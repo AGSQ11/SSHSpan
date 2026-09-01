@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-09-01
+
+### Fixed
+
+- Release notes: the changelog-section extraction used an awk dynamic regex
+  in which the escaped brackets opened a character class, so no section ever
+  matched and every release fell back to the generic "see CHANGELOG.md" text.
+  It now uses an anchored literal-string comparison.
+
 ## [1.0.6] - 2026-09-01
 
 ### Fixed
