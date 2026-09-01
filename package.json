@@ -1,0 +1,92 @@
+{
+  "name": "sshspan",
+  "productName": "SSHSpan",
+  "version": "1.0.0",
+  "description": "Cross-platform SSH key manager. Create, store, organize, and deploy SSH keys with a local encrypted SQLite database.",
+  "author": {
+    "name": "SSHSpan Contributors",
+    "email": "sshspan@example.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/sshspan/sshspan",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sshspan/sshspan.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sshspan/sshspan/issues"
+  },
+  "keywords": [
+    "ssh",
+    "keys",
+    "ssh-keygen",
+    "rsa",
+    "ed25519",
+    "ecdsa",
+    "electron",
+    "security",
+    "sqlite"
+  ],
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging",
+    "test": "node tests/run-tests.js",
+    "icon": "node scripts/make-icon.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "type": "commonjs",
+  "dependencies": {
+    "sql.js": "^1.13.0",
+    "bcrypt-pbkdf": "^1.0.2"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "org.sshspan.app",
+    "productName": "SSHSpan",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "assets/icon.png"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

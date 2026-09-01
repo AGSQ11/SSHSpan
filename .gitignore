@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Electron build output
+dist/
+build/
+release/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local database and key material
+.sshspan/
+sshspan.db
+sshspan.db.tmp
+
+# Test and coverage artifacts
+coverage/
+.nyc_output/
+*.log
+*.out
+*.out.txt
+
+# Environment
+.env
+.env.local
