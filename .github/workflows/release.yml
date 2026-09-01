@@ -24,9 +24,7 @@ jobs:
             artifacts: 'release/*.exe'
           - os: ubuntu-latest
             dist: 'dist:linux'
-            artifacts: |
-              release/*.AppImage
-              release/*.deb
+            artifacts: 'release/*.AppImage release/*.deb'
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository

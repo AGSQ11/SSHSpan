@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-09-01
+
+### Fixed
+
+- Linux CI: `tests/smoke-app.js` hardcoded the Windows ssh-keygen path
+  (`C:\Windows\System32\OpenSSH\ssh-keygen.exe`), so the app suite failed on
+  the Linux runner. The test now resolves ssh-keygen per platform.
+- Release workflow: single-line matrix `artifacts` values (multiline values
+  produced garbled job names and unreadable logs).
+
 ## [1.0.3] - 2026-09-01
 
 ### Fixed

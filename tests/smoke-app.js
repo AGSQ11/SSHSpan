@@ -9,9 +9,19 @@ const keyService = require('../src/main/services/keyService');
 const { serializeOpenSSHPrivateKey } = require('../src/main/services/opensshParser');
 const crypto = require('crypto');
 
-const KEYGEN = 'C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe';
+/**
+ * Run ssh-keygen, which lives at a fixed location on Windows and on PATH
+ * elsewhere. Commands are inline literals through execFileSync (no shell).
+ */
+function keygen(args) {
+  if (process.platform === 'win32') {
+    return execFileSync('C:/Windows/System32/OpenSSH/ssh-keygen.exe', args, { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  }
+  return execFileSync('ssh-keygen', args, { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+}
+
 function keygenFp(file) {
-  const out = execFileSync(KEYGEN, ['-l', '-f', file], { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  const out = keygen(['-l', '-f', file]);
   const m = out.match(/SHA256:[A-Za-z0-9+/]+/);
   return m ? m[0] : null;
 }
@@ -127,7 +137,7 @@ function ok(name, cond, extra) {
   // ssh-keygen accepts the deployed encrypted key and fingerprint matches
   const fp = (() => {
     try {
-      const pub = execFileSync(KEYGEN, ['-y', '-P', 'dep-pass-1', '-f', dep.files[0]], { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+      const pub = keygen(['-y', '-P', 'dep-pass-1', '-f', dep.files[0]]).trim();
       const pf = dep.files[0] + '.derived.pub';
       fs.writeFileSync(pf, pub + '\n');
       return keygenFp(pf);
