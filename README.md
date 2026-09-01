@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/sshspan-readme-hero.svg" alt="SSHSpan — encrypted SSH key management" width="100%">
+</p>
+
 # SSHSpan
 
 🔐 Cross-platform SSH key manager for the desktop.

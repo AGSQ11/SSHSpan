@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="640" viewBox="0 0 1600 640">
+<defs>
+  <linearGradient id="bg" x1="0" x2="1"><stop offset="0" stop-color="#0f1115"/><stop offset="1" stop-color="#111827"/></linearGradient>
+  <linearGradient id="logo" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#3b82f6"/><stop offset="1" stop-color="#6ea8ff"/></linearGradient>
+  <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000" flood-opacity=".45"/></filter>
+</defs>
+<rect width="1600" height="640" fill="url(#bg)"/>
+<g opacity=".22" stroke="#2d3748" stroke-width="1">
+  <path d="M920 0V640"/><path d="M960 0V640"/><path d="M1000 0V640"/><path d="M1040 0V640"/><path d="M1080 0V640"/><path d="M1120 0V640"/><path d="M1160 0V640"/><path d="M1200 0V640"/><path d="M1240 0V640"/><path d="M1280 0V640"/><path d="M1320 0V640"/><path d="M1360 0V640"/><path d="M1400 0V640"/><path d="M1440 0V640"/><path d="M1480 0V640"/><path d="M1520 0V640"/><path d="M1560 0V640"/>
+  <path d="M900 0H1600"/><path d="M900 40H1600"/><path d="M900 80H1600"/><path d="M900 120H1600"/><path d="M900 160H1600"/><path d="M900 200H1600"/><path d="M900 240H1600"/><path d="M900 280H1600"/><path d="M900 320H1600"/><path d="M900 360H1600"/><path d="M900 400H1600"/><path d="M900 440H1600"/><path d="M900 480H1600"/><path d="M900 520H1600"/><path d="M900 560H1600"/><path d="M900 600H1600"/>
+</g>
+<g font-family="Segoe UI,Arial,sans-serif">
+  <rect x="92" y="92" width="94" height="94" rx="22" fill="url(#logo)" filter="url(#shadow)"/>
+  <text x="110" y="150" font-family="Consolas,monospace" font-size="34" font-weight="800" fill="#0b1020">&gt;_</text>
+  <text x="92" y="292" font-size="82" font-weight="800" fill="#e6e9ef">SSHSpan</text>
+  <text x="92" y="350" font-size="28" fill="#e6e9ef">Encrypted SSH key management.</text>
+  <text x="92" y="390" font-size="28" fill="#9aa3b2">Local-first. Cross-platform. Under your control.</text>
+
+  <g font-size="16" font-weight="700">
+    <rect x="92" y="432" width="188" height="38" rx="19" fill="#14223a" stroke="#2a3140"/>
+    <circle cx="108" cy="451" r="4" fill="#6ea8ff"/><text x="120" y="457" fill="#dfe5ef">AES-256-GCM vault</text>
+    <rect x="292" y="432" width="169" height="38" rx="19" fill="#102b1c" stroke="#2a3140"/>
+    <circle cx="308" cy="451" r="4" fill="#4ade80"/><text x="320" y="457" fill="#dfe5ef">Offline by design</text>
+    <rect x="473" y="432" width="164" height="38" rx="19" fill="#30250d" stroke="#2a3140"/>
+    <circle cx="489" cy="451" r="4" fill="#fbbf24"/><text x="501" y="457" fill="#dfe5ef">OpenSSH config</text>
+  </g>
+  <text x="92" y="526" font-size="18" fill="#6b7280">SSH keys • encrypted vault • reversible config deployment • optional vault sync</text>
+
+  <g filter="url(#shadow)">
+    <rect x="840" y="110" width="670" height="430" rx="22" fill="#151920" stroke="#2a3140" stroke-width="2"/>
+  </g>
+  <path d="M862 110H1488a22 22 0 0 1 22 22v26H840v-26a22 22 0 0 1 22-22z" fill="#1b2029"/>
+  <circle cx="867" cy="134" r="5" fill="#f87171"/><circle cx="889" cy="134" r="5" fill="#fbbf24"/><circle cx="911" cy="134" r="5" fill="#4ade80"/>
+  <text x="1140" y="139" font-size="15" font-weight="700" fill="#9aa3b2">SSHSpan</text>
+
+  <rect x="840" y="158" width="150" height="382" fill="#13171d"/>
+  <path d="M990 158V540" stroke="#2a3140"/>
+  <rect x="858" y="182" width="34" height="34" rx="9" fill="#6ea8ff"/>
+  <text x="865" y="204" font-family="Consolas,monospace" font-size="12" font-weight="800" fill="#0b1020">&gt;_</text>
+  <text x="901" y="204" font-size="15" font-weight="700" fill="#e6e9ef">SSHSpan</text>
+  <rect x="854" y="237" width="122" height="32" rx="7" fill="#1a2a43"/><text x="868" y="258" font-size="15" fill="#6ea8ff">Keys</text>
+  <text x="868" y="300" font-size="15" fill="#9aa3b2">SSH Config</text><text x="868" y="342" font-size="15" fill="#9aa3b2">Settings</text><text x="868" y="384" font-size="15" fill="#9aa3b2">Audit</text>
+  <rect x="854" y="482" width="122" height="34" rx="8" fill="#1b2029" stroke="#2a3140"/>
+  <circle cx="866" cy="499" r="4" fill="#4ade80"/><text x="878" y="504" font-size="12" fill="#9aa3b2">Vault unlocked</text>
+
+  <text x="1016" y="205" font-size="23" font-weight="700" fill="#e6e9ef">SSH Keys</text>
+  <text x="1016" y="236" font-size="15" fill="#6b7280">3 keys protected locally</text>
+  <rect x="1376" y="184" width="110" height="34" rx="8" fill="#6ea8ff"/><text x="1390" y="206" font-size="14" font-weight="700" fill="#0b1020">+ New Key</text>
+
+  <g>
+    <rect x="1016" y="255" width="470" height="76" rx="11" fill="#1b2029" stroke="#2a3140"/>
+    <circle cx="1042" cy="293" r="8" fill="none" stroke="#6ea8ff" stroke-width="3"/><path d="M1049 293h22m-8 0v7m8-7v5" stroke="#6ea8ff" stroke-width="3"/>
+    <text x="1080" y="282" font-size="15" font-weight="700" fill="#e6e9ef">prod-eu</text><text x="1080" y="307" font-family="Consolas,monospace" font-size="15" fill="#9aa3b2">ED25519   SHA256:Wg8X…6FM</text><circle cx="1462" cy="293" r="5" fill="#4ade80"/>
+    <rect x="1016" y="345" width="470" height="76" rx="11" fill="#1b2029" stroke="#2a3140"/>
+    <circle cx="1042" cy="383" r="8" fill="none" stroke="#6ea8ff" stroke-width="3"/><path d="M1049 383h22m-8 0v7m8-7v5" stroke="#6ea8ff" stroke-width="3"/>
+    <text x="1080" y="372" font-size="15" font-weight="700" fill="#e6e9ef">git-signing</text><text x="1080" y="397" font-family="Consolas,monospace" font-size="15" fill="#9aa3b2">RSA 4096   SHA256:J3sK…9Qp</text><circle cx="1462" cy="383" r="5" fill="#6ea8ff"/>
+    <rect x="1016" y="435" width="470" height="76" rx="11" fill="#1b2029" stroke="#2a3140"/>
+    <circle cx="1042" cy="473" r="8" fill="none" stroke="#6ea8ff" stroke-width="3"/><path d="M1049 473h22m-8 0v7m8-7v5" stroke="#6ea8ff" stroke-width="3"/>
+    <text x="1080" y="462" font-size="15" font-weight="700" fill="#e6e9ef">backup-node</text><text x="1080" y="487" font-family="Consolas,monospace" font-size="15" fill="#9aa3b2">ECDSA P-384   SHA256:K7dP…2Lm</text><circle cx="1462" cy="473" r="5" fill="#fbbf24"/>
+  </g>
+</g>
+<path d="M70 585H630" stroke="#2a3140" stroke-width="2"/><path d="M70 585H230" stroke="#6ea8ff" stroke-width="4"/>
+</svg>
