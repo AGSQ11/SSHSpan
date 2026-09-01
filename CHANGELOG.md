@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-09-02
+
+### Fixed
+
+- Narrow-window layout: the keys list and detail pane squeezed each other
+  instead of stacking (the detail pane had a hard `min-width: 340px` inside a
+  non-wrapping flex row), and key rows overflowed because the renderer builds
+  `.key-row-main/-name/-sub` while the stylesheet only defined
+  `.key-info/.key-name/.key-sub`, leaving them unstyled with no truncation.
+  The layout now wraps and stacks, long names and fingerprints ellipsize, and
+  the sidebar collapses to icons under 900px / 620px breakpoints. Also fixed
+  the unstyled "public only" badge (`.badge.ghost`) and made the topbar,
+  toolbar, export row, deploy options, settings rows and audit table reflow
+  instead of squashing.
+
 ## [1.0.7] - 2026-09-01
 
 ### Fixed

@@ -188,23 +188,36 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
   padding: 14px 20px;
   border-bottom: 1px solid var(--border);
 }
-.topbar h1 { font-size: 17px; font-weight: 700; }
-.topbar-actions { display: flex; gap: 8px; }
+.topbar h1 { font-size: 17px; font-weight: 700; min-width: 0; overflow-wrap: anywhere; }
+.topbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
 .view { flex: 1; overflow: auto; padding: 16px 20px; }
 
 /* ---- keys view ------------------------------------------------------------ */
 
-.toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; }
-.toolbar input[type="search"] { max-width: 380px; }
-.toolbar select { width: 150px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+.toolbar input[type="search"] { max-width: 380px; min-width: 160px; }
+.toolbar select { width: 150px; flex: none; }
+.toolbar .spacer { min-width: 0; }
 
-.keys-layout { display: flex; gap: 16px; align-items: flex-start; }
+.keys-layout {
+  display: flex;
+  flex-wrap: wrap;              /* stack the detail pane below the list */
+  gap: 16px;
+  align-items: flex-start;
+}
 
-.key-list { flex: 1.25; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.key-list {
+  flex: 1 1 320px;              /* grow, but stack when under ~320px */
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
 
 .key-row {
   display: flex; align-items: center; gap: 12px;
@@ -218,6 +231,24 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 .key-row.selected { border-color: var(--accent); background: var(--accent-weak); }
 .key-row input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
 
+/* The renderer builds rows with .key-row-main/-name/-sub (see app.js). */
+.key-row-main { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+
+.key-row-name {
+  font-weight: 600; font-size: 13.5px;
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0;
+}
+.key-row-name > :first-child {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.key-row-sub {
+  color: var(--text-faint); font-size: 11.5px;
+  margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 .key-info { min-width: 0; flex: 1; }
 .key-name { font-weight: 600; font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
 .key-sub { color: var(--text-faint); font-size: 11.5px; font-family: var(--mono); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -227,7 +258,8 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
   padding: 2px 7px; border-radius: 999px; text-transform: uppercase;
   background: var(--accent-weak); color: var(--accent); flex: none;
 }
-.badge.pub { background: rgba(251, 191, 36, 0.14); color: var(--warn); }
+.badge.pub,
+.badge.ghost { background: rgba(251, 191, 36, 0.14); color: var(--warn); }
 
 .empty-state {
   flex: 1; text-align: center; padding: 60px 20px; color: var(--text-dim);
@@ -239,7 +271,8 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 /* ---- detail pane ------------------------------------------------------------ */
 
 .detail-pane {
-  flex: 1; min-width: 340px;
+  flex: 1 1 340px;
+  min-width: 0;                 /* was 340px: it crushed the list when narrow */
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -261,10 +294,10 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 
 .detail-actions { display: flex; gap: 8px; }
 
-.export-row { display: flex; gap: 8px; align-items: center; }
-.export-row select { flex: 1.2; }
-.export-row input { flex: 1; }
-.export-row .primary-btn { flex: none; }
+.export-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.export-row select { flex: 1.2; min-width: 170px; }
+.export-row input { flex: 1; min-width: 130px; }
+.export-row .primary-btn { flex: none; margin-left: auto; }
 
 /* ---- config / deploy view ---------------------------------------------------- */
 
@@ -274,8 +307,8 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 .config-section code { font-family: var(--mono); font-size: 11.5px; color: var(--accent); }
 
 .deploy-options { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; align-items: flex-end; }
-.deploy-options label { min-width: 140px; }
-.deploy-options input[type="text"], .deploy-options input[type="number"] { width: 150px; }
+.deploy-options label { min-width: 140px; flex: 1 1 140px; }
+.deploy-options input[type="text"], .deploy-options input[type="number"] { width: 100%; max-width: 150px; }
 
 #configPreview { margin-top: 10px; width: 100%; }
 
@@ -312,6 +345,38 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 }
 .audit-table td { padding: 6px 10px; border-bottom: 1px solid rgba(42, 49, 64, 0.5); color: var(--text-dim); }
 .audit-table td.ev { font-family: var(--mono); color: var(--accent); font-size: 12px; }
+
+/* ---- responsive: sidebar collapses and rows stack on narrow windows ---- */
+
+@media (max-width: 900px) {
+  .sidebar { width: 64px; min-width: 64px; padding: 12px 8px; }
+  .brand-name { display: none; }
+  .nav-item { text-align: center; padding: 8px 4px; font-size: 11px; }
+  .nav-item::first-letter { font-size: 14px; }
+  .vault-status .vault-label { display: none; }
+  #newKeyBtn { font-size: 0; padding: 8px; }
+  #newKeyBtn::before { content: '+'; font-size: 15px; }
+  .keys-layout { flex-direction: column; }
+  .detail-pane, .key-list { flex: 1 1 auto; width: 100%; }
+}
+
+@media (max-width: 620px) {
+  .view { padding: 12px 12px; }
+  .topbar { padding: 10px 12px; }
+  .toolbar input[type="search"] { max-width: none; width: 100%; }
+  .toolbar select { width: 100%; }
+  .setting-row { flex-direction: column; align-items: stretch; }
+  .setting-row input[type="number"], .setting-row select { width: 100%; }
+  .export-row .primary-btn { margin-left: 0; width: 100%; }
+  .detail-actions, .config-actions, .bw-actions { flex-wrap: wrap; }
+}
+
+/* Audit table: keep it readable instead of squashing columns to nothing. */
+.audit-view { max-width: 100%; }
+.audit-table { table-layout: fixed; }
+.audit-table th:nth-child(1) { width: 170px; }
+.audit-table th:nth-child(2) { width: 190px; }
+.audit-table td { overflow-wrap: anywhere; }
 
 /* ---- modals ---------------------------------------------------------------------- */
 
