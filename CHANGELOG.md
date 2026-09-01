@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-09-01
+
+### Fixed
+
+- Release workflow: the "sync package version with tag" step failed with
+  "npm error Version not changed" when the tag version already matched
+  `package.json`. It now bumps only when the versions differ.
+
 ## [1.0.2] - 2026-09-01
 
 ### Added

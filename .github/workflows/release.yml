@@ -50,7 +50,15 @@ jobs:
             *.*)   V="$V.0" ;;
             *)     V="$V.0.0" ;;
           esac
-          npm version --no-git-tag-version "$V"
+          # npm version exits non-zero when the version is already correct,
+          # so only run it when the tag really differs from package.json.
+          CURRENT="$(node -p "require('./package.json').version")"
+          if [ "$V" != "$CURRENT" ]; then
+            npm version --no-git-tag-version "$V"
+            echo "Version bumped: $CURRENT -> $V"
+          else
+            echo "Version already $V; nothing to change."
+          fi
 
       - name: Run test suites
         run: npm test
