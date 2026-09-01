@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-09-01
+
+### Fixed
+
+- Linux CI: the release upload step failed with "Pattern 'release/*.AppImage
+  release/*.deb' does not match any files" — space-separated globs are read as
+  a single literal pattern. Artifact globs are one per line again, with an
+  explicit job `name` so the Actions UI stays readable.
+
 ## [1.0.5] - 2026-09-01
 
 ### Fixed

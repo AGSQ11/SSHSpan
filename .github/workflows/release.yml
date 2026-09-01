@@ -21,11 +21,20 @@ jobs:
         include:
           - os: windows-latest
             dist: 'dist:win'
-            artifacts: 'release/*.exe'
+            platform: Windows
+            # One glob per line: softprops/action-gh-release matches each
+            # line as a separate pattern (a single space-separated string
+            # would be treated as one literal pattern).
+            artifacts: |
+              release/*.exe
           - os: ubuntu-latest
             dist: 'dist:linux'
-            artifacts: 'release/*.AppImage release/*.deb'
+            platform: Linux
+            artifacts: |
+              release/*.AppImage
+              release/*.deb
     runs-on: ${{ matrix.os }}
+    name: ${{ matrix.platform }} (${{ matrix.dist }})
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
