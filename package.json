@@ -1,10 +1,11 @@
 {
   "name": "sshspan",
   "productName": "SSHSpan",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Cross-platform SSH key manager. Create, store, organize, and deploy SSH keys with a local encrypted SQLite database.",
   "author": {
-    "name": "AGSQ11"
+    "name": "AGSQ11",
+    "email": "agsq11@users.noreply.github.com"
   },
   "license": "MIT",
   "homepage": "https://github.com/AGSQ11/SSHSpan",

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-09-01
+
+### Fixed
+
+- Linux CI: electron-builder rejected the deb build with "Please specify
+  author 'email' in the application package.json" (required by deb package
+  metadata). Added `author.email` to package.json.
+
 ## [1.0.4] - 2026-09-01
 
 ### Fixed
