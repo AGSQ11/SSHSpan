@@ -8,7 +8,7 @@
  *   base64url( salt || iv || tag || ciphertext )
  *
  * Security notes:
- *   - Keys are derived with scrypt (N=2^14, r=8, p=1) over a 16-byte salt.
+ *   - Keys are derived with scrypt (N=2^16, r=8, p=1) over a 16-byte salt.
  *   - AES-256-GCM with a 12-byte random IV and 16-byte auth tag.
  *   - The master password is never persisted; only a verification hash is.
  * ---------------------------------------------------------------------------
@@ -23,7 +23,7 @@ const SALT_LEN = 16;
 const IV_LEN = 12;
 const TAG_LEN = 16;
 const KEY_LEN = 32;
-const SCRYPT_N = 1 << 14; // 16384
+const SCRYPT_N = 1 << 16; // 65536 — stronger offline brute-force cost for the master password (v1.0.0)
 const SCRYPT_R = 8;
 const SCRYPT_P = 1;
 
@@ -35,7 +35,7 @@ function deriveKey(password, salt) {
     N: SCRYPT_N,
     r: SCRYPT_R,
     p: SCRYPT_P,
-    maxMemory: 64 * 1024 * 1024
+    maxmem: 256 * 1024 * 1024
   });
 }
 
@@ -86,7 +86,7 @@ function decrypt(blobB64, password) {
 function createVerification(password) {
   const salt = crypto.randomBytes(SALT_LEN);
   const hash = crypto.scryptSync(password, salt, 32, {
-    N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxMemory: 64 * 1024 * 1024
+    N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: 256 * 1024 * 1024
   });
   return { hash: hash.toString('base64url'), salt: salt.toString('base64url') };
 }
@@ -97,7 +97,7 @@ function createVerification(password) {
 function verifyPassword(password, storedHash, storedSalt) {
   const salt = Buffer.from(storedSalt, 'base64url');
   const expected = crypto.scryptSync(password, salt, 32, {
-    N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxMemory: 64 * 1024 * 1024
+    N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: 256 * 1024 * 1024
   });
   const actual = Buffer.from(storedHash, 'base64url');
   if (actual.length !== expected.length) return false;

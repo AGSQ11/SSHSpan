@@ -14,7 +14,7 @@ cryptographic library is used.
 
 The master password is never stored. When a vault is created, the app derives two values:
 
-- a **scrypt** key derivation: N = 16384, r = 8, p = 1, over a 16-byte random salt;
+- a **scrypt** key derivation: N = 65536, r = 8, p = 1, over a 16-byte random salt;
 - the derived key is used as an AES-256 key to encrypt every private key in the vault.
 
 Separately, a **verification hash** is stored in the `config` table so the app can tell whether
@@ -106,7 +106,7 @@ These are deliberate, documented trade-offs, not bugs:
 - **No hardware-backed key storage.** SSHSpan uses software cryptography via Node's OpenSSL
   binding. It does not use a TPM, HSM, or platform secure enclave. Keys are as strong as the
   master password and the OS's PRNG.
-- **Passphrase protection is only as strong as the user's password.** Scrypt with N=16384,
+- **Passphrase protection is only as strong as the user's password.** Scrypt with N=65536,
   r=8, p=1 provides meaningful but not indefinite protection against offline guessing. A
   weak master password can be brute-forced from the stored hash and salt.
 - **Full disk encryption is recommended.** Because the database file is not encrypted at the
