@@ -51,7 +51,10 @@ const SCHEMA = [
      createdAt INTEGER NOT NULL,
      updatedAt INTEGER NOT NULL,
      tags TEXT NOT NULL DEFAULT '[]',
-     sshConfig TEXT NOT NULL DEFAULT '[]'
+     sshConfig TEXT NOT NULL DEFAULT '[]',
+     bitwardenId TEXT,
+     bitwardenRevision TEXT,
+     bitwardenUpdatedAt INTEGER
   )`,
   `CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS audit (
@@ -69,7 +72,8 @@ const SCHEMA = [
 /** Whitelisted columns for updateKey() — prevents arbitrary column writes. */
 const UPDATABLE_KEY_FIELDS = [
   'name', 'comment', 'tags', 'sshConfig', 'passphrase',
-  'privateKeyPem', 'encrypted', 'updatedAt'
+  'privateKeyPem', 'encrypted', 'updatedAt',
+  'bitwardenId', 'bitwardenRevision', 'bitwardenUpdatedAt'
 ];
 
 function defaultDbPath() {
@@ -95,11 +99,33 @@ class Database {
     }
     this.db = new SQL.Database(data || undefined);
     for (const stmt of SCHEMA) this.db.run(stmt);
+    this._migrate();
     if (!this._get('SELECT value FROM meta WHERE key = ?', ['schema_version'])) {
       this._run('INSERT INTO meta (key, value) VALUES (?, ?)', ['schema_version', '1']);
     }
     this._ready = true;
     return this;
+  }
+
+  /**
+   * In-place upgrades for vaults created before the current schema. Each
+   * step is idempotent: a duplicate-column ALTER simply means it ran before.
+   */
+  _migrate() {
+    const alters = [
+      // v2: Bitwarden sync linkage (cipher id, last-seen remote revision,
+      // local time of the last successful per-row sync)
+      'ALTER TABLE keys ADD COLUMN bitwardenId TEXT',
+      'ALTER TABLE keys ADD COLUMN bitwardenRevision TEXT',
+      'ALTER TABLE keys ADD COLUMN bitwardenUpdatedAt INTEGER'
+    ];
+    for (const sql of alters) {
+      try {
+        this.db.run(sql);
+      } catch (e) {
+        if (!/duplicate column/i.test(String(e && e.message))) throw e;
+      }
+    }
   }
 
   /** Debounced persistence: coalesce rapid writes, then flush atomically. */
@@ -197,11 +223,13 @@ class Database {
   insertKey(k) {
     this._mutate(
       `INSERT INTO keys (id,name,type,bits,comment,fingerprint,privateKeyPem,publicKeyPem,
-        publicAuthorizedKey,encrypted,passphrase,createdAt,updatedAt,tags,sshConfig)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        publicAuthorizedKey,encrypted,passphrase,createdAt,updatedAt,tags,sshConfig,
+        bitwardenId,bitwardenRevision,bitwardenUpdatedAt)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [k.id, k.name, k.type, k.bits, k.comment || '', k.fingerprint, k.privateKeyPem,
        k.publicKeyPem, k.publicAuthorizedKey, k.encrypted ? 1 : 0, k.passphrase || null,
-       k.createdAt, k.updatedAt, JSON.stringify(k.tags || []), JSON.stringify(k.sshConfig || [])]
+       k.createdAt, k.updatedAt, JSON.stringify(k.tags || []), JSON.stringify(k.sshConfig || []),
+       k.bitwardenId || null, k.bitwardenRevision || null, k.bitwardenUpdatedAt || null]
     );
     this.audit('key.create', k.id);
     return k;
@@ -220,6 +248,27 @@ class Database {
     params.push(id);
     this._mutate('UPDATE keys SET ' + fields.join(', ') + ' WHERE id = ?', params);
     this.audit('key.update', id);
+    return this.getKey(id);
+  }
+
+  /**
+   * Write key content + Bitwarden sync state as decided by the sync engine.
+   * Unlike updateKey() this does NOT touch updatedAt unless the caller passes
+   * it — a pull overwrites local content and must not later look like a local
+   * edit (that would push the remote value right back).
+   */
+  updateKeyFromSync(id, patch) {
+    const fields = [];
+    const params = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (!UPDATABLE_KEY_FIELDS.includes(k)) continue;
+      fields.push(k + ' = ?');
+      params.push(k === 'tags' || k === 'sshConfig' ? JSON.stringify(v) : (v ?? null));
+    }
+    if (fields.length === 0) return this.getKey(id);
+    params.push(id);
+    this._mutate('UPDATE keys SET ' + fields.join(', ') + ' WHERE id = ?', params);
+    this.audit('key.sync', id);
     return this.getKey(id);
   }
   deleteKey(id) {

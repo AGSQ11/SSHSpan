@@ -12,19 +12,20 @@ Everything runs locally. No cloud, no telemetry, no network access — ever.
 
 ## Features
 
-- **Generate keys** — RSA (2048–8192 bits), Ed25519, and ECDSA (nistp256/384/521), built on Node's native `crypto` module.
+- **Generate keys** — RSA (3072–8192 bits), Ed25519, and ECDSA (nistp256/384/521), built on Node's native `crypto` module.
 - **Import keys** — PEM private (PKCS#8 / PKCS#1 / SEC1), OpenSSH new-format private keys (including passphrase-protected), PEM public keys, and `authorized_keys` public lines.
 - **Export keys** — OpenSSH new-format private, PKCS#8 PEM (plain or AES-256-CBC encrypted), SPKI PEM public, and `authorized_keys` lines.
 - **Encrypted vault** — every private key is encrypted with AES-256-GCM. The master password is never stored; only a scrypt verification hash is persisted.
 - **Deploy to SSH config** — writes reversible `Host` blocks into `~/.ssh/config` between marker comments, so they can be removed cleanly.
 - **Audit log** — append-only record of key create/update/delete, vault lock/unlock, and config writes.
-- **Offline by design** — zero telemetry, zero network calls, fully local storage.
+- **Bitwarden / Vaultwarden sync (optional)** — mirror your keys to SSH key items in your own vault, two-way, manual or on an interval.
+- **Offline by design** — zero telemetry; no network access unless you enable the Bitwarden sync, which talks only to the server you configure.
 
 ## Installation
 
 ### From a release (recommended)
 
-Download the installer for your platform from the [releases page](https://github.com/sshspan/sshspan/releases):
+Download the installer for your platform from the [releases page](https://github.com/AGSQ11/SSHSpan/releases):
 
 - **Windows** — `SSHSpan-Setup.exe` (NSIS installer) or `SSHSpan-Portable.exe`.
 - **Linux** — `SSHSpan.AppImage` or the `.deb` package.
@@ -34,7 +35,7 @@ Download the installer for your platform from the [releases page](https://github
 SSHSpan requires **Node.js 18 or later**.
 
 ```bash
-git clone https://github.com/sshspan/sshspan.git
+git clone https://github.com/AGSQ11/SSHSpan.git
 cd sshspan
 npm install
 npm start
@@ -83,6 +84,27 @@ Host myserver
 # <<< SSHSpan managed <<<
 ```
 
+### 5. Sync with Bitwarden or Vaultwarden (optional)
+
+In **Settings → Bitwarden / Vaultwarden sync**, enter your vault server URL
+(e.g. `https://vault.example.com` for a self-hosted Vaultwarden), the account
+email, the vault master password, and a folder name (`SSHSpan` by default).
+Then:
+
+- **Test connection** verifies the server, credentials, and KDF settings.
+- **Sync now** mirrors keys in both directions: local keys become SSH key
+  items in your vault, and SSH key items from the vault are imported locally.
+  Matching is done by fingerprint; the newest change wins per item;
+  deletions are never propagated automatically.
+- **Auto-sync** repeats the sync on a fixed interval (5–1440 minutes) while
+  the vault is unlocked.
+
+Keys are encrypted client-side with the Bitwarden protocol before anything is
+sent — the server only ever receives ciphertext. Self-hosted vaults must be
+reachable via a public hostname (LAN/localhost addresses are refused by
+design). Two-factor accounts are not supported yet; use a dedicated account
+without 2FA. See `docs/SECURITY.md` for the details.
+
 ### Data locations
 
 | Artifact | Path |
@@ -113,9 +135,11 @@ and cross-platform builds.
 
 **Why is there no cloud sync?**
 
-SSHSpan is intentionally fully offline. Private keys never leave your machine,
-and the app makes no network calls, so there is nothing to sync and no attack
-surface to expose.
+SSHSpan is intentionally local-first. Private keys never leave your machine
+unless you explicitly enable the Bitwarden/Vaultwarden sync, which sends them
+end-to-end encrypted to your own vault (the optional sync described above).
+There is no built-in cloud of our own, no telemetry, and no account — the
+app makes no network calls until you configure a sync destination yourself.
 
 **How does SSHSpan interoperate with ssh-keygen?**
 

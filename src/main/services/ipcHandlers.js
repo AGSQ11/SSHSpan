@@ -88,6 +88,20 @@ async function settingsSet(payload) {
   return { ok: true };
 }
 
+// ---- bitwarden sync ----
+async function syncGetConfig() {
+  return app.syncGetConfig();
+}
+async function syncSaveConfig(payload) {
+  return app.syncSaveConfig(payload || {});
+}
+async function syncTest() {
+  return app.syncTest();
+}
+async function syncNow(payload) {
+  return app.syncNow(payload || {});
+}
+
 // ---- audit ----
 async function auditList(payload) {
   return app.listAudit(payload && payload.limit);
@@ -120,6 +134,10 @@ const handlers = {
   'keys:render-config': keysRenderConfig,
   'settings:get': settingsGet,
   'settings:set': settingsSet,
+  'sync:get-config': syncGetConfig,
+  'sync:save-config': syncSaveConfig,
+  'sync:test': syncTest,
+  'sync:now': syncNow,
   'audit:list': auditList,
   'clipboard:write-public': clipboardWritePublic
 };

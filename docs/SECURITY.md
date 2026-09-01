@@ -1,9 +1,11 @@
 # SSHSpan security model
 
-SSHSpan is a local-only SSH key manager. It stores no data on any server, makes no network
-requests, and ships no telemetry. This document describes the cryptographic controls, the
-storage layout, and the threat model the app is designed to defend against, as well as the
-things it deliberately does not defend against.
+SSHSpan is a local-first SSH key manager. It stores no data on any server, ships no telemetry,
+and by default makes no network requests at all. The single optional exception is the
+**Bitwarden/Vaultwarden sync** feature, which only talks to the server the user explicitly
+configures (see below). This document describes the cryptographic controls, the storage
+layout, and the threat model the app is designed to defend against, as well as the things it
+deliberately does not defend against.
 
 ## Cryptographic primitives
 
@@ -73,8 +75,50 @@ restrictive default ACLs of the user profile directory on Windows.
 6. **Exports are under user control.** `keys:export` and `keys:copy-public` require an
    unlocked vault and never write private key material to the clipboard; only
    `clipboard:write-public` exists, and it writes the public key only.
-7. **The app is fully offline.** There is no telemetry, no network access, no auto-update
-   mechanism, and no phone-home of any kind. Every operation runs locally.
+7. **The app is fully offline by default.** There is no telemetry, no auto-update mechanism,
+   and no phone-home of any kind. The only network code in the app is the opt-in
+   Bitwarden/Vaultwarden sync (below), which contacts exactly one destination: the server URL
+   the user configured.
+
+## Bitwarden / Vaultwarden sync
+
+The optional sync feature stores SSH key items in the user's own Bitwarden-compatible vault.
+Its security properties:
+
+- **Opt-in and scoped.** The feature is idle until the user configures a server URL, account
+  email, and master password in Settings. It talks to *that* server only, over http/HTTPS,
+  and never to anything else.
+- **SSRF guard.** The configured URL is validated before any request: http/https schemes
+  only, no embedded credentials, and localhost/`.local` hostnames, literal loopback, private,
+  link-local, CGNAT, multicast, documentation and other reserved addresses (IPv4 and IPv6,
+  including IPv4-mapped forms) are rejected. The hostname is DNS-resolved and *every*
+  resolved address must be public. A self-hosted vault must therefore be reachable via a
+  public hostname (e.g. behind a reverse proxy with a real domain); LAN/localhost addresses
+  are deliberately out of scope.
+- **End-to-end encryption is preserved.** Item fields are encrypted client-side with the
+  Bitwarden protocol (master key via PBKDF2/Argon2id, HKDF-Expand stretching, AES-256-CBC +
+  HMAC-SHA256 EncStrings), exactly as official clients do; the server only ever receives
+  ciphertext. SSHSpan accepts only HMAC-verified type-2 EncStrings and verifies the MAC
+  (timing-safe) before decrypting.
+- **The stored vault master password is sealed with the SSHSpan vault password.** It is
+  AES-256-GCM-encrypted before it touches disk and is only decryptable while the SSHSpan
+  vault is unlocked; locking the vault makes sync (including the optional auto-sync timer)
+  impossible until it is unlocked again. Changing the master password re-seals it.
+- **Private keys leave the vault only as OpenSSH-format material inside a Bitwarden SSH key
+  item.** Exported to the remote item they are unencrypted OpenSSH PEM (the format Bitwarden
+  requires for its SSH agent), protected end-to-end by Bitwarden's own encryption.
+- **Deletions are never propagated.** A sync creates and updates items both ways but never
+  deletes; a remote deletion is only reported in the summary and audit log.
+- **Every sync action is audited** (`sync.config`, `sync.push`, `sync.pull`, `sync.run`,
+  `sync.error`).
+
+Known limitations of the sync feature:
+
+- Accounts with **two-factor authentication** are not supported yet (the password grant
+  cannot answer a 2FA challenge); use a dedicated account without 2FA. Bitwarden cloud's
+  new-device login verification may also require approving the device once by email.
+- `bw serve`-style localhost integrations are intentionally not used, for the same SSRF
+  reasons that private addresses are rejected.
 
 ## Threat model
 
@@ -122,6 +166,12 @@ These are deliberate, documented trade-offs, not bugs:
 - **Passphrase-protected exports are recommended for portability.** When exporting a private
   key to OpenSSH or PKCS#8 format, the app can encrypt the output with a user-supplied
   passphrase. This passphrase is independent of the vault master password and is not stored.
+- **Sync widens the blast radius of a server compromise to key availability, not
+  confidentiality.** If the configured Bitwarden/Vaultwarden server or the account password
+  is compromised, an attacker obtains ciphertext that requires the account's master password
+  to decrypt — the same trust model as any Bitwarden client. A malicious server, however,
+  could feed SSHSpan crafted items; they are parsed with the same hardened key parsers used
+  for user imports.
 
 ## Operational guidance
 

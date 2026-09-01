@@ -29,6 +29,7 @@ const Session = require('./sessionService');
 const keyService = require('./keyService');
 const sshConfigService = require('./sshConfigService');
 const cryptoService = require('./cryptoService');
+const { BitwardenSync } = require('./bitwardenSyncService');
 
 const MIN_PASSWORD_LEN = 8;
 
@@ -37,6 +38,9 @@ class SshSpan {
     this.db = null;
     this.settings = null;
     this.session = new Session();
+    this.bitwardenSync = new BitwardenSync(this);
+    // Vault lock (manual or idle timer) must stop the auto-sync timer.
+    this.session.onIdle(() => this.bitwardenSync.stopAutoSync());
   }
 
   async init(dbPath) {
@@ -61,6 +65,7 @@ class SshSpan {
     this.session.setup(String(password), this.db);
     this.settings.set('vault.created', Date.now());
     this.db.audit('vault.created');
+    this.bitwardenSync.refreshAutoSync();
     return { unlocked: true };
   }
 
@@ -75,6 +80,7 @@ class SshSpan {
       this.db.audit('vault.unlock_failed');
       throw e;
     }
+    this.bitwardenSync.refreshAutoSync();
     return { unlocked: true };
   }
 
@@ -117,6 +123,16 @@ class SshSpan {
         : k.privateKeyPem;
       const reEncrypted = cryptoService.encrypt(plaintext, String(newPassword));
       this.db.updateKey(k.id, { privateKeyPem: reEncrypted, encrypted: 1 });
+    }
+    // The stored Bitwarden master password (if any) is sealed with the vault
+    // password — re-encrypt it alongside the keys.
+    const bwEncRaw = this.db.getConfig('bwSync.password');
+    if (bwEncRaw) {
+      let blob = bwEncRaw;
+      try { blob = JSON.parse(bwEncRaw); } catch (e) { /* legacy raw blob */ }
+      const bwPlain = cryptoService.decrypt(blob, String(currentPassword));
+      this.db.setConfig('bwSync.password',
+        JSON.stringify(cryptoService.encrypt(bwPlain, String(newPassword))));
     }
     this.session.changePassword(String(newPassword), this.db);
     this.db.audit('vault.password_changed');
@@ -175,7 +191,10 @@ class SshSpan {
       createdAt: now,
       updatedAt: now,
       tags: opts.tags || [],
-      sshConfig: []
+      sshConfig: [],
+      bitwardenId: opts.bitwardenId || null,
+      bitwardenRevision: opts.bitwardenRevision || null,
+      bitwardenUpdatedAt: opts.bitwardenUpdatedAt || null
     };
     if (row.privateKeyPem) {
       this._requireUnlocked();
@@ -184,6 +203,21 @@ class SshSpan {
     }
     this.db.insertKey(row);
     return this._sanitize(this.db.getKey(row.id));
+  }
+
+  /**
+   * Insert a key pulled from the Bitwarden vault, already linked to its
+   * remote cipher. Same encryption/dedup rules as a local import.
+   */
+  storeSyncedKey(record, opts = {}) {
+    return this._storeKey(record, opts);
+  }
+
+  /** Plaintext (PKCS#8) private key PEM for a row; vault must be unlocked. */
+  getDecryptedPrivateKeyPem(id) {
+    const row = this.db.getKey(id);
+    if (!row) throw new Error('Key not found: ' + id);
+    return this._decryptedPrivatePem(row);
   }
 
   createKey(opts = {}) {
@@ -262,6 +296,24 @@ class SshSpan {
     return this.settings.get('sshKeysDir') || path.join(os.homedir(), '.sshspan', 'keys');
   }
 
+  /**
+   * File path for a deployed key. Row ids become file names under keysDir(),
+   * so the id must match our UUID whitelist exactly and the resolved target
+   * must stay inside the keys directory before anything is written.
+   */
+  _deployFileFor(rowId, dir) {
+    const match = String(rowId).match(
+      /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    if (!match) {
+      throw new Error('Refusing to deploy: key id "' + rowId + '" is not a valid UUID.');
+    }
+    const target = path.resolve(dir, match[1]);
+    if (!target.startsWith(path.resolve(dir) + path.sep)) {
+      throw new Error('Refusing to deploy: resolved path escapes the keys directory.');
+    }
+    return target;
+  }
+
   /** Restrict a deployed key file to the current user only. */
   _lockDownFile(file) {
     if (process.platform !== 'win32') {
@@ -297,7 +349,7 @@ class SshSpan {
         comment: row.comment,
         passphrase: opts.keyPassphrase || ''
       });
-      const file = path.join(dir, row.id);
+      const file = this._deployFileFor(row.id, dir);
       fs.writeFileSync(file, opensshPem + '\n', { mode: 0o600 });
       this._lockDownFile(file);
       const pubFile = file + '.pub';
@@ -348,6 +400,11 @@ class SshSpan {
 
   getSettings() { return this.settings.getAll(); }
   setSetting(key, value) {
+    // Bitwarden sync settings have their own validated IPC channel
+    // (sync:save-config) — the generic path must not be able to write them.
+    if (String(key).startsWith('bwSync.')) {
+      throw new Error('Bitwarden sync settings must be changed via the sync settings dialog.');
+    }
     this.settings.set(key, value);
     if (key === 'autoLockMinutes') {
       this.session.setTimeout(Number(value) * 60 * 1000);
@@ -355,7 +412,15 @@ class SshSpan {
     this.db.audit('settings.changed', key);
   }
 
+  // ---- Bitwarden sync -------------------------------------------------------
+
+  syncGetConfig() { return this.bitwardenSync.getConfig(); }
+  syncSaveConfig(patch) { return this.bitwardenSync.saveConfig(patch); }
+  syncTest() { return this.bitwardenSync.testConnection(); }
+  syncNow(opts) { return this.bitwardenSync.syncNow(opts); }
+
   close() {
+    this.bitwardenSync.stopAutoSync();
     if (this.db) this.db.close();
   }
 }

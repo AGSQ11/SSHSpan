@@ -1,0 +1,79 @@
+name: Release
+
+# Build and publish a GitHub release for every version tag (v1.0, v1.1, v1.2, ...).
+# Windows (NSIS installer + portable exe) and Linux (AppImage + deb) are built
+# on their native runners. Release notes are taken from the matching
+# "## [X.Y.Z]" section in CHANGELOG.md when present, and GitHub's automatic
+# "What's Changed" summary is appended.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            dist: 'dist:win'
+            artifacts: 'release/*.exe'
+          - os: ubuntu-latest
+            dist: 'dist:linux'
+            artifacts: |
+              release/*.AppImage
+              release/*.deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync package version with tag (v1.1 -> 1.1.0)
+        shell: bash
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          case "$V" in
+            *.*.*) ;;
+            *.*)   V="$V.0" ;;
+            *)     V="$V.0.0" ;;
+          esac
+          npm version --no-git-tag-version "$V"
+
+      - name: Run test suites
+        run: npm test
+
+      - name: Build installers
+        run: npm run ${{ matrix.dist }} -- --publish never
+
+      - name: Extract release notes from CHANGELOG
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="[$VERSION]" \
+            '$0 ~ "^## \\[" ver "\\]" {flag=1; next} flag && /^## /{exit} flag {print}' \
+            CHANGELOG.md > RELEASE_BODY.md
+          if [ ! -s RELEASE_BODY.md ]; then
+            echo "Changes in this release — see [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)." > RELEASE_BODY.md
+          fi
+
+      - name: Attach artifacts to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_BODY.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: ${{ matrix.artifacts }}

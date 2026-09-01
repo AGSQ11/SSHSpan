@@ -1,20 +1,19 @@
 {
   "name": "sshspan",
   "productName": "SSHSpan",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Cross-platform SSH key manager. Create, store, organize, and deploy SSH keys with a local encrypted SQLite database.",
   "author": {
-    "name": "SSHSpan Contributors",
-    "email": "sshspan@example.com"
+    "name": "AGSQ11"
   },
   "license": "MIT",
-  "homepage": "https://github.com/sshspan/sshspan",
+  "homepage": "https://github.com/AGSQ11/SSHSpan",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sshspan/sshspan.git"
+    "url": "https://github.com/AGSQ11/SSHSpan.git"
   },
   "bugs": {
-    "url": "https://github.com/sshspan/sshspan/issues"
+    "url": "https://github.com/AGSQ11/SSHSpan/issues"
   },
   "keywords": [
     "ssh",
@@ -48,8 +47,9 @@
   ],
   "type": "commonjs",
   "dependencies": {
-    "sql.js": "^1.13.0",
-    "bcrypt-pbkdf": "^1.0.2"
+    "bcrypt-pbkdf": "^1.0.2",
+    "hash-wasm": "^4.12.0",
+    "sql.js": "^1.13.0"
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -86,7 +86,12 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "license": "assets/license.txt"
+    },
+    "portable": {
+      "artifactName": "${productName}-Portable-${version}.${ext}"
     }
   }
 }

@@ -482,6 +482,163 @@ async function copyConfig() {
 }
 
 // --------------------------------------------------------------------------
+// bitwarden sync settings
+// --------------------------------------------------------------------------
+
+const bwInputs = {};
+
+function bwSummaryText(s) {
+  if (!s) return '';
+  if (s.ok === false) return 'Last sync failed: ' + (s.error || 'unknown error');
+  const parts = [];
+  if (s.pushed) parts.push(s.pushed + ' pushed');
+  if (s.updatedRemote) parts.push(s.updatedRemote + ' updated remotely');
+  if (s.pulled) parts.push(s.pulled + ' imported');
+  if (s.updatedLocal) parts.push(s.updatedLocal + ' updated locally');
+  if (s.linked) parts.push(s.linked + ' linked');
+  if (s.conflicts) parts.push(s.conflicts + ' conflict(s), local won');
+  if (s.remoteDeleted) parts.push(s.remoteDeleted + ' deleted remotely (kept locally)');
+  if (s.errors && s.errors.length) parts.push(s.errors.length + ' error(s)');
+  const base = parts.length ? parts.join(', ') : 'everything already in sync';
+  return 'Last sync ' + fmtTime(s.at || Date.now()) + ' \u2014 ' + base;
+}
+
+async function loadBitwardenSync() {
+  const grid = el('bwGrid');
+  const status = el('bwStatus');
+  grid.innerHTML = '';
+  status.textContent = '';
+  let cfg;
+  try {
+    cfg = unwrap(await api.syncGetConfig());
+  } catch (e) {
+    status.textContent = 'Sync settings unavailable: ' + e.message;
+    return;
+  }
+  state.bw = cfg;
+
+  const mkRow = (labelText, control) => {
+    const label = document.createElement('label');
+    const span = document.createElement('span');
+    span.textContent = labelText;
+    label.appendChild(span);
+    label.appendChild(control);
+    grid.appendChild(label);
+  };
+
+  bwInputs.serverUrl = document.createElement('input');
+  bwInputs.serverUrl.type = 'url';
+  bwInputs.serverUrl.placeholder = 'https://vault.example.com';
+  bwInputs.serverUrl.value = cfg.serverUrl || '';
+  mkRow('Vault server URL', bwInputs.serverUrl);
+
+  bwInputs.email = document.createElement('input');
+  bwInputs.email.type = 'email';
+  bwInputs.email.placeholder = 'you@example.com';
+  bwInputs.email.value = cfg.email || '';
+  mkRow('Account email', bwInputs.email);
+
+  bwInputs.masterPassword = document.createElement('input');
+  bwInputs.masterPassword.type = 'password';
+  bwInputs.masterPassword.autocomplete = 'off';
+  bwInputs.masterPassword.placeholder = cfg.hasStoredPassword
+    ? 'stored \u2014 leave blank to keep' : 'vault master password';
+  mkRow('Vault master password', bwInputs.masterPassword);
+
+  bwInputs.folderName = document.createElement('input');
+  bwInputs.folderName.type = 'text';
+  bwInputs.folderName.placeholder = 'SSHSpan';
+  bwInputs.folderName.value = cfg.folderName || 'SSHSpan';
+  mkRow('Vault folder', bwInputs.folderName);
+
+  bwInputs.autoSync = document.createElement('input');
+  bwInputs.autoSync.type = 'checkbox';
+  bwInputs.autoSync.checked = !!cfg.autoSync;
+  const autoRow = document.createElement('div');
+  autoRow.className = 'bw-auto-row';
+  autoRow.appendChild(bwInputs.autoSync);
+  const autoLabel = document.createElement('span');
+  autoLabel.textContent = 'Auto-sync every ';
+  autoRow.appendChild(autoLabel);
+  bwInputs.autoSyncMinutes = document.createElement('input');
+  bwInputs.autoSyncMinutes.type = 'number';
+  bwInputs.autoSyncMinutes.min = '5';
+  bwInputs.autoSyncMinutes.max = '1440';
+  bwInputs.autoSyncMinutes.value = cfg.autoSyncMinutes || 15;
+  autoRow.appendChild(bwInputs.autoSyncMinutes);
+  const minutesLabel = document.createElement('span');
+  minutesLabel.textContent = ' minutes (while the vault is unlocked)';
+  autoRow.appendChild(minutesLabel);
+  mkRow('Automatic sync', autoRow);
+
+  if (cfg.lastSyncAt) {
+    status.textContent = bwSummaryText(Object.assign({}, cfg.lastResult, { at: cfg.lastSyncAt }));
+  }
+}
+
+async function bwSave() {
+  const serverUrl = bwInputs.serverUrl.value.trim();
+  const email = bwInputs.email.value.trim();
+  if (!serverUrl) { toast('Enter your vault server URL.', 'err'); return; }
+  if (!email) { toast('Enter your account email.', 'err'); return; }
+  const patch = {
+    serverUrl,
+    email,
+    folderName: bwInputs.folderName.value.trim() || 'SSHSpan',
+    autoSync: bwInputs.autoSync.checked,
+    autoSyncMinutes: Number(bwInputs.autoSyncMinutes.value) || 15
+  };
+  const pw = bwInputs.masterPassword.value;
+  if (pw) patch.masterPassword = pw;
+  try {
+    await unwrap(await api.syncSaveConfig(patch));
+    bwInputs.masterPassword.value = '';
+    toast('Sync settings saved.', 'ok');
+    await loadBitwardenSync();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function bwTest() {
+  try {
+    const r = unwrap(await api.syncTest());
+    el('bwStatus').textContent = 'Connected to ' + r.server +
+      (r.version ? ' (Vaultwarden ' + r.version + ')' : '') +
+      ' \u2014 account ' + r.account + ', ' + r.sshItemCount + ' SSH key item(s) in vault.';
+    toast('Connection OK.', 'ok');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function bwSyncNow() {
+  const btn = el('bwSyncNowBtn');
+  btn.disabled = true;
+  el('bwStatus').textContent = 'Syncing\u2026';
+  try {
+    const s = unwrap(await api.syncNow({ reason: 'manual' }));
+    if (!s.ok) {
+      el('bwStatus').textContent = 'Last sync failed: ' + (s.error || 'unknown error');
+      toast(s.error || 'Sync failed.', 'err');
+    } else {
+      el('bwStatus').textContent = bwSummaryText(Object.assign({}, s, { at: Date.now() }));
+      const problems = s.errors.length + s.skipped.length;
+      toast(problems
+        ? 'Sync finished with ' + problems + ' item(s) needing attention \u2014 see the audit log.'
+        : 'Sync complete: ' + (s.pushed + s.updatedRemote + s.pulled + s.updatedLocal) + ' change(s).',
+        'ok');
+      await loadKeys();
+    }
+  } catch (e) {
+    toast(e.message, 'err');
+    el('bwStatus').textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// --------------------------------------------------------------------------
 // settings view
 // --------------------------------------------------------------------------
 
@@ -592,7 +749,10 @@ async function switchView(view) {
     el('view-' + v).hidden = v !== view;
   }
   el('viewTitle').textContent = VIEW_TITLES[view];
-  if (view === 'settings') await loadSettings();
+  if (view === 'settings') {
+    await loadSettings();
+    await loadBitwardenSync();
+  }
   if (view === 'audit') await loadAudit();
   if (view === 'keys') renderKeyList();
 }
@@ -650,6 +810,20 @@ function wire() {
   el('copyConfigBtn').addEventListener('click', copyConfig);
   el('keyPassphraseToggle').addEventListener('change', () => {
     el('keyPassphraseInput').hidden = !el('keyPassphraseToggle').checked;
+  });
+
+  // bitwarden sync (settings view)
+  el('bwSaveBtn').addEventListener('click', () => {
+    if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
+    bwSave();
+  });
+  el('bwTestBtn').addEventListener('click', () => {
+    if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
+    bwTest();
+  });
+  el('bwSyncNowBtn').addEventListener('click', () => {
+    if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
+    bwSyncNow();
   });
 
   // keyboard: Escape closes modals; Ctrl/Cmd shortcuts for navigation + actions

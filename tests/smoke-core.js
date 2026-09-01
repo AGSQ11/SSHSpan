@@ -18,7 +18,7 @@ function expectThrow(name, fn) {
 
 // 1. Generate each type
 const cases = [
-  { type: 'rsa', bits: 2048 },
+  { type: 'rsa', bits: 3072 },
   { type: 'ed25519' },
   { type: 'ecdsa', curve: 'nistp256' },
   { type: 'ecdsa', curve: 'nistp384' },
@@ -76,7 +76,7 @@ const privImport = keyService.parsePem(rec.privateKeyPem, '');
 check('import PKCS8 pem', privImport.fingerprint === rec.fingerprint && !privImport.publicOnly);
 
 // 8. SSH public blob roundtrip (parse public line back)
-const rsaRec = keyService.generate({ type: 'rsa', bits: 2048, comment: 'blob' });
+const rsaRec = keyService.generate({ type: 'rsa', bits: 3072, comment: 'blob' });
 const rsaPub = keyService.parsePem(rsaRec.publicAuthorizedKey, '');
 check('rsa public blob roundtrip', rsaPub.fingerprint === rsaRec.fingerprint);
 const ecRec = keyService.generate({ type: 'ecdsa', curve: 'nistp521', comment: 'blob' });

@@ -74,7 +74,11 @@ Every channel is invoked through `window.sshspan.<method>(args)` and returns a P
 | `keys:deploy` | `keysDeploy({ ids, ...opts })` | ids + host/user/port/strictHostKey/keyPassphrase/writeSshConfig | `{ files, keys, keysDir, configPath, configBytes }` |
 | `keys:render-config` | `keysRenderConfig({ ids, ...opts })` | ids + config options | rendered config text |
 | `settings:get` | `settingsGet()` | — | settings object |
-| `settings:set` | `settingsSet({ key, value })` | — | `{ ok: true }` |
+| `settings:set` | `settingsSet({ key, value })` | — | `{ ok: true }` (rejects `bwSync.*` keys) |
+| `sync:get-config` | `syncGetConfig()` | — | sanitized sync config (no secrets) |
+| `sync:save-config` | `syncSaveConfig(patch)` | serverUrl/email/folderName/autoSync/autoSyncMinutes/masterPassword | saved config |
+| `sync:test` | `syncTest()` | — | `{ ok, server, account, kdf, sshItemCount, folders }` |
+| `sync:now` | `syncNow({ reason })` | — | sync summary (pushed/pulled/updated/conflicts/errors) |
 | `audit:list` | `auditList({ limit })` | — | audit row array |
 | `clipboard:write-public` | `clipboardWritePublic({ id })` | — | `{ ok }` |
 
@@ -94,13 +98,13 @@ sshspan.js is the high-level orchestrator. It owns the vault lifecycle (create/u
 database.js wraps sql.js. It loads the WASM, opens the database at `~/.sshspan/sshspan.db`, runs migrations, and exposes `run(sql, params)` and `all(sql, params)`. Persistence is debounced 500 ms: after any write it schedules `db.export()`, serializes to a temp file, and atomically renames over the real path. No WAL or busy pragmas are used; on next open the file is read directly.
 
 ### src/main/services/cryptoService.js
-cryptoService.js implements the vault crypto. `deriveKey(password, salt)` runs scrypt with N=16384, r=8, p=1 and returns a 32-byte key. `encrypt(key, plaintext)` generates a 16-byte salt and a 12-byte IV, runs AES-256-GCM with AAD `sshspan-aad`, and returns `base64url(salt || iv || tag || ciphertext)`. `decrypt(key, blob)` reverses it and verifies the GCM tag. `hashForVerify(password, salt)` derives a scrypt hash used for the timing-safe master-password check. The master password itself is never persisted.
+cryptoService.js implements the vault crypto. `deriveKey(password, salt)` runs scrypt with N=65536, r=8, p=1 and returns a 32-byte key. `encrypt(key, plaintext)` generates a 16-byte salt and a 12-byte IV, runs AES-256-GCM with AAD `sshspan-aad`, and returns `base64url(salt || iv || tag || ciphertext)`. `decrypt(key, blob)` reverses it and verifies the GCM tag. `hashForVerify(password, salt)` derives a scrypt hash used for the timing-safe master-password check. The master password itself is never persisted.
 
 ### src/main/services/sessionService.js
 sessionService.js holds the unlocked master password in memory only. `lock()` wipes it. An auto-lock idle timer (configurable via the `autoLockMinutes` setting, default 15) calls `lock()` after inactivity; the timer is `unref()`'d so it never holds a process open. Private key material is never stored unencrypted: storing a private key requires an unlocked vault and the blob is AES-256-GCM encrypted before insert. Only public-only records (imported public halves) can exist while locked.
 
 ### src/main/services/keyService.js
-keyService.js owns key generation, parsing, and export. Generation uses Node `crypto.generateKeyPairSync`: rsa (2048-8192 bits), ed25519, ecdsa (nistp256/384/521). Fingerprints are `SHA256:<base64 without padding>` of the SSH public wire blob. Exports produce OpenSSH new-format private keys, PKCS#8 PEM (plain or AES-256-CBC encrypted), SPKI PEM public keys, and authorized_keys lines. `keysGet` strips `privateKeyPem` and `passphrase` before returning.
+keyService.js owns key generation, parsing, and export. Generation uses Node `crypto.generateKeyPairSync`: rsa (3072-8192 bits; the 2048-bit floor was raised to 3072 in v1.0.1), ed25519, ecdsa (nistp256/384/521). Fingerprints are `SHA256:<base64 without padding>` of the SSH public wire blob. Exports produce OpenSSH new-format private keys, PKCS#8 PEM (plain or AES-256-CBC encrypted), SPKI PEM public keys, and authorized_keys lines. `keysGet` strips `privateKeyPem` and `passphrase` before returning.
 
 ### src/main/services/opensshParser.js
 opensshParser.js parses `openssh-key-v1` private key files. It supports the ciphers none, aes256-ctr, aes256-gcm, and chacha20-poly1305@openssh.com, with bcrypt KDF via `bcrypt-pbkdf`. It can also parse legacy PEM private keys and public keys for import.
@@ -113,6 +117,15 @@ settingsService.js reads and writes the `config` table. Known keys and defaults:
 
 ### src/main/services/ipcHandlers.js
 ipcHandlers.js registers every `ipcMain.handle` channel listed in the IPC contract table. Each handler validates its payload, calls the appropriate service method, and returns the canonical `{ ok: true, data }` / `{ ok: false, error }` envelope.
+
+### src/main/services/bitwardenCrypto.js
+bitwardenCrypto.js implements the subset of the Bitwarden client-side crypto stack needed to write SSH key (cipher type 5) items: master key derivation (PBKDF2-SHA256 or Argon2id via `hash-wasm`), the PBKDF2 login password hash, master-key stretching via HKDF-Expand (SHA-256, infos `enc`/`mac`), and the `2.<iv>|<ct>|<mac>` EncString format (AES-256-CBC + HMAC-SHA256 through WebCrypto SubtleCrypto, MAC verified timing-safely before decryption). Only type-2 EncStrings are accepted; the server only ever receives ciphertext.
+
+### src/main/services/bitwardenClient.js
+bitwardenClient.js is the Bitwarden/Vaultwarden HTTP client: prelogin, password-grant and refresh-grant token requests, `/api/sync`, folder create, cipher create/update. Every request runs against a base URL that passed `resolveSafeServerUrl` — the SSRF guard that enforces http/https only, rejects localhost/`.local` hostnames, literal loopback/private/reserved IPv4+IPv6 addresses (including IPv4-mapped and 6to4 forms), and refuses hostnames whose DNS resolution yields a private or reserved address. Self-hosted vaults must therefore be reachable via a public hostname.
+
+### src/main/services/bitwardenSyncService.js
+bitwardenSyncService.js is the two-way sync engine. It maps local key records to remote cipher type-5 items, linking rows by stored `bitwardenId` or, on first contact, by fingerprint. Per row, newest side wins: local `updatedAt` vs the per-row `bitwardenUpdatedAt` baseline decides the local side, remote `revisionDate` vs the stored `bitwardenRevision` decides the remote side; simultaneous changes favour the local copy and are reported as conflicts. Remote deletions are reported but never propagated. It manages the target vault folder (created on demand, default name `SSHSpan`), runs an optional auto-sync timer while the vault is unlocked, and stores its configuration under `bwSync.*` config keys — the Bitwarden master password is sealed with the vault master password (AES-256-GCM) and only decryptable while the vault is unlocked.
 
 ## Data flows
 
@@ -140,6 +153,9 @@ renderer → vaultChangePassword (new password only; the current one is held by 
 ### Lock vault
 renderer → vaultLock → sessionService.lock() wipes master password → mark locked → audit row.
 
+### Bitwarden sync
+renderer → sync:save-config → SSRF URL validation (incl. DNS) → settings + master password sealed with the vault key → `sync:now` (manual or auto timer) → BitwardenClient: prelogin → password-grant token → `/api/sync` → decrypt user key → ensure target folder → per-row push/pull as described in the module walkthrough → read-back of `bitwardenId`/`bitwardenRevision` → audit rows (`sync.push`, `sync.pull`, `sync.run`, `sync.error`).
+
 ## SQLite schema
 The database has four tables, created by database.js migrations on first open.
 
@@ -161,7 +177,10 @@ CREATE TABLE IF NOT EXISTS keys (
   createdAt INTEGER NOT NULL,
   updatedAt INTEGER NOT NULL,
   tags TEXT NOT NULL DEFAULT '[]',   -- JSON array
-  sshConfig TEXT NOT NULL DEFAULT '[]' -- JSON array
+  sshConfig TEXT NOT NULL DEFAULT '[]', -- JSON array
+  bitwardenId TEXT,                  -- remote cipher id when the row is linked to Bitwarden
+  bitwardenRevision TEXT,            -- last-seen remote revisionDate (ISO)
+  bitwardenUpdatedAt INTEGER         -- local epoch millis of the last successful per-row sync
 );
 -- ECDSA curve is derived from bits at read time (256→nistp256, 384→nistp384, 521→nistp521).
 

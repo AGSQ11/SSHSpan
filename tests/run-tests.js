@@ -12,8 +12,7 @@
  *   3. smoke-app.js         - end-to-end vault/import/export/rekey/deploy
  *   4. crosscheck-keygen.js - interop against real OpenSSH ssh-keygen
  *                             (skipped with a loud notice when no ssh-keygen
- *                              binary is available; set SSH_KEYGEN to point
- *                              at one explicitly)
+ *                              binary is on PATH)
  * ---------------------------------------------------------------------------
  */
 
@@ -26,6 +25,7 @@ const SUITES = [
   { name: 'core', file: 'smoke-core.js' },
   { name: 'database', file: 'smoke-db.js' },
   { name: 'app', file: 'smoke-app.js' },
+  { name: 'bitwarden-sync', file: 'smoke-bitwarden.js' },
   { name: 'openssh-crosscheck', file: 'crosscheck-keygen.js' }
 ];
 

@@ -128,6 +128,25 @@
           <h2>Settings</h2>
           <div class="settings-grid"></div>
           <p class="hint">Data location: <code id="dataDirHint">~/.sshspan/sshspan.db</code></p>
+
+          <hr class="sep" />
+
+          <h2>Bitwarden / Vaultwarden sync</h2>
+          <p class="hint">
+            Keeps your SSH keys mirrored as SSH key items in your own vault (folder
+            <code>SSHSpan</code> by default). Two-way: changes sync in both directions,
+            newest wins; deletions are never propagated automatically. Self-hosted servers
+            must use a public hostname &mdash; private, LAN and localhost addresses are
+            refused for safety. The stored vault password is sealed with your SSHSpan
+            master password and only readable while the vault is unlocked.
+          </p>
+          <div class="settings-grid" id="bwGrid"></div>
+          <div class="bw-actions">
+            <button id="bwSaveBtn" class="primary-btn">Save</button>
+            <button id="bwTestBtn" class="ghost-btn">Test connection</button>
+            <button id="bwSyncNowBtn" class="primary-btn">Sync now</button>
+          </div>
+          <p class="hint" id="bwStatus"></p>
         </div>
       </div>
 
@@ -166,7 +185,6 @@
           </label>
           <label id="genBitsRow">Bits
             <select id="genBits">
-              <option value="2048">2048</option>
               <option value="3072">3072</option>
               <option value="4096" selected>4096</option>
               <option value="8192">8192</option>

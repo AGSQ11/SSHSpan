@@ -71,7 +71,7 @@ function ok(name, cond, extra) {
   ok('unlock with right password', app.session.isUnlocked());
 
   // ---- import: openssh private with passphrase ----
-  const genRec = keyService.generate({ type: 'rsa', bits: 2048, comment: 'import-me' });
+  const genRec = keyService.generate({ type: 'rsa', bits: 3072, comment: 'import-me' });
   const keyObj = crypto.createPrivateKey(genRec.privateKeyPem);
   const encFile = serializeOpenSSHPrivateKey(keyObj, { comment: 'import-me', passphrase: 'src-pass-7' });
   threw = false;

@@ -32,6 +32,12 @@ const api = {
   settingsGet: () => ipcRenderer.invoke('settings:get'),
   settingsSet: (key, value) => ipcRenderer.invoke('settings:set', { key, value }),
 
+  // bitwarden sync
+  syncGetConfig: () => ipcRenderer.invoke('sync:get-config'),
+  syncSaveConfig: (patch) => ipcRenderer.invoke('sync:save-config', patch),
+  syncTest: () => ipcRenderer.invoke('sync:test'),
+  syncNow: (opts) => ipcRenderer.invoke('sync:now', opts),
+
   // audit
   auditList: (limit) => ipcRenderer.invoke('audit:list', { limit }),
 

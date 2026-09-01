@@ -280,6 +280,10 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 #configPreview { margin-top: 10px; width: 100%; }
 
 .config-actions { display: flex; gap: 8px; margin-top: 10px; }
+.bw-actions { display: flex; gap: 8px; margin: 4px 0 10px; }
+.bw-auto-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.bw-auto-row input[type="number"] { width: 72px; }
+.bw-auto-row input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
 
 /* ---- settings ------------------------------------------------------------------ */
 

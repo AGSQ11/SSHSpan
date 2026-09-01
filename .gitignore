@@ -28,3 +28,7 @@ coverage/
 # Environment
 .env
 .env.local
+.mimosa/
+
+# Local build scratch
+.buildtmp/
