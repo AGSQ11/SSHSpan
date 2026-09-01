@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; font-src 'self' data:" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSHSpan</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔐</text></svg>" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">SSH</div>
+        <div class="brand-name">SSHSpan</div>
+      </div>
+      <nav class="nav">
+        <button data-view="keys" class="nav-item active" title="Keys">&#128273; Keys</button>
+        <button data-view="config" class="nav-item" title="Deploy">&#128295; Deploy</button>
+        <button data-view="settings" class="nav-item" title="Settings">&#9881; Settings</button>
+        <button data-view="audit" class="nav-item" title="Audit Log">&#128220; Audit</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="vault-status" id="vaultStatus">
+          <span class="dot locked"></span>
+          <span class="vault-label">Locked</span>
+        </div>
+        <button id="newKeyBtn" class="primary-btn wide">+ New Key</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <h1 id="viewTitle">Keys</h1>
+        <div class="topbar-actions" id="topbarActions">
+          <button id="changePasswordBtn" class="ghost-btn" title="Change master password">Change password</button>
+          <button id="lockBtn" class="ghost-btn" title="Lock the vault now">Lock</button>
+        </div>
+      </header>
+
+      <div class="view" id="view-keys">
+        <div class="toolbar">
+          <input type="search" id="searchInput" placeholder="Search keys by name, comment, fingerprint…" />
+          <select id="typeFilter">
+            <option value="">All types</option>
+            <option value="rsa">RSA</option>
+            <option value="ed25519">Ed25519</option>
+            <option value="ecdsa">ECDSA</option>
+          </select>
+          <span class="spacer"></span>
+          <span class="hint" id="selectionHint"></span>
+        </div>
+        <div class="keys-layout">
+          <div class="key-list" id="keyList"></div>
+          <div class="empty-state" id="emptyState" hidden>
+            <div class="empty-icon">&#128273;</div>
+            <h3>No keys yet</h3>
+            <p>Generate or import your first SSH key.</p>
+          </div>
+          <section class="detail-pane" id="detailPane" hidden>
+            <div class="detail-head">
+              <h2 id="detailName">—</h2>
+              <span class="badge" id="detailType">—</span>
+            </div>
+            <dl class="detail-meta" id="detailMeta"></dl>
+            <label class="detail-label">Fingerprint</label>
+            <code class="mono block" id="detailFingerprint">—</code>
+            <label class="detail-label">Public key (authorized_keys)</label>
+            <textarea class="mono" id="detailAuthorized" rows="4" readonly spellcheck="false"></textarea>
+            <div class="detail-actions">
+              <button id="detailCopyPublicBtn" class="ghost-btn">Copy public key</button>
+              <button id="detailDeleteBtn" class="danger-btn">Delete</button>
+            </div>
+            <hr class="sep" />
+            <label class="detail-label">Export private key</label>
+            <div class="export-row">
+              <select id="detailExportFormat">
+                <option value="openssh-private">OpenSSH private (new format)</option>
+                <option value="pkcs8">PKCS#8 PEM (unencrypted)</option>
+                <option value="pkcs8-encrypted">PKCS#8 PEM (encrypted)</option>
+                <option value="public-pem">Public key PEM (SPKI)</option>
+                <option value="authorized_keys">authorized_keys line</option>
+              </select>
+              <input type="password" id="detailExportPass" placeholder="Passphrase (for encrypted export)" />
+              <button id="detailExportBtn" class="primary-btn">Export</button>
+            </div>
+            <p class="hint" id="exportHint">Private material never leaves the main process; export is explicit and always asks first.</p>
+          </section>
+        </div>
+      </div>
+
+      <div class="view" id="view-config" hidden>
+        <div class="config-view">
+          <div class="config-section">
+            <h2>Deploy to SSH</h2>
+            <p>
+              Writes the selected private keys to <code>~/.sshspan/keys/&lt;id&gt;</code> (owner-only
+              permissions) and manages Host blocks in <code>~/.ssh/config</code> between
+              <code># &gt;&gt;&gt; SSHSpan managed &gt;&gt;&gt;</code> markers. Nothing is written without your consent.
+            </p>
+            <div class="deploy-options">
+              <label>Host alias <input type="text" id="cfgHost" placeholder="myserver" /></label>
+              <label>User <input type="text" id="cfgUser" placeholder="deploy" /></label>
+              <label>Port <input type="number" id="cfgPort" placeholder="22" min="1" max="65535" /></label>
+              <label class="ghost-btn checkbox">
+                <input type="checkbox" id="strictHostKeyToggle" checked /> StrictHostKeyChecking
+              </label>
+              <label class="ghost-btn checkbox">
+                <input type="checkbox" id="keyPassphraseToggle" /> Encrypt deployed files
+              </label>
+              <input type="password" id="keyPassphraseInput" placeholder="Deployed-key passphrase" hidden />
+            </div>
+            <p class="hint" id="deploySelectionHint">Select keys to deploy using the checkboxes in the Keys view.</p>
+            <textarea id="configPreview" readonly rows="16" spellcheck="false" placeholder="# Select keys and press Preview"></textarea>
+            <div class="config-actions">
+              <button id="previewConfigBtn" class="ghost-btn">Preview</button>
+              <button id="deployConfigBtn" class="primary-btn">Deploy keys + config</button>
+              <button id="copyConfigBtn" class="ghost-btn">Copy config</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="view" id="view-settings" hidden>
+        <div class="settings-view">
+          <h2>Settings</h2>
+          <div class="settings-grid"></div>
+          <p class="hint">Data location: <code id="dataDirHint">~/.sshspan/sshspan.db</code></p>
+        </div>
+      </div>
+
+      <div class="view" id="view-audit" hidden>
+        <div class="audit-view">
+          <h2>Audit Log</h2>
+          <table class="audit-table">
+            <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
+            <tbody id="auditBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Modal: New / Import Key -->
+  <div class="modal-backdrop" id="modalBackdrop" hidden>
+    <div class="modal">
+      <header class="modal-header">
+        <h2 id="modalTitle">New Key</h2>
+        <button class="icon-btn" data-close>&#10005;</button>
+      </header>
+      <div class="modal-body">
+        <div class="tabs">
+          <button data-tab="generate" class="tab active">Generate</button>
+          <button data-tab="import" class="tab">Import</button>
+        </div>
+        <div class="tab-panel" id="tab-generate">
+          <label>Name <input type="text" id="genName" placeholder="my-laptop" /></label>
+          <label>Type
+            <select id="genType">
+              <option value="ed25519" selected>Ed25519 (recommended)</option>
+              <option value="rsa">RSA</option>
+              <option value="ecdsa">ECDSA</option>
+            </select>
+          </label>
+          <label id="genBitsRow">Bits
+            <select id="genBits">
+              <option value="2048">2048</option>
+              <option value="3072">3072</option>
+              <option value="4096" selected>4096</option>
+              <option value="8192">8192</option>
+            </select>
+          </label>
+          <label id="genCurveRow" hidden>Curve
+            <select id="genCurve">
+              <option value="nistp256" selected>nistp256</option>
+              <option value="nistp384">nistp384</option>
+              <option value="nistp521">nistp521</option>
+            </select>
+          </label>
+          <label>Comment <input type="text" id="genComment" placeholder="user@host" /></label>
+        </div>
+        <div class="tab-panel" id="tab-import" hidden>
+          <label>Name <input type="text" id="importName" placeholder="work-server" /></label>
+          <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, SPKI public PEM, or authorized_keys line)
+            <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."></textarea>
+          </label>
+          <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" /></label>
+        </div>
+      </div>
+      <footer class="modal-footer">
+        <button data-close class="ghost-btn">Cancel</button>
+        <button id="modalPrimary" class="primary-btn">Create</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal: Vault (create / unlock / change password) -->
+  <div class="modal-backdrop" id="vaultModal" hidden>
+    <div class="modal modal-sm">
+      <header class="modal-header"><h2 id="vaultModalTitle">Master Password</h2></header>
+      <div class="modal-body">
+        <p id="vaultModalText">Set a master password to encrypt your private keys at rest.</p>
+        <input type="password" id="vaultPassword" placeholder="Master password" autocomplete="off" />
+        <input type="password" id="vaultPasswordConfirm" placeholder="Confirm password" autocomplete="off" hidden />
+        <input type="password" id="vaultPasswordCurrent" placeholder="Current password" autocomplete="off" hidden />
+      </div>
+      <footer class="modal-footer">
+        <button data-close class="ghost-btn" id="vaultCancelBtn">Cancel</button>
+        <button id="vaultPrimary" class="primary-btn">Continue</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
