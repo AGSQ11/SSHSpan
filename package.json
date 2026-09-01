@@ -33,6 +33,7 @@
     "dev": "electron . --enable-logging",
     "test": "node tests/run-tests.js",
     "icon": "node scripts/make-icon.js",
+    "icon:sidebar": "node scripts/make-sidebar-icon.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
     "dist:win": "electron-builder --win",

@@ -68,6 +68,34 @@ async function copyText(text) {
 }
 
 // --------------------------------------------------------------------------
+// branding
+// --------------------------------------------------------------------------
+
+/**
+ * Use the compact sidebar icon (assets/icon-sidebar.png, ~45 KB) rather than
+ * the full-size artwork (~1 MB) — the badge is only 34 px on screen. Resolved
+ * relative to the document so it works unpacked, installed and inside an asar;
+ * falls back to the text mark if the file is unavailable.
+ */
+function loadBrandIcon() {
+  const img = el('brandIcon');
+  if (!img) return;
+  img.addEventListener('error', () => {
+    img.remove();
+    const fallback = document.createElement('div');
+    fallback.className = 'logo';
+    fallback.textContent = 'SSH';
+    const brand = document.querySelector('.brand');
+    if (brand) brand.insertBefore(fallback, brand.firstChild);
+  });
+  try {
+    img.src = new URL('../../assets/icon-sidebar.png', document.baseURI).href;
+  } catch (e) {
+    // leave the alt text in place
+  }
+}
+
+// --------------------------------------------------------------------------
 // app state
 // --------------------------------------------------------------------------
 
@@ -866,6 +894,7 @@ async function lockNow() {
   onGenTypeChange();
   switchTab('generate');
   updateSelectionHint();
+  loadBrandIcon();
   await refreshVaultStatus();
 
   // Catch auto-locks (session timer) without user interaction.

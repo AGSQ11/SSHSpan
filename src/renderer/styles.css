@@ -53,7 +53,18 @@ body {
 
 .brand { display: flex; align-items: center; gap: 10px; padding: 2px 4px; }
 
-.logo {
+/* App icon (assets/icon.png) — also used by the tray and window chrome. */
+img.logo {
+  width: 34px; height: 34px;
+  flex: none;
+  object-fit: contain;
+  border-radius: 8px;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* Fallback text mark, shown only if the icon file cannot be loaded. */
+.logo:not(img) {
   width: 34px; height: 34px;
   border-radius: 9px;
   background: linear-gradient(135deg, #3b82f6, #6ea8ff);
@@ -62,6 +73,7 @@ body {
   font-size: 11px;
   display: flex; align-items: center; justify-content: center;
   letter-spacing: 0.4px;
+  flex: none;
 }
 
 .brand-name { font-weight: 700; font-size: 15px; letter-spacing: 0.2px; }
