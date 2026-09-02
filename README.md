@@ -17,8 +17,8 @@ Everything runs locally. No cloud, no telemetry, no network access — ever.
 ## Features
 
 - **Generate keys** — RSA (3072–8192 bits), Ed25519, and ECDSA (nistp256/384/521), built on Node's native `crypto` module.
-- **Import keys** — PEM private (PKCS#8 / PKCS#1 / SEC1), OpenSSH new-format private keys (including passphrase-protected), PEM public keys, and `authorized_keys` public lines.
-- **Export keys** — OpenSSH new-format private, PKCS#8 PEM (plain or AES-256-CBC encrypted), SPKI PEM public, and `authorized_keys` lines.
+- **Import keys** — PEM private (PKCS#8 / PKCS#1 / SEC1), OpenSSH new-format private keys (including passphrase-protected), PuTTY `.ppk` (version 3, including passphrase-protected), PEM public keys, and `authorized_keys` public lines.
+- **Export keys** — OpenSSH new-format private, PuTTY `.ppk` (version 3), PKCS#8 PEM (plain or AES-256-CBC encrypted), SPKI PEM public, and `authorized_keys` lines.
 - **Encrypted vault** — every private key is encrypted with AES-256-GCM. The master password is never stored; only a scrypt verification hash is persisted.
 - **Deploy to SSH config** — writes reversible `Host` blocks into `~/.ssh/config` between marker comments, so they can be removed cleanly.
 - **Audit log** — append-only record of key create/update/delete, vault lock/unlock, and config writes.

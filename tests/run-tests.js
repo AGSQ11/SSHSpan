@@ -10,7 +10,9 @@
  *   1. smoke-core.js        - crypto core: generation, parsing, formats
  *   2. smoke-db.js          - sql.js persistence layer (CRUD + durability)
  *   3. smoke-app.js         - end-to-end vault/import/export/rekey/deploy
- *   4. crosscheck-keygen.js - interop against real OpenSSH ssh-keygen
+ *   4. smoke-bitwarden.js     - Bitwarden/Vaultwarden sync (fake transport)
+ *   5. smoke-putty.js         - PuTTY .ppk import/export (v3, all key types)
+ *   6. crosscheck-keygen.js   - interop against real OpenSSH ssh-keygen
  *                             (skipped with a loud notice when no ssh-keygen
  *                              binary is on PATH)
  * ---------------------------------------------------------------------------
@@ -26,6 +28,7 @@ const SUITES = [
   { name: 'database', file: 'smoke-db.js' },
   { name: 'app', file: 'smoke-app.js' },
   { name: 'bitwarden-sync', file: 'smoke-bitwarden.js' },
+  { name: 'putty', file: 'smoke-putty.js' },
   { name: 'openssh-crosscheck', file: 'crosscheck-keygen.js' }
 ];
 

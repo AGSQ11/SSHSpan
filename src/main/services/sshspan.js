@@ -226,15 +226,32 @@ class SshSpan {
     return this._storeKey(record, opts);
   }
 
+  /**
+   * Import key material. Synchronous for every format except PuTTY .ppk,
+   * whose Argon2 KDF makes parsing async - use importKeyAsync (the IPC path)
+   * when .ppk support is required.
+   */
   importKey(text, opts = {}) {
     const pem = String(text || '').trim();
     let record;
     if (/-----BEGIN OPENSSH PRIVATE KEY-----/.test(pem)) {
       record = keyService.parseOpenSshFile(pem, opts.passphrase);
+    } else if (keyService.isPuttyKey(pem)) {
+      throw new Error('PuTTY .ppk import is asynchronous - call importKeyAsync() for this format.');
     } else {
       record = keyService.parsePem(pem, opts.passphrase);
     }
     return this._storeKey(record, opts);
+  }
+
+  /** Import any supported format, including PuTTY .ppk (async). */
+  async importKeyAsync(text, opts = {}) {
+    const pem = String(text || '').trim();
+    if (keyService.isPuttyKey(pem)) {
+      const record = await keyService.parsePuttyFile(pem, opts.passphrase);
+      return this._storeKey(record, opts);
+    }
+    return this.importKey(pem, opts);
   }
 
   updateKey(id, patch = {}) {
@@ -284,6 +301,14 @@ class SshSpan {
         if (!opts.passphrase) throw new Error('A passphrase is required for encrypted PKCS#8 export.');
         const pem = this._decryptedPrivatePem(row);
         return keyService.toPkcs8PrivateKey(pem, String(opts.passphrase));
+      }
+      case 'ppk': {
+        // PuTTY .ppk (version 3); encrypts when a passphrase is supplied.
+        const pem = this._decryptedPrivatePem(row);
+        return keyService.toPuttyPrivateKey(pem, {
+          comment: opts.comment || row.comment,
+          passphrase: opts.passphrase || ''
+        });
       }
       default:
         throw new Error('Unknown export format: ' + format);

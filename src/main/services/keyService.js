@@ -18,6 +18,7 @@
 
 const crypto = require('crypto');
 const { parseOpenSSHPrivateKey, serializeOpenSSHPrivateKey } = require('./opensshParser');
+const puttyParser = require('./puttyParser');
 
 const VALID_TYPES = ['rsa', 'ed25519', 'ecdsa'];
 
@@ -337,6 +338,22 @@ function parseOpenSshFile(pem, passphrase) {
 }
 
 /**
+ * Import a PuTTY private key file (.ppk, version 3 only).
+ * Passphrase-protected files require a passphrase; version 2 files are
+ * rejected with guidance because their KDF and MAC are SHA-1 based.
+ */
+async function parsePuttyFile(text, passphrase) {
+  const parsed = await puttyParser.parsePPK(text, passphrase);
+  const publicKeyObj = crypto.createPublicKey(parsed.keyObject);
+  return buildRecord(parsed.keyObject, publicKeyObj, parsed.comment || '');
+}
+
+/** True when `text` looks like a PuTTY .ppk file. */
+function isPuttyKey(text) {
+  return puttyParser.isPPK(text);
+}
+
+/**
  * Export a private key as OpenSSH new format.
  * With a passphrase the key is encrypted (aes256-ctr + bcrypt KDF);
  * without one it is written unencrypted.
@@ -344,6 +361,19 @@ function parseOpenSshFile(pem, passphrase) {
 function toOpenSSHPrivateKey(privateKeyPem, opts = {}) {
   const keyObject = crypto.createPrivateKey(privateKeyPem);
   return serializeOpenSSHPrivateKey(keyObject, {
+    comment: opts.comment || '',
+    passphrase: opts.passphrase || ''
+  });
+}
+
+/**
+ * Export a private key as a PuTTY .ppk file (version 3).
+ * With a passphrase the key is encrypted (aes256-cbc + Argon2id);
+ * without one it is written unencrypted.
+ */
+async function toPuttyPrivateKey(privateKeyPem, opts = {}) {
+  const keyObject = crypto.createPrivateKey(privateKeyPem);
+  return puttyParser.serializePPK(keyObject, {
     comment: opts.comment || '',
     passphrase: opts.passphrase || ''
   });
@@ -386,7 +416,10 @@ module.exports = {
   generate,
   parsePem,
   parseOpenSshFile,
+  parsePuttyFile,
+  isPuttyKey,
   toOpenSSHPrivateKey,
+  toPuttyPrivateKey,
   toPkcs8PrivateKey,
   toAuthorizedKey,
   fingerprintOf,

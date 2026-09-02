@@ -109,6 +109,12 @@ keyService.js owns key generation, parsing, and export. Generation uses Node `cr
 ### src/main/services/opensshParser.js
 opensshParser.js parses `openssh-key-v1` private key files. It supports the ciphers none, aes256-ctr, aes256-gcm, and chacha20-poly1305@openssh.com, with bcrypt KDF via `bcrypt-pbkdf`. It can also parse legacy PEM private keys and public keys for import.
 
+### src/main/services/ppkCipher.js
+ppkCipher.js holds the AES-256-CBC helpers used by the PPK container. The mode is mandated by the PPK format; it runs through WebCrypto SubtleCrypto and length-checks key, IV and data before use. Decryption failures are reported generically so the parser's constant-time MAC check remains the authority on integrity.
+
+### src/main/services/puttyParser.js
+puttyParser.js parses and writes PuTTY private key files (`.ppk`, version 3) for RSA, Ed25519 and ECDSA. It derives key material with Argon2 (Node's built-in `argon2Sync`), splits the 80-byte tag into AES key / CBC IV / MAC key, and verifies the HMAC-SHA-256 integrity check timing-safely over the DECRYPTED private blob before returning any key material, so a wrong passphrase or tampered file never yields a usable key. Version 2 files are rejected with guidance to re-save them in a current PuTTYgen, because that format uses SHA-1 for both its KDF and its MAC. Argon2 parameters read from a file are validated, and implausible memory requests are refused.
+
 ### src/main/services/sshConfigService.js
 sshConfigService.js manages the Host block in `~/.ssh/config` between the markers `# >>> SSHSpan managed >>>` and `# <<< SSHSpan managed <<<`. Deployed IdentityFile values point to `~/.sshspan/keys/<key-id>` and deployed files are written with mode 0600.
 

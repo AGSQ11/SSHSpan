@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-02
+
+### Added
+
+- PuTTY key support (`.ppk`, version 3 — the format current PuTTYgen writes):
+  import passphrase-protected or plain `.ppk` files, and export any stored key
+  as a `.ppk` (encrypted with Argon2id + AES-256-CBC when a passphrase is
+  given). Covers RSA, Ed25519 and ECDSA (nistp256/384/521). Import/export are
+  wired into the Import tab and the Export format dropdown.
+- Sidebar shows the real application icon instead of the `[SSH]` text badge,
+  using an optimized 256x256 PNG derived from the app artwork
+  (`scripts/make-sidebar-icon.js`, `npm run icon:sidebar`).
+
+### Security
+
+- PuTTY `.ppk` version 2 files are rejected with guidance to re-save them in a
+  current PuTTYgen, because that format derives its key material and integrity
+  check with SHA-1.
+- The PPK MAC (HMAC-SHA-256 over the algorithm, encryption type, comment,
+  public key and decrypted private blob) is verified timing-safely before any
+  key material is returned, so a wrong passphrase or a tampered file never
+  yields a usable key. Argon2 parameters from an incoming file are validated,
+  with implausible memory requests refused.
+
 ## [1.0.8] - 2026-09-02
 
 ### Fixed

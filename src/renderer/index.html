@@ -78,6 +78,7 @@
             <div class="export-row">
               <select id="detailExportFormat">
                 <option value="openssh-private">OpenSSH private (new format)</option>
+                <option value="ppk">PuTTY private (.ppk v3)</option>
                 <option value="pkcs8">PKCS#8 PEM (unencrypted)</option>
                 <option value="pkcs8-encrypted">PKCS#8 PEM (encrypted)</option>
                 <option value="public-pem">Public key PEM (SPKI)</option>
@@ -201,7 +202,7 @@
         </div>
         <div class="tab-panel" id="tab-import" hidden>
           <label>Name <input type="text" id="importName" placeholder="work-server" /></label>
-          <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, SPKI public PEM, or authorized_keys line)
+          <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, PuTTY .ppk v3, SPKI public PEM, or authorized_keys line)
             <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."></textarea>
           </label>
           <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" /></label>

@@ -51,7 +51,7 @@ async function keysCreate(payload) {
   return { id: k.id };
 }
 async function keysImport(payload) {
-  const k = app.importKey(payload.pem, payload);
+  const k = await app.importKeyAsync(payload.pem, payload);
   return { id: k.id };
 }
 async function keysUpdate(payload) {

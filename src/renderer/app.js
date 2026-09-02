@@ -367,6 +367,7 @@ async function copyPublic() {
 
 const EXPORT_EXT = {
   'openssh-private': '',
+  'ppk': '.ppk',
   'pkcs8': '.pem',
   'pkcs8-encrypted': '.enc.pem',
   'public-pem': '.pub',
