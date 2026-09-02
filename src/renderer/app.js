@@ -402,7 +402,10 @@ function openKeyModal() {
   el('genName').focus();
 }
 
-function closeKeyModal() { el('modalBackdrop').hidden = true; }
+function closeKeyModal() {
+  el('modalBackdrop').hidden = true;
+  resetImportFileHint();
+}
 
 function switchTab(tab) {
   for (const b of document.querySelectorAll('.tab')) {
@@ -418,6 +421,37 @@ function onGenTypeChange() {
   const t = el('genType').value;
   el('genBitsRow').hidden = t !== 'rsa';
   el('genCurveRow').hidden = t !== 'ecdsa';
+}
+
+/**
+ * Import via a native Open dialog. The main process reads the file and
+ * returns its text; we then feed it through the normal import path so
+ * browsing and pasting behave identically.
+ */
+async function browseForImport() {
+  try {
+    const res = unwrap(await api.dialogReadTextFile({ title: 'Import SSH key' }));
+    if (!res || res.canceled || !res.text) return; // user cancelled
+    const pem = res.text.trim();
+    if (!pem) { toast('That file is empty.', 'err'); return; }
+
+    // Pre-fill the name field from the file name when it is still blank.
+    const nameInput = el('importName');
+    if (!nameInput.value.trim()) {
+      nameInput.value = (res.name || 'imported-key').replace(/\.[^.]+$/, '');
+    }
+    el('importPem').value = pem;
+    el('importFileHint').textContent = 'Loaded ' + res.name + ' — press Import to add it.';
+    el('importPass').focus();
+    toast('Loaded ' + res.name + '. Enter the passphrase if the key is encrypted, then Import.', 'info');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+function resetImportFileHint() {
+  const hint = el('importFileHint');
+  if (hint) hint.textContent = 'or paste the key material below';
 }
 
 async function submitKeyModal() {
@@ -832,6 +866,7 @@ function wire() {
   }
   el('modalPrimary').addEventListener('click', submitKeyModal);
   el('genType').addEventListener('change', onGenTypeChange);
+  el('importBrowseBtn').addEventListener('click', browseForImport);
 
   // deploy view
   el('previewConfigBtn').addEventListener('click', previewConfig);

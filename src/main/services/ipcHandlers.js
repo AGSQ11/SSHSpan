@@ -107,6 +107,14 @@ async function auditList(payload) {
   return app.listAudit(payload && payload.limit);
 }
 
+// ---- file dialogs (main process reads/writes; renderer never touches fs) ----
+async function dialogReadTextFile(payload = {}) {
+  return app.readTextFileFromDialog(payload);
+}
+async function dialogSaveText(payload = {}) {
+  return app.saveTextFileViaDialog(payload);
+}
+
 // ---- clipboard (public key only) ----
 async function clipboardWritePublic(payload) {
   const k = app.getKey(payload.id);
@@ -138,6 +146,8 @@ const handlers = {
   'sync:save-config': syncSaveConfig,
   'sync:test': syncTest,
   'sync:now': syncNow,
+  'dialog:read-text-file': dialogReadTextFile,
+  'dialog:save-text': dialogSaveText,
   'audit:list': auditList,
   'clipboard:write-public': clipboardWritePublic
 };

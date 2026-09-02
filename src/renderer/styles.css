@@ -306,6 +306,11 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color:
 
 .detail-actions { display: flex; gap: 8px; }
 
+.import-source {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.import-source .hint { min-width: 0; overflow-wrap: anywhere; }
+
 .export-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .export-row select { flex: 1.2; min-width: 170px; }
 .export-row input { flex: 1; min-width: 130px; }

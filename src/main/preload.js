@@ -28,6 +28,10 @@ const api = {
   keysDeploy: (ids, opts) => ipcRenderer.invoke('keys:deploy', { ids, ...opts }),
   keysRenderConfig: (ids, opts) => ipcRenderer.invoke('keys:render-config', { ids, ...opts }),
 
+  // file dialogs (the main process reads and writes; no fs access here)
+  dialogReadTextFile: (opts) => ipcRenderer.invoke('dialog:read-text-file', opts),
+  dialogSaveText: (opts) => ipcRenderer.invoke('dialog:save-text', opts),
+
   // settings
   settingsGet: () => ipcRenderer.invoke('settings:get'),
   settingsSet: (key, value) => ipcRenderer.invoke('settings:set', { key, value }),

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-02
+
+### Added
+
+- Import keys from a file, not only by pasting: the Import tab has a
+  "Browse for key file…" button that opens a native file picker
+  (`.ppk`, `.pem`, `.key`, `.pub`, `.txt` and all files). The main process
+  reads the chosen file and feeds it through the same import path as pasted
+  material, so both routes behave identically; the name field pre-fills from
+  the file name. Files larger than 512 KB are refused.
+
 ## [1.1.0] - 2026-09-02
 
 ### Added

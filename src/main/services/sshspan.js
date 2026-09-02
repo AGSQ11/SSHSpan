@@ -33,6 +33,9 @@ const { BitwardenSync } = require('./bitwardenSyncService');
 
 const MIN_PASSWORD_LEN = 8;
 
+/** Largest file we will read through the import dialog. */
+const MAX_IMPORT_BYTES = 512 * 1024;
+
 class SshSpan {
   constructor() {
     this.db = null;
@@ -435,6 +438,63 @@ class SshSpan {
       this.session.setTimeout(Number(value) * 60 * 1000);
     }
     this.db.audit('settings.changed', key);
+  }
+
+  // ---- file dialogs ------------------------------------------------------
+
+  /**
+   * Show an Open dialog and return the chosen file's text content.
+   * Reading happens in the main process; the renderer never touches fs.
+   */
+  async readTextFileFromDialog(opts = {}) {
+    const { dialog, BrowserWindow } = require('electron');
+    const win = BrowserWindow.getFocusedWindow() || null;
+    const res = await dialog.showOpenDialog(win, {
+      title: opts.title || 'Import key file',
+      defaultPath: opts.defaultPath || os.homedir(),
+      properties: ['openFile', 'showHiddenFiles'],
+      filters: opts.filters && opts.filters.length
+        ? opts.filters
+        : [
+            { name: 'SSH keys', extensions: ['ppk', 'pem', 'key', 'pub', 'txt', ''] },
+            { name: 'All files', extensions: ['*'] }
+          ]
+    });
+    if (res.canceled || !res.filePaths || res.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    const file = res.filePaths[0];
+    const maxBytes = Number(opts.maxBytes) > 0 ? Number(opts.maxBytes) : MAX_IMPORT_BYTES;
+    const size = fs.statSync(file).size;
+    if (size > maxBytes) {
+      throw new Error('That file is ' + Math.ceil(size / 1024) + ' KB — too large to be a key (limit ' +
+        Math.floor(maxBytes / 1024) + ' KB).');
+    }
+    return {
+      canceled: false,
+      path: file,
+      name: path.basename(file),
+      text: fs.readFileSync(file, 'utf8')
+    };
+  }
+
+  /**
+   * Show a Save dialog and write `text` to the chosen path.
+   * Returns the saved path (or canceled) so the caller can report it.
+   */
+  async saveTextFileViaDialog(opts = {}) {
+    const { dialog, BrowserWindow } = require('electron');
+    const win = BrowserWindow.getFocusedWindow() || null;
+    const res = await dialog.showSaveDialog(win, {
+      title: opts.title || 'Export key',
+      defaultPath: opts.defaultPath || (path.join(os.homedir(), opts.fileName || 'key')),
+      filters: opts.filters && opts.filters.length ? opts.filters : undefined
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    const target = path.resolve(res.filePath);
+    fs.writeFileSync(target, String(opts.text || ''), { mode: 0o600 });
+    this._lockDownFile(target);
+    return { canceled: false, path: target };
   }
 
   // ---- Bitwarden sync -------------------------------------------------------
