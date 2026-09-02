@@ -36,7 +36,9 @@ Download the installer for your platform from the [releases page](https://github
 
 ### From source
 
-SSHSpan requires **Node.js 18 or later**.
+SSHSpan requires **Node.js 22.6 or later** (24+ recommended) — PuTTY `.ppk`
+support uses Node's built-in `crypto.argon2Sync`. On older runtimes the app
+runs normally and PuTTY import/export is simply unavailable.
 
 ```bash
 git clone https://github.com/AGSQ11/SSHSpan.git

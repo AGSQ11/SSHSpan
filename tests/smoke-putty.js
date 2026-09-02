@@ -11,6 +11,14 @@ function ok(name, cond, extra) {
   console.log('PASS ' + name);
 }
 
+// PPK v3 needs Argon2. Node 22.6+/24+ provides it via crypto.argon2Sync; on
+// older runtimes this suite skips rather than failing the build.
+if (typeof crypto.argon2Sync !== 'function') {
+  console.log('SKIPPED: no built-in Argon2 in Node ' + process.version +
+    ' (Node 22.6+ / 24+ required for PuTTY .ppk support).');
+  process.exit(0);
+}
+
 const PW = 'pw-' + crypto.randomBytes(6).toString('hex');
 
 // Low Argon2 cost keeps the suite fast; real exports use puttygen's defaults.

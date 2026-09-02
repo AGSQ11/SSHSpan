@@ -161,7 +161,8 @@ function hmacSha256(key, data) {
  */
 function argon2KeyMaterial(passphrase, variantId, salt, memory, passes, parallelism, outputLen) {
   if (typeof nodeCrypto.argon2Sync !== 'function') {
-    throw new Error('This Node build has no built-in Argon2 support. Node 22.6+ / 24+ is required.');
+    throw new Error('PuTTY keys cannot be read or written here: this Node build (' +
+      process.version + ') has no built-in Argon2. Node 22.6+ / 24+ is required.');
   }
   const options = {
     message: Buffer.from(String(passphrase), 'utf8'),
