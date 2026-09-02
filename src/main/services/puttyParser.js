@@ -178,6 +178,34 @@ function argon2KeyMaterial(passphrase, variantId, salt, memory, passes, parallel
   throw new Error('Unsupported Argon2 variant id: ' + String(variantId));
 }
 
+/**
+ * Key material for PPK version 2 (SHA-1 based, PuTTY <= 0.74).
+ *
+ * Cipher key: SHA-1(0 || passphrase) || SHA-1(1 || passphrase), first 32 bytes.
+ * IV: all zeroes. MAC key: SHA-1("putty-private-key-file-mac-key" || passphrase).
+ *
+ * SHA-1 is cryptographically weak and is used here ONLY because the v2 file
+ * format mandates it; this code path is read-only. v2 files are imported but
+ * never written.
+ */
+function v2KeyMaterial(passphrase) {
+  const pw = Buffer.from(String(passphrase || ''), 'utf8');
+  const seq = (n) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32BE(n, 0);
+    return b;
+  };
+  const h0 = nodeCrypto.createHash('sha1').update(Buffer.concat([seq(0), pw])).digest();
+  const h1 = nodeCrypto.createHash('sha1').update(Buffer.concat([seq(1), pw])).digest();
+  const cipherKey = Buffer.concat([h0, h1]).subarray(0, 32);
+  const iv = Buffer.alloc(16); // v2 uses a zero IV
+  const macKey = nodeCrypto.createHash('sha1')
+    .update(Buffer.from('putty-private-key-file-mac-key', 'utf8'))
+    .update(pw)
+    .digest();
+  return { cipherKey, iv, macKey };
+}
+
 /** MAC preimage: five SSH strings, as specified in Appendix C. */
 function macPreimage(algorithm, encryption, comment, publicBlob, privatePlain) {
   return Buffer.concat([
@@ -368,14 +396,13 @@ function parseStructure(text) {
   }
   const version = Number(header[1]);
   const algorithm = header[2];
-  if (version === 2) {
-    throw new Error(
-      'This is a PPK version 2 file (PuTTY 0.74 or older), which uses SHA-1 for its ' +
-      'passphrase KDF and integrity check. Open it in a current PuTTYgen and re-save it ' +
-      'to convert to version 3, then import again.');
-  }
-  if (version !== 3) {
-    throw new Error('Unsupported PPK file version: ' + version);
+  // v2 (PuTTY <= 0.74) is accepted for IMPORT only: its KDF and MAC are
+  // SHA-1 based, which is weak but mandated by the format, and reading an
+  // existing legacy file is safer than telling users to hunt down an old
+  // tool. Export always writes v3.
+  if (version !== 2 && version !== 3) {
+    throw new Error('Unsupported PPK file version: ' + version +
+      ' (supported: 2 and 3)');
   }
   if (!SUPPORTED_ALGORITHMS.includes(algorithm)) {
     throw new Error('Unsupported PPK key algorithm: ' + algorithm +
@@ -435,12 +462,15 @@ function isPPK(text) {
 async function parsePPK(text, passphrase) {
   const ppk = parseStructure(text);
   const pw = String(passphrase || '');
+  const isV2 = ppk.version === 2;
 
   if (ppk.encryption === 'none') {
-    // Key material is zero-length; the MAC still runs, with an empty key.
+    // v3 MACs with an empty key; v2 uses a plain SHA-1 hash of the blob.
     const expected = Buffer.from(ppk.fields['Private-MAC'], 'hex');
-    const actual = hmacSha256(Buffer.alloc(0),
-      macPreimage(ppk.algorithm, ppk.encryption, ppk.comment, ppk.publicBlob, ppk.privateBlob));
+    const actual = isV2
+      ? nodeCrypto.createHash('sha1').update(ppk.privateBlob).digest()
+      : hmacSha256(Buffer.alloc(0),
+        macPreimage(ppk.algorithm, ppk.encryption, ppk.comment, ppk.publicBlob, ppk.privateBlob));
     if (!timingSafeEqual(expected, actual)) {
       throw new Error('PPK integrity check failed - the file is corrupt or has been tampered with.');
     }
@@ -448,24 +478,34 @@ async function parsePPK(text, passphrase) {
   }
 
   if (!pw) throw new Error('This PuTTY key is encrypted; enter its passphrase.');
-  const params = readArgon2Params(ppk.fields);
   if (ppk.privateBlob.length === 0 || ppk.privateBlob.length % ppkCipher.BLOCK !== 0) {
     throw new Error('Encrypted private key section is not a whole number of AES blocks.');
   }
 
-  const material = argon2KeyMaterial(pw, params.variantId, params.salt,
-    params.memory, params.passes, params.parallelism, TAG_LEN);
-  const cipherKey = material.subarray(0, 32);
-  const iv = material.subarray(32, 48);
-  const macKey = material.subarray(48, 80);
+  let cipherKey, iv, macKey;
+  if (isV2) {
+    const km = v2KeyMaterial(pw);
+    cipherKey = km.cipherKey;
+    iv = km.iv;
+    macKey = km.macKey;
+  } else {
+    const params = readArgon2Params(ppk.fields);
+    const material = argon2KeyMaterial(pw, params.variantId, params.salt,
+      params.memory, params.passes, params.parallelism, TAG_LEN);
+    cipherKey = material.subarray(0, 32);
+    iv = material.subarray(32, 48);
+    macKey = material.subarray(48, 80);
+  }
 
   const plain = await ppkCipher.decrypt(cipherKey, iv, ppk.privateBlob);
 
   // Verify the MAC over the DECRYPTED plaintext (padding included) before
-  // exposing any key material.
+  // exposing any key material. v2 uses HMAC-SHA-1, v3 HMAC-SHA-256.
   const expected = Buffer.from(ppk.fields['Private-MAC'], 'hex');
-  const actual = hmacSha256(macKey,
-    macPreimage(ppk.algorithm, ppk.encryption, ppk.comment, ppk.publicBlob, plain));
+  const preimage = macPreimage(ppk.algorithm, ppk.encryption, ppk.comment, ppk.publicBlob, plain);
+  const actual = isV2
+    ? nodeCrypto.createHmac('sha1', macKey).update(preimage).digest()
+    : hmacSha256(macKey, preimage);
   if (!timingSafeEqual(expected, actual)) {
     throw new Error('Incorrect passphrase, or the file is corrupt or has been tampered with.');
   }

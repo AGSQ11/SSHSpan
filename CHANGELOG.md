@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-02
+
+### Added
+
+- Import legacy PuTTY **version 2** `.ppk` files (PuTTY 0.52–0.74), encrypted or
+  not, for all supported key types. v2 uses a SHA-1 based KDF and HMAC-SHA-1,
+  which is weak but mandated by that format; it is accepted for **import only**,
+  and exporting a v2 key writes the current **v3** format, so importing one
+  quietly upgrades it.
+
 ## [1.1.1] - 2026-09-02
 
 ### Added

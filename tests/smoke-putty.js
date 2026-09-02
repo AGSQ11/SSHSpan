@@ -11,6 +11,74 @@ function ok(name, cond, extra) {
   console.log('PASS ' + name);
 }
 
+/**
+ * Build a PPK version 2 file (PuTTY 0.52-0.74) from the spec:
+ *   cipher key = SHA1(0||pw) || SHA1(1||pw), first 32 bytes
+ *   IV         = 16 zero bytes
+ *   MAC key    = SHA1("putty-private-key-file-mac-key" || pw)
+ *   MAC        = HMAC-SHA-1 over the usual five-string preimage
+ * Unencrypted v2 files use an empty passphrase and a plain SHA-1 of the blob.
+ * (Corroborated by the Go implementation at kayrus/putty and by hashcat's
+ * mode 99200, which cracks real v2 files.)
+ */
+function buildV2(keyPair, opts = {}) {
+  const pw = Buffer.from(opts.passphrase || '', 'utf8');
+  const jwk = keyPair.privateKey.export({ format: 'jwk' });
+  const pub = internals.publicBlobFromJwk(jwk);
+  const body = internals.privateBlobFromJwk(jwk);
+  const encrypted = opts.passphrase ? 'aes256-cbc' : 'none';
+  const comment = opts.comment || 'v2-key';
+
+  const padded = (() => {
+    const padLen = (16 - (body.length % 16)) % 16;
+    return padLen ? Buffer.concat([body, crypto.randomBytes(padLen)]) : body;
+  })();
+
+  let blob = padded;
+  if (opts.passphrase) {
+    const seq = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n, 0); return b; };
+    const hash = (n) => crypto.createHash('sha1')
+      .update(Buffer.concat([seq(n), pw])).digest();
+    const cipherKey = Buffer.concat([hash(0), hash(1)]).subarray(0, 32);
+    const iv = Buffer.alloc(16);
+    const c = crypto.createCipheriv('aes-256-cbc', cipherKey, iv);
+    blob = Buffer.concat([c.update(padded), c.final()]);
+  }
+
+  // MAC: unencrypted v2 hashes the blob directly; encrypted v2 uses HMAC-SHA-1.
+  let mac;
+  if (opts.passphrase) {
+    const macKey = crypto.createHash('sha1')
+      .update(Buffer.from('putty-private-key-file-mac-key', 'utf8'))
+      .update(pw).digest();
+    mac = crypto.createHmac('sha1', macKey)
+      .update(internals.macPreimage(internals.algorithmForJwk(jwk),
+        encrypted, comment, pub, padded))
+      .digest('hex');
+  } else {
+    mac = crypto.createHash('sha1').update(blob).digest('hex');
+  }
+
+  const b64 = (b) => {
+    const s = b.toString('base64');
+    const out = [];
+    for (let i = 0; i < s.length; i += 64) out.push(s.slice(i, i + 64));
+    return out;
+  };
+  const pubLines = b64(pub);
+  const privLines = b64(blob);
+  const algo = internals.algorithmForJwk(jwk);
+
+  return [
+    'PuTTY-User-Key-File-2: ' + algo,
+    'Encryption: ' + encrypted,
+    'Comment: ' + comment,
+    'Public-Lines: ' + pubLines.length, ...pubLines,
+    'Private-Lines: ' + privLines.length, ...privLines,
+    'Private-MAC: ' + mac
+  ].join('\n') + '\n';
+}
+
 // PPK v3 needs Argon2. Node 22.6+/24+ provides it via crypto.argon2Sync; on
 // older runtimes this suite skips rather than failing the build.
 if (typeof crypto.argon2Sync !== 'function') {
@@ -102,13 +170,45 @@ const TYPES = [
     ok(label + ': tampered header rejected', threw);
   }
 
-  // ---- version and algorithm policy ---------------------------------------
-  threw = false;
-  try {
-    await parsePPK('PuTTY-User-Key-File-2: ssh-rsa\nEncryption: none\nComment: x\n' +
-      'Public-Lines: 1\nAAAA\nPrivate-Lines: 1\nAAAA\nPrivate-MAC: aaaa\n');
-  } catch (e) { threw = /version 2/.test(e.message) && /PuTTYgen/.test(e.message); }
-  ok('v2 rejected with conversion guidance', threw);
+  // ---- version 2 (legacy, SHA-1 based) can be IMPORTED --------------------
+  // Corroborated against the spec (PuTTY docs C.5.1), the Go implementation at
+  // kayrus/putty and hashcat mode 99200.
+  for (const [label, gen] of TYPES) {
+    const kp = gen();
+    const orig = kp.privateKey.export({ format: 'jwk' });
+
+    // unencrypted v2
+    const v2plain = buildV2(kp, { comment: 'legacy-plain' });
+    ok(label + ' v2: header recognised', isPPK(v2plain));
+    let r = await parsePPK(v2plain);
+    ok(label + ' v2: plain round trip', r.keyObject.export({ format: 'jwk' }).d === orig.d);
+    ok(label + ' v2: version reported', r.version === 2 && r.encrypted === false);
+
+    // encrypted v2
+    const v2enc = buildV2(kp, { comment: 'legacy-enc', passphrase: PW });
+    r = await parsePPK(v2enc, PW);
+    ok(label + ' v2: encrypted round trip', r.keyObject.export({ format: 'jwk' }).d === orig.d);
+    ok(label + ' v2: reports encrypted', r.encrypted === true);
+
+    // wrong passphrase
+    threw = false;
+    try { await parsePPK(v2enc, 'not-the-passphrase'); } catch (e) { threw = true; }
+    ok(label + ' v2: wrong passphrase rejected', threw);
+
+    // tampered MAC
+    threw = false;
+    try { await parsePPK(v2enc.replace(/Private-MAC: ./, 'Private-MAC: 0')); } catch (e) { threw = true; }
+    ok(label + ' v2: tampered MAC rejected', threw);
+
+    // v2 MAC is HMAC-SHA-1 (40 hex digits), v3 is HMAC-SHA-256 (64)
+    ok(label + ' v2: MAC is 40 hex digits (SHA-1)',
+      /^Private-MAC: [0-9a-f]{40}$/m.test(v2enc));
+  }
+
+  // v3 files keep the longer MAC
+  const v3mac = await serializePPK(crypto.generateKeyPairSync('ed25519').privateKey,
+    { comment: 'c', passphrase: PW, ...FAST });
+  ok('v3: MAC is 64 hex digits (SHA-256)', /^Private-MAC: [0-9a-f]{64}$/m.test(v3mac));
 
   threw = false;
   try { await parsePPK('PuTTY-User-Key-File-9: ssh-rsa\n'); } catch (e) {
