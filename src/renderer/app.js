@@ -248,10 +248,10 @@ function catNodeEl(cat, depth) {
   }
   row.appendChild(chev);
 
-  const ico = document.createElement('span');
-  ico.className = 'cat-ico';
-  ico.innerHTML = ico(state.expandedCatIds.has(cat.id) ? 'folder-open' : 'folder');
-  row.appendChild(ico);
+  const catIco = document.createElement('span');
+  catIco.className = 'cat-ico';
+  catIco.innerHTML = ico(state.expandedCatIds.has(cat.id) ? 'folder-open' : 'folder');
+  row.appendChild(catIco);
 
   const lbl = document.createElement('span');
   lbl.className = 'cat-label';
@@ -299,7 +299,7 @@ function renderCategoryTree() {
     u.dataset.depth = '0';
     if (state.activeCategoryId === 'uncategorized') u.classList.add('active');
     const chev = document.createElement('span'); chev.className = 'cat-chevron leaf'; u.appendChild(chev);
-    const ico = document.createElement('span'); ico.className = 'cat-ico'; ico.innerHTML = ico('folder'); u.appendChild(ico);
+    const catIco = document.createElement('span'); catIco.className = 'cat-ico'; catIco.innerHTML = ico('folder'); u.appendChild(catIco);
     const lbl = document.createElement('span'); lbl.className = 'cat-label'; lbl.textContent = 'Uncategorized'; u.appendChild(lbl);
     const cnt = document.createElement('span'); cnt.className = 'cat-count'; cnt.textContent = uncategorizedKeyCount(); u.appendChild(cnt);
     u.addEventListener('click', () => setActiveCategory('uncategorized'));
@@ -740,8 +740,8 @@ async function refreshVaultStatus(silent) {
   const info = vaultStatusHTML(s.unlocked, s.hasVault);
   status.classList.remove('locked', 'unlocked', 'novault');
   status.classList.add(info.state);
-  const ico = el('vaultIcon');
-  if (ico) ico.innerHTML = info.icon;
+  const vaultIcon = el('vaultIcon');
+  if (vaultIcon) vaultIcon.innerHTML = info.icon;
   const lbl = el('vaultLabel');
   if (lbl) lbl.textContent = info.label;
   el('newKeyBtn').disabled = !s.unlocked;
