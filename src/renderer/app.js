@@ -1561,8 +1561,12 @@ async function switchView(view) {
   }
   if (view === 'connect') {
     applyNavLockState();
-    if (state.unlocked) await loadServers();
-    else clearConnectView();
+    if (state.unlocked) {
+      await loadServers();
+      el('termStrip').textContent = 'Ready.';
+    } else {
+      clearConnectView();
+    }
   }
 }
 
@@ -1755,6 +1759,19 @@ function wire() {
   });
   el('srvSaveBtn').addEventListener('click', submitServerModal);
 
+  // Connect password modal
+  el('connectPwOkBtn').addEventListener('click', () => {
+    closeConnectPwModal(el('connectPwInput').value || '');
+  });
+  el('connectPwCancelBtn').addEventListener('click', () => closeConnectPwModal(null));
+  el('connectPwInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); el('connectPwOkBtn').click(); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeConnectPwModal(null); }
+  });
+  el('connectPwModal').addEventListener('click', (e) => {
+    if (e.target === el('connectPwModal')) closeConnectPwModal(null);
+  });
+
   if (typeof initTerminal === 'function') initTerminal();
 }
 
@@ -1767,6 +1784,26 @@ async function lockNow() {
 }
 
 // ─── Connect: saved servers + SSH sessions ─────────────────────────────────
+
+// Password prompt for connect — uses a custom modal instead of native prompt()
+// which silently fails in Tauri's WebView.
+function askConnectPassword(server, callback) {
+  const modal = document.getElementById('connectPwModal');
+  if (!modal) return callback(null); // fallback
+  modal.hidden = false;
+  const label = document.getElementById('connectPwLabel');
+  if (label) label.textContent = `Password for ${server.username}@${server.host}:`;
+  const inp = document.getElementById('connectPwInput');
+  if (inp) { inp.value = ''; setTimeout(() => inp.focus(), 50); }
+  state._connectPwCallback = callback;
+}
+function closeConnectPwModal(value) {
+  const modal = document.getElementById('connectPwModal');
+  if (modal) modal.hidden = true;
+  const cb = state._connectPwCallback;
+  state._connectPwCallback = null;
+  if (cb) cb(value);
+}
 
 async function loadServers() {
   if (!state.unlocked) { clearConnectView(); return; }
@@ -2038,8 +2075,9 @@ async function connectToServer(srv, opts = {}) {
 
   let pw = null;
   if (srv.authMethod !== 'publickey') {
-    pw = prompt(srv.authMethod === 'password' ? 'Password:' : 'Password (kbd-interactive):', '');
-    if (pw === null) {
+    // Use a custom modal — native prompt() silently fails in Tauri webview.
+    pw = await new Promise(resolve => askConnectPassword(srv, resolve));
+    if (pw === null || pw === undefined) {
       if (typeof terminalSetStatus === 'function') terminalSetStatus('Cancelled.');
       return;
     }
@@ -2076,8 +2114,8 @@ async function disconnectActive() {
 async function testSelectedServer(srv) {
   let pw = null;
   if (srv.authMethod !== 'publickey') {
-    pw = prompt(srv.authMethod === 'password' ? 'Password to test:' : 'Password to test (kbd-int):', '');
-    if (pw === null) return;
+    pw = await new Promise(resolve => askConnectPassword(srv, resolve));
+    if (pw === null || pw === undefined) return;
   }
   if (typeof terminalSetStatus === 'function') terminalSetStatus(`Testing ${srv.host}:${srv.port}…`);
   try {

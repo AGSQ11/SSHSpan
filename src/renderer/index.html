@@ -337,6 +337,26 @@
     </div>
   </div>
 
+  <!-- Modal: Connect password prompt -->
+  <div class="modal-backdrop" id="connectPwModal" hidden>
+    <div class="modal modal-sm">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="key-round"></span>
+          <h2 id="connectPwTitle">Enter Password</h2>
+        </div>
+      </header>
+      <div class="modal-body">
+        <p id="connectPwLabel" class="hint">Password:</p>
+        <input type="password" id="connectPwInput" placeholder="Password" autocomplete="off" />
+      </div>
+      <footer class="modal-footer">
+        <button id="connectPwCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="connectPwOkBtn" class="primary-btn">Connect</button>
+      </footer>
+    </div>
+  </div>
+
   <!-- Toast -->
   <div id="toast"></div>
 
