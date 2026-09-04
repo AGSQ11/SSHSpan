@@ -3,29 +3,41 @@
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; font-src 'self' data:" />
+        content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src ipc: http://tauri.localhost" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SSHSpan</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔐</text></svg>" />
   <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="vendor/xterm.css" />
 </head>
 <body>
   <div id="app">
     <aside class="sidebar">
       <div class="brand">
         <img class="logo" id="brandIcon" alt="SSHSpan" />
-        <div class="brand-name">SSHSpan</div>
+        <div class="brand-text">
+          <span class="brand-name">SSHSpan</span>
+          <span class="brand-sub">Key manager</span>
+        </div>
       </div>
       <nav class="nav">
-        <button data-view="keys" class="nav-item active" title="Keys">&#128273; Keys</button>
-        <button data-view="config" class="nav-item" title="Deploy">&#128295; Deploy</button>
-        <button data-view="settings" class="nav-item" title="Settings">&#9881; Settings</button>
-        <button data-view="audit" class="nav-item" title="Audit Log">&#128220; Audit</button>
+        <button data-view="keys" class="nav-item active" title="Keys" aria-label="Keys"><span data-nav-ico="key-round"></span><span class="nav-label">Keys</span></button>
+        <button data-view="connect" class="nav-item" title="Connect" aria-label="Connect" data-requires-unlock><span data-nav-ico="monitor-smartphone"></span><span class="nav-label">Connect</span></button>
+        <button data-view="config" class="nav-item" title="Deploy" aria-label="Deploy"><span data-nav-ico="wrench"></span><span class="nav-label">Deploy</span></button>
+        <button data-view="settings" class="nav-item" title="Settings" aria-label="Settings"><span data-nav-ico="settings"></span><span class="nav-label">Settings</span></button>
+        <button data-view="audit" class="nav-item" title="Audit Log" aria-label="Audit Log"><span data-nav-ico="scroll-text"></span><span class="nav-label">Audit</span></button>
       </nav>
+      <div class="cat-panel" id="catPanel" hidden>
+        <div class="cat-panel-head">
+          <span class="cat-panel-title">Categories</span>
+          <button class="icon-btn" id="catAddRootBtn" title="New top-level category" data-ico="folder-plus"></button>
+        </div>
+        <div class="cat-tree" id="catTree"></div>
+      </div>
       <div class="sidebar-bottom">
-        <div class="vault-status" id="vaultStatus">
-          <span class="dot locked"></span>
-          <span class="vault-label">Locked</span>
+        <div class="vault-status" id="vaultStatus" title="Vault status">
+          <span class="vault-ico" id="vaultIcon"></span>
+          <span class="vault-label" id="vaultLabel">Locked</span>
         </div>
         <button id="newKeyBtn" class="primary-btn wide">+ New Key</button>
       </div>
@@ -33,45 +45,65 @@
 
     <main class="content">
       <header class="topbar">
-        <h1 id="viewTitle">Keys</h1>
+        <div class="topbar-title">
+          <div class="topbar-head">
+            <h1 id="viewTitle">Keys</h1>
+            <nav class="breadcrumb" id="breadcrumb" hidden aria-label="Current category"></nav>
+          </div>
+          <p class="topbar-sub" id="viewSubtitle"></p>
+        </div>
         <div class="topbar-actions" id="topbarActions">
-          <button id="changePasswordBtn" class="ghost-btn" title="Change master password">Change password</button>
-          <button id="lockBtn" class="ghost-btn" title="Lock the vault now">Lock</button>
+          <button id="changePasswordBtn" class="ghost-btn" title="Change master password"><span data-ico="key-round"></span>Change password</button>
+          <button id="lockBtn" class="ghost-btn" title="Lock the vault now (Ctrl+L)"><span data-ico="lock"></span>Lock</button>
         </div>
       </header>
 
       <div class="view" id="view-keys">
         <div class="toolbar">
-          <input type="search" id="searchInput" placeholder="Search keys by name, comment, fingerprint…" />
+          <div class="search-wrap">
+            <span class="search-ico" data-ico="search"></span>
+            <input type="search" id="searchInput" placeholder="Search keys by name, comment, fingerprint…" />
+          </div>
           <select id="typeFilter">
             <option value="">All types</option>
             <option value="rsa">RSA</option>
             <option value="ed25519">Ed25519</option>
             <option value="ecdsa">ECDSA</option>
           </select>
+          <button id="catFilterBtn" class="ghost-btn cat-filter-btn" title="Filter by category" disabled>
+            <span data-ico="folder"></span><span id="catFilterLabel">All categories</span>
+          </button>
           <span class="spacer"></span>
+          <span class="count-chip" id="keyCount" hidden></span>
           <span class="hint" id="selectionHint"></span>
         </div>
         <div class="keys-layout">
-          <div class="key-list" id="keyList"></div>
-          <div class="empty-state" id="emptyState" hidden>
-            <div class="empty-icon">&#128273;</div>
-            <h3>No keys yet</h3>
-            <p>Generate or import your first SSH key.</p>
+          <div class="key-list-col">
+            <div class="key-list" id="keyList"></div>
+            <div class="empty-state" id="emptyState" hidden>
+              <div class="empty-ico" data-ico="key-round"></div>
+              <h3>No keys yet</h3>
+              <p>Generate or import your first SSH key pair.</p>
+              <button id="emptyNewBtn" class="ghost-btn">+ New Key</button>
+            </div>
           </div>
           <section class="detail-pane" id="detailPane" hidden>
             <div class="detail-head">
+              <span class="key-avatar" id="detailAvatar"></span>
               <h2 id="detailName">—</h2>
               <span class="badge" id="detailType">—</span>
             </div>
             <dl class="detail-meta" id="detailMeta"></dl>
+            <label class="detail-label">Categories</label>
+            <div class="cat-chips" id="detailCategories"></div>
+            <button id="detailBrowseCategoriesBtn" class="ghost-btn cat-browse-btn" disabled><span data-ico="folder-plus"></span>Browse categories…</button>
             <label class="detail-label">Fingerprint</label>
             <code class="mono block" id="detailFingerprint">—</code>
             <label class="detail-label">Public key (authorized_keys)</label>
             <textarea class="mono" id="detailAuthorized" rows="4" readonly spellcheck="false"></textarea>
             <div class="detail-actions">
-              <button id="detailCopyPublicBtn" class="ghost-btn">Copy public key</button>
-              <button id="detailDeleteBtn" class="danger-btn">Delete</button>
+              <button id="detailCopyPublicBtn" class="ghost-btn"><span data-ico="copy"></span>Copy public key</button>
+              <button id="detailDeleteBtn" class="danger-btn"><span data-ico="trash-2"></span>Delete</button>
             </div>
             <hr class="sep" />
             <label class="detail-label">Export private key</label>
@@ -85,40 +117,76 @@
                 <option value="authorized_keys">authorized_keys line</option>
               </select>
               <input type="password" id="detailExportPass" placeholder="Passphrase (for encrypted export)" />
-              <button id="detailExportBtn" class="primary-btn">Export</button>
+              <button id="detailExportBtn" class="primary-btn"><span data-ico="download"></span>Export</button>
             </div>
             <p class="hint" id="exportHint">Private material never leaves the main process; export is explicit and always asks first.</p>
           </section>
         </div>
       </div>
 
+      <div class="view" id="view-connect" hidden>
+        <div class="connect-layout">
+          <aside class="server-col">
+            <div class="server-list-head">
+              <div class="search-wrap">
+                <span class="search-ico" data-ico="search"></span>
+                <input type="search" id="serverSearch" placeholder="Search servers…" />
+              </div>
+              <button id="serverNewBtn" class="primary-btn" title="New server"><span data-ico="plus"></span>New</button>
+            </div>
+            <div class="server-list" id="serverList"></div>
+            <div class="empty-state small" id="serverEmpty" hidden>
+              <div class="empty-ico" data-ico="monitor-smartphone"></div>
+              <p>No saved servers yet.</p>
+              <p class="hint">Create one with <strong>New</strong>, or right-click a key and choose <em>Use this key to connect…</em>.</p>
+            </div>
+          </aside>
+          <section class="terminal-col">
+            <div class="terminal-head">
+              <div class="terminal-title">
+                <strong id="termTitle">No connection</strong>
+                <span class="badge" id="termBadge" hidden></span>
+              </div>
+              <div class="terminal-actions">
+                <button id="termTestBtn" class="ghost-btn" hidden><span data-ico="plug-zap"></span>Test</button>
+                <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span>Reconnect</button>
+                <button id="termDisconnectBtn" class="danger-btn" hidden><span data-ico="x"></span>Disconnect</button>
+              </div>
+            </div>
+            <div class="terminal-host" id="terminalHost"></div>
+            <div class="terminal-strip" id="termStrip">Ready.</div>
+          </section>
+        </div>
+      </div>
+
       <div class="view" id="view-config" hidden>
         <div class="config-view">
-          <div class="config-section">
-            <h2>Deploy to SSH</h2>
-            <p>
-              Writes the selected private keys to <code>~/.sshspan/keys/&lt;id&gt;</code> (owner-only
-              permissions) and manages Host blocks in <code>~/.ssh/config</code> between
-              <code># &gt;&gt;&gt; SSHSpan managed &gt;&gt;&gt;</code> markers. Nothing is written without your consent.
-            </p>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h2>Deploy to SSH</h2>
+                <p class="card-sub">
+                  Writes the selected private keys to <code>~/.sshspan/keys/&lt;id&gt;</code> (owner-only
+                  permissions) and manages Host blocks in <code>~/.ssh/config</code> between
+                  <code># &gt;&gt;&gt; SSHSpan managed &gt;&gt;&gt;</code> markers. Nothing is written without your consent.
+                </p>
+              </div>
+              <span class="count-chip" id="deployCount" hidden></span>
+            </div>
             <div class="deploy-options">
               <label>Host alias <input type="text" id="cfgHost" placeholder="myserver" /></label>
               <label>User <input type="text" id="cfgUser" placeholder="deploy" /></label>
               <label>Port <input type="number" id="cfgPort" placeholder="22" min="1" max="65535" /></label>
-              <label class="ghost-btn checkbox">
-                <input type="checkbox" id="strictHostKeyToggle" checked /> StrictHostKeyChecking
-              </label>
-              <label class="ghost-btn checkbox">
-                <input type="checkbox" id="keyPassphraseToggle" /> Encrypt deployed files
-              </label>
+              <label class="toggle-chip"><input type="checkbox" id="strictHostKeyToggle" checked /><span class="toggle-box"></span>StrictHostKeyChecking</label>
+              <label class="toggle-chip"><input type="checkbox" id="keyPassphraseToggle" /><span class="toggle-box"></span>Encrypt deployed files</label>
               <input type="password" id="keyPassphraseInput" placeholder="Deployed-key passphrase" hidden />
             </div>
             <p class="hint" id="deploySelectionHint">Select keys to deploy using the checkboxes in the Keys view.</p>
             <textarea id="configPreview" readonly rows="16" spellcheck="false" placeholder="# Select keys and press Preview"></textarea>
             <div class="config-actions">
-              <button id="previewConfigBtn" class="ghost-btn">Preview</button>
-              <button id="deployConfigBtn" class="primary-btn">Deploy keys + config</button>
-              <button id="copyConfigBtn" class="ghost-btn">Copy config</button>
+              <button id="previewConfigBtn" class="ghost-btn"><span data-ico="file-text"></span>Preview</button>
+              <button id="deployConfigBtn" class="primary-btn"><span data-ico="shield-check"></span>Deploy keys + config</button>
+              <button id="copyConfigBtn" class="ghost-btn"><span data-ico="copy"></span>Copy config</button>
             </div>
           </div>
         </div>
@@ -126,38 +194,53 @@
 
       <div class="view" id="view-settings" hidden>
         <div class="settings-view">
-          <h2>Settings</h2>
-          <div class="settings-grid"></div>
-          <p class="hint">Data location: <code id="dataDirHint">~/.sshspan/sshspan.db</code></p>
-
-          <hr class="sep" />
-
-          <h2>Bitwarden / Vaultwarden sync</h2>
-          <p class="hint">
-            Keeps your SSH keys mirrored as SSH key items in your own vault (folder
-            <code>SSHSpan</code> by default). Two-way: changes sync in both directions,
-            newest wins; deletions are never propagated automatically. Self-hosted servers
-            must use a public hostname &mdash; private, LAN and localhost addresses are
-            refused for safety. The stored vault password is sealed with your SSHSpan
-            master password and only readable while the vault is unlocked.
-          </p>
-          <div class="settings-grid" id="bwGrid"></div>
-          <div class="bw-actions">
-            <button id="bwSaveBtn" class="primary-btn">Save</button>
-            <button id="bwTestBtn" class="ghost-btn">Test connection</button>
-            <button id="bwSyncNowBtn" class="primary-btn">Sync now</button>
+          <h2>General</h2>
+          <div class="card">
+            <div class="settings-grid"></div>
+            <p class="hint">Data location: <code id="dataDirHint">~/.sshspan/sshspan.db</code></p>
           </div>
-          <p class="hint" id="bwStatus"></p>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h2>Bitwarden / Vaultwarden sync</h2>
+                <p class="card-sub">
+                  Keeps your SSH keys mirrored as SSH key items in your own vault (folder
+                  <code>SSHSpan</code> by default). Two-way: changes sync in both directions,
+                  newest wins; deletions are never propagated automatically. Self-hosted servers
+                  must use a public hostname &mdash; private, LAN and localhost addresses are
+                  refused for safety. The stored vault password is sealed with your SSHSpan
+                  master password and only readable while the vault is unlocked.
+                </p>
+              </div>
+            </div>
+            <div class="settings-grid" id="bwGrid"></div>
+            <div class="bw-actions">
+              <button id="bwSaveBtn" class="primary-btn"><span data-ico="cloud-cog"></span>Save</button>
+              <button id="bwTestBtn" class="ghost-btn"><span data-ico="server-cog"></span>Test connection</button>
+              <button id="bwSyncNowBtn" class="primary-btn"><span data-ico="refresh-cw"></span>Sync now</button>
+            </div>
+            <div class="status-strip" id="bwStatus">Not configured yet.</div>
+          </div>
         </div>
       </div>
 
       <div class="view" id="view-audit" hidden>
         <div class="audit-view">
-          <h2>Audit Log</h2>
-          <table class="audit-table">
-            <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
-            <tbody id="auditBody"></tbody>
-          </table>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h2>Audit log</h2>
+                <p class="card-sub">Every sensitive action is recorded locally in your vault.</p>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="audit-table">
+                <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
+                <tbody id="auditBody"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </div>
     </main>
@@ -167,13 +250,16 @@
   <div class="modal-backdrop" id="modalBackdrop" hidden>
     <div class="modal">
       <header class="modal-header">
-        <h2 id="modalTitle">New Key</h2>
-        <button class="icon-btn" data-close>&#10005;</button>
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="key-square"></span>
+          <h2 id="modalTitle">New Key</h2>
+        </div>
+        <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
         <div class="tabs">
-          <button data-tab="generate" class="tab active">Generate</button>
-          <button data-tab="import" class="tab">Import</button>
+          <button data-tab="generate" class="tab active"><span data-ico="key-round"></span>Generate</button>
+          <button data-tab="import" class="tab"><span data-ico="file-up"></span>Import</button>
         </div>
         <div class="tab-panel" id="tab-generate">
           <label>Name <input type="text" id="genName" placeholder="my-laptop" /></label>
@@ -199,17 +285,27 @@
             </select>
           </label>
           <label>Comment <input type="text" id="genComment" placeholder="user@host" /></label>
+          <div class="cat-field">
+            <span class="cat-field-label">Categories</span>
+            <div class="cat-chips" id="genCategories"></div>
+            <button type="button" id="genBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories…</button>
+          </div>
         </div>
         <div class="tab-panel" id="tab-import" hidden>
           <label>Name <input type="text" id="importName" placeholder="work-server" /></label>
           <div class="import-source">
-            <button type="button" id="importBrowseBtn" class="ghost-btn">Browse for key file…</button>
+            <button type="button" id="importBrowseBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse for key file…</button>
             <span class="hint" id="importFileHint">or paste the key material below</span>
           </div>
           <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, PuTTY .ppk v3, SPKI public PEM, or authorized_keys line)
             <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."></textarea>
           </label>
           <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" /></label>
+          <div class="cat-field">
+            <span class="cat-field-label">Categories</span>
+            <div class="cat-chips" id="importCategories"></div>
+            <button type="button" id="importBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories…</button>
+          </div>
         </div>
       </div>
       <footer class="modal-footer">
@@ -222,7 +318,12 @@
   <!-- Modal: Vault (create / unlock / change password) -->
   <div class="modal-backdrop" id="vaultModal" hidden>
     <div class="modal modal-sm">
-      <header class="modal-header"><h2 id="vaultModalTitle">Master Password</h2></header>
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="lock"></span>
+          <h2 id="vaultModalTitle">Master Password</h2>
+        </div>
+      </header>
       <div class="modal-body">
         <p id="vaultModalText">Set a master password to encrypt your private keys at rest.</p>
         <input type="password" id="vaultPassword" placeholder="Master password" autocomplete="off" />
@@ -239,6 +340,105 @@
   <!-- Toast -->
   <div id="toast"></div>
 
+  <!-- Multi-select category picker (used from sidebar filter, new-key modal, detail pane, move-to) -->
+  <div class="modal-backdrop" id="pickerModal" hidden>
+    <div class="modal picker-modal">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="folder"></span>
+          <h2 id="pickerTitle">Categories</h2>
+        </div>
+        <button class="icon-btn" id="pickerCloseBtn" title="Close" data-ico-x=""></button>
+      </header>
+      <div class="modal-body">
+        <div class="search-wrap picker-search">
+          <span class="search-ico" data-ico="search"></span>
+          <input type="search" id="pickerSearch" placeholder="Filter categories…" />
+        </div>
+        <div class="picker-tree" id="pickerTree"></div>
+      </div>
+      <footer class="modal-footer">
+        <button id="pickerCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="pickerSaveBtn" class="primary-btn">Save</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal: New / Edit SSH server -->
+  <div class="modal-backdrop" id="serverModal" hidden>
+    <div class="modal">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="server"></span>
+          <h2 id="serverModalTitle">New Server</h2>
+        </div>
+        <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
+      </header>
+      <div class="modal-body">
+        <div class="server-grid">
+          <label class="span-2">Name <input type="text" id="srvName" placeholder="prod-web-1" /></label>
+          <label>Host <input type="text" id="srvHost" placeholder="192.0.2.10 or host.example.com" /></label>
+          <label>Port <input type="number" id="srvPort" placeholder="22" min="1" max="65535" /></label>
+          <label>Username <input type="text" id="srvUser" placeholder="deploy" /></label>
+          <label class="span-2 auth-method-row">Auth method
+            <div class="seg">
+              <button type="button" data-auth="publickey" class="seg-btn active">Key</button>
+              <button type="button" data-auth="password" class="seg-btn">Password</button>
+              <button type="button" data-auth="keyboard-interactive" class="seg-btn">Kbd-int</button>
+            </div>
+          </label>
+          <div class="span-2 key-row" id="srvKeyRow">
+            <label>Vault key
+              <select id="srvKeyId">
+                <option value="">— select a key —</option>
+              </select>
+            </label>
+            <div class="pem-row">
+              <input type="text" id="srvPemPath" placeholder="…or pick a .pem file on disk" />
+              <button type="button" id="srvBrowsePemBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse</button>
+            </div>
+          </div>
+          <div class="span-2 pw-row" id="srvPwRow" hidden>
+            <label>Password (optional, only used at connect time)
+              <input type="password" id="srvPassword" placeholder="leave blank to type at connect time" autocomplete="off" />
+            </label>
+            <label class="toggle-chip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
+          </div>
+        </div>
+        <p class="hint">Keys are unsealed only inside the Rust process; the renderer never sees private key bytes.</p>
+      </div>
+      <footer class="modal-footer">
+        <button data-close class="ghost-btn">Cancel</button>
+        <button id="srvSaveBtn" class="primary-btn">Save</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Inline rename prompt modal -->
+  <div class="modal-backdrop" id="promptModal" hidden>
+    <div class="modal modal-sm">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="pencil"></span>
+          <h2 id="promptTitle">Rename</h2>
+        </div>
+      </header>
+      <div class="modal-body">
+        <p id="promptMessage" class="hint"></p>
+        <input type="text" id="promptInput" />
+      </div>
+      <footer class="modal-footer">
+        <button id="promptCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="promptOkBtn" class="primary-btn">OK</button>
+      </footer>
+    </div>
+  </div>
+
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script src="vendor/addon-web-links.js"></script>
+  <script src="icons.js"></script>
   <script src="app.js"></script>
+  <script src="terminal.js"></script>
 </body>
 </html>
