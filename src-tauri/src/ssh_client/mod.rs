@@ -150,7 +150,11 @@ pub type SessionId = String;
 
 fn base_client_config() -> client::Config {
     client::Config {
-        inactivity_timeout: Some(Duration::from_secs(0)), // no inactivity drop for interactive
+        // None disables the inactivity timer so an interactive shell can sit
+        // idle indefinitely while the user thinks. Some(Duration::from_secs(0))
+        // would mean "fire after 0 seconds" — russh would tear down the
+        // session the moment the channel went quiet between commands.
+        inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(30)),
         ..<_>::default()
     }
