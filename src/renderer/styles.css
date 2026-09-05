@@ -1159,13 +1159,13 @@ label:focus-within { color: var(--text); }
 .terminal-host {
   flex: 1;
   background: #0f1115;
-  padding: 6px 10px 2px 10px;
+  /* No padding: xterm measures the host box exactly; padding skews FitAddon. */
+  padding: 4px;
   min-height: 0;
   overflow: hidden;
 }
-.terminal-host .xterm,
-.terminal-host .xterm-viewport,
-.terminal-host .xterm-screen { height: 100% !important; }
+/* xterm sizes its own rows/cols; FitAddon picks dimensions that fill this box.
+   Do NOT force heights on .xterm-* elements — that breaks rendering. */
 .terminal-strip {
   border-top: 1px solid var(--line);
   padding: 6px 12px;

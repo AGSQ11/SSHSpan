@@ -260,6 +260,7 @@ pub async fn start_interactive(
     let mut session = client::connect(config, (&target_host[..], target_port), handler)
         .await
         .map_err(|e| anyhow::anyhow!("Connection failed: {e}"))?;
+    eprintln!("[sshspan-terminal] tcp+kex established to {target_host}:{target_port}");
 
     authenticate(&mut session, &ConnectParams {
         server: params.server.clone(),
@@ -268,6 +269,7 @@ pub async fn start_interactive(
         key_pem: params.key_pem.clone(),
         password: params.password.clone(),
     }).await?;
+    eprintln!("[sshspan-terminal] authenticated as {}", params.username);
 
     // Terminal dimensions start at 80x24; the renderer sends the real size right
     // after it learns the session id. The terminal_modes list must include
@@ -288,6 +290,7 @@ pub async fn start_interactive(
         .request_shell(true)
         .await
         .map_err(|e| anyhow::anyhow!("Shell request failed: {e}"))?;
+    eprintln!("[sshspan-terminal] pty + shell ready, streaming");
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -310,7 +313,9 @@ pub async fn start_interactive(
         "\r\n\x1b[1;32mConnected to {target_host}:{target_port} as {} ({server_name})\x1b[0m\r\n",
         params.username
     );
-    let _ = on_data.send(banner);
+    if let Err(e) = on_data.send(banner) {
+        eprintln!("[sshspan-terminal] channel send failed right after connect: {e}");
+    }
 
     tauri::async_runtime::spawn(async move {
         loop {
@@ -319,13 +324,17 @@ pub async fn start_interactive(
                     match msg {
                         Some(ChannelMsg::Data { data }) => {
                             let text = String::from_utf8_lossy(&data);
-                            if on_data.send(text.to_string()).is_err() {
-                                break; // renderer went away
+                            if let Err(e) = on_data.send(text.to_string()) {
+                                // Renderer channel died — tear the session down,
+                                // but leave a stderr trail so it is diagnosable.
+                                eprintln!("[sshspan-terminal] data send failed, closing session {reg_session_id}: {e}");
+                                break;
                             }
                         }
                         Some(ChannelMsg::ExtendedData { data, .. }) => {
                             let text = String::from_utf8_lossy(&data);
-                            if on_data.send(text.to_string()).is_err() {
+                            if let Err(e) = on_data.send(text.to_string()) {
+                                eprintln!("[sshspan-terminal] stderr-send failed, closing session {reg_session_id}: {e}");
                                 break;
                             }
                         }

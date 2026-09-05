@@ -121,11 +121,13 @@ pub async fn terminal_connect(
     ).map_err(CmdError)?;
 
     // Welcome banner so the user sees something even before the first
-    // shell prompt arrives.
-    let _ = on_data.send(format!(
+    // shell prompt arrives. If the channel to the webview is broken, FAIL
+    // LOUDLY — a silent failure here looks exactly like a connected-but-blank
+    // terminal, which cost us a debugging cycle already.
+    on_data.send(format!(
         "\r\n\x1b[1;36mConnecting to {}:{} as {} (auth={})\x1b[0m\r\n",
         resolved.server.host, resolved.server.port, resolved.username, resolved.auth_method
-    ));
+    )).map_err(|e| CmdError(format!("Terminal channel to webview is not delivering data: {e}")))?;
 
     let session_id = ssh_client::start_interactive(
         resolved.clone(),
