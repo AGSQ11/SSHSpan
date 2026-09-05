@@ -16,6 +16,11 @@
 
 'use strict';
 
+// Boot marker: app.js checks this at startup. If it's missing, terminal.js
+// did not load/execute and the Connect view cannot work — we surface that
+// visibly instead of failing silently.
+window.__SSHPAN_TERMINAL_JS__ = 'loaded-v7';
+
 const { invoke, Channel } = window.__TAURI__.core;
 
 let term = null;

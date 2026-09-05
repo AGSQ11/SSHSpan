@@ -1,7 +1,7 @@
 {
   "name": "sshspan",
   "productName": "SSHSpan",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Cross-platform SSH key manager. Create, store, organize, and deploy SSH keys with a local encrypted SQLite database.",
   "author": {
     "name": "AGSQ11",
@@ -23,24 +23,24 @@
     "rsa",
     "ed25519",
     "ecdsa",
-    "electron",
+    "tauri",
     "security",
-    "sqlite"
+    "sqlite",
+    "bitwarden"
   ],
-  "main": "src/main/index.js",
+  "main": "src/renderer/app.js",
   "scripts": {
-    "start": "electron .",
-    "dev": "electron . --enable-logging",
-    "test": "node tests/run-tests.js",
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "dist:win": "tauri build --target x86_64-pc-windows-msvc",
+    "dist:linux": "tauri build --target x86_64-unknown-linux-gnu",
     "icon": "node scripts/make-icon.js",
     "icon:sidebar": "node scripts/make-sidebar-icon.js",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder",
-    "dist:win": "electron-builder --win",
-    "dist:linux": "electron-builder --linux"
+    "test": "node tests/run-tests.js"
   },
   "engines": {
-    "node": ">=22.6.0"
+    "node": ">=18.0.0"
   },
   "os": [
     "win32",
@@ -49,51 +49,10 @@
   ],
   "type": "commonjs",
   "dependencies": {
-    "bcrypt-pbkdf": "^1.0.2",
-    "hash-wasm": "^4.12.0",
-    "sql.js": "^1.13.0"
+    "bcrypt-pbkdf": "^1.0.2"
   },
   "devDependencies": {
-    "electron": "^33.0.0",
-    "electron-builder": "^24.13.3"
-  },
-  "build": {
-    "appId": "org.sshspan.app",
-    "productName": "SSHSpan",
-    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
-    "directories": {
-      "output": "release",
-      "buildResources": "assets"
-    },
-    "files": [
-      "src/**/*",
-      "assets/**/*",
-      "package.json"
-    ],
-    "asar": true,
-    "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ],
-      "icon": "assets/icon.png"
-    },
-    "linux": {
-      "target": [
-        "AppImage",
-        "deb"
-      ],
-      "category": "Utility",
-      "icon": "assets/icon.png"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "artifactName": "${productName}-Setup-${version}.${ext}",
-      "license": "assets/license.txt"
-    },
-    "portable": {
-      "artifactName": "${productName}-Portable-${version}.${ext}"
-    }
+    "@tauri-apps/cli": "^2",
+    "@tauri-apps/api": "^2"
   }
 }

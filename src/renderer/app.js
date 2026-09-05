@@ -1563,7 +1563,7 @@ async function switchView(view) {
     applyNavLockState();
     if (state.unlocked) {
       await loadServers();
-      el('termStrip').textContent = 'Ready.';
+      el('termStrip').textContent = 'Ready. (build ' + (window.__SSHPAN_BUILD__ || 'unknown') + ')';
     } else {
       clearConnectView();
     }
@@ -2060,6 +2060,12 @@ function openServerPickerForKey(key) {
 // ─── Connect / disconnect / test ───────────────────────────────────────────
 
 async function connectToServer(srv, opts = {}) {
+  // Hard requirement: terminal.js provides the xterm glue. Never skip silently.
+  if (typeof terminalConnect !== 'function' || typeof ensureTerminalForSession !== 'function') {
+    el('termStrip').textContent = 'terminal.js is missing — Connect cannot run.';
+    toast('terminal.js is missing — reinstall the app.', 'err');
+    return;
+  }
   if (state.connectSessionId) {
     if (!confirm('A connection is already open. Disconnect it and start a new one?')) return;
     await disconnectActive();
@@ -2067,54 +2073,48 @@ async function connectToServer(srv, opts = {}) {
   // Build the xterm instance now that the view is visible. Doing this earlier
   // (during initTerminal) failed because the host element had zero size while
   // the connect view was hidden.
-  if (typeof ensureTerminalForSession === 'function') ensureTerminalForSession();
-  if (typeof terminalReset === 'function') terminalReset();
-  if (typeof terminalSetStatus === 'function') terminalSetStatus(`Connecting to ${srv.host}:${srv.port}…`);
+  ensureTerminalForSession();
+  terminalReset();
   el('termTitle').textContent = srv.name;
   el('termBadge').textContent = srv.host + ':' + srv.port;
   el('termBadge').hidden = false;
   // Only show Disconnect once a session is actually open.
   el('termDisconnectBtn').hidden = true;
-  // Show a Connecting indicator instead of Reconnect/Test while we're trying.
   el('termReconnectBtn').hidden = true;
   el('termTestBtn').hidden = true;
-  // Disable the server-list rows so the user can't double-click another row.
   if (el('serverList')) el('serverList').classList.add('connecting');
 
   let pw = null;
-  if (srv.authMethod !== 'publickey') {
-    // Use a custom modal — native prompt() silently fails in Tauri webview.
+  if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
+    // No password stored — ask at connect time via the custom modal (native
+    // prompt() silently fails in Tauri webview).
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) {
-      if (typeof terminalSetStatus === 'function') terminalSetStatus('Cancelled.');
+      terminalSetStatus('Cancelled.');
       if (el('serverList')) el('serverList').classList.remove('connecting');
       return;
     }
   }
 
-  if (typeof terminalConnect === 'function') {
-    try {
-      const sessionId = await terminalConnect(srv, { cols: 80, rows: 24, ...opts });
-      state.connectSessionId = sessionId;
-      state.connectServerId = srv.id;
-      // Success — flip to the connected button set.
-      el('termReconnectBtn').hidden = false;
-      el('termDisconnectBtn').hidden = false;
-      el('termTestBtn').hidden = false;
-      if (el('serverList')) el('serverList').classList.remove('connecting');
-      if (typeof terminalSetStatus === 'function') terminalSetStatus(`Connected to ${srv.host}:${srv.port}`);
-    } catch (e) {
-      const msg = e.message || String(e);
-      state.connectSessionId = null;
-      state.connectServerId = null;
-      // Failure — fall back to the unconnected button set.
-      el('termDisconnectBtn').hidden = true;
-      el('termReconnectBtn').hidden = false;
-      el('termTestBtn').hidden = false;
-      if (el('serverList')) el('serverList').classList.remove('connecting');
-      if (typeof terminalSetStatus === 'function') terminalSetStatus(`Failed: ${msg}`);
-      toast(msg, 'err');
-    }
+  try {
+    const sessionId = await terminalConnect(srv, { cols: 80, rows: 24, ...opts });
+    state.connectSessionId = sessionId;
+    state.connectServerId = srv.id;
+    // Success — flip to the connected button set.
+    el('termReconnectBtn').hidden = false;
+    el('termDisconnectBtn').hidden = false;
+    el('termTestBtn').hidden = false;
+    if (el('serverList')) el('serverList').classList.remove('connecting');
+  } catch (e) {
+    const msg = e.message || String(e);
+    state.connectSessionId = null;
+    state.connectServerId = null;
+    el('termDisconnectBtn').hidden = true;
+    el('termReconnectBtn').hidden = false;
+    el('termTestBtn').hidden = false;
+    if (el('serverList')) el('serverList').classList.remove('connecting');
+    terminalSetStatus(`Failed: ${msg}`);
+    toast(msg, 'err');
   }
 }
 
@@ -2132,7 +2132,7 @@ async function disconnectActive() {
 
 async function testSelectedServer(srv) {
   let pw = null;
-  if (srv.authMethod !== 'publickey') {
+  if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) return;
   }
@@ -2173,12 +2173,25 @@ function escapeHtml(s) {
 // ─── boot ──────────────────────────────────────────────────────────────────
 
 (async function main() {
+  // Surface any uncaught renderer error — in release builds there is no
+  // devtools console, so silent failures look like "nothing happens".
+  window.addEventListener('error', (ev) => {
+    toast('JS error: ' + (ev.message || 'unknown'), 'err');
+  });
+
+  // terminal.js must be loaded for the Connect view to function. It sets this
+  // marker as its first statement; if it is missing, that script did not load.
+  window.__SSHPAN_BUILD__ = 'diag-v7';
+
   injectIcons();
   wire();
   onGenTypeChange();
   switchTab('generate');
   updateSelectionHint();
   loadBrandIcon();
+  if (!window.__SSHPAN_TERMINAL_JS__) {
+    toast('terminal.js failed to load — the Connect view will not work. Please reinstall.', 'err');
+  }
   await refreshVaultStatus();
 
   // Catch auto-locks without user interaction.
