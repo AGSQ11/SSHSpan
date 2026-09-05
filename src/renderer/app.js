@@ -2064,7 +2064,11 @@ async function connectToServer(srv, opts = {}) {
     if (!confirm('A connection is already open. Disconnect it and start a new one?')) return;
     await disconnectActive();
   }
-  if (typeof terminalReset === 'function') terminalReset('');
+  // Build the xterm instance now that the view is visible. Doing this earlier
+  // (during initTerminal) failed because the host element had zero size while
+  // the connect view was hidden.
+  if (typeof ensureTerminalForSession === 'function') ensureTerminalForSession();
+  if (typeof terminalReset === 'function') terminalReset();
   if (typeof terminalSetStatus === 'function') terminalSetStatus(`Connecting to ${srv.host}:${srv.port}…`);
   el('termTitle').textContent = srv.name;
   el('termBadge').textContent = srv.host + ':' + srv.port;
@@ -2093,6 +2097,11 @@ async function connectToServer(srv, opts = {}) {
       if (typeof terminalSetStatus === 'function') terminalSetStatus(`Connected to ${srv.host}:${srv.port}`);
     } catch (e) {
       const msg = e.message || String(e);
+      state.connectSessionId = null;
+      state.connectServerId = null;
+      el('termDisconnectBtn').hidden = true;
+      el('termReconnectBtn').hidden = false;
+      el('termTestBtn').hidden = false;
       if (typeof terminalSetStatus === 'function') terminalSetStatus(`Failed: ${msg}`);
       toast(msg, 'err');
     }

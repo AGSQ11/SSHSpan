@@ -94,12 +94,14 @@ fn resolve_for_server(
 /// Used at every `.map_err()` site that needs the result of an `anyhow::Result`.
 fn anyhow_cmd(e: anyhow::Error) -> CmdError { CmdError(e.to_string()) }
 
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn terminal_connect(
     app: AppHandle,
     server_id: String,
     cols: u32,
     rows: u32,
+    // Rust param name uses snake_case to satisfy clippy; the JS side sends the
+    // camelCase variant `onData` per Tauri v2's default argument-case rule.
     on_data: Channel<String>,
     override_username: Option<String>,
     override_key_id: Option<String>,
@@ -118,24 +120,19 @@ pub async fn terminal_connect(
         override_username, override_key_id, override_pem_path, prompt_password,
     ).map_err(CmdError)?;
 
-    // Emit a friendly banner the moment we know the host key is wrong, instead
-    // of letting russh surface the failure as a bare error string. We can't
-    // detect the mismatch here (we don't have the presented key yet) but we
-    // can give the user a clear next-step hint after the fact by attaching a
-    // small `mismatch_hint` flag the renderer can use to render a help line.
+    // Welcome banner so the user sees something even before the first
+    // shell prompt arrives.
     let _ = on_data.send(format!(
         "\r\n\x1b[1;36mConnecting to {}:{} as {} (auth={})\x1b[0m\r\n",
         resolved.server.host, resolved.server.port, resolved.username, resolved.auth_method
     ));
 
-    // Spawn the connection — returns the new session id.
     let session_id = ssh_client::start_interactive(
         resolved.clone(),
         db.clone(),
         registry.clone(),
         on_data,
     ).await.map_err(|e| {
-        // Translate the most common russh errors into something readable.
         let msg = e.to_string();
         let friendly = if msg.contains("Key exchange failed") || msg.contains("key exchange") {
             "The host rejected the connection during key exchange. If this host's fingerprint changed, forget it in the known_hosts list and retry.".to_string()

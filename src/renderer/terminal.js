@@ -6,12 +6,12 @@
  * (their UMD wrappers attach to globalThis).
  *
  * Public functions (called from app.js):
- *   initTerminal()               - called once at boot
- *   terminalReset(bannerText)    - clear screen, optional first line
+ *   initTerminal()               - called once at boot (deferred until visible)
+ *   ensureTerminalForSession()   - called when a session is starting; open +
+ *                                   fit the terminal in its now-visible host.
+ *   terminalReset()              - clear screen before a new session
  *   terminalSetStatus(text)      - write to the bottom status strip
- *   terminalConnect(server, opts) - returns a Promise<string sessionId>;
- *                                   sets up the on_data channel and the
- *                                   keystroke/resize flows.
+ *   terminalConnect(server, opts) - opens the russh session; returns sessionId.
  *
  * The Rust side hands us a `tauri::ipc::Channel<String>` that streams
  * server-rendered terminal output. We feed each line to term.write().
@@ -19,24 +19,42 @@
 
 'use strict';
 
-const { invoke, Channel } = window.__TAURI__.core;
+const { invoke, Channel: TauriChannelCtor } = window.__TAURI__.core;
+const Channel = TauriChannelCtor;
 
 let term = null;
 let fitAddon = null;
+let webLinksAddon = null;
 let resizeObserver = null;
+let sessionEndedFlag = false;
+let currentSessionId = null;
 
-function ensureTerminal() {
+function findVendorGlobal(...names) {
+  for (const n of names) {
+    if (window[n]) return window[n];
+    if (window.FitAddon && window.FitAddon.FitAddon && n === 'FitAddon') return window.FitAddon.FitAddon;
+    if (window.WebLinksAddon && window.WebLinksAddon.WebLinksAddon && n === 'WebLinksAddon') return window.WebLinksAddon.WebLinksAddon;
+  }
+  return null;
+}
+
+function buildTerminal() {
   if (term) return term;
   const host = document.getElementById('terminalHost');
   if (!host) return null;
+  // The host div is inside `.terminal-col` which starts hidden. xterm.js
+  // measures on `open()` so we must only build the terminal when the view
+  // has been switched to. The host may also have zero size at first paint
+  // even after unhide, so we set explicit minimums and use FitAddon only
+  // after the first frame is laid out.
+  host.style.minHeight = '240px';
 
-  // xterm.js v5 globals from the vendored UMD bundles.
   const Terminal = window.Terminal;
-  const FitAddon = window.FitAddon && window.FitAddon.FitAddon;
-  const WebLinksAddon = window.WebLinksAddon && window.WebLinksAddon.WebLinksAddon;
+  const FitAddon = findVendorGlobal('FitAddon');
+  const WebLinksAddon = findVendorGlobal('WebLinksAddon');
 
   if (!Terminal) {
-    host.textContent = 'Failed to load xterm.js (Terminal is undefined).';
+    host.textContent = 'Failed to load xterm.js (Terminal is undefined). The vendor bundle may be missing.';
     return null;
   }
 
@@ -57,26 +75,35 @@ function ensureTerminal() {
 
   if (FitAddon) {
     fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
+    try { term.loadAddon(fitAddon); } catch (e) { /* addon missing — non-fatal */ }
   }
   if (WebLinksAddon) {
-    term.loadAddon(new WebLinksAddon());
+    webLinksAddon = new WebLinksAddon();
+    try { term.loadAddon(webLinksAddon); } catch (e) { /* addon missing — non-fatal */ }
   }
 
   term.open(host);
-  // Initial fit on the next tick (DOM measurements).
-  setTimeout(() => { try { fitAddon && fitAddon.fit(); } catch (e) {} }, 0);
+  // First fit on the next tick so width/height are settled.
+  requestAnimationFrame(() => {
+    try { fitAddon && fitAddon.fit(); } catch (e) {}
+  });
 
+  // ResizeObserver: only run while a session is active to avoid sending
+  // resize events with NaN/uninitialized dimensions before connect.
   resizeObserver = new ResizeObserver(() => {
     if (!fitAddon || !term) return;
     try {
-      fitAddon.fit();
-      if (window.__sshspanActiveSession) {
-        invoke('terminal_resize', {
-          sessionId: window.__sshspanActiveSession,
-          cols: term.cols,
-          rows: term.rows,
-        }).catch(() => {});
+      const proposed = fitAddon.proposeDimensions();
+      if (proposed && !isNaN(proposed.cols) && !isNaN(proposed.rows)
+          && proposed.cols >= 2 && proposed.rows >= 1) {
+        fitAddon.fit();
+        if (currentSessionId) {
+          invoke('terminal_resize', {
+            sessionId: currentSessionId,
+            cols: term.cols,
+            rows: term.rows,
+          }).catch(() => {});
+        }
       }
     } catch (e) {}
   });
@@ -85,16 +112,24 @@ function ensureTerminal() {
   return term;
 }
 
-function initTerminal() {
-  ensureTerminal();
+function ensureTerminalForSession() {
+  return buildTerminal();
 }
 
-function terminalReset(bannerText) {
-  const t = ensureTerminal();
+function initTerminal() {
+  // No-op until a session is starting. Building xterm on a hidden element
+  // throws because of zero-dimension measurements; we wait for the user to
+  // actually open the Connect view (handled by switchView in app.js, which
+  // calls ensureTerminalForSession lazily on the first connect).
+}
+
+function terminalReset() {
+  const t = buildTerminal();
   if (!t) return;
   t.reset();
-  setTimeout(() => { try { fitAddon && fitAddon.fit(); } catch (e) {} }, 0);
-  if (bannerText) t.writeln(bannerText);
+  requestAnimationFrame(() => {
+    try { fitAddon && fitAddon.fit(); } catch (e) {}
+  });
 }
 
 function terminalSetStatus(text) {
@@ -102,100 +137,126 @@ function terminalSetStatus(text) {
   if (s) s.textContent = text;
 }
 
-// One Channel<String> per session. The Rust terminal_connect handler accepts
-// it as a parameter named `on_data` (camelCase) and pipes output into it.
 function terminalConnect(server, opts) {
   return new Promise(async (resolve, reject) => {
-    const t = ensureTerminal();
+    const t = buildTerminal();
     if (!t) return reject(new Error('xterm.js unavailable'));
     if (!server || !server.id) return reject(new Error('Server is required.'));
-    terminalReset('');
-    setTimeout(() => { try { fitAddon && fitAddon.fit(); } catch (e) {} }, 0);
 
+    sessionEndedFlag = false;
+    currentSessionId = null;
+
+    terminalReset();
+    // Focus the terminal so it receives keystrokes.
+    setTimeout(() => { try { t.focus(); } catch (e) {} }, 50);
+
+    // Tauri v2 Channel: this is a structured IPC channel. Each .send() from
+    // Rust triggers onmessage on the JS side. We pass it directly to invoke().
     const onData = new Channel();
     onData.onmessage = (text) => {
-      if (!text) return;
+      if (typeof text !== 'string') return;
+      // text may include ANSI sequences; xterm.js parses them.
       try { t.write(text); } catch (e) {}
     };
 
+    // Tauri command arg naming: Rust side is `onData` (camelCase). The
+    // payload key MUST match what Tauri expects, which by default is the
+    // camelCase form of the Rust parameter name.
     const args = {
       serverId: server.id,
       cols: t.cols || 80,
       rows: t.rows || 24,
-      on_data: onData,
+      onData: onData,
       overrideUsername: opts && opts.overrideUsername,
       overrideKeyId: opts && opts.overrideKeyId,
       overridePemPath: opts && opts.overridePemPath,
       promptPassword: opts && opts.promptPassword,
     };
 
-    // Forward keystrokes to the SSH session. xterm.js sends raw bytes
-    // (including escape sequences for arrow keys, Ctrl-C, etc.).
+    // Send keystrokes as raw bytes to the SSH session.
     const dataSub = t.onData(async (data) => {
-      if (!window.__sshspanActiveSession) return;
+      if (!currentSessionId) return;
       try {
+        const bytes = Array.from(data).map(c => c.charCodeAt(0) & 0xff);
         await invoke('terminal_send', {
-          sessionId: window.__sshspanActiveSession,
-          bytes: Array.from(data).map(c => c.charCodeAt(0) & 0xff),
+          sessionId: currentSessionId,
+          bytes,
         });
       } catch (e) {
-        // ignore individual keystroke errors (closed channel, etc.)
+        // Channel may have closed; let the close-detection below tear us down.
       }
     });
 
     try {
       const r = await invoke('terminal_connect', args);
-      const sessionId = r && r.sessionId;
-      if (!sessionId) throw new Error((r && r.error) || 'No session id returned.');
+      if (!r || !r.ok || !r.sessionId) {
+        const errMsg = (r && r.error) || 'No session id returned.';
+        throw new Error(errMsg);
+      }
+      const sessionId = r.sessionId;
+      currentSessionId = sessionId;
+      sessionEndedFlag = false;
 
-      window.__sshspanActiveSession = sessionId;
-
-      // Stop forwarding keystrokes and tear down on disconnect.
-      const oldSession = sessionId;
-      const finishOnClose = () => {
-        if (window.__sshspanActiveSession !== oldSession) return;
-        window.__sshspanActiveSession = null;
-        try { dataSub.dispose(); } catch (e) {}
-        try { t.writeln('\r\n\x1b[1;33m[connection closed]\x1b[0m'); } catch (e) {}
-        if (typeof window.onTerminalClosed === 'function') window.onTerminalClosed();
-      };
-
-      // The session ends when the Rust task drops its input_tx (our disconnect)
-      // or when the channel closes from the server. We can't observe that from
-      // JS directly, so we hook the "exit" pattern: when the next terminal_send
-      // fails (channel closed), we treat it as ended.
-      const origSend = t.onData;
-      // Wrap dataSub by replacing the onData handler: detect closed channel via
-      // a one-shot probe after a write.
-      const probeId = setInterval(async () => {
-        if (window.__sshspanActiveSession !== oldSession) {
-          clearInterval(probeId);
-          return;
-        }
-        try {
-          await invoke('terminal_list', {});
-        } catch (e) {
-          clearInterval(probeId);
-          finishOnClose();
-        }
-      }, 4000);
-
-      // Send the actual terminal size now that the session is open.
+      // Push the actual size now that we have a live session.
       try {
         await invoke('terminal_resize', {
           sessionId, cols: t.cols, rows: t.rows,
         });
       } catch (e) {}
 
+      // Close detection: when a send fails because the channel has been
+      // dropped on the Rust side, mark the session as ended. This is more
+      // reliable than a polling probe and reacts within milliseconds of
+      // either side hanging up.
+      let pollHandle = null;
+      const startCloseDetection = () => {
+        pollHandle = setInterval(async () => {
+          if (sessionEndedFlag || currentSessionId !== sessionId) {
+            clearInterval(pollHandle);
+            return;
+          }
+          try {
+            await invoke('terminal_list', {});
+          } catch (e) {
+            clearInterval(pollHandle);
+            if (!sessionEndedFlag) doClose(sessionId);
+          }
+        }, 1500);
+      };
+
+      const doClose = (sid) => {
+        if (sessionEndedFlag || currentSessionId !== sid) return;
+        sessionEndedFlag = true;
+        currentSessionId = null;
+        try { dataSub.dispose(); } catch (e) {}
+        try { t.writeln('\r\n\x1b[1;33m[connection closed]\x1b[0m'); } catch (e) {}
+        if (typeof window.onTerminalClosed === 'function') window.onTerminalClosed();
+      };
+
+      // Initial size send might race; trigger after a small delay so the
+      // server-side PTY matches what xterm reports.
+      setTimeout(() => {
+        try {
+          invoke('terminal_resize', {
+            sessionId, cols: t.cols, rows: t.rows,
+          }).catch(() => {});
+        } catch (e) {}
+        startCloseDetection();
+      }, 50);
+
       resolve(sessionId);
     } catch (e) {
       try { dataSub.dispose(); } catch (e2) {}
-      reject(e);
+      currentSessionId = null;
+      const msg = e && e.message ? e.message : String(e);
+      try { t.writeln('\r\n\x1b[1;31m[connection failed: ' + msg + ']\x1b[0m'); } catch (e3) {}
+      reject(new Error(msg));
     }
   });
 }
 
 window.initTerminal = initTerminal;
+window.ensureTerminalForSession = ensureTerminalForSession;
 window.terminalReset = terminalReset;
 window.terminalSetStatus = terminalSetStatus;
 window.terminalConnect = terminalConnect;
