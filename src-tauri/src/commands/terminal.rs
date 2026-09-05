@@ -18,14 +18,17 @@ use super::{CmdResult, CmdError};
 
 // ─── Resolution helpers ─────────────────────────────────────────────────────
 
-/// Decrypt the vault-stored key into the PEM bytes russh wants to load.
-fn key_pem_for_id(db: &Database, vault_pw: &str, key_id: &str) -> Result<String, String> {
+/// Decrypt the vault-stored key into OpenSSH PRIVATE KEY text for russh.
+/// The vault stores the private half as a raw binary OpenSSH blob (not PEM),
+/// so route it through the same load+export path used by key_export/deploy.
+fn key_pem_for_id(app: &AppHandle, db: &Database, vault_pw: &str, key_id: &str) -> Result<String, String> {
     let key = db.get_key(key_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Key not found: {key_id}"))?;
-    let bytes = crate::crypto::vault::unseal(vault_pw, &key.private_key_encrypted)
-        .map_err(|_| "Failed to decrypt key — vault password may have changed.".to_string())?;
-    String::from_utf8(bytes).map_err(|_| "Key bytes are not valid UTF-8 PEM.".to_string())
+    let key_data = super::load_private_key_data(app, &key, vault_pw)
+        .map_err(|e| format!("Could not load vault key \"{}\": {e}", key.name))?;
+    crate::crypto::keys::export_private_key(&key_data, crate::crypto::keys::KeyFormat::OpenSsh, None)
+        .map_err(|e| format!("Could not serialize key \"{}\" for SSH: {e}", key.name))
 }
 
 /// Decrypt a server's saved password (sealed with the same vault master) if one is stored.
@@ -46,6 +49,7 @@ fn saved_pw_for_server(_db: &Database, vault_pw: &str, server: &db::ServerRecord
 /// key to connect…" right-click flow — when the user picks a key right on a key
 /// row, we want to keep the server's saved username but swap the key.
 fn resolve_for_server(
+    app: &AppHandle,
     db: &Database,
     vault_pw: &str,
     server_id: &str,
@@ -67,7 +71,7 @@ fn resolve_for_server(
     // publickey: prefer the override key (from key context menu), then the server's key_id, then its pem_path.
     if auth_method == "publickey" {
         if let Some(kid) = override_key_id.or_else(|| server.key_id.clone()) {
-            key_pem = Some(key_pem_for_id(db, vault_pw, &kid)?);
+            key_pem = Some(key_pem_for_id(app, db, vault_pw, &kid)?);
         } else if let Some(p) = override_pem_path.or_else(|| server.pem_path.clone()) {
             // Read PEM from disk — leaves the file untouched, treats it as a public key on the SSH server side.
             key_pem = Some(std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?);
@@ -116,7 +120,7 @@ pub async fn terminal_connect(
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
 
     let resolved = resolve_for_server(
-        &db, &vault_pw, &server_id,
+        &app, &db, &vault_pw, &server_id,
         override_username, override_key_id, override_pem_path, prompt_password,
     ).map_err(CmdError)?;
 
@@ -233,7 +237,7 @@ pub async fn server_test(
     let db = app.state::<AppState>().db.clone();
 
     let resolved = resolve_for_server(
-        &db, &vault_pw, &server_id, None, None, None, prompt_password,
+        &app, &db, &vault_pw, &server_id, None, None, None, prompt_password,
     ).map_err(CmdError)?;
 
     let started = std::time::Instant::now();
