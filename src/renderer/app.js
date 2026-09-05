@@ -2204,11 +2204,7 @@ function escapeHtml(s) {
     toast('JS error: ' + (ev.message || 'unknown'), 'err');
   });
 
-  // terminal.js must be loaded for the Connect view to function. It sets this
-  // marker as its first statement; if it is missing, that script did not load.
-  window.__SSHPAN_BUILD__ = 'putty-v9c';
-  // Show the build marker in the window title — visible on every screen
-  // (including the unlock modal), so a stale install is instantly obvious.
+  window.__SSHPAN_BUILD__ = 'v10-dynload';
   document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();
@@ -2217,15 +2213,36 @@ function escapeHtml(s) {
   switchTab('generate');
   updateSelectionHint();
   loadBrandIcon();
-  await refreshVaultStatus();
 
-  // terminal.js must be loaded for the Connect view to function. IMPORTANT:
-  // this check must run only after ALL classic scripts have executed — app.js
-  // itself runs BEFORE terminal.js in document order, so checking before the
-  // first await would always fire a false "terminal.js failed to load" toast.
-  if (!window.__SSHPAN_TERMINAL_JS__) {
-    toast('terminal.js failed to load — the Connect view will not work. Please reinstall.', 'err');
+  // Load the terminal stack explicitly, in order, with loud per-file errors.
+  // A statically-failed <script src> fires no window.onerror — it fails
+  // silently, which cost us days of "blank terminal" debugging.
+  const loadScript = (src) => new Promise((resolve) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = () => resolve({ src, ok: true });
+    s.onerror = () => resolve({ src, ok: false });
+    document.head.appendChild(s);
+  });
+  const results = [];
+  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js']) {
+    const r = await loadScript(src);
+    results.push(r);
+    if (!r.ok) toast('Failed to load ' + src + ' — Connect will not work.', 'err');
   }
+
+  // Build marker: visible in the sidebar brand on every screen (the window
+  // title is owned by the OS window and does not follow document.title).
+  const brandSub = document.querySelector('.brand-sub');
+  if (brandSub) brandSub.textContent = 'KEY MANAGER · ' + window.__SSHPAN_BUILD__;
+
+  if (!window.__SSHPAN_TERMINAL_JS__) {
+    toast('terminal.js loaded but did not initialize — Connect view will not work.', 'err');
+  } else if (!window.Terminal) {
+    toast('xterm.js did not expose window.Terminal — terminal rendering unavailable.', 'err');
+  }
+
+  await refreshVaultStatus();
 
   // Catch auto-locks without user interaction.
   setInterval(() => {
