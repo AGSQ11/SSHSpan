@@ -2204,7 +2204,7 @@ function escapeHtml(s) {
     toast('JS error: ' + (ev.message || 'unknown'), 'err');
   });
 
-  window.__SSHPAN_BUILD__ = 'v11-cursor';
+  window.__SSHPAN_BUILD__ = 'v13-colors';;;
   document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();

@@ -1194,6 +1194,33 @@ label:focus-within { color: var(--text); }
 }
 .term-max-btn svg { width: 14px; height: 14px; }
 
+/* ─── xterm.js core rules missing from the vendored xterm.css ────────────────
+   @xterm/xterm@5.5.0 ships an incomplete css/xterm.css: without these rules the
+   row grid collapses to free-flowing text (no white-space: pre), and the
+   selection layer has no positioning. Verified via CDP against the packaged
+   app. The renderer's own injected <style> (colors, span layout, cursor) needs
+   CSP style-src 'unsafe-inline' to apply — see tauri.conf.json. */
+.xterm .xterm-rows {
+  position: absolute;
+  right: 0;
+  left: 0;
+  top: 0;
+}
+.xterm .xterm-rows > div {
+  white-space: pre;
+}
+.xterm .xterm-selection {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 5;
+}
+.xterm .xterm-selection div {
+  position: absolute;
+}
+.xterm-bold { font-weight: bold; }
+.xterm-italic { font-style: italic; }
+
 /* ─── Terminal maximized-to-app mode ─────────────────────────────────────
    #app.term-max: the terminal takes over the whole window. A thin taskbar
    (terminal-head on top + status strip at the bottom) stays usable; the

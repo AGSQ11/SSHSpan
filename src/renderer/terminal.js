@@ -19,7 +19,7 @@
 // Boot marker: app.js checks this at startup. If it's missing, terminal.js
 // did not load/execute and the Connect view cannot work — we surface that
 // visibly instead of failing silently.
-window.__SSHPAN_TERMINAL_JS__ = 'loaded-v11';
+window.__SSHPAN_TERMINAL_JS__ = 'loaded-v13';;;
 
 // NOTE: app.js already declares top-level `const invoke` in the shared global
 // lexical scope of these classic scripts. Re-declaring `invoke` (or any
@@ -107,10 +107,19 @@ function buildTerminal() {
   }
 
   term.open(host);
+  // Debug handle: lets CDP/devtools write ANSI test patterns directly.
+  window.__term = term;
   // Fit on the next two frames so layout is fully settled before measuring.
   requestAnimationFrame(() => requestAnimationFrame(() => {
     try { fitAddon && fitAddon.fit(); } catch (e) {}
   }));
+
+  // Window resizes must refit: the ResizeObserver on host can miss cases
+  // (e.g. maximize) — observed live: the grid stayed at its original 500px.
+  window.addEventListener('resize', () => {
+    clearTimeout(window.__sshRefitTimer);
+    window.__sshRefitTimer = setTimeout(fitTerminalNow, 120);
+  });
 
   // ── PuTTY-style clipboard behavior ──────────────────────────────────────
   // Selecting text copies it immediately; right-click pastes the clipboard
