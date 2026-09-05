@@ -82,7 +82,10 @@ function buildTerminal() {
       background: '#0f1115',
       foreground: '#e7e9ee',
       cursor: '#ffffff',
-      selectionBackground: '#3b82f640',
+      // Selection uses the app accent (--accent #6ea8ff) at ~35% alpha so the
+      // glyphs underneath stay readable; slightly dimmer when unfocused.
+      selectionBackground: '#6ea8ff59',
+      selectionInactiveBackground: '#6ea8ff33',
     },
     scrollback: 5000,
     convertEol: false,
