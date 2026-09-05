@@ -157,6 +157,13 @@ function terminalConnect(server, opts) {
       if (typeof text !== 'string') return;
       // text may include ANSI sequences; xterm.js parses them.
       try { t.write(text); } catch (e) {}
+      // Also surface first few to the status line — confirms streaming is alive
+      // even if rendering is glitchy.
+      const strip = document.getElementById('termStrip');
+      if (strip && text.length > 0 && strip.dataset.firstByte !== '1') {
+        strip.dataset.firstByte = '1';
+        strip.textContent = 'Receiving data: ' + text.replace(/\x1b\[[0-9;]*m/g, '').slice(0, 60);
+      }
     };
 
     // Tauri command arg naming: Rust side is `onData` (camelCase). The

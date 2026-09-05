@@ -2073,9 +2073,13 @@ async function connectToServer(srv, opts = {}) {
   el('termTitle').textContent = srv.name;
   el('termBadge').textContent = srv.host + ':' + srv.port;
   el('termBadge').hidden = false;
-  el('termDisconnectBtn').hidden = false;
+  // Only show Disconnect once a session is actually open.
+  el('termDisconnectBtn').hidden = true;
+  // Show a Connecting indicator instead of Reconnect/Test while we're trying.
   el('termReconnectBtn').hidden = true;
   el('termTestBtn').hidden = true;
+  // Disable the server-list rows so the user can't double-click another row.
+  if (el('serverList')) el('serverList').classList.add('connecting');
 
   let pw = null;
   if (srv.authMethod !== 'publickey') {
@@ -2083,6 +2087,7 @@ async function connectToServer(srv, opts = {}) {
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) {
       if (typeof terminalSetStatus === 'function') terminalSetStatus('Cancelled.');
+      if (el('serverList')) el('serverList').classList.remove('connecting');
       return;
     }
   }
@@ -2092,16 +2097,21 @@ async function connectToServer(srv, opts = {}) {
       const sessionId = await terminalConnect(srv, { cols: 80, rows: 24, ...opts });
       state.connectSessionId = sessionId;
       state.connectServerId = srv.id;
+      // Success — flip to the connected button set.
       el('termReconnectBtn').hidden = false;
       el('termDisconnectBtn').hidden = false;
+      el('termTestBtn').hidden = false;
+      if (el('serverList')) el('serverList').classList.remove('connecting');
       if (typeof terminalSetStatus === 'function') terminalSetStatus(`Connected to ${srv.host}:${srv.port}`);
     } catch (e) {
       const msg = e.message || String(e);
       state.connectSessionId = null;
       state.connectServerId = null;
+      // Failure — fall back to the unconnected button set.
       el('termDisconnectBtn').hidden = true;
       el('termReconnectBtn').hidden = false;
       el('termTestBtn').hidden = false;
+      if (el('serverList')) el('serverList').classList.remove('connecting');
       if (typeof terminalSetStatus === 'function') terminalSetStatus(`Failed: ${msg}`);
       toast(msg, 'err');
     }

@@ -16,6 +16,7 @@ use base64ct::Encoding;
 use russh::client::{self, Handle};
 use russh::keys::*;
 use russh::*;
+use russh::Pty;
 use tauri::ipc::Channel;
 
 use crate::db::{Database, ServerRecord};
@@ -269,10 +270,18 @@ pub async fn start_interactive(
     }).await?;
 
     // Terminal dimensions start at 80x24; the renderer sends the real size right
-    // after it learns the session id.
+    // after it learns the session id. The terminal_modes list must include
+    // at least Pty::ECHO — many sshd implementations REJECT a PTY request with
+    // no modes at all (silent PTY rejection = no input echo, no prompt).
     let mut channel = session.channel_open_session().await?;
     channel
-        .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+        .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[
+            (Pty::ECHO, 1),
+            (Pty::ICANON, 1),
+            (Pty::ISIG, 1),
+            (Pty::OPOST, 1),
+            (Pty::ONLCR, 1),
+        ])
         .await
         .map_err(|e| anyhow::anyhow!("PTY request failed: {e}"))?;
     channel
