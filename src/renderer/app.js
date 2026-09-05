@@ -1327,9 +1327,84 @@ async function deployConfig() {
     el('configPreview').value = 'Deployed ' + res.keys.length + ' key(s)\n'
       + res.keys.map(k => '  ' + k.name + ' -> ' + k.file).join('\n');
     toast('Keys deployed.', 'ok');
+
+    // Optionally register the deployed keys as Connect servers (Deploy ↔ Connect bridge).
+    if (el('deployRegisterToggle')?.checked) {
+      const alias = el('cfgHost').value.trim();
+      const user = el('cfgUser').value.trim();
+      if (!alias || !user) {
+        toast('Enter a Host alias and User to register servers.', 'info');
+        return;
+      }
+      const multi = res.keys.length > 1;
+      let registered = 0;
+      for (const k of res.keys) {
+        try {
+          await call('server_save', {
+            id: null,
+            name: multi ? `${alias} · ${k.name}` : alias,
+            host: alias,
+            port: parseInt(el('cfgPort').value, 10) || 22,
+            username: user,
+            authMethod: 'publickey',
+            keyId: null,
+            pemPath: k.file,
+            savedPassword: null,
+            categoryId: null,
+            color: null,
+          });
+          registered += 1;
+        } catch (e) { /* keep registering the rest */ }
+      }
+      if (registered) {
+        await loadServers();
+        toast(`${registered} server(s) registered in Connect.`, 'ok');
+      }
+    }
   } catch (e) {
     toast(e.message || String(e), 'err');
   }
+}
+
+// Import a Host block from ~/.ssh/config into the server-edit modal, prefilled.
+async function importFromSshConfig(anchorEl) {
+  try {
+    const res = await call('ssh_config_list_hosts');
+    const hosts = res.hosts || [];
+    if (hosts.length === 0) { toast('No Host blocks found in ~/.ssh/config.', 'info'); return; }
+    closeKeyConnectMenu();
+    const menu = document.createElement('div');
+    menu.className = 'ctx-menu';
+    menu.id = 'keyConnectMenu';
+    for (const h of hosts) {
+      const b = document.createElement('button');
+      b.className = 'ctx-item';
+      const label = `${h.host} <small>(${escapeHtml(h.user || '?')}@${escapeHtml(h.hostname || h.host)}:${h.port || 22})</small>`;
+      b.innerHTML = `${ico('server')}<span>${label}</span>`;
+      b.addEventListener('click', () => {
+        closeKeyConnectMenu();
+        openServerModal({
+          prefill: {
+            name: h.host,
+            host: h.hostname || h.host,
+            port: h.port || 22,
+            username: h.user || '',
+            pemPath: h.identity_file || '',
+          },
+        });
+      });
+      menu.appendChild(b);
+    }
+    const rect = anchorEl.getBoundingClientRect();
+    menu.style.left = rect.left + 'px';
+    menu.style.top = (rect.bottom + 4) + 'px';
+    document.body.appendChild(menu);
+    const onAway = (ev) => {
+      if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
+      closeKeyConnectMenu();
+    };
+    setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
 async function copyConfig() {
@@ -1345,7 +1420,8 @@ const BW_FIELDS = [
   { key: 'server_url',      label: 'Server URL',          type: 'url',      placeholder: 'https://vault.example.com', required: true },
   { key: 'email',           label: 'Email',               type: 'email',    placeholder: 'you@example.com',           required: true },
   { key: 'master_password', label: 'Master Password',     type: 'password', placeholder: 'Your Bitwarden master password', required: false },
-  { key: 'folder_name',     label: 'Sync Folder',         type: 'text',     placeholder: 'SSHSpan',                   required: false },
+  { key: 'folder_name',          label: 'Keys folder',    type: 'text', placeholder: 'SSHSpan_Keys',     required: false },
+  { key: 'servers_folder_name', label: 'Servers folder', type: 'text', placeholder: 'SSHSpan_Servers', required: false },
 ];
 
 function setBwStatus(text, cls) {
@@ -1396,6 +1472,7 @@ async function saveBitwardenConfig() {
     email: el('bw_email').value.trim(),
     masterPassword: el('bw_master_password').value || undefined,
     folderName: el('bw_folder_name').value.trim() || undefined,
+    serversFolderName: el('bw_servers_folder_name') ? (el('bw_servers_folder_name').value.trim() || undefined) : undefined,
   };
   if (!payload.serverUrl) { toast('Server URL is required.', 'err'); el('bw_server_url').focus(); return; }
   if (!payload.email) { toast('Email is required.', 'err'); el('bw_email').focus(); return; }
@@ -1856,6 +1933,7 @@ function wire() {
 
   // ─── Connect view wiring ────────────────────────────────────────────────
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
+  el('serverImportBtn').addEventListener('click', (ev) => importFromSshConfig(ev.currentTarget));
   el('serverSearch').addEventListener('input', renderServerList);
   el('termDisconnectBtn').addEventListener('click', disconnectActive);
   const termMaxBtn = el('termMaxBtn');
@@ -2122,7 +2200,7 @@ function openServerContextMenu(x, y, srv) {
 
 // ─── Server modal ───────────────────────────────────────────────────────────
 
-function openServerModal({ id, keyId } = {}) {
+function openServerModal({ id, keyId, prefill } = {}) {
   el('serverModal').hidden = false;
   el('serverModalTitle').textContent = id ? 'Edit Server' : 'New Server';
   // Populate key dropdown from cached state.keys
@@ -2142,12 +2220,12 @@ function openServerModal({ id, keyId } = {}) {
     srv = state.servers.find(s => s.id === id) || null;
     if (!srv) { toast('Server not found.', 'err'); closeServerModal(); return; }
   }
-  el('srvName').value    = srv ? srv.name : '';
-  el('srvHost').value    = srv ? srv.host : '';
-  el('srvPort').value    = srv ? (srv.port || 22) : 22;
-  el('srvUser').value    = srv ? srv.username : '';
+  el('srvName').value    = srv ? srv.name : (prefill?.name || '');
+  el('srvHost').value    = srv ? srv.host : (prefill?.host || '');
+  el('srvPort').value    = srv ? (srv.port || 22) : (prefill?.port || 22);
+  el('srvUser').value    = srv ? srv.username : (prefill?.username || '');
   el('srvKeyId').value   = srv ? (srv.keyId || keyId || '') : (keyId || '');
-  el('srvPemPath').value = srv ? (srv.pemPath || '') : '';
+  el('srvPemPath').value = srv ? (srv.pemPath || '') : (prefill?.pemPath || '');
   el('srvPassword').value = '';
   el('srvSavePw').checked = false;
   setConnectAuthMethod(srv ? srv.authMethod : (keyId ? 'publickey' : 'publickey'));

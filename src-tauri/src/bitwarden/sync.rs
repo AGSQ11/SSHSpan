@@ -16,12 +16,14 @@ use crate::db::{Database, KeyRecord};
 const FOLDER_DEFAULT: &str = "SSHSpan";
 
 /// Run a full two-way sync. Returns a JSON summary.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sync(
     server_url: &str,
     email: &str,
     master_password: &str,
     device_id: &str,
     folder_name: &str,
+    servers_folder_name: &str,
     db: &Database,
     vault_password: &str,
 ) -> Result<serde_json::Value> {
@@ -39,6 +41,40 @@ pub async fn run_sync(
         Some(f) => Some(f.id.clone()),
         None => {
             let created = client.create_folder(folder_name).await.ok();
+            created.and_then(|v| v.get("id").and_then(|id| id.as_str()).map(String::from))
+        }
+    };
+
+    // Folder migration: single-folder era -> SSHSpan_Keys / SSHSpan_Servers.
+    // When the default key folder is requested and a legacy "SSHSpan" folder
+    // exists, rename it instead of creating a duplicate.
+    let keys_lower = folder_name.to_lowercase();
+    let has_legacy = remote.folders.iter().any(|f| {
+        f.name.as_ref().map_or(false, |n| n.to_lowercase() == "sshspan")
+    });
+    let has_keys_folder = remote.folders.iter().any(|f| {
+        f.name.as_ref().map_or(false, |n| n.to_lowercase() == keys_lower)
+    });
+    if keys_lower == "sshspan_keys" && has_legacy && !has_keys_folder {
+        let legacy = remote.folders.iter().find(|f| {
+            f.name.as_ref().map_or(false, |n| n.to_lowercase() == "sshspan")
+        }).cloned();
+        if let Some(legacy) = legacy {
+            if client.update_folder(&legacy.id, folder_name).await.is_ok() {
+                let _ = db.add_audit("sync.folder_migrated", None, "SSHSpan -> SSHSpan_Keys");
+            }
+        }
+    }
+
+    // Resolve (or create) the servers folder.
+    let servers_lower = servers_folder_name.to_lowercase();
+    let servers_folder = remote.folders.iter().find(|f| {
+        f.name.as_ref().map_or(false, |n| n.to_lowercase() == servers_lower)
+    });
+    let servers_folder_id = match servers_folder {
+        Some(f) => Some(f.id.clone()),
+        None => {
+            let created = client.create_folder(servers_folder_name).await.ok();
             created.and_then(|v| v.get("id").and_then(|id| id.as_str()).map(String::from))
         }
     };
@@ -231,6 +267,66 @@ pub async fn run_sync(
         }
     }
 
+    // Server sync (Bitwarden Login-type ciphers in SSHSpan_Servers)
+    let remote_logins: Vec<_> = remote.ciphers.iter().filter(|c| {
+        c.cipher_type == 1
+            && c.deleted_date.is_none()
+            && c.organization_id.is_none()
+            && c.folder_id.as_ref() == servers_folder_id.as_ref()
+    }).collect();
+
+    let local_servers = db.list_servers()?;
+    let mut server_matched = std::collections::HashSet::new();
+    let (mut servers_pushed, mut servers_updated_remote) = (0usize, 0usize);
+    let (mut servers_pulled, mut servers_updated_local) = (0usize, 0usize);
+
+    for sv in &local_servers {
+        let cipher = sv.bitwarden_id.as_ref().and_then(|bw_id| {
+            remote_logins.iter().find(|c| c.id == *bw_id)
+        });
+
+        let cipher = match cipher {
+            Some(c) => c,
+            None => {
+                match push_local_server(&mut client, sv, &servers_folder_id, db, vault_password).await {
+                    Ok(()) => { servers_pushed += 1; }
+                    Err(e) => { errors.push(serde_json::json!({"server": sv.name, "error": e.to_string()})); }
+                }
+                continue;
+            }
+        };
+
+        server_matched.insert(cipher.id.clone());
+
+        // Timestamps are stored as RFC 3339 strings for servers.
+        let local_changed = sv.updated_at.to_rfc3339() > sv.bitwarden_updated_at.clone().unwrap_or_default();
+        let remote_changed = cipher.revision_date.as_ref()
+            .map_or(false, |rd| rd.as_str() > sv.bitwarden_revision_ts.clone().unwrap_or_default().as_str());
+
+        if !local_changed && !remote_changed { continue; }
+
+        if local_changed {
+            if remote_changed { conflicts += 1; } // local wins
+            match push_local_server(&mut client, sv, &servers_folder_id, db, vault_password).await {
+                Ok(()) => { servers_updated_remote += 1; }
+                Err(e) => { errors.push(serde_json::json!({"server": sv.name, "error": e.to_string()})); }
+            }
+        } else {
+            match pull_remote_server(&mut client, cipher, sv, db, vault_password).await {
+                Ok(()) => { servers_updated_local += 1; }
+                Err(e) => { errors.push(serde_json::json!({"server": sv.name, "error": e.to_string()})); }
+            }
+        }
+    }
+
+    for cipher in &remote_logins {
+        if server_matched.contains(&cipher.id) { continue; }
+        match pull_new_server(&mut client, cipher, db, vault_password).await {
+            Ok(()) => { servers_pulled += 1; }
+            Err(e) => { errors.push(serde_json::json!({"cipher_id": cipher.id, "error": e.to_string()})); }
+        }
+    }
+
     client.close();
 
     Ok(serde_json::json!({
@@ -242,6 +338,10 @@ pub async fn run_sync(
         "linked": linked,
         "conflicts": conflicts,
         "remoteDeleted": remote_deleted,
+        "serversPushed": servers_pushed,
+        "serversUpdatedRemote": servers_updated_remote,
+        "serversPulled": servers_pulled,
+        "serversUpdatedLocal": servers_updated_local,
         "errors": errors,
     }))
 }
@@ -398,4 +498,229 @@ fn parse_openssh_public_line(line: &str) -> Result<Vec<u8>> {
     use base64ct::Encoding;
     let b64 = line.split_whitespace().nth(1).ok_or_else(|| anyhow::anyhow!("Malformed stored public key"))?;
     base64ct::Base64::decode_vec(b64).map_err(|e| anyhow::anyhow!("Malformed stored public key: {e}"))
+}
+
+// ─── Server sync helpers (Bitwarden Login-type ciphers) ────────────────────
+
+/// Build the `notes` metadata blob for a server cipher: auth method, the
+/// bound key's fingerprint (so the pull side can re-link by fingerprint),
+/// and the category path.
+fn server_notes(client: &BitwardenClient, db: &Database, sv: &crate::db::ServerRecord) -> Result<Option<String>> {
+    let key_fp = match &sv.key_id {
+        Some(kid) => db.get_key(kid)?.map(|k| k.fingerprint_sha256),
+        None => None,
+    };
+    let category = match &sv.category_id {
+        Some(cid) => db.get_category(cid)?.map(|cat| serde_json::json!({
+            "id": cat.id,
+            "path": db.category_path_string(&cat.id),
+        })),
+        None => None,
+    };
+    if key_fp.is_none() && category.is_none() {
+        return Ok(None);
+    }
+    let plain = serde_json::to_string(&serde_json::json!({
+        "v": 1,
+        "sshspan": {
+            "authMethod": sv.auth_method,
+            "keyFingerprint": key_fp,
+            "category": category,
+        }
+    }))?;
+    Ok(Some(client.encrypt_field(&plain)?))
+}
+
+async fn push_local_server(
+    client: &mut BitwardenClient,
+    sv: &crate::db::ServerRecord,
+    folder_id: &Option<String>,
+    db: &Database,
+    vault_password: &str,
+) -> Result<()> {
+    let name_enc = client.encrypt_field(&sv.name)?;
+    let user_enc = client.encrypt_field(&sv.username)?;
+    let password_enc = match &sv.saved_password {
+        Some(sealed) => {
+            let plain = crate::crypto::vault::unseal(vault_password, sealed)
+                .map_err(|e| anyhow::anyhow!("saved password unseal failed: {e}"))?;
+            let plain_str = String::from_utf8(plain).unwrap_or_default();
+            if plain_str.is_empty() { None } else { Some(client.encrypt_field(&plain_str)?) }
+        }
+        None => None,
+    };
+    let uri_plain = format!("ssh://{}:{}", sv.host, sv.port);
+    let uri_enc = client.encrypt_field(&uri_plain)?;
+    let notes_enc = server_notes(client, db, sv)?;
+
+    let cipher = serde_json::json!({
+        "type": 1,
+        "organizationId": null,
+        "folderId": folder_id,
+        "name": name_enc,
+        "notes": notes_enc,
+        "favorite": false,
+        "reprompt": 0,
+        "login": {
+            "username": user_enc,
+            "password": password_enc,
+            "uris": [{ "uri": uri_enc }],
+        },
+    });
+
+    if let Some(ref bw_id) = sv.bitwarden_id {
+        client.update_cipher(bw_id, &cipher).await?;
+    } else {
+        let created = client.create_cipher(&cipher).await?;
+        let new_id = created.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let rev = created.get("revisionDate").and_then(|v| v.as_str()).map(String::from);
+        let mut updated = sv.clone();
+        updated.bitwarden_id = Some(new_id);
+        updated.bitwarden_revision_ts = rev;
+        updated.bitwarden_updated_at = Some(chrono::Utc::now().to_rfc3339());
+        db.update_server(&updated)?;
+    }
+    Ok(())
+}
+
+/// Extract host/port from the cipher's ssh:// URI (falls back to the name).
+fn server_host_port(client: &BitwardenClient, cipher: &crate::bitwarden::SyncCipher) -> (String, u16) {
+    if let Some(login) = &cipher.login {
+        if let Some(uris) = &login.uris {
+            if let Some(first) = uris.first() {
+                if let Some(enc) = &first.uri {
+                    if let Ok(uri) = client.decrypt_field(enc) {
+                        let rest = uri.strip_prefix("ssh://").unwrap_or(&uri);
+                        let (h, p) = match rest.rsplit_once(':') {
+                            Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(22)),
+                            None => (rest.to_string(), 22),
+                        };
+                        if !h.is_empty() {
+                            return (h, p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let name = cipher.name.as_ref()
+        .and_then(|n| client.decrypt_field(n).ok())
+        .unwrap_or_else(|| "imported server".to_string());
+    (name, 22)
+}
+
+/// notes -> (auth_method, key_fingerprint, category_id)
+fn parse_server_notes(client: &BitwardenClient, cipher: &crate::bitwarden::SyncCipher, db: &Database)
+    -> (Option<String>, Option<String>, Option<String>) {
+    let Some(notes_enc) = cipher.notes.as_ref() else { return (None, None, None) };
+    let Ok(plain) = client.decrypt_field(notes_enc) else { return (None, None, None) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&plain) else { return (None, None, None) };
+    let Some(ss) = v.get("sshspan") else { return (None, None, None) };
+    let auth = ss.get("authMethod").and_then(|a| a.as_str()).map(String::from);
+    let fp = ss.get("keyFingerprint").and_then(|f| f.as_str()).map(String::from);
+    let cat = ss.get("category").and_then(|c| c.as_object()).and_then(|c| {
+        let id = c.get("id").and_then(|i| i.as_str()).map(String::from);
+        let path = c.get("path").and_then(|p| p.as_str()).map(String::from);
+        match (id, path) {
+            (Some(id), _) if db.get_category(&id).ok().flatten().is_some() => Some(id),
+            (_, Some(path)) => db.ensure_category_path(&path).ok().flatten(),
+            _ => None,
+        }
+    });
+    (auth, fp, cat)
+}
+
+async fn pull_remote_server(
+    client: &mut BitwardenClient,
+    cipher: &crate::bitwarden::SyncCipher,
+    sv: &crate::db::ServerRecord,
+    db: &Database,
+    vault_password: &str,
+) -> Result<()> {
+    let (host, port) = server_host_port(client, cipher);
+    let username = cipher.login.as_ref()
+        .and_then(|l| l.username.as_ref())
+        .and_then(|u| client.decrypt_field(u).ok())
+        .unwrap_or_else(|| sv.username.clone());
+    let password_plain = cipher.login.as_ref()
+        .and_then(|l| l.password.as_ref())
+        .map(|p| client.decrypt_field(p))
+        .transpose().unwrap_or(None);
+    let name = cipher.name.as_ref()
+        .and_then(|n| client.decrypt_field(n).ok())
+        .unwrap_or_else(|| sv.name.clone());
+    let (auth_method, key_fp, category_id) = parse_server_notes(client, cipher, db);
+
+    // Re-link the key by fingerprint if the local vault has a match.
+    let key_id = key_fp.as_ref().and_then(|fp| {
+        db.list_keys().ok()?.into_iter().find(|k| &k.fingerprint_sha256 == fp).map(|k| k.id)
+    }).or_else(|| sv.key_id.clone());
+
+    let mut updated = sv.clone();
+    updated.name = name;
+    updated.host = host;
+    updated.port = port;
+    updated.username = username;
+    updated.auth_method = auth_method.unwrap_or_else(|| sv.auth_method.clone());
+    updated.key_id = key_id;
+    updated.category_id = category_id.or_else(|| sv.category_id.clone());
+    updated.saved_password = match password_plain {
+        Some(p) if !p.is_empty() => crate::crypto::vault::seal(vault_password, p.as_bytes()).ok(),
+        _ => None,
+    };
+    updated.updated_at = chrono::Utc::now();
+    updated.bitwarden_revision_ts = cipher.revision_date.clone();
+    updated.bitwarden_updated_at = Some(chrono::Utc::now().to_rfc3339());
+    db.update_server(&updated)?;
+    Ok(())
+}
+
+async fn pull_new_server(
+    client: &mut BitwardenClient,
+    cipher: &crate::bitwarden::SyncCipher,
+    db: &Database,
+    vault_password: &str,
+) -> Result<()> {
+    let (host, port) = server_host_port(client, cipher);
+    let username = cipher.login.as_ref()
+        .and_then(|l| l.username.as_ref())
+        .and_then(|u| client.decrypt_field(u).ok())
+        .unwrap_or_else(|| "root".to_string());
+    let password_plain = cipher.login.as_ref()
+        .and_then(|l| l.password.as_ref())
+        .map(|p| client.decrypt_field(p))
+        .transpose().unwrap_or(None);
+    let name = cipher.name.as_ref()
+        .and_then(|n| client.decrypt_field(n).ok())
+        .unwrap_or_else(|| host.clone());
+    let (auth_method, key_fp, category_id) = parse_server_notes(client, cipher, db);
+
+    let key_id = key_fp.as_ref().and_then(|fp| {
+        db.list_keys().ok()?.into_iter().find(|k| &k.fingerprint_sha256 == fp).map(|k| k.id)
+    });
+
+    let record = crate::db::ServerRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        host,
+        port,
+        username,
+        key_id,
+        pem_path: None,
+        auth_method: auth_method.unwrap_or_else(|| "publickey".to_string()),
+        saved_password: match password_plain {
+            Some(p) if !p.is_empty() => crate::crypto::vault::seal(vault_password, p.as_bytes()).ok(),
+            _ => None,
+        },
+        category_id,
+        color: None,
+        last_connected_at: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        bitwarden_id: Some(cipher.id.clone()),
+        bitwarden_revision_ts: cipher.revision_date.clone(),
+        bitwarden_updated_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+    db.insert_server(&record)?;
+    Ok(())
 }

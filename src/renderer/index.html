@@ -132,6 +132,7 @@
                 <span class="search-ico" data-ico="search"></span>
                 <input type="search" id="serverSearch" placeholder="Search servers…" />
               </div>
+              <button id="serverImportBtn" class="ghost-btn" title="Import a Host block from ~/.ssh/config"><span data-ico="file-text"></span>Config</button>
               <button id="serverNewBtn" class="primary-btn" title="New server"><span data-ico="plus"></span>New</button>
             </div>
             <div class="server-list" id="serverList"></div>
@@ -180,6 +181,7 @@
               <label>Port <input type="number" id="cfgPort" placeholder="22" min="1" max="65535" /></label>
               <label class="toggle-chip"><input type="checkbox" id="strictHostKeyToggle" checked /><span class="toggle-box"></span>StrictHostKeyChecking</label>
               <label class="toggle-chip"><input type="checkbox" id="keyPassphraseToggle" /><span class="toggle-box"></span>Encrypt deployed files</label>
+              <label class="toggle-chip"><input type="checkbox" id="deployRegisterToggle" /><span class="toggle-box"></span>Also register in Connect</label>
               <input type="password" id="keyPassphraseInput" placeholder="Deployed-key passphrase" hidden />
             </div>
             <p class="hint" id="deploySelectionHint">Select keys to deploy using the checkboxes in the Keys view.</p>

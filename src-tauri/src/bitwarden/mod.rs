@@ -68,6 +68,8 @@ pub struct SyncCipher {
     pub favorite: bool,
     #[serde(rename = "sshKey", default)]
     pub ssh_key: Option<SshKeyBlock>,
+    #[serde(default)]
+    pub login: Option<LoginBlock>,
     #[serde(rename = "revisionDate", default)]
     pub revision_date: Option<String>,
     #[serde(rename = "deletedDate", default)]
@@ -84,6 +86,21 @@ pub struct SshKeyBlock {
     pub public_key: Option<String>,  // encrypted
     #[serde(rename = "keyFingerprint", default)]
     pub key_fingerprint: Option<String>, // encrypted
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginUri {
+    pub uri: Option<String>, // encrypted
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginBlock {
+    #[serde(default)]
+    pub username: Option<String>, // encrypted
+    #[serde(default)]
+    pub password: Option<String>, // encrypted
+    #[serde(rename = "uris", default)]
+    pub uris: Option<Vec<LoginUri>>,
 }
 
 // ─── BitwardenClient ────────────────────────────────────────────────────
@@ -398,6 +415,14 @@ impl BitwardenClient {
     pub async fn create_folder(&mut self, name: &str) -> Result<serde_json::Value> {
         let encrypted_name = self.encrypt_field(name)?;
         self.api_request("POST", "/api/folders", Some(&serde_json::json!({
+            "name": encrypted_name
+        }))).await
+    }
+
+    pub async fn update_folder(&mut self, id: &str, name: &str) -> Result<serde_json::Value> {
+        let encrypted_name = self.encrypt_field(name)?;
+        let path = format!("/api/folders/{}", urlencoding::encode(id));
+        self.api_request("PUT", &path, Some(&serde_json::json!({
             "name": encrypted_name
         }))).await
     }

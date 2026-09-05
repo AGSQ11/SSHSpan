@@ -879,6 +879,7 @@ pub fn bitwarden_get_config(app: AppHandle) -> CmdResult<serde_json::Value> {
         "server_url": config.server_url,
         "email": config.email,
         "folder_name": config.folder_name,
+        "servers_folder_name": config.servers_folder_name,
         "last_sync": config.last_sync.map(|d| d.to_rfc3339()),
         "last_result": config.last_result.as_ref().and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()),
     }))
@@ -891,6 +892,7 @@ pub fn bitwarden_save_config(
     email: String,
     master_password: Option<String>,
     folder_name: Option<String>,
+    servers_folder_name: Option<String>,
 ) -> CmdResult<serde_json::Value> {
     if vault_password(&app)?.is_empty() { return Err("Vault is locked.".into()); }
     let pw = vault_password(&app)?;
@@ -913,7 +915,8 @@ pub fn bitwarden_save_config(
         let sealed = crate::crypto::vault::seal(&pw, mp.as_bytes()).map_err(|e| e.to_string())?;
         config.master_password = Some(sealed);
     }
-    config.folder_name = Some(folder_name.unwrap_or_else(|| "SSHSpan".to_string()));
+    config.folder_name = Some(folder_name.unwrap_or_else(|| "SSHSpan_Keys".to_string()));
+    config.servers_folder_name = Some(servers_folder_name.unwrap_or_else(|| "SSHSpan_Servers".to_string()));
     if config.device_id.is_none() {
         config.device_id = Some(Uuid::new_v4().to_string());
     }
@@ -966,7 +969,8 @@ pub async fn bitwarden_sync(app: AppHandle) -> CmdResult<serde_json::Value> {
     let server_url = config.server_url.ok_or_else(|| "No server URL configured.".to_string())?;
     let email = config.email.ok_or_else(|| "No email configured.".to_string())?;
     let mp_sealed = config.master_password.ok_or_else(|| "No master password stored. Re-save the sync settings.".to_string())?;
-    let folder_name = config.folder_name.unwrap_or_else(|| "SSHSpan".to_string());
+    let folder_name = config.folder_name.unwrap_or_else(|| "SSHSpan_Keys".to_string());
+    let servers_folder_name = config.servers_folder_name.clone().unwrap_or_else(|| "SSHSpan_Servers".to_string());
 
     let pw = vault_password(&app)?;
     let master_password = String::from_utf8(
@@ -981,7 +985,7 @@ pub async fn bitwarden_sync(app: AppHandle) -> CmdResult<serde_json::Value> {
     // it directly here is safe and does not nest a tokio runtime.
     let result = crate::bitwarden::sync::run_sync(
         &server_url, &email, &master_password, &device_id,
-        &folder_name, &db, &pw,
+        &folder_name, &servers_folder_name, &db, &pw,
     ).await.map_err(|e| e.to_string())?;
 
     // Store sync result

@@ -75,6 +75,10 @@ pub struct ServerRecord {
     pub last_connected_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    // Bitwarden two-way sync metadata
+    pub bitwarden_id: Option<String>,
+    pub bitwarden_revision_ts: Option<String>,
+    pub bitwarden_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +95,8 @@ pub struct BitwardenConfig {
     pub server_url: Option<String>,
     pub email: Option<String>,
     pub master_password: Option<String>,  // sealed JSON blob (encrypted with vault pw)
-    pub folder_name: Option<String>,      // default "SSHSpan"
+    pub folder_name: Option<String>,      // keys folder (legacy single-folder default: "SSHSpan")
+    pub servers_folder_name: Option<String>, // servers folder (default "SSHSpan_Servers")
     pub device_id: Option<String>,
     pub last_sync: Option<DateTime<Utc>>,
     pub last_result: Option<String>,      // JSON sync summary
@@ -101,7 +106,7 @@ impl Default for BitwardenConfig {
     fn default() -> Self {
         Self {
             server_url: None, email: None, master_password: None,
-            folder_name: None, device_id: None,
+            folder_name: None, servers_folder_name: None, device_id: None,
             last_sync: None, last_result: None,
         }
     }
@@ -229,6 +234,13 @@ impl Database {
             let _ = sqlx::query("ALTER TABLE keys ADD COLUMN bitwarden_revision_ts TEXT")
                 .execute(&self.pool).await;
             let _ = sqlx::query("ALTER TABLE keys ADD COLUMN bitwarden_updated_at TEXT")
+                .execute(&self.pool).await;
+            // Migration: server sync metadata (Bitwarden two-way server sync)
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_id TEXT")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_revision_ts TEXT")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_updated_at TEXT")
                 .execute(&self.pool).await;
 
             // Categories: user-defined tree of named nodes that group keys.
@@ -517,11 +529,12 @@ impl Database {
 
     pub fn save_bitwarden_config(&self, config: &BitwardenConfig) -> Result<()> {
         block(async {
-            let fields: [(&str, Option<String>); 7] = [
+            let fields: [(&str, Option<String>); 8] = [
                 ("server_url", config.server_url.clone()),
                 ("email", config.email.clone()),
                 ("master_password", config.master_password.clone()),
                 ("folder_name", config.folder_name.clone()),
+                ("servers_folder_name", config.servers_folder_name.clone()),
                 ("device_id", config.device_id.clone()),
                 ("last_sync", config.last_sync.map(|d| d.to_rfc3339())),
                 ("last_result", config.last_result.clone()),
@@ -559,6 +572,7 @@ impl Database {
                     "email" => config.email = Some(value),
                     "master_password" => config.master_password = Some(value),
                     "folder_name" => config.folder_name = Some(value),
+                    "servers_folder_name" => config.servers_folder_name = Some(value),
                     "device_id" => config.device_id = Some(value),
                     "last_sync" => config.last_sync = DateTime::parse_from_rfc3339(&value).ok().map(|d| d.with_timezone(&Utc)),
                     "last_result" => config.last_result = Some(value),
@@ -921,6 +935,9 @@ impl Database {
                 .ok().map(|d| d.with_timezone(&Utc)).unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())
                 .ok().map(|d| d.with_timezone(&Utc)).unwrap_or_else(|| Utc::now()),
+            bitwarden_id: row.get("bitwarden_id"),
+            bitwarden_revision_ts: row.get("bitwarden_revision_ts"),
+            bitwarden_updated_at: row.get("bitwarden_updated_at"),
         }
     }
 
@@ -929,8 +946,9 @@ impl Database {
             sqlx::query(
                 r#"
                 INSERT INTO servers (id, name, host, port, username, key_id, pem_path, auth_method,
-                                     saved_password, category_id, color, last_connected_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     saved_password, category_id, color, last_connected_at, created_at, updated_at,
+                                     bitwarden_id, bitwarden_revision_ts, bitwarden_updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&s.id).bind(&s.name).bind(&s.host).bind(s.port as i64)
@@ -938,6 +956,7 @@ impl Database {
             .bind(&s.saved_password).bind(&s.category_id).bind(&s.color)
             .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
             .bind(s.created_at.to_rfc3339()).bind(s.updated_at.to_rfc3339())
+            .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
             .execute(&self.pool).await?;
             Ok(())
         })
@@ -948,7 +967,8 @@ impl Database {
             sqlx::query(
                 r#"
                 UPDATE servers SET name = ?, host = ?, port = ?, username = ?, key_id = ?, pem_path = ?,
-                    auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?
+                    auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?,
+                    bitwarden_id = ?, bitwarden_revision_ts = ?, bitwarden_updated_at = ?
                 WHERE id = ?
                 "#,
             )
@@ -957,6 +977,7 @@ impl Database {
             .bind(&s.category_id).bind(&s.color)
             .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
             .bind(s.updated_at.to_rfc3339())
+            .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
             .bind(&s.id)
             .execute(&self.pool).await?;
             Ok(())
@@ -1167,6 +1188,9 @@ impl Database {
                     .bind(s("last_connected_at"))
                     .bind(s("created_at").unwrap_or(""))
                     .bind(s("updated_at").unwrap_or(""))
+                    .bind(s("bitwarden_id"))
+                    .bind(s("bitwarden_revision_ts"))
+                    .bind(s("bitwarden_updated_at"))
                     .execute(&mut *tx).await?;
                     servers_n += 1;
                 }
