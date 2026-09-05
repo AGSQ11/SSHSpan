@@ -1,0 +1,112 @@
+[package]
+name = "sshspan"
+version = "1.3.6"
+description = "SSH Key Manager - Cross-platform SSH key management with Bitwarden sync"
+authors = ["AGSQ11"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/AGSQ11/SSHSpan"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# ─── Core Tauri ──────────────────────────────────────────────────────────────
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+
+# ─── Tauri plugins ──────────────────────────────────────────────────────────
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-process = "2"
+tauri-plugin-os = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-updater = "2"
+
+# ─── Crypto: password hashing / KDF ─────────────────────────────────────────
+argon2 = "0.5"                    # Argon2id (PPK v3, vault KDF)
+bcrypt-pbkdf = "0.11"             # OpenSSH bcrypt KDF
+pbkdf2 = "0.12"                   # PBKDF2-HMAC-SHA256 (Bitwarden, encrypted PKCS#8)
+hkdf = "0.12"                     # HKDF-SHA256 (vault key derivation, Bitwarden)
+
+# ─── Crypto: symmetric ciphers ──────────────────────────────────────────────
+aes-gcm = "0.10"                  # AES-256-GCM (vault encryption)
+aes = "0.8"                       # AES-256 block cipher (CBC, CTR modes)
+cbc = "0.1"                       # CBC mode (PPK, Bitwarden, encrypted PKCS#8)
+ctr = "0.9"                       # CTR mode (OpenSSH private key encryption)
+chacha20poly1305 = "0.10"         # ChaCha20-Poly1305 (Bitwarden GCM)
+chacha20 = "0.9"                  # ChaCha20 stream cipher
+poly1305 = "0.8"                  # Poly1305 MAC
+
+# ─── Crypto: MAC / hash ─────────────────────────────────────────────────────
+hmac = "0.12"                     # HMAC-SHA256 (Bitwarden MAC, PPK MAC)
+sha1 = "0.10"                     # SHA-1 (PPK v2 key derivation)
+sha2 = "0.10"                     # SHA-256 / SHA-512
+md-5 = "0.7"                      # MD5 (legacy SSH fingerprint)
+
+# ─── Crypto: asymmetric keys ────────────────────────────────────────────────
+rsa = { version = "0.9", features = ["pem"] }
+ed25519-dalek = "2"               # Ed25519 signing
+p256 = "0.13"                     # ECDSA P-256
+p384 = "0.13"                     # ECDSA P-384
+p521 = "0.13"                     # ECDSA P-521
+x25519-dalek = "2"                # X25519 key exchange
+
+# ─── SSH key format (audited, RustCrypto) ────────────────────────────────────
+# Handles OpenSSH parse/serialize, key generation (all algorithms incl.
+# P-384/P-521), and correct SHA-256 fingerprints. Used as the source of
+# truth for key material instead of hand-rolled wire-format encoding.
+# (PPK is not supported by this crate; handled separately in crypto/putty.rs
+# against the authoritative spec in PuTTY's own documentation.)
+ssh-key = { version = "0.6", features = [
+    "std", "alloc", "getrandom", "rand_core",
+    "ed25519", "rsa", "p256", "p384", "p521", "encryption",
+] }
+
+# ─── Crypto: encoding / utilities ───────────────────────────────────────────
+base64ct = "1.6"                  # Base64 (CT-safe, no alloc)
+hex = "0.4"                       # Hex encode/decode
+rand = "0.8"                      # CSPRNG
+rand_chacha = "0.3"               # ChaCha CSPRNG
+zeroize = "1.8"                   # Zero memory on drop
+subtle = "2.5"                    # Constant-time comparisons
+
+# ─── PKCS#8 / DER encoding ─────────────────────────────────────────────────
+pkcs8 = "0.10"                    # PrivateKeyInfo / SPKI encoding
+der = "0.7"                       # ASN.1 DER primitives
+
+# ─── Serialization ──────────────────────────────────────────────────────────
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# ─── Time ───────────────────────────────────────────────────────────────────
+chrono = { version = "0.4", features = ["serde"] }
+
+# ─── IDs / paths ────────────────────────────────────────────────────────────
+uuid = { version = "1", features = ["v4", "serde", "fast-rng"] }
+directories = "5"
+dirs = "5"
+
+# ─── HTTP client ────────────────────────────────────────────────────────────
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
+url = "2"                          # URL parsing (SSRF guard, Bitwarden client)
+
+# ─── SQL ────────────────────────────────────────────────────────────────────
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+
+# ─── Async runtime ──────────────────────────────────────────────────────────
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+# ─── Error handling ─────────────────────────────────────────────────────────
+anyhow = "1.0"
+thiserror = "1.0"
+
+generic-array = "0.14"
+# ─── Utilities ─────────────────────────────────────────────────────────────
+opener = "0.7"                    # Open URLs / reveal files in OS default app
+urlencoding = "2"                 # URL-encode cipher IDs for Bitwarden API
+russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }
