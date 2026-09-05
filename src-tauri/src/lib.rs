@@ -19,6 +19,7 @@ use tauri::{
 use commands::*;
 use commands::server::*;
 use commands::terminal::*;
+use commands::updater::*;
 use db::Database;
 use ssh_client::SessionRegistry;
 
@@ -76,6 +77,7 @@ pub fn run() {
             // Vault commands
             vault_create, vault_unlock, vault_lock, vault_change_password,
             vault_status, vault_export, vault_import,
+            vault_backup_create, vault_backup_restore,
             // Key commands
             key_generate, key_import, key_export, key_delete, key_list,
             key_get, key_fingerprint, key_deploy, key_remove_deployed,
@@ -98,6 +100,8 @@ pub fn run() {
             audit_list,
             // System commands
             system_open_external, system_show_item_in_folder, system_select_file,
+            system_pick_save_path, system_write_text_file,
+            update_check, update_download_and_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

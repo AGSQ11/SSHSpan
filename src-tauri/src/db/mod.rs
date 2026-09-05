@@ -153,6 +153,14 @@ impl Database {
         let pool = block(async {
             SqlitePool::connect(&db_url).await
         })?;
+        // Owner-only permissions on the vault file (Unix). The DB holds the
+        // Argon2id verifier and sealed key material; default umasks can leave
+        // it world-readable depending on the system.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
         let db = Self { pool, db_path };
         db.migrate()?;
         Ok(db)
@@ -1046,6 +1054,162 @@ impl Database {
             sqlx::query("DELETE FROM known_hosts WHERE host = ?").bind(host)
                 .execute(&self.pool).await?;
             Ok(())
+        })
+    }
+
+    // ── Backup / restore ───────────────────────────────────────────────────
+
+    /// Upsert every entity from an (already unsealed) backup payload in one
+    /// transaction. Existing rows with the same id/host are overwritten —
+    /// re-running a restore is safe. Returns per-entity row counts.
+    pub fn restore_backup(&self, data: &serde_json::Value) -> Result<serde_json::Value> {
+        block(async {
+            let mut tx = self.pool.begin().await?;
+            let (mut keys_n, mut cats_n, mut kc_n) = (0u32, 0u32, 0u32);
+            let (mut servers_n, mut hosts_n, mut settings_n) = (0u32, 0u32, 0u32);
+
+            if let Some(arr) = data.get("categories").and_then(|v| v.as_array()) {
+                for c in arr {
+                    let Some(id) = c.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("imported");
+                    let parent = c.get("parent_id").and_then(|v| v.as_str());
+                    let color = c.get("color").and_then(|v| v.as_str());
+                    let sort = c.get("sort_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let created = c.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                    let updated = c.get("updated_at").and_then(|v| v.as_str()).unwrap_or(created);
+                    sqlx::query(
+                        "INSERT INTO categories (id, name, parent_id, color, sort_index, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, parent_id=excluded.parent_id, \
+                           color=excluded.color, sort_index=excluded.sort_index, updated_at=excluded.updated_at",
+                    )
+                    .bind(id).bind(name).bind(parent).bind(color).bind(sort).bind(created).bind(updated)
+                    .execute(&mut *tx).await?;
+                    cats_n += 1;
+                }
+            }
+
+            if let Some(arr) = data.get("keys").and_then(|v| v.as_array()) {
+                for k in arr {
+                    let Some(id) = k.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let s = |f: &str| k.get(f).and_then(|v| v.as_str());
+                    sqlx::query(
+                        "INSERT INTO keys (id, name, key_type, public_key, private_key_encrypted, \
+                           fingerprint_sha256, fingerprint_md5, comment, created_at, updated_at, \
+                           deployed, deploy_path, bitwarden_id, bitwarden_sync, \
+                           bitwarden_revision_ts, bitwarden_updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, key_type=excluded.key_type, \
+                           public_key=excluded.public_key, private_key_encrypted=excluded.private_key_encrypted, \
+                           fingerprint_sha256=excluded.fingerprint_sha256, fingerprint_md5=excluded.fingerprint_md5, \
+                           comment=excluded.comment, updated_at=excluded.updated_at, deployed=excluded.deployed, \
+                           deploy_path=excluded.deploy_path, bitwarden_id=excluded.bitwarden_id, \
+                           bitwarden_sync=excluded.bitwarden_sync, bitwarden_revision_ts=excluded.bitwarden_revision_ts, \
+                           bitwarden_updated_at=excluded.bitwarden_updated_at",
+                    )
+                    .bind(id)
+                    .bind(s("name").unwrap_or("imported"))
+                    .bind(s("key_type").unwrap_or("rsa"))
+                    .bind(s("public_key").unwrap_or(""))
+                    .bind(s("private_key_encrypted").unwrap_or(""))
+                    .bind(s("fingerprint_sha256").unwrap_or(""))
+                    .bind(s("fingerprint_md5").unwrap_or(""))
+                    .bind(s("comment").unwrap_or(""))
+                    .bind(s("created_at").unwrap_or(""))
+                    .bind(s("updated_at").unwrap_or(""))
+                    .bind(k.get("deployed").and_then(|v| v.as_bool()).unwrap_or(false) as i64)
+                    .bind(s("deploy_path"))
+                    .bind(s("bitwarden_id"))
+                    .bind(k.get("bitwarden_sync").and_then(|v| v.as_bool()).unwrap_or(false) as i64)
+                    .bind(s("bitwarden_revision_ts"))
+                    .bind(s("bitwarden_updated_at"))
+                    .execute(&mut *tx).await?;
+                    keys_n += 1;
+                    if let Some(cats) = k.get("category_ids").and_then(|v| v.as_array()) {
+                        sqlx::query("DELETE FROM key_categories WHERE key_id = ?")
+                            .bind(id).execute(&mut *tx).await?;
+                        for cid in cats {
+                            if let Some(cid) = cid.as_str() {
+                                sqlx::query("INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)")
+                                    .bind(id).bind(cid).execute(&mut *tx).await?;
+                                kc_n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(arr) = data.get("servers").and_then(|v| v.as_array()) {
+                for sv in arr {
+                    let Some(id) = sv.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let s = |f: &str| sv.get(f).and_then(|v| v.as_str());
+                    sqlx::query(
+                        "INSERT INTO servers (id, name, host, port, username, key_id, pem_path, auth_method, \
+                           saved_password, category_id, color, last_connected_at, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, host=excluded.host, port=excluded.port, \
+                           username=excluded.username, key_id=excluded.key_id, pem_path=excluded.pem_path, \
+                           auth_method=excluded.auth_method, saved_password=excluded.saved_password, \
+                           category_id=excluded.category_id, color=excluded.color, \
+                           last_connected_at=excluded.last_connected_at, updated_at=excluded.updated_at",
+                    )
+                    .bind(id)
+                    .bind(s("name").unwrap_or("imported"))
+                    .bind(s("host").unwrap_or(""))
+                    .bind(sv.get("port").and_then(|v| v.as_i64()).unwrap_or(22))
+                    .bind(s("username").unwrap_or("root"))
+                    .bind(s("key_id"))
+                    .bind(s("pem_path"))
+                    .bind(s("auth_method").unwrap_or("publickey"))
+                    .bind(s("saved_password"))
+                    .bind(s("category_id"))
+                    .bind(s("color"))
+                    .bind(s("last_connected_at"))
+                    .bind(s("created_at").unwrap_or(""))
+                    .bind(s("updated_at").unwrap_or(""))
+                    .execute(&mut *tx).await?;
+                    servers_n += 1;
+                }
+            }
+
+            if let Some(arr) = data.get("known_hosts").and_then(|v| v.as_array()) {
+                for h in arr {
+                    let Some(host) = h.get("host").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let host_key = h.get("host_key").and_then(|v| v.as_str()).unwrap_or("");
+                    let fp = h.get("fingerprint_sha256").and_then(|v| v.as_str()).unwrap_or("");
+                    let seen = h.get("first_seen").and_then(|v| v.as_str()).unwrap_or("");
+                    sqlx::query(
+                        "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
+                         VALUES (?, ?, ?, ?) \
+                         ON CONFLICT(host) DO UPDATE SET host_key=excluded.host_key, \
+                           fingerprint_sha256=excluded.fingerprint_sha256, first_seen=excluded.first_seen",
+                    )
+                    .bind(host).bind(host_key).bind(fp).bind(seen)
+                    .execute(&mut *tx).await?;
+                    hosts_n += 1;
+                }
+            }
+
+            if let Some(obj) = data.get("settings").and_then(|v| v.as_object()) {
+                for (k, v) in obj {
+                    if let Some(val) = v.as_str() {
+                        sqlx::query(
+                            "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
+                             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                        )
+                        .bind(format!("setting.{k}")).bind(val)
+                        .bind(chrono::Utc::now().to_rfc3339())
+                        .execute(&mut *tx).await?;
+                        settings_n += 1;
+                    }
+                }
+            }
+
+            tx.commit().await?;
+            Ok(serde_json::json!({
+                "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
+                "servers": servers_n, "knownHosts": hosts_n, "settings": settings_n,
+            }))
         })
     }
 }

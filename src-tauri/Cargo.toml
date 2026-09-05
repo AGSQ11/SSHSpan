@@ -109,4 +109,5 @@ generic-array = "0.14"
 # ─── Utilities ─────────────────────────────────────────────────────────────
 opener = "0.7"                    # Open URLs / reveal files in OS default app
 urlencoding = "2"                 # URL-encode cipher IDs for Bitwarden API
+semver = "1"                    # Release version comparison (update check)
 russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }

@@ -204,6 +204,36 @@
           <div class="card">
             <div class="card-head">
               <div>
+                <h2>Known hosts</h2>
+                <p class="card-sub">Host keys pinned on first connect (TOFU). Forgetting a host makes SSHSpan re-accept whatever key it presents on the next connection.</p>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="audit-table">
+                <thead><tr><th>Host</th><th>Fingerprint (SHA-256)</th><th>First seen</th><th></th></tr></thead>
+                <tbody id="knownHostsBody"></tbody>
+              </table>
+            </div>
+            <p class="hint" id="knownHostsEmpty" hidden>No hosts pinned yet — they appear after the first Connect session.</p>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h2>Backup &amp; Restore</h2>
+                <p class="card-sub">Exports your entire vault — keys (still encrypted), categories, saved servers, known hosts, and settings — as a single sealed file. Restoring requires the master password that was current when the backup was taken.</p>
+              </div>
+            </div>
+            <div class="bw-actions">
+              <button id="backupExportBtn" class="primary-btn"><span data-ico="download"></span>Create backup…</button>
+              <button id="backupImportBtn" class="ghost-btn"><span data-ico="file-up"></span>Restore from backup…</button>
+            </div>
+            <div class="status-strip" id="backupStatus">Backups are sealed with your master password — treat the file as a secret.</div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
                 <h2>Bitwarden / Vaultwarden sync</h2>
                 <p class="card-sub">
                   Keeps your SSH keys mirrored as SSH key items in your own vault (folder
@@ -424,6 +454,11 @@
               <input type="password" id="srvPassword" placeholder="leave blank to type at connect time" autocomplete="off" />
             </label>
             <label class="toggle-chip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
+          </div>
+          <div class="span-2 cat-field">
+            <span class="cat-field-label">Category</span>
+            <div class="cat-chips" id="srvCategory"></div>
+            <button type="button" id="srvBrowseCategoryBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories…</button>
           </div>
         </div>
         <p class="hint">Keys are unsealed only inside the Rust process; the renderer never sees private key bytes.</p>

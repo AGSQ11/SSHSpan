@@ -759,6 +759,7 @@ async function refreshVaultStatus(silent) {
     hideVaultModal();
     if (!wasUnlocked || !silent) await loadKeys();
   }
+  resetAutoLockTimer();
 }
 
 // Lock/unlock the nav buttons that require an unlocked vault (Connect, Deploy).
@@ -1477,6 +1478,8 @@ async function loadSettings() {
   autoLock.addEventListener('change', async () => {
     try {
       await call('settings_set', { key: 'autoLockMinutes', value: String(autoLock.value) });
+      state.settings.autoLockMinutes = autoLock.value;
+      resetAutoLockTimer();
       toast('Auto-lock updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
@@ -1492,6 +1495,122 @@ async function loadSettings() {
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   mkRow('Confirm before deleting keys', confirmDelete);
+
+  const autoUpdate = document.createElement('input');
+  autoUpdate.type = 'checkbox';
+  autoUpdate.checked = state.settings.autoUpdateCheck !== false;
+  autoUpdate.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'autoUpdateCheck', value: String(autoUpdate.checked) });
+      state.settings.autoUpdateCheck = autoUpdate.checked;
+      toast('Saved.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Automatically check GitHub for a newer release', autoUpdate);
+
+  const checkNow = document.createElement('button');
+  checkNow.className = 'ghost-btn';
+  checkNow.innerHTML = `${ico('refresh-cw')}<span>Check now</span>`;
+  checkNow.addEventListener('click', manualUpdateCheck);
+  mkRow('Updates', checkNow);
+
+  loadKnownHosts();
+}
+
+// ─── known hosts (Settings panel) ──────────────────────────────────────────
+// ─── vault backup / restore (Settings panel) ───────────────────────────────
+
+async function backupCreate() {
+  try {
+    const r = await call('vault_backup_create');
+    const pick = await call('system_pick_save_path', {
+      title: 'Save vault backup',
+      defaultName: r.filename,
+    });
+    if (pick.canceled) return;
+    await call('system_write_text_file', {
+      path: pick.path,
+      contents: JSON.stringify(r.json, null, 2),
+    });
+    const c = r.counts;
+    el('backupStatus').textContent = `Backup saved: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+    toast('Backup created.', 'ok');
+  } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+async function backupRestore() {
+  try {
+    const pick = await call('system_select_file', { title: 'Select vault backup file' });
+    if (pick.canceled) return;
+    const payloadJson = pick.text;
+    if (!confirm('Restoring will add or overwrite entries with the ones from this backup. Continue?')) return;
+    try {
+      const r = await call('vault_backup_restore', { payloadJson, backupPassword: null });
+      finishRestore(r);
+    } catch (e) {
+      const msg = e.message || String(e);
+      if (!msg.includes('different master password')) throw e;
+      // The backup was created under a different master password — ask for it.
+      promptModal('Backup password',
+        'This backup was created with a different master password. Enter the one that was active when the backup was taken:',
+        '', async (pw) => {
+          if (!pw) return;
+          try {
+            const r2 = await call('vault_backup_restore', { payloadJson, backupPassword: pw });
+            finishRestore(r2);
+          } catch (e2) { toast(e2.message || String(e2), 'err'); }
+        });
+    }
+  } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+function finishRestore(r) {
+  const c = r.counts;
+  el('backupStatus').textContent = `Restored: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+  loadKeys();
+  loadServers();
+  toast('Backup restored.', 'ok');
+}
+async function loadKnownHosts() {
+  const body = el('knownHostsBody');
+  const empty = el('knownHostsEmpty');
+  if (!body) return;
+  body.innerHTML = '';
+  try {
+    const res = await call('known_hosts_list');
+    const hosts = res.hosts || [];
+    empty.hidden = hosts.length > 0;
+    for (const h of hosts) {
+      const tr = document.createElement('tr');
+      const tdHost = document.createElement('td');
+      tdHost.textContent = h.host;
+      const tdFp = document.createElement('td');
+      const code = document.createElement('code');
+      code.className = 'mono';
+      code.textContent = h.fingerprintSha256 || '—';
+      tdFp.appendChild(code);
+      const tdSeen = document.createElement('td');
+      tdSeen.textContent = fmtTime(h.firstSeen);
+      const tdAct = document.createElement('td');
+      const forget = document.createElement('button');
+      forget.className = 'ghost-btn';
+      forget.innerHTML = `${ico('trash-2')}<span>Forget</span>`;
+      forget.addEventListener('click', async () => {
+        if (!confirm(`Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`)) return;
+        try {
+          await call('known_hosts_forget', { host: h.host });
+          await loadKnownHosts();
+          toast('Host forgotten.', 'ok');
+        } catch (e) { toast(e.message || String(e), 'err'); }
+      });
+      tdAct.appendChild(forget);
+      tr.appendChild(tdHost); tr.appendChild(tdFp); tr.appendChild(tdSeen); tr.appendChild(tdAct);
+      body.appendChild(tr);
+    }
+  } catch (e) {
+    empty.hidden = false;
+    body.innerHTML = '';
+  }
 }
 
 // ─── audit view ────────────────────────────────────────────────────────────
@@ -1553,6 +1672,7 @@ async function switchView(view) {
   if (view === 'settings') {
     await loadSettings();
     await loadBitwardenConfig();
+    await loadKnownHosts();
   }
   if (view === 'audit') await loadAudit();
   if (view === 'keys') {
@@ -1672,6 +1792,10 @@ function wire() {
     bwSyncNow();
   });
 
+  // backup & restore (Settings)
+  el('backupExportBtn').addEventListener('click', backupCreate);
+  el('backupImportBtn').addEventListener('click', backupRestore);
+
   // picker modal
   el('pickerCloseBtn').addEventListener('click', closeCategoryPicker);
   el('pickerCancelBtn').addEventListener('click', closeCategoryPicker);
@@ -1761,6 +1885,17 @@ function wire() {
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   el('srvSaveBtn').addEventListener('click', submitServerModal);
+  el('srvBrowseCategoryBtn').addEventListener('click', () => {
+    openCategoryPicker({
+      title: 'Server category',
+      initial: state._pendingServerCategory ? [state._pendingServerCategory] : [],
+      single: true,
+      onSave: (ids) => {
+        state._pendingServerCategory = ids[0] || null;
+        renderServerCategoryChips();
+      },
+    });
+  });
 
   // Connect password modal
   el('connectPwOkBtn').addEventListener('click', () => {
@@ -1784,6 +1919,56 @@ async function lockNow() {
     await refreshVaultStatus();
     toast('Vault locked.', 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+// ─── Auto-lock (idle timer, honors the autoLockMinutes setting) ────────────
+
+let autoLockTimer = null;
+
+function resetAutoLockTimer() {
+  if (autoLockTimer) { clearTimeout(autoLockTimer); autoLockTimer = null; }
+  const mins = parseInt(state.settings.autoLockMinutes, 10);
+  if (!state.unlocked || !mins || mins <= 0) return;
+  autoLockTimer = setTimeout(async () => {
+    autoLockTimer = null;
+    if (state.unlocked) {
+      toast('Vault auto-locked after inactivity.', 'info');
+      await lockNow();
+    }
+  }, mins * 60 * 1000);
+}
+
+// ─── Update check (GitHub releases; manual + auto per setting) ─────────────
+
+async function manualUpdateCheck() {
+  try {
+    const r = await call('update_check');
+    if (r.available) {
+      const install = confirm(
+        `A newer version is available: ${r.current} → ${r.version}\n\n` +
+        `${r.notes ? r.notes.slice(0, 800) + '\n\n' : ''}` +
+        `Download and run the installer for this OS?`);
+      if (install) {
+        toast('Downloading installer…', 'info');
+        await call('update_download_and_run', { url: r.assetUrl, version: r.version });
+        // The app exits itself right after spawning the installer.
+      }
+    } else {
+      toast(`You are on the latest version (${r.current}).`, 'ok');
+    }
+  } catch (e) {
+    toast(e.message || String(e), 'err');
+  }
+}
+
+async function autoUpdateCheckOnBoot() {
+  if (state.settings.autoUpdateCheck === false) return;
+  try {
+    const r = await call('update_check');
+    if (r.available) {
+      toast(`Update available: ${r.version} — Settings → "Check now" to install.`, 'info');
+    }
+  } catch (e) { /* offline or rate-limited: silently ignore on boot */ }
 }
 
 // ─── Connect: saved servers + SSH sessions ─────────────────────────────────
@@ -1966,13 +2151,25 @@ function openServerModal({ id, keyId } = {}) {
   el('srvPassword').value = '';
   el('srvSavePw').checked = false;
   setConnectAuthMethod(srv ? srv.authMethod : (keyId ? 'publickey' : 'publickey'));
+  // Category (single-select; schema is one category_id per server)
+  state._pendingServerCategory = srv ? (srv.categoryId || null) : null;
+  renderServerCategoryChips();
   state._editingServerId = id || null;
   setTimeout(() => el('srvName').focus(), 0);
+}
+
+function renderServerCategoryChips() {
+  const ids = state._pendingServerCategory ? [state._pendingServerCategory] : [];
+  renderCategoryChips(el('srvCategory'), ids, {
+    removable: true,
+    onRemove: () => { state._pendingServerCategory = null; renderServerCategoryChips(); },
+  });
 }
 
 function closeServerModal() {
   el('serverModal').hidden = true;
   state._editingServerId = null;
+  state._pendingServerCategory = null;
 }
 
 function setConnectAuthMethod(method) {
@@ -2003,7 +2200,7 @@ async function submitServerModal() {
     keyId: method === 'publickey' ? (el('srvKeyId').value || null) : null,
     pemPath: method === 'publickey' ? (el('srvPemPath').value.trim() || null) : null,
     savedPassword: (method !== 'publickey' && el('srvSavePw').checked) ? el('srvPassword').value : null,
-    categoryId: null,
+    categoryId: state._pendingServerCategory,
     color: null,
   };
   try {
@@ -2243,6 +2440,19 @@ function escapeHtml(s) {
   }
 
   await refreshVaultStatus();
+
+  // Auto-lock needs the persisted settings at boot (loadSettings only runs
+  // when the Settings view is opened).
+  try { state.settings = await call('settings_get'); } catch (e) { state.settings = {}; }
+
+  // Auto-lock idle timer: user activity resets it; expiry calls lockNow().
+  for (const ev of ['keydown', 'mousedown', 'wheel', 'touchstart']) {
+    document.addEventListener(ev, () => resetAutoLockTimer(), { passive: true });
+  }
+  resetAutoLockTimer();
+
+  // Optional update check (only when the setting is ticked; never auto-installs).
+  autoUpdateCheckOnBoot();
 
   // Catch auto-locks without user interaction.
   setInterval(() => {

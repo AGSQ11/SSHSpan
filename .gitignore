@@ -33,3 +33,4 @@ coverage/
 # Local build scratch
 .buildtmp/
 .zcode/
+src-tauri/target/
