@@ -229,16 +229,20 @@ mod tests {
     fn ed25519_private_der_structure() {
         let seed = [0x11u8; 32];
         let der = ed25519_private_to_pkcs8(&seed);
-        // SEQUENCE(46) { INTEGER(0), SEQUENCE(alg,5b), OCTET STRING(34) { OCTET STRING(32) { seed } } }
+        // SEQUENCE(46) { INTEGER 0, SEQUENCE{OID 1.3.101.112}, OCTET STRING{ OCTET STRING(32){seed} } }
         assert_eq!(der[0], 0x30); // SEQUENCE
-        assert_eq!(der[1], 46); // length
+        assert_eq!(der[1], 46); // content length (short form)
         assert_eq!(&der[2..5], &[0x02, 0x01, 0x00]); // INTEGER 0
-        // outer octet string tag/len
-        let outer_start = 5 + 5; // version(3) + algid(5)
-        assert_eq!(der[outer_start], 0x04);
-        assert_eq!(der[outer_start + 1], 34);
-        assert_eq!(der[outer_start + 2], 0x04); // inner octet string tag
-        assert_eq!(der[outer_start + 3], 32);
-        assert_eq!(&der[outer_start + 4..outer_start + 4 + 32], &seed);
+        // AlgorithmIdentifier TLV (header 2 + content 5 = 7 bytes)
+        assert_eq!(&der[5..12], &[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70]);
+        // privateKey OCTET STRING starts after the 2-byte SEQUENCE header
+        // plus version(3) plus AlgorithmIdentifier(7) = index 12.
+        let outer = 12;
+        assert_eq!(der[outer], 0x04);
+        assert_eq!(der[outer + 1], 34); // wraps CurvePrivateKey
+        assert_eq!(der[outer + 2], 0x04); // CurvePrivateKey OCTET STRING
+        assert_eq!(der[outer + 3], 32);
+        assert_eq!(&der[outer + 4..outer + 4 + 32], &seed);
+        assert_eq!(der.len(), outer + 4 + 32); // 48 total
     }
 }
