@@ -2214,10 +2214,15 @@ function escapeHtml(s) {
   switchTab('generate');
   updateSelectionHint();
   loadBrandIcon();
+  await refreshVaultStatus();
+
+  // terminal.js must be loaded for the Connect view to function. IMPORTANT:
+  // this check must run only after ALL classic scripts have executed — app.js
+  // itself runs BEFORE terminal.js in document order, so checking before the
+  // first await would always fire a false "terminal.js failed to load" toast.
   if (!window.__SSHPAN_TERMINAL_JS__) {
     toast('terminal.js failed to load — the Connect view will not work. Please reinstall.', 'err');
   }
-  await refreshVaultStatus();
 
   // Catch auto-locks without user interaction.
   setInterval(() => {
