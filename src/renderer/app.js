@@ -2206,7 +2206,10 @@ function escapeHtml(s) {
 
   // terminal.js must be loaded for the Connect view to function. It sets this
   // marker as its first statement; if it is missing, that script did not load.
-  window.__SSHPAN_BUILD__ = 'putty-v9';
+  window.__SSHPAN_BUILD__ = 'putty-v9c';
+  // Show the build marker in the window title — visible on every screen
+  // (including the unlock modal), so a stale install is instantly obvious.
+  document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();
   wire();
