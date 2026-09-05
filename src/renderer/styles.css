@@ -1067,8 +1067,8 @@ label:focus-within { color: var(--text); }
 .server-col {
   display: flex;
   flex-direction: column;
-  background: var(--panel-bg);
-  border: 1px solid var(--border);
+  background: var(--panel);
+  border: 1px solid var(--line);
   border-radius: 12px;
   overflow: hidden;
   min-height: 0;
@@ -1077,7 +1077,7 @@ label:focus-within { color: var(--text); }
   display: flex;
   gap: 8px;
   padding: 10px 10px 6px 10px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line);
   align-items: center;
 }
 .server-list-head .search-wrap { flex: 1; min-width: 0; }
@@ -1094,9 +1094,9 @@ label:focus-within { color: var(--text); }
   margin-bottom: 4px;
   border: 1px solid transparent;
 }
-.server-row:hover { background: var(--hover-bg); }
+.server-row:hover { background: var(--hover); }
 .server-row.selected {
-  background: var(--accent-soft);
+  background: var(--accent-weak);
   border-color: var(--accent);
 }
 .server-row-head {
@@ -1114,13 +1114,13 @@ label:focus-within { color: var(--text); }
 }
 .server-row-sub {
   font-size: 12px;
-  color: var(--muted);
+  color: var(--text-dim);
   margin-top: 2px;
   font-family: 'JetBrains Mono', 'Menlo', monospace;
 }
 .server-row-auth {
   font-size: 11px;
-  color: var(--muted);
+  color: var(--text-dim);
   display: flex;
   align-items: center;
   gap: 4px;
@@ -1131,8 +1131,8 @@ label:focus-within { color: var(--text); }
 .terminal-col {
   display: flex;
   flex-direction: column;
-  background: var(--panel-bg);
-  border: 1px solid var(--border);
+  background: var(--panel);
+  border: 1px solid var(--line);
   border-radius: 12px;
   overflow: hidden;
   min-height: 0;
@@ -1142,7 +1142,7 @@ label:focus-within { color: var(--text); }
   align-items: center;
   justify-content: space-between;
   padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line);
 }
 .terminal-title {
   display: flex;
@@ -1167,10 +1167,10 @@ label:focus-within { color: var(--text); }
 .terminal-host .xterm-viewport,
 .terminal-host .xterm-screen { height: 100% !important; }
 .terminal-strip {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line);
   padding: 6px 12px;
   font-size: 12px;
-  color: var(--muted);
+  color: var(--text-dim);
   background: var(--bg);
   white-space: nowrap;
   overflow: hidden;
@@ -1190,12 +1190,12 @@ label:focus-within { color: var(--text); }
   flex-direction: column;
   gap: 4px;
   font-size: 12px;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 .server-grid input,
 .server-grid select {
-  background: var(--input-bg);
-  border: 1px solid var(--border);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
   border-radius: 6px;
   padding: 7px 9px;
   color: var(--text);
@@ -1203,8 +1203,8 @@ label:focus-within { color: var(--text); }
 }
 .seg {
   display: inline-flex;
-  background: var(--input-bg);
-  border: 1px solid var(--border);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
   width: fit-content;
@@ -1212,7 +1212,7 @@ label:focus-within { color: var(--text); }
 .seg-btn {
   border: 0;
   background: transparent;
-  color: var(--muted);
+  color: var(--text-dim);
   padding: 6px 12px;
   font-size: 12px;
   cursor: pointer;
@@ -1234,13 +1234,14 @@ label:focus-within { color: var(--text); }
   position: fixed;
   z-index: 1000;
   min-width: 200px;
-  background: var(--panel-bg);
-  border: 1px solid var(--border);
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
   border-radius: 8px;
   padding: 4px;
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-2);
   display: flex;
   flex-direction: column;
+  color: var(--text);
 }
 .ctx-item {
   display: flex;
@@ -1254,11 +1255,12 @@ label:focus-within { color: var(--text); }
   border-radius: 6px;
   cursor: pointer;
   font-size: 13px;
+  width: 100%;
 }
-.ctx-item:hover { background: var(--hover-bg); }
+.ctx-item:hover { background: var(--hover); }
 .ctx-item svg { width: 14px; height: 14px; flex: none; }
-.ctx-item small { color: var(--muted); font-size: 11px; }
-.ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+.ctx-item small { color: var(--text-dim); font-size: 11px; }
+.ctx-sep { height: 1px; background: var(--line); margin: 4px 6px; }
 
 /* ─── Nav: locked-variant for vault-gated buttons ─────────────────────── */
 
