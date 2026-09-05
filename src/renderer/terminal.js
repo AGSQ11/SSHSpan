@@ -19,7 +19,7 @@
 // Boot marker: app.js checks this at startup. If it's missing, terminal.js
 // did not load/execute and the Connect view cannot work — we surface that
 // visibly instead of failing silently.
-window.__SSHPAN_TERMINAL_JS__ = 'loaded-v8';
+window.__SSHPAN_TERMINAL_JS__ = 'loaded-v9';
 
 // NOTE: app.js already declares top-level `const invoke` in the shared global
 // lexical scope of these classic scripts. Re-declaring `invoke` (or any
@@ -27,6 +27,20 @@ window.__SSHPAN_TERMINAL_JS__ = 'loaded-v8';
 // file at load time — the exact bug that made the terminal permanently blank.
 // Namespace everything instead.
 const tcore = window.__TAURI__.core;
+// Clipboard via the Tauri plugin (permissions are granted in capabilities);
+// navigator.clipboard as fallback.
+const tclip = (window.__TAURI__ && window.__TAURI__.clipboardManager) || null;
+
+function copyText(text) {
+  if (!text) return;
+  if (tclip) { tclip.writeText(text).catch(() => {}); return; }
+  if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+}
+
+async function readClipboard() {
+  if (tclip) { try { return await tclip.readText(); } catch (e) {} }
+  try { return await navigator.clipboard.readText(); } catch (e) { return ''; }
+}
 
 let term = null;
 let fitAddon = null;
@@ -89,6 +103,29 @@ function buildTerminal() {
     try { fitAddon && fitAddon.fit(); } catch (e) {}
   }));
 
+  // ── PuTTY-style clipboard behavior ──────────────────────────────────────
+  // Selecting text copies it immediately; right-click pastes the clipboard
+  // into the session; Ctrl+Shift+C/V work too.
+  try {
+    term.onSelectionChange(() => {
+      const sel = term.getSelection();
+      if (sel) copyText(sel);
+    });
+  } catch (e) {}
+  try {
+    term.textarea.addEventListener('contextmenu', async (e) => {
+      e.preventDefault();
+      const text = await readClipboard();
+      if (text) term.paste(text);
+    });
+    term.textarea.addEventListener('keydown', (e) => {
+      if (!e.ctrlKey || !e.shiftKey) return;
+      const k = e.key.toLowerCase();
+      if (k === 'c') { const sel = term.getSelection(); if (sel) { copyText(sel); e.preventDefault(); } }
+      else if (k === 'v') { e.preventDefault(); readClipboard().then(t => { if (t) term.paste(t); }); }
+    });
+  } catch (e) {}
+
   // No !important height CSS — let xterm size itself from rows/cols and let
   // FitAddon pick the row count that fills the host.
   const ro = new ResizeObserver(() => {
@@ -128,6 +165,23 @@ function terminalReset() {
 function terminalSetStatus(text) {
   const s = document.getElementById('termStrip');
   if (s) s.textContent = text;
+}
+
+/// Refit the terminal to its host and push the new size to the remote PTY.
+/// Used by the maximize/restore toggle after the layout settles.
+function fitTerminalNow() {
+  if (!term || !fitAddon) return;
+  try {
+    const d = fitAddon.proposeDimensions();
+    if (d && Number.isFinite(d.cols) && Number.isFinite(d.rows) && d.cols >= 2 && d.rows >= 2) {
+      fitAddon.fit();
+      if (currentSessionId) {
+        tcore.invoke('terminal_resize', { sessionId: currentSessionId, cols: term.cols, rows: term.rows })
+          .catch(() => {});
+      }
+    }
+  } catch (e) {}
+  try { term.focus(); } catch (e) {}
 }
 
 function terminalConnect(server, opts) {
@@ -240,3 +294,4 @@ window.ensureTerminalForSession = ensureTerminalForSession;
 window.terminalReset = terminalReset;
 window.terminalSetStatus = terminalSetStatus;
 window.terminalConnect = terminalConnect;
+window.fitTerminalNow = fitTerminalNow;

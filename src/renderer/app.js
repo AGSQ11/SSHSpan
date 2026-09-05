@@ -1707,6 +1707,7 @@ function wire() {
     if (ev.key === 'Escape') {
       if (!el('modalBackdrop').hidden) closeKeyModal();
       else if (!el('serverModal').hidden) closeServerModal();
+      else if (el('app').classList.contains('term-max')) toggleTermMax();
       else if (!el('vaultModal').hidden && state.vaultMode === 'change') hideVaultModal();
       return;
     }
@@ -1733,6 +1734,8 @@ function wire() {
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
   el('serverSearch').addEventListener('input', renderServerList);
   el('termDisconnectBtn').addEventListener('click', disconnectActive);
+  const termMaxBtn = el('termMaxBtn');
+  if (termMaxBtn) termMaxBtn.addEventListener('click', toggleTermMax);
   el('termReconnectBtn').addEventListener('click', () => {
     const srv = currentSelectedServer();
     if (srv) connectToServer(srv);
@@ -2130,6 +2133,28 @@ async function disconnectActive() {
   if (typeof terminalSetStatus === 'function') terminalSetStatus('Disconnected.');
 }
 
+// Toggle the terminal between the normal Connect layout and a full-app
+// "maximized" mode: sidebar/topbar/server-list hidden, terminal fills the
+// window, and a thin taskbar strip (status + this restore button) remains.
+function toggleTermMax() {
+  const app = el('app');
+  const btn = el('termMaxBtn');
+  if (!app || !btn) return;
+  const max = app.classList.toggle('term-max');
+  btn.innerHTML = ico(max ? 'minimize-2' : 'maximize-2');
+  btn.title = max ? 'Restore terminal size (<>)' : 'Expand terminal to full window';
+  if (typeof terminalSetStatus === 'function') {
+    terminalSetStatus(max ? 'Terminal maximized — press Esc or <> to restore.' : 'Restored.');
+  }
+  // Let the layout settle, then refit + push the new PTY size.
+  setTimeout(() => {
+    if (typeof fitTerminalNow === 'function') fitTerminalNow();
+  }, 80);
+  setTimeout(() => {
+    if (typeof fitTerminalNow === 'function') fitTerminalNow();
+  }, 250);
+}
+
 async function testSelectedServer(srv) {
   let pw = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
@@ -2181,7 +2206,7 @@ function escapeHtml(s) {
 
   // terminal.js must be loaded for the Connect view to function. It sets this
   // marker as its first statement; if it is missing, that script did not load.
-  window.__SSHPAN_BUILD__ = 'diag-v7';
+  window.__SSHPAN_BUILD__ = 'putty-v9';
 
   injectIcons();
   wire();

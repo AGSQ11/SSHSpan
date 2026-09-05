@@ -1136,6 +1136,7 @@ label:focus-within { color: var(--text); }
   border-radius: 12px;
   overflow: hidden;
   min-height: 0;
+  position: relative;
 }
 .terminal-head {
   display: flex;
@@ -1166,6 +1167,51 @@ label:focus-within { color: var(--text); }
 }
 /* xterm sizes its own rows/cols; FitAddon picks dimensions that fill this box.
    Do NOT force heights on .xterm-* elements — that breaks rendering. */
+
+/* Floating maximize/restore (<>) control, lower-right above the strip. */
+.term-max-btn {
+  position: absolute;
+  right: 8px;
+  bottom: 34px;
+  z-index: 30;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(18, 22, 31, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0.35;
+  padding: 0;
+}
+.term-max-btn:hover {
+  opacity: 1;
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+.term-max-btn svg { width: 14px; height: 14px; }
+
+/* ─── Terminal maximized-to-app mode ─────────────────────────────────────
+   #app.term-max: the terminal takes over the whole window. A thin taskbar
+   (terminal-head on top + status strip at the bottom) stays usable; the
+   sidebar, topbar and server list are hidden. */
+#app.term-max .sidebar { display: none; }
+#app.term-max .topbar { display: none; }
+#app.term-max .content { min-width: 0; }
+#app.term-max .view { padding: 0; overflow: hidden; }
+#app.term-max .connect-layout {
+  height: 100vh;
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+#app.term-max .server-col { display: none; }
+#app.term-max .terminal-col {
+  border-radius: 0;
+  border: 0;
+}
 .terminal-strip {
   border-top: 1px solid var(--line);
   padding: 6px 12px;
