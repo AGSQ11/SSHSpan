@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-09-05
+
+The Node.js/Electron backend is fully replaced by a compiled **Rust core (Tauri v2)**, and
+SSHSpan gains an **embedded SSH client**. Full migration story:
+[`docs/REWRITE-ROADMAP.md`](docs/REWRITE-ROADMAP.md).
+
+### Added
+
+- **Connect — embedded SSH client** (russh 0.63 + xterm.js 5.5, both vendored/offline):
+  - Saved servers with per-server username + SSH-key binding, auth methods
+    (publickey / password / keyboard-interactive), optional password sealed with the vault
+    master, latency test, last-connected tracking.
+  - Interactive PTY terminal: full ANSI colors, 5000-line scrollback, live resize
+    (incl. maximize-to-app with a floating `<>` toggle and `Esc` restore).
+  - PuTTY behaviors: select-to-copy, right-click paste, Ctrl+Shift+C/V, blinking block cursor,
+    solid accent selection highlight.
+  - TOFU host-key pinning (`known_hosts` table); mismatch refuses the connection.
+  - Right-click any key → **"Use this key to connect…"** (server's username + clicked key).
+  - Vault-gated: locking the vault disconnects every live session.
+  - Audit events: `connect.start/stop`, `server.save/delete`, `server.test_ok/fail`,
+    `known_hosts.forget`.
+
+### Changed
+
+- **Backend rewritten from Node.js to Rust** (Tauri v2): crypto (`ssh-key`, AES-256-GCM +
+  bcrypt-pbkdf2 vault sealing), SQLite via sqlx (same vault file, in-place migration),
+  Bitwarden/Vaultwarden client (expand-only HKDF, Vaultwarden client-version gate,
+  SSRF-safe URL validation), SSH deploy, and `~/.ssh/config` management.
+- Renderer unchanged in spirit (plain HTML/CSS/JS, strict CSP, vendored xterm.js, generated
+  Lucide icon sprite); DevTools enabled in release (the UI holds no secrets).
+- Installers shrink from ~150 MB (Electron) to ~9 MB (NSIS).
+- Removed the legacy Node/Electron backend (`src/main/`, Node test harnesses); Rust unit tests
+  live in `src-tauri` (`cargo test`).
+
 ## [1.2.0] - 2026-09-02
 
 ### Added

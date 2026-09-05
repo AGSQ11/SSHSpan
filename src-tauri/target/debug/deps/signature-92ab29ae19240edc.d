@@ -1,0 +1,12 @@
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\signature-92ab29ae19240edc.d: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\hazmat.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\encoding.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\error.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\keypair.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\signer.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\verifier.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\../README.md
+
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\libsignature-92ab29ae19240edc.rmeta: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\hazmat.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\encoding.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\error.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\keypair.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\signer.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\verifier.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\../README.md
+
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\lib.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\hazmat.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\encoding.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\error.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\keypair.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\signer.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\verifier.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\signature-3.0.0\src\../README.md:

@@ -1,0 +1,11 @@
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\os_info-04eece81c6b7e463.d: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\windows\mod.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\windows\winapi.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\bitness.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\info.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\os_type.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\version.rs
+
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\libos_info-04eece81c6b7e463.rmeta: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\windows\mod.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\windows\winapi.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\bitness.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\info.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\os_type.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\version.rs
+
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\lib.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\windows\mod.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\windows\winapi.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\bitness.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\info.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\os_type.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\os_info-3.15.0\src\version.rs:
