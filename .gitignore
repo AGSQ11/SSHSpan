@@ -32,3 +32,4 @@ coverage/
 
 # Local build scratch
 .buildtmp/
+.zcode/
