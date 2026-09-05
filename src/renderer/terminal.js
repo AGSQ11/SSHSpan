@@ -19,9 +19,14 @@
 // Boot marker: app.js checks this at startup. If it's missing, terminal.js
 // did not load/execute and the Connect view cannot work — we surface that
 // visibly instead of failing silently.
-window.__SSHPAN_TERMINAL_JS__ = 'loaded-v7';
+window.__SSHPAN_TERMINAL_JS__ = 'loaded-v8';
 
-const { invoke, Channel } = window.__TAURI__.core;
+// NOTE: app.js already declares top-level `const invoke` in the shared global
+// lexical scope of these classic scripts. Re-declaring `invoke` (or any
+// top-level const it declares) here is a SyntaxError that kills this whole
+// file at load time — the exact bug that made the terminal permanently blank.
+// Namespace everything instead.
+const tcore = window.__TAURI__.core;
 
 let term = null;
 let fitAddon = null;
@@ -93,7 +98,7 @@ function buildTerminal() {
       if (d && Number.isFinite(d.cols) && Number.isFinite(d.rows) && d.cols >= 2 && d.rows >= 2) {
         fitAddon.fit();
         if (currentSessionId) {
-          invoke('terminal_resize', { sessionId: currentSessionId, cols: term.cols, rows: term.rows })
+          tcore.invoke('terminal_resize', { sessionId: currentSessionId, cols: term.cols, rows: term.rows })
             .catch(() => {});
         }
       }
@@ -140,7 +145,7 @@ function terminalConnect(server, opts) {
     setTimeout(() => { try { t.focus(); } catch (e) {} }, 50);
 
     // Tauri v2 Channel: each Rust-side .send() triggers onmessage here.
-    const onData = new Channel();
+    const onData = new tcore.Channel();
     onData.onmessage = (text) => {
       if (typeof text !== 'string' || text.length === 0) return;
       if (!gotFirstChannelData) {
@@ -168,7 +173,7 @@ function terminalConnect(server, opts) {
     const dataSub = t.onData(async (data) => {
       if (!currentSessionId) return;
       try {
-        await invoke('terminal_send', {
+        await tcore.invoke('terminal_send', {
           sessionId: currentSessionId,
           bytes: Array.from(encoder.encode(data)),
         });
@@ -187,7 +192,7 @@ function terminalConnect(server, opts) {
     };
 
     try {
-      const r = await invoke('terminal_connect', args);
+      const r = await tcore.invoke('terminal_connect', args);
       if (!r || !r.ok || !r.sessionId) {
         throw new Error((r && r.error) || 'No session id returned.');
       }
@@ -201,7 +206,7 @@ function terminalConnect(server, opts) {
 
       // Push the real terminal size now that the session is live.
       try {
-        await invoke('terminal_resize', { sessionId, cols: t.cols, rows: t.rows });
+        await tcore.invoke('terminal_resize', { sessionId, cols: t.cols, rows: t.rows });
       } catch (e) {}
 
       // Close detection via registry CONTENT (not invoke errors): when the
@@ -212,7 +217,7 @@ function terminalConnect(server, opts) {
           return;
         }
         try {
-          const res = await invoke('terminal_list', {});
+          const res = await tcore.invoke('terminal_list', {});
           const stillThere = (res.active || []).some(s => s.sessionId === sessionId);
           if (!stillThere) teardown(sessionId);
         } catch (e) { teardown(sessionId); }
