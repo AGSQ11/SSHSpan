@@ -1,6 +1,6 @@
 [package]
 name = "sshspan"
-version = "1.3.2"
+version = "1.3.3"
 description = "SSH Key Manager - Cross-platform SSH key management with Bitwarden sync"
 authors = ["AGSQ11"]
 edition = "2021"

@@ -19,7 +19,7 @@
 // Boot marker: app.js checks this at startup. If it's missing, terminal.js
 // did not load/execute and the Connect view cannot work — we surface that
 // visibly instead of failing silently.
-window.__SSHPAN_TERMINAL_JS__ = 'loaded-v9';
+window.__SSHPAN_TERMINAL_JS__ = 'loaded-v11';
 
 // NOTE: app.js already declares top-level `const invoke` in the shared global
 // lexical scope of these classic scripts. Re-declaring `invoke` (or any
@@ -54,10 +54,12 @@ function trace(line) {
   if (term) {
     try { term.writeln('\x1b[90m' + line + '\x1b[0m'); } catch (e) {}
   }
-  // Mirror to the status strip too: if terminal geometry is broken, the strip
-  // still shows the last stage.
-  const s = document.getElementById('termStrip');
-  if (s) s.textContent = line.replace(/\x1b\[[0-9;]*m/g, '');
+  // Mirror to the status strip too — but only while we're still connecting.
+  // Once data flows, the strip shows the friendlier "Connected — streaming".
+  if (!gotFirstChannelData) {
+    const s = document.getElementById('termStrip');
+    if (s) s.textContent = line.replace(/\x1b\[[0-9;]*m/g, '');
+  }
 }
 
 function buildTerminal() {
@@ -76,16 +78,20 @@ function buildTerminal() {
 
   term = new Terminal({
     cursorBlink: true,
+    cursorStyle: 'block',          // PuTTY-style position marker
     fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
     fontSize: 13,
     theme: {
       background: '#0f1115',
       foreground: '#e7e9ee',
-      cursor: '#ffffff',
-      // Selection uses the app accent (--accent #6ea8ff) at ~35% alpha so the
-      // glyphs underneath stay readable; slightly dimmer when unfocused.
-      selectionBackground: '#6ea8ff59',
-      selectionInactiveBackground: '#6ea8ff33',
+      // Blinking block caret in the app's green, like PuTTY's prompt marker.
+      cursor: '#34d399',
+      cursorAccent: '#0f1115',
+      // Solid, unmistakable selection highlight (alpha variants rendered
+      // invisibly in some render paths). On-brand accent blue, white text.
+      selectionBackground: '#4f8ef7',
+      selectionForeground: '#ffffff',
+      selectionInactiveBackground: '#1d3252',
     },
     scrollback: 5000,
     convertEol: false,
