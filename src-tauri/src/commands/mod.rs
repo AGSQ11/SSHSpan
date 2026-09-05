@@ -5,6 +5,7 @@
 pub mod server;
 pub mod terminal;
 pub mod updater;
+pub mod sftp;
 
 use tauri::AppHandle;
 use tauri::Manager;
@@ -197,6 +198,7 @@ pub fn vault_lock(app: AppHandle) -> CmdResult<serde_json::Value> {
     // password; sessions that survive into a locked vault would otherwise be
     // using unsealed key material with no way to re-derive it.
     app.state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>().kill_all();
+    app.state::<crate::sftp::EditRegistry>().stop_all();
     app.state::<VaultPasswordStore>().clear();
     app.state::<AppState>().db.add_audit("vault.lock", None, "").map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))

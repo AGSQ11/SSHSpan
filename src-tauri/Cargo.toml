@@ -1,6 +1,6 @@
 [package]
 name = "sshspan"
-version = "1.3.6"
+version = "1.4.0"
 description = "SSH Key Manager - Cross-platform SSH key management with Bitwarden sync"
 authors = ["AGSQ11"]
 edition = "2021"
@@ -109,5 +109,7 @@ generic-array = "0.14"
 # ─── Utilities ─────────────────────────────────────────────────────────────
 opener = "0.7"                    # Open URLs / reveal files in OS default app
 urlencoding = "2"                 # URL-encode cipher IDs for Bitwarden API
+russh-sftp = "2"                  # SFTP client subsystem over russh channels
+notify = "7"                       # file watching (SFTP open-with-editor sync-back)
 semver = "1"                    # Release version comparison (update check)
 russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }

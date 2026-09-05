@@ -149,12 +149,17 @@
                 <span class="badge" id="termBadge" hidden></span>
               </div>
               <div class="terminal-actions">
+                <button id="termModeBtn" class="ghost-btn" hidden title="Switch between terminal and file browser"><span data-ico="folder-tree"></span><span id="termModeLabel">SFTP</span></button>
                 <button id="termTestBtn" class="ghost-btn" hidden><span data-ico="plug-zap"></span>Test</button>
                 <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span>Reconnect</button>
                 <button id="termDisconnectBtn" class="danger-btn" hidden><span data-ico="x"></span>Disconnect</button>
               </div>
             </div>
-            <div class="terminal-host" id="terminalHost"></div>
+            <div class="term-tabs" id="termTabs">
+              <div class="term-tab-add" id="termTabAdd" title="New connection — pick a server from the list"><span data-ico="plus"></span></div>
+            </div>
+            <div class="terminal-body" id="terminalBody"></div>
+            <div class="sftp-body" id="sftpBody"></div>
             <button id="termMaxBtn" class="term-max-btn" title="Expand terminal to full window" data-ico="maximize-2"></button>
             <div class="terminal-strip" id="termStrip">Ready.</div>
           </section>

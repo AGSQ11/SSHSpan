@@ -695,6 +695,9 @@ const state = {
   connectAuthMethod: 'publickey',
   _pendingConnectServer: null,  // server id set by openServerPickerForKey
   _pendingConnectKey: null,
+  // multi-tab SSH sessions
+  sessions: new Map(),   // tabId -> {tabId, sessionId, serverId, serverName, host, port, mode, sftpReady, sftpPath, ended}
+  activeTabId: null,
 };
 
 // ─── vault gate ────────────────────────────────────────────────────────────
@@ -777,7 +780,7 @@ function applyNavLockState() {
 function clearConnectView() {
   state.servers = [];
   state.connectSelectedId = null;
-  if (typeof terminalReset === 'function') terminalReset('Vault is locked.');
+  if (typeof window.terminalResetActive === 'function') window.terminalResetActive();
   const list = el('serverList'); if (list) list.innerHTML = '';
   const empty = el('serverEmpty'); if (empty) empty.hidden = true;
   el('termTitle').textContent = 'No connection';
@@ -788,6 +791,22 @@ function clearConnectView() {
   el('termStrip').textContent = state.unlocked ? 'Ready.' : 'Unlock the vault to connect.';
   state._pendingConnectServer = null;
   state._pendingConnectKey = null;
+  // Close every session tab.
+  for (const tabId of [...state.sessions.keys()]) {
+    const tab = state.sessions.get(tabId);
+    if (tab && window.tabSessionLive(tabId)) {
+      call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
+    }
+    if (tab && tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
+    window.destroyTabTerminal(tabId);
+    state.sessions.delete(tabId);
+  }
+  state.activeTabId = null;
+  const sbody = document.getElementById('sftpBody');
+  if (sbody) sbody.classList.remove('visible');
+  const tbody = document.getElementById('terminalBody');
+  if (tbody) tbody.style.display = 'flex';
+  renderTermTabs();
 }
 
 async function submitVaultModal() {
@@ -1935,12 +1954,12 @@ function wire() {
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
   el('serverImportBtn').addEventListener('click', (ev) => importFromSshConfig(ev.currentTarget));
   el('serverSearch').addEventListener('input', renderServerList);
-  el('termDisconnectBtn').addEventListener('click', disconnectActive);
+  el('termDisconnectBtn').addEventListener('click', disconnectActiveTab);
   const termMaxBtn = el('termMaxBtn');
   if (termMaxBtn) termMaxBtn.addEventListener('click', toggleTermMax);
   el('termReconnectBtn').addEventListener('click', () => {
     const srv = currentSelectedServer();
-    if (srv) connectToServer(srv);
+    if (srv) openSessionTab(srv);
   });
   el('termTestBtn').addEventListener('click', () => {
     const srv = currentSelectedServer();
@@ -2138,7 +2157,7 @@ function renderServerList() {
     row.appendChild(auth);
 
     row.addEventListener('click', () => selectServer(s.id));
-    row.addEventListener('dblclick', () => connectToServer(s));
+    row.addEventListener('dblclick', () => openSessionTab(s));
     row.addEventListener('contextmenu', (ev) => {
       ev.preventDefault();
       openServerContextMenu(ev.clientX, ev.clientY, s);
@@ -2150,18 +2169,7 @@ function renderServerList() {
 function selectServer(id) {
   state.connectSelectedId = id;
   renderServerList();
-  const srv = currentSelectedServer();
-  el('termTitle').textContent = srv ? srv.name : 'No connection';
-  el('termBadge').hidden = !srv;
-  if (srv) {
-    el('termBadge').textContent = srv.host + ':' + srv.port;
-    el('termTestBtn').hidden = false;
-    el('termReconnectBtn').hidden = !!state.connectSessionId;
-  } else {
-    el('termTestBtn').hidden = true;
-    el('termReconnectBtn').hidden = true;
-  }
-  el('termDisconnectBtn').hidden = !state.connectSessionId;
+  updateTerminalHead();
 }
 
 function openServerContextMenu(x, y, srv) {
@@ -2177,7 +2185,7 @@ function openServerContextMenu(x, y, srv) {
     menu.appendChild(b);
     return b;
   };
-  mk('Connect', 'plug-zap', () => connectToServer(srv));
+  mk('Connect', 'plug-zap', () => openSessionTab(srv));
   mk('Edit', 'pencil', () => openServerModal({ id: srv.id }));
   mk('Delete', 'trash-2', async () => {
     if (!confirm(`Delete server "${srv.name}"?`)) return;
@@ -2309,7 +2317,7 @@ function openServerPickerForKey(key) {
       closeKeyConnectMenu();
       state._pendingConnectKey = key.id;
       selectServer(s.id);
-      connectToServer(s, { overrideKeyId: key.id });
+      openSessionTab(s, { overrideKeyId: key.id });
     });
     menu.appendChild(b);
   }
@@ -2337,80 +2345,76 @@ function openServerPickerForKey(key) {
 
 // ─── Connect / disconnect / test ───────────────────────────────────────────
 
-async function connectToServer(srv, opts = {}) {
-  // Hard requirement: terminal.js provides the xterm glue. Never skip silently.
-  if (typeof terminalConnect !== 'function' || typeof ensureTerminalForSession !== 'function') {
-    el('termStrip').textContent = 'terminal.js is missing — Connect cannot run.';
-    toast('terminal.js is missing — reinstall the app.', 'err');
+function newTabId() {
+  return 'tab-' + Date.now().toString(36) + Math.floor(Math.random() * 1e4);
+}
+
+/// Open a NEW session tab for a server (always a new tab — never replaces).
+async function openSessionTab(srv, opts = {}) {
+  if (typeof window.terminalConnectInTab !== 'function') {
+    toast('terminal.js is missing — Connect cannot run.', 'err');
     return;
   }
-  if (state.connectSessionId) {
-    if (!confirm('A connection is already open. Disconnect it and start a new one?')) return;
-    await disconnectActive();
-  }
-  // Build the xterm instance now that the view is visible. Doing this earlier
-  // (during initTerminal) failed because the host element had zero size while
-  // the connect view was hidden.
-  ensureTerminalForSession();
-  terminalReset();
-  el('termTitle').textContent = srv.name;
-  el('termBadge').textContent = srv.host + ':' + srv.port;
-  el('termBadge').hidden = false;
-  // Only show Disconnect once a session is actually open.
+  switchView('connect');
+  const tabId = newTabId();
+  const tab = {
+    tabId,
+    sessionId: null,
+    serverId: srv.id,
+    serverName: srv.name || srv.host,
+    host: srv.host,
+    port: srv.port || 22,
+    mode: 'ssh',
+    sftpReady: false,
+    sftpPath: '/',
+    ended: false,
+  };
+  state.sessions.set(tabId, tab);
+  window.createTabTerminal(tabId);
+  state.activeTabId = tabId;
+  window.showTabTerminal(tabId);
+  renderTermTabs();
+  updateTerminalHead();
   el('termDisconnectBtn').hidden = true;
   el('termReconnectBtn').hidden = true;
-  el('termTestBtn').hidden = true;
-  if (el('serverList')) el('serverList').classList.add('connecting');
+  terminalSetStatus(`Connecting to ${srv.host}:${srv.port}…`);
 
   let pw = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
-    // No password stored — ask at connect time via the custom modal (native
-    // prompt() silently fails in Tauri webview).
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) {
       terminalSetStatus('Cancelled.');
-      if (el('serverList')) el('serverList').classList.remove('connecting');
+      closeSessionTab(tabId, { skipConfirm: true });
       return;
     }
   }
 
   try {
-    const sessionId = await terminalConnect(srv, { cols: 80, rows: 24, ...opts });
-    state.connectSessionId = sessionId;
-    state.connectServerId = srv.id;
-    // Success — flip to the connected button set.
-    el('termReconnectBtn').hidden = false;
-    el('termDisconnectBtn').hidden = false;
-    el('termTestBtn').hidden = false;
-    if (el('serverList')) el('serverList').classList.remove('connecting');
+    const sessionId = await window.terminalConnectInTab(tabId, srv, { ...opts, promptPassword: pw });
+    tab.sessionId = sessionId;
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Connected to ${srv.host}:${srv.port} — streaming`);
   } catch (e) {
-    const msg = e.message || String(e);
-    state.connectSessionId = null;
-    state.connectServerId = null;
-    el('termDisconnectBtn').hidden = true;
-    el('termReconnectBtn').hidden = false;
-    el('termTestBtn').hidden = false;
-    if (el('serverList')) el('serverList').classList.remove('connecting');
-    terminalSetStatus(`Failed: ${msg}`);
-    toast(msg, 'err');
+    tab.ended = true;
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Failed: ${e.message || e}`);
+    toast(e.message || String(e), 'err');
   }
 }
 
-async function disconnectActive() {
-  if (!state.connectSessionId) return;
-  const id = state.connectSessionId;
-  try { await call('terminal_disconnect', { sessionId: id }); } catch (e) {}
-  state.connectSessionId = null;
-  state.connectServerId = null;
-  el('termDisconnectBtn').hidden = true;
-  el('termReconnectBtn').hidden = false;
-  el('termTestBtn').hidden = false;
-  if (typeof terminalSetStatus === 'function') terminalSetStatus('Disconnected.');
+/// Disconnect the active tab's live session (tab stays with [connection closed]).
+async function disconnectActiveTab() {
+  const tab = state.sessions.get(state.activeTabId);
+  if (!tab || !window.tabSessionLive(tab.tabId)) return;
+  try { await call('terminal_disconnect', { sessionId: tab.sessionId }); } catch (e) {}
+  // The close-detection poll fires onSessionClosed, which finalizes tab state.
 }
 
-// Toggle the terminal between the normal Connect layout and a full-app
-// "maximized" mode: sidebar/topbar/server-list hidden, terminal fills the
-// window, and a thin taskbar strip (status + this restore button) remains.
+/// Toggle the terminal between the normal Connect layout and a full-app
+/// "maximized" mode: sidebar/topbar/server-list hidden, terminal fills the
+/// window, and a thin taskbar strip (status + restore button) remains.
 function toggleTermMax() {
   const app = el('app');
   const btn = el('termMaxBtn');
@@ -2422,48 +2426,155 @@ function toggleTermMax() {
     terminalSetStatus(max ? 'Terminal maximized — press Esc or <> to restore.' : 'Restored.');
   }
   // Let the layout settle, then refit + push the new PTY size.
-  setTimeout(() => {
-    if (typeof fitTerminalNow === 'function') fitTerminalNow();
-  }, 80);
-  setTimeout(() => {
-    if (typeof fitTerminalNow === 'function') fitTerminalNow();
-  }, 250);
+  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 80);
+  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 250);
 }
 
-async function testSelectedServer(srv) {
+/// Reconnect the active tab: new session in the SAME tab (keeps scrollback).
+async function reconnectActiveTab() {
+  const tab = state.sessions.get(state.activeTabId);
+  if (!tab) return;
+  const srv = state.servers.find(s => s.id === tab.serverId);
+  if (!srv) { toast('Server no longer exists.', 'err'); return; }
   let pw = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) return;
   }
-  if (typeof terminalSetStatus === 'function') terminalSetStatus(`Testing ${srv.host}:${srv.port}…`);
+  terminalSetStatus(`Reconnecting to ${srv.host}:${srv.port}…`);
+  el('termDisconnectBtn').hidden = true;
+  el('termReconnectBtn').hidden = true;
   try {
-    const r = await call('server_test', { serverId: srv.id, promptPassword: pw });
-    if (r && r.ok) {
-      if (typeof terminalSetStatus === 'function') terminalSetStatus(`OK — ${r.latencyMs} ms`);
-      toast(`Reachable (${r.latencyMs} ms)`, 'ok');
-    } else {
-      if (typeof terminalSetStatus === 'function') terminalSetStatus(`Failed: ${r && r.error ? r.error : 'unknown'}`);
-      toast(r && r.error ? r.error : 'Test failed', 'err');
-    }
+    const sessionId = await window.terminalConnectInTab(tab.tabId, srv, { promptPassword: pw });
+    tab.sessionId = sessionId;
+    tab.ended = false;
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Connected to ${srv.host}:${srv.port} — streaming`);
   } catch (e) {
-    if (typeof terminalSetStatus === 'function') terminalSetStatus(`Failed: ${e.message || e}`);
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Failed: ${e.message || e}`);
     toast(e.message || String(e), 'err');
   }
 }
 
-// Called by terminal.js when the session ends on the Rust side.
-function onTerminalClosed() {
-  state.connectSessionId = null;
-  state.connectServerId = null;
-  el('termDisconnectBtn').hidden = true;
-  el('termReconnectBtn').hidden = false;
-  el('termTestBtn').hidden = false;
-  if (typeof terminalSetStatus === 'function') terminalSetStatus('Connection closed.');
+/// Close a tab: disconnect if live, dispose terminal, forget the session.
+function closeSessionTab(tabId, { skipConfirm = false } = {}) {
+  const tab = state.sessions.get(tabId);
+  if (!tab) return;
+  const live = window.tabSessionLive(tabId);
+  if (live && !skipConfirm && !confirm(`Close the session to ${tab.serverName}?`)) return;
+  if (live) call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
+  if (tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
+  window.destroyTabTerminal(tabId);
+  state.sessions.delete(tabId);
+  if (state.activeTabId === tabId) {
+    state.activeTabId = state.sessions.keys().next().value || null;
+    if (state.activeTabId) {
+      const nt = state.sessions.get(state.activeTabId);
+      if (nt && nt.mode === 'sftp') window.showSftpForTab(state.activeTabId);
+      else window.showTabTerminal(state.activeTabId);
+    } else {
+      const sbody = document.getElementById('sftpBody');
+      if (sbody) sbody.classList.remove('visible');
+      const body = document.getElementById('terminalBody');
+      if (body) body.style.display = 'flex';
+    }
+  }
+  renderTermTabs();
+  updateTerminalHead();
 }
-window.onTerminalClosed = onTerminalClosed;
 
-// ─── tiny escaper used by context menus ────────────────────────────────────
+/// Activate a tab (click on its chip).
+function activateSessionTab(tabId) {
+  state.activeTabId = tabId;
+  const tab = state.sessions.get(tabId);
+  if (tab && tab.mode === 'sftp') window.showSftpForTab(tabId);
+  else window.showTabTerminal(tabId);
+  renderTermTabs();
+  updateTerminalHead();
+}
+
+/// Tab strip: chips for each session + the persistent "+" button.
+function renderTermTabs() {
+  const strip = el('termTabs');
+  if (!strip) return;
+  strip.querySelectorAll('.term-tab').forEach(n => n.remove());
+  const addBtn = el('termTabAdd');
+  for (const [tabId, tab] of state.sessions) {
+    const chip = document.createElement('div');
+    chip.className = 'term-tab' + (tabId === state.activeTabId ? ' active' : '') + (tab.ended ? ' ended' : '');
+    const dot = document.createElement('span');
+    dot.className = 'term-tab-dot' + (window.tabSessionLive(tabId) ? ' live' : '');
+    const name = document.createElement('span');
+    name.className = 'term-tab-name';
+    name.textContent = tab.serverName;
+    name.title = `${tab.serverName} (${tab.host}:${tab.port})`;
+    const close = document.createElement('span');
+    close.className = 'term-tab-close';
+    close.textContent = '×';
+    close.title = 'Close session';
+    close.addEventListener('click', (ev) => { ev.stopPropagation(); closeSessionTab(tabId); });
+    chip.appendChild(dot);
+    chip.appendChild(name);
+    chip.appendChild(close);
+    chip.addEventListener('click', () => activateSessionTab(tabId));
+    strip.insertBefore(chip, addBtn);
+  }
+}
+
+/// Head title + buttons follow the active tab, or the selected server.
+function updateTerminalHead() {
+  const tab = state.sessions.get(state.activeTabId);
+  const srv = currentSelectedServer();
+  el('termTestBtn').hidden = !srv;
+  if (tab) {
+    el('termTitle').textContent = tab.serverName;
+    el('termBadge').textContent = `${tab.host}:${tab.port}`;
+    el('termBadge').hidden = false;
+    const live = window.tabSessionLive(tab.tabId);
+    el('termDisconnectBtn').hidden = !live;
+    el('termReconnectBtn').hidden = live;
+    el('termModeBtn').hidden = !live;
+    el('termModeLabel').textContent = tab.mode === 'sftp' ? 'SSH' : 'SFTP';
+  } else if (srv) {
+    el('termTitle').textContent = srv.name;
+    el('termBadge').textContent = `${srv.host}:${srv.port}`;
+    el('termBadge').hidden = false;
+    el('termDisconnectBtn').hidden = true;
+    el('termReconnectBtn').hidden = false;
+    el('termModeBtn').hidden = true;
+  } else {
+    el('termTitle').textContent = 'No connection';
+    el('termBadge').hidden = true;
+    el('termDisconnectBtn').hidden = true;
+    el('termReconnectBtn').hidden = true;
+    el('termModeBtn').hidden = true;
+  }
+}
+
+/// Called by terminal.js when a tab's SSH session ends (server side or drop).
+function onSessionClosed(tabId) {
+  const tab = state.sessions.get(tabId);
+  if (!tab) return;
+  tab.ended = true;
+  if (tab.sftpReady) {
+    call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
+    tab.sftpReady = false;
+    if (tab.mode === 'sftp' && tabId === state.activeTabId) {
+      window.showSshForTab(tabId);
+      tab.mode = 'ssh';
+    }
+  }
+  tab.sessionId = null;
+  if (tabId === state.activeTabId) terminalSetStatus('Connection closed.');
+  renderTermTabs();
+  updateTerminalHead();
+}
+window.onSessionClosed = onSessionClosed;
+
+// ─── tiny escaper used by context menus// ─── tiny escaper used by context menus ────────────────────────────────────
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -2473,17 +2584,29 @@ function escapeHtml(s) {
 // ─── boot ──────────────────────────────────────────────────────────────────
 
 (async function main() {
-  // Surface any uncaught renderer error — in release builds there is no
-  // devtools console, so silent failures look like "nothing happens".
+  // Persistent boot-error log — readable via CDP even after the toast fades.
+  window.__bootErrors = window.__bootErrors || [];
   window.addEventListener('error', (ev) => {
-    toast('JS error: ' + (ev.message || 'unknown'), 'err');
+    const msg = 'JS error: ' + (ev.message || 'unknown');
+    window.__bootErrors.push(msg + (ev.filename ? ' @ ' + ev.filename + ':' + ev.lineno : ''));
+    toast(msg, 'err');
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    const r = ev.reason;
+    window.__bootErrors.push('unhandled rejection: ' + (r && r.message ? r.message : String(r)));
   });
 
-  window.__SSHPAN_BUILD__ = 'v13-colors';;;
+  window.__SSHPAN_BUILD__ = 'v14-tabs';;;
   document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();
-  wire();
+  try {
+    wire();
+  } catch (e) {
+    window.__bootErrors.push('wire() threw: ' + (e.stack || e.message || String(e)));
+    toast('UI init failed: ' + e.message, 'err');
+    throw e;
+  }
   onGenTypeChange();
   switchTab('generate');
   updateSelectionHint();
@@ -2500,7 +2623,7 @@ function escapeHtml(s) {
     document.head.appendChild(s);
   });
   const results = [];
-  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js']) {
+  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js', 'sftp.js']) {
     const r = await loadScript(src);
     results.push(r);
     if (!r.ok) toast('Failed to load ' + src + ' — Connect will not work.', 'err');
