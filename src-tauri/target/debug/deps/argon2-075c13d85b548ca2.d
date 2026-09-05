@@ -1,0 +1,12 @@
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\argon2-075c13d85b548ca2.d: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\algorithm.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\blake2b_long.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\block.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\error.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\params.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\version.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\../README.md
+
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\libargon2-075c13d85b548ca2.rmeta: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\algorithm.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\blake2b_long.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\block.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\error.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\params.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\version.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\../README.md
+
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\lib.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\algorithm.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\blake2b_long.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\block.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\error.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\params.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\version.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\argon2-0.5.3\src\../README.md:

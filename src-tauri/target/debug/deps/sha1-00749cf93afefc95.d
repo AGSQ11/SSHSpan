@@ -1,0 +1,11 @@
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\sha1-00749cf93afefc95.d: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\block_api.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\consts.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\../README.md C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress\soft.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress\x86_sha.rs
+
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\libsha1-00749cf93afefc95.rmeta: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\block_api.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\consts.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\../README.md C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress\soft.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress\x86_sha.rs
+
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\lib.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\block_api.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\consts.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\../README.md:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress\soft.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\sha1-0.11.0\src\compress\x86_sha.rs:

@@ -1,0 +1,12 @@
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\wry-5f3ba2bc202be635.d: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\custom_protocol_workaround.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\error.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\proxy.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\web_context.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\mod.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\drag_drop.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\util.rs
+
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\libwry-5f3ba2bc202be635.rmeta: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\custom_protocol_workaround.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\error.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\proxy.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\web_context.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\mod.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\drag_drop.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\util.rs
+
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\lib.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\custom_protocol_workaround.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\error.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\proxy.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\web_context.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\mod.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\drag_drop.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wry-0.55.1\src\webview2\util.rs:

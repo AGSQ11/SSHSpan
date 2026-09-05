@@ -1,8 +1,8 @@
 name: Release
 
-# Build and publish a GitHub release for every version tag (v1.0, v1.1, v1.2, ...).
-# Windows (NSIS installer + portable exe) and Linux (AppImage + deb) are built
-# on their native runners. Release notes are taken from the matching
+# Build and publish a GitHub release for every version tag (v1.3, v1.4, ...).
+# Windows (NSIS installer + MSI) and Linux (AppImage + deb) are built on their
+# native runners via `tauri build`. Release notes are taken from the matching
 # "## [X.Y.Z]" section in CHANGELOG.md when present, and GitHub's automatic
 # "What's Changed" summary is appended.
 on:
@@ -20,36 +20,55 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            dist: 'dist:win'
             platform: Windows
-            # One glob per line: softprops/action-gh-release matches each
-            # line as a separate pattern (a single space-separated string
-            # would be treated as one literal pattern).
             artifacts: |
-              release/*.exe
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           - os: ubuntu-latest
-            dist: 'dist:linux'
             platform: Linux
             artifacts: |
-              release/*.AppImage
-              release/*.deb
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.platform }} (${{ matrix.dist }})
+    name: ${{ matrix.platform }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Set up Node.js (Tauri CLI)
         uses: actions/setup-node@v4
         with:
-          # 22.6+ is required: PPK (PuTTY) import/export uses crypto.argon2Sync.
           node-version: 24
           cache: npm
 
-      - name: Install dependencies
+      - name: Install JS dependencies
         run: npm ci
 
-      - name: Sync package version with tag (v1.1 -> 1.1.0)
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux system dependencies (Tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Sync package version with tag (v1.3 -> 1.3.0)
         shell: bash
         run: |
           V="${GITHUB_REF_NAME#v}"
@@ -58,21 +77,25 @@ jobs:
             *.*)   V="$V.0" ;;
             *)     V="$V.0.0" ;;
           esac
-          # npm version exits non-zero when the version is already correct,
-          # so only run it when the tag really differs from package.json.
           CURRENT="$(node -p "require('./package.json').version")"
           if [ "$V" != "$CURRENT" ]; then
             npm version --no-git-tag-version "$V"
+            node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version='$V';fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')"
             echo "Version bumped: $CURRENT -> $V"
           else
             echo "Version already $V; nothing to change."
           fi
 
-      - name: Run test suites
-        run: npm test
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Build installers
-        run: npm run ${{ matrix.dist }} -- --publish never
+      - name: Build installers (Tauri)
+        run: npm run dist:win
+        if: runner.os == 'Windows'
+
+      - name: Build installers (Tauri)
+        run: npm run dist:linux
+        if: runner.os == 'Linux'
 
       - name: Extract release notes from CHANGELOG
         shell: bash

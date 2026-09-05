@@ -1,0 +1,12 @@
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\p384-8b0c415745cdd8d8.d: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\ecdh.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\ecdsa.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\field.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\scalar.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\tables.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\../README.md
+
+E:\Development\ssh-keyz\src-tauri\target\debug\deps\libp384-8b0c415745cdd8d8.rmeta: C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\lib.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\ecdh.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\ecdsa.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\field.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\scalar.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\tables.rs C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\../README.md
+
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\lib.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\ecdh.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\ecdsa.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\field.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\scalar.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\arithmetic\tables.rs:
+C:\Users\Andrei\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\p384-0.14.0\src\../README.md:
