@@ -1965,6 +1965,11 @@ function wire() {
     const srv = currentSelectedServer();
     if (srv) testSelectedServer(srv);
   });
+  const termModeBtn = el('termModeBtn');
+  if (termModeBtn) termModeBtn.addEventListener('click', () => {
+    if (typeof window.toggleSshSftpMode === 'function') window.toggleSshSftpMode();
+    else toast('SFTP is still loading — try again in a moment.', 'err');
+  });
   // server modal
   for (const b of document.querySelectorAll('#serverModal [data-close]')) {
     b.addEventListener('click', closeServerModal);
