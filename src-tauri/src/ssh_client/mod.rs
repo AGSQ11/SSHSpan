@@ -270,10 +270,11 @@ pub async fn start_interactive(
     let config = Arc::new(base_client_config());
     let handler = TerminalHandler { host: target_host.clone(), db: db.clone() };
 
+    let t0 = std::time::Instant::now();
     let mut session = client::connect(config, (&target_host[..], target_port), handler)
         .await
         .map_err(|e| anyhow::anyhow!("Connection failed: {e}"))?;
-    eprintln!("[sshspan-terminal] tcp+kex established to {target_host}:{target_port}");
+    eprintln!("[sshspan-terminal] tcp+kex+hostkey in {}ms", t0.elapsed().as_millis());
 
     authenticate(&mut session, &ConnectParams {
         server: params.server.clone(),
@@ -282,7 +283,7 @@ pub async fn start_interactive(
         key_pem: params.key_pem.clone(),
         password: params.password.clone(),
     }).await?;
-    eprintln!("[sshspan-terminal] authenticated as {}", params.username);
+    eprintln!("[sshspan-terminal] auth in {}ms", t0.elapsed().as_millis());
 
     // Terminal dimensions start at 80x24; the renderer sends the real size right
     // after it learns the session id. The terminal_modes list must include
@@ -303,7 +304,7 @@ pub async fn start_interactive(
         .request_shell(true)
         .await
         .map_err(|e| anyhow::anyhow!("Shell request failed: {e}"))?;
-    eprintln!("[sshspan-terminal] pty + shell ready, streaming");
+    eprintln!("[sshspan-terminal] pty+shell in {}ms — streaming", t0.elapsed().as_millis());
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();

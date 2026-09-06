@@ -39,7 +39,7 @@ async function toggleSshSftpMode() {
       }
       tab.mode = 'sftp';
       showSftpForTab(tab.tabId);
-      await renderSftpPanel(tab);
+      await refreshSftpPanel(tab.tabId);
     } catch (e) {
       toast(e.message || String(e), 'err');
     }

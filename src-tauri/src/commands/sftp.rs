@@ -7,6 +7,8 @@ use std::sync::atomic::Ordering;
 use notify::Watcher;
 use tauri::{AppHandle, Manager};
 
+use std::sync::Arc as StdArc;
+
 use crate::sftp::{EditRegistry, EditWatch, SftpRegistry, edit_temp_dir};
 use crate::ssh_client::SessionRegistry;
 use crate::AppState;
@@ -21,7 +23,7 @@ fn sftp_from_session(app: &AppHandle, session_id: &str) -> Result<Arc<russh_sftp
 /// Open the SFTP subsystem on a live session (lazily, on first SFTP switch).
 #[tauri::command]
 pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
-    let sftp_tx = app.state::<SessionRegistry>().get_sftp_tx(&session_id)
+    let sftp_tx = app.state::<StdArc<SessionRegistry>>().get_sftp_tx(&session_id)
         .ok_or_else(|| CmdError("No such session.".into()))?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     sftp_tx.send(tx).map_err(|_| CmdError("Session is closing.".into()))?;

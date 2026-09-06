@@ -235,13 +235,6 @@ impl Database {
                 .execute(&self.pool).await;
             let _ = sqlx::query("ALTER TABLE keys ADD COLUMN bitwarden_updated_at TEXT")
                 .execute(&self.pool).await;
-            // Migration: server sync metadata (Bitwarden two-way server sync)
-            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_id TEXT")
-                .execute(&self.pool).await;
-            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_revision_ts TEXT")
-                .execute(&self.pool).await;
-            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_updated_at TEXT")
-                .execute(&self.pool).await;
 
             // Categories: user-defined tree of named nodes that group keys.
             // Arbitrary depth via self-referential parent_id; many-to-many to
@@ -303,6 +296,17 @@ impl Database {
                 )
                 "#,
             ).execute(&self.pool).await?;
+
+            // Migration: server sync metadata (Bitwarden two-way server sync).
+            // Must run after the servers table above exists — on a fresh DB an
+            // ALTER TABLE against a not-yet-created table fails silently and
+            // the columns never get added.
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_id TEXT")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_revision_ts TEXT")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_updated_at TEXT")
+                .execute(&self.pool).await;
 
             sqlx::query(
                 r#"
@@ -1250,6 +1254,13 @@ fn short_hash(s: &str) -> u32 {
 }
 
 fn get_db_path(_app: &AppHandle) -> Result<PathBuf> {
+    // Test override: SSHSPAN_DB=<path> isolates a dev instance from the
+    // real vault (used by the local e2e rig).
+    if let Ok(p) = std::env::var("SSHSPAN_DB") {
+        if !p.trim().is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
     let dirs = ProjectDirs::from("org", "sshspan", "SSHSpan")
         .ok_or_else(|| anyhow::anyhow!("Could not determine app data directory"))?;
     Ok(dirs.data_dir().join("sshspan.db"))

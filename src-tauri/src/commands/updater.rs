@@ -64,10 +64,10 @@ fn is_newer(candidate_tag: &str, current: &str) -> bool {
 
 /// Check GitHub for the latest release and, if newer, report the asset URL for
 /// this OS. Never installs anything — the renderer asks the user first.
-#[tauri::command(async)]
-pub fn update_check() -> CmdResult<serde_json::Value> {
+#[tauri::command]
+pub async fn update_check() -> CmdResult<serde_json::Value> {
     let current = current_version();
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Check")
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -75,10 +75,12 @@ pub fn update_check() -> CmdResult<serde_json::Value> {
     let rel: GhRelease = client
         .get(RELEASES_API)
         .send()
+        .await
         .map_err(|e| CmdError(format!("Could not reach GitHub: {e}")))?
         .error_for_status()
         .map_err(|e| CmdError(format!("GitHub API error: {e}")))?
         .json()
+        .await
         .map_err(|e| CmdError(format!("Could not parse GitHub response: {e}")))?;
 
     let available = is_newer(&rel.tag_name, current);
@@ -99,8 +101,8 @@ pub fn update_check() -> CmdResult<serde_json::Value> {
 /// Download the chosen installer to a temp path, launch it detached, and exit
 /// the app so the installer isn't blocked by our own running process.
 /// The renderer must only call this after the user explicitly approved.
-#[tauri::command(async)]
-pub fn update_download_and_run(app: AppHandle, url: String, version: String) -> CmdResult<serde_json::Value> {
+#[tauri::command]
+pub async fn update_download_and_run(app: AppHandle, url: String, version: String) -> CmdResult<serde_json::Value> {
     // Only accept installer URLs from our GitHub releases domain.
     let parsed = url::Url::parse(&url).map_err(|e| CmdError(format!("Bad asset URL: {e}")))?;
     let host_ok = parsed.host_str().map_or(false, |h| {
@@ -122,20 +124,22 @@ pub fn update_download_and_run(app: AppHandle, url: String, version: String) -> 
     let dest = std::env::temp_dir()
         .join(format!("sshspan-{}-update{}", version, ext));
 
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Download")
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| CmdError(e.to_string()))?;
-    let mut resp = client
+    let resp = client
         .get(&url)
         .send()
+        .await
         .map_err(|e| CmdError(format!("Download failed: {e}")))?
         .error_for_status()
         .map_err(|e| CmdError(format!("Download failed: {e}")))?;
-    let mut file = std::fs::File::create(&dest).map_err(|e| CmdError(e.to_string()))?;
-    use std::io::Write;
-    std::io::copy(&mut resp, &mut file).map_err(|e| CmdError(e.to_string()))?;
+    let mut file = tokio::fs::File::create(&dest).await.map_err(|e| CmdError(e.to_string()))?;
+    use tokio::io::AsyncWriteExt;
+    let bytes = resp.bytes().await.map_err(|e| CmdError(format!("Download failed: {e}")))?;
+    file.write_all(&bytes).await.map_err(|e| CmdError(e.to_string()))?;
     drop(file);
 
     // Launch the installer detached.
@@ -166,8 +170,8 @@ pub fn update_download_and_run(app: AppHandle, url: String, version: String) -> 
     // Respond to the renderer first, then exit so our files unlock and the
     // installer (already running detached) takes over.
     let app_for_exit = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(2500));
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         app_for_exit.exit(0);
     });
     Ok(serde_json::json!({ "ok": true, "installer": dest.display().to_string() }))

@@ -113,3 +113,5 @@ russh-sftp = "2"                  # SFTP client subsystem over russh channels
 notify = "7"                       # file watching (SFTP open-with-editor sync-back)
 semver = "1"                    # Release version comparison (update check)
 russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }
+log = "0.4"                        # surfaces russh-sftp's internal warn!() (dev tooling)
+env_logger = "0.11"                # used by examples/dev-sshd.rs + examples/sftp-smoke.rs (dev tooling only)
