@@ -350,6 +350,7 @@ fn db_bitwarden_config_save_load() {
         email: Some("user@example.com".to_string()),
         master_password: Some("sealed-blob".to_string()),
         folder_name: Some("SSHSpan".to_string()),
+        servers_folder_name: Some("SSHSpan_Servers".to_string()),
         device_id: Some("device-1".to_string()),
         last_sync: None,
         last_result: None,
