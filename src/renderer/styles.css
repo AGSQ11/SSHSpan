@@ -1420,9 +1420,14 @@ label:focus-within { color: var(--text); }
   font-size: 12px;
 }
 .sftp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.sftp-table td { padding: 5px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); }
-.sftp-table tr[data-isdir="1"] td:first-child { color: var(--accent); font-weight: 600; }
-.sftp-table tbody tr:hover { background: var(--hover); }
+.sftp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); }
+.sftp-entry { cursor: default; user-select: none; outline: none; }
+.sftp-entry.sftp-dir { cursor: pointer; }
+.sftp-entry.sftp-file { cursor: pointer; }
+.sftp-entry.sftp-dir td:first-child { color: var(--accent); font-weight: 600; }
+.sftp-entry:hover, .sftp-entry:focus-visible { background: var(--hover); }
+.sftp-entry.selected { background: var(--accent-weak); box-shadow: inset 3px 0 var(--accent); }
+.sftp-entry.selected td:first-child { color: var(--text); }
 .sftp-drop-hint {
   margin-top: 10px;
   border: 1px dashed var(--line-strong);

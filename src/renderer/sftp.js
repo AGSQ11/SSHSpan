@@ -162,12 +162,30 @@ async function refreshSftpPanel(tabId) {
       tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
       tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
 
-      if (entry.isDir) {
-        tr.addEventListener('dblclick', () => {
+      tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
+      tr.tabIndex = 0;
+      tr.setAttribute('role', 'button');
+      tr.title = entry.isDir ? 'Double-click to open folder' : 'Double-click to download file';
+      tr.addEventListener('click', () => {
+        for (const row of tbody.querySelectorAll('.sftp-entry.selected')) row.classList.remove('selected');
+        tr.classList.add('selected');
+      });
+      tr.addEventListener('dblclick', () => {
+        if (entry.isDir) {
           tab.sftpPath = sftpJoin(tab.sftpPath, entry.name);
           refreshSftpPanel(tabId);
-        });
-      }
+        } else {
+          sftpDownloadTo(tabId, sftpJoin(tab.sftpPath, entry.name), entry.name);
+        }
+      });
+      tr.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') tr.dispatchEvent(new MouseEvent('dblclick'));
+        else if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) {
+          ev.preventDefault();
+          const rect = tr.getBoundingClientRect();
+          openSftpFileMenu(rect.left + 12, rect.top + 12, tabId, entry);
+        }
+      });
       tr.addEventListener('contextmenu', (ev) => {
         ev.preventDefault();
         openSftpFileMenu(ev.clientX, ev.clientY, tabId, entry);
