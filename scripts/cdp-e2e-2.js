@@ -1,5 +1,8 @@
 /* Focused: connect + watch terminal + then SFTP toggle, generous timeouts. */
 'use strict';
+const fs = require('fs');
+const path = require('path');
+const TMP = process.env.SSHSPAN_E2E_TMP || require('os').tmpdir();
 const wsUrl = process.argv[2];
 const ws = new WebSocket(wsUrl);
 let id = 0;
@@ -66,7 +69,7 @@ ws.onopen = async () => {
 
   const fs = require('fs');
   const shot = await send('Page.captureScreenshot', { format: 'png' });
-  fs.writeFileSync('C:/Users/Andrei/AppData/Local/Temp/sshspan-e2e2.png', Buffer.from(shot.data, 'base64'));
+  fs.writeFileSync(path.join(TMP, 'sshspan-e2e2.png'), Buffer.from(shot.data, 'base64'));
   console.log('SCREENSHOT saved');
   ws.close(); process.exit(0);
 };

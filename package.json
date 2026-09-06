@@ -43,15 +43,11 @@
   },
   "os": [
     "win32",
-    "darwin",
     "linux"
   ],
   "type": "commonjs",
-  "dependencies": {
-    "bcrypt-pbkdf": "^1.0.2"
-  },
   "devDependencies": {
-    "@tauri-apps/cli": "^2",
-    "@tauri-apps/api": "^2"
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/cli": "^2"
   }
 }

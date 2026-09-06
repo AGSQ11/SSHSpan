@@ -1291,7 +1291,9 @@ async function submitKeyModal() {
     if (activeTab === 'generate') {
       const cats = (state._pendingGenerateCategories && state._pendingGenerateCategories()) || [];
       await call('key_create_with_categories', {
-        keyType: el('genType').value,
+        keyType: el('genType').value === 'ecdsa'
+          ? `ecdsa-${el('genCurve').value || 'p256'}`
+          : el('genType').value,
         bits: Number(el('genBits').value),
         name: el('genName').value.trim() || undefined,
         comment: el('genComment').value.trim() || undefined,
@@ -1328,12 +1330,27 @@ async function submitKeyModal() {
 async function previewConfig() {
   const ids = [...state.deploySelected];
   if (ids.length === 0) { toast('Select at least one key in the Keys view.', 'err'); return; }
-  try {
-    const res = await call('ssh_config_read');
-    el('configPreview').value = JSON.stringify(res.hosts, null, 2);
-  } catch (e) {
-    toast(e.message || String(e), 'err');
-  }
+  const host = el('cfgHost').value.trim() || 'sshspan-host';
+  const user = el('cfgUser').value.trim();
+  const port = Number(el('cfgPort').value) || 22;
+  const strict = el('strictHostKeyToggle')?.checked !== false;
+  const encrypted = el('keyPassphraseToggle')?.checked === true;
+  const selected = state.keys.filter(k => ids.includes(k.id));
+  const blocks = selected.map((key) => {
+    const alias = selected.length === 1 ? host : `${host}-${safeFileName(key.name)}`;
+    const keyFile = `~/.ssh/sshspan_${safeFileName(key.name)}`;
+    return [
+      `Host ${alias}`,
+      `  HostName ${alias}`,
+      user ? `  User ${user}` : '',
+      `  Port ${port}`,
+      `  IdentityFile ${keyFile}`,
+      '  IdentitiesOnly yes',
+      `  StrictHostKeyChecking ${strict ? 'yes' : 'no'}`,
+      encrypted ? '  (deployed private key is passphrase-protected)' : '',
+    ].filter(Boolean).join('\\n');
+  });
+  el('configPreview').value = blocks.join('\\n\\n') + '\\n\\n# Selected keys: ' + ids.length;
 }
 
 async function deployConfig() {
@@ -1342,7 +1359,15 @@ async function deployConfig() {
   const sure = window.confirm('Deploy ' + ids.length + ' key(s) to ~/.ssh/ and update ~/.ssh/config?');
   if (!sure) return;
   try {
-    const res = await call('key_deploy', { ids });
+    const passphraseEnabled = el('keyPassphraseToggle')?.checked === true;
+    const passphrase = passphraseEnabled ? (el('keyPassphraseInput')?.value || '') : undefined;
+    if (passphraseEnabled && !passphrase) {
+      toast('Enter a passphrase for encrypted deployed keys.', 'err');
+      el('keyPassphraseInput')?.focus();
+      return;
+    }
+    const strictHostKey = el('strictHostKeyToggle')?.checked !== false;
+    const res = await call('key_deploy', { ids, passphrase, strictHostKey });
     el('configPreview').value = 'Deployed ' + res.keys.length + ' key(s)\n'
       + res.keys.map(k => '  ' + k.name + ' -> ' + k.file).join('\n');
     toast('Keys deployed.', 'ok');
@@ -1851,8 +1876,6 @@ function wire() {
     // expose for submitKeyModal
     state._pendingGenerateCategories = () => store.generate;
     state._pendingImportCategories = () => store.import;
-    // patch the modal close: reset pending categories.
-    el('modalBackdrop').addEventListener('click', () => { store.generate = []; store.import = []; });
   }
 
   // key modal
@@ -1970,7 +1993,10 @@ function wire() {
     if (typeof window.toggleSshSftpMode === 'function') window.toggleSshSftpMode();
     else toast('SFTP is still loading — try again in a moment.', 'err');
   });
-  // server modal
+  el('keyPassphraseToggle')?.addEventListener('change', (ev) => {
+    const input = el('keyPassphraseInput');
+    if (input) input.hidden = !ev.target.checked;
+  });
   for (const b of document.querySelectorAll('#serverModal [data-close]')) {
     b.addEventListener('click', closeServerModal);
   }
@@ -2349,6 +2375,21 @@ function openServerPickerForKey(key) {
 }
 
 // ─── Connect / disconnect / test ───────────────────────────────────────────
+
+async function testSelectedServer(srv) {
+  if (!srv) return;
+  terminalSetStatus(`Testing ${srv.host}:${srv.port || 22}…`);
+  try {
+    const result = await call('server_test', { serverId: srv.id });
+    if (result && result.ok === false) throw new Error(result.error || 'Connection test failed.');
+    const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
+    terminalSetStatus(`Connection OK${ms}`);
+    toast(`Connection to ${srv.name} succeeded${ms}.`, 'ok');
+  } catch (e) {
+    terminalSetStatus('Connection test failed.');
+    toast(e.message || String(e), 'err');
+  }
+}
 
 function newTabId() {
   return 'tab-' + Date.now().toString(36) + Math.floor(Math.random() * 1e4);

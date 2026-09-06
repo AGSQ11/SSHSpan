@@ -1,67 +1,66 @@
 # Contributing to SSHSpan
 
-Thank you for your interest in improving SSHSpan. This document describes how to set up a
-development environment, the conventions the project follows, and how to submit changes.
+Thank you for improving SSHSpan. SSHSpan is a Rust/Tauri v2 desktop application with a vanilla HTML/CSS/JavaScript renderer.
 
 ## Development setup
 
-SSHSpan is an Electron app. From the repository root:
+Install Node.js 24+, Rust stable, and the Tauri v2 system prerequisites for your platform. From the repository root:
 
 ```sh
-npm install
+npm ci
 npm run dev
 ```
 
-- `npm run dev` starts the Electron app with logging enabled. There is no hot reload; restart
-  after changes (`npm start` works identically).
-- The source is in `src/main/` (process, services, IPC handlers) and `src/renderer/` (vanilla
-  HTML/CSS/JS views).
-- The database is created on first run at `~/.sshspan/sshspan.db`. Use a throwaway home
-  directory or a test vault when developing, because the app will prompt to create a vault.
+The Tauri backend lives in `src-tauri/src/`; the renderer lives in `src/renderer/`. The local vault is created in the platform app-data directory. Use a throwaway test database or a separate development profile when working on vault behavior.
+
+## Useful commands
+
+```sh
+# Development app
+npm run dev
+
+# Rust tests (requires cargo on PATH)
+npm test
+
+# Direct Rust checks
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+# Production bundles
+npm run dist:win
+npm run dist:linux -- --bundles deb,rpm
+```
+
+The SFTP e2e fixtures are opt-in examples and are not release binaries:
+
+```sh
+cargo run --manifest-path src-tauri/Cargo.toml --example dev-sshd
+cargo run --manifest-path src-tauri/Cargo.toml --example sftp-smoke
+```
 
 ## Conventions
 
-- **Code style.** The existing code uses 2-space indentation, single quotes, semicolons, and
-  `'use strict'` module headers. Match the surrounding code in each file.
-- **Terminology.** Use "vault" for the master-password-protected store and "key" for an SSH
-  key pair record. Do not use "wallet", "account", or "credential" for these concepts.
-- **IPC contract.** Every channel returns `{ ok: true, data }` or `{ ok: false, error }`.
-  Never return raw private key material from `keys:get`; only public key material, metadata,
-  and renderable config.
-- **Security.** Never log the master password, private key material, or the contents of the
-  encrypted blob. The audit log records events, not secrets.
-- **Dependencies.** The app is deliberately dependency-light. Before adding a new dependency,
-  consider whether a Node built-in can do the job, whether the dependency is maintained, and
-  whether it introduces native code that breaks the zero-build portability goal.
-
-## Testing
-
-```sh
-npm test
-```
-
-Tests live under `tests/` and are run by the plain-Node harness `tests/run-tests.js` (no test
-framework dependency): crypto/format unit checks (`smoke-core.js`), database persistence
-(`smoke-db.js`), the full vault+key lifecycle through the aggregator (`smoke-app.js`), and an
-interop cross-check against the system `ssh-keygen` when available (`crosscheck-keygen.js`).
-Each suite uses a temporary directory, never the real `~/.sshspan/`.
+- Match the surrounding Rust formatting with `cargo fmt`; use the existing vanilla JS style in renderer files.
+- Use “vault” for the master-password-protected store and “key” for an SSH key pair record.
+- Tauri commands return `Result<T, String>` through the IPC bridge. Keep command arguments in camelCase on the renderer wire; Rust parameters use the project’s Tauri command naming convention.
+- Never log the master password, private key material, saved SSH passwords, or encrypted blob contents.
+- Private key material must remain in the Rust process unless the user explicitly requests an export or deployment operation.
+- Add or update tests for changes to crypto, database migrations, IPC contracts, and SSH/SFTP behavior.
 
 ## Pull requests
 
-1. Fork the repository and create a branch from `main`.
-2. Make your change with focused commits.
-3. Ensure `npm test` passes (all four suites green).
-4. Open a pull request describing the change, the reasoning, and any user-visible behaviour.
-5. For security-sensitive changes, include a short note in the PR about the threat model
-   impact and whether the change is a hardening or a new capability.
+1. Create a branch from `main`.
+2. Keep commits focused and explain user-visible behavior in the PR.
+3. Run JavaScript syntax checks and `cargo test --all-targets` locally.
+4. Run `cargo fmt --check`; run clippy when changing Rust APIs or security-sensitive code.
+5. For release-affecting changes, verify the native bundle on the platform you can test.
+6. Never create a tag or GitHub release automatically; releases are maintainer actions.
 
 ## Reporting security issues
 
-Do not open a public issue for security vulnerabilities. Instead, describe the issue and the
-steps to reproduce it privately to the maintainers. Include the affected component, the
-severity, and any suggested mitigation.
+Do not open a public issue for security vulnerabilities. Contact the maintainers privately with the affected component, severity, reproduction steps, and suggested mitigation.
 
 ## Licensing
 
-By contributing, you agree that your contributions are licensed under the terms of the
-project license (see `LICENSE`).
+By contributing, you agree that your contributions are licensed under the project license (see `LICENSE`).

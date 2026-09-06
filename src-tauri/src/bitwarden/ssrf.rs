@@ -64,7 +64,7 @@ fn expand_ipv6(addr: &str) -> Option<Vec<u16>> {
         // Handle embedded IPv4 tail: split on last ':', parse the IPv4 part
         if let Some(last_colon) = s.rfind(':') {
             let (ipv6_part, ipv4_part) = s.split_at(last_colon);
-            let ipv4_part = &ipv6_part[1..]; // skip the ':'
+            let ipv4_part = &ipv4_part[1..]; // skip the ':'
             let n = v4_to_int(ipv4_part)?;
             let high = ((n >> 16) & 0xFFFF) as u16;
             let low = (n & 0xFFFF) as u16;
@@ -198,10 +198,7 @@ pub fn resolve_safe_server_url(server_url: &str) -> anyhow::Result<String> {
         anyhow::bail!("Local hostnames are not allowed. Use the public hostname of your vault server.");
     }
 
-    // Port check
-    if let Some(port) = url.port() {
-        // port is u16 so always <= 65535; no check needed
-    }
+    // URL parsing validates any explicit port.
 
     // Literal IP check
     if host.contains(':') {

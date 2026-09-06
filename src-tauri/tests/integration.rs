@@ -525,6 +525,7 @@ fn key_deploy_creates_files() {
         None,
         None,
         None,
+        None,
     );
 
     // Note: deploy_key writes to ~/.ssh, which may not exist in test env

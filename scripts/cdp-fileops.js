@@ -1,7 +1,10 @@
 /* File ops round-trip: upload, download, rename, delete. */
 'use strict';
-const wsUrl = process.argv[2];
-const ws = new WebSocket(wsUrl);
+const path = require('path');
+const TMP = process.env.SSHSPAN_E2E_TMP || require('os').tmpdir();
+const uploadPath = path.join(TMP, 'e2e-upload.txt').replace(/\\/g, '/');
+const downloadPath = path.join(TMP, 'e2e-dl.txt').replace(/\\/g, '/');
+
 let id = 0; const pending = new Map();
 ws.onmessage = (ev) => { const m = JSON.parse(ev.data); if (m.id && pending.has(m.id)) { pending.get(m.id)(m.result); pending.delete(m.id); } };
 ws.onopen = async () => {
@@ -19,14 +22,14 @@ ws.onopen = async () => {
   const sid = JSON.stringify(tab.sessionId);
 
   console.log('UPLOAD:', await ev(`(async () => {
-    await call('system_write_text_file', { path: 'C:/Users/Andrei/AppData/Local/Temp/e2e-upload.txt', contents: 'uploaded content ' + Date.now() });
-    await call('sftp_upload', { sessionId: ${sid}, local: 'C:/Users/Andrei/AppData/Local/Temp/e2e-upload.txt', remote: '/e2e-upload.txt' });
+    await call('system_write_text_file', { path: uploadPath, contents: 'uploaded content ' + Date.now() });
+    await call('sftp_upload', { sessionId: ${sid}, local: uploadPath, remote: '/e2e-upload.txt' });
     const r = await call('sftp_list_dir', { sessionId: ${sid}, path: '/' });
     return r.entries.map(e => e.name).join(',');
   })()`));
 
   console.log('DOWNLOAD:', await ev(`(async () => {
-    const r = await call('sftp_download', { sessionId: ${sid}, remote: '/e2e-upload.txt', local: 'C:/Users/Andrei/AppData/Local/Temp/e2e-dl.txt' });
+    const r = await call('sftp_download', { sessionId: ${sid}, remote: '/e2e-upload.txt', local: downloadPath });
     return JSON.stringify(r);
   })()`));
 

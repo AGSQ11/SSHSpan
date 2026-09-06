@@ -1,14 +1,14 @@
 //! Database layer using sqlx with SQLite
 //! Replaces database.js (sql.js WASM)
 
-use sqlx::{SqlitePool, Row, sqlite::SqliteRow};
-use tauri::AppHandle;
-use directories::ProjectDirs;
-use std::path::PathBuf;
-use std::collections::HashMap;
-use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyRecord {
@@ -94,20 +94,25 @@ pub struct KnownHost {
 pub struct BitwardenConfig {
     pub server_url: Option<String>,
     pub email: Option<String>,
-    pub master_password: Option<String>,  // sealed JSON blob (encrypted with vault pw)
-    pub folder_name: Option<String>,      // keys folder (legacy single-folder default: "SSHSpan")
+    pub master_password: Option<String>, // sealed JSON blob (encrypted with vault pw)
+    pub folder_name: Option<String>,     // keys folder (legacy single-folder default: "SSHSpan")
     pub servers_folder_name: Option<String>, // servers folder (default "SSHSpan_Servers")
     pub device_id: Option<String>,
     pub last_sync: Option<DateTime<Utc>>,
-    pub last_result: Option<String>,      // JSON sync summary
+    pub last_result: Option<String>, // JSON sync summary
 }
 
 impl Default for BitwardenConfig {
     fn default() -> Self {
         Self {
-            server_url: None, email: None, master_password: None,
-            folder_name: None, servers_folder_name: None, device_id: None,
-            last_sync: None, last_result: None,
+            server_url: None,
+            email: None,
+            master_password: None,
+            folder_name: None,
+            servers_folder_name: None,
+            device_id: None,
+            last_sync: None,
+            last_result: None,
         }
     }
 }
@@ -115,7 +120,7 @@ impl Default for BitwardenConfig {
 #[derive(Clone)]
 pub struct Database {
     pub pool: SqlitePool,
-    
+
     pub db_path: PathBuf,
 }
 
@@ -126,9 +131,8 @@ use std::sync::OnceLock;
 /// first call so subsequent DB hits don't pay the ~300ms runtime-init cost.
 fn cached_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Runtime::new().expect("Failed to create DB tokio runtime")
-    })
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create DB tokio runtime"))
 }
 
 /// Run an async block to completion, blocking the current thread.
@@ -140,9 +144,7 @@ fn cached_runtime() -> &'static tokio::runtime::Runtime {
 /// call.
 fn block<F: std::future::Future<Output = T>, T>(f: F) -> T {
     if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(f)
-        })
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
     } else {
         cached_runtime().block_on(f)
     }
@@ -155,9 +157,7 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = block(async {
-            SqlitePool::connect(&db_url).await
-        })?;
+        let pool = block(async { SqlitePool::connect(&db_url).await })?;
         // Owner-only permissions on the vault file (Unix). The DB holds the
         // Argon2id verifier and sealed key material; default umasks can leave
         // it world-readable depending on the system.
@@ -192,7 +192,9 @@ impl Database {
                     bitwarden_sync INTEGER DEFAULT 0
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
             sqlx::query(
                 r#"
@@ -202,7 +204,9 @@ impl Database {
                     updated_at TEXT NOT NULL
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
             sqlx::query(
                 r#"
@@ -214,7 +218,9 @@ impl Database {
                     timestamp TEXT NOT NULL
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
             sqlx::query(
                 r#"
@@ -224,17 +230,29 @@ impl Database {
                     updated_at TEXT NOT NULL
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_keys_fingerprint ON keys(fingerprint_sha256)").execute(&self.pool).await?;
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_keys_bitwarden_id ON keys(bitwarden_id)").execute(&self.pool).await?;
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)").execute(&self.pool).await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_keys_fingerprint ON keys(fingerprint_sha256)",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_keys_bitwarden_id ON keys(bitwarden_id)")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)")
+                .execute(&self.pool)
+                .await?;
 
             // Migration: add sync metadata columns if missing
             let _ = sqlx::query("ALTER TABLE keys ADD COLUMN bitwarden_revision_ts TEXT")
-                .execute(&self.pool).await;
+                .execute(&self.pool)
+                .await;
             let _ = sqlx::query("ALTER TABLE keys ADD COLUMN bitwarden_updated_at TEXT")
-                .execute(&self.pool).await;
+                .execute(&self.pool)
+                .await;
 
             // Categories: user-defined tree of named nodes that group keys.
             // Arbitrary depth via self-referential parent_id; many-to-many to
@@ -251,10 +269,15 @@ impl Database {
                     updated_at  TEXT NOT NULL
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id)")
-                .execute(&self.pool).await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id)",
+            )
+            .execute(&self.pool)
+            .await?;
 
             sqlx::query(
                 r#"
@@ -264,12 +287,20 @@ impl Database {
                     PRIMARY KEY (key_id, category_id)
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_key_categories_cat ON key_categories(category_id)")
-                .execute(&self.pool).await?;
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_key_categories_key ON key_categories(key_id)")
-                .execute(&self.pool).await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_key_categories_cat ON key_categories(category_id)",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_key_categories_key ON key_categories(key_id)",
+            )
+            .execute(&self.pool)
+            .await?;
 
             // Connect: saved SSH servers (PuTTY-style sessions) + trusted host keys.
             // key_id references keys.id; the private key itself is never copied —
@@ -295,18 +326,23 @@ impl Database {
                     updated_at    TEXT NOT NULL
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
             // Migration: server sync metadata (Bitwarden two-way server sync).
             // Must run after the servers table above exists — on a fresh DB an
             // ALTER TABLE against a not-yet-created table fails silently and
             // the columns never get added.
             let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_id TEXT")
-                .execute(&self.pool).await;
+                .execute(&self.pool)
+                .await;
             let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_revision_ts TEXT")
-                .execute(&self.pool).await;
+                .execute(&self.pool)
+                .await;
             let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_updated_at TEXT")
-                .execute(&self.pool).await;
+                .execute(&self.pool)
+                .await;
 
             sqlx::query(
                 r#"
@@ -317,7 +353,9 @@ impl Database {
                     first_seen       TEXT NOT NULL
                 )
                 "#,
-            ).execute(&self.pool).await?;
+            )
+            .execute(&self.pool)
+            .await?;
 
             Ok::<_, anyhow::Error>(())
         })
@@ -402,7 +440,12 @@ impl Database {
     }
 
     /// Update only Bitwarden sync metadata on a key row (lightweight, no full record needed).
-    pub fn update_key_sync_meta(&self, id: &str, bitwarden_id: &str, revision_date: Option<&str>) -> Result<()> {
+    pub fn update_key_sync_meta(
+        &self,
+        id: &str,
+        bitwarden_id: &str,
+        revision_date: Option<&str>,
+    ) -> Result<()> {
         let rev_ts = revision_date
             .and_then(|rd| chrono::DateTime::parse_from_rfc3339(rd).ok())
             .map(|rd| rd.timestamp_millis().to_string());
@@ -450,15 +493,21 @@ impl Database {
             fingerprint_sha256: row.get("fingerprint_sha256"),
             fingerprint_md5: row.get("fingerprint_md5"),
             comment: row.get("comment"),
-            created_at: DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str()).unwrap().with_timezone(&Utc),
-            updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str()).unwrap().with_timezone(&Utc),
+            created_at: DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())
+                .unwrap()
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())
+                .unwrap()
+                .with_timezone(&Utc),
             deployed: row.get::<i64, _>("deployed") != 0,
             deploy_path: row.get("deploy_path"),
             bitwarden_id: row.get("bitwarden_id"),
             bitwarden_sync: row.get::<i64, _>("bitwarden_sync") != 0,
-            bitwarden_revision_ts: row.get::<Option<String>, _>("bitwarden_revision_ts")
+            bitwarden_revision_ts: row
+                .get::<Option<String>, _>("bitwarden_revision_ts")
                 .and_then(|s| s.parse().ok()),
-            bitwarden_updated_at: row.get::<Option<String>, _>("bitwarden_updated_at")
+            bitwarden_updated_at: row
+                .get::<Option<String>, _>("bitwarden_updated_at")
                 .and_then(|s| s.parse().ok()),
             category_ids: Vec::new(), // populated by list_keys_with_categories / get_key_with_categories
         }
@@ -496,7 +545,7 @@ impl Database {
     pub fn add_audit(&self, action: &str, key_id: Option<&str>, details: &str) -> Result<()> {
         block(async {
             sqlx::query(
-                "INSERT INTO audit_log (action, key_id, details, timestamp) VALUES (?, ?, ?, ?)"
+                "INSERT INTO audit_log (action, key_id, details, timestamp) VALUES (?, ?, ?, ?)",
             )
             .bind(action)
             .bind(key_id)
@@ -517,15 +566,20 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
 
-            Ok(rows.into_iter().map(|row| AuditRecord {
-                id: row.get("id"),
-                action: row.get("action"),
-                key_id: row.get("key_id"),
-                details: row.get("details"),
-                timestamp: DateTime::parse_from_rfc3339(row.get::<String, _>("timestamp").as_str())
+            Ok(rows
+                .into_iter()
+                .map(|row| AuditRecord {
+                    id: row.get("id"),
+                    action: row.get("action"),
+                    key_id: row.get("key_id"),
+                    details: row.get("details"),
+                    timestamp: DateTime::parse_from_rfc3339(
+                        row.get::<String, _>("timestamp").as_str(),
+                    )
                     .unwrap()
                     .with_timezone(&Utc),
-            }).collect())
+                })
+                .collect())
         })
     }
 
@@ -578,7 +632,11 @@ impl Database {
                     "folder_name" => config.folder_name = Some(value),
                     "servers_folder_name" => config.servers_folder_name = Some(value),
                     "device_id" => config.device_id = Some(value),
-                    "last_sync" => config.last_sync = DateTime::parse_from_rfc3339(&value).ok().map(|d| d.with_timezone(&Utc)),
+                    "last_sync" => {
+                        config.last_sync = DateTime::parse_from_rfc3339(&value)
+                            .ok()
+                            .map(|d| d.with_timezone(&Utc))
+                    }
                     "last_result" => config.last_result = Some(value),
                     _ => {}
                 }
@@ -595,7 +653,7 @@ impl Database {
             let rows = sqlx::query(
                 "SELECT id, name, parent_id, color, sort_index, created_at, updated_at \
                  FROM categories \
-                 ORDER BY CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END, sort_index, name"
+                 ORDER BY CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END, sort_index, name",
             )
             .fetch_all(&self.pool)
             .await?;
@@ -658,15 +716,16 @@ impl Database {
     pub fn delete_category(&self, id: &str) -> Result<Vec<String>> {
         block(async {
             let mut tx = self.pool.begin().await?;
-            let parent: Option<String> = sqlx::query_scalar("SELECT parent_id FROM categories WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
+            let parent: Option<String> =
+                sqlx::query_scalar("SELECT parent_id FROM categories WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten();
             // Reassign children to the deleted node's parent.
-            sqlx::query("UPDATE categories SET parent_id = ? WHERE parent_id = ?")
+            sqlx::query("UPDATE categories SET parent_id = ? WHERE parent_id IS ?")
                 .bind(&parent)
-                .bind(id)
+                .bind(&Some(id.to_string()))
                 .execute(&mut *tx)
                 .await?;
             // Drop the join rows for this category.
@@ -689,7 +748,9 @@ impl Database {
             .fetch_all(&mut *tx)
             .await?;
             for c in children.into_iter().flatten() {
-                if c != id { reassigned.push(c); }
+                if c != id {
+                    reassigned.push(c);
+                }
             }
             tx.commit().await?;
             Ok(reassigned)
@@ -706,7 +767,7 @@ impl Database {
                 .await?;
             for cat_id in category_ids {
                 sqlx::query(
-                    "INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)"
+                    "INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)",
                 )
                 .bind(key_id)
                 .bind(cat_id)
@@ -721,12 +782,11 @@ impl Database {
     /// Returns category IDs the given key belongs to.
     pub fn list_categories_for_key(&self, key_id: &str) -> Result<Vec<String>> {
         block(async {
-            let rows: Vec<Option<String>> = sqlx::query_scalar(
-                "SELECT category_id FROM key_categories WHERE key_id = ?"
-            )
-            .bind(key_id)
-            .fetch_all(&self.pool)
-            .await?;
+            let rows: Vec<Option<String>> =
+                sqlx::query_scalar("SELECT category_id FROM key_categories WHERE key_id = ?")
+                    .bind(key_id)
+                    .fetch_all(&self.pool)
+                    .await?;
             Ok(rows.into_iter().flatten().collect())
         })
     }
@@ -735,11 +795,10 @@ impl Database {
     /// renderer's bulk cache.
     pub fn all_key_categories(&self) -> Result<HashMap<String, Vec<String>>> {
         block(async {
-            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-                "SELECT key_id, category_id FROM key_categories"
-            )
-            .fetch_all(&self.pool)
-            .await?;
+            let rows: Vec<(String, Option<String>)> =
+                sqlx::query_as("SELECT key_id, category_id FROM key_categories")
+                    .fetch_all(&self.pool)
+                    .await?;
             let mut out: HashMap<String, Vec<String>> = HashMap::new();
             for (k, c) in rows {
                 if let Some(cat) = c {
@@ -751,7 +810,11 @@ impl Database {
     }
 
     /// Atomically assign categories on key insert (used by `key_create_with_categories`).
-    pub fn insert_key_with_categories(&self, key: &KeyRecord, category_ids: &[String]) -> Result<()> {
+    pub fn insert_key_with_categories(
+        &self,
+        key: &KeyRecord,
+        category_ids: &[String],
+    ) -> Result<()> {
         block(async {
             let mut tx = self.pool.begin().await?;
             sqlx::query(
@@ -783,7 +846,7 @@ impl Database {
             .await?;
             for cat_id in category_ids {
                 sqlx::query(
-                    "INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)"
+                    "INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)",
                 )
                 .bind(&key.id)
                 .bind(cat_id)
@@ -819,7 +882,9 @@ impl Database {
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
-            let Some(row) = row else { return Ok(None); };
+            let Some(row) = row else {
+                return Ok(None);
+            };
             let mut k = Self::row_to_key(row);
             let kc_map = self.all_key_categories_inner(&self.pool).await?;
             if let Some(ids) = kc_map.get(&k.id) {
@@ -829,12 +894,14 @@ impl Database {
         })
     }
 
-    async fn all_key_categories_inner(&self, pool: &SqlitePool) -> Result<HashMap<String, Vec<String>>> {
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT key_id, category_id FROM key_categories"
-        )
-        .fetch_all(pool)
-        .await?;
+    async fn all_key_categories_inner(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT key_id, category_id FROM key_categories")
+                .fetch_all(pool)
+                .await?;
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
         for (k, c) in rows {
             if let Some(cat) = c {
@@ -852,9 +919,11 @@ impl Database {
             color: row.get("color"),
             sort_index: row.get::<i64, _>("sort_index"),
             created_at: DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())
-                .unwrap().with_timezone(&Utc),
+                .unwrap()
+                .with_timezone(&Utc),
             updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())
-                .unwrap().with_timezone(&Utc),
+                .unwrap()
+                .with_timezone(&Utc),
         }
     }
 
@@ -864,7 +933,10 @@ impl Database {
         let mut cur: Option<String> = Some(id.to_string());
         while let Some(cid) = cur {
             match self.get_category(&cid) {
-                Ok(Some(c)) => { out.push(c.name); cur = c.parent_id; }
+                Ok(Some(c)) => {
+                    out.push(c.name);
+                    cur = c.parent_id;
+                }
                 _ => break,
             }
         }
@@ -878,19 +950,24 @@ impl Database {
     /// re-imports converge to the same uuid.
     pub fn ensure_category_path(&self, path: &str) -> Result<Option<String>> {
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if segments.is_empty() { return Ok(None); }
+        if segments.is_empty() {
+            return Ok(None);
+        }
         // Compute a deterministic id for the *root* based on its segment so
         // re-imports of the same root converge.
         let mut current_parent: Option<String> = None;
         let mut full_path = String::new();
         let mut last_id: Option<String> = None;
         for seg in segments {
-            if !full_path.is_empty() { full_path.push('/'); }
+            if !full_path.is_empty() {
+                full_path.push('/');
+            }
             full_path.push_str(seg);
             // Search for a sibling with this parent_id and name.
             let existing: Option<Category> = {
                 let rows = self.list_categories()?;
-                rows.into_iter().find(|c| c.name == seg && c.parent_id == current_parent)
+                rows.into_iter()
+                    .find(|c| c.name == seg && c.parent_id == current_parent)
             };
             if let Some(c) = existing {
                 let cid = c.id.clone();
@@ -900,13 +977,21 @@ impl Database {
                 // Create a new node with a deterministic id from the full path.
                 let id = format!("path-{:x}", short_hash(&full_path));
                 let now = Utc::now();
-                let max_si = self.list_categories()?.into_iter()
+                let max_si = self
+                    .list_categories()?
+                    .into_iter()
                     .filter(|c| c.parent_id == current_parent)
-                    .map(|c| c.sort_index).max().unwrap_or(-1);
+                    .map(|c| c.sort_index)
+                    .max()
+                    .unwrap_or(-1);
                 let cat = Category {
-                    id: id.clone(), name: seg.to_string(),
-                    parent_id: current_parent.clone(), color: None,
-                    sort_index: max_si + 1, created_at: now, updated_at: now,
+                    id: id.clone(),
+                    name: seg.to_string(),
+                    parent_id: current_parent.clone(),
+                    color: None,
+                    sort_index: max_si + 1,
+                    created_at: now,
+                    updated_at: now,
                 };
                 self.insert_category(&cat)?;
                 last_id = Some(id);
@@ -920,7 +1005,8 @@ impl Database {
 
     fn row_to_server(row: SqliteRow) -> ServerRecord {
         let parse_ts = |s: Option<String>| {
-            s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|d| d.with_timezone(&Utc))
+            s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&Utc))
         };
         ServerRecord {
             id: row.get("id"),
@@ -936,9 +1022,13 @@ impl Database {
             color: row.get("color"),
             last_connected_at: parse_ts(row.get("last_connected_at")),
             created_at: DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())
-                .ok().map(|d| d.with_timezone(&Utc)).unwrap_or_else(|| Utc::now()),
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())
-                .ok().map(|d| d.with_timezone(&Utc)).unwrap_or_else(|| Utc::now()),
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|| Utc::now()),
             bitwarden_id: row.get("bitwarden_id"),
             bitwarden_revision_ts: row.get("bitwarden_revision_ts"),
             bitwarden_updated_at: row.get("bitwarden_updated_at"),
@@ -990,8 +1080,10 @@ impl Database {
 
     pub fn delete_server(&self, id: &str) -> Result<()> {
         block(async {
-            sqlx::query("DELETE FROM servers WHERE id = ?").bind(id)
-                .execute(&self.pool).await?;
+            sqlx::query("DELETE FROM servers WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
             Ok(())
         })
     }
@@ -999,7 +1091,9 @@ impl Database {
     pub fn get_server(&self, id: &str) -> Result<Option<ServerRecord>> {
         block(async {
             let row = sqlx::query("SELECT * FROM servers WHERE id = ?")
-                .bind(id).fetch_optional(&self.pool).await?;
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
             Ok(row.map(|r| Self::row_to_server(r)))
         })
     }
@@ -1007,7 +1101,8 @@ impl Database {
     pub fn list_servers(&self) -> Result<Vec<ServerRecord>> {
         block(async {
             let rows = sqlx::query("SELECT * FROM servers ORDER BY name COLLATE NOCASE ASC")
-                .fetch_all(&self.pool).await?;
+                .fetch_all(&self.pool)
+                .await?;
             Ok(rows.into_iter().map(|r| Self::row_to_server(r)).collect())
         })
     }
@@ -1015,7 +1110,9 @@ impl Database {
     pub fn get_key_name(&self, key_id: &str) -> Result<Option<(String, String)>> {
         block(async {
             let row = sqlx::query("SELECT name, key_type FROM keys WHERE id = ?")
-                .bind(key_id).fetch_optional(&self.pool).await?;
+                .bind(key_id)
+                .fetch_optional(&self.pool)
+                .await?;
             Ok(match row {
                 Some(r) => Some((r.get::<String, _>("name"), r.get::<String, _>("key_type"))),
                 None => None,
@@ -1031,7 +1128,9 @@ impl Database {
             host_key: row.get("host_key"),
             fingerprint_sha256: row.get("fingerprint_sha256"),
             first_seen: DateTime::parse_from_rfc3339(row.get::<String, _>("first_seen").as_str())
-                .ok().map(|d| d.with_timezone(&Utc)).unwrap_or_else(|| Utc::now()),
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|| Utc::now()),
         }
     }
 
@@ -1039,9 +1138,11 @@ impl Database {
     /// with a DIFFERENT key (the caller should treat that as a mismatch).
     pub fn add_known_host(&self, host: &str, host_key: &str, fingerprint: &str) -> Result<bool> {
         block(async {
-            let existing = sqlx::query_scalar::<_, String>(
-                "SELECT host_key FROM known_hosts WHERE host = ?"
-            ).bind(host).fetch_optional(&self.pool).await?;
+            let existing =
+                sqlx::query_scalar::<_, String>("SELECT host_key FROM known_hosts WHERE host = ?")
+                    .bind(host)
+                    .fetch_optional(&self.pool)
+                    .await?;
             match existing {
                 Some(current) if current == host_key => Ok(true),
                 Some(_) => Ok(false),
@@ -1061,7 +1162,9 @@ impl Database {
     pub fn get_known_host(&self, host: &str) -> Result<Option<KnownHost>> {
         block(async {
             let row = sqlx::query("SELECT * FROM known_hosts WHERE host = ?")
-                .bind(host).fetch_optional(&self.pool).await?;
+                .bind(host)
+                .fetch_optional(&self.pool)
+                .await?;
             Ok(row.map(|r| Self::row_to_known_host(r)))
         })
     }
@@ -1069,15 +1172,21 @@ impl Database {
     pub fn list_known_hosts(&self) -> Result<Vec<KnownHost>> {
         block(async {
             let rows = sqlx::query("SELECT * FROM known_hosts ORDER BY host COLLATE NOCASE ASC")
-                .fetch_all(&self.pool).await?;
-            Ok(rows.into_iter().map(|r| Self::row_to_known_host(r)).collect())
+                .fetch_all(&self.pool)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| Self::row_to_known_host(r))
+                .collect())
         })
     }
 
     pub fn delete_known_host(&self, host: &str) -> Result<()> {
         block(async {
-            sqlx::query("DELETE FROM known_hosts WHERE host = ?").bind(host)
-                .execute(&self.pool).await?;
+            sqlx::query("DELETE FROM known_hosts WHERE host = ?")
+                .bind(host)
+                .execute(&self.pool)
+                .await?;
             Ok(())
         })
     }
@@ -1095,13 +1204,22 @@ impl Database {
 
             if let Some(arr) = data.get("categories").and_then(|v| v.as_array()) {
                 for c in arr {
-                    let Some(id) = c.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let Some(id) = c
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
                     let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("imported");
                     let parent = c.get("parent_id").and_then(|v| v.as_str());
                     let color = c.get("color").and_then(|v| v.as_str());
                     let sort = c.get("sort_index").and_then(|v| v.as_i64()).unwrap_or(0);
                     let created = c.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-                    let updated = c.get("updated_at").and_then(|v| v.as_str()).unwrap_or(created);
+                    let updated = c
+                        .get("updated_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(created);
                     sqlx::query(
                         "INSERT INTO categories (id, name, parent_id, color, sort_index, created_at, updated_at) \
                          VALUES (?, ?, ?, ?, ?, ?, ?) \
@@ -1116,7 +1234,13 @@ impl Database {
 
             if let Some(arr) = data.get("keys").and_then(|v| v.as_array()) {
                 for k in arr {
-                    let Some(id) = k.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let Some(id) = k
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
                     let s = |f: &str| k.get(f).and_then(|v| v.as_str());
                     sqlx::query(
                         "INSERT INTO keys (id, name, key_type, public_key, private_key_encrypted, \
@@ -1152,7 +1276,9 @@ impl Database {
                     keys_n += 1;
                     if let Some(cats) = k.get("category_ids").and_then(|v| v.as_array()) {
                         sqlx::query("DELETE FROM key_categories WHERE key_id = ?")
-                            .bind(id).execute(&mut *tx).await?;
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await?;
                         for cid in cats {
                             if let Some(cid) = cid.as_str() {
                                 sqlx::query("INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)")
@@ -1166,7 +1292,13 @@ impl Database {
 
             if let Some(arr) = data.get("servers").and_then(|v| v.as_array()) {
                 for sv in arr {
-                    let Some(id) = sv.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let Some(id) = sv
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
                     let s = |f: &str| sv.get(f).and_then(|v| v.as_str());
                     sqlx::query(
                         "INSERT INTO servers (id, name, host, port, username, key_id, pem_path, auth_method, \
@@ -1202,9 +1334,18 @@ impl Database {
 
             if let Some(arr) = data.get("known_hosts").and_then(|v| v.as_array()) {
                 for h in arr {
-                    let Some(host) = h.get("host").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let Some(host) = h
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
                     let host_key = h.get("host_key").and_then(|v| v.as_str()).unwrap_or("");
-                    let fp = h.get("fingerprint_sha256").and_then(|v| v.as_str()).unwrap_or("");
+                    let fp = h
+                        .get("fingerprint_sha256")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let seen = h.get("first_seen").and_then(|v| v.as_str()).unwrap_or("");
                     sqlx::query(
                         "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \

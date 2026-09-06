@@ -1,12 +1,12 @@
 //! SSH key deployment and agent integration
 //! Replaces sshConfigService.js deployment logic and parts of sshspan.js
 
-use std::path::PathBuf;
+use crate::config::{SshConfigService, SshHostConfig};
+use anyhow::Result;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use anyhow::Result;
-use crate::config::{SshConfigService, SshHostConfig};
+use std::path::PathBuf;
 
 pub struct SshService;
 
@@ -20,6 +20,7 @@ impl SshService {
         hostname: Option<&str>,
         user: Option<&str>,
         port: Option<u16>,
+        strict_host_key: Option<bool>,
     ) -> Result<DeployResult> {
         let ssh_dir = get_ssh_dir()?;
         fs::create_dir_all(&ssh_dir)?;
@@ -31,7 +32,7 @@ impl SshService {
 
         // Write private key
         fs::write(&private_path, private_key_pem)?;
-        
+
         // Set permissions: 600 on Unix, handle Windows ACL
         #[cfg(unix)]
         {
@@ -39,7 +40,7 @@ impl SshService {
             perms.set_mode(0o600);
             fs::set_permissions(&private_path, perms)?;
         }
-        
+
         #[cfg(windows)]
         {
             // Use icacls to restrict to current user
@@ -54,11 +55,21 @@ impl SshService {
         let mut config = config_service.read()?;
 
         let host = host_alias.unwrap_or(key_name);
-        
+
         // Check if host already exists
         if let Some(existing) = config.hosts.iter_mut().find(|h| h.host == host) {
             existing.identity_file = Some(private_path.to_string_lossy().to_string());
             existing.identities_only = Some(true);
+            if let Some(strict) = strict_host_key {
+                existing.extra.insert(
+                    "stricthostkeychecking".to_string(),
+                    if strict {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                );
+            }
             if let Some(h) = hostname {
                 existing.hostname = Some(h.to_string());
             }
@@ -78,7 +89,20 @@ impl SshService {
                 identities_only: Some(true),
                 forward_agent: Some(false),
                 proxy_jump: None,
-                extra: std::collections::HashMap::new(),
+                extra: {
+                    let mut extra = std::collections::HashMap::new();
+                    if let Some(strict) = strict_host_key {
+                        extra.insert(
+                            "stricthostkeychecking".to_string(),
+                            if strict {
+                                "yes".to_string()
+                            } else {
+                                "no".to_string()
+                            },
+                        );
+                    }
+                    extra
+                },
             });
         }
 
@@ -121,23 +145,23 @@ impl SshService {
     /// List all deployed keys
     pub fn list_deployed_keys() -> Result<Vec<DeployedKeyInfo>> {
         let ssh_dir = get_ssh_dir()?;
-        
+
         if !ssh_dir.exists() {
             return Ok(Vec::new());
         }
 
         let mut keys = Vec::new();
-        
+
         for entry in fs::read_dir(&ssh_dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.extension().map_or(false, |ext| ext == "pub") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if stem.starts_with("sshspan_") {
                         let key_name = &stem[8..]; // Remove "sshspan_" prefix
                         let private_path = ssh_dir.join(stem);
-                        
+
                         keys.push(DeployedKeyInfo {
                             name: key_name.to_string(),
                             private_key_path: private_path.to_string_lossy().to_string(),
@@ -178,7 +202,13 @@ pub struct DeployedKeyInfo {
 
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -193,28 +223,28 @@ fn get_ssh_dir() -> Result<PathBuf> {
 #[cfg(windows)]
 fn restrict_windows_file(path: &PathBuf) -> Result<()> {
     use std::process::Command;
-    
+
     // Get current user SID
     let output = Command::new("whoami")
         .arg("/user")
         .arg("/fo")
         .arg("csv")
         .output()?;
-    
+
     let output_str = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = output_str.lines().collect();
-    
+
     if lines.len() >= 2 {
         let parts: Vec<&str> = lines[1].split(',').collect();
         if parts.len() >= 2 {
             let sid = parts[1].trim_matches('"');
-            
+
             // Remove inheritance and set explicit permissions
             let _ = Command::new("icacls")
                 .arg(path)
                 .arg("/inheritance:r")
                 .output();
-            
+
             let _ = Command::new("icacls")
                 .arg(path)
                 .arg("/grant:r")
@@ -222,6 +252,6 @@ fn restrict_windows_file(path: &PathBuf) -> Result<()> {
                 .output();
         }
     }
-    
+
     Ok(())
 }

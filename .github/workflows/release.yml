@@ -1,7 +1,7 @@
 name: Release
 
 # Build and publish a GitHub release for every version tag (v1.3, v1.4, ...).
-# Windows (NSIS installer + MSI) and Linux (AppImage + deb) are built on their
+# Windows (NSIS installer + MSI) and Linux (deb + rpm) are built on their
 # native runners via `tauri build`. Release notes are taken from the matching
 # "## [X.Y.Z]" section in CHANGELOG.md when present, and GitHub's automatic
 # "What's Changed" summary is appended.
@@ -58,6 +58,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
             build-essential \
             curl \
             wget \
@@ -85,6 +86,9 @@ jobs:
           else
             echo "Version already $V; nothing to change."
           fi
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
