@@ -11,7 +11,6 @@ use std::sync::Arc as StdArc;
 
 use crate::sftp::{EditRegistry, EditWatch, SftpRegistry, edit_temp_dir};
 use crate::ssh_client::SessionRegistry;
-use crate::AppState;
 
 use super::{CmdError, CmdResult};
 

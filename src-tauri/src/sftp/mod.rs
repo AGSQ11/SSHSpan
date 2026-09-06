@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use notify::Watcher;
 use russh_sftp::client::SftpSession;
 
 /// Per-connection SFTP sessions, keyed by SSH session id.

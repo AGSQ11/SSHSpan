@@ -13,8 +13,6 @@ use anyhow::Result;
 use crate::bitwarden::BitwardenClient;
 use crate::db::{Database, KeyRecord};
 
-const FOLDER_DEFAULT: &str = "SSHSpan";
-
 /// Run a full two-way sync. Returns a JSON summary.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sync(
