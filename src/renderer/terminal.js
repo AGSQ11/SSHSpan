@@ -1,35 +1,36 @@
 /**
- * terminal.js — xterm.js wrapper for the Connect view.
+ * terminal.js — per-tab xterm.js sessions for the Connect view.
  * ---------------------------------------------------------------------------
- * Loaded after `vendor/xterm.js`, `vendor/addon-fit.js`, `vendor/addon-web-links.js`,
- * which expose globals `Terminal`, `FitAddon`, `WebLinksAddon` on window (UMD).
+ * Every session lives in its own tab: its own xterm instance, host <div>,
+ * IPC channel, keystroke subscription, and close-detection poll. Inactive
+ * tabs stay mounted (hidden) so scrollback survives tab switches.
  *
- * Public functions (called from app.js):
- *   ensureTerminalForSession()   - build/open/fit xterm now that the view is visible
- *   terminalReset()              - clear screen before a new session
- *   terminalSetStatus(text)      - bottom status strip
- *   terminalConnect(server, opts) - opens the russh session; returns sessionId
- *
- * Diagnostics: every connect stage is written DIRECTLY into the terminal via
- * term.writeln so the trace works even when the Tauri Channel is broken.
+ * Public API (called from app.js):
+ *   createTabTerminal(tabId)      - build the tab's xterm in a new host div
+ *   showTabTerminal(tabId)        - activate a tab (show host + refit + focus)
+ *   destroyTabTerminal(tabId)     - dispose the tab's terminal + host
+ *   connectInTab(tabId, srv, opts)- open the SSH session for that tab
+ *   setTabSession(tabId, sid)     - record the live session id on the tab
+ *   tabSessionLive(tabId)         - is the tab's SSH session open?
+ *   fitActiveTerminal()           - refit the active tab (resize/maximize)
+ *   terminalResetActive()         - clear the active terminal
+ *   terminalSetStatus(text)       - bottom status strip (global)
+ *   session end calls window.onSessionClosed(tabId) (implemented in app.js).
  */
 
 'use strict';
 
-// Boot marker: app.js checks this at startup. If it's missing, terminal.js
-// did not load/execute and the Connect view cannot work — we surface that
-// visibly instead of failing silently.
-window.__SSHPAN_TERMINAL_JS__ = 'loaded-v13';;;
+// Boot marker: app.js checks this at startup (see main()).
+window.__SSHPAN_TERMINAL_JS__ = 'loaded-v14-tabs';
 
-// NOTE: app.js already declares top-level `const invoke` in the shared global
-// lexical scope of these classic scripts. Re-declaring `invoke` (or any
-// top-level const it declares) here is a SyntaxError that kills this whole
-// file at load time — the exact bug that made the terminal permanently blank.
-// Namespace everything instead.
+// app.js already declares top-level `const invoke` in the shared classic-
+// script global scope — re-declaring it here is a SyntaxError that kills the
+// whole file. Namespace everything.
 const tcore = window.__TAURI__.core;
-// Clipboard via the Tauri plugin (permissions are granted in capabilities);
-// navigator.clipboard as fallback.
 const tclip = (window.__TAURI__ && window.__TAURI__.clipboardManager) || null;
+
+const sshTabs = new Map();   // tabId -> {term, fitAddon, hostEl, sessionId, pollHandle, dataSub, sessionEnded, gotFirstData}
+let activeTabId = null;
 
 function copyText(text) {
   if (!text) return;
@@ -42,53 +43,72 @@ async function readClipboard() {
   try { return await navigator.clipboard.readText(); } catch (e) { return ''; }
 }
 
-let term = null;
-let fitAddon = null;
-let currentSessionId = null;
-let sessionEndedFlag = false;
-let gotFirstChannelData = false;
+function tabRecord(tabId) { return sshTabs.get(tabId) || null; }
+function activeTab() { return activeTabId ? sshTabs.get(activeTabId) : null; }
 
-function trace(line) {
-  // Write a diagnostic line straight into the terminal. Independent of the
-  // Channel — this is how we tell "channel broken" from "terminal broken".
-  if (term) {
-    try { term.writeln('\x1b[90m' + line + '\x1b[0m'); } catch (e) {}
+function trace(tabId, line) {
+  const t = tabRecord(tabId);
+  if (t) {
+    try { t.term.writeln('\x1b[90m' + line + '\x1b[0m'); } catch (e) {}
   }
-  // Mirror to the status strip too — but only while we're still connecting.
-  // Once data flows, the strip shows the friendlier "Connected — streaming".
-  if (!gotFirstChannelData) {
+  if (tabId === activeTabId) {
     const s = document.getElementById('termStrip');
     if (s) s.textContent = line.replace(/\x1b\[[0-9;]*m/g, '');
   }
 }
 
-function buildTerminal() {
-  if (term) return term;
-  const host = document.getElementById('terminalHost');
-  if (!host) return null;
+function wireTerminalClipboard(t) {
+  try {
+    t.onSelectionChange(() => {
+      const sel = t.getSelection();
+      if (sel) copyText(sel);
+    });
+  } catch (e) {}
+  try {
+    t.textarea.addEventListener('contextmenu', async (e) => {
+      e.preventDefault();
+      const text = await readClipboard();
+      if (text) t.paste(text);
+    });
+    t.textarea.addEventListener('keydown', (e) => {
+      if (!e.ctrlKey || !e.shiftKey) return;
+      const k = e.key.toLowerCase();
+      if (k === 'c') { const sel = t.getSelection(); if (sel) { copyText(sel); e.preventDefault(); } }
+      else if (k === 'v') { e.preventDefault(); readClipboard().then(txt => { if (txt) t.paste(txt); }); }
+    });
+  } catch (e) {}
+}
+
+/// Factory: build the tab's xterm instance in its own host <div>.
+function createTabTerminal(tabId) {
+  if (sshTabs.has(tabId)) return sshTabs.get(tabId);
+  const body = document.getElementById('terminalBody');
+  if (!body) return null;
 
   const Terminal = window.Terminal;
   const FitAddonCtor = window.FitAddon && window.FitAddon.FitAddon;
   const WebLinksCtor = window.WebLinksAddon && window.WebLinksAddon.WebLinksAddon;
-
   if (!Terminal) {
-    host.textContent = 'Failed to load xterm.js (window.Terminal is undefined).';
+    body.textContent = 'Failed to load xterm.js (window.Terminal is undefined).';
     return null;
   }
 
-  term = new Terminal({
+  const host = document.createElement('div');
+  host.className = 'terminal-host';
+  host.id = 'terminalHost-' + tabId;
+  host.style.display = 'none';
+  body.appendChild(host);
+
+  const term = new Terminal({
     cursorBlink: true,
-    cursorStyle: 'block',          // PuTTY-style position marker
+    cursorStyle: 'block',
     fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
     fontSize: 13,
     theme: {
       background: '#0f1115',
       foreground: '#e7e9ee',
-      // Blinking block caret in the app's green, like PuTTY's prompt marker.
       cursor: '#34d399',
       cursorAccent: '#0f1115',
-      // Solid, unmistakable selection highlight (alpha variants rendered
-      // invisibly in some render paths). On-brand accent blue, white text.
       selectionBackground: '#4f8ef7',
       selectionForeground: '#ffffff',
       selectionInactiveBackground: '#1d3252',
@@ -98,62 +118,37 @@ function buildTerminal() {
     allowProposedApi: true,
   });
 
+  let fitAddon = null;
   if (FitAddonCtor) {
     fitAddon = new FitAddonCtor();
     try { term.loadAddon(fitAddon); } catch (e) { fitAddon = null; }
   }
   if (WebLinksCtor) {
-    try { term.loadAddon(new WebLinksCtor()); } catch (e) { /* non-fatal */ }
+    try { term.loadAddon(new WebLinksCtor()); } catch (e) {}
   }
 
   term.open(host);
-  // Debug handle: lets CDP/devtools write ANSI test patterns directly.
-  window.__term = term;
-  // Fit on the next two frames so layout is fully settled before measuring.
   requestAnimationFrame(() => requestAnimationFrame(() => {
     try { fitAddon && fitAddon.fit(); } catch (e) {}
   }));
+  wireTerminalClipboard(term);
 
-  // Window resizes must refit: the ResizeObserver on host can miss cases
-  // (e.g. maximize) — observed live: the grid stayed at its original 500px.
-  window.addEventListener('resize', () => {
-    clearTimeout(window.__sshRefitTimer);
-    window.__sshRefitTimer = setTimeout(fitTerminalNow, 120);
-  });
+  const record = {
+    term, fitAddon, hostEl: host,
+    sessionId: null, pollHandle: null, dataSub: null,
+    sessionEnded: false, gotFirstData: false,
+  };
+  sshTabs.set(tabId, record);
 
-  // ── PuTTY-style clipboard behavior ──────────────────────────────────────
-  // Selecting text copies it immediately; right-click pastes the clipboard
-  // into the session; Ctrl+Shift+C/V work too.
-  try {
-    term.onSelectionChange(() => {
-      const sel = term.getSelection();
-      if (sel) copyText(sel);
-    });
-  } catch (e) {}
-  try {
-    term.textarea.addEventListener('contextmenu', async (e) => {
-      e.preventDefault();
-      const text = await readClipboard();
-      if (text) term.paste(text);
-    });
-    term.textarea.addEventListener('keydown', (e) => {
-      if (!e.ctrlKey || !e.shiftKey) return;
-      const k = e.key.toLowerCase();
-      if (k === 'c') { const sel = term.getSelection(); if (sel) { copyText(sel); e.preventDefault(); } }
-      else if (k === 'v') { e.preventDefault(); readClipboard().then(t => { if (t) term.paste(t); }); }
-    });
-  } catch (e) {}
-
-  // No !important height CSS — let xterm size itself from rows/cols and let
-  // FitAddon pick the row count that fills the host.
+  // Refit the tab when it becomes visible again (display:none -> block).
   const ro = new ResizeObserver(() => {
+    if (host.style.display === 'none') return;
     try {
-      if (!fitAddon || !term) return;
-      const d = fitAddon.proposeDimensions();
+      const d = fitAddon && fitAddon.proposeDimensions();
       if (d && Number.isFinite(d.cols) && Number.isFinite(d.rows) && d.cols >= 2 && d.rows >= 2) {
         fitAddon.fit();
-        if (currentSessionId) {
-          tcore.invoke('terminal_resize', { sessionId: currentSessionId, cols: term.cols, rows: term.rows })
+        if (record.sessionId) {
+          tcore.invoke('terminal_resize', { sessionId: record.sessionId, cols: term.cols, rows: term.rows })
             .catch(() => {});
         }
       }
@@ -161,23 +156,70 @@ function buildTerminal() {
   });
   ro.observe(host);
 
-  return term;
+  return record;
 }
 
-function ensureTerminalForSession() {
-  return buildTerminal();
+/// Activate a tab: show its host, hide the others, refit, focus.
+function showTabTerminal(tabId) {
+  activeTabId = tabId;
+  for (const [id, rec] of sshTabs) {
+    rec.hostEl.style.display = (id === tabId) ? 'block' : 'none';
+  }
+  const rec = sshTabs.get(tabId);
+  if (rec) {
+    setTimeout(() => {
+      try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {}
+      try { rec.term.focus(); } catch (e) {}
+    }, 60);
+  }
 }
 
-function initTerminal() {
-  // Deliberately lazy: xterm measures its host on open(), and the connect
-  // view starts hidden (zero-size measurements break rendering).
+/// Dispose a tab's terminal and host element.
+function destroyTabTerminal(tabId) {
+  const rec = sshTabs.get(tabId);
+  if (!rec) return;
+  if (rec.pollHandle) clearInterval(rec.pollHandle);
+  try { rec.dataSub && rec.dataSub.dispose(); } catch (e) {}
+  try { rec.term.dispose(); } catch (e) {}
+  rec.hostEl.remove();
+  sshTabs.delete(tabId);
+  if (activeTabId === tabId) {
+    activeTabId = sshTabs.keys().next().value || null;
+    if (activeTabId) showTabTerminal(activeTabId);
+  }
 }
 
-function terminalReset() {
-  const t = buildTerminal();
-  if (!t) return;
-  t.reset();
-  requestAnimationFrame(() => { try { fitAddon && fitAddon.fit(); } catch (e) {} });
+function tabSessionLive(tabId) {
+  const rec = tabRecord(tabId);
+  return !!(rec && rec.sessionId);
+}
+
+function setTabSession(tabId, sessionId) {
+  const rec = tabRecord(tabId);
+  if (rec) rec.sessionId = sessionId;
+}
+
+function fitActiveTerminal() {
+  const rec = activeTab();
+  if (!rec || !rec.fitAddon) return;
+  try {
+    const d = rec.fitAddon.proposeDimensions();
+    if (d && Number.isFinite(d.cols) && Number.isFinite(d.rows) && d.cols >= 2 && d.rows >= 2) {
+      rec.fitAddon.fit();
+      if (rec.sessionId) {
+        tcore.invoke('terminal_resize', { sessionId: rec.sessionId, cols: rec.term.cols, rows: rec.term.rows })
+          .catch(() => {});
+      }
+    }
+  } catch (e) {}
+  try { rec.term.focus(); } catch (e) {}
+}
+
+function terminalResetActive() {
+  const rec = activeTab();
+  if (!rec) return;
+  rec.term.reset();
+  requestAnimationFrame(() => { try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {} });
 }
 
 function terminalSetStatus(text) {
@@ -185,45 +227,29 @@ function terminalSetStatus(text) {
   if (s) s.textContent = text;
 }
 
-/// Refit the terminal to its host and push the new size to the remote PTY.
-/// Used by the maximize/restore toggle after the layout settles.
-function fitTerminalNow() {
-  if (!term || !fitAddon) return;
-  try {
-    const d = fitAddon.proposeDimensions();
-    if (d && Number.isFinite(d.cols) && Number.isFinite(d.rows) && d.cols >= 2 && d.rows >= 2) {
-      fitAddon.fit();
-      if (currentSessionId) {
-        tcore.invoke('terminal_resize', { sessionId: currentSessionId, cols: term.cols, rows: term.rows })
-          .catch(() => {});
-      }
-    }
-  } catch (e) {}
-  try { term.focus(); } catch (e) {}
-}
-
-function terminalConnect(server, opts) {
+/// Open the SSH session for a tab. Resolves with the sessionId.
+function terminalConnectInTab(tabId, server, opts) {
   return new Promise(async (resolve, reject) => {
-    const t = buildTerminal();
-    if (!t) return reject(new Error('xterm.js unavailable'));
+    let rec = tabRecord(tabId);
+    if (!rec) rec = createTabTerminal(tabId);
+    if (!rec) return reject(new Error('xterm.js unavailable'));
     if (!server || !server.id) return reject(new Error('Server is required.'));
 
-    sessionEndedFlag = false;
-    gotFirstChannelData = false;
-    currentSessionId = null;
+    const t = rec.term;
+    rec.sessionEnded = false;
+    rec.gotFirstData = false;
+    rec.sessionId = null;
 
-    terminalReset();
-    trace(`[sshspan] xterm ready (${t.cols}x${t.rows}) — connecting to ${server.host}:${server.port} (auth=${server.authMethod || 'publickey'})`);
+    try { t.reset(); } catch (e) {}
+    trace(tabId, `[sshspan] xterm ready (${t.cols}x${t.rows}) — connecting to ${server.host}:${server.port} (auth=${server.authMethod || 'publickey'})`);
     setTimeout(() => { try { t.focus(); } catch (e) {} }, 50);
 
-    // Tauri v2 Channel: each Rust-side .send() triggers onmessage here.
     const onData = new tcore.Channel();
     onData.onmessage = (text) => {
       if (typeof text !== 'string' || text.length === 0) return;
-      if (!gotFirstChannelData) {
-        gotFirstChannelData = true;
-        trace('[sshspan] channel data flowing — first bytes received from session');
-        terminalSetStatus(`Connected to ${server.host}:${server.port} — streaming`);
+      if (!rec.gotFirstData) {
+        rec.gotFirstData = true;
+        if (tabId === activeTabId) terminalSetStatus(`Connected to ${server.host}:${server.port} — streaming`);
       }
       try { t.write(text); } catch (e) {}
     };
@@ -232,35 +258,32 @@ function terminalConnect(server, opts) {
       serverId: server.id,
       cols: t.cols || 80,
       rows: t.rows || 24,
-      onData: onData,               // Rust param on_data, camelCase payload key
+      onData: onData,
       overrideUsername: opts && opts.overrideUsername,
       overrideKeyId: opts && opts.overrideKeyId,
       overridePemPath: opts && opts.overridePemPath,
       promptPassword: opts && opts.promptPassword,
     };
 
-    // Keystrokes: xterm gives UTF-16 strings; the remote PTY expects UTF-8
-    // bytes. Encode properly (charCodeAt&0xff mangles non-ASCII).
     const encoder = new TextEncoder();
     const dataSub = t.onData(async (data) => {
-      if (!currentSessionId) return;
+      if (!rec.sessionId) return;
       try {
         await tcore.invoke('terminal_send', {
-          sessionId: currentSessionId,
+          sessionId: rec.sessionId,
           bytes: Array.from(encoder.encode(data)),
         });
       } catch (e) { /* closed channel — close-detection handles teardown */ }
     });
 
-    let pollHandle = null;
     const teardown = (sid) => {
-      if (sessionEndedFlag || currentSessionId !== sid) return;
-      sessionEndedFlag = true;
-      currentSessionId = null;
-      if (pollHandle) clearInterval(pollHandle);
+      if (rec.sessionEnded || rec.sessionId !== sid) return;
+      rec.sessionEnded = true;
+      rec.sessionId = null;
+      if (rec.pollHandle) { clearInterval(rec.pollHandle); rec.pollHandle = null; }
       try { dataSub.dispose(); } catch (e) {}
       try { t.writeln('\r\n\x1b[1;33m[connection closed]\x1b[0m'); } catch (e) {}
-      if (typeof window.onTerminalClosed === 'function') window.onTerminalClosed();
+      if (typeof window.onSessionClosed === 'function') window.onSessionClosed(tabId);
     };
 
     try {
@@ -269,23 +292,21 @@ function terminalConnect(server, opts) {
         throw new Error((r && r.error) || 'No session id returned.');
       }
       const sessionId = r.sessionId;
-      currentSessionId = sessionId;
-      trace(`[sshspan] session established (id=${sessionId.slice(0, 8)}…) — waiting for remote output`);
-
-      if (!gotFirstChannelData) {
-        trace('[sshspan] NOTE: no channel data yet. If this line is the last one you see, the Tauri Channel is not delivering.');
+      rec.sessionId = sessionId;
+      trace(tabId, `[sshspan] session established (id=${sessionId.slice(0, 8)}…) — waiting for remote output`);
+      if (!rec.gotFirstData) {
+        trace(tabId, '[sshspan] NOTE: no channel data yet. If this is the last line you see, the IPC Channel is not delivering.');
       }
 
-      // Push the real terminal size now that the session is live.
       try {
         await tcore.invoke('terminal_resize', { sessionId, cols: t.cols, rows: t.rows });
       } catch (e) {}
 
-      // Close detection via registry CONTENT (not invoke errors): when the
-      // session id disappears from terminal_list, the Rust task has exited.
-      pollHandle = setInterval(async () => {
-        if (sessionEndedFlag || currentSessionId !== sessionId) {
-          clearInterval(pollHandle);
+      // Close detection via registry content per tab.
+      rec.pollHandle = setInterval(async () => {
+        if (rec.sessionEnded || rec.sessionId !== sessionId) {
+          clearInterval(rec.pollHandle);
+          rec.pollHandle = null;
           return;
         }
         try {
@@ -297,19 +318,30 @@ function terminalConnect(server, opts) {
 
       resolve(sessionId);
     } catch (e) {
-      sessionEndedFlag = true;
-      currentSessionId = null;
+      rec.sessionEnded = true;
+      rec.sessionId = null;
       try { dataSub.dispose(); } catch (e2) {}
       const msg = e && e.message ? e.message : String(e);
-      trace(`[sshspan] CONNECT FAILED: ${msg}`);
+      trace(tabId, `[sshspan] CONNECT FAILED: ${msg}`);
       reject(new Error(msg));
     }
   });
 }
 
-window.initTerminal = initTerminal;
-window.ensureTerminalForSession = ensureTerminalForSession;
-window.terminalReset = terminalReset;
+// Window resize refits the ACTIVE tab.
+window.addEventListener('resize', () => {
+  clearTimeout(window.__sshRefitTimer);
+  window.__sshRefitTimer = setTimeout(fitActiveTerminal, 120);
+});
+
+window.initTerminal = function () {}; // lazy: tabs build on demand
+window.createTabTerminal = createTabTerminal;
+window.showTabTerminal = showTabTerminal;
+window.destroyTabTerminal = destroyTabTerminal;
+window.tabSessionLive = tabSessionLive;
+window.setTabSession = setTabSession;
+window.fitActiveTerminal = fitActiveTerminal;
+window.terminalResetActive = terminalResetActive;
 window.terminalSetStatus = terminalSetStatus;
-window.terminalConnect = terminalConnect;
-window.fitTerminalNow = fitTerminalNow;
+window.tabRecord = tabRecord;
+window.terminalConnectInTab = terminalConnectInTab;

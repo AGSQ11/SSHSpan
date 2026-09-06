@@ -695,6 +695,9 @@ const state = {
   connectAuthMethod: 'publickey',
   _pendingConnectServer: null,  // server id set by openServerPickerForKey
   _pendingConnectKey: null,
+  // multi-tab SSH sessions
+  sessions: new Map(),   // tabId -> {tabId, sessionId, serverId, serverName, host, port, mode, sftpReady, sftpPath, ended}
+  activeTabId: null,
 };
 
 // ─── vault gate ────────────────────────────────────────────────────────────
@@ -759,6 +762,7 @@ async function refreshVaultStatus(silent) {
     hideVaultModal();
     if (!wasUnlocked || !silent) await loadKeys();
   }
+  resetAutoLockTimer();
 }
 
 // Lock/unlock the nav buttons that require an unlocked vault (Connect, Deploy).
@@ -776,7 +780,7 @@ function applyNavLockState() {
 function clearConnectView() {
   state.servers = [];
   state.connectSelectedId = null;
-  if (typeof terminalReset === 'function') terminalReset('Vault is locked.');
+  if (typeof window.terminalResetActive === 'function') window.terminalResetActive();
   const list = el('serverList'); if (list) list.innerHTML = '';
   const empty = el('serverEmpty'); if (empty) empty.hidden = true;
   el('termTitle').textContent = 'No connection';
@@ -787,6 +791,22 @@ function clearConnectView() {
   el('termStrip').textContent = state.unlocked ? 'Ready.' : 'Unlock the vault to connect.';
   state._pendingConnectServer = null;
   state._pendingConnectKey = null;
+  // Close every session tab.
+  for (const tabId of [...state.sessions.keys()]) {
+    const tab = state.sessions.get(tabId);
+    if (tab && window.tabSessionLive(tabId)) {
+      call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
+    }
+    if (tab && tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
+    window.destroyTabTerminal(tabId);
+    state.sessions.delete(tabId);
+  }
+  state.activeTabId = null;
+  const sbody = document.getElementById('sftpBody');
+  if (sbody) sbody.classList.remove('visible');
+  const tbody = document.getElementById('terminalBody');
+  if (tbody) tbody.style.display = 'flex';
+  renderTermTabs();
 }
 
 async function submitVaultModal() {
@@ -1326,9 +1346,84 @@ async function deployConfig() {
     el('configPreview').value = 'Deployed ' + res.keys.length + ' key(s)\n'
       + res.keys.map(k => '  ' + k.name + ' -> ' + k.file).join('\n');
     toast('Keys deployed.', 'ok');
+
+    // Optionally register the deployed keys as Connect servers (Deploy ↔ Connect bridge).
+    if (el('deployRegisterToggle')?.checked) {
+      const alias = el('cfgHost').value.trim();
+      const user = el('cfgUser').value.trim();
+      if (!alias || !user) {
+        toast('Enter a Host alias and User to register servers.', 'info');
+        return;
+      }
+      const multi = res.keys.length > 1;
+      let registered = 0;
+      for (const k of res.keys) {
+        try {
+          await call('server_save', {
+            id: null,
+            name: multi ? `${alias} · ${k.name}` : alias,
+            host: alias,
+            port: parseInt(el('cfgPort').value, 10) || 22,
+            username: user,
+            authMethod: 'publickey',
+            keyId: null,
+            pemPath: k.file,
+            savedPassword: null,
+            categoryId: null,
+            color: null,
+          });
+          registered += 1;
+        } catch (e) { /* keep registering the rest */ }
+      }
+      if (registered) {
+        await loadServers();
+        toast(`${registered} server(s) registered in Connect.`, 'ok');
+      }
+    }
   } catch (e) {
     toast(e.message || String(e), 'err');
   }
+}
+
+// Import a Host block from ~/.ssh/config into the server-edit modal, prefilled.
+async function importFromSshConfig(anchorEl) {
+  try {
+    const res = await call('ssh_config_list_hosts');
+    const hosts = res.hosts || [];
+    if (hosts.length === 0) { toast('No Host blocks found in ~/.ssh/config.', 'info'); return; }
+    closeKeyConnectMenu();
+    const menu = document.createElement('div');
+    menu.className = 'ctx-menu';
+    menu.id = 'keyConnectMenu';
+    for (const h of hosts) {
+      const b = document.createElement('button');
+      b.className = 'ctx-item';
+      const label = `${h.host} <small>(${escapeHtml(h.user || '?')}@${escapeHtml(h.hostname || h.host)}:${h.port || 22})</small>`;
+      b.innerHTML = `${ico('server')}<span>${label}</span>`;
+      b.addEventListener('click', () => {
+        closeKeyConnectMenu();
+        openServerModal({
+          prefill: {
+            name: h.host,
+            host: h.hostname || h.host,
+            port: h.port || 22,
+            username: h.user || '',
+            pemPath: h.identity_file || '',
+          },
+        });
+      });
+      menu.appendChild(b);
+    }
+    const rect = anchorEl.getBoundingClientRect();
+    menu.style.left = rect.left + 'px';
+    menu.style.top = (rect.bottom + 4) + 'px';
+    document.body.appendChild(menu);
+    const onAway = (ev) => {
+      if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
+      closeKeyConnectMenu();
+    };
+    setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
 async function copyConfig() {
@@ -1344,7 +1439,8 @@ const BW_FIELDS = [
   { key: 'server_url',      label: 'Server URL',          type: 'url',      placeholder: 'https://vault.example.com', required: true },
   { key: 'email',           label: 'Email',               type: 'email',    placeholder: 'you@example.com',           required: true },
   { key: 'master_password', label: 'Master Password',     type: 'password', placeholder: 'Your Bitwarden master password', required: false },
-  { key: 'folder_name',     label: 'Sync Folder',         type: 'text',     placeholder: 'SSHSpan',                   required: false },
+  { key: 'folder_name',          label: 'Keys folder',    type: 'text', placeholder: 'SSHSpan_Keys',     required: false },
+  { key: 'servers_folder_name', label: 'Servers folder', type: 'text', placeholder: 'SSHSpan_Servers', required: false },
 ];
 
 function setBwStatus(text, cls) {
@@ -1395,6 +1491,7 @@ async function saveBitwardenConfig() {
     email: el('bw_email').value.trim(),
     masterPassword: el('bw_master_password').value || undefined,
     folderName: el('bw_folder_name').value.trim() || undefined,
+    serversFolderName: el('bw_servers_folder_name') ? (el('bw_servers_folder_name').value.trim() || undefined) : undefined,
   };
   if (!payload.serverUrl) { toast('Server URL is required.', 'err'); el('bw_server_url').focus(); return; }
   if (!payload.email) { toast('Email is required.', 'err'); el('bw_email').focus(); return; }
@@ -1477,6 +1574,8 @@ async function loadSettings() {
   autoLock.addEventListener('change', async () => {
     try {
       await call('settings_set', { key: 'autoLockMinutes', value: String(autoLock.value) });
+      state.settings.autoLockMinutes = autoLock.value;
+      resetAutoLockTimer();
       toast('Auto-lock updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
@@ -1492,6 +1591,122 @@ async function loadSettings() {
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   mkRow('Confirm before deleting keys', confirmDelete);
+
+  const autoUpdate = document.createElement('input');
+  autoUpdate.type = 'checkbox';
+  autoUpdate.checked = state.settings.autoUpdateCheck !== false;
+  autoUpdate.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'autoUpdateCheck', value: String(autoUpdate.checked) });
+      state.settings.autoUpdateCheck = autoUpdate.checked;
+      toast('Saved.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Automatically check GitHub for a newer release', autoUpdate);
+
+  const checkNow = document.createElement('button');
+  checkNow.className = 'ghost-btn';
+  checkNow.innerHTML = `${ico('refresh-cw')}<span>Check now</span>`;
+  checkNow.addEventListener('click', manualUpdateCheck);
+  mkRow('Updates', checkNow);
+
+  loadKnownHosts();
+}
+
+// ─── known hosts (Settings panel) ──────────────────────────────────────────
+// ─── vault backup / restore (Settings panel) ───────────────────────────────
+
+async function backupCreate() {
+  try {
+    const r = await call('vault_backup_create');
+    const pick = await call('system_pick_save_path', {
+      title: 'Save vault backup',
+      defaultName: r.filename,
+    });
+    if (pick.canceled) return;
+    await call('system_write_text_file', {
+      path: pick.path,
+      contents: JSON.stringify(r.json, null, 2),
+    });
+    const c = r.counts;
+    el('backupStatus').textContent = `Backup saved: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+    toast('Backup created.', 'ok');
+  } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+async function backupRestore() {
+  try {
+    const pick = await call('system_select_file', { title: 'Select vault backup file' });
+    if (pick.canceled) return;
+    const payloadJson = pick.text;
+    if (!confirm('Restoring will add or overwrite entries with the ones from this backup. Continue?')) return;
+    try {
+      const r = await call('vault_backup_restore', { payloadJson, backupPassword: null });
+      finishRestore(r);
+    } catch (e) {
+      const msg = e.message || String(e);
+      if (!msg.includes('different master password')) throw e;
+      // The backup was created under a different master password — ask for it.
+      promptModal('Backup password',
+        'This backup was created with a different master password. Enter the one that was active when the backup was taken:',
+        '', async (pw) => {
+          if (!pw) return;
+          try {
+            const r2 = await call('vault_backup_restore', { payloadJson, backupPassword: pw });
+            finishRestore(r2);
+          } catch (e2) { toast(e2.message || String(e2), 'err'); }
+        });
+    }
+  } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+function finishRestore(r) {
+  const c = r.counts;
+  el('backupStatus').textContent = `Restored: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+  loadKeys();
+  loadServers();
+  toast('Backup restored.', 'ok');
+}
+async function loadKnownHosts() {
+  const body = el('knownHostsBody');
+  const empty = el('knownHostsEmpty');
+  if (!body) return;
+  body.innerHTML = '';
+  try {
+    const res = await call('known_hosts_list');
+    const hosts = res.hosts || [];
+    empty.hidden = hosts.length > 0;
+    for (const h of hosts) {
+      const tr = document.createElement('tr');
+      const tdHost = document.createElement('td');
+      tdHost.textContent = h.host;
+      const tdFp = document.createElement('td');
+      const code = document.createElement('code');
+      code.className = 'mono';
+      code.textContent = h.fingerprintSha256 || '—';
+      tdFp.appendChild(code);
+      const tdSeen = document.createElement('td');
+      tdSeen.textContent = fmtTime(h.firstSeen);
+      const tdAct = document.createElement('td');
+      const forget = document.createElement('button');
+      forget.className = 'ghost-btn';
+      forget.innerHTML = `${ico('trash-2')}<span>Forget</span>`;
+      forget.addEventListener('click', async () => {
+        if (!confirm(`Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`)) return;
+        try {
+          await call('known_hosts_forget', { host: h.host });
+          await loadKnownHosts();
+          toast('Host forgotten.', 'ok');
+        } catch (e) { toast(e.message || String(e), 'err'); }
+      });
+      tdAct.appendChild(forget);
+      tr.appendChild(tdHost); tr.appendChild(tdFp); tr.appendChild(tdSeen); tr.appendChild(tdAct);
+      body.appendChild(tr);
+    }
+  } catch (e) {
+    empty.hidden = false;
+    body.innerHTML = '';
+  }
 }
 
 // ─── audit view ────────────────────────────────────────────────────────────
@@ -1553,6 +1768,7 @@ async function switchView(view) {
   if (view === 'settings') {
     await loadSettings();
     await loadBitwardenConfig();
+    await loadKnownHosts();
   }
   if (view === 'audit') await loadAudit();
   if (view === 'keys') {
@@ -1672,6 +1888,10 @@ function wire() {
     bwSyncNow();
   });
 
+  // backup & restore (Settings)
+  el('backupExportBtn').addEventListener('click', backupCreate);
+  el('backupImportBtn').addEventListener('click', backupRestore);
+
   // picker modal
   el('pickerCloseBtn').addEventListener('click', closeCategoryPicker);
   el('pickerCancelBtn').addEventListener('click', closeCategoryPicker);
@@ -1732,13 +1952,14 @@ function wire() {
 
   // ─── Connect view wiring ────────────────────────────────────────────────
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
+  el('serverImportBtn').addEventListener('click', (ev) => importFromSshConfig(ev.currentTarget));
   el('serverSearch').addEventListener('input', renderServerList);
-  el('termDisconnectBtn').addEventListener('click', disconnectActive);
+  el('termDisconnectBtn').addEventListener('click', disconnectActiveTab);
   const termMaxBtn = el('termMaxBtn');
   if (termMaxBtn) termMaxBtn.addEventListener('click', toggleTermMax);
   el('termReconnectBtn').addEventListener('click', () => {
     const srv = currentSelectedServer();
-    if (srv) connectToServer(srv);
+    if (srv) openSessionTab(srv);
   });
   el('termTestBtn').addEventListener('click', () => {
     const srv = currentSelectedServer();
@@ -1761,6 +1982,17 @@ function wire() {
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   el('srvSaveBtn').addEventListener('click', submitServerModal);
+  el('srvBrowseCategoryBtn').addEventListener('click', () => {
+    openCategoryPicker({
+      title: 'Server category',
+      initial: state._pendingServerCategory ? [state._pendingServerCategory] : [],
+      single: true,
+      onSave: (ids) => {
+        state._pendingServerCategory = ids[0] || null;
+        renderServerCategoryChips();
+      },
+    });
+  });
 
   // Connect password modal
   el('connectPwOkBtn').addEventListener('click', () => {
@@ -1784,6 +2016,56 @@ async function lockNow() {
     await refreshVaultStatus();
     toast('Vault locked.', 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+// ─── Auto-lock (idle timer, honors the autoLockMinutes setting) ────────────
+
+let autoLockTimer = null;
+
+function resetAutoLockTimer() {
+  if (autoLockTimer) { clearTimeout(autoLockTimer); autoLockTimer = null; }
+  const mins = parseInt(state.settings.autoLockMinutes, 10);
+  if (!state.unlocked || !mins || mins <= 0) return;
+  autoLockTimer = setTimeout(async () => {
+    autoLockTimer = null;
+    if (state.unlocked) {
+      toast('Vault auto-locked after inactivity.', 'info');
+      await lockNow();
+    }
+  }, mins * 60 * 1000);
+}
+
+// ─── Update check (GitHub releases; manual + auto per setting) ─────────────
+
+async function manualUpdateCheck() {
+  try {
+    const r = await call('update_check');
+    if (r.available) {
+      const install = confirm(
+        `A newer version is available: ${r.current} → ${r.version}\n\n` +
+        `${r.notes ? r.notes.slice(0, 800) + '\n\n' : ''}` +
+        `Download and run the installer for this OS?`);
+      if (install) {
+        toast('Downloading installer…', 'info');
+        await call('update_download_and_run', { url: r.assetUrl, version: r.version });
+        // The app exits itself right after spawning the installer.
+      }
+    } else {
+      toast(`You are on the latest version (${r.current}).`, 'ok');
+    }
+  } catch (e) {
+    toast(e.message || String(e), 'err');
+  }
+}
+
+async function autoUpdateCheckOnBoot() {
+  if (state.settings.autoUpdateCheck === false) return;
+  try {
+    const r = await call('update_check');
+    if (r.available) {
+      toast(`Update available: ${r.version} — Settings → "Check now" to install.`, 'info');
+    }
+  } catch (e) { /* offline or rate-limited: silently ignore on boot */ }
 }
 
 // ─── Connect: saved servers + SSH sessions ─────────────────────────────────
@@ -1875,7 +2157,7 @@ function renderServerList() {
     row.appendChild(auth);
 
     row.addEventListener('click', () => selectServer(s.id));
-    row.addEventListener('dblclick', () => connectToServer(s));
+    row.addEventListener('dblclick', () => openSessionTab(s));
     row.addEventListener('contextmenu', (ev) => {
       ev.preventDefault();
       openServerContextMenu(ev.clientX, ev.clientY, s);
@@ -1887,18 +2169,7 @@ function renderServerList() {
 function selectServer(id) {
   state.connectSelectedId = id;
   renderServerList();
-  const srv = currentSelectedServer();
-  el('termTitle').textContent = srv ? srv.name : 'No connection';
-  el('termBadge').hidden = !srv;
-  if (srv) {
-    el('termBadge').textContent = srv.host + ':' + srv.port;
-    el('termTestBtn').hidden = false;
-    el('termReconnectBtn').hidden = !!state.connectSessionId;
-  } else {
-    el('termTestBtn').hidden = true;
-    el('termReconnectBtn').hidden = true;
-  }
-  el('termDisconnectBtn').hidden = !state.connectSessionId;
+  updateTerminalHead();
 }
 
 function openServerContextMenu(x, y, srv) {
@@ -1914,7 +2185,7 @@ function openServerContextMenu(x, y, srv) {
     menu.appendChild(b);
     return b;
   };
-  mk('Connect', 'plug-zap', () => connectToServer(srv));
+  mk('Connect', 'plug-zap', () => openSessionTab(srv));
   mk('Edit', 'pencil', () => openServerModal({ id: srv.id }));
   mk('Delete', 'trash-2', async () => {
     if (!confirm(`Delete server "${srv.name}"?`)) return;
@@ -1937,7 +2208,7 @@ function openServerContextMenu(x, y, srv) {
 
 // ─── Server modal ───────────────────────────────────────────────────────────
 
-function openServerModal({ id, keyId } = {}) {
+function openServerModal({ id, keyId, prefill } = {}) {
   el('serverModal').hidden = false;
   el('serverModalTitle').textContent = id ? 'Edit Server' : 'New Server';
   // Populate key dropdown from cached state.keys
@@ -1957,22 +2228,34 @@ function openServerModal({ id, keyId } = {}) {
     srv = state.servers.find(s => s.id === id) || null;
     if (!srv) { toast('Server not found.', 'err'); closeServerModal(); return; }
   }
-  el('srvName').value    = srv ? srv.name : '';
-  el('srvHost').value    = srv ? srv.host : '';
-  el('srvPort').value    = srv ? (srv.port || 22) : 22;
-  el('srvUser').value    = srv ? srv.username : '';
+  el('srvName').value    = srv ? srv.name : (prefill?.name || '');
+  el('srvHost').value    = srv ? srv.host : (prefill?.host || '');
+  el('srvPort').value    = srv ? (srv.port || 22) : (prefill?.port || 22);
+  el('srvUser').value    = srv ? srv.username : (prefill?.username || '');
   el('srvKeyId').value   = srv ? (srv.keyId || keyId || '') : (keyId || '');
-  el('srvPemPath').value = srv ? (srv.pemPath || '') : '';
+  el('srvPemPath').value = srv ? (srv.pemPath || '') : (prefill?.pemPath || '');
   el('srvPassword').value = '';
   el('srvSavePw').checked = false;
   setConnectAuthMethod(srv ? srv.authMethod : (keyId ? 'publickey' : 'publickey'));
+  // Category (single-select; schema is one category_id per server)
+  state._pendingServerCategory = srv ? (srv.categoryId || null) : null;
+  renderServerCategoryChips();
   state._editingServerId = id || null;
   setTimeout(() => el('srvName').focus(), 0);
+}
+
+function renderServerCategoryChips() {
+  const ids = state._pendingServerCategory ? [state._pendingServerCategory] : [];
+  renderCategoryChips(el('srvCategory'), ids, {
+    removable: true,
+    onRemove: () => { state._pendingServerCategory = null; renderServerCategoryChips(); },
+  });
 }
 
 function closeServerModal() {
   el('serverModal').hidden = true;
   state._editingServerId = null;
+  state._pendingServerCategory = null;
 }
 
 function setConnectAuthMethod(method) {
@@ -2003,7 +2286,7 @@ async function submitServerModal() {
     keyId: method === 'publickey' ? (el('srvKeyId').value || null) : null,
     pemPath: method === 'publickey' ? (el('srvPemPath').value.trim() || null) : null,
     savedPassword: (method !== 'publickey' && el('srvSavePw').checked) ? el('srvPassword').value : null,
-    categoryId: null,
+    categoryId: state._pendingServerCategory,
     color: null,
   };
   try {
@@ -2034,7 +2317,7 @@ function openServerPickerForKey(key) {
       closeKeyConnectMenu();
       state._pendingConnectKey = key.id;
       selectServer(s.id);
-      connectToServer(s, { overrideKeyId: key.id });
+      openSessionTab(s, { overrideKeyId: key.id });
     });
     menu.appendChild(b);
   }
@@ -2062,80 +2345,76 @@ function openServerPickerForKey(key) {
 
 // ─── Connect / disconnect / test ───────────────────────────────────────────
 
-async function connectToServer(srv, opts = {}) {
-  // Hard requirement: terminal.js provides the xterm glue. Never skip silently.
-  if (typeof terminalConnect !== 'function' || typeof ensureTerminalForSession !== 'function') {
-    el('termStrip').textContent = 'terminal.js is missing — Connect cannot run.';
-    toast('terminal.js is missing — reinstall the app.', 'err');
+function newTabId() {
+  return 'tab-' + Date.now().toString(36) + Math.floor(Math.random() * 1e4);
+}
+
+/// Open a NEW session tab for a server (always a new tab — never replaces).
+async function openSessionTab(srv, opts = {}) {
+  if (typeof window.terminalConnectInTab !== 'function') {
+    toast('terminal.js is missing — Connect cannot run.', 'err');
     return;
   }
-  if (state.connectSessionId) {
-    if (!confirm('A connection is already open. Disconnect it and start a new one?')) return;
-    await disconnectActive();
-  }
-  // Build the xterm instance now that the view is visible. Doing this earlier
-  // (during initTerminal) failed because the host element had zero size while
-  // the connect view was hidden.
-  ensureTerminalForSession();
-  terminalReset();
-  el('termTitle').textContent = srv.name;
-  el('termBadge').textContent = srv.host + ':' + srv.port;
-  el('termBadge').hidden = false;
-  // Only show Disconnect once a session is actually open.
+  switchView('connect');
+  const tabId = newTabId();
+  const tab = {
+    tabId,
+    sessionId: null,
+    serverId: srv.id,
+    serverName: srv.name || srv.host,
+    host: srv.host,
+    port: srv.port || 22,
+    mode: 'ssh',
+    sftpReady: false,
+    sftpPath: '/',
+    ended: false,
+  };
+  state.sessions.set(tabId, tab);
+  window.createTabTerminal(tabId);
+  state.activeTabId = tabId;
+  window.showTabTerminal(tabId);
+  renderTermTabs();
+  updateTerminalHead();
   el('termDisconnectBtn').hidden = true;
   el('termReconnectBtn').hidden = true;
-  el('termTestBtn').hidden = true;
-  if (el('serverList')) el('serverList').classList.add('connecting');
+  terminalSetStatus(`Connecting to ${srv.host}:${srv.port}…`);
 
   let pw = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
-    // No password stored — ask at connect time via the custom modal (native
-    // prompt() silently fails in Tauri webview).
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) {
       terminalSetStatus('Cancelled.');
-      if (el('serverList')) el('serverList').classList.remove('connecting');
+      closeSessionTab(tabId, { skipConfirm: true });
       return;
     }
   }
 
   try {
-    const sessionId = await terminalConnect(srv, { cols: 80, rows: 24, ...opts });
-    state.connectSessionId = sessionId;
-    state.connectServerId = srv.id;
-    // Success — flip to the connected button set.
-    el('termReconnectBtn').hidden = false;
-    el('termDisconnectBtn').hidden = false;
-    el('termTestBtn').hidden = false;
-    if (el('serverList')) el('serverList').classList.remove('connecting');
+    const sessionId = await window.terminalConnectInTab(tabId, srv, { ...opts, promptPassword: pw });
+    tab.sessionId = sessionId;
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Connected to ${srv.host}:${srv.port} — streaming`);
   } catch (e) {
-    const msg = e.message || String(e);
-    state.connectSessionId = null;
-    state.connectServerId = null;
-    el('termDisconnectBtn').hidden = true;
-    el('termReconnectBtn').hidden = false;
-    el('termTestBtn').hidden = false;
-    if (el('serverList')) el('serverList').classList.remove('connecting');
-    terminalSetStatus(`Failed: ${msg}`);
-    toast(msg, 'err');
+    tab.ended = true;
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Failed: ${e.message || e}`);
+    toast(e.message || String(e), 'err');
   }
 }
 
-async function disconnectActive() {
-  if (!state.connectSessionId) return;
-  const id = state.connectSessionId;
-  try { await call('terminal_disconnect', { sessionId: id }); } catch (e) {}
-  state.connectSessionId = null;
-  state.connectServerId = null;
-  el('termDisconnectBtn').hidden = true;
-  el('termReconnectBtn').hidden = false;
-  el('termTestBtn').hidden = false;
-  if (typeof terminalSetStatus === 'function') terminalSetStatus('Disconnected.');
+/// Disconnect the active tab's live session (tab stays with [connection closed]).
+async function disconnectActiveTab() {
+  const tab = state.sessions.get(state.activeTabId);
+  if (!tab || !window.tabSessionLive(tab.tabId)) return;
+  try { await call('terminal_disconnect', { sessionId: tab.sessionId }); } catch (e) {}
+  // The close-detection poll fires onSessionClosed, which finalizes tab state.
 }
 
-// Toggle the terminal between the normal Connect layout and a full-app
-// "maximized" mode: sidebar/topbar/server-list hidden, terminal fills the
-// window, and a thin taskbar strip (status + this restore button) remains.
+/// Toggle the terminal between the normal Connect layout and a full-app
+/// "maximized" mode: sidebar/topbar/server-list hidden, terminal fills the
+/// window, and a thin taskbar strip (status + restore button) remains.
 function toggleTermMax() {
   const app = el('app');
   const btn = el('termMaxBtn');
@@ -2147,48 +2426,155 @@ function toggleTermMax() {
     terminalSetStatus(max ? 'Terminal maximized — press Esc or <> to restore.' : 'Restored.');
   }
   // Let the layout settle, then refit + push the new PTY size.
-  setTimeout(() => {
-    if (typeof fitTerminalNow === 'function') fitTerminalNow();
-  }, 80);
-  setTimeout(() => {
-    if (typeof fitTerminalNow === 'function') fitTerminalNow();
-  }, 250);
+  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 80);
+  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 250);
 }
 
-async function testSelectedServer(srv) {
+/// Reconnect the active tab: new session in the SAME tab (keeps scrollback).
+async function reconnectActiveTab() {
+  const tab = state.sessions.get(state.activeTabId);
+  if (!tab) return;
+  const srv = state.servers.find(s => s.id === tab.serverId);
+  if (!srv) { toast('Server no longer exists.', 'err'); return; }
   let pw = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) return;
   }
-  if (typeof terminalSetStatus === 'function') terminalSetStatus(`Testing ${srv.host}:${srv.port}…`);
+  terminalSetStatus(`Reconnecting to ${srv.host}:${srv.port}…`);
+  el('termDisconnectBtn').hidden = true;
+  el('termReconnectBtn').hidden = true;
   try {
-    const r = await call('server_test', { serverId: srv.id, promptPassword: pw });
-    if (r && r.ok) {
-      if (typeof terminalSetStatus === 'function') terminalSetStatus(`OK — ${r.latencyMs} ms`);
-      toast(`Reachable (${r.latencyMs} ms)`, 'ok');
-    } else {
-      if (typeof terminalSetStatus === 'function') terminalSetStatus(`Failed: ${r && r.error ? r.error : 'unknown'}`);
-      toast(r && r.error ? r.error : 'Test failed', 'err');
-    }
+    const sessionId = await window.terminalConnectInTab(tab.tabId, srv, { promptPassword: pw });
+    tab.sessionId = sessionId;
+    tab.ended = false;
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Connected to ${srv.host}:${srv.port} — streaming`);
   } catch (e) {
-    if (typeof terminalSetStatus === 'function') terminalSetStatus(`Failed: ${e.message || e}`);
+    renderTermTabs();
+    updateTerminalHead();
+    terminalSetStatus(`Failed: ${e.message || e}`);
     toast(e.message || String(e), 'err');
   }
 }
 
-// Called by terminal.js when the session ends on the Rust side.
-function onTerminalClosed() {
-  state.connectSessionId = null;
-  state.connectServerId = null;
-  el('termDisconnectBtn').hidden = true;
-  el('termReconnectBtn').hidden = false;
-  el('termTestBtn').hidden = false;
-  if (typeof terminalSetStatus === 'function') terminalSetStatus('Connection closed.');
+/// Close a tab: disconnect if live, dispose terminal, forget the session.
+function closeSessionTab(tabId, { skipConfirm = false } = {}) {
+  const tab = state.sessions.get(tabId);
+  if (!tab) return;
+  const live = window.tabSessionLive(tabId);
+  if (live && !skipConfirm && !confirm(`Close the session to ${tab.serverName}?`)) return;
+  if (live) call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
+  if (tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
+  window.destroyTabTerminal(tabId);
+  state.sessions.delete(tabId);
+  if (state.activeTabId === tabId) {
+    state.activeTabId = state.sessions.keys().next().value || null;
+    if (state.activeTabId) {
+      const nt = state.sessions.get(state.activeTabId);
+      if (nt && nt.mode === 'sftp') window.showSftpForTab(state.activeTabId);
+      else window.showTabTerminal(state.activeTabId);
+    } else {
+      const sbody = document.getElementById('sftpBody');
+      if (sbody) sbody.classList.remove('visible');
+      const body = document.getElementById('terminalBody');
+      if (body) body.style.display = 'flex';
+    }
+  }
+  renderTermTabs();
+  updateTerminalHead();
 }
-window.onTerminalClosed = onTerminalClosed;
 
-// ─── tiny escaper used by context menus ────────────────────────────────────
+/// Activate a tab (click on its chip).
+function activateSessionTab(tabId) {
+  state.activeTabId = tabId;
+  const tab = state.sessions.get(tabId);
+  if (tab && tab.mode === 'sftp') window.showSftpForTab(tabId);
+  else window.showTabTerminal(tabId);
+  renderTermTabs();
+  updateTerminalHead();
+}
+
+/// Tab strip: chips for each session + the persistent "+" button.
+function renderTermTabs() {
+  const strip = el('termTabs');
+  if (!strip) return;
+  strip.querySelectorAll('.term-tab').forEach(n => n.remove());
+  const addBtn = el('termTabAdd');
+  for (const [tabId, tab] of state.sessions) {
+    const chip = document.createElement('div');
+    chip.className = 'term-tab' + (tabId === state.activeTabId ? ' active' : '') + (tab.ended ? ' ended' : '');
+    const dot = document.createElement('span');
+    dot.className = 'term-tab-dot' + (window.tabSessionLive(tabId) ? ' live' : '');
+    const name = document.createElement('span');
+    name.className = 'term-tab-name';
+    name.textContent = tab.serverName;
+    name.title = `${tab.serverName} (${tab.host}:${tab.port})`;
+    const close = document.createElement('span');
+    close.className = 'term-tab-close';
+    close.textContent = '×';
+    close.title = 'Close session';
+    close.addEventListener('click', (ev) => { ev.stopPropagation(); closeSessionTab(tabId); });
+    chip.appendChild(dot);
+    chip.appendChild(name);
+    chip.appendChild(close);
+    chip.addEventListener('click', () => activateSessionTab(tabId));
+    strip.insertBefore(chip, addBtn);
+  }
+}
+
+/// Head title + buttons follow the active tab, or the selected server.
+function updateTerminalHead() {
+  const tab = state.sessions.get(state.activeTabId);
+  const srv = currentSelectedServer();
+  el('termTestBtn').hidden = !srv;
+  if (tab) {
+    el('termTitle').textContent = tab.serverName;
+    el('termBadge').textContent = `${tab.host}:${tab.port}`;
+    el('termBadge').hidden = false;
+    const live = window.tabSessionLive(tab.tabId);
+    el('termDisconnectBtn').hidden = !live;
+    el('termReconnectBtn').hidden = live;
+    el('termModeBtn').hidden = !live;
+    el('termModeLabel').textContent = tab.mode === 'sftp' ? 'SSH' : 'SFTP';
+  } else if (srv) {
+    el('termTitle').textContent = srv.name;
+    el('termBadge').textContent = `${srv.host}:${srv.port}`;
+    el('termBadge').hidden = false;
+    el('termDisconnectBtn').hidden = true;
+    el('termReconnectBtn').hidden = false;
+    el('termModeBtn').hidden = true;
+  } else {
+    el('termTitle').textContent = 'No connection';
+    el('termBadge').hidden = true;
+    el('termDisconnectBtn').hidden = true;
+    el('termReconnectBtn').hidden = true;
+    el('termModeBtn').hidden = true;
+  }
+}
+
+/// Called by terminal.js when a tab's SSH session ends (server side or drop).
+function onSessionClosed(tabId) {
+  const tab = state.sessions.get(tabId);
+  if (!tab) return;
+  tab.ended = true;
+  if (tab.sftpReady) {
+    call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
+    tab.sftpReady = false;
+    if (tab.mode === 'sftp' && tabId === state.activeTabId) {
+      window.showSshForTab(tabId);
+      tab.mode = 'ssh';
+    }
+  }
+  tab.sessionId = null;
+  if (tabId === state.activeTabId) terminalSetStatus('Connection closed.');
+  renderTermTabs();
+  updateTerminalHead();
+}
+window.onSessionClosed = onSessionClosed;
+
+// ─── tiny escaper used by context menus// ─── tiny escaper used by context menus ────────────────────────────────────
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -2198,17 +2584,29 @@ function escapeHtml(s) {
 // ─── boot ──────────────────────────────────────────────────────────────────
 
 (async function main() {
-  // Surface any uncaught renderer error — in release builds there is no
-  // devtools console, so silent failures look like "nothing happens".
+  // Persistent boot-error log — readable via CDP even after the toast fades.
+  window.__bootErrors = window.__bootErrors || [];
   window.addEventListener('error', (ev) => {
-    toast('JS error: ' + (ev.message || 'unknown'), 'err');
+    const msg = 'JS error: ' + (ev.message || 'unknown');
+    window.__bootErrors.push(msg + (ev.filename ? ' @ ' + ev.filename + ':' + ev.lineno : ''));
+    toast(msg, 'err');
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    const r = ev.reason;
+    window.__bootErrors.push('unhandled rejection: ' + (r && r.message ? r.message : String(r)));
   });
 
-  window.__SSHPAN_BUILD__ = 'v13-colors';;;
+  window.__SSHPAN_BUILD__ = 'v14-tabs';;;
   document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();
-  wire();
+  try {
+    wire();
+  } catch (e) {
+    window.__bootErrors.push('wire() threw: ' + (e.stack || e.message || String(e)));
+    toast('UI init failed: ' + e.message, 'err');
+    throw e;
+  }
   onGenTypeChange();
   switchTab('generate');
   updateSelectionHint();
@@ -2225,7 +2623,7 @@ function escapeHtml(s) {
     document.head.appendChild(s);
   });
   const results = [];
-  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js']) {
+  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js', 'sftp.js']) {
     const r = await loadScript(src);
     results.push(r);
     if (!r.ok) toast('Failed to load ' + src + ' — Connect will not work.', 'err');
@@ -2243,6 +2641,19 @@ function escapeHtml(s) {
   }
 
   await refreshVaultStatus();
+
+  // Auto-lock needs the persisted settings at boot (loadSettings only runs
+  // when the Settings view is opened).
+  try { state.settings = await call('settings_get'); } catch (e) { state.settings = {}; }
+
+  // Auto-lock idle timer: user activity resets it; expiry calls lockNow().
+  for (const ev of ['keydown', 'mousedown', 'wheel', 'touchstart']) {
+    document.addEventListener(ev, () => resetAutoLockTimer(), { passive: true });
+  }
+  resetAutoLockTimer();
+
+  // Optional update check (only when the setting is ticked; never auto-installs).
+  autoUpdateCheckOnBoot();
 
   // Catch auto-locks without user interaction.
   setInterval(() => {

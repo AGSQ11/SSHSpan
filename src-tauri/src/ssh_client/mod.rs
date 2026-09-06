@@ -30,6 +30,13 @@ pub struct SessionHandle {
     pub started_at_ms: i64,
     pub input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     pub resize_tx: tokio::sync::mpsc::UnboundedSender<(u32, u32)>,
+    /// Requests an SFTP subsystem channel on the session's authenticated
+    /// connection. The session task owns the russh `Handle` (it is not
+    /// Clone), so SFTP open requests are sent to it over this channel and
+    /// answered on a oneshot.
+    pub sftp_tx: tokio::sync::mpsc::UnboundedSender<
+        tokio::sync::oneshot::Sender<anyhow::Result<russh_sftp::client::SftpSession>>,
+    >,
 }
 
 /// Registry of all live SSH sessions (Tauri-managed state).
@@ -53,6 +60,12 @@ impl SessionRegistry {
 
     pub fn get_resize_tx(&self, id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>> {
         self.sessions.lock().unwrap().get(id).map(|s| s.resize_tx.clone())
+    }
+
+    pub fn get_sftp_tx(&self, id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<
+        tokio::sync::oneshot::Sender<anyhow::Result<russh_sftp::client::SftpSession>>,
+    >> {
+        self.sessions.lock().unwrap().get(id).map(|s| s.sftp_tx.clone())
     }
 
     pub fn remove(&self, id: &str) -> Option<SessionHandle> {
@@ -257,10 +270,11 @@ pub async fn start_interactive(
     let config = Arc::new(base_client_config());
     let handler = TerminalHandler { host: target_host.clone(), db: db.clone() };
 
+    let t0 = std::time::Instant::now();
     let mut session = client::connect(config, (&target_host[..], target_port), handler)
         .await
         .map_err(|e| anyhow::anyhow!("Connection failed: {e}"))?;
-    eprintln!("[sshspan-terminal] tcp+kex established to {target_host}:{target_port}");
+    eprintln!("[sshspan-terminal] tcp+kex+hostkey in {}ms", t0.elapsed().as_millis());
 
     authenticate(&mut session, &ConnectParams {
         server: params.server.clone(),
@@ -269,7 +283,7 @@ pub async fn start_interactive(
         key_pem: params.key_pem.clone(),
         password: params.password.clone(),
     }).await?;
-    eprintln!("[sshspan-terminal] authenticated as {}", params.username);
+    eprintln!("[sshspan-terminal] auth in {}ms", t0.elapsed().as_millis());
 
     // Terminal dimensions start at 80x24; the renderer sends the real size right
     // after it learns the session id. The terminal_modes list must include
@@ -290,11 +304,14 @@ pub async fn start_interactive(
         .request_shell(true)
         .await
         .map_err(|e| anyhow::anyhow!("Shell request failed: {e}"))?;
-    eprintln!("[sshspan-terminal] pty + shell ready, streaming");
+    eprintln!("[sshspan-terminal] pty+shell in {}ms — streaming", t0.elapsed().as_millis());
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
+    let (sftp_tx, mut sftp_rx) = tokio::sync::mpsc::unbounded_channel::<
+        tokio::sync::oneshot::Sender<anyhow::Result<russh_sftp::client::SftpSession>>,
+    >();
 
     registry.insert(SessionHandle {
         session_id: session_id.clone(),
@@ -304,6 +321,7 @@ pub async fn start_interactive(
         started_at_ms: chrono::Utc::now().timestamp_millis(),
         input_tx,
         resize_tx,
+        sftp_tx,
     });
 
     let server_name = params.server.name.clone();
@@ -317,6 +335,9 @@ pub async fn start_interactive(
         eprintln!("[sshspan-terminal] channel send failed right after connect: {e}");
     }
 
+    // The spawned task owns the russh session handle (it is not Clone), so
+    // SFTP channel opens are requested from the registry via sftp_tx and
+    // serviced here alongside shell I/O.
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::select! {
@@ -362,6 +383,24 @@ pub async fn start_interactive(
                             if channel.window_change(cols, rows, 0, 0).await.is_err() { break; }
                         }
                         None => break,
+                    }
+                }
+                req = sftp_rx.recv() => {
+                    match req {
+                        Some(reply) => {
+                            // Open a fresh session channel on the authenticated
+                            // connection and run the SFTP subsystem over it.
+                            let result = (|| async {
+                                let ch = session.channel_open_session().await
+                                    .map_err(|e| anyhow::anyhow!("channel open failed: {e}"))?;
+                                ch.request_subsystem(true, "sftp").await
+                                    .map_err(|e| anyhow::anyhow!("sftp subsystem failed: {e}"))?;
+                                russh_sftp::client::SftpSession::new(ch.into_stream()).await
+                                    .map_err(|e| anyhow::anyhow!("sftp init failed: {e}"))
+                            })().await;
+                            let _ = reply.send(result);
+                        }
+                        None => {} // registry gone; keep the shell alive
                     }
                 }
             }

@@ -8,6 +8,7 @@ pub mod bitwarden;
 pub mod ssh;
 pub mod config;
 pub mod ssh_client;
+pub mod sftp;
 
 use tauri::{
     Emitter,
@@ -19,6 +20,9 @@ use tauri::{
 use commands::*;
 use commands::server::*;
 use commands::terminal::*;
+use commands::updater::*;
+use commands::sftp::*;
+use sftp::{SftpRegistry, EditRegistry};
 use db::Database;
 use ssh_client::SessionRegistry;
 
@@ -62,6 +66,8 @@ pub fn run() {
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
+            app.manage(SftpRegistry::new());
+            app.manage(EditRegistry::new());
 
             create_tray(app.handle())?;
             
@@ -76,6 +82,7 @@ pub fn run() {
             // Vault commands
             vault_create, vault_unlock, vault_lock, vault_change_password,
             vault_status, vault_export, vault_import,
+            vault_backup_create, vault_backup_restore,
             // Key commands
             key_generate, key_import, key_export, key_delete, key_list,
             key_get, key_fingerprint, key_deploy, key_remove_deployed,
@@ -90,6 +97,8 @@ pub fn run() {
             // Connect / interactive SSH terminal
             terminal_connect, terminal_send, terminal_resize, terminal_disconnect, terminal_list,
             server_test, known_hosts_list, known_hosts_forget,
+            sftp_open, sftp_list_dir, sftp_mkdir, sftp_remove, sftp_rename,
+            sftp_download, sftp_upload, sftp_open_for_edit, sftp_close_edit, sftp_close, sftp_stage_path,
             // Bitwarden commands
             bitwarden_get_config, bitwarden_save_config, bitwarden_test_connection, bitwarden_sync,
             // Settings commands
@@ -98,6 +107,8 @@ pub fn run() {
             audit_list,
             // System commands
             system_open_external, system_show_item_in_folder, system_select_file,
+            system_pick_save_path, system_write_text_file,
+            update_check, update_download_and_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

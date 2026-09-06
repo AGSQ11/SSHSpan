@@ -75,6 +75,10 @@ pub struct ServerRecord {
     pub last_connected_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    // Bitwarden two-way sync metadata
+    pub bitwarden_id: Option<String>,
+    pub bitwarden_revision_ts: Option<String>,
+    pub bitwarden_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +95,8 @@ pub struct BitwardenConfig {
     pub server_url: Option<String>,
     pub email: Option<String>,
     pub master_password: Option<String>,  // sealed JSON blob (encrypted with vault pw)
-    pub folder_name: Option<String>,      // default "SSHSpan"
+    pub folder_name: Option<String>,      // keys folder (legacy single-folder default: "SSHSpan")
+    pub servers_folder_name: Option<String>, // servers folder (default "SSHSpan_Servers")
     pub device_id: Option<String>,
     pub last_sync: Option<DateTime<Utc>>,
     pub last_result: Option<String>,      // JSON sync summary
@@ -101,7 +106,7 @@ impl Default for BitwardenConfig {
     fn default() -> Self {
         Self {
             server_url: None, email: None, master_password: None,
-            folder_name: None, device_id: None,
+            folder_name: None, servers_folder_name: None, device_id: None,
             last_sync: None, last_result: None,
         }
     }
@@ -153,6 +158,14 @@ impl Database {
         let pool = block(async {
             SqlitePool::connect(&db_url).await
         })?;
+        // Owner-only permissions on the vault file (Unix). The DB holds the
+        // Argon2id verifier and sealed key material; default umasks can leave
+        // it world-readable depending on the system.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
         let db = Self { pool, db_path };
         db.migrate()?;
         Ok(db)
@@ -283,6 +296,17 @@ impl Database {
                 )
                 "#,
             ).execute(&self.pool).await?;
+
+            // Migration: server sync metadata (Bitwarden two-way server sync).
+            // Must run after the servers table above exists — on a fresh DB an
+            // ALTER TABLE against a not-yet-created table fails silently and
+            // the columns never get added.
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_id TEXT")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_revision_ts TEXT")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_updated_at TEXT")
+                .execute(&self.pool).await;
 
             sqlx::query(
                 r#"
@@ -509,11 +533,12 @@ impl Database {
 
     pub fn save_bitwarden_config(&self, config: &BitwardenConfig) -> Result<()> {
         block(async {
-            let fields: [(&str, Option<String>); 7] = [
+            let fields: [(&str, Option<String>); 8] = [
                 ("server_url", config.server_url.clone()),
                 ("email", config.email.clone()),
                 ("master_password", config.master_password.clone()),
                 ("folder_name", config.folder_name.clone()),
+                ("servers_folder_name", config.servers_folder_name.clone()),
                 ("device_id", config.device_id.clone()),
                 ("last_sync", config.last_sync.map(|d| d.to_rfc3339())),
                 ("last_result", config.last_result.clone()),
@@ -551,6 +576,7 @@ impl Database {
                     "email" => config.email = Some(value),
                     "master_password" => config.master_password = Some(value),
                     "folder_name" => config.folder_name = Some(value),
+                    "servers_folder_name" => config.servers_folder_name = Some(value),
                     "device_id" => config.device_id = Some(value),
                     "last_sync" => config.last_sync = DateTime::parse_from_rfc3339(&value).ok().map(|d| d.with_timezone(&Utc)),
                     "last_result" => config.last_result = Some(value),
@@ -913,6 +939,9 @@ impl Database {
                 .ok().map(|d| d.with_timezone(&Utc)).unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())
                 .ok().map(|d| d.with_timezone(&Utc)).unwrap_or_else(|| Utc::now()),
+            bitwarden_id: row.get("bitwarden_id"),
+            bitwarden_revision_ts: row.get("bitwarden_revision_ts"),
+            bitwarden_updated_at: row.get("bitwarden_updated_at"),
         }
     }
 
@@ -921,8 +950,9 @@ impl Database {
             sqlx::query(
                 r#"
                 INSERT INTO servers (id, name, host, port, username, key_id, pem_path, auth_method,
-                                     saved_password, category_id, color, last_connected_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     saved_password, category_id, color, last_connected_at, created_at, updated_at,
+                                     bitwarden_id, bitwarden_revision_ts, bitwarden_updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&s.id).bind(&s.name).bind(&s.host).bind(s.port as i64)
@@ -930,6 +960,7 @@ impl Database {
             .bind(&s.saved_password).bind(&s.category_id).bind(&s.color)
             .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
             .bind(s.created_at.to_rfc3339()).bind(s.updated_at.to_rfc3339())
+            .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
             .execute(&self.pool).await?;
             Ok(())
         })
@@ -940,7 +971,8 @@ impl Database {
             sqlx::query(
                 r#"
                 UPDATE servers SET name = ?, host = ?, port = ?, username = ?, key_id = ?, pem_path = ?,
-                    auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?
+                    auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?,
+                    bitwarden_id = ?, bitwarden_revision_ts = ?, bitwarden_updated_at = ?
                 WHERE id = ?
                 "#,
             )
@@ -949,6 +981,7 @@ impl Database {
             .bind(&s.category_id).bind(&s.color)
             .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
             .bind(s.updated_at.to_rfc3339())
+            .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
             .bind(&s.id)
             .execute(&self.pool).await?;
             Ok(())
@@ -1048,6 +1081,165 @@ impl Database {
             Ok(())
         })
     }
+
+    // ── Backup / restore ───────────────────────────────────────────────────
+
+    /// Upsert every entity from an (already unsealed) backup payload in one
+    /// transaction. Existing rows with the same id/host are overwritten —
+    /// re-running a restore is safe. Returns per-entity row counts.
+    pub fn restore_backup(&self, data: &serde_json::Value) -> Result<serde_json::Value> {
+        block(async {
+            let mut tx = self.pool.begin().await?;
+            let (mut keys_n, mut cats_n, mut kc_n) = (0u32, 0u32, 0u32);
+            let (mut servers_n, mut hosts_n, mut settings_n) = (0u32, 0u32, 0u32);
+
+            if let Some(arr) = data.get("categories").and_then(|v| v.as_array()) {
+                for c in arr {
+                    let Some(id) = c.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("imported");
+                    let parent = c.get("parent_id").and_then(|v| v.as_str());
+                    let color = c.get("color").and_then(|v| v.as_str());
+                    let sort = c.get("sort_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let created = c.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                    let updated = c.get("updated_at").and_then(|v| v.as_str()).unwrap_or(created);
+                    sqlx::query(
+                        "INSERT INTO categories (id, name, parent_id, color, sort_index, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, parent_id=excluded.parent_id, \
+                           color=excluded.color, sort_index=excluded.sort_index, updated_at=excluded.updated_at",
+                    )
+                    .bind(id).bind(name).bind(parent).bind(color).bind(sort).bind(created).bind(updated)
+                    .execute(&mut *tx).await?;
+                    cats_n += 1;
+                }
+            }
+
+            if let Some(arr) = data.get("keys").and_then(|v| v.as_array()) {
+                for k in arr {
+                    let Some(id) = k.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let s = |f: &str| k.get(f).and_then(|v| v.as_str());
+                    sqlx::query(
+                        "INSERT INTO keys (id, name, key_type, public_key, private_key_encrypted, \
+                           fingerprint_sha256, fingerprint_md5, comment, created_at, updated_at, \
+                           deployed, deploy_path, bitwarden_id, bitwarden_sync, \
+                           bitwarden_revision_ts, bitwarden_updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, key_type=excluded.key_type, \
+                           public_key=excluded.public_key, private_key_encrypted=excluded.private_key_encrypted, \
+                           fingerprint_sha256=excluded.fingerprint_sha256, fingerprint_md5=excluded.fingerprint_md5, \
+                           comment=excluded.comment, updated_at=excluded.updated_at, deployed=excluded.deployed, \
+                           deploy_path=excluded.deploy_path, bitwarden_id=excluded.bitwarden_id, \
+                           bitwarden_sync=excluded.bitwarden_sync, bitwarden_revision_ts=excluded.bitwarden_revision_ts, \
+                           bitwarden_updated_at=excluded.bitwarden_updated_at",
+                    )
+                    .bind(id)
+                    .bind(s("name").unwrap_or("imported"))
+                    .bind(s("key_type").unwrap_or("rsa"))
+                    .bind(s("public_key").unwrap_or(""))
+                    .bind(s("private_key_encrypted").unwrap_or(""))
+                    .bind(s("fingerprint_sha256").unwrap_or(""))
+                    .bind(s("fingerprint_md5").unwrap_or(""))
+                    .bind(s("comment").unwrap_or(""))
+                    .bind(s("created_at").unwrap_or(""))
+                    .bind(s("updated_at").unwrap_or(""))
+                    .bind(k.get("deployed").and_then(|v| v.as_bool()).unwrap_or(false) as i64)
+                    .bind(s("deploy_path"))
+                    .bind(s("bitwarden_id"))
+                    .bind(k.get("bitwarden_sync").and_then(|v| v.as_bool()).unwrap_or(false) as i64)
+                    .bind(s("bitwarden_revision_ts"))
+                    .bind(s("bitwarden_updated_at"))
+                    .execute(&mut *tx).await?;
+                    keys_n += 1;
+                    if let Some(cats) = k.get("category_ids").and_then(|v| v.as_array()) {
+                        sqlx::query("DELETE FROM key_categories WHERE key_id = ?")
+                            .bind(id).execute(&mut *tx).await?;
+                        for cid in cats {
+                            if let Some(cid) = cid.as_str() {
+                                sqlx::query("INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)")
+                                    .bind(id).bind(cid).execute(&mut *tx).await?;
+                                kc_n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(arr) = data.get("servers").and_then(|v| v.as_array()) {
+                for sv in arr {
+                    let Some(id) = sv.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let s = |f: &str| sv.get(f).and_then(|v| v.as_str());
+                    sqlx::query(
+                        "INSERT INTO servers (id, name, host, port, username, key_id, pem_path, auth_method, \
+                           saved_password, category_id, color, last_connected_at, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, host=excluded.host, port=excluded.port, \
+                           username=excluded.username, key_id=excluded.key_id, pem_path=excluded.pem_path, \
+                           auth_method=excluded.auth_method, saved_password=excluded.saved_password, \
+                           category_id=excluded.category_id, color=excluded.color, \
+                           last_connected_at=excluded.last_connected_at, updated_at=excluded.updated_at",
+                    )
+                    .bind(id)
+                    .bind(s("name").unwrap_or("imported"))
+                    .bind(s("host").unwrap_or(""))
+                    .bind(sv.get("port").and_then(|v| v.as_i64()).unwrap_or(22))
+                    .bind(s("username").unwrap_or("root"))
+                    .bind(s("key_id"))
+                    .bind(s("pem_path"))
+                    .bind(s("auth_method").unwrap_or("publickey"))
+                    .bind(s("saved_password"))
+                    .bind(s("category_id"))
+                    .bind(s("color"))
+                    .bind(s("last_connected_at"))
+                    .bind(s("created_at").unwrap_or(""))
+                    .bind(s("updated_at").unwrap_or(""))
+                    .bind(s("bitwarden_id"))
+                    .bind(s("bitwarden_revision_ts"))
+                    .bind(s("bitwarden_updated_at"))
+                    .execute(&mut *tx).await?;
+                    servers_n += 1;
+                }
+            }
+
+            if let Some(arr) = data.get("known_hosts").and_then(|v| v.as_array()) {
+                for h in arr {
+                    let Some(host) = h.get("host").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else { continue };
+                    let host_key = h.get("host_key").and_then(|v| v.as_str()).unwrap_or("");
+                    let fp = h.get("fingerprint_sha256").and_then(|v| v.as_str()).unwrap_or("");
+                    let seen = h.get("first_seen").and_then(|v| v.as_str()).unwrap_or("");
+                    sqlx::query(
+                        "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
+                         VALUES (?, ?, ?, ?) \
+                         ON CONFLICT(host) DO UPDATE SET host_key=excluded.host_key, \
+                           fingerprint_sha256=excluded.fingerprint_sha256, first_seen=excluded.first_seen",
+                    )
+                    .bind(host).bind(host_key).bind(fp).bind(seen)
+                    .execute(&mut *tx).await?;
+                    hosts_n += 1;
+                }
+            }
+
+            if let Some(obj) = data.get("settings").and_then(|v| v.as_object()) {
+                for (k, v) in obj {
+                    if let Some(val) = v.as_str() {
+                        sqlx::query(
+                            "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
+                             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                        )
+                        .bind(format!("setting.{k}")).bind(val)
+                        .bind(chrono::Utc::now().to_rfc3339())
+                        .execute(&mut *tx).await?;
+                        settings_n += 1;
+                    }
+                }
+            }
+
+            tx.commit().await?;
+            Ok(serde_json::json!({
+                "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
+                "servers": servers_n, "knownHosts": hosts_n, "settings": settings_n,
+            }))
+        })
+    }
 }
 
 /// FNV-1a 32-bit hash of the string, formatted as 8 lowercase hex chars.
@@ -1062,6 +1254,13 @@ fn short_hash(s: &str) -> u32 {
 }
 
 fn get_db_path(_app: &AppHandle) -> Result<PathBuf> {
+    // Test override: SSHSPAN_DB=<path> isolates a dev instance from the
+    // real vault (used by the local e2e rig).
+    if let Ok(p) = std::env::var("SSHSPAN_DB") {
+        if !p.trim().is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
     let dirs = ProjectDirs::from("org", "sshspan", "SSHSpan")
         .ok_or_else(|| anyhow::anyhow!("Could not determine app data directory"))?;
     Ok(dirs.data_dir().join("sshspan.db"))

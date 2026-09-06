@@ -4,6 +4,8 @@
 
 pub mod server;
 pub mod terminal;
+pub mod updater;
+pub mod sftp;
 
 use tauri::AppHandle;
 use tauri::Manager;
@@ -63,9 +65,11 @@ fn vault_password(app: &AppHandle) -> CmdResult<String> {
     Ok(app.state::<VaultPasswordStore>().get().map(|s| s.to_string()).unwrap_or_default())
 }
 
-/// In-memory vault password (set on unlock, cleared on lock)
+/// In-memory vault password (set on unlock, cleared on lock).
+/// Wrapped in `Zeroizing` so the password is wiped from memory when the
+/// store replaces or drops it, not just left as freed heap bytes.
 pub struct VaultPasswordStore {
-    password: std::sync::Mutex<Option<String>>,
+    password: std::sync::Mutex<Option<zeroize::Zeroizing<String>>>,
 }
 
 impl VaultPasswordStore {
@@ -73,13 +77,58 @@ impl VaultPasswordStore {
         Self { password: std::sync::Mutex::new(None) }
     }
     pub fn get(&self) -> Option<String> {
-        self.password.lock().unwrap().clone()
+        self.password.lock().unwrap().as_ref().map(|p| p.to_string())
     }
     pub fn set(&self, p: String) {
-        *self.password.lock().unwrap() = Some(p);
+        *self.password.lock().unwrap() = Some(zeroize::Zeroizing::new(p));
     }
     pub fn clear(&self) {
         *self.password.lock().unwrap() = None;
+    }
+}
+
+// ─── Master password hashing (Argon2id) ─────────────────────────────────────
+
+const MASTER_HASH_KEY: &str = "master.hash";
+
+/// True when the stored value is an Argon2 PHC-format hash (vs. the legacy
+/// plaintext era, which stored the raw password under the same key).
+fn is_argon2_hash(s: &str) -> bool {
+    s.starts_with("$argon2")
+}
+
+/// Hash a master password with Argon2id (crate defaults: m=19 MiB, t=2, p=1).
+fn hash_master_password(password: &str) -> Result<String, String> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Verify a master password against the stored value. Transparently handles
+/// the legacy plaintext era: on a plaintext match, re-hashes in place so the
+/// stored value is upgraded to Argon2id on the first successful unlock.
+fn verify_master_password(db: &db::Database, password: &str) -> Result<bool, String> {
+    let stored = db.get_config(MASTER_HASH_KEY).unwrap_or_default();
+    let Some(stored) = stored.filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    if is_argon2_hash(&stored) {
+        use argon2::password_hash::PasswordVerifier;
+        let parsed = argon2::PasswordHash::new(&stored).map_err(|e| e.to_string())?;
+        Ok(argon2::Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok())
+    } else {
+        let ok = stored == password;
+        if ok {
+            let hashed = hash_master_password(password)?;
+            db.set_config(MASTER_HASH_KEY, &hashed).map_err(|e| e.to_string())?;
+            let _ = db.add_audit("vault.hash_upgraded", None, "Plaintext verifier upgraded to Argon2id");
+        }
+        Ok(ok)
     }
 }
 
@@ -89,7 +138,7 @@ impl VaultPasswordStore {
 
 #[tauri::command]
 pub fn vault_status(app: AppHandle) -> CmdResult<serde_json::Value> {
-    let has_vault = app.state::<AppState>().db.get_config("master.hash")
+    let has_vault = app.state::<AppState>().db.get_config(MASTER_HASH_KEY)
         .map(|h| h.as_ref().map_or(false, |s| !s.is_empty()))
         .unwrap_or(false);
 
@@ -98,13 +147,13 @@ pub fn vault_status(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "hasVault": has_vault, "unlocked": unlocked }))
 }
 
-/// Create a new vault. Stores a verification hash and unlocks in one step.
+/// Create a new vault. Stores an Argon2id verification hash and unlocks in one step.
 #[tauri::command]
 pub fn vault_create(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
     if password.len() < 8 {
         return Err("Master password must be at least 8 characters.".into());
     }
-    if app.state::<AppState>().db.get_config("master.hash")
+    if app.state::<AppState>().db.get_config(MASTER_HASH_KEY)
         .map(|h| h.as_ref().map_or(false, |s| !s.is_empty()))
         .unwrap_or(false)
     {
@@ -112,7 +161,8 @@ pub fn vault_create(app: AppHandle, password: String) -> CmdResult<serde_json::V
     }
 
     let db = &app.state::<AppState>().db;
-    db.set_config("master.hash", &password).map_err(|e| e.to_string())?;
+    let hashed = hash_master_password(&password).map_err(CmdError::from)?;
+    db.set_config(MASTER_HASH_KEY, &hashed).map_err(|e| e.to_string())?;
     db.set_config("vault.created", &now()).map_err(|e| e.to_string())?;
     db.add_audit("vault.created", None, "Vault created").map_err(|e| e.to_string())?;
 
@@ -122,16 +172,18 @@ pub fn vault_create(app: AppHandle, password: String) -> CmdResult<serde_json::V
     Ok(serde_json::json!({ "ok": true }))
 }
 
-/// Unlock an existing vault by verifying the password against the stored hash.
+/// Unlock an existing vault by verifying the password against the stored
+/// Argon2id hash (or upgrading a legacy plaintext verifier in place).
 #[tauri::command]
 pub fn vault_unlock(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
-    let stored = app.state::<AppState>().db.get_config("master.hash")
+    let stored = app.state::<AppState>().db.get_config(MASTER_HASH_KEY)
         .unwrap_or_default();
     if stored.as_ref().map_or(true, |s| s.is_empty()) {
         return Err("No vault exists. Create one first.".into());
     }
-    // Simple comparison (production: compare against Argon2id hash)
-    if Some(&password) != stored.as_ref() {
+    let ok = verify_master_password(&app.state::<AppState>().db, &password)
+        .map_err(|e| e.to_string())?;
+    if !ok {
         app.state::<AppState>().db.add_audit("vault.unlock_failed", None, "Failed attempt").map_err(|e| e.to_string())?;
         return Err("Incorrect master password.".into());
     }
@@ -146,6 +198,7 @@ pub fn vault_lock(app: AppHandle) -> CmdResult<serde_json::Value> {
     // password; sessions that survive into a locked vault would otherwise be
     // using unsealed key material with no way to re-derive it.
     app.state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>().kill_all();
+    app.state::<crate::sftp::EditRegistry>().stop_all();
     app.state::<VaultPasswordStore>().clear();
     app.state::<AppState>().db.add_audit("vault.lock", None, "").map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
@@ -156,8 +209,13 @@ pub fn vault_change_password(app: AppHandle, current_password: String, new_passw
     if new_password.len() < 8 {
         return Err("New master password must be at least 8 characters.".into());
     }
-    let stored = app.state::<AppState>().db.get_config("master.hash").unwrap_or_default();
-    if Some(&current_password) != stored.as_ref() {
+    let stored = app.state::<AppState>().db.get_config(MASTER_HASH_KEY).unwrap_or_default();
+    if stored.as_ref().map_or(true, |s| s.is_empty()) {
+        return Err("No vault exists. Create one first.".into());
+    }
+    let ok = verify_master_password(&app.state::<AppState>().db, &current_password)
+        .map_err(|e| e.to_string())?;
+    if !ok {
         return Err("Current master password is incorrect.".into());
     }
 
@@ -197,7 +255,8 @@ pub fn vault_change_password(app: AppHandle, current_password: String, new_passw
         }
     }
 
-    db.set_config("master.hash", &new_password).map_err(|e| e.to_string())?;
+    let hashed = hash_master_password(&new_password).map_err(CmdError::from)?;
+    db.set_config(MASTER_HASH_KEY, &hashed).map_err(|e| e.to_string())?;
     db.add_audit("vault.password_changed", None, &format!("Re-encrypted {reencrypted} key(s)"))
         .map_err(|e| e.to_string())?;
     app.state::<VaultPasswordStore>().set(new_password);
@@ -244,6 +303,149 @@ pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<s
         }
     }
     Ok(serde_json::json!({ "ok": true, "imported": imported }))
+}
+
+// ─── Vault backup / restore ────────────────────────────────────────────────
+
+/// Serialize the whole vault (keys + categories + links + servers +
+/// known_hosts + settings) and seal the payload with the current vault
+/// password. The inner key blobs are sealed with the same password, so a
+/// backup can only be restored with the master password that was current
+/// when it was created (or by supplying that password at restore time).
+#[tauri::command]
+pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
+    let pw = vault_password(&app)?;
+    if pw.is_empty() { return Err("Vault is locked.".into()); }
+    let db = &app.state::<AppState>().db;
+
+    let keys = db.list_keys_with_categories().map_err(|e| e.to_string())?;
+    let categories = db.list_categories().map_err(|e| e.to_string())?;
+    let servers = db.list_servers().map_err(|e| e.to_string())?;
+    let known_hosts = db.list_known_hosts().map_err(|e| e.to_string())?;
+
+    let settings: serde_json::Map<String, serde_json::Value> = ["autoLockMinutes", "sshKeysDir",
+        "sshConfigPath", "theme", "confirmDelete", "autoUpdateCheck"]
+        .iter()
+        .filter_map(|k| db.get_config(&format!("setting.{k}")).ok().flatten().map(|v| (k.to_string(), serde_json::json!(v))))
+        .collect();
+
+    let payload = serde_json::json!({
+        "keys": keys,
+        "categories": categories,
+        "servers": servers,
+        "known_hosts": known_hosts,
+        "settings": settings,
+    });
+    let payload_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let sealed = crate::crypto::vault::seal(&pw, payload_str.as_bytes()).map_err(|e| e.to_string())?;
+
+    let document = serde_json::json!({
+        "format": "sshspan-backup",
+        "version": 1,
+        "created": now(),
+        "sealed": sealed,
+    });
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("sshspan-backup-{stamp}.json");
+    let count = serde_json::json!({
+        "keys": keys.len(), "categories": categories.len(),
+        "servers": servers.len(), "knownHosts": known_hosts.len(),
+    });
+    let _ = db.add_audit("vault.backup_created", None, &count.to_string());
+    Ok(serde_json::json!({ "json": document, "filename": filename, "counts": count }))
+}
+
+/// Restore a backup document. The outer envelope is unsealed with the current
+/// vault password; on failure the caller may supply the password that was
+/// current when the backup was taken, and key blobs + saved server passwords
+/// are then re-sealed with the current one so everything becomes usable.
+#[tauri::command]
+pub fn vault_backup_restore(
+    app: AppHandle,
+    payload_json: String,
+    backup_password: Option<String>,
+) -> CmdResult<serde_json::Value> {
+    let pw = vault_password(&app)?;
+    if pw.is_empty() { return Err("Vault is locked.".into()); }
+    let doc: serde_json::Value = serde_json::from_str(&payload_json).map_err(|e| e.to_string())?;
+    if doc.get("format").and_then(|v| v.as_str()) != Some("sshspan-backup") {
+        return Err("Not an SSHSpan backup file.".into());
+    }
+    let Some(sealed) = doc.get("sealed").and_then(|v| v.as_str()) else {
+        return Err("Backup file is missing its sealed payload.".into());
+    };
+
+    let mut reused_backup_password = false;
+    let plaintext = match crate::crypto::vault::unseal(&pw, sealed) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let bp = backup_password.as_deref().filter(|p| !p.is_empty())
+                .ok_or_else(|| "This backup was created with a different master password. Enter that password to restore it.".to_string())?;
+            reused_backup_password = true;
+            crate::crypto::vault::unseal(bp, sealed)
+                .map_err(|_| "Backup password is incorrect.".to_string())?
+        }
+    };
+    let mut data: serde_json::Value = serde_json::from_slice(&plaintext)
+        .map_err(|_| "Backup payload is corrupted.".to_string())?;
+
+    // If the backup came from a different (older) password, re-seal key
+    // material and saved server passwords with the current one.
+    if reused_backup_password {
+        let bp = backup_password.as_deref().unwrap_or_default().to_string();
+        if let Some(arr) = data.get_mut("keys").and_then(|v| v.as_array_mut()) {
+            for k in arr.iter_mut() {
+                if let Some(blob) = k.get("private_key_encrypted").and_then(|v| v.as_str()).map(String::from) {
+                    if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
+                        if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
+                            k["private_key_encrypted"] = serde_json::json!(resealed);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(arr) = data.get_mut("servers").and_then(|v| v.as_array_mut()) {
+            for sv in arr.iter_mut() {
+                if let Some(blob) = sv.get("saved_password").and_then(|v| v.as_str()).map(String::from) {
+                    if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
+                        if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
+                            sv["saved_password"] = serde_json::json!(resealed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let counts = app.state::<AppState>().db.restore_backup(&data).map_err(|e| e.to_string())?;
+    let _ = app.state::<AppState>().db.add_audit("vault.backup_restored", None, &counts.to_string());
+    Ok(serde_json::json!({ "ok": true, "counts": counts, "passwordReLinked": reused_backup_password }))
+}
+
+// ─── File save helpers (backup export / generic) ───────────────────────────
+
+/// Native save-file dialog; returns the chosen path (or canceled).
+#[tauri::command]
+pub fn system_pick_save_path(app: AppHandle, title: Option<String>, default_name: Option<String>) -> CmdResult<serde_json::Value> {
+    use tauri_plugin_dialog::DialogExt;
+    let result = app.dialog().file()
+        .set_title(title.unwrap_or_else(|| "Save file".into()))
+        .set_file_name(default_name.as_deref().unwrap_or("file.txt"))
+        .blocking_save_file();
+    match result {
+        Some(path) => Ok(serde_json::json!({ "canceled": false, "path": path.to_string() })),
+        None => Ok(serde_json::json!({ "canceled": true })),
+    }
+}
+
+/// Write UTF-8 text to an absolute path (used for vault backup export).
+#[tauri::command]
+pub fn system_write_text_file(path: String, contents: String) -> CmdResult<serde_json::Value> {
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&path, contents).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true }))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -679,6 +881,7 @@ pub fn bitwarden_get_config(app: AppHandle) -> CmdResult<serde_json::Value> {
         "server_url": config.server_url,
         "email": config.email,
         "folder_name": config.folder_name,
+        "servers_folder_name": config.servers_folder_name,
         "last_sync": config.last_sync.map(|d| d.to_rfc3339()),
         "last_result": config.last_result.as_ref().and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()),
     }))
@@ -691,6 +894,7 @@ pub fn bitwarden_save_config(
     email: String,
     master_password: Option<String>,
     folder_name: Option<String>,
+    servers_folder_name: Option<String>,
 ) -> CmdResult<serde_json::Value> {
     if vault_password(&app)?.is_empty() { return Err("Vault is locked.".into()); }
     let pw = vault_password(&app)?;
@@ -713,7 +917,8 @@ pub fn bitwarden_save_config(
         let sealed = crate::crypto::vault::seal(&pw, mp.as_bytes()).map_err(|e| e.to_string())?;
         config.master_password = Some(sealed);
     }
-    config.folder_name = Some(folder_name.unwrap_or_else(|| "SSHSpan".to_string()));
+    config.folder_name = Some(folder_name.unwrap_or_else(|| "SSHSpan_Keys".to_string()));
+    config.servers_folder_name = Some(servers_folder_name.unwrap_or_else(|| "SSHSpan_Servers".to_string()));
     if config.device_id.is_none() {
         config.device_id = Some(Uuid::new_v4().to_string());
     }
@@ -766,7 +971,8 @@ pub async fn bitwarden_sync(app: AppHandle) -> CmdResult<serde_json::Value> {
     let server_url = config.server_url.ok_or_else(|| "No server URL configured.".to_string())?;
     let email = config.email.ok_or_else(|| "No email configured.".to_string())?;
     let mp_sealed = config.master_password.ok_or_else(|| "No master password stored. Re-save the sync settings.".to_string())?;
-    let folder_name = config.folder_name.unwrap_or_else(|| "SSHSpan".to_string());
+    let folder_name = config.folder_name.unwrap_or_else(|| "SSHSpan_Keys".to_string());
+    let servers_folder_name = config.servers_folder_name.clone().unwrap_or_else(|| "SSHSpan_Servers".to_string());
 
     let pw = vault_password(&app)?;
     let master_password = String::from_utf8(
@@ -781,7 +987,7 @@ pub async fn bitwarden_sync(app: AppHandle) -> CmdResult<serde_json::Value> {
     // it directly here is safe and does not nest a tokio runtime.
     let result = crate::bitwarden::sync::run_sync(
         &server_url, &email, &master_password, &device_id,
-        &folder_name, &db, &pw,
+        &folder_name, &servers_folder_name, &db, &pw,
     ).await.map_err(|e| e.to_string())?;
 
     // Store sync result

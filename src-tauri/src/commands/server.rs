@@ -137,6 +137,9 @@ pub fn server_save(
                 last_connected_at: None,
                 created_at: now,
                 updated_at: now,
+                bitwarden_id: None,
+                bitwarden_revision_ts: None,
+                bitwarden_updated_at: None,
             };
             db.insert_server(&rec).map_err(|e| e.to_string())?;
             rec
