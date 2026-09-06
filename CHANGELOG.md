@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-07
+
+Patch release focused on closing audited feature gaps and making the release/development workflow truthful.
+
+### Fixed
+
+- Wired the Connect **Test** button to the existing server connectivity IPC and surfaced latency/errors.
+- Passed the selected ECDSA curve through key generation (`p256`, `p384`, or `p521`).
+- Made Deploy Preview represent the selected keys and current Host/User/Port/options instead of displaying the existing SSH config.
+- Wired deploy-key passphrase encryption and `StrictHostKeyChecking` into deployment/config generation.
+- Added missing renderer icons used by Connect and server controls.
+- Prevented category selections from being cleared by an unrelated modal backdrop handler.
+- Made master-password changes fail safely when a sealed key cannot be re-encrypted instead of silently leaving mixed-password vault data.
+- Fixed root-category deletion so child categories are correctly reparented.
+- Corrected the IPv4 tail parsing in IPv4-mapped IPv6 SSRF validation.
+
+### Maintenance
+
+- Replaced stale Electron-era contributor documentation with current Tauri/Rust instructions.
+- Synchronized npm lockfile metadata and removed the unused Node `bcrypt-pbkdf` dependency.
+- Made CDP e2e scripts use a configurable temporary directory.
+- Aligned Linux release documentation with the deb/rpm artifacts and added Rust formatting checks to release CI.
+- Removed unsupported macOS advertising until a macOS release job exists.
+
+
 ## [1.3.6] - 2026-09-05
 
 The Node.js/Electron backend is fully replaced by a compiled **Rust core (Tauri v2)**, and
