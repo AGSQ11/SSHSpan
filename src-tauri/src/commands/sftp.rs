@@ -1,6 +1,9 @@
 //! SFTP IPC commands: directory listing, file ops, download/upload, and the
 //! "open with system editor" flow (temp download + watch + auto re-upload).
 
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -155,6 +158,12 @@ pub async fn sftp_download(
     tokio::io::copy(&mut remote_file, &mut local_file)
         .await
         .map_err(|e| CmdError(format!("download failed: {e}")))?;
+    // Await the SFTP CLOSE response so a completed transfer is not reported
+    // while the remote handle is still being flushed/closed.
+    remote_file
+        .close()
+        .await
+        .map_err(|e| CmdError(format!("download close failed: {e}")))?;
     Ok(serde_json::json!({ "ok": true, "local": local }))
 }
 
@@ -166,17 +175,79 @@ pub async fn sftp_upload(
     remote: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
+    let local_path = PathBuf::from(&local);
+    let metadata = tokio::fs::metadata(&local_path)
+        .await
+        .map_err(|e| CmdError(format!("local path failed: {e}")))?;
+    let files = if metadata.is_dir() {
+        upload_directory(sftp.clone(), local_path, remote.clone()).await?
+    } else {
+        upload_one_file(sftp.clone(), local_path, remote.clone()).await?;
+        1
+    };
+    Ok(serde_json::json!({ "ok": true, "remote": remote, "files": files }))
+}
+
+async fn upload_one_file(
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    local: PathBuf,
+    remote: String,
+) -> Result<(), CmdError> {
     let mut local_file = tokio::fs::File::open(&local)
         .await
-        .map_err(|e| CmdError(e.to_string()))?;
+        .map_err(|e| CmdError(format!("local file failed: {e}")))?;
     let mut remote_file = sftp
         .create(&remote)
         .await
-        .map_err(|e| CmdError(format!("open failed: {e}")))?;
+        .map_err(|e| CmdError(format!("remote open failed: {e}")))?;
     tokio::io::copy(&mut local_file, &mut remote_file)
         .await
         .map_err(|e| CmdError(format!("upload failed: {e}")))?;
-    Ok(serde_json::json!({ "ok": true, "remote": remote }))
+    remote_file
+        .close()
+        .await
+        .map_err(|e| CmdError(format!("upload close failed: {e}")))?;
+    Ok(())
+}
+
+fn upload_directory(
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    local_dir: PathBuf,
+    remote_dir: String,
+) -> Pin<Box<dyn Future<Output = Result<usize, CmdError>> + Send>> {
+    Box::pin(async move {
+        sftp.create_dir(&remote_dir)
+            .await
+            .map_err(|e| CmdError(format!("remote mkdir failed: {e}")))?;
+        let mut count = 0;
+        let mut entries = tokio::fs::read_dir(&local_dir)
+            .await
+            .map_err(|e| CmdError(format!("local directory failed: {e}")))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| CmdError(format!("local directory read failed: {e}")))?
+        {
+            let local = entry.path();
+            let remote = format!(
+                "{}/{}",
+                remote_dir.trim_end_matches('/'),
+                entry.file_name().to_string_lossy()
+            );
+            if entry
+                .file_type()
+                .await
+                .map_err(|e| CmdError(format!("local file type failed: {e}")))?
+                .is_dir()
+            {
+                count += upload_directory(sftp.clone(), local, remote).await?;
+            } else {
+                upload_one_file(sftp.clone(), local, remote).await?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    })
 }
 
 /// Download a remote file to a temp location, start watching it, and hand the
