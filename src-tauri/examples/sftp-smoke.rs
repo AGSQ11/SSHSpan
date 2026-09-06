@@ -14,7 +14,10 @@ use tokio::io::AsyncReadExt;
 struct H;
 impl client::Handler for H {
     type Error = anyhow::Error;
-    async fn check_server_key(&mut self, _: &russh::keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        _: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
@@ -33,7 +36,10 @@ async fn main() -> anyhow::Result<()> {
     println!("sftp init ok, cwd={:?}", sftp.canonicalize(".").await?);
 
     let entries: Vec<_> = sftp.read_dir(".").await?.collect();
-    println!("list: {:?}", entries.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+    println!(
+        "list: {:?}",
+        entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
 
     println!("opening hello.txt for read...");
     let mut f = sftp.open("hello.txt").await?;

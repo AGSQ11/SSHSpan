@@ -10,11 +10,11 @@
 //! encrypted locally — the server only ever sees ciphertext.
 
 use aes::Aes256;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use base64ct::{Base64, Encoding};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac_array;
 use sha2::Sha256;
-use base64ct::{Base64, Encoding};
 
 use crate::crypto::utils::constant_time_eq;
 
@@ -22,15 +22,20 @@ use crate::crypto::utils::constant_time_eq;
 
 #[derive(Debug, Clone)]
 pub struct KdfParams {
-    pub kdf_type: u32,      // 0 = PBKDF2, 1 = Argon2id
-    pub iterations: u32,    // PBKDF2 iterations or Argon2 iterations
-    pub memory: u32,        // Argon2 memory in KiB (ignored for PBKDF2)
-    pub parallelism: u32,   // Argon2 parallelism (ignored for PBKDF2)
+    pub kdf_type: u32,    // 0 = PBKDF2, 1 = Argon2id
+    pub iterations: u32,  // PBKDF2 iterations or Argon2 iterations
+    pub memory: u32,      // Argon2 memory in KiB (ignored for PBKDF2)
+    pub parallelism: u32, // Argon2 parallelism (ignored for PBKDF2)
 }
 
 impl Default for KdfParams {
     fn default() -> Self {
-        Self { kdf_type: 0, iterations: 600_000, memory: 0, parallelism: 0 }
+        Self {
+            kdf_type: 0,
+            iterations: 600_000,
+            memory: 0,
+            parallelism: 0,
+        }
     }
 }
 
@@ -47,20 +52,26 @@ pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow
 
     match kdf.kdf_type {
         0 => {
-            let iterations = if kdf.iterations > 0 { kdf.iterations } else { 600_000 };
+            let iterations = if kdf.iterations > 0 {
+                kdf.iterations
+            } else {
+                600_000
+            };
             Ok(pbkdf2_hmac_array::<Sha256, 32>(pw, salt_bytes, iterations))
         }
         1 => {
-            use argon2::{Argon2, Algorithm, Version, Params};
+            use argon2::{Algorithm, Argon2, Params, Version};
             let params = Params::new(
                 kdf.memory.max(64),    // minimum 64 KiB
                 kdf.iterations.max(3), // minimum 3
                 kdf.parallelism.max(4),
                 Some(32),
-            ).map_err(|e| anyhow::anyhow!("Argon2 param error: {e}"))?;
+            )
+            .map_err(|e| anyhow::anyhow!("Argon2 param error: {e}"))?;
             let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
             let mut key = [0u8; 32];
-            argon2.hash_password_into(pw, salt_bytes, &mut key)
+            argon2
+                .hash_password_into(pw, salt_bytes, &mut key)
                 .map_err(|e| anyhow::anyhow!("Argon2 derivation failed: {e}"))?;
             Ok(key)
         }
@@ -92,7 +103,8 @@ fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(blocks * HASH_LEN);
     let mut t: Vec<u8> = Vec::new(); // T(0) = empty
     for i in 1..=blocks {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(prk).expect("HMAC accepts any key size");
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(prk).expect("HMAC accepts any key size");
         mac.update(&t);
         mac.update(info);
         mac.update(&[i as u8]);
@@ -136,8 +148,12 @@ struct ParsedEncString {
 
 /// Parse an EncString "2.<iv>|<ct>|<mac>" into its parts.
 fn parse_enc_string(s: &str) -> anyhow::Result<ParsedEncString> {
-    let dot = s.find('.').ok_or_else(|| anyhow::anyhow!("Malformed encString (missing type)"))?;
-    let typ: u32 = s[..dot].parse().map_err(|_| anyhow::anyhow!("Malformed encString type"))?;
+    let dot = s
+        .find('.')
+        .ok_or_else(|| anyhow::anyhow!("Malformed encString (missing type)"))?;
+    let typ: u32 = s[..dot]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Malformed encString type"))?;
     if typ != ENC_TYPE {
         anyhow::bail!("Unsupported encString type {typ} (only type {ENC_TYPE} is supported)");
     }
@@ -148,8 +164,12 @@ fn parse_enc_string(s: &str) -> anyhow::Result<ParsedEncString> {
     let iv = Base64::decode_vec(parts[0]).map_err(|e| anyhow::anyhow!("Bad IV base64: {e}"))?;
     let ct = Base64::decode_vec(parts[1]).map_err(|e| anyhow::anyhow!("Bad CT base64: {e}"))?;
     let mac = Base64::decode_vec(parts[2]).map_err(|e| anyhow::anyhow!("Bad MAC base64: {e}"))?;
-    if iv.len() != 16 { anyhow::bail!("Bad IV length: {} (expected 16)", iv.len()); }
-    if mac.len() != 32 { anyhow::bail!("Bad MAC length: {} (expected 32)", mac.len()); }
+    if iv.len() != 16 {
+        anyhow::bail!("Bad IV length: {} (expected 16)", iv.len());
+    }
+    if mac.len() != 32 {
+        anyhow::bail!("Bad MAC length: {} (expected 32)", mac.len());
+    }
     Ok(ParsedEncString { iv, ct, mac })
 }
 
@@ -176,7 +196,8 @@ pub fn encrypt_string(plaintext: &str, key64: &[u8; 64]) -> anyhow::Result<Strin
     hmac.update(&ct);
     let mac = hmac.finalize().into_bytes();
 
-    Ok(format!("2.{}|{}|{}",
+    Ok(format!(
+        "2.{}|{}|{}",
         Base64::encode_string(&iv),
         Base64::encode_string(&ct),
         Base64::encode_string(&mac),
@@ -202,7 +223,8 @@ pub fn encrypt_bytes(plaintext: &[u8], key64: &[u8; 64]) -> anyhow::Result<Strin
     hmac.update(&ct);
     let mac = hmac.finalize().into_bytes();
 
-    Ok(format!("2.{}|{}|{}",
+    Ok(format!(
+        "2.{}|{}|{}",
         Base64::encode_string(&iv),
         Base64::encode_string(&ct),
         Base64::encode_string(&mac),
@@ -261,7 +283,9 @@ mod tests {
         // master key = 0x00..0x1f; vectors computed with the Electron
         // bitwardenCrypto.js hkdfExpandSha256 (expand-only, no Extract).
         let mut mk = [0u8; 32];
-        for (i, b) in mk.iter_mut().enumerate() { *b = i as u8; }
+        for (i, b) in mk.iter_mut().enumerate() {
+            *b = i as u8;
+        }
         let stretched = stretch_master_key(&mk);
         assert_eq!(
             hex(&stretched[..32]),
@@ -282,10 +306,15 @@ mod tests {
         // the original length, not leak the pad block (previously a 64-byte
         // user key came back as 80 bytes, which broke profile.key unwrapping).
         let mut key = [0u8; 64];
-        for (i, b) in key.iter_mut().enumerate() { *b = (i % 251) as u8; }
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
         let pt: Vec<u8> = (0..64u8).collect(); // 64 bytes = block-aligned
         let enc = encrypt_bytes(&pt, &key).unwrap();
-        assert!(enc.starts_with("2."), "encBytes must produce a type-2 encString");
+        assert!(
+            enc.starts_with("2."),
+            "encBytes must produce a type-2 encString"
+        );
 
         let dec = decrypt_to_bytes(&enc, &key).unwrap();
         assert_eq!(dec.len(), pt.len(), "pad block must be stripped");

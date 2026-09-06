@@ -1,11 +1,11 @@
 //! Integration tests for SSHSpan Tauri backend
 //! Tests key generation, fingerprinting, import/export, database, and config
 
-use sshspan::crypto::keys::{self, KeyType, KeyFormat};
-use sshspan::crypto::utils;
 use sshspan::config::SshConfig;
-use sshspan::db::Database;
+use sshspan::crypto::keys::{self, KeyFormat, KeyType};
+use sshspan::crypto::utils;
 use sshspan::db::BitwardenConfig;
+use sshspan::db::Database;
 
 /// Parse the algorithm tag out of an exported OpenSSH public-key line
 /// ("<algo> <base64> [comment]") — used to assert roundtrip structure.
@@ -91,7 +91,10 @@ fn openssh_public_key_parse_bad_format() {
     assert!(good.split_whitespace().count() >= 2);
     let bad = "not-a-valid-key";
     let bad_parts: Vec<&str> = bad.split_whitespace().collect();
-    assert!(bad_parts.len() < 2, "a key without base64 payload must be rejected");
+    assert!(
+        bad_parts.len() < 2,
+        "a key without base64 payload must be rejected"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -104,7 +107,10 @@ fn key_export_openssh_format() {
     let exported = keys::export_public_key(&key, KeyFormat::OpenSsh).unwrap();
     assert!(exported.starts_with("ssh-ed25519 "));
     assert!(exported.contains("export-test"));
-    assert!(exported.split_whitespace().nth(1).map_or(false, |b| !b.is_empty()));
+    assert!(exported
+        .split_whitespace()
+        .nth(1)
+        .map_or(false, |b| !b.is_empty()));
 }
 
 #[test]
@@ -144,7 +150,10 @@ fn fingerprint_unique_per_key() {
     let key2 = keys::generate_key_pair(KeyType::Ed25519, None, "b".to_string()).unwrap();
     let fp1 = keys::compute_fingerprint_sha256(&key1.public_key);
     let fp2 = keys::compute_fingerprint_sha256(&key2.public_key);
-    assert_ne!(fp1, fp2, "different keys should have different fingerprints");
+    assert_ne!(
+        fp1, fp2,
+        "different keys should have different fingerprints"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -222,7 +231,13 @@ Host server
     assert_eq!(config.hosts.len(), 1);
     assert_eq!(config.hosts[0].forward_agent, Some(true));
     assert_eq!(config.hosts[0].proxy_jump.as_deref(), Some("bastion"));
-    assert_eq!(config.hosts[0].extra.get("customoption").map(|s| s.as_str()), Some("custom-value"));
+    assert_eq!(
+        config.hosts[0]
+            .extra
+            .get("customoption")
+            .map(|s| s.as_str()),
+        Some("custom-value")
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -273,7 +288,12 @@ fn key_type_clone() {
 
 #[test]
 fn key_format_variants() {
-    let formats = [KeyFormat::OpenSsh, KeyFormat::Pkcs8, KeyFormat::Putty, KeyFormat::Rfc4716];
+    let formats = [
+        KeyFormat::OpenSsh,
+        KeyFormat::Pkcs8,
+        KeyFormat::Putty,
+        KeyFormat::Rfc4716,
+    ];
     for f in &formats {
         assert_eq!(*f, *f);
     }
@@ -282,7 +302,6 @@ fn key_format_variants() {
 // ═════════════════════════════════════════════════════════════════════════════
 //  Database Operations (direct, no Tauri runtime needed)
 // ═════════════════════════════════════════════════════════════════════════════
-
 
 fn create_test_db() -> Database {
     // Use a unique temp path per test to avoid conflicts
@@ -296,7 +315,6 @@ fn create_test_db() -> Database {
     Database { pool, db_path }
 }
 
-
 fn get_test_db() -> Database {
     let db_path = std::env::temp_dir().join(format!(
         "sshspan_test_{}.db",
@@ -305,7 +323,9 @@ fn get_test_db() -> Database {
     let _ = std::fs::remove_file(&db_path);
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let pool = rt.block_on(async { sqlx::SqlitePool::connect(&db_url).await }).unwrap();
+    let pool = rt
+        .block_on(async { sqlx::SqlitePool::connect(&db_url).await })
+        .unwrap();
     let db = Database { pool, db_path };
     rt.block_on(async {
         sqlx::query("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)").execute(&db.pool).await.unwrap();
@@ -359,7 +379,10 @@ fn db_bitwarden_config_save_load() {
     db.save_bitwarden_config(&config).unwrap();
     let loaded = db.load_bitwarden_config().unwrap();
 
-    assert_eq!(loaded.server_url.as_deref(), Some("https://vault.example.com"));
+    assert_eq!(
+        loaded.server_url.as_deref(),
+        Some("https://vault.example.com")
+    );
     assert_eq!(loaded.email.as_deref(), Some("user@example.com"));
     assert_eq!(loaded.master_password.as_deref(), Some("sealed-blob"));
     assert_eq!(loaded.folder_name.as_deref(), Some("SSHSpan"));
@@ -393,7 +416,10 @@ fn db_bitwarden_config_overwrite() {
     db.save_bitwarden_config(&config2).unwrap();
 
     let loaded = db.load_bitwarden_config().unwrap();
-    assert_eq!(loaded.server_url.as_deref(), Some("https://new.example.com"));
+    assert_eq!(
+        loaded.server_url.as_deref(),
+        Some("https://new.example.com")
+    );
     assert_eq!(loaded.email.as_deref(), Some("new@example.com"));
 }
 
@@ -425,8 +451,10 @@ fn vault_lifecycle_create_unlock_lock() {
     // Create vault — store password hash
     let password = "testpass123";
     db.set_config("master.hash", password).unwrap();
-    db.set_config("vault.created", &chrono::Utc::now().to_rfc3339()).unwrap();
-    db.add_audit("vault.created", None, "Vault created").unwrap();
+    db.set_config("vault.created", &chrono::Utc::now().to_rfc3339())
+        .unwrap();
+    db.add_audit("vault.created", None, "Vault created")
+        .unwrap();
 
     // Verify vault exists
     let hash = db.get_config("master.hash").unwrap();
@@ -449,7 +477,10 @@ fn vault_lifecycle_create_unlock_lock() {
 
     // Simulate unlock with wrong password — should fail
     let wrong_stored = db.get_config("master.hash").unwrap().unwrap();
-    assert_ne!("wrongpassword", wrong_stored, "wrong password should not match");
+    assert_ne!(
+        "wrongpassword", wrong_stored,
+        "wrong password should not match"
+    );
 }
 
 #[test]
@@ -463,7 +494,8 @@ fn vault_lifecycle_full_flow() {
     // 2. Create vault
     let pw = "masterpass456";
     db.set_config("master.hash", pw).unwrap();
-    db.set_config("vault.created", &chrono::Utc::now().to_rfc3339()).unwrap();
+    db.set_config("vault.created", &chrono::Utc::now().to_rfc3339())
+        .unwrap();
     db.add_audit("vault.created", None, "").unwrap();
 
     // 3. Verify creation
@@ -564,7 +596,10 @@ fn bitwarden_config_partial_update() {
     db.save_bitwarden_config(&updated).unwrap();
 
     let loaded = db.load_bitwarden_config().unwrap();
-    assert_eq!(loaded.server_url.as_deref(), Some("https://new.example.com"));
+    assert_eq!(
+        loaded.server_url.as_deref(),
+        Some("https://new.example.com")
+    );
     assert_eq!(loaded.email.as_deref(), Some("new@example.com"));
     assert_eq!(loaded.folder_name.as_deref(), Some("SSHSpan"));
 }
@@ -584,7 +619,10 @@ fn bitwarden_config_last_sync() {
     let loaded = db.load_bitwarden_config().unwrap();
     assert!(loaded.last_sync.is_some());
     let loaded_sync = loaded.last_sync.unwrap();
-    assert!((loaded_sync - sync_time).num_seconds().abs() < 2, "sync time should be close to original");
+    assert!(
+        (loaded_sync - sync_time).num_seconds().abs() < 2,
+        "sync time should be close to original"
+    );
 }
 
 #[test]
@@ -621,7 +659,10 @@ fn key_full_roundtrip_ed25519() {
     // 3. The exported line carries algorithm + base64 + comment
     assert_eq!(openssh_pub_algo(&pub_exported), "ssh-ed25519");
     assert!(pub_exported.ends_with("full-rt"));
-    assert!(pub_exported.split_whitespace().nth(1).map_or(false, |b| !b.is_empty()));
+    assert!(pub_exported
+        .split_whitespace()
+        .nth(1)
+        .map_or(false, |b| !b.is_empty()));
 }
 
 #[test]

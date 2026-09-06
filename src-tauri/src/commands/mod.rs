@@ -279,14 +279,15 @@ pub fn vault_change_password(
     let keys = db.list_keys().map_err(|e| e.to_string())?;
     let mut migrated = Vec::with_capacity(keys.len());
     for mut key in keys {
-        let plaintext = match crate::crypto::vault::unseal(&current_password, &key.private_key_encrypted) {
-            Ok(bytes) => bytes,
-            Err(_e) if !key.private_key_encrypted.trim_start().starts_with('{') => {
-                // Pre-vault-encryption records stored raw key bytes as text.
-                key.private_key_encrypted.as_bytes().to_vec()
-            }
-            Err(e) => return Err(format!("Cannot re-encrypt key {}: {e}", key.id).into()),
-        };
+        let plaintext =
+            match crate::crypto::vault::unseal(&current_password, &key.private_key_encrypted) {
+                Ok(bytes) => bytes,
+                Err(_e) if !key.private_key_encrypted.trim_start().starts_with('{') => {
+                    // Pre-vault-encryption records stored raw key bytes as text.
+                    key.private_key_encrypted.as_bytes().to_vec()
+                }
+                Err(e) => return Err(format!("Cannot re-encrypt key {}: {e}", key.id).into()),
+            };
         key.private_key_encrypted =
             crate::crypto::vault::seal(&new_password, &plaintext).map_err(|e| e.to_string())?;
         key.updated_at = chrono::Utc::now();

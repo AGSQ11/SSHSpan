@@ -3,9 +3,9 @@
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
+use super::{CmdError, CmdResult};
 use crate::db::{self, ServerRecord};
 use crate::AppState;
-use super::{CmdResult, CmdError};
 
 /// Build the JSON a server row is returned as, resolving the referenced vault
 /// key's name/type so the renderer needs no second round trip.
@@ -82,8 +82,13 @@ pub fn server_save(
     // publickey requires a key or pem path; password/kbd-interactive require a saved password
     // (the user may choose to leave it blank and type it at connect time, so only enforce
     // the key side).
-    if method == "publickey" && key_id.is_none() && pem_path.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        return Err(CmdError("Choose a key for publickey auth (or pick a .pem file).".into()));
+    if method == "publickey"
+        && key_id.is_none()
+        && pem_path.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        return Err(CmdError(
+            "Choose a key for publickey auth (or pick a .pem file).".into(),
+        ));
     }
 
     let db = &app.state::<AppState>().db;
@@ -91,20 +96,27 @@ pub fn server_save(
 
     // Seal the saved password with the vault password if provided.
     let saved_sealed: Option<String> = match saved_password {
-        Some(p) if !p.is_empty() => Some(crate::crypto::vault::seal(&vault_pw, p.as_bytes())
-            .map_err(|e| CmdError(e.to_string()))?),
+        Some(p) if !p.is_empty() => Some(
+            crate::crypto::vault::seal(&vault_pw, p.as_bytes())
+                .map_err(|e| CmdError(e.to_string()))?,
+        ),
         _ => None,
     };
 
     let trimmed_name = name.trim().to_string();
     let trimmed_host = host.trim().to_string();
     let trimmed_user = username.trim().to_string();
-    let pem_clean = pem_path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
-    let key_clean = key_id.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    let pem_clean = pem_path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let key_clean = key_id
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
 
     let server = match &id {
         Some(existing_id) => {
-            let mut existing = db.get_server(existing_id)
+            let mut existing = db
+                .get_server(existing_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| CmdError("Server not found.".into()))?;
             existing.name = trimmed_name;
@@ -115,7 +127,9 @@ pub fn server_save(
             existing.key_id = key_clean;
             existing.pem_path = pem_clean;
             existing.saved_password = saved_sealed;
-            existing.category_id = category_id.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+            existing.category_id = category_id
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty());
             existing.color = color;
             existing.updated_at = now;
             db.update_server(&existing).map_err(|e| e.to_string())?;
@@ -132,7 +146,9 @@ pub fn server_save(
                 key_id: key_clean,
                 pem_path: pem_clean,
                 saved_password: saved_sealed,
-                category_id: category_id.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+                category_id: category_id
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty()),
                 color,
                 last_connected_at: None,
                 created_at: now,
@@ -146,7 +162,11 @@ pub fn server_save(
         }
     };
 
-    let _ = db.add_audit("server.save", None, &format!("{} @ {}:{}", server.name, server.host, server.port));
+    let _ = db.add_audit(
+        "server.save",
+        None,
+        &format!("{} @ {}:{}", server.name, server.host, server.port),
+    );
 
     Ok(serde_json::json!({ "ok": true, "id": server.id }))
 }

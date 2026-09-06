@@ -5,9 +5,7 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
-use argon2::{
-    Argon2, Algorithm, Version, Params,
-};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64ct::{Base64, Encoding};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -35,7 +33,9 @@ impl VaultKey {
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
         let mut hash = [0u8; 32];
-        argon2.hash_password_into(password.as_bytes(), salt, &mut hash).map_err(|e| anyhow::anyhow!(e))?;
+        argon2
+            .hash_password_into(password.as_bytes(), salt, &mut hash)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(Self(hash))
     }
@@ -44,7 +44,9 @@ impl VaultKey {
     pub fn derive_encryption_key(&self, context: &[u8]) -> [u8; 32] {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
         let mut okm = [0u8; 32];
-        hk.expand(context, &mut okm).map_err(|e| anyhow::anyhow!(e)).expect("HKDF expand failed");
+        hk.expand(context, &mut okm)
+            .map_err(|e| anyhow::anyhow!(e))
+            .expect("HKDF expand failed");
         okm
     }
 
@@ -52,7 +54,9 @@ impl VaultKey {
     pub fn derive_auth_key(&self, context: &[u8]) -> [u8; 32] {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
         let mut okm = [0u8; 32];
-        hk.expand(&[context, b"auth"].concat(), &mut okm).map_err(|e| anyhow::anyhow!(e)).expect("HKDF expand failed");
+        hk.expand(&[context, b"auth"].concat(), &mut okm)
+            .map_err(|e| anyhow::anyhow!(e))
+            .expect("HKDF expand failed");
         okm
     }
 }
@@ -61,10 +65,10 @@ impl VaultKey {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedVault {
     pub version: u32,
-    pub salt: String,        // Base64 encoded
-    pub nonce: String,       // Base64 encoded
-    pub ciphertext: String,  // Base64 encoded
-    pub auth_tag: String,    // Base64 encoded (for verification)
+    pub salt: String,       // Base64 encoded
+    pub nonce: String,      // Base64 encoded
+    pub ciphertext: String, // Base64 encoded
+    pub auth_tag: String,   // Base64 encoded (for verification)
 }
 
 impl EncryptedVault {
@@ -76,7 +80,9 @@ impl EncryptedVault {
 
         let cipher = Aes256Gcm::new_from_slice(&enc_key)?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-        let ciphertext = cipher.encrypt(&nonce, data).map_err(|e| anyhow::anyhow!(e))?;
+        let ciphertext = cipher
+            .encrypt(&nonce, data)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // AES-GCM returns ciphertext || auth_tag combined
         let (ciphertext, auth_tag) = ciphertext.split_at(ciphertext.len() - 16);
@@ -107,8 +113,9 @@ impl EncryptedVault {
         let cipher = Aes256Gcm::new_from_slice(&enc_key)?;
         let nonce = Nonce::from_slice(&nonce);
 
-        let plaintext = cipher.decrypt(nonce, combined.as_ref())
-            .map_err(|_| anyhow::anyhow!("Decryption failed: invalid password or corrupted data"))?;
+        let plaintext = cipher.decrypt(nonce, combined.as_ref()).map_err(|_| {
+            anyhow::anyhow!("Decryption failed: invalid password or corrupted data")
+        })?;
 
         Ok(plaintext)
     }
@@ -132,7 +139,7 @@ pub fn seal(password: &str, data: &[u8]) -> anyhow::Result<String> {
 
 /// Reverse of [`seal`].
 pub fn unseal(password: &str, sealed: &str) -> anyhow::Result<Vec<u8>> {
-    let enc: EncryptedVault = serde_json::from_str(sealed)
-        .map_err(|e| anyhow::anyhow!("Corrupted vault entry: {e}"))?;
+    let enc: EncryptedVault =
+        serde_json::from_str(sealed).map_err(|e| anyhow::anyhow!("Corrupted vault entry: {e}"))?;
     enc.decrypt(password)
 }

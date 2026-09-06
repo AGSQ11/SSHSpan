@@ -14,30 +14,46 @@ use crate::db::{self, Database};
 use crate::ssh_client::{self, ResolvedConnection, SessionRegistry};
 use crate::AppState;
 
-use super::{CmdResult, CmdError};
+use super::{CmdError, CmdResult};
 
 // ─── Resolution helpers ─────────────────────────────────────────────────────
 
 /// Decrypt the vault-stored key into OpenSSH PRIVATE KEY text for russh.
 /// The vault stores the private half as a raw binary OpenSSH blob (not PEM),
 /// so route it through the same load+export path used by key_export/deploy.
-fn key_pem_for_id(app: &AppHandle, db: &Database, vault_pw: &str, key_id: &str) -> Result<String, String> {
-    let key = db.get_key(key_id)
+fn key_pem_for_id(
+    app: &AppHandle,
+    db: &Database,
+    vault_pw: &str,
+    key_id: &str,
+) -> Result<String, String> {
+    let key = db
+        .get_key(key_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Key not found: {key_id}"))?;
     let key_data = super::load_private_key_data(app, &key, vault_pw)
         .map_err(|e| format!("Could not load vault key \"{}\": {e}", key.name))?;
-    crate::crypto::keys::export_private_key(&key_data, crate::crypto::keys::KeyFormat::OpenSsh, None)
-        .map_err(|e| format!("Could not serialize key \"{}\" for SSH: {e}", key.name))
+    crate::crypto::keys::export_private_key(
+        &key_data,
+        crate::crypto::keys::KeyFormat::OpenSsh,
+        None,
+    )
+    .map_err(|e| format!("Could not serialize key \"{}\" for SSH: {e}", key.name))
 }
 
 /// Decrypt a server's saved password (sealed with the same vault master) if one is stored.
-fn saved_pw_for_server(_db: &Database, vault_pw: &str, server: &db::ServerRecord) -> Result<Option<String>, String> {
+fn saved_pw_for_server(
+    _db: &Database,
+    vault_pw: &str,
+    server: &db::ServerRecord,
+) -> Result<Option<String>, String> {
     match &server.saved_password {
         Some(sealed) => {
             let bytes = crate::crypto::vault::unseal(vault_pw, sealed)
                 .map_err(|_| "Failed to decrypt saved password.".to_string())?;
-            Ok(Some(String::from_utf8(bytes).map_err(|_| "Saved password is not valid UTF-8.".to_string())?))
+            Ok(Some(String::from_utf8(bytes).map_err(|_| {
+                "Saved password is not valid UTF-8.".to_string()
+            })?))
         }
         None => Ok(None),
     }
@@ -58,7 +74,8 @@ fn resolve_for_server(
     override_pem_path: Option<String>,
     prompt_password: Option<String>,
 ) -> Result<ResolvedConnection, String> {
-    let server = db.get_server(server_id)
+    let server = db
+        .get_server(server_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Server not found: {server_id}"))?;
 
@@ -74,7 +91,8 @@ fn resolve_for_server(
             key_pem = Some(key_pem_for_id(app, db, vault_pw, &kid)?);
         } else if let Some(p) = override_pem_path.or_else(|| server.pem_path.clone()) {
             // Read PEM from disk — leaves the file untouched, treats it as a public key on the SSH server side.
-            key_pem = Some(std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?);
+            key_pem =
+                Some(std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?);
         }
     } else if auth_method == "password" || auth_method == "keyboard-interactive" {
         // Prefer the runtime prompt (always), then the saved password.
@@ -96,7 +114,9 @@ fn resolve_for_server(
 
 /// Convert an `anyhow::Error` into a `CmdError` (which is `From<String>`).
 /// Used at every `.map_err()` site that needs the result of an `anyhow::Result`.
-fn anyhow_cmd(e: anyhow::Error) -> CmdError { CmdError(e.to_string()) }
+fn anyhow_cmd(e: anyhow::Error) -> CmdError {
+    CmdError(e.to_string())
+}
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn terminal_connect(
@@ -120,18 +140,31 @@ pub async fn terminal_connect(
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
 
     let resolved = resolve_for_server(
-        &app, &db, &vault_pw, &server_id,
-        override_username, override_key_id, override_pem_path, prompt_password,
-    ).map_err(CmdError)?;
+        &app,
+        &db,
+        &vault_pw,
+        &server_id,
+        override_username,
+        override_key_id,
+        override_pem_path,
+        prompt_password,
+    )
+    .map_err(CmdError)?;
 
     // Welcome banner so the user sees something even before the first
     // shell prompt arrives. If the channel to the webview is broken, FAIL
     // LOUDLY — a silent failure here looks exactly like a connected-but-blank
     // terminal, which cost us a debugging cycle already.
-    on_data.send(format!(
-        "\r\n\x1b[1;36mConnecting to {}:{} as {} (auth={})\x1b[0m\r\n",
-        resolved.server.host, resolved.server.port, resolved.username, resolved.auth_method
-    )).map_err(|e| CmdError(format!("Terminal channel to webview is not delivering data: {e}")))?;
+    on_data
+        .send(format!(
+            "\r\n\x1b[1;36mConnecting to {}:{} as {} (auth={})\x1b[0m\r\n",
+            resolved.server.host, resolved.server.port, resolved.username, resolved.auth_method
+        ))
+        .map_err(|e| {
+            CmdError(format!(
+                "Terminal channel to webview is not delivering data: {e}"
+            ))
+        })?;
 
     let session_id = ssh_client::start_interactive(
         resolved.clone(),
@@ -158,7 +191,10 @@ pub async fn terminal_connect(
     let _ = db.add_audit(
         "connect.start",
         None,
-        &format!("{} @ {}:{} as {}", resolved.server.name, resolved.server.host, resolved.server.port, resolved.username),
+        &format!(
+            "{} @ {}:{} as {}",
+            resolved.server.name, resolved.server.host, resolved.server.port, resolved.username
+        ),
     );
 
     Ok(serde_json::json!({
@@ -198,31 +234,38 @@ pub fn terminal_resize(
 }
 
 #[tauri::command]
-pub fn terminal_disconnect(
-    app: AppHandle,
-    session_id: String,
-) -> CmdResult<serde_json::Value> {
+pub fn terminal_disconnect(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
-    let server_name = registry.list().into_iter()
+    let server_name = registry
+        .list()
+        .into_iter()
         .find(|(id, _, _, _, _)| id == &session_id)
         .map(|(_, name, _, _, _)| name)
         .unwrap_or_default();
     ssh_client::session_disconnect(&registry, &session_id);
-    app.state::<crate::sftp::EditRegistry>().stop_all_for_session(&session_id);
+    app.state::<crate::sftp::EditRegistry>()
+        .stop_all_for_session(&session_id);
     app.state::<crate::sftp::SftpRegistry>().remove(&session_id);
-    let _ = app.state::<AppState>().db.add_audit("connect.stop", None, &server_name);
+    let _ = app
+        .state::<AppState>()
+        .db
+        .add_audit("connect.stop", None, &server_name);
     Ok(serde_json::json!({ "ok": true }))
 }
 
 #[tauri::command]
 pub fn terminal_list(app: AppHandle) -> CmdResult<serde_json::Value> {
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
-    let active: Vec<serde_json::Value> = registry.list().into_iter().map(|(id, name, host, port, since)| {
-        serde_json::json!({
-            "sessionId": id, "serverName": name,
-            "host": host, "port": port, "sinceMs": since,
+    let active: Vec<serde_json::Value> = registry
+        .list()
+        .into_iter()
+        .map(|(id, name, host, port, since)| {
+            serde_json::json!({
+                "sessionId": id, "serverName": name,
+                "host": host, "port": port, "sinceMs": since,
+            })
         })
-    }).collect();
+        .collect();
     Ok(serde_json::json!({ "active": active }))
 }
 
@@ -235,12 +278,22 @@ pub async fn server_test(
     prompt_password: Option<String>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
-    if vault_pw.is_empty() { return Err(CmdError("Vault is locked.".into())); }
+    if vault_pw.is_empty() {
+        return Err(CmdError("Vault is locked.".into()));
+    }
     let db = app.state::<AppState>().db.clone();
 
     let resolved = resolve_for_server(
-        &app, &db, &vault_pw, &server_id, None, None, None, prompt_password,
-    ).map_err(CmdError)?;
+        &app,
+        &db,
+        &vault_pw,
+        &server_id,
+        None,
+        None,
+        None,
+        prompt_password,
+    )
+    .map_err(CmdError)?;
 
     let started = std::time::Instant::now();
     // Open + authenticate using the same russh glue as start_interactive,
@@ -258,25 +311,33 @@ pub async fn server_test(
             config,
             (resolved.server.host.as_str(), resolved.server.port),
             handler,
-        ).await.map_err(|e| anyhow::anyhow!("Connect failed: {e}"))?;
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Connect failed: {e}"))?;
 
         // Mirror the auth path used by start_interactive so the user gets the
         // same verdict here that they would get on a real connect.
-        ssh_client::authenticate(&mut session, &ssh_client::ConnectParams {
-            server: resolved.server.clone(),
-            username: resolved.username.clone(),
-            auth_method: resolved.auth_method.clone(),
-            key_pem: resolved.key_pem.clone(),
-            password: resolved.password.clone(),
-        }).await?;
+        ssh_client::authenticate(
+            &mut session,
+            &ssh_client::ConnectParams {
+                server: resolved.server.clone(),
+                username: resolved.username.clone(),
+                auth_method: resolved.auth_method.clone(),
+                key_pem: resolved.key_pem.clone(),
+                password: resolved.password.clone(),
+            },
+        )
+        .await?;
         Ok(())
-    }.await;
+    }
+    .await;
 
     let elapsed = started.elapsed().as_millis() as u64;
     match result {
         Ok(()) => {
             let _ = db.add_audit(
-                "server.test_ok", None,
+                "server.test_ok",
+                None,
                 &format!("{} ({} ms)", resolved.server.name, elapsed),
             );
             Ok(serde_json::json!({ "ok": true, "latencyMs": elapsed }))
@@ -301,20 +362,33 @@ pub async fn server_test(
 
 #[tauri::command]
 pub fn known_hosts_list(app: AppHandle) -> CmdResult<serde_json::Value> {
-    let rows = app.state::<AppState>().db.list_known_hosts().map_err(|e| e.to_string())?;
-    let arr: Vec<serde_json::Value> = rows.iter().map(|r| {
-        serde_json::json!({
-            "host": r.host,
-            "fingerprintSha256": r.fingerprint_sha256,
-            "firstSeen": r.first_seen.to_rfc3339(),
+    let rows = app
+        .state::<AppState>()
+        .db
+        .list_known_hosts()
+        .map_err(|e| e.to_string())?;
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "host": r.host,
+                "fingerprintSha256": r.fingerprint_sha256,
+                "firstSeen": r.first_seen.to_rfc3339(),
+            })
         })
-    }).collect();
+        .collect();
     Ok(serde_json::json!({ "hosts": arr }))
 }
 
 #[tauri::command]
 pub fn known_hosts_forget(app: AppHandle, host: String) -> CmdResult<serde_json::Value> {
-    app.state::<AppState>().db.delete_known_host(&host).map_err(|e| e.to_string())?;
-    let _ = app.state::<AppState>().db.add_audit("known_hosts.forget", None, &host);
+    app.state::<AppState>()
+        .db
+        .delete_known_host(&host)
+        .map_err(|e| e.to_string())?;
+    let _ = app
+        .state::<AppState>()
+        .db
+        .add_audit("known_hosts.forget", None, &host);
     Ok(serde_json::json!({ "ok": true }))
 }

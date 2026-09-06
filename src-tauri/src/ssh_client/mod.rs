@@ -15,8 +15,8 @@ use std::time::Duration;
 use base64ct::Encoding;
 use russh::client::{self, Handle};
 use russh::keys::*;
-use russh::*;
 use russh::Pty;
+use russh::*;
 use tauri::ipc::Channel;
 
 use crate::db::{Database, ServerRecord};
@@ -47,25 +47,50 @@ pub struct SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()) }
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn insert(&self, handle: SessionHandle) {
-        self.sessions.lock().unwrap().insert(handle.session_id.clone(), handle);
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(handle.session_id.clone(), handle);
     }
 
     pub fn get_input_tx(&self, id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> {
-        self.sessions.lock().unwrap().get(id).map(|s| s.input_tx.clone())
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| s.input_tx.clone())
     }
 
-    pub fn get_resize_tx(&self, id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>> {
-        self.sessions.lock().unwrap().get(id).map(|s| s.resize_tx.clone())
+    pub fn get_resize_tx(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<(u32, u32)>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| s.resize_tx.clone())
     }
 
-    pub fn get_sftp_tx(&self, id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<
-        tokio::sync::oneshot::Sender<anyhow::Result<russh_sftp::client::SftpSession>>,
-    >> {
-        self.sessions.lock().unwrap().get(id).map(|s| s.sftp_tx.clone())
+    pub fn get_sftp_tx(
+        &self,
+        id: &str,
+    ) -> Option<
+        tokio::sync::mpsc::UnboundedSender<
+            tokio::sync::oneshot::Sender<anyhow::Result<russh_sftp::client::SftpSession>>,
+        >,
+    > {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| s.sftp_tx.clone())
     }
 
     pub fn remove(&self, id: &str) -> Option<SessionHandle> {
@@ -73,8 +98,19 @@ impl SessionRegistry {
     }
 
     pub fn list(&self) -> Vec<(String, String, String, u16, i64)> {
-        self.sessions.lock().unwrap().iter()
-            .map(|(id, s)| (id.clone(), s.server_name.clone(), s.host.clone(), s.port, s.started_at_ms))
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, s)| {
+                (
+                    id.clone(),
+                    s.server_name.clone(),
+                    s.host.clone(),
+                    s.port,
+                    s.started_at_ms,
+                )
+            })
             .collect()
     }
 
@@ -139,12 +175,16 @@ impl client::Handler for TerminalHandler {
 pub fn fingerprint_of_blob(blob_b64: &str) -> Option<String> {
     use sha2::Digest;
     let bytes = base64ct::Base64::decode_vec(blob_b64).ok()?;
-    Some(base64ct::Base64::encode_string(&sha2::Sha256::digest(&bytes)))
+    Some(base64ct::Base64::encode_string(&sha2::Sha256::digest(
+        &bytes,
+    )))
 }
 
 /// `ssh-keygen`-style display form: "SHA256:…".
 pub fn hostkey_fingerprint_display(blob_b64: &str) -> String {
-    fingerprint_of_blob(blob_b64).map(|f| format!("SHA256:{f}")).unwrap_or_else(|| "?".into())
+    fingerprint_of_blob(blob_b64)
+        .map(|f| format!("SHA256:{f}"))
+        .unwrap_or_else(|| "?".into())
 }
 
 /// Everything needed to open one connection.
@@ -189,40 +229,49 @@ pub async fn authenticate(
     let user = params.username.clone();
     match params.auth_method.as_str() {
         "publickey" => {
-            let pem = params.key_pem.as_deref()
+            let pem = params
+                .key_pem
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("No private key selected for this session"))?;
             let key_pair = decode_secret_key(pem, None)
                 .map_err(|e| anyhow::anyhow!("Could not decode the selected private key: {e}"))?;
             let auth = session
-                .authenticate_publickey(
-                    &user,
-                    PrivateKeyWithHashAlg::new(Arc::new(key_pair), None),
-                )
+                .authenticate_publickey(&user, PrivateKeyWithHashAlg::new(Arc::new(key_pair), None))
                 .await?;
             if !auth.success() {
                 return Err(anyhow::anyhow!("Public-key authentication failed: the server rejected the key for user \"{user}\"."));
             }
         }
         "password" => {
-            let pw = params.password.as_deref()
+            let pw = params
+                .password
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("No password available for this session."))?;
             let auth = session.authenticate_password(&user, pw).await?;
             if !auth.success() {
-                return Err(anyhow::anyhow!("Password authentication failed for user \"{user}\"."));
+                return Err(anyhow::anyhow!(
+                    "Password authentication failed for user \"{user}\"."
+                ));
             }
         }
         "keyboard-interactive" => {
-            let mut response = session.authenticate_keyboard_interactive_start(&user, None).await?;
+            let mut response = session
+                .authenticate_keyboard_interactive_start(&user, None)
+                .await?;
             let mut attempts = 0;
             loop {
                 attempts += 1;
                 if attempts > 30 {
-                    return Err(anyhow::anyhow!("Keyboard-interactive authentication did not complete."));
+                    return Err(anyhow::anyhow!(
+                        "Keyboard-interactive authentication did not complete."
+                    ));
                 }
                 match response {
                     client::KeyboardInteractiveAuthResponse::Success => break,
                     client::KeyboardInteractiveAuthResponse::Failure { .. } => {
-                        return Err(anyhow::anyhow!("Keyboard-interactive authentication failed."));
+                        return Err(anyhow::anyhow!(
+                            "Keyboard-interactive authentication failed."
+                        ));
                     }
                     client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
                         let mut responses = Vec::new();
@@ -231,7 +280,9 @@ pub async fn authenticate(
                             // other input (2FA codes, OTP) cannot be answered offline.
                             responses.push(params.password.clone().unwrap_or_default());
                         }
-                        response = session.authenticate_keyboard_interactive_respond(responses).await?;
+                        response = session
+                            .authenticate_keyboard_interactive_respond(responses)
+                            .await?;
                     }
                 }
             }
@@ -268,21 +319,31 @@ pub async fn start_interactive(
     let target_port = params.server.port;
 
     let config = Arc::new(base_client_config());
-    let handler = TerminalHandler { host: target_host.clone(), db: db.clone() };
+    let handler = TerminalHandler {
+        host: target_host.clone(),
+        db: db.clone(),
+    };
 
     let t0 = std::time::Instant::now();
     let mut session = client::connect(config, (&target_host[..], target_port), handler)
         .await
         .map_err(|e| anyhow::anyhow!("Connection failed: {e}"))?;
-    eprintln!("[sshspan-terminal] tcp+kex+hostkey in {}ms", t0.elapsed().as_millis());
+    eprintln!(
+        "[sshspan-terminal] tcp+kex+hostkey in {}ms",
+        t0.elapsed().as_millis()
+    );
 
-    authenticate(&mut session, &ConnectParams {
-        server: params.server.clone(),
-        username: params.username.clone(),
-        auth_method: params.auth_method.clone(),
-        key_pem: params.key_pem.clone(),
-        password: params.password.clone(),
-    }).await?;
+    authenticate(
+        &mut session,
+        &ConnectParams {
+            server: params.server.clone(),
+            username: params.username.clone(),
+            auth_method: params.auth_method.clone(),
+            key_pem: params.key_pem.clone(),
+            password: params.password.clone(),
+        },
+    )
+    .await?;
     eprintln!("[sshspan-terminal] auth in {}ms", t0.elapsed().as_millis());
 
     // Terminal dimensions start at 80x24; the renderer sends the real size right
@@ -291,20 +352,31 @@ pub async fn start_interactive(
     // no modes at all (silent PTY rejection = no input echo, no prompt).
     let mut channel = session.channel_open_session().await?;
     channel
-        .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[
-            (Pty::ECHO, 1),
-            (Pty::ICANON, 1),
-            (Pty::ISIG, 1),
-            (Pty::OPOST, 1),
-            (Pty::ONLCR, 1),
-        ])
+        .request_pty(
+            false,
+            "xterm-256color",
+            80,
+            24,
+            0,
+            0,
+            &[
+                (Pty::ECHO, 1),
+                (Pty::ICANON, 1),
+                (Pty::ISIG, 1),
+                (Pty::OPOST, 1),
+                (Pty::ONLCR, 1),
+            ],
+        )
         .await
         .map_err(|e| anyhow::anyhow!("PTY request failed: {e}"))?;
     channel
         .request_shell(true)
         .await
         .map_err(|e| anyhow::anyhow!("Shell request failed: {e}"))?;
-    eprintln!("[sshspan-terminal] pty+shell in {}ms — streaming", t0.elapsed().as_millis());
+    eprintln!(
+        "[sshspan-terminal] pty+shell in {}ms — streaming",
+        t0.elapsed().as_millis()
+    );
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -418,17 +490,30 @@ pub async fn start_interactive(
 }
 
 /// Send raw bytes (keystrokes) to a live session's stdin.
-pub fn session_send(registry: &SessionRegistry, session_id: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+pub fn session_send(
+    registry: &SessionRegistry,
+    session_id: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<()> {
     match registry.get_input_tx(session_id) {
-        Some(tx) => tx.send(bytes).map_err(|_| anyhow::anyhow!("Session is closing.")),
+        Some(tx) => tx
+            .send(bytes)
+            .map_err(|_| anyhow::anyhow!("Session is closing.")),
         None => Err(anyhow::anyhow!("No such session.")),
     }
 }
 
 /// Resize a live session's remote PTY.
-pub fn session_resize(registry: &SessionRegistry, session_id: &str, cols: u32, rows: u32) -> anyhow::Result<()> {
+pub fn session_resize(
+    registry: &SessionRegistry,
+    session_id: &str,
+    cols: u32,
+    rows: u32,
+) -> anyhow::Result<()> {
     match registry.get_resize_tx(session_id) {
-        Some(tx) => tx.send((cols, rows)).map_err(|_| anyhow::anyhow!("Session is closing.")),
+        Some(tx) => tx
+            .send((cols, rows))
+            .map_err(|_| anyhow::anyhow!("Session is closing.")),
         None => Err(anyhow::anyhow!("No such session.")),
     }
 }

@@ -5,7 +5,7 @@
 use serde::Deserialize;
 use tauri::AppHandle;
 
-use super::{CmdResult, CmdError};
+use super::{CmdError, CmdResult};
 
 const RELEASES_API: &str = "https://api.github.com/repos/AGSQ11/SSHSpan/releases/latest";
 
@@ -31,7 +31,9 @@ fn current_version() -> &'static str {
 fn pick_asset_for_os(assets: &[GhAsset]) -> Option<&GhAsset> {
     #[cfg(target_os = "windows")]
     {
-        assets.iter().find(|a| a.name.ends_with("_x64-setup.exe"))
+        assets
+            .iter()
+            .find(|a| a.name.ends_with("_x64-setup.exe"))
             .or_else(|| assets.iter().find(|a| a.name.ends_with("_x64_en-US.msi")))
     }
     #[cfg(target_os = "linux")]
@@ -39,10 +41,14 @@ fn pick_asset_for_os(assets: &[GhAsset]) -> Option<&GhAsset> {
         // Prefer the native package format: .deb where dpkg exists, else .rpm.
         let has_dpkg = std::path::Path::new("/usr/bin/dpkg").exists();
         if has_dpkg {
-            assets.iter().find(|a| a.name.ends_with("_amd64.deb"))
+            assets
+                .iter()
+                .find(|a| a.name.ends_with("_amd64.deb"))
                 .or_else(|| assets.iter().find(|a| a.name.ends_with(".rpm")))
         } else {
-            assets.iter().find(|a| a.name.ends_with(".rpm"))
+            assets
+                .iter()
+                .find(|a| a.name.ends_with(".rpm"))
                 .or_else(|| assets.iter().find(|a| a.name.ends_with("_amd64.deb")))
         }
     }
@@ -56,7 +62,10 @@ fn pick_asset_for_os(assets: &[GhAsset]) -> Option<&GhAsset> {
 fn is_newer(candidate_tag: &str, current: &str) -> bool {
     let strip = |s: &str| s.trim().trim_start_matches('v').to_string();
     let (cand, cur) = (strip(candidate_tag), strip(current));
-    match (semver::Version::parse(&cand), semver::Version::parse(cur.as_str())) {
+    match (
+        semver::Version::parse(&cand),
+        semver::Version::parse(cur.as_str()),
+    ) {
         (Ok(a), Ok(b)) => a > b,
         _ => cand != cur, // unparsable tags: only flag a genuine difference
     }
@@ -102,14 +111,20 @@ pub async fn update_check() -> CmdResult<serde_json::Value> {
 /// the app so the installer isn't blocked by our own running process.
 /// The renderer must only call this after the user explicitly approved.
 #[tauri::command]
-pub async fn update_download_and_run(app: AppHandle, url: String, version: String) -> CmdResult<serde_json::Value> {
+pub async fn update_download_and_run(
+    app: AppHandle,
+    url: String,
+    version: String,
+) -> CmdResult<serde_json::Value> {
     // Only accept installer URLs from our GitHub releases domain.
     let parsed = url::Url::parse(&url).map_err(|e| CmdError(format!("Bad asset URL: {e}")))?;
     let host_ok = parsed.host_str().map_or(false, |h| {
         h == "github.com" || h.ends_with(".github.com") || h.ends_with("githubusercontent.com")
     });
     if !host_ok {
-        return Err(CmdError("Refusing to download from a non-GitHub URL.".into()));
+        return Err(CmdError(
+            "Refusing to download from a non-GitHub URL.".into(),
+        ));
     }
 
     let ext = if url.contains(".msi") {
@@ -121,8 +136,7 @@ pub async fn update_download_and_run(app: AppHandle, url: String, version: Strin
     } else {
         ".exe"
     };
-    let dest = std::env::temp_dir()
-        .join(format!("sshspan-{}-update{}", version, ext));
+    let dest = std::env::temp_dir().join(format!("sshspan-{}-update{}", version, ext));
 
     let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Download")
@@ -136,10 +150,17 @@ pub async fn update_download_and_run(app: AppHandle, url: String, version: Strin
         .map_err(|e| CmdError(format!("Download failed: {e}")))?
         .error_for_status()
         .map_err(|e| CmdError(format!("Download failed: {e}")))?;
-    let mut file = tokio::fs::File::create(&dest).await.map_err(|e| CmdError(e.to_string()))?;
+    let mut file = tokio::fs::File::create(&dest)
+        .await
+        .map_err(|e| CmdError(e.to_string()))?;
     use tokio::io::AsyncWriteExt;
-    let bytes = resp.bytes().await.map_err(|e| CmdError(format!("Download failed: {e}")))?;
-    file.write_all(&bytes).await.map_err(|e| CmdError(e.to_string()))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| CmdError(format!("Download failed: {e}")))?;
+    file.write_all(&bytes)
+        .await
+        .map_err(|e| CmdError(e.to_string()))?;
     drop(file);
 
     // Launch the installer detached.

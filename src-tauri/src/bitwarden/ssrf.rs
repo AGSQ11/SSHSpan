@@ -6,18 +6,26 @@ use std::net::ToSocketAddrs;
 
 fn v4_to_int(s: &str) -> Option<u32> {
     let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 { return None; }
+    if parts.len() != 4 {
+        return None;
+    }
     let mut n: u32 = 0;
     for p in &parts {
         let v: u32 = p.parse().ok()?;
-        if v > 255 { return None; }
+        if v > 255 {
+            return None;
+        }
         n = n * 256 + v;
     }
     Some(n)
 }
 
 fn in_cidr4(ip: u32, base: u32, bits: u32) -> bool {
-    let mask = if bits == 0 { 0u32 } else { (!0u32).wrapping_shl(32 - bits) };
+    let mask = if bits == 0 {
+        0u32
+    } else {
+        (!0u32).wrapping_shl(32 - bits)
+    };
     (ip & mask) == (base & mask)
 }
 
@@ -28,10 +36,10 @@ pub fn is_restricted_ipv4(ip: &str) -> bool {
         None => return false,
     };
     let ranges: &[(u32, u32)] = &[
-        (0x00000000,  8), // "this network"
-        (0x0A000000,  8), // 10.0.0.0/8 private
+        (0x00000000, 8),  // "this network"
+        (0x0A000000, 8),  // 10.0.0.0/8 private
         (0x64400000, 10), // 100.64.0.0/10 CGNAT
-        (0x7F000000,  8), // 127.0.0.0/8 loopback
+        (0x7F000000, 8),  // 127.0.0.0/8 loopback
         (0xA9FE0000, 16), // 169.254.0.0/16 link-local
         (0xAC100000, 12), // 172.16.0.0/12 private
         (0xC0000000, 24), // 192.0.0.0/24 IETF protocol assignments
@@ -41,14 +49,20 @@ pub fn is_restricted_ipv4(ip: &str) -> bool {
         (0xC6120000, 15), // 198.18.0.0/15 benchmarking
         (0xC6336400, 24), // 198.51.100.0/24 TEST-NET-2
         (0xCB007100, 24), // 203.0.113.0/24 TEST-NET-3
-        (0xE0000000,  4), // 224.0.0.0/4 multicast
-        (0xF0000000,  4), // 240.0.0.0/4 reserved
+        (0xE0000000, 4),  // 224.0.0.0/4 multicast
+        (0xF0000000, 4),  // 240.0.0.0/4 reserved
     ];
     ranges.iter().any(|&(base, bits)| in_cidr4(n, base, bits))
 }
 
 fn int_to_v4(n: u32) -> String {
-    format!("{}.{}.{}.{}", (n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255)
+    format!(
+        "{}.{}.{}.{}",
+        (n >> 24) & 255,
+        (n >> 16) & 255,
+        (n >> 8) & 255,
+        n & 255
+    )
 }
 
 // ─── IPv6 helpers ───────────────────────────────────────────────────────
@@ -58,7 +72,9 @@ fn int_to_v4(n: u32) -> String {
 fn expand_ipv6(addr: &str) -> Option<Vec<u16>> {
     let trimmed = addr.trim().to_lowercase();
     let s = trimmed.trim_start_matches('[').trim_end_matches(']');
-    if s == "::" { return Some(vec![0; 8]); }
+    if s == "::" {
+        return Some(vec![0; 8]);
+    }
 
     let s = if s.contains('.') {
         // Handle embedded IPv4 tail: split on last ':', parse the IPv4 part
@@ -77,7 +93,9 @@ fn expand_ipv6(addr: &str) -> Option<Vec<u16>> {
     };
 
     let dc: Vec<&str> = s.split("::").collect();
-    if dc.len() > 2 { return None; }
+    if dc.len() > 2 {
+        return None;
+    }
 
     let head: Vec<&str> = if !dc[0].is_empty() {
         dc[0].split(':').filter(|s| !s.is_empty()).collect()
@@ -91,20 +109,28 @@ fn expand_ipv6(addr: &str) -> Option<Vec<u16>> {
     };
 
     let missing = 8usize.saturating_sub(head.len() + tail.len());
-    if dc.len() == 2 && missing < 1 { return None; }
-    if dc.len() == 1 && head.len() != 8 { return None; }
+    if dc.len() == 2 && missing < 1 {
+        return None;
+    }
+    if dc.len() == 1 && head.len() != 8 {
+        return None;
+    }
 
     let mut groups: Vec<u16> = Vec::with_capacity(8);
     for g in &head {
         groups.push(u16::from_str_radix(g, 16).ok()?);
     }
     if dc.len() == 2 {
-        for _ in 0..missing { groups.push(0); }
+        for _ in 0..missing {
+            groups.push(0);
+        }
     }
     for g in &tail {
         groups.push(u16::from_str_radix(g, 16).ok()?);
     }
-    if groups.len() != 8 { return None; }
+    if groups.len() != 8 {
+        return None;
+    }
     Some(groups)
 }
 
@@ -114,22 +140,42 @@ pub fn is_restricted_ipv6(ip: &str) -> bool {
         Some(g) => g,
         None => return true, // unparseable → refuse
     };
-    if g.iter().all(|&v| v == 0) { return true; } // unspecified
+    if g.iter().all(|&v| v == 0) {
+        return true;
+    } // unspecified
 
     let low32 = ((g[6] as u32) << 16 | g[7] as u32) as u32;
 
     // IPv4-mapped ::ffff:0:0/96 and deprecated IPv4-compatible ::/96
     if g[0] == 0 && g[1] == 0 && g[2] == 0 && g[3] == 0 && g[4] == 0 {
-        if g[5] == 0xFFFF { return is_restricted_ipv4(&int_to_v4(low32)); }
-        if g[5] == 0 && low32 != 0 { return is_restricted_ipv4(&int_to_v4(low32)); }
+        if g[5] == 0xFFFF {
+            return is_restricted_ipv4(&int_to_v4(low32));
+        }
+        if g[5] == 0 && low32 != 0 {
+            return is_restricted_ipv4(&int_to_v4(low32));
+        }
     }
-    if g[0] == 0x64 && g[1] == 0xFF9B { return true; } // NAT64
-    if g[0] == 0x0100 && g[1] == 0 && g[2] == 0 && g[3] == 0 { return true; } // discard-only
-    if g[0] == 0x2001 && (g[1] == 0 || g[1] == 0x0DB8) { return true; } // Teredo / documentation
-    if g[0] == 0x2002 { return true; } // 6to4
-    if (g[0] & 0xFE00) == 0xFC00 { return true; } // unique-local fc00::/7
-    if (g[0] & 0xFFC0) == 0xFE80 { return true; } // link-local fe80::/10
-    if (g[0] & 0xFF00) == 0xFF00 { return true; } // multicast ff00::/8
+    if g[0] == 0x64 && g[1] == 0xFF9B {
+        return true;
+    } // NAT64
+    if g[0] == 0x0100 && g[1] == 0 && g[2] == 0 && g[3] == 0 {
+        return true;
+    } // discard-only
+    if g[0] == 0x2001 && (g[1] == 0 || g[1] == 0x0DB8) {
+        return true;
+    } // Teredo / documentation
+    if g[0] == 0x2002 {
+        return true;
+    } // 6to4
+    if (g[0] & 0xFE00) == 0xFC00 {
+        return true;
+    } // unique-local fc00::/7
+    if (g[0] & 0xFFC0) == 0xFE80 {
+        return true;
+    } // link-local fe80::/10
+    if (g[0] & 0xFF00) == 0xFF00 {
+        return true;
+    } // multicast ff00::/8
 
     false
 }
@@ -154,13 +200,17 @@ pub struct DnsRecord {
 /// Default DNS lookup (blocking, for production use).
 pub fn default_dns_lookup(hostname: &str) -> anyhow::Result<Vec<DnsRecord>> {
     use std::net::ToSocketAddrs;
-    let addrs = format!("{hostname}:0").to_socket_addrs()
+    let addrs = format!("{hostname}:0")
+        .to_socket_addrs()
         .map_err(|e| anyhow::anyhow!("Cannot resolve \"{hostname}\": {e}"))?;
     let mut results = Vec::new();
     for addr in addrs {
         let ip = addr.ip();
         let family = if ip.is_ipv4() { 4 } else { 6 };
-        results.push(DnsRecord { address: ip.to_string(), family });
+        results.push(DnsRecord {
+            address: ip.to_string(),
+            family,
+        });
     }
     if results.is_empty() {
         anyhow::bail!("Hostname \"{hostname}\" does not resolve.");
@@ -183,7 +233,8 @@ pub fn resolve_safe_server_url(server_url: &str) -> anyhow::Result<String> {
         anyhow::bail!("Server URL must not contain credentials.");
     }
 
-    let host = url.host_str()
+    let host = url
+        .host_str()
         .ok_or_else(|| anyhow::anyhow!("Server URL has no hostname."))?
         .to_lowercase()
         .trim_start_matches('[')
@@ -195,7 +246,9 @@ pub fn resolve_safe_server_url(server_url: &str) -> anyhow::Result<String> {
         anyhow::bail!("Server URL has no hostname.");
     }
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
-        anyhow::bail!("Local hostnames are not allowed. Use the public hostname of your vault server.");
+        anyhow::bail!(
+            "Local hostnames are not allowed. Use the public hostname of your vault server."
+        );
     }
 
     // URL parsing validates any explicit port.
@@ -229,7 +282,12 @@ pub fn resolve_safe_server_url(server_url: &str) -> anyhow::Result<String> {
     let base = if path.is_empty() || path == "/" {
         format!("{}://{}", scheme, host_port(&url))
     } else {
-        format!("{}://{}/{}", scheme, host_port(&url), path.trim_start_matches('/'))
+        format!(
+            "{}://{}/{}",
+            scheme,
+            host_port(&url),
+            path.trim_start_matches('/')
+        )
     };
 
     Ok(base)

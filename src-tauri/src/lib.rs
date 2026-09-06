@@ -1,29 +1,28 @@
 //! SSHSpan - Cross-platform SSH Key Manager
 //! Tauri v2 library entry point
 
+pub mod bitwarden;
 pub mod commands;
+pub mod config;
 pub mod crypto;
 pub mod db;
-pub mod bitwarden;
-pub mod ssh;
-pub mod config;
-pub mod ssh_client;
 pub mod sftp;
+pub mod ssh;
+pub mod ssh_client;
 
 use tauri::{
-    Emitter,
     menu::{Menu, MenuItem},
-    tray::{TrayIconBuilder, TrayIconEvent, MouseButton},
-    Manager,
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager,
 };
 
-use commands::*;
 use commands::server::*;
+use commands::sftp::*;
 use commands::terminal::*;
 use commands::updater::*;
-use commands::sftp::*;
-use sftp::{SftpRegistry, EditRegistry};
+use commands::*;
 use db::Database;
+use sftp::{EditRegistry, SftpRegistry};
 use ssh_client::SessionRegistry;
 
 /// Application state shared across commands
@@ -70,7 +69,6 @@ pub fn run() {
             app.manage(EditRegistry::new());
 
             create_tray(app.handle())?;
-            
 
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -80,35 +78,80 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             // Vault commands
-            vault_create, vault_unlock, vault_lock, vault_change_password,
-            vault_status, vault_export, vault_import,
-            vault_backup_create, vault_backup_restore,
+            vault_create,
+            vault_unlock,
+            vault_lock,
+            vault_change_password,
+            vault_status,
+            vault_export,
+            vault_import,
+            vault_backup_create,
+            vault_backup_restore,
             // Key commands
-            key_generate, key_import, key_export, key_delete, key_list,
-            key_get, key_fingerprint, key_deploy, key_remove_deployed,
+            key_generate,
+            key_import,
+            key_export,
+            key_delete,
+            key_list,
+            key_get,
+            key_fingerprint,
+            key_deploy,
+            key_remove_deployed,
             // Category commands
-            category_list, category_create, category_rename, category_reparent, category_delete,
+            category_list,
+            category_create,
+            category_rename,
+            category_reparent,
+            category_delete,
             // Key ↔ category bridge
-            key_set_categories, key_create_with_categories,
+            key_set_categories,
+            key_create_with_categories,
             // SSH Config commands
-            ssh_config_read, ssh_config_write, ssh_config_list_hosts,
+            ssh_config_read,
+            ssh_config_write,
+            ssh_config_list_hosts,
             // Saved server CRUD
-            server_list, server_save, server_delete,
+            server_list,
+            server_save,
+            server_delete,
             // Connect / interactive SSH terminal
-            terminal_connect, terminal_send, terminal_resize, terminal_disconnect, terminal_list,
-            server_test, known_hosts_list, known_hosts_forget,
-            sftp_open, sftp_list_dir, sftp_mkdir, sftp_remove, sftp_rename,
-            sftp_download, sftp_upload, sftp_open_for_edit, sftp_close_edit, sftp_close, sftp_stage_path,
+            terminal_connect,
+            terminal_send,
+            terminal_resize,
+            terminal_disconnect,
+            terminal_list,
+            server_test,
+            known_hosts_list,
+            known_hosts_forget,
+            sftp_open,
+            sftp_list_dir,
+            sftp_mkdir,
+            sftp_remove,
+            sftp_rename,
+            sftp_download,
+            sftp_upload,
+            sftp_open_for_edit,
+            sftp_close_edit,
+            sftp_close,
+            sftp_stage_path,
             // Bitwarden commands
-            bitwarden_get_config, bitwarden_save_config, bitwarden_test_connection, bitwarden_sync,
+            bitwarden_get_config,
+            bitwarden_save_config,
+            bitwarden_test_connection,
+            bitwarden_sync,
             // Settings commands
-            settings_get, settings_set,
+            settings_get,
+            settings_set,
             // Audit log commands
             audit_list,
             // System commands
-            system_open_external, system_show_item_in_folder, system_select_file,
-            system_pick_save_path, system_write_text_file,
-            update_check, update_download_and_run,
+            system_open_external,
+            system_show_item_in_folder,
+            system_select_file,
+            system_pick_save_path,
+            system_write_text_file,
+            update_check,
+            update_download_and_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -143,7 +186,11 @@ fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
             }
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
@@ -155,4 +202,3 @@ fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
 
     Ok(())
 }
-

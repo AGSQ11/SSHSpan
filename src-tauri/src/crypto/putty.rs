@@ -22,14 +22,19 @@
 //! all downstream export/fingerprint logic is shared with the OpenSSH path.
 
 use aes::Aes256;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::NoPadding};
-use argon2::{Argon2, Algorithm as Argon2Algorithm, Version as Argon2Version, Params as Argon2Params};
+use argon2::{
+    Algorithm as Argon2Algorithm, Argon2, Params as Argon2Params, Version as Argon2Version,
+};
+use base64ct::{Base64, Encoding};
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use base64ct::{Base64, Encoding};
 use ssh_key::{
-    private::{EcdsaKeypair, EcdsaPrivateKey, Ed25519Keypair, Ed25519PrivateKey, KeypairData, RsaKeypair, RsaPrivateKey as SshRsaPrivateKey},
+    private::{
+        EcdsaKeypair, EcdsaPrivateKey, Ed25519Keypair, Ed25519PrivateKey, KeypairData, RsaKeypair,
+        RsaPrivateKey as SshRsaPrivateKey,
+    },
     Mpint, PrivateKey, PublicKey,
 };
 
@@ -104,9 +109,16 @@ fn parse_ppk_file(data: &str) -> anyhow::Result<ParsedPpk> {
         } else if let Some(v) = line.strip_prefix("Comment:") {
             comment = v.trim().to_string();
         } else if let Some(v) = line.strip_prefix("Public-Lines:") {
-            let n: usize = v.trim().parse().map_err(|_| anyhow::anyhow!("Bad Public-Lines count"))?;
-            let b64: String = lines.get(i + 1..i + 1 + n).ok_or_else(|| anyhow::anyhow!("Truncated public key section"))?.concat();
-            public_blob = Base64::decode_vec(&b64).map_err(|e| anyhow::anyhow!("Bad public key base64: {e}"))?;
+            let n: usize = v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Bad Public-Lines count"))?;
+            let b64: String = lines
+                .get(i + 1..i + 1 + n)
+                .ok_or_else(|| anyhow::anyhow!("Truncated public key section"))?
+                .concat();
+            public_blob = Base64::decode_vec(&b64)
+                .map_err(|e| anyhow::anyhow!("Bad public key base64: {e}"))?;
             i += n;
         } else if let Some(v) = line.strip_prefix("Key-Derivation:") {
             argon2_flavour = match v.trim() {
@@ -116,17 +128,34 @@ fn parse_ppk_file(data: &str) -> anyhow::Result<ParsedPpk> {
                 other => anyhow::bail!("Unknown Argon2 flavour: {other}"),
             };
         } else if let Some(v) = line.strip_prefix("Argon2-Memory:") {
-            argon2_memory_kb = v.trim().parse().map_err(|_| anyhow::anyhow!("Bad Argon2-Memory"))?;
+            argon2_memory_kb = v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Bad Argon2-Memory"))?;
         } else if let Some(v) = line.strip_prefix("Argon2-Passes:") {
-            argon2_passes = v.trim().parse().map_err(|_| anyhow::anyhow!("Bad Argon2-Passes"))?;
+            argon2_passes = v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Bad Argon2-Passes"))?;
         } else if let Some(v) = line.strip_prefix("Argon2-Parallelism:") {
-            argon2_parallelism = v.trim().parse().map_err(|_| anyhow::anyhow!("Bad Argon2-Parallelism"))?;
+            argon2_parallelism = v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Bad Argon2-Parallelism"))?;
         } else if let Some(v) = line.strip_prefix("Argon2-Salt:") {
-            argon2_salt = hex::decode(v.trim()).map_err(|e| anyhow::anyhow!("Bad Argon2-Salt hex: {e}"))?;
+            argon2_salt =
+                hex::decode(v.trim()).map_err(|e| anyhow::anyhow!("Bad Argon2-Salt hex: {e}"))?;
         } else if let Some(v) = line.strip_prefix("Private-Lines:") {
-            let n: usize = v.trim().parse().map_err(|_| anyhow::anyhow!("Bad Private-Lines count"))?;
-            let b64: String = lines.get(i + 1..i + 1 + n).ok_or_else(|| anyhow::anyhow!("Truncated private key section"))?.concat();
-            private_blob = Base64::decode_vec(&b64).map_err(|e| anyhow::anyhow!("Bad private key base64: {e}"))?;
+            let n: usize = v
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Bad Private-Lines count"))?;
+            let b64: String = lines
+                .get(i + 1..i + 1 + n)
+                .ok_or_else(|| anyhow::anyhow!("Truncated private key section"))?
+                .concat();
+            private_blob = Base64::decode_vec(&b64)
+                .map_err(|e| anyhow::anyhow!("Bad private key base64: {e}"))?;
             i += n;
         } else if let Some(v) = line.strip_prefix("Private-MAC:") {
             mac = hex::decode(v.trim()).map_err(|e| anyhow::anyhow!("Bad Private-MAC hex: {e}"))?;
@@ -139,8 +168,18 @@ fn parse_ppk_file(data: &str) -> anyhow::Result<ParsedPpk> {
     }
 
     Ok(ParsedPpk {
-        version, algorithm_name, encrypted, comment, public_blob, private_blob, mac,
-        argon2_flavour, argon2_memory_kb, argon2_passes, argon2_parallelism, argon2_salt,
+        version,
+        algorithm_name,
+        encrypted,
+        comment,
+        public_blob,
+        private_blob,
+        mac,
+        argon2_flavour,
+        argon2_memory_kb,
+        argon2_passes,
+        argon2_parallelism,
+        argon2_salt,
     })
 }
 
@@ -148,18 +187,27 @@ fn parse_ppk_file(data: &str) -> anyhow::Result<ParsedPpk> {
 
 /// PPK v3 (Appendix C.4): a *single* Argon2 call whose tag length is
 /// cipher_key_len + iv_len + mac_key_len; output split in that order.
-fn derive_v3(parsed: &ParsedPpk, passphrase: &str) -> anyhow::Result<([u8; 32], [u8; 16], [u8; 32])> {
+fn derive_v3(
+    parsed: &ParsedPpk,
+    passphrase: &str,
+) -> anyhow::Result<([u8; 32], [u8; 16], [u8; 32])> {
     let algo = match parsed.argon2_flavour {
         Argon2Flavour::D => Argon2Algorithm::Argon2d,
         Argon2Flavour::I => Argon2Algorithm::Argon2i,
         Argon2Flavour::Id => Argon2Algorithm::Argon2id,
     };
-    let params = Argon2Params::new(parsed.argon2_memory_kb, parsed.argon2_passes, parsed.argon2_parallelism, Some(80))
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let params = Argon2Params::new(
+        parsed.argon2_memory_kb,
+        parsed.argon2_passes,
+        parsed.argon2_parallelism,
+        Some(80),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     let argon2 = Argon2::new(algo, Argon2Version::V0x13, params);
 
     let mut output = [0u8; 80];
-    argon2.hash_password_into(passphrase.as_bytes(), &parsed.argon2_salt, &mut output)
+    argon2
+        .hash_password_into(passphrase.as_bytes(), &parsed.argon2_salt, &mut output)
         .map_err(|e| anyhow::anyhow!("Argon2 key derivation failed: {e}"))?;
 
     let mut cipher_key = [0u8; 32];
@@ -209,14 +257,25 @@ fn ssh_string(out: &mut Vec<u8>, data: &[u8]) {
 fn mac_preimage(parsed: &ParsedPpk, plaintext_private_blob: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     ssh_string(&mut buf, parsed.algorithm_name.as_bytes());
-    ssh_string(&mut buf, if parsed.encrypted { b"aes256-cbc" } else { b"none" });
+    ssh_string(
+        &mut buf,
+        if parsed.encrypted {
+            b"aes256-cbc"
+        } else {
+            b"none"
+        },
+    );
     ssh_string(&mut buf, parsed.comment.as_bytes());
     ssh_string(&mut buf, &parsed.public_blob);
     ssh_string(&mut buf, plaintext_private_blob);
     buf
 }
 
-fn verify_mac_v3(parsed: &ParsedPpk, mac_key: &[u8; 32], plaintext_private_blob: &[u8]) -> anyhow::Result<()> {
+fn verify_mac_v3(
+    parsed: &ParsedPpk,
+    mac_key: &[u8; 32],
+    plaintext_private_blob: &[u8],
+) -> anyhow::Result<()> {
     if parsed.mac.is_empty() {
         return Ok(());
     }
@@ -230,7 +289,11 @@ fn verify_mac_v3(parsed: &ParsedPpk, mac_key: &[u8; 32], plaintext_private_blob:
     Ok(())
 }
 
-fn verify_mac_v2(parsed: &ParsedPpk, mac_key: &[u8; 20], plaintext_private_blob: &[u8]) -> anyhow::Result<()> {
+fn verify_mac_v2(
+    parsed: &ParsedPpk,
+    mac_key: &[u8; 20],
+    plaintext_private_blob: &[u8],
+) -> anyhow::Result<()> {
     if parsed.mac.is_empty() {
         return Ok(());
     }
@@ -260,7 +323,11 @@ fn cbc_decrypt_no_padding(ciphertext: &[u8], key: &[u8], iv: &[u8]) -> anyhow::R
     Ok(buf)
 }
 
-fn cbc_encrypt_no_padding(plaintext_padded: &mut [u8], key: &[u8], iv: &[u8]) -> anyhow::Result<()> {
+fn cbc_encrypt_no_padding(
+    plaintext_padded: &mut [u8],
+    key: &[u8],
+    iv: &[u8],
+) -> anyhow::Result<()> {
     let len = plaintext_padded.len();
     if len == 0 {
         return Ok(());
@@ -302,7 +369,10 @@ fn mpint_to_fixed_be(mpint_bytes: &[u8], width: usize) -> anyhow::Result<Vec<u8>
         mpint_bytes
     };
     if trimmed.len() > width {
-        anyhow::bail!("PPK scalar is wider than expected ({} > {width} bytes)", trimmed.len());
+        anyhow::bail!(
+            "PPK scalar is wider than expected ({} > {width} bytes)",
+            trimmed.len()
+        );
     }
     let mut out = vec![0u8; width - trimmed.len()];
     out.extend_from_slice(trimmed);
@@ -312,7 +382,10 @@ fn mpint_to_fixed_be(mpint_bytes: &[u8], width: usize) -> anyhow::Result<Vec<u8>
 /// Build the type-specific `KeypairData` from the (already decrypted)
 /// private blob per Appendix C.3, paired with the public key parsed from
 /// the file's public-lines section.
-fn build_keypair_data(parsed: &ParsedPpk, plaintext_private_blob: &[u8]) -> anyhow::Result<(KeyType, KeypairData)> {
+fn build_keypair_data(
+    parsed: &ParsedPpk,
+    plaintext_private_blob: &[u8],
+) -> anyhow::Result<(KeyType, KeypairData)> {
     let public_key = PublicKey::from_bytes(&parsed.public_blob)
         .map_err(|e| anyhow::anyhow!("Invalid public key data in PPK file: {e}"))?;
 
@@ -320,7 +393,13 @@ fn build_keypair_data(parsed: &ParsedPpk, plaintext_private_blob: &[u8]) -> anyh
 
     match parsed.algorithm_name.as_str() {
         "ssh-rsa" => {
-            let rsa_pub = public_key.key_data().rsa().ok_or_else(|| anyhow::anyhow!("PPK header says ssh-rsa but public blob isn't RSA"))?.clone();
+            let rsa_pub = public_key
+                .key_data()
+                .rsa()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("PPK header says ssh-rsa but public blob isn't RSA")
+                })?
+                .clone();
             let d = read_mpint_bytes(plaintext_private_blob, &mut pos)?;
             let p = read_mpint_bytes(plaintext_private_blob, &mut pos)?;
             let q = read_mpint_bytes(plaintext_private_blob, &mut pos)?;
@@ -331,38 +410,73 @@ fn build_keypair_data(parsed: &ParsedPpk, plaintext_private_blob: &[u8]) -> anyh
                 p: Mpint::from_bytes(&p).map_err(|e| anyhow::anyhow!(e))?,
                 q: Mpint::from_bytes(&q).map_err(|e| anyhow::anyhow!(e))?,
             };
-            Ok((KeyType::Rsa, KeypairData::Rsa(RsaKeypair { public: rsa_pub, private })))
+            Ok((
+                KeyType::Rsa,
+                KeypairData::Rsa(RsaKeypair {
+                    public: rsa_pub,
+                    private,
+                }),
+            ))
         }
         "ssh-ed25519" => {
             let scalar = read_mpint_bytes(plaintext_private_blob, &mut pos)?;
             let seed = mpint_to_fixed_be(&scalar, 32)?;
-            let seed_arr: [u8; 32] = seed.try_into().map_err(|_| anyhow::anyhow!("Bad Ed25519 seed length"))?;
+            let seed_arr: [u8; 32] = seed
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Bad Ed25519 seed length"))?;
             let private = Ed25519PrivateKey::from_bytes(&seed_arr);
             let keypair: Ed25519Keypair = private.into();
             Ok((KeyType::Ed25519, KeypairData::Ed25519(keypair)))
         }
         "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
-            let ecdsa_pub = public_key.key_data().ecdsa().ok_or_else(|| anyhow::anyhow!("PPK header says ECDSA but public blob isn't ECDSA"))?.clone();
+            let ecdsa_pub = public_key
+                .key_data()
+                .ecdsa()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("PPK header says ECDSA but public blob isn't ECDSA")
+                })?
+                .clone();
             let scalar = read_mpint_bytes(plaintext_private_blob, &mut pos)?;
 
             let (key_type, keypair) = match &ecdsa_pub {
                 ssh_key::public::EcdsaPublicKey::NistP256(point) => {
                     let bytes = mpint_to_fixed_be(&scalar, 32)?;
-                    let sk = p256::SecretKey::from_slice(&bytes).map_err(|e| anyhow::anyhow!("Invalid P-256 scalar: {e}"))?;
+                    let sk = p256::SecretKey::from_slice(&bytes)
+                        .map_err(|e| anyhow::anyhow!("Invalid P-256 scalar: {e}"))?;
                     let private: EcdsaPrivateKey<32> = sk.into();
-                    (KeyType::EcdsaP256, EcdsaKeypair::NistP256 { public: point.clone(), private })
+                    (
+                        KeyType::EcdsaP256,
+                        EcdsaKeypair::NistP256 {
+                            public: point.clone(),
+                            private,
+                        },
+                    )
                 }
                 ssh_key::public::EcdsaPublicKey::NistP384(point) => {
                     let bytes = mpint_to_fixed_be(&scalar, 48)?;
-                    let sk = p384::SecretKey::from_slice(&bytes).map_err(|e| anyhow::anyhow!("Invalid P-384 scalar: {e}"))?;
+                    let sk = p384::SecretKey::from_slice(&bytes)
+                        .map_err(|e| anyhow::anyhow!("Invalid P-384 scalar: {e}"))?;
                     let private: EcdsaPrivateKey<48> = sk.into();
-                    (KeyType::EcdsaP384, EcdsaKeypair::NistP384 { public: point.clone(), private })
+                    (
+                        KeyType::EcdsaP384,
+                        EcdsaKeypair::NistP384 {
+                            public: point.clone(),
+                            private,
+                        },
+                    )
                 }
                 ssh_key::public::EcdsaPublicKey::NistP521(point) => {
                     let bytes = mpint_to_fixed_be(&scalar, 66)?;
-                    let sk = p521::SecretKey::from_slice(&bytes).map_err(|e| anyhow::anyhow!("Invalid P-521 scalar: {e}"))?;
+                    let sk = p521::SecretKey::from_slice(&bytes)
+                        .map_err(|e| anyhow::anyhow!("Invalid P-521 scalar: {e}"))?;
                     let private: EcdsaPrivateKey<66> = sk.into();
-                    (KeyType::EcdsaP521, EcdsaKeypair::NistP521 { public: point.clone(), private })
+                    (
+                        KeyType::EcdsaP521,
+                        EcdsaKeypair::NistP521 {
+                            public: point.clone(),
+                            private,
+                        },
+                    )
                 }
             };
             Ok((key_type, KeypairData::Ecdsa(keypair)))
@@ -399,25 +513,42 @@ pub fn import_ppk(data: &str, passphrase: Option<&str>) -> anyhow::Result<Privat
     };
 
     let (key_type, keypair_data) = build_keypair_data(&parsed, &plaintext_private_blob)?;
-    let private_key = PrivateKey::new(keypair_data, parsed.comment.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    let private_key =
+        PrivateKey::new(keypair_data, parsed.comment.clone()).map_err(|e| anyhow::anyhow!(e))?;
 
-    let private_bytes = private_key.to_bytes().map_err(|e| anyhow::anyhow!(e))?.to_vec();
-    let public_bytes = private_key.public_key().to_bytes().map_err(|e| anyhow::anyhow!(e))?.to_vec();
+    let private_bytes = private_key
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_vec();
+    let public_bytes = private_key
+        .public_key()
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_vec();
 
-    Ok(PrivateKeyData::new(key_type, private_bytes, public_bytes, parsed.comment))
+    Ok(PrivateKeyData::new(
+        key_type,
+        private_bytes,
+        public_bytes,
+        parsed.comment,
+    ))
 }
 
 /// Export a key to PuTTY PPK v3 format, optionally encrypted with a
 /// passphrase (Argon2id, PuTTY's own default flavour).
 pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow::Result<String> {
-    let private_key = PrivateKey::from_bytes(&key_data.private_key).map_err(|e| anyhow::anyhow!(e))?;
+    let private_key =
+        PrivateKey::from_bytes(&key_data.private_key).map_err(|e| anyhow::anyhow!(e))?;
     let algorithm_name = key_data.key_type.algorithm_name();
 
     let mut out = String::new();
     out.push_str(&format!("PuTTY-User-Key-File-3: {algorithm_name}\n"));
 
     let pass = passphrase.filter(|p| !p.is_empty());
-    out.push_str(&format!("Encryption: {}\n", if pass.is_some() { "aes256-cbc" } else { "none" }));
+    out.push_str(&format!(
+        "Encryption: {}\n",
+        if pass.is_some() { "aes256-cbc" } else { "none" }
+    ));
     out.push_str(&format!("Comment: {}\n", key_data.comment));
 
     let pub_b64 = Base64::encode_string(&key_data.public_key);
@@ -437,10 +568,13 @@ pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow
         out.push_str(&format!("Argon2-Parallelism: {parallelism}\n"));
         out.push_str(&format!("Argon2-Salt: {}\n", hex::encode(&salt)));
 
-        let params = Argon2Params::new(memory_kb, passes, parallelism, Some(80)).map_err(|e| anyhow::anyhow!(e))?;
+        let params = Argon2Params::new(memory_kb, passes, parallelism, Some(80))
+            .map_err(|e| anyhow::anyhow!(e))?;
         let argon2 = Argon2::new(Argon2Algorithm::Argon2id, Argon2Version::V0x13, params);
         let mut kdf_out = [0u8; 80];
-        argon2.hash_password_into(pass.as_bytes(), &salt, &mut kdf_out).map_err(|e| anyhow::anyhow!(e))?;
+        argon2
+            .hash_password_into(pass.as_bytes(), &salt, &mut kdf_out)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let cipher_key = &kdf_out[0..32];
         let iv = &kdf_out[32..48];
         let mac_key = &kdf_out[48..80];
@@ -455,22 +589,38 @@ pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow
         let mut mac_key_arr = [0u8; 32];
         mac_key_arr.copy_from_slice(mac_key);
         let parsed_for_mac = ParsedPpk {
-            version: PpkVersion::V3, algorithm_name: algorithm_name.to_string(), encrypted: true,
-            comment: key_data.comment.clone(), public_blob: key_data.public_key.clone(),
-            private_blob: Vec::new(), mac: Vec::new(), argon2_flavour: Argon2Flavour::Id,
-            argon2_memory_kb: memory_kb, argon2_passes: passes, argon2_parallelism: parallelism,
+            version: PpkVersion::V3,
+            algorithm_name: algorithm_name.to_string(),
+            encrypted: true,
+            comment: key_data.comment.clone(),
+            public_blob: key_data.public_key.clone(),
+            private_blob: Vec::new(),
+            mac: Vec::new(),
+            argon2_flavour: Argon2Flavour::Id,
+            argon2_memory_kb: memory_kb,
+            argon2_passes: passes,
+            argon2_parallelism: parallelism,
             argon2_salt: salt,
         };
         let preimage = mac_preimage(&parsed_for_mac, &private_blob);
-        let mut mac = Hmac::<Sha256>::new_from_slice(&mac_key_arr).expect("HMAC accepts any key size");
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&mac_key_arr).expect("HMAC accepts any key size");
         mac.update(&preimage);
         (padded, mac.finalize().into_bytes().to_vec())
     } else {
         let parsed_for_mac = ParsedPpk {
-            version: PpkVersion::V3, algorithm_name: algorithm_name.to_string(), encrypted: false,
-            comment: key_data.comment.clone(), public_blob: key_data.public_key.clone(),
-            private_blob: Vec::new(), mac: Vec::new(), argon2_flavour: Argon2Flavour::Id,
-            argon2_memory_kb: 0, argon2_passes: 0, argon2_parallelism: 0, argon2_salt: Vec::new(),
+            version: PpkVersion::V3,
+            algorithm_name: algorithm_name.to_string(),
+            encrypted: false,
+            comment: key_data.comment.clone(),
+            public_blob: key_data.public_key.clone(),
+            private_blob: Vec::new(),
+            mac: Vec::new(),
+            argon2_flavour: Argon2Flavour::Id,
+            argon2_memory_kb: 0,
+            argon2_passes: 0,
+            argon2_parallelism: 0,
+            argon2_salt: Vec::new(),
         };
         // Unencrypted files still carry a MAC; the key material is
         // zero-length per the spec ("If encryption-type is none, then all

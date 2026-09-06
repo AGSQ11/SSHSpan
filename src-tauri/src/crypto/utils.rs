@@ -31,7 +31,7 @@ pub fn ssh_fingerprint_sha256(public_key: &[u8]) -> String {
 
 /// Compute SSH fingerprint (MD5) - legacy format
 pub fn ssh_fingerprint_md5(public_key: &[u8]) -> String {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     let hash = Md5::digest(public_key);
     let mut result = String::new();
     for (i, byte) in hash.iter().enumerate() {
@@ -97,7 +97,10 @@ pub fn read_length_prefixed(data: &[u8], offset: &mut usize) -> anyhow::Result<V
         anyhow::bail!("Buffer too short for length");
     }
     let len = u32::from_be_bytes([
-        data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
     ]) as usize;
     *offset += 4;
 
@@ -121,7 +124,10 @@ pub fn read_u32(data: &[u8], offset: &mut usize) -> anyhow::Result<u32> {
         anyhow::bail!("Buffer too short for u32");
     }
     let val = u32::from_be_bytes([
-        data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
     ]);
     *offset += 4;
     Ok(val)
@@ -138,8 +144,14 @@ pub fn read_u64(data: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
         anyhow::bail!("Buffer too short for u64");
     }
     let val = u64::from_be_bytes([
-        data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3],
-        data[*offset + 4], data[*offset + 5], data[*offset + 6], data[*offset + 7]
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+        data[*offset + 4],
+        data[*offset + 5],
+        data[*offset + 6],
+        data[*offset + 7],
     ]);
     *offset += 8;
     Ok(val)

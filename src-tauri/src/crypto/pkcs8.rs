@@ -46,11 +46,36 @@ fn rsa_private_to_pkcs8(kp: &ssh_key::private::RsaKeypair) -> anyhow::Result<Vec
     use pkcs8::EncodePrivateKey;
     use rsa::BigUint;
 
-    let n = BigUint::from_bytes_be(kp.public.n.as_positive_bytes().ok_or_else(|| anyhow::anyhow!("Negative RSA modulus"))?);
-    let e = BigUint::from_bytes_be(kp.public.e.as_positive_bytes().ok_or_else(|| anyhow::anyhow!("Negative RSA exponent"))?);
-    let d = BigUint::from_bytes_be(kp.private.d.as_positive_bytes().ok_or_else(|| anyhow::anyhow!("Negative RSA d"))?);
-    let p = BigUint::from_bytes_be(kp.private.p.as_positive_bytes().ok_or_else(|| anyhow::anyhow!("Negative RSA p"))?);
-    let q = BigUint::from_bytes_be(kp.private.q.as_positive_bytes().ok_or_else(|| anyhow::anyhow!("Negative RSA q"))?);
+    let n = BigUint::from_bytes_be(
+        kp.public
+            .n
+            .as_positive_bytes()
+            .ok_or_else(|| anyhow::anyhow!("Negative RSA modulus"))?,
+    );
+    let e = BigUint::from_bytes_be(
+        kp.public
+            .e
+            .as_positive_bytes()
+            .ok_or_else(|| anyhow::anyhow!("Negative RSA exponent"))?,
+    );
+    let d = BigUint::from_bytes_be(
+        kp.private
+            .d
+            .as_positive_bytes()
+            .ok_or_else(|| anyhow::anyhow!("Negative RSA d"))?,
+    );
+    let p = BigUint::from_bytes_be(
+        kp.private
+            .p
+            .as_positive_bytes()
+            .ok_or_else(|| anyhow::anyhow!("Negative RSA p"))?,
+    );
+    let q = BigUint::from_bytes_be(
+        kp.private
+            .q
+            .as_positive_bytes()
+            .ok_or_else(|| anyhow::anyhow!("Negative RSA q"))?,
+    );
 
     let private_key = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])
         .map_err(|e| anyhow::anyhow!("Failed to reconstruct RSA key: {e}"))?;
@@ -63,11 +88,23 @@ fn rsa_public_to_spki(pub_key: &ssh_key::public::RsaPublicKey) -> anyhow::Result
     use pkcs8::EncodePublicKey;
     use rsa::BigUint;
 
-    let n = BigUint::from_bytes_be(pub_key.n.as_positive_bytes().ok_or_else(|| anyhow::anyhow!("Negative RSA modulus"))?);
-    let e = BigUint::from_bytes_be(pub_key.e.as_positive_bytes().ok_or_else(|| anyhow::anyhow!("Negative RSA exponent"))?);
+    let n = BigUint::from_bytes_be(
+        pub_key
+            .n
+            .as_positive_bytes()
+            .ok_or_else(|| anyhow::anyhow!("Negative RSA modulus"))?,
+    );
+    let e = BigUint::from_bytes_be(
+        pub_key
+            .e
+            .as_positive_bytes()
+            .ok_or_else(|| anyhow::anyhow!("Negative RSA exponent"))?,
+    );
 
     let public_key = rsa::RsaPublicKey::new(n, e).map_err(|e| anyhow::anyhow!(e))?;
-    let der = public_key.to_public_key_der().map_err(|e| anyhow::anyhow!(e))?;
+    let der = public_key
+        .to_public_key_der()
+        .map_err(|e| anyhow::anyhow!(e))?;
     Ok(der.as_bytes().to_vec())
 }
 
@@ -80,15 +117,27 @@ fn ecdsa_private_to_pkcs8(kp: &ssh_key::private::EcdsaKeypair) -> anyhow::Result
     match kp {
         ssh_key::private::EcdsaKeypair::NistP256 { .. } => {
             let sk = p256::SecretKey::from_slice(scalar).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(sk.to_pkcs8_der().map_err(|e| anyhow::anyhow!(e))?.as_bytes().to_vec())
+            Ok(sk
+                .to_pkcs8_der()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .as_bytes()
+                .to_vec())
         }
         ssh_key::private::EcdsaKeypair::NistP384 { .. } => {
             let sk = p384::SecretKey::from_slice(scalar).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(sk.to_pkcs8_der().map_err(|e| anyhow::anyhow!(e))?.as_bytes().to_vec())
+            Ok(sk
+                .to_pkcs8_der()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .as_bytes()
+                .to_vec())
         }
         ssh_key::private::EcdsaKeypair::NistP521 { .. } => {
             let sk = p521::SecretKey::from_slice(scalar).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(sk.to_pkcs8_der().map_err(|e| anyhow::anyhow!(e))?.as_bytes().to_vec())
+            Ok(sk
+                .to_pkcs8_der()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .as_bytes()
+                .to_vec())
         }
     }
 }
@@ -100,15 +149,27 @@ fn ecdsa_public_to_spki(pub_key: &ssh_key::public::EcdsaPublicKey) -> anyhow::Re
     match pub_key {
         ssh_key::public::EcdsaPublicKey::NistP256(_) => {
             let pk = p256::PublicKey::from_sec1_bytes(sec1).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(pk.to_public_key_der().map_err(|e| anyhow::anyhow!(e))?.as_bytes().to_vec())
+            Ok(pk
+                .to_public_key_der()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .as_bytes()
+                .to_vec())
         }
         ssh_key::public::EcdsaPublicKey::NistP384(_) => {
             let pk = p384::PublicKey::from_sec1_bytes(sec1).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(pk.to_public_key_der().map_err(|e| anyhow::anyhow!(e))?.as_bytes().to_vec())
+            Ok(pk
+                .to_public_key_der()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .as_bytes()
+                .to_vec())
         }
         ssh_key::public::EcdsaPublicKey::NistP521(_) => {
             let pk = p521::PublicKey::from_sec1_bytes(sec1).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(pk.to_public_key_der().map_err(|e| anyhow::anyhow!(e))?.as_bytes().to_vec())
+            Ok(pk
+                .to_public_key_der()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .as_bytes()
+                .to_vec())
         }
     }
 }
@@ -222,7 +283,10 @@ mod tests {
     #[test]
     fn ed25519_oid_matches_rfc8410() {
         // Known encoding: 06 03 2B 65 70
-        assert_eq!(der_oid(&[1, 3, 101, 112]), vec![0x06, 0x03, 0x2B, 0x65, 0x70]);
+        assert_eq!(
+            der_oid(&[1, 3, 101, 112]),
+            vec![0x06, 0x03, 0x2B, 0x65, 0x70]
+        );
     }
 
     #[test]
@@ -233,7 +297,7 @@ mod tests {
         assert_eq!(der[0], 0x30); // SEQUENCE
         assert_eq!(der[1], 46); // content length (short form)
         assert_eq!(&der[2..5], &[0x02, 0x01, 0x00]); // INTEGER 0
-        // AlgorithmIdentifier TLV (header 2 + content 5 = 7 bytes)
+                                                     // AlgorithmIdentifier TLV (header 2 + content 5 = 7 bytes)
         assert_eq!(&der[5..12], &[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70]);
         // privateKey OCTET STRING starts after the 2-byte SEQUENCE header
         // plus version(3) plus AlgorithmIdentifier(7) = index 12.

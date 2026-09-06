@@ -36,7 +36,11 @@ fn to_abs(root: &Path, p: &str) -> PathBuf {
     let rel = p.strip_prefix('/').unwrap_or(&p);
     let joined = root.join(rel);
     // prevent escaping the root
-    if joined.starts_with(root) { joined } else { root.to_path_buf() }
+    if joined.starts_with(root) {
+        joined
+    } else {
+        root.to_path_buf()
+    }
 }
 
 #[derive(Clone)]
@@ -74,7 +78,11 @@ impl russh::server::Handler for SshSession {
     type Error = anyhow::Error;
 
     async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
-        if password == "testpass" { Ok(Auth::Accept) } else { Ok(Auth::reject()) }
+        if password == "testpass" {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::reject())
+        }
     }
 
     async fn channel_open_session(
@@ -95,7 +103,10 @@ impl russh::server::Handler for SshSession {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
-        session.data(channel, b"dev-sshd ready. Type anything (echo mode).\r\ndev-sshd$ ".as_ref())?;
+        session.data(
+            channel,
+            b"dev-sshd ready. Type anything (echo mode).\r\ndev-sshd$ ".as_ref(),
+        )?;
         Ok(())
     }
 
@@ -163,7 +174,9 @@ impl FsSftp {
             next_handle: 1,
         }
     }
-    fn abs(&self, p: &str) -> PathBuf { to_abs(&self.root, p) }
+    fn abs(&self, p: &str) -> PathBuf {
+        to_abs(&self.root, p)
+    }
     fn virt(&self, p: &Path) -> String {
         let rel = p.strip_prefix(&self.root).unwrap_or(p);
         format!("/{}", rel.display())
@@ -177,7 +190,11 @@ impl russh_sftp::server::Handler for FsSftp {
         StatusCode::OpUnsupported
     }
 
-    async fn init(&mut self, version: u32, _extensions: HashMap<String, String>) -> Result<Version, Self::Error> {
+    async fn init(
+        &mut self,
+        version: u32,
+        _extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
         eprintln!("[dev-sshd] sftp init v{version}");
         Ok(Version::new())
     }
@@ -187,7 +204,12 @@ impl russh_sftp::server::Handler for FsSftp {
         self.handles.remove(&handle);
         self.write_handles.remove(&handle);
         eprintln!("[dev-sshd] close EXIT id={id}");
-        Ok(Status { id, status_code: StatusCode::Ok, error_message: "Ok".to_string(), language_tag: "en-US".to_string() })
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
@@ -198,7 +220,10 @@ impl russh_sftp::server::Handler for FsSftp {
                 for e in rd.flatten() {
                     let is_dir = e.path().is_dir();
                     let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    let mtime = e.metadata().ok().and_then(|m| m.modified().ok())
+                    let mtime = e
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as u32)
                         .unwrap_or(0);
@@ -225,28 +250,65 @@ impl russh_sftp::server::Handler for FsSftp {
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         let abs = self.abs(&path);
         let exists = abs.exists();
-        let virt = if exists { self.virt(&abs) } else { path.clone() };
-        Ok(Name { id, files: vec![File::dummy(&virt)] })
+        let virt = if exists {
+            self.virt(&abs)
+        } else {
+            path.clone()
+        };
+        Ok(Name {
+            id,
+            files: vec![File::dummy(&virt)],
+        })
     }
 
-    async fn mkdir(&mut self, id: u32, path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
         std::fs::create_dir_all(self.abs(&path)).map_err(|_| StatusCode::Failure)?;
-        Ok(Status { id, status_code: StatusCode::Ok, error_message: "Ok".to_string(), language_tag: "en-US".to_string() })
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
     }
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         std::fs::remove_dir(self.abs(&path)).map_err(|_| StatusCode::Failure)?;
-        Ok(Status { id, status_code: StatusCode::Ok, error_message: "Ok".to_string(), language_tag: "en-US".to_string() })
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
     }
 
     async fn remove(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         std::fs::remove_file(self.abs(&path)).map_err(|_| StatusCode::Failure)?;
-        Ok(Status { id, status_code: StatusCode::Ok, error_message: "Ok".to_string(), language_tag: "en-US".to_string() })
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
     }
 
-    async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, Self::Error> {
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
         std::fs::rename(self.abs(&oldpath), self.abs(&newpath)).map_err(|_| StatusCode::Failure)?;
-        Ok(Status { id, status_code: StatusCode::Ok, error_message: "Ok".to_string(), language_tag: "en-US".to_string() })
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
     }
 
     async fn open(
@@ -262,8 +324,15 @@ impl russh_sftp::server::Handler for FsSftp {
         self.next_handle += 1;
         if pflags.contains(russh_sftp::protocol::OpenFlags::WRITE) {
             eprintln!("[dev-sshd] open: opening for write...");
-            let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true)
-                .open(&abs).map_err(|e| { eprintln!("[dev-sshd] open write FAILED: {e}"); StatusCode::Failure })?;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&abs)
+                .map_err(|e| {
+                    eprintln!("[dev-sshd] open write FAILED: {e}");
+                    StatusCode::Failure
+                })?;
             eprintln!("[dev-sshd] open: write handle ok");
             self.write_handles.insert(h.clone(), f);
         }
@@ -272,12 +341,25 @@ impl russh_sftp::server::Handler for FsSftp {
         Ok(Handle { id, handle: h })
     }
 
-    async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<russh_sftp::protocol::Data, Self::Error> {
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<russh_sftp::protocol::Data, Self::Error> {
         use std::io::{Read, Seek, SeekFrom};
         eprintln!("[dev-sshd] read ENTER id={id} handle={handle} offset={offset} len={len}");
-        let Some(path) = self.handles.get(&handle) else { eprintln!("[dev-sshd] read: no such handle"); return Err(StatusCode::Failure) };
-        let mut f = std::fs::File::open(path).map_err(|e| { eprintln!("[dev-sshd] read: open FAILED: {e}"); StatusCode::Failure })?;
-        f.seek(SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        let Some(path) = self.handles.get(&handle) else {
+            eprintln!("[dev-sshd] read: no such handle");
+            return Err(StatusCode::Failure);
+        };
+        let mut f = std::fs::File::open(path).map_err(|e| {
+            eprintln!("[dev-sshd] read: open FAILED: {e}");
+            StatusCode::Failure
+        })?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
         let mut buf = vec![0u8; len as usize];
         let n = f.read(&mut buf).map_err(|_| StatusCode::Failure)?;
         buf.truncate(n);
@@ -285,14 +367,32 @@ impl russh_sftp::server::Handler for FsSftp {
         Ok(russh_sftp::protocol::Data { id, data: buf })
     }
 
-    async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
         use std::io::{Seek, SeekFrom, Write};
-        eprintln!("[dev-sshd] write ENTER id={id} handle={handle} offset={offset} len={}", data.len());
-        let Some(f) = self.write_handles.get_mut(&handle) else { eprintln!("[dev-sshd] write: no such handle"); return Err(StatusCode::Failure) };
-        f.seek(SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        eprintln!(
+            "[dev-sshd] write ENTER id={id} handle={handle} offset={offset} len={}",
+            data.len()
+        );
+        let Some(f) = self.write_handles.get_mut(&handle) else {
+            eprintln!("[dev-sshd] write: no such handle");
+            return Err(StatusCode::Failure);
+        };
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
         f.write_all(&data).map_err(|_| StatusCode::Failure)?;
         eprintln!("[dev-sshd] write EXIT id={id}");
-        Ok(Status { id, status_code: StatusCode::Ok, error_message: "Ok".to_string(), language_tag: "en-US".to_string() })
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
     }
 }
 
@@ -309,8 +409,8 @@ fn main() {
             .arg(&key_path)
             .output();
     }
-    let host_key = russh::keys::load_secret_key(key_path.display().to_string(), None)
-        .expect("host key");
+    let host_key =
+        russh::keys::load_secret_key(key_path.display().to_string(), None).expect("host key");
 
     let config = russh::server::Config {
         auth_rejection_time: std::time::Duration::from_secs(0),
@@ -319,9 +419,14 @@ fn main() {
     };
 
     eprintln!("[dev-sshd] listening on 127.0.0.1:2222 (any user / password: testpass)");
-    tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
         .block_on(async {
             let mut server = SshServer;
-            let _ = server.run_on_address(Arc::new(config), ("127.0.0.1", 2222)).await;
+            let _ = server
+                .run_on_address(Arc::new(config), ("127.0.0.1", 2222))
+                .await;
         });
 }

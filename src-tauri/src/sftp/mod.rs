@@ -15,7 +15,9 @@ pub struct SftpRegistry {
 
 impl SftpRegistry {
     pub fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()) }
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
     }
     pub fn insert(&self, id: String, sftp: Arc<SftpSession>) {
         self.sessions.lock().unwrap().insert(id, sftp);
@@ -47,10 +49,16 @@ pub struct EditRegistry {
 
 impl EditRegistry {
     pub fn new() -> Self {
-        Self { watches: Mutex::new(HashMap::new()) }
+        Self {
+            watches: Mutex::new(HashMap::new()),
+        }
     }
     pub fn get(&self, key: &str) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        self.watches.lock().unwrap().get(key).map(|w| w.stopped.clone())
+        self.watches
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|w| w.stopped.clone())
     }
     pub fn insert(&self, key: String, watch: EditWatch) {
         self.watches.lock().unwrap().insert(key, watch);
@@ -75,7 +83,8 @@ impl EditRegistry {
     }
     pub fn stop_all_for_session(&self, session_id: &str) {
         let mut guard = self.watches.lock().unwrap();
-        let keys: Vec<String> = guard.iter()
+        let keys: Vec<String> = guard
+            .iter()
             .filter(|(_, w)| w.session_id == session_id)
             .map(|(k, _)| k.clone())
             .collect();

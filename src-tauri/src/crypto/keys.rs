@@ -9,7 +9,7 @@
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::crypto::utils::{generate_random_vec, ssh_fingerprint_sha256, ssh_fingerprint_md5};
+use crate::crypto::utils::{generate_random_vec, ssh_fingerprint_md5, ssh_fingerprint_sha256};
 use base64ct::{Base64, Encoding};
 use ssh_key::{
     private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair},
@@ -17,7 +17,9 @@ use ssh_key::{
     Algorithm, EcdsaCurve, LineEnding, PrivateKey,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, zeroize::Zeroize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, zeroize::Zeroize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyType {
     Rsa,
@@ -43,9 +45,15 @@ impl KeyType {
         match alg {
             Algorithm::Rsa { .. } => Ok(KeyType::Rsa),
             Algorithm::Ed25519 => Ok(KeyType::Ed25519),
-            Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 } => Ok(KeyType::EcdsaP256),
-            Algorithm::Ecdsa { curve: EcdsaCurve::NistP384 } => Ok(KeyType::EcdsaP384),
-            Algorithm::Ecdsa { curve: EcdsaCurve::NistP521 } => Ok(KeyType::EcdsaP521),
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            } => Ok(KeyType::EcdsaP256),
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP384,
+            } => Ok(KeyType::EcdsaP384),
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP521,
+            } => Ok(KeyType::EcdsaP521),
             other => anyhow::bail!("Unsupported key algorithm: {:?}", other),
         }
     }
@@ -100,20 +108,35 @@ pub struct PrivateKeyData {
 }
 
 impl PrivateKeyData {
-    pub fn new(key_type: KeyType, private_key: impl Into<Vec<u8>>, public_key: impl Into<Vec<u8>>, comment: String) -> Self {
-        Self { key_type, private_key: private_key.into(), public_key: public_key.into(), comment }
+    pub fn new(
+        key_type: KeyType,
+        private_key: impl Into<Vec<u8>>,
+        public_key: impl Into<Vec<u8>>,
+        comment: String,
+    ) -> Self {
+        Self {
+            key_type,
+            private_key: private_key.into(),
+            public_key: public_key.into(),
+            comment,
+        }
     }
 
     /// Reconstruct the `ssh_key::PrivateKey` this data represents.
     fn to_ssh_key(&self) -> anyhow::Result<PrivateKey> {
-        PrivateKey::from_bytes(&self.private_key).map_err(|e| anyhow::anyhow!("Invalid stored private key: {e}"))
+        PrivateKey::from_bytes(&self.private_key)
+            .map_err(|e| anyhow::anyhow!("Invalid stored private key: {e}"))
     }
 }
 
 /// Generate a new key pair of the given type.
 ///
 /// `bits` only applies to RSA (clamped to 2048-16384; default 3072).
-pub fn generate_key_pair(key_type: KeyType, bits: Option<u32>, comment: String) -> anyhow::Result<PrivateKeyData> {
+pub fn generate_key_pair(
+    key_type: KeyType,
+    bits: Option<u32>,
+    comment: String,
+) -> anyhow::Result<PrivateKeyData> {
     let mut rng = OsRng;
 
     let keypair_data: KeypairData = match key_type {
@@ -122,39 +145,68 @@ pub fn generate_key_pair(key_type: KeyType, bits: Option<u32>, comment: String) 
             KeypairData::Rsa(RsaKeypair::random(&mut rng, bits).map_err(|e| anyhow::anyhow!(e))?)
         }
         KeyType::Ed25519 => KeypairData::Ed25519(Ed25519Keypair::random(&mut rng)),
-        KeyType::EcdsaP256 => {
-            KeypairData::Ecdsa(EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP256).map_err(|e| anyhow::anyhow!(e))?)
-        }
-        KeyType::EcdsaP384 => {
-            KeypairData::Ecdsa(EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP384).map_err(|e| anyhow::anyhow!(e))?)
-        }
-        KeyType::EcdsaP521 => {
-            KeypairData::Ecdsa(EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP521).map_err(|e| anyhow::anyhow!(e))?)
-        }
+        KeyType::EcdsaP256 => KeypairData::Ecdsa(
+            EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP256).map_err(|e| anyhow::anyhow!(e))?,
+        ),
+        KeyType::EcdsaP384 => KeypairData::Ecdsa(
+            EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP384).map_err(|e| anyhow::anyhow!(e))?,
+        ),
+        KeyType::EcdsaP521 => KeypairData::Ecdsa(
+            EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP521).map_err(|e| anyhow::anyhow!(e))?,
+        ),
     };
 
-    let private_key = PrivateKey::new(keypair_data, comment.clone()).map_err(|e| anyhow::anyhow!(e))?;
-    let private_bytes = private_key.to_bytes().map_err(|e| anyhow::anyhow!(e))?.to_vec();
-    let public_bytes = private_key.public_key().to_bytes().map_err(|e| anyhow::anyhow!(e))?.to_vec();
+    let private_key =
+        PrivateKey::new(keypair_data, comment.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    let private_bytes = private_key
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_vec();
+    let public_bytes = private_key
+        .public_key()
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_vec();
 
-    Ok(PrivateKeyData::new(key_type, private_bytes, public_bytes, comment))
+    Ok(PrivateKeyData::new(
+        key_type,
+        private_bytes,
+        public_bytes,
+        comment,
+    ))
 }
 
 /// Import a key from an OpenSSH-formatted PEM private key (`-----BEGIN
 /// OPENSSH PRIVATE KEY-----`). Handles encrypted and plaintext keys.
-pub fn import_openssh_private(pem: &str, passphrase: Option<&str>) -> anyhow::Result<PrivateKeyData> {
-    let mut key = PrivateKey::from_openssh(pem).map_err(|e| anyhow::anyhow!("Failed to parse OpenSSH key: {e}"))?;
+pub fn import_openssh_private(
+    pem: &str,
+    passphrase: Option<&str>,
+) -> anyhow::Result<PrivateKeyData> {
+    let mut key = PrivateKey::from_openssh(pem)
+        .map_err(|e| anyhow::anyhow!("Failed to parse OpenSSH key: {e}"))?;
     if key.is_encrypted() {
-        let pass = passphrase.ok_or_else(|| anyhow::anyhow!("This key is encrypted; a passphrase is required."))?;
-        key = key.decrypt(pass).map_err(|_| anyhow::anyhow!("Incorrect passphrase, or the key file is corrupted."))?;
+        let pass = passphrase
+            .ok_or_else(|| anyhow::anyhow!("This key is encrypted; a passphrase is required."))?;
+        key = key
+            .decrypt(pass)
+            .map_err(|_| anyhow::anyhow!("Incorrect passphrase, or the key file is corrupted."))?;
     }
 
     let key_type = KeyType::from_ssh_key_algorithm(&key.algorithm())?;
     let comment = key.comment().to_string();
     let private_bytes = key.to_bytes().map_err(|e| anyhow::anyhow!(e))?.to_vec();
-    let public_bytes = key.public_key().to_bytes().map_err(|e| anyhow::anyhow!(e))?.to_vec();
+    let public_bytes = key
+        .public_key()
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_vec();
 
-    Ok(PrivateKeyData::new(key_type, private_bytes, public_bytes, comment))
+    Ok(PrivateKeyData::new(
+        key_type,
+        private_bytes,
+        public_bytes,
+        comment,
+    ))
 }
 
 /// Compute SSH fingerprint (SHA-256) - matches `ssh-keygen -lf` exactly.
@@ -182,10 +234,7 @@ pub fn export_private_key(
 }
 
 /// Export public key in various formats
-pub fn export_public_key(
-    key_data: &PrivateKeyData,
-    format: KeyFormat,
-) -> anyhow::Result<String> {
+pub fn export_public_key(key_data: &PrivateKeyData, format: KeyFormat) -> anyhow::Result<String> {
     match format {
         KeyFormat::OpenSsh => export_openssh_public(key_data),
         KeyFormat::Pkcs8 => export_pkcs8_public(key_data),
@@ -196,25 +245,42 @@ pub fn export_public_key(
 
 /// Export as OpenSSH format, optionally encrypted with a passphrase
 /// (aes256-ctr + bcrypt KDF, matching modern `ssh-keygen` defaults).
-fn export_openssh_private(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow::Result<String> {
+fn export_openssh_private(
+    key_data: &PrivateKeyData,
+    passphrase: Option<&str>,
+) -> anyhow::Result<String> {
     let key = key_data.to_ssh_key()?;
     let key = match passphrase {
         Some(pass) if !pass.is_empty() => {
             let mut rng = OsRng;
-            key.encrypt(&mut rng, pass).map_err(|e| anyhow::anyhow!(e))?
+            key.encrypt(&mut rng, pass)
+                .map_err(|e| anyhow::anyhow!(e))?
         }
         _ => key,
     };
-    Ok(key.to_openssh(LineEnding::LF).map_err(|e| anyhow::anyhow!(e))?.to_string())
+    Ok(key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_string())
 }
 
 fn export_openssh_public(key_data: &PrivateKeyData) -> anyhow::Result<String> {
     let b64 = Base64::encode_string(&key_data.public_key);
-    Ok(format!("{} {} {}", key_data.key_type.algorithm_name(), b64, key_data.comment).trim_end().to_string())
+    Ok(format!(
+        "{} {} {}",
+        key_data.key_type.algorithm_name(),
+        b64,
+        key_data.comment
+    )
+    .trim_end()
+    .to_string())
 }
 
 /// Export as PKCS#8 format (SPKI public / PrivateKeyInfo private PEM)
-fn export_pkcs8_private(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow::Result<String> {
+fn export_pkcs8_private(
+    key_data: &PrivateKeyData,
+    passphrase: Option<&str>,
+) -> anyhow::Result<String> {
     let der = crate::crypto::pkcs8::private_key_to_pkcs8_der(key_data)?;
     if let Some(pass) = passphrase.filter(|p| !p.is_empty()) {
         encrypt_pkcs8_with_passphrase(&der, pass)
@@ -240,7 +306,10 @@ fn pem_wrap(label: &str, der: &[u8]) -> anyhow::Result<String> {
 }
 
 /// Export as PuTTY PPK format
-fn export_putty_private(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow::Result<String> {
+fn export_putty_private(
+    key_data: &PrivateKeyData,
+    passphrase: Option<&str>,
+) -> anyhow::Result<String> {
     crate::crypto::putty::export_ppk(key_data, passphrase)
 }
 
@@ -249,7 +318,10 @@ fn export_putty_public(key_data: &PrivateKeyData) -> anyhow::Result<String> {
 }
 
 /// Export as RFC 4716 format
-fn export_rfc4716_private(_key_data: &PrivateKeyData, _passphrase: Option<&str>) -> anyhow::Result<String> {
+fn export_rfc4716_private(
+    _key_data: &PrivateKeyData,
+    _passphrase: Option<&str>,
+) -> anyhow::Result<String> {
     anyhow::bail!("RFC 4716 private key export not supported (not part of the RFC 4716 spec; OpenSSH doesn't support it either).");
 }
 
@@ -260,7 +332,10 @@ fn export_rfc4716_public(key_data: &PrivateKeyData) -> anyhow::Result<String> {
         anyhow::bail!("Invalid OpenSSH public key");
     }
     let base64_key = parts[1];
-    let comment = parts.get(2).map(|s| s.to_string()).unwrap_or_else(|| key_data.comment.clone());
+    let comment = parts
+        .get(2)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| key_data.comment.clone());
 
     let mut output = String::new();
     output.push_str("---- BEGIN SSH2 PUBLIC KEY ----\n");
@@ -273,7 +348,7 @@ fn export_rfc4716_public(key_data: &PrivateKeyData) -> anyhow::Result<String> {
 /// Encrypt PKCS#8 DER private key with a passphrase (PBES2 style, AES-256-CBC)
 fn encrypt_pkcs8_with_passphrase(pkcs8_der: &[u8], passphrase: &str) -> anyhow::Result<String> {
     use aes::Aes256;
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+    use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     use pbkdf2::pbkdf2_hmac_array;
     use sha2::Sha256;
 

@@ -1,10 +1,10 @@
 //! SSH config file management
 //! Replaces sshConfigService.js
 
-use std::path::PathBuf;
-use std::fs;
-use directories::ProjectDirs;
 use anyhow::Result;
+use directories::ProjectDirs;
+use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SshHostConfig {
@@ -112,10 +112,10 @@ impl SshConfig {
 
     pub fn to_config_string(&self) -> String {
         let mut output = String::new();
-        
+
         for host in &self.hosts {
             output.push_str(&format!("Host {}\n", host.host));
-            
+
             if let Some(v) = &host.hostname {
                 output.push_str(&format!("    HostName {}\n", v));
             }
@@ -129,19 +129,25 @@ impl SshConfig {
                 output.push_str(&format!("    IdentityFile {}\n", v));
             }
             if let Some(v) = host.identities_only {
-                output.push_str(&format!("    IdentitiesOnly {}\n", if v { "yes" } else { "no" }));
+                output.push_str(&format!(
+                    "    IdentitiesOnly {}\n",
+                    if v { "yes" } else { "no" }
+                ));
             }
             if let Some(v) = host.forward_agent {
-                output.push_str(&format!("    ForwardAgent {}\n", if v { "yes" } else { "no" }));
+                output.push_str(&format!(
+                    "    ForwardAgent {}\n",
+                    if v { "yes" } else { "no" }
+                ));
             }
             if let Some(v) = &host.proxy_jump {
                 output.push_str(&format!("    ProxyJump {}\n", v));
             }
-            
+
             for (k, v) in &host.extra {
                 output.push_str(&format!("    {} {}\n", k, v));
             }
-            
+
             output.push('\n');
         }
 
@@ -182,7 +188,7 @@ impl SshConfigService {
 
     pub fn write(&self, config: &SshConfig) -> Result<()> {
         let content = config.to_config_string();
-        
+
         // Ensure .ssh directory exists
         if let Some(parent) = self.config_path.parent() {
             fs::create_dir_all(parent)?;
@@ -219,9 +225,12 @@ impl SshConfigService {
 
     pub fn get_deployable_keys(&self) -> Vec<String> {
         self.read()
-            .map(|c| c.hosts.iter()
-                .filter_map(|h| h.identity_file.clone())
-                .collect())
+            .map(|c| {
+                c.hosts
+                    .iter()
+                    .filter_map(|h| h.identity_file.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
