@@ -245,6 +245,8 @@ pub fn terminal_disconnect(app: AppHandle, session_id: String) -> CmdResult<serd
     ssh_client::session_disconnect(&registry, &session_id);
     app.state::<crate::sftp::EditRegistry>()
         .stop_all_for_session(&session_id);
+    app.state::<crate::sftp::KeepaliveRegistry>()
+        .stop(&session_id);
     app.state::<crate::sftp::SftpRegistry>().remove(&session_id);
     let _ = app
         .state::<AppState>()

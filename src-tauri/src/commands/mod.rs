@@ -244,6 +244,7 @@ pub fn vault_lock(app: AppHandle) -> CmdResult<serde_json::Value> {
     app.state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
         .kill_all();
     app.state::<crate::sftp::EditRegistry>().stop_all();
+    app.state::<crate::sftp::KeepaliveRegistry>().stop_all();
     app.state::<VaultPasswordStore>().clear();
     app.state::<AppState>()
         .db

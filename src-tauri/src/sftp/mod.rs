@@ -2,6 +2,8 @@
 //! keyed by the tab's SSH session id, alongside a registry of "open with
 //! system editor" watches that re-upload files when the local copy changes.
 
+pub mod queue;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -103,4 +105,38 @@ pub fn edit_temp_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("sshspan-edit");
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Keep-alive stop flags for open SFTP sessions: a periodic cheap round-trip
+/// keeps NAT/firewall state alive. Setting the flag stops the loop; the entry
+/// is removed when the SFTP session closes.
+#[derive(Default)]
+pub struct KeepaliveRegistry {
+    flags: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+}
+
+impl KeepaliveRegistry {
+    pub fn new() -> Self {
+        Self {
+            flags: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn insert(&self, session_id: String, stopped: Arc<std::sync::atomic::AtomicBool>) {
+        // Stop any previous loop for this session first.
+        if let Some(old) = self.flags.lock().unwrap().insert(session_id, stopped) {
+            old.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    pub fn stop(&self, session_id: &str) {
+        if let Some(f) = self.flags.lock().unwrap().remove(session_id) {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    pub fn stop_all(&self) {
+        let mut guard = self.flags.lock().unwrap();
+        for (_, f) in guard.iter() {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        guard.clear();
+    }
 }

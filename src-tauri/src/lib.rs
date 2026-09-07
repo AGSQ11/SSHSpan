@@ -22,7 +22,7 @@ use commands::terminal::*;
 use commands::updater::*;
 use commands::*;
 use db::Database;
-use sftp::{EditRegistry, SftpRegistry};
+use sftp::{EditRegistry, KeepaliveRegistry, SftpRegistry};
 use ssh_client::SessionRegistry;
 
 /// Application state shared across commands
@@ -67,6 +67,8 @@ pub fn run() {
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
             app.manage(SftpRegistry::new());
             app.manage(EditRegistry::new());
+            app.manage(KeepaliveRegistry::new());
+            app.manage(crate::sftp::queue::TransferQueue::new());
 
             create_tray(app.handle())?;
 
@@ -132,6 +134,20 @@ pub fn run() {
             sftp_upload,
             sftp_open_for_edit,
             sftp_close_edit,
+            sftp_chmod,
+            sftp_get_permissions,
+            sftp_touch,
+            sftp_fs_info,
+            sftp_keepalive_start,
+            sftp_queue_add,
+            sftp_queue_list,
+            sftp_queue_cancel,
+            sftp_queue_retry,
+            sftp_queue_clear_finished,
+            sftp_search,
+            sftp_bookmarks_list,
+            sftp_bookmarks_save,
+            sftp_local_list,
             sftp_close,
             sftp_stage_path,
             // Bitwarden commands
