@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-07
+
+### Fixed
+
+- SFTP downloads now explicitly close and await remote handles before reporting success.
+- SFTP uploads now explicitly close and await remote handles, surfacing local-open, remote-open, transfer, and close failures.
+- Dragging a local folder into the SFTP browser now recursively creates the remote directory tree and uploads nested files.
+- SFTP rows behave like file-manager entries: selectable, keyboard-focusable, double-clickable, and context-menu accessible.
+
+
 ## [1.4.1] - 2026-09-07
 
 Patch release focused on closing audited feature gaps and making the release/development workflow truthful.
