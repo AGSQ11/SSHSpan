@@ -52,6 +52,7 @@ pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_js
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SftpEntry {
     pub name: String,
     pub is_dir: bool,
