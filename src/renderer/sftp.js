@@ -949,22 +949,32 @@ function localNavigateUp(tabId) {
 
 // ─── downloads / uploads via the queue ──────────────────────────────────────
 
-/// Last local dir used for downloads (session-scope preference).
-let lastDownloadDir = null;
-
 async function queueDownloads(tabId, remotePaths) {
   const tab = sftpTab(tabId);
   if (!tab) return;
-  const destDir = lastDownloadDir;
+  // Plain "Download" lands in the local pane's current directory. If the
+  // local pane isn't open, open it so the destination is always visible —
+  // never a hidden temp folder. Explicit placement stays on "Download as…".
+  sftpTabState(tab);
+  if (!tab.dualPane) toggleDualPane(tabId);
+  if (!tab.localPath) {
+    // Local listing hasn't loaded yet (toggle just opened it) — wait briefly.
+    await new Promise(r => setTimeout(r, 600));
+  }
+  const dir = tab.localPath || null;
+  if (!dir) {
+    toast('Local pane is still loading — try again in a moment.', 'err');
+    return;
+  }
   try {
     const r = await sftpCall('sftp_queue_add', {
       sessionId: tab.sessionId,
       direction: 'download',
       items: remotePaths.map(p => ({ remote: p })),
-      destDir,
+      destDir: dir,
     });
-    sftpLog(tabId, `queued ${r.added} download(s)`);
-    if (r.added > 0) toast(`${r.added} download(s) queued.`, 'ok');
+    sftpLog(tabId, `queued ${r.added} download(s) → ${dir}`);
+    if (r.added > 0) toast(`${r.added} download(s) → ${dir}`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
@@ -988,7 +998,6 @@ async function sftpDownloadTo(tabId, fullPath, name) {
   try {
     const pick = await call('system_pick_save_path', { title: 'Save remote file', defaultName: name });
     if (pick.canceled) return;
-    lastDownloadDir = pick.path.replace(/[\\/][^\\/]+$/, '') || lastDownloadDir;
     await sftpCall('sftp_download', { sessionId: tab.sessionId, remote: fullPath, local: pick.path });
     toast('Downloaded to ' + pick.path, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
