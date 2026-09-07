@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-07
+
+Feature release bringing the SFTP client to FileZilla parity: a background
+transfer queue, dual-pane browsing, remote file permissions, recursive search,
+per-server bookmarks, multi-select, and more.
+
+### Added
+
+- **Background transfer queue** — uploads and downloads run on dedicated SFTP
+  channels over the live SSH connection, so browsing stays responsive during
+  transfers. Queued/Failed/Done tabs with per-job progress bars, transfer
+  speed, cancel and retry, aggregate status, and clear-finished. Two transfers
+  run in parallel by default; configurable 1–4 in Settings. Double-clicking a
+  remote file enqueues a download to the last-used directory; "Download as…"
+  keeps the save dialog. Directory transfers expand recursively in both
+  directions.
+- **File permissions (chmod)** — dialog with an owner/group/other read/write/
+  execute grid, live two-way octal sync, recursion, and files/directories/all
+  targeting. Prefilled from the server's current mode.
+- **Recursive remote search** — inline search bar over the current directory
+  tree (case-insensitive, 500-result cap, depth-limited); results stream in
+  live and clicking one navigates to its folder.
+- **Per-server bookmarks** — save the current remote (and local) directory as
+  a named bookmark via the toolbar star; one click navigates; right-click
+  removes.
+- **Dual-pane mode** — optional local pane alongside the remote listing with
+  a draggable splitter. Drag a local file onto the remote pane (or
+  double-click it) to enqueue an upload; double-click local folders to
+  navigate. OS drag-and-drop onto the remote pane continues to upload.
+- **Multi-select** — Ctrl-click, Shift-click ranges, Ctrl+A, and empty-area
+  click to clear. Context-menu actions (download, delete, chmod) apply to the
+  whole selection with batch-aware labels and a single confirmation.
+- **Sortable columns** — Name/Size/Modified headers with ascending/descending
+  indicators; directories always group first.
+- **New file** — create an empty remote file from the context menu (refuses
+  to overwrite an existing path).
+- **Remote disk usage** — free/total space via `statvfs@openssh.com` shown
+  beside the path bar; hidden automatically when the server lacks support.
+- **Per-tab activity log** — timestamped connect/transfer/chmod/search/delete
+  events, 200-line cap, failures mirrored into it.
+- **SFTP keep-alive** — a 30-second round-trip keeps idle sessions alive
+  through NATs and firewalls; stopped automatically on close, disconnect, or
+  vault lock.
+- **Settings** — parallel transfer count (1–4), show-hidden-files default,
+  and the dual-pane preference persists across sessions.
+- Context menu: Copy path, Copy `sftp://` URL, Select all, Download as….
+
+### Fixed
+
+- Remote entries whose names start with a dot are hidden by default.
+
+### Maintenance
+
+- dev-sshd test fixture now implements `stat`/`lstat`/`setstat`, making
+  chmod, the new-file guard, and queue download expansion testable
+  end-to-end.
+- Verified by a 23-check CDP e2e suite against the live fixture (queue
+  progress events, chmod round-trip, search, bookmarks, multi-select,
+  hidden-file and sort behavior, dual-pane listing, settings round-trip)
+  plus the full Rust test suite.
+
+
 ## [1.4.2] - 2026-09-07
 
 ### Fixed
