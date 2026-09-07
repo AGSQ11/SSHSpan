@@ -1403,14 +1403,22 @@ label:focus-within { color: var(--text); }
 .term-tab-add svg { width: 14px; height: 14px; }
 
 .terminal-body { display: flex; flex: 1; min-height: 0; flex-direction: column; }
-.sftp-body { display: none; flex: 1; min-height: 0; overflow: auto; }
-.sftp-body.visible { display: block; }
-.sftp-panel { padding: 10px 12px; }
-.sftp-toolbar {
-  display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
-}
-.sftp-path {
+.sftp-body { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
+.sftp-body.visible { display: flex; }
+.sftp-panel {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
   flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+.sftp-toolbar {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 0;
+}
+.sftp-toolbar .ghost-btn.active { border-color: var(--accent); color: var(--accent); }
+.sftp-path {
+  flex: 1; min-width: 80px;
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -1419,7 +1427,33 @@ label:focus-within { color: var(--text); }
   font-family: 'JetBrains Mono', 'Menlo', monospace;
   font-size: 12px;
 }
+.sftp-fsinfo { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+
+/* panes (dual mode) */
+.sftp-panes { display: flex; flex: 1; min-height: 0; gap: 0; }
+.sftp-pane { flex: 1; min-width: 0; overflow: auto; display: flex; flex-direction: column; }
+.sftp-splitter {
+  flex: none; width: 6px; cursor: col-resize;
+  background: transparent; position: relative;
+}
+.sftp-splitter::after {
+  content: ''; position: absolute; left: 2px; top: 10%; bottom: 10%; width: 2px;
+  background: var(--line-strong); border-radius: 2px;
+}
+.sftp-splitter:hover::after { background: var(--accent); }
+.sftp-panel:not(.dual) .sftp-local,
+.sftp-panel:not(.dual) .sftp-splitter { display: none; }
+
+/* sortable table */
 .sftp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.sftp-table th {
+  text-align: left; padding: 6px 8px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--text-faint); border-bottom: 1px solid var(--line);
+  cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel);
+}
+.sftp-table th.sorted { color: var(--accent); }
+.sftp-table th.sorted::after { content: ' ↑'; }
+.sftp-table th.sorted.desc::after { content: ' ↓'; }
 .sftp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); }
 .sftp-entry { cursor: default; user-select: none; outline: none; }
 .sftp-entry.sftp-dir { cursor: pointer; }
@@ -1428,6 +1462,71 @@ label:focus-within { color: var(--text); }
 .sftp-entry:hover, .sftp-entry:focus-visible { background: var(--hover); }
 .sftp-entry.selected { background: var(--accent-weak); box-shadow: inset 3px 0 var(--accent); }
 .sftp-entry.selected td:first-child { color: var(--text); }
+
+/* search bar */
+.sftp-searchbar { display: flex; flex-direction: column; gap: 4px; }
+.sftp-searchbar[hidden] { display: none; }
+.sftp-searchbar input {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 9px; color: var(--text); font-size: 13px;
+}
+.sftp-searchstatus { font-size: 11px; color: var(--text-dim); }
+.sftp-searchresults { max-height: 160px; overflow: auto; display: flex; flex-direction: column; gap: 2px; }
+.sftp-searchitem {
+  padding: 4px 8px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  font-family: var(--mono); color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sftp-searchitem:hover { background: var(--hover); color: var(--accent); }
+
+/* activity log */
+.sftp-log {
+  max-height: 140px; overflow: auto; margin: 0;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; font-size: 11px; color: var(--text-dim);
+  font-family: var(--mono); white-space: pre-wrap;
+}
+.sftp-log[hidden] { display: none; }
+
+/* transfer queue */
+.sftp-queuepanel {
+  flex: none; max-height: 200px; display: flex; flex-direction: column;
+  border-top: 1px solid var(--line); background: var(--panel);
+  padding: 6px 12px; gap: 6px;
+}
+.sftp-queuehead { display: flex; align-items: center; gap: 10px; }
+.sftp-queuetitle { font-size: 12px; font-weight: 600; color: var(--text); }
+.sftp-queuesummary { font-size: 11px; color: var(--text-dim); flex: 1; }
+.sftp-queuetabs { display: flex; gap: 4px; }
+.sftp-queuetab {
+  background: transparent; border: 1px solid transparent; border-radius: 6px;
+  color: var(--text-dim); font-size: 11px; padding: 3px 8px; cursor: pointer;
+}
+.sftp-queuetab.active { color: var(--accent); border-color: var(--accent); }
+.sftp-queuelist { overflow: auto; display: flex; flex-direction: column; gap: 4px; }
+.sftp-queueitem { display: flex; align-items: center; gap: 10px; }
+.sftp-queueinfo { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.sftp-queuename {
+  font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sftp-queuesub { font-size: 11px; color: var(--text-faint); }
+.sftp-queuebar {
+  flex: none; width: 160px; height: 6px; border-radius: 3px;
+  background: var(--panel-3); overflow: hidden;
+}
+.sftp-queuefill { height: 100%; background: var(--accent); transition: width .2s; }
+.sftp-queuefill.done { background: var(--ok); }
+.sftp-queuefill.failed { background: var(--danger); }
+.sftp-queueactions { display: flex; gap: 4px; }
+
+/* chmod dialog grid */
+.chmod-grid { width: 100%; border-collapse: collapse; }
+.chmod-grid th, .chmod-grid td { padding: 6px 10px; text-align: center; }
+.chmod-grid thead th { font-size: 11px; color: var(--text-faint); text-transform: uppercase; }
+.chmod-grid tbody th { text-align: left; font-size: 13px; color: var(--text); }
+.chmod-grid input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
+
 .sftp-drop-hint {
   margin-top: 10px;
   border: 1px dashed var(--line-strong);

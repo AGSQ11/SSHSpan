@@ -15,7 +15,9 @@
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
-use russh_sftp::protocol::{File, FileAttributes, Handle, Name, Status, StatusCode, Version};
+use russh_sftp::protocol::{
+    Attrs, File, FileAttributes, Handle, Name, Status, StatusCode, Version,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -177,6 +179,27 @@ impl FsSftp {
     fn abs(&self, p: &str) -> PathBuf {
         to_abs(&self.root, p)
     }
+    fn attrs_for(abs: &std::path::Path) -> FileAttributes {
+        let mut attrs = FileAttributes::dummy();
+        if let Ok(md) = std::fs::metadata(abs) {
+            attrs.size = Some(if md.is_dir() { 0 } else { md.len() });
+            attrs.mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as u32);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                attrs.permissions = Some(md.permissions().mode() & 0o7777);
+            }
+            #[cfg(windows)]
+            {
+                attrs.permissions = Some(0o644);
+            }
+        }
+        attrs
+    }
     fn virt(&self, p: &Path) -> String {
         let rel = p.strip_prefix(&self.root).unwrap_or(p);
         format!("/{}", rel.display())
@@ -258,6 +281,47 @@ impl russh_sftp::server::Handler for FsSftp {
         Ok(Name {
             id,
             files: vec![File::dummy(&virt)],
+        })
+    }
+
+    async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let abs = self.abs(&path);
+        if !abs.exists() {
+            return Err(StatusCode::NoSuchFile);
+        }
+        Ok(Attrs {
+            id,
+            attrs: Self::attrs_for(&abs),
+        })
+    }
+
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        self.stat(id, path).await
+    }
+
+    async fn setstat(
+        &mut self,
+        id: u32,
+        path: String,
+        attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        let abs = self.abs(&path);
+        if let Some(mode) = attrs.permissions {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(mode));
+            }
+            #[cfg(windows)]
+            {
+                let _ = mode; // read-only toggle not modeled on Windows fixture
+            }
+        }
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
         })
     }
 

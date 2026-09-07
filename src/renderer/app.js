@@ -1635,6 +1635,34 @@ async function loadSettings() {
   checkNow.addEventListener('click', manualUpdateCheck);
   mkRow('Updates', checkNow);
 
+  const sftpParallel = document.createElement('input');
+  sftpParallel.type = 'number';
+  sftpParallel.min = '1';
+  sftpParallel.max = '4';
+  sftpParallel.value = state.settings.sftpParallel || 2;
+  sftpParallel.addEventListener('change', async () => {
+    const v = Math.max(1, Math.min(4, parseInt(sftpParallel.value, 10) || 2));
+    sftpParallel.value = v;
+    try {
+      await call('settings_set', { key: 'sftpParallel', value: String(v) });
+      state.settings.sftpParallel = v;
+      toast('Parallel transfers updated.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('SFTP parallel transfers (1–4)', sftpParallel);
+
+  const sftpHidden = document.createElement('input');
+  sftpHidden.type = 'checkbox';
+  sftpHidden.checked = state.settings.sftpShowHidden === '1';
+  sftpHidden.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'sftpShowHidden', value: sftpHidden.checked ? '1' : '0' });
+      state.settings.sftpShowHidden = sftpHidden.checked ? '1' : '0';
+      toast('Saved.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Show hidden files in SFTP by default', sftpHidden);
+
   loadKnownHosts();
 }
 
@@ -2691,6 +2719,7 @@ function escapeHtml(s) {
   // Auto-lock needs the persisted settings at boot (loadSettings only runs
   // when the Settings view is opened).
   try { state.settings = await call('settings_get'); } catch (e) { state.settings = {}; }
+  state.sftpDualPane = state.settings.sftpDualPane === '1';
 
   // Auto-lock idle timer: user activity resets it; expiry calls lockNow().
   for (const ev of ['keydown', 'mousedown', 'wheel', 'touchstart']) {

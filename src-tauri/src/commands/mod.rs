@@ -1431,6 +1431,10 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
         "sshConfigPath",
         "theme",
         "confirmDelete",
+        "autoUpdateCheck",
+        "sftpParallel",
+        "sftpShowHidden",
+        "sftpDualPane",
     ];
     let mut settings = serde_json::Map::new();
     for key in &keys {

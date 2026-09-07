@@ -497,6 +497,53 @@
     </div>
   </div>
 
+  <!-- SFTP chmod modal -->
+  <div class="modal-backdrop" id="chmodModal" hidden>
+    <div class="modal modal-sm">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="settings"></span>
+          <h2 id="chmodTitle">Permissions</h2>
+        </div>
+        <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
+      </header>
+      <div class="modal-body">
+        <table class="chmod-grid">
+          <thead>
+            <tr><th></th><th>Read</th><th>Write</th><th>Execute</th></tr>
+          </thead>
+          <tbody>
+            <tr><th>Owner</th>
+              <td><input type="checkbox" id="chmod-owner-r" /></td>
+              <td><input type="checkbox" id="chmod-owner-w" /></td>
+              <td><input type="checkbox" id="chmod-owner-x" /></td></tr>
+            <tr><th>Group</th>
+              <td><input type="checkbox" id="chmod-group-r" /></td>
+              <td><input type="checkbox" id="chmod-group-w" /></td>
+              <td><input type="checkbox" id="chmod-group-x" /></td></tr>
+            <tr><th>Other</th>
+              <td><input type="checkbox" id="chmod-other-r" /></td>
+              <td><input type="checkbox" id="chmod-other-w" /></td>
+              <td><input type="checkbox" id="chmod-other-x" /></td></tr>
+          </tbody>
+        </table>
+        <label>Numeric value <input type="text" id="chmodOctal" maxlength="3" placeholder="644" /></label>
+        <label class="toggle-chip"><input type="checkbox" id="chmodRecurse" /><span class="toggle-box"></span>Recurse into subdirectories</label>
+        <label>Apply to
+          <select id="chmodApplyTo">
+            <option value="all">Files and directories</option>
+            <option value="files">Files only</option>
+            <option value="dirs">Directories only</option>
+          </select>
+        </label>
+      </div>
+      <footer class="modal-footer">
+        <button id="chmodCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="chmodApplyBtn" class="primary-btn">Apply</button>
+      </footer>
+    </div>
+  </div>
+
   <script src="icons.js"></script>
   <script src="app.js"></script>
   <!-- vendor/xterm.js, addon-fit.js, addon-web-links.js and terminal.js are
