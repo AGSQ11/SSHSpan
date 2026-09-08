@@ -980,6 +980,11 @@ pub fn category_list(app: AppHandle) -> CmdResult<serde_json::Value> {
     let db = &app.state::<AppState>().db;
     let categories = db.list_categories().map_err(|e| e.to_string())?;
     let kc_map = db.all_key_categories().map_err(|e| e.to_string())?;
+    let host_orphans = db
+        .list_servers()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|s| s.category_id.is_none());
     let orphans = db
         .list_keys_with_categories()
         .map_err(|e| e.to_string())?
@@ -993,6 +998,7 @@ pub fn category_list(app: AppHandle) -> CmdResult<serde_json::Value> {
         "categories": categories,
         "allKeyCategories": serde_json::Value::Object(map_for_js),
         "orphans": orphans,
+        "hostOrphans": host_orphans,
     }))
 }
 
@@ -1002,15 +1008,30 @@ pub fn category_create(
     name: String,
     parent_id: Option<String>,
     color: Option<String>,
+    scope: Option<String>,
 ) -> CmdResult<db::Category> {
     let db = &app.state::<AppState>().db;
+    let scope = scope.unwrap_or_else(|| "key".to_string());
+    if scope != "key" && scope != "host" {
+        return Err("Category scope must be key or host.".into());
+    }
+    if let Some(parent) = parent_id.as_deref() {
+        if db
+            .get_category(parent)
+            .map_err(|e| e.to_string())?
+            .map(|p| p.scope != scope)
+            .unwrap_or(true)
+        {
+            return Err("A category parent must use the same key/host scope.".into());
+        }
+    }
     let now = chrono::Utc::now();
     // sort_index = max sibling + 1
     let max_si: i64 = db
         .list_categories()
         .map_err(|e| e.to_string())?
         .iter()
-        .filter(|c| c.parent_id == parent_id)
+        .filter(|c| c.parent_id == parent_id && c.scope == scope)
         .map(|c| c.sort_index)
         .max()
         .unwrap_or(-1);
@@ -1018,6 +1039,7 @@ pub fn category_create(
         id: Uuid::new_v4().to_string(),
         name,
         parent_id,
+        scope,
         color,
         sort_index: max_si + 1,
         created_at: now,
@@ -1074,6 +1096,16 @@ pub fn category_reparent(
             cur = by_id.get(&cur_id).and_then(|c| c.parent_id.clone());
         }
     }
+    if let Some(parent) = new_parent_id.as_deref() {
+        if db
+            .get_category(parent)
+            .map_err(|e| e.to_string())?
+            .map(|p| p.scope != c.scope)
+            .unwrap_or(true)
+        {
+            return Err("A category cannot be moved across key/host scopes.".into());
+        }
+    }
     c.parent_id = new_parent_id;
     if let Some(si) = sort_index {
         c.sort_index = si;
@@ -1099,11 +1131,12 @@ pub fn key_set_categories(
     category_ids: Vec<String>,
 ) -> CmdResult<serde_json::Value> {
     let db = &app.state::<AppState>().db;
-    // Validate every category exists (otherwise sync / typos could create dangling join rows).
+    // Validate every category exists and belongs to the key scope.
     let known: std::collections::HashSet<String> = db
         .list_categories()
         .map_err(|e| e.to_string())?
         .into_iter()
+        .filter(|c| c.scope == "key")
         .map(|c| c.id)
         .collect();
     for cid in &category_ids {
@@ -1149,6 +1182,18 @@ pub fn key_create_with_categories(
         crate::crypto::vault::seal(&pw, &key_data.private_key).map_err(|e| e.to_string())?;
 
     let cats = category_ids.unwrap_or_default();
+    let valid_ids: std::collections::HashSet<String> = app
+        .state::<AppState>()
+        .db
+        .list_categories()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|c| c.scope == "key")
+        .map(|c| c.id)
+        .collect();
+    if cats.iter().any(|id| !valid_ids.contains(id)) {
+        return Err("Keys can only use key categories.".into());
+    }
     let key_record = KeyRecord {
         id: Uuid::new_v4().to_string(),
         name: name_str.clone(),

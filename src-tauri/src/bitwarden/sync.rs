@@ -331,9 +331,10 @@ pub async fn run_sync(
                                             {
                                                 Some(id)
                                             }
-                                            (_, Some(path)) => {
-                                                db.ensure_category_path(&path).ok().flatten()
-                                            }
+                                            (_, Some(path)) => db
+                                                .ensure_category_path_scoped(&path, "key")
+                                                .ok()
+                                                .flatten(),
                                             _ => None,
                                         }
                                     })
@@ -651,9 +652,10 @@ async fn pull_remote_item(
                                         {
                                             Some(id)
                                         }
-                                        (_, Some(path)) => {
-                                            db.ensure_category_path(&path).ok().flatten()
-                                        }
+                                        (_, Some(path)) => db
+                                            .ensure_category_path_scoped(&path, "key")
+                                            .ok()
+                                            .flatten(),
                                         _ => None,
                                     }
                                 })
@@ -685,9 +687,26 @@ fn parse_openssh_public_line(line: &str) -> Result<Vec<u8>> {
 
 // ─── Server sync helpers (Bitwarden Login-type ciphers) ────────────────────
 
+fn prefixed_host_category_path(path: &str) -> String {
+    let mut parts = path.split('/');
+    match parts.next() {
+        Some(root) if !root.is_empty() => std::iter::once(format!("Hosts-{root}"))
+            .chain(parts.map(String::from))
+            .collect::<Vec<_>>()
+            .join("/"),
+        _ => path.to_string(),
+    }
+}
+
+fn unprefix_host_category_path(path: &str) -> String {
+    path.split('/')
+        .map(|part| part.strip_prefix("Hosts-").unwrap_or(part))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Build the `notes` metadata blob for a server cipher: auth method, the
-/// bound key's fingerprint (so the pull side can re-link by fingerprint),
-/// and the category path.
+/// bound key's fingerprint, and the host category path.
 fn server_notes(
     client: &BitwardenClient,
     db: &Database,
@@ -698,12 +717,15 @@ fn server_notes(
         None => None,
     };
     let category = match &sv.category_id {
-        Some(cid) => db.get_category(cid)?.map(|cat| {
-            serde_json::json!({
-                "id": cat.id,
-                "path": db.category_path_string(&cat.id),
-            })
-        }),
+        Some(cid) => db
+            .get_category(cid)?
+            .filter(|cat| cat.scope == "host")
+            .map(|cat| {
+                serde_json::json!({
+                    "id": cat.id,
+                    "path": prefixed_host_category_path(&db.category_path_string(&cat.id)),
+                })
+            }),
         None => None,
     };
     if key_fp.is_none() && category.is_none() {
@@ -847,8 +869,20 @@ fn parse_server_notes(
             let id = c.get("id").and_then(|i| i.as_str()).map(String::from);
             let path = c.get("path").and_then(|p| p.as_str()).map(String::from);
             match (id, path) {
-                (Some(id), _) if db.get_category(&id).ok().flatten().is_some() => Some(id),
-                (_, Some(path)) => db.ensure_category_path(&path).ok().flatten(),
+                (Some(id), _)
+                    if db
+                        .get_category(&id)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.scope == "host")
+                        .unwrap_or(false) =>
+                {
+                    Some(id)
+                }
+                (_, Some(path)) => db
+                    .ensure_category_path_scoped(&unprefix_host_category_path(&path), "host")
+                    .ok()
+                    .flatten(),
                 _ => None,
             }
         });
