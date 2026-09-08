@@ -193,3 +193,21 @@ pinned trust-on-first-use. See [docs/SECURITY.md](docs/SECURITY.md) and
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+## Project statistics
+
+<p align="center">
+  <a href="https://github.com/AGSQ11/SSHSpan/releases">
+    <img src="https://img.shields.io/github/downloads/AGSQ11/SSHSpan/total?style=flat-square&label=Release%20downloads" alt="Total release downloads">
+  </a>
+  <a href="https://github.com/AGSQ11/SSHSpan/releases/latest">
+    <img src="https://img.shields.io/github/downloads/AGSQ11/SSHSpan/latest/total?style=flat-square&label=Latest%20release" alt="Latest release downloads">
+  </a>
+  <a href="https://github.com/AGSQ11/SSHSpan/stargazers">
+    <img src="https://img.shields.io/github/stars/AGSQ11/SSHSpan?style=flat-square&label=Stars" alt="GitHub stars">
+  </a>
+  <a href="https://github.com/AGSQ11/SSHSpan/forks">
+    <img src="https://img.shields.io/github/forks/AGSQ11/SSHSpan?style=flat-square&label=Forks" alt="GitHub forks">
+  </a>
+  <img src="https://hits.sh/github.com/AGSQ11/SSHSpan.svg?style=flat-square&label=README%20views" alt="README views">
+</p>
