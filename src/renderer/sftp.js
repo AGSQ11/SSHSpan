@@ -73,7 +73,10 @@ async function toggleSshSftpMode() {
   }
   if (tab.mode === 'sftp') {
     tab.mode = 'ssh';
-    showSshForTab(tab.tabId);
+    if (state.activeTabId === tab.tabId) {
+      if (typeof window.activateSessionSurface === 'function') window.activateSessionSurface(tab.tabId);
+      else showSshForTab(tab.tabId);
+    }
   } else {
     try {
       if (!tab.sftpReady) {
@@ -85,7 +88,10 @@ async function toggleSshSftpMode() {
         wireQueueEvents();
       }
       tab.mode = 'sftp';
-      showSftpForTab(tab.tabId);
+      if (state.activeTabId === tab.tabId) {
+        if (typeof window.activateSessionSurface === 'function') window.activateSessionSurface(tab.tabId);
+        else showSftpForTab(tab.tabId);
+      }
       await refreshSftpPanel(tab.tabId);
     } catch (e) {
       toast(e.message || String(e), 'err');
@@ -100,7 +106,9 @@ function showSftpForTab(tabId) {
   if (body) body.style.display = 'none';
   if (sbody) {
     sbody.classList.add('visible');
-    for (const child of sbody.children) child.style.display = 'none';
+    for (const child of sbody.children) {
+      child.style.display = child.id === 'sftpQueuePanel' ? 'flex' : 'none';
+    }
     let panel = document.getElementById('sftpPanel-' + tabId);
     if (!panel) {
       panel = buildSftpPanel(tabId);
@@ -109,11 +117,11 @@ function showSftpForTab(tabId) {
     panel.style.display = 'flex';
   }
   let queuePanel = document.getElementById('sftpQueuePanel');
-  if (!queuePanel) {
+  if (!queuePanel && sbody) {
     queuePanel = buildQueuePanel();
     sbody.appendChild(queuePanel);
   }
-  queuePanel.style.display = 'flex';
+  if (queuePanel) queuePanel.style.display = 'flex';
   const label = document.getElementById('termModeLabel');
   if (label) label.textContent = 'SSH';
   const rec = window.tabRecord ? window.tabRecord(tabId) : null;
@@ -121,11 +129,16 @@ function showSftpForTab(tabId) {
 }
 
 function showSshForTab(tabId) {
+  const rec = window.tabRecord ? window.tabRecord(tabId) : null;
   const sbody = document.getElementById('sftpBody');
-  if (sbody) sbody.classList.remove('visible');
+  if (sbody) {
+    sbody.classList.remove('visible');
+    for (const child of sbody.children) child.style.display = 'none';
+  }
   const body = document.getElementById('terminalBody');
   if (body) body.style.display = 'flex';
-  window.showTabTerminal(tabId);
+  if (rec && rec.hostEl) rec.hostEl.style.display = 'block';
+  if (typeof window.showTabTerminal === 'function') window.showTabTerminal(tabId);
   const label = document.getElementById('termModeLabel');
   if (label) label.textContent = 'SFTP';
 }
