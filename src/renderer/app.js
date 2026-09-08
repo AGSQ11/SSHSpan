@@ -2557,10 +2557,7 @@ async function openSessionTab(srv, opts = {}) {
   };
   state.sessions.set(tabId, tab);
   window.createTabTerminal(tabId);
-  state.activeTabId = tabId;
-  window.showTabTerminal(tabId);
-  renderTermTabs();
-  updateTerminalHead();
+  activateSessionSurface(tabId);
   el('termDisconnectBtn').hidden = true;
   el('termReconnectBtn').hidden = true;
   terminalSetStatus(`Connecting to ${srv.host}:${srv.port}…`);
@@ -2645,6 +2642,24 @@ async function reconnectActiveTab() {
   }
 }
 
+/// Activate the complete SSH/SFTP surface for one connection tab.
+function activateSessionSurface(tabId) {
+  const tab = state.sessions.get(tabId);
+  if (!tab) return;
+  window.__activeSessionSurface = tabId;
+  state.activeTabId = tabId;
+  if (tab.mode === 'sftp') {
+    if (typeof window.showSftpForTab !== 'function') return;
+    window.showSftpForTab(tabId);
+  } else {
+    if (typeof window.showSshForTab === 'function') window.showSshForTab(tabId);
+    else if (typeof window.showTabTerminal === 'function') window.showTabTerminal(tabId);
+    else return;
+  }
+  renderTermTabs();
+  updateTerminalHead();
+}
+
 /// Close a tab: disconnect if live, dispose terminal, forget the session.
 function closeSessionTab(tabId, { skipConfirm = false } = {}) {
   const tab = state.sessions.get(tabId);
@@ -2654,32 +2669,33 @@ function closeSessionTab(tabId, { skipConfirm = false } = {}) {
   if (live) call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
   if (tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
   window.destroyTabTerminal(tabId);
+  const panel = document.getElementById('sftpPanel-' + tabId);
+  if (panel) panel.remove();
   state.sessions.delete(tabId);
   if (state.activeTabId === tabId) {
-    state.activeTabId = state.sessions.keys().next().value || null;
-    if (state.activeTabId) {
-      const nt = state.sessions.get(state.activeTabId);
-      if (nt && nt.mode === 'sftp') window.showSftpForTab(state.activeTabId);
-      else window.showTabTerminal(state.activeTabId);
-    } else {
+    const nextId = state.sessions.keys().next().value || null;
+    if (nextId) activateSessionSurface(nextId);
+    else {
+      state.activeTabId = null;
       const sbody = document.getElementById('sftpBody');
-      if (sbody) sbody.classList.remove('visible');
+      if (sbody) {
+        sbody.classList.remove('visible');
+        for (const child of sbody.children) child.style.display = 'none';
+      }
       const body = document.getElementById('terminalBody');
       if (body) body.style.display = 'flex';
+      renderTermTabs();
+      updateTerminalHead();
     }
+  } else {
+    renderTermTabs();
+    updateTerminalHead();
   }
-  renderTermTabs();
-  updateTerminalHead();
 }
 
 /// Activate a tab (click on its chip).
 function activateSessionTab(tabId) {
-  state.activeTabId = tabId;
-  const tab = state.sessions.get(tabId);
-  if (tab && tab.mode === 'sftp') window.showSftpForTab(tabId);
-  else window.showTabTerminal(tabId);
-  renderTermTabs();
-  updateTerminalHead();
+  activateSessionSurface(tabId);
 }
 
 /// Tab strip: chips for each session + the persistent "+" button.
@@ -2748,17 +2764,18 @@ function onSessionClosed(tabId) {
   if (tab.sftpReady) {
     call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
     tab.sftpReady = false;
-    if (tab.mode === 'sftp' && tabId === state.activeTabId) {
-      window.showSshForTab(tabId);
-      tab.mode = 'ssh';
-    }
   }
+  if (tab.mode === 'sftp') tab.mode = 'ssh';
   tab.sessionId = null;
-  if (tabId === state.activeTabId) terminalSetStatus('Connection closed.');
+  if (tabId === state.activeTabId) {
+    activateSessionSurface(tabId);
+    terminalSetStatus('Connection closed.');
+  }
   renderTermTabs();
   updateTerminalHead();
 }
 window.onSessionClosed = onSessionClosed;
+window.activateSessionSurface = activateSessionSurface;
 
 // ─── tiny escaper used by context menus// ─── tiny escaper used by context menus ────────────────────────────────────
 function escapeHtml(s) {
