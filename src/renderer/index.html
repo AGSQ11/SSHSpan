@@ -408,12 +408,13 @@
         </div>
         <button class="icon-btn" id="pickerCloseBtn" title="Close" data-ico-x=""></button>
       </header>
-      <div class="modal-body">
+      <div class="modal-body picker-body">
         <div class="search-wrap picker-search">
           <span class="search-ico" data-ico="search"></span>
-          <input type="search" id="pickerSearch" placeholder="Filter categories…" />
+          <input type="search" id="pickerSearch" role="combobox" aria-expanded="true" aria-controls="pickerTree" aria-autocomplete="list" placeholder="Filter categories…" />
         </div>
-        <div class="picker-tree" id="pickerTree"></div>
+        <div class="picker-selection" id="pickerSelection" aria-live="polite"></div>
+        <div class="picker-tree" id="pickerTree" role="listbox" aria-multiselectable="true" tabindex="-1"></div>
       </div>
       <footer class="modal-footer">
         <button id="pickerCancelBtn" class="ghost-btn">Cancel</button>

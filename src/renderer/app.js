@@ -548,11 +548,15 @@ function openCategoryPicker({ title, initial, single, onSave }) {
   state.pickerSelected = new Set(initial || []);
   state.pickerSingle = !!single;
   state.pickerCallback = onSave;
+  state.pickerActive = -1;
+  state.pickerTrigger = document.activeElement;
   el('pickerTitle').textContent = title || 'Categories';
   el('pickerSaveBtn').textContent = single ? 'Select' : 'Save';
   el('pickerSearch').value = '';
+  el('pickerTree').setAttribute('aria-multiselectable', String(!single));
   renderPickerTree('');
   el('pickerModal').hidden = false;
+  setTimeout(() => el('pickerSearch').focus(), 0);
 }
 
 function closeCategoryPicker() {
@@ -560,62 +564,95 @@ function closeCategoryPicker() {
   state.pickerCallback = null;
   state.pickerSelected = new Set();
   state.pickerSingle = false;
+  state.pickerActive = -1;
+  if (state.pickerTrigger && document.contains(state.pickerTrigger)) state.pickerTrigger.focus();
+  state.pickerTrigger = null;
+}
+
+function pickerToggle(id) {
+  if (state.pickerSelected.has(id)) state.pickerSelected.delete(id);
+  else {
+    if (state.pickerSingle) state.pickerSelected.clear();
+    state.pickerSelected.add(id);
+  }
+  if (state.pickerSingle) {
+    const cb = state.pickerCallback;
+    const ids = [...state.pickerSelected];
+    closeCategoryPicker();
+    if (cb) cb(ids);
+    return;
+  }
+  renderPickerTree(el('pickerSearch').value);
+}
+
+function renderPickerSelection() {
+  const host = el('pickerSelection');
+  host.innerHTML = '';
+  const ids = [...state.pickerSelected];
+  host.hidden = ids.length === 0;
+  if (!ids.length) return;
+  const label = document.createElement('span');
+  label.className = 'picker-selection-label';
+  label.textContent = `${ids.length} selected`;
+  host.appendChild(label);
+  for (const id of ids) {
+    const chip = document.createElement('span');
+    chip.className = 'picker-chip';
+    chip.title = catPathString(id);
+    const text = document.createElement('span'); text.textContent = catPathString(id); chip.appendChild(text);
+    const remove = document.createElement('button');
+    remove.type = 'button'; remove.className = 'picker-chip-remove';
+    remove.setAttribute('aria-label', `Remove ${catPathString(id)}`); remove.innerHTML = ico('x');
+    remove.addEventListener('click', () => pickerToggle(id));
+    chip.appendChild(remove); host.appendChild(chip);
+  }
+  const clear = document.createElement('button');
+  clear.type = 'button'; clear.className = 'picker-clear'; clear.textContent = 'Clear';
+  clear.addEventListener('click', () => { state.pickerSelected.clear(); renderPickerTree(el('pickerSearch').value); });
+  host.appendChild(clear);
 }
 
 function renderPickerTree(filter) {
   const tree = el('pickerTree');
   tree.innerHTML = '';
   const lower = (filter || '').toLowerCase();
+  const rows = [];
   const matches = (name) => !lower || name.toLowerCase().includes(lower);
   const walk = (cat, depth) => {
     const visible = matches(cat.name) || (depth === 0 && lower === '');
-    // include if any descendant matches
     const anyDesc = !lower ? true : treeHasMatchingDescendant(cat.id, lower);
     if (!visible && !anyDesc) return;
-    const row = document.createElement('div');
-    row.className = 'picker-row';
-    if (state.pickerSelected.has(cat.id)) row.classList.add('checked');
-    row.dataset.depth = String(depth);
-    const indent = document.createElement('span');
-    indent.className = 'picker-indent';
-    indent.style.width = (depth * 14) + 'px';
-    row.appendChild(indent);
-    const box = document.createElement('span'); box.className = 'picker-box'; row.appendChild(box);
-    const name = document.createElement('span'); name.className = 'picker-name'; name.textContent = cat.name; row.appendChild(name);
-    row.addEventListener('click', () => {
-      if (state.pickerSelected.has(cat.id)) state.pickerSelected.delete(cat.id);
-      else { if (state.pickerSingle) state.pickerSelected.clear(); state.pickerSelected.add(cat.id); }
-      if (state.pickerSingle) {
-        // commit immediately
-        const cb = state.pickerCallback; closeCategoryPicker();
-        if (cb) cb([...state.pickerSelected]);
-        return;
-      }
-      renderPickerTree(lower);
-    });
-    tree.appendChild(row);
+    rows.push({ cat, depth });
     for (const c of childrenOf(cat.id)) walk(c, depth + 1);
   };
-  // uncategorized
-  if (!lower || 'uncategorized'.includes(lower)) {
-    const u = document.createElement('div');
-    u.className = 'picker-row';
-    u.dataset.depth = '0';
-    const indent = document.createElement('span'); indent.className = 'picker-indent'; u.appendChild(indent);
-    const box = document.createElement('span'); box.className = 'picker-box'; u.appendChild(box);
-    const name = document.createElement('span'); name.className = 'picker-name'; name.textContent = 'Uncategorized'; u.appendChild(name);
-    u.style.display = 'none';
-    tree.appendChild(u);
-  }
   for (const c of childrenOf(null)) walk(c, 0);
   if (state.categories.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'picker-row';
-    empty.style.opacity = '0.6';
-    empty.style.cursor = 'default';
-    empty.innerHTML = '<span class="picker-name">No categories yet. Create one in the sidebar.</span>';
-    tree.appendChild(empty);
+    tree.innerHTML = '<div class="picker-empty">No categories yet. Create one in the sidebar.</div>';
+    renderPickerSelection(); return;
   }
+  if (!rows.length) {
+    tree.innerHTML = '<div class="picker-empty">No matching categories.</div>';
+    renderPickerSelection(); return;
+  }
+  rows.forEach(({ cat, depth }, index) => {
+    const row = document.createElement('div');
+    row.className = 'picker-row' + (state.pickerSelected.has(cat.id) ? ' checked' : '');
+    row.dataset.depth = String(depth); row.dataset.index = String(index); row.dataset.id = cat.id;
+    row.id = `picker-option-${cat.id}`; row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', String(state.pickerSelected.has(cat.id)));
+    row.tabIndex = -1;
+    if (index === state.pickerActive) row.classList.add('active');
+    const indent = document.createElement('span'); indent.className = 'picker-indent'; indent.style.width = `${depth * 14}px`;
+    const box = document.createElement('span'); box.className = 'picker-box';
+    const name = document.createElement('span'); name.className = 'picker-name'; name.textContent = cat.name;
+    row.append(indent, box, name);
+    row.addEventListener('click', () => pickerToggle(cat.id));
+    tree.appendChild(row);
+  });
+  renderPickerSelection();
+  if (state.pickerActive >= rows.length) state.pickerActive = rows.length - 1;
+  const active = tree.querySelector('.picker-row.active');
+  el('pickerSearch').setAttribute('aria-activedescendant', active?.id || '');
 }
 
 function treeHasMatchingDescendant(catId, lower) {
@@ -685,6 +722,8 @@ const state = {
   // picker
   pickerCallback: null,
   pickerSelected: new Set(),  // ids the user has ticked
+  pickerActive: -1,
+  pickerTrigger: null,
   // drag
   draggingCatId: null,
   // prompt
@@ -1952,7 +1991,30 @@ function wire() {
     closeCategoryPicker();
     if (cb) cb(ids);
   });
-  el('pickerSearch').addEventListener('input', (e) => renderPickerTree(e.target.value));
+  el('pickerSearch').addEventListener('input', (e) => {
+    state.pickerActive = -1;
+    renderPickerTree(e.target.value);
+  });
+  el('pickerSearch').addEventListener('keydown', (e) => {
+    const rows = [...el('pickerTree').querySelectorAll('.picker-row[role="option"]')];
+    if (e.key === 'Escape') { e.preventDefault(); closeCategoryPicker(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!rows.length) return;
+      const delta = e.key === 'ArrowDown' ? 1 : -1;
+      state.pickerActive = (state.pickerActive + delta + rows.length) % rows.length;
+      renderPickerTree(el('pickerSearch').value);
+      el('pickerTree').querySelector(`[data-index="${state.pickerActive}"]`)?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    if ((e.key === 'Enter' || e.key === ' ') && state.pickerActive >= 0 && rows[state.pickerActive]) {
+      e.preventDefault();
+      pickerToggle(rows[state.pickerActive].dataset.id);
+    }
+  });
+  el('pickerTree').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeCategoryPicker(); }
+  });
   el('pickerModal').addEventListener('click', (e) => {
     if (e.target === el('pickerModal')) closeCategoryPicker();
   });
