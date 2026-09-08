@@ -23,6 +23,10 @@ configure.
 
 ## What's new
 
+- **v1.7.0** - PuTTY-style terminal utilities: right-click terminal/tab context menu, copy
+  all, paste confirmation, duplicate/restart sessions, configurable scrollback, bell
+  behavior, keyboard compatibility settings, SSH keepalive, and normal remote Tab
+  completion through an explicit `TERM=xterm-256color` + UTF-8 PTY setup.
 - **v1.6.0** - Separate key and host categories: the Keys view and the Hosts/Connect view
   each get their own category tree with independent recursive filters and uncategorized
   counts. Scope is enforced everywhere (assignments, parents, backup/restore) and syncs to
@@ -31,8 +35,6 @@ configure.
 - **v1.5.0** - SFTP reaches FileZilla parity: background transfer queue, dual-pane browsing,
   chmod dialog, recursive search, per-server bookmarks, multi-select, sorting, remote disk
   usage, and SFTP keep-alive.
-- **v1.4.x** - Embedded SFTP client (browse, transfer, drag-and-drop folders), connectivity
-  Test button, deploy-preview fixes, and a batch of audited bug fixes.
 - Full history in the [changelog](CHANGELOG.md).
 
 ## Screenshots
@@ -92,9 +94,11 @@ A quick tour of the desktop UI:
 - **Saved servers** with per-server username + SSH-key binding; optional password storage
   (sealed with your vault master, unsealed only in-process at connect time).
 - **Interactive terminal** (xterm.js + the `russh` Rust SSH library): full ANSI colors,
-  5000-line scrollback, resizable grid.
-- **PuTTY behaviors**: select text to copy instantly, right-click to paste, Ctrl+Shift+C/V,
-  blinking block cursor.
+  configurable scrollback, resizable grid, explicit UTF-8 PTY, and `TERM=xterm-256color`.
+- **PuTTY behaviors**: select text to copy instantly, right-click terminal/tab menu,
+  Copy All, paste with optional multi-line confirmation, Ctrl+Shift+C/V, duplicate and
+  restart sessions, clear/reset terminal, visual or sound bell, keyboard compatibility
+  settings, and optional SSH keepalive.
 - **Host-key pinning (TOFU)** - first connection stores the server's fingerprint; any change
   is refused with a clear warning.
 - **Right-click any key -> "Use this key to connect..."** - pick a saved server (its username
@@ -147,12 +151,12 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
 
 ### From a release (recommended)
 Grab the latest installer from [Releases](https://github.com/AGSQ11/SSHSpan/releases) -
-current release is **v1.6.0**:
+current release is **v1.7.0**:
 
 | Platform | Files |
 | --- | --- |
-| Windows | `SSHSpan_1.6.0_x64-setup.exe` (NSIS, per-user) · `SSHSpan_1.6.0_x64_en-US.msi` (system-wide) |
-| Linux | `SSHSpan_1.6.0_amd64.deb` · `SSHSpan-1.6.0-1.x86_64.rpm` |
+| Windows | `SSHSpan_1.7.0_x64-setup.exe` (NSIS, per-user) · `SSHSpan_1.7.0_x64_en-US.msi` (system-wide) |
+| Linux | `SSHSpan_1.7.0_amd64.deb` · `SSHSpan-1.7.0-1.x86_64.rpm` |
 
 ### Build from source
 Prerequisites: [Rust](https://rustup.rs) (stable), Node.js >= 18 (for the Tauri CLI), and on
