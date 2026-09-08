@@ -178,6 +178,21 @@ impl Database {
         Ok(db)
     }
 
+    /// Open/migrate a database at an explicit path. Test/isolation entry point
+    /// (the app itself always goes through [`Database::new`], which honors the
+    /// `SSHSPAN_DB` override and the platform data dir).
+    #[cfg(test)]
+    pub fn open_at(db_path: PathBuf) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = block(async { SqlitePool::connect(&db_url).await })?;
+        let db = Self { pool, db_path };
+        db.migrate()?;
+        Ok(db)
+    }
+
     fn migrate(&self) -> Result<()> {
         block(async {
             sqlx::query(
