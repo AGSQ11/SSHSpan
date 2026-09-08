@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-08
+
+Feature release focused on category organization and everyday picker usability.
+
+### Added
+
+- **Separate key and host categories** — categories now have an explicit `key` or `host` scope. The Keys view shows only key categories; the Hosts/Connect view shows only host categories, with independent filters and uncategorized counts.
+- **Host category filtering** — saved servers can be filtered recursively through their host-category tree, including an explicit uncategorized-hosts entry.
+- **Scope-safe assignments** — keys can only use key categories, servers can only use host categories, and category parents must stay within the same scope.
+- **Scoped backup and restore** — category scope is preserved in vault backups. Older backups without scope continue to restore as key categories, while invalid cross-scope assignments are ignored safely.
+- **Bitwarden host-category namespace** — server category paths are exported with a `Hosts-` prefix, such as `Hosts-Production/Web`, and the prefix is removed on import so host categories remain separate from key categories.
+- **Compact category picker** — the picker now uses a bounded layout with a fixed search area, scrollable results, selected chips, remove/clear actions, empty states, and keyboard navigation.
+- **Accessible picker interactions** — category selection now exposes combobox/listbox semantics, active-row navigation, `aria-selected` state, Escape dismissal, and focus restoration.
+
+### Compatibility and safety
+
+- Existing categories remain key categories during migration.
+- Existing server references to old shared categories are cleared rather than silently reusing key categories as host categories.
+- Legacy unprefixed Bitwarden server metadata is imported as host-scoped category data.
+
+### Verification
+
+- Rust formatting, compilation, and the full test suite passed: 4 unit tests and 42 integration tests.
+- Renderer syntax checks passed for `app.js` and `sftp.js`.
+- Changes delivered in PR #11 and PR #12.
+
 ## [1.5.0] - 2026-09-07
 
 Feature release bringing the SFTP client to FileZilla parity: a background
