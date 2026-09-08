@@ -510,11 +510,13 @@ impl Database {
             fingerprint_md5: row.get("fingerprint_md5"),
             comment: row.get("comment"),
             created_at: DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())
-                .unwrap()
-                .with_timezone(&Utc),
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())
-                .unwrap()
-                .with_timezone(&Utc),
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|| Utc::now()),
             deployed: row.get::<i64, _>("deployed") != 0,
             deploy_path: row.get("deploy_path"),
             bitwarden_id: row.get("bitwarden_id"),
@@ -592,8 +594,9 @@ impl Database {
                     timestamp: DateTime::parse_from_rfc3339(
                         row.get::<String, _>("timestamp").as_str(),
                     )
-                    .unwrap()
-                    .with_timezone(&Utc),
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|| Utc::now()),
                 })
                 .collect())
         })
@@ -938,11 +941,13 @@ impl Database {
             color: row.get("color"),
             sort_index: row.get::<i64, _>("sort_index"),
             created_at: DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())
-                .unwrap()
-                .with_timezone(&Utc),
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|| Utc::now()),
             updated_at: DateTime::parse_from_rfc3339(row.get::<String, _>("updated_at").as_str())
-                .unwrap()
-                .with_timezone(&Utc),
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|| Utc::now()),
         }
     }
 
