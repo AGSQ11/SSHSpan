@@ -164,16 +164,25 @@ struct FsSftp {
     handles: HashMap<String, PathBuf>, // handle string -> file path
     write_handles: HashMap<String, std::fs::File>,
     next_handle: u32,
+    /// Whether the EOF-FAILURE emulation is active (see `read`).
+    eof_fail_emulation: bool,
 }
 
 impl FsSftp {
     fn new(root: PathBuf) -> Self {
+        // EOF-failure emulation: act like a server that returns FAILURE for a
+        // read crossing the real EOF (see `read`). Enabled by setting
+        // SSHSPAN_DEV_SFTP_EOF_FAILURE=1; any truthy value works.
+        let eof_fail_emulation = std::env::var("SSHSPAN_DEV_SFTP_EOF_FAILURE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
         Self {
             root,
             dir_entries: None,
             handles: HashMap::new(),
             write_handles: HashMap::new(),
             next_handle: 1,
+            eof_fail_emulation,
         }
     }
     fn abs(&self, p: &str) -> PathBuf {
@@ -414,6 +423,30 @@ impl russh_sftp::server::Handler for FsSftp {
     ) -> Result<russh_sftp::protocol::Data, Self::Error> {
         use std::io::{Read, Seek, SeekFrom};
         eprintln!("[dev-sshd] read ENTER id={id} handle={handle} offset={offset} len={len}");
+        // Bug-emulation mode: SFTP servers/bridges that answer a read which
+        // crosses the file's EOF with SSH_FX_FAILURE ("short read" style)
+        // instead of a short DATA packet + a later EOF status. Set
+        // SSHSPAN_DEV_SFTP_EOF_FAILURE=1 to reproduce the "Send to" bug:
+        // download failed: Failure: Failure. Only files whose name starts
+        // with "eof-failure" are affected.
+        if self.eof_fail_emulation
+            && self
+                .handles
+                .get(&handle)
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("eof-failure"))
+        {
+            if let Some(path) = self.handles.get(&handle) {
+                if let Ok(md) = std::fs::metadata(path) {
+                    let size = md.len();
+                    if offset < size && offset + len as u64 > size {
+                        eprintln!("[dev-sshd] read: EOF-failure emulation hit (size={size})");
+                        return Err(StatusCode::Failure);
+                    }
+                }
+            }
+        }
         let Some(path) = self.handles.get(&handle) else {
             eprintln!("[dev-sshd] read: no such handle");
             return Err(StatusCode::Failure);
@@ -422,9 +455,13 @@ impl russh_sftp::server::Handler for FsSftp {
             eprintln!("[dev-sshd] read: open FAILED: {e}");
             StatusCode::Failure
         })?;
+        // Normal servers (OpenSSH included) clamp the read to the file size
+        // and return a short DATA packet; a following read at EOF gets EOF.
+        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let n = (len as u64).min(size.saturating_sub(offset)) as usize;
         f.seek(SeekFrom::Start(offset))
             .map_err(|_| StatusCode::Failure)?;
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = vec![0u8; n];
         let n = f.read(&mut buf).map_err(|_| StatusCode::Failure)?;
         buf.truncate(n);
         eprintln!("[dev-sshd] read EXIT id={id} n={n}");

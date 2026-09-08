@@ -221,12 +221,17 @@ async fn open_transfer_channel(
 }
 
 /// Chunked copy with progress + cancellation. Returns bytes copied.
+/// `max_read` clamps each read (downloads pass the remaining file size) so
+/// the final read never crosses EOF — some SFTP servers answer such reads
+/// with SSH_FX_FAILURE instead of a short read, which would fail the whole
+/// transfer on the last chunk.
 async fn copy_with_progress<R, W>(
     app: &AppHandle,
     job_id: u64,
     reader: &mut R,
     writer: &mut W,
     cancel: Arc<AtomicBool>,
+    max_read: Option<u64>,
 ) -> Result<u64, String>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -242,7 +247,19 @@ where
         if cancel.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
-        let n = reader.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if let Some(max) = max_read {
+            if done >= max {
+                break;
+            }
+        }
+        let want = match max_read {
+            Some(max) => ((max - done) as usize).min(buf.len()),
+            None => buf.len(),
+        };
+        let n = reader
+            .read(&mut buf[..want])
+            .await
+            .map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
@@ -344,18 +361,34 @@ async fn run_job(
                     .create(&remote)
                     .await
                     .map_err(|e| format!("remote open failed: {e}"))?;
-                copy_with_progress(&app, job_id, &mut lf, &mut rf, cancel.clone()).await?;
+                copy_with_progress(&app, job_id, &mut lf, &mut rf, cancel.clone(), None).await?;
                 rf.close().await.map_err(|e| format!("close failed: {e}"))?;
             }
             JobKind::Download => {
-                let mut rf = sftp
-                    .open(&remote)
+                let mut rf = sftp.open(&remote).await.map_err(|e| {
+                    format!(
+                        "remote open failed: {}",
+                        crate::commands::sftp::sftp_error_detail(e)
+                    )
+                })?;
+                // Clamp reads to the file size so the final chunk never
+                // crosses EOF (see copy_with_progress doc comment).
+                let size = sftp
+                    .metadata(&remote)
                     .await
-                    .map_err(|e| format!("remote open failed: {e}"))?;
+                    .map_err(|e| {
+                        format!(
+                            "remote stat failed: {}",
+                            crate::commands::sftp::sftp_error_detail(e)
+                        )
+                    })?
+                    .size
+                    .unwrap_or(0);
                 let mut lf = tokio::fs::File::create(&local)
                     .await
                     .map_err(|e| format!("local create failed: {e}"))?;
-                copy_with_progress(&app, job_id, &mut rf, &mut lf, cancel.clone()).await?;
+                copy_with_progress(&app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size))
+                    .await?;
                 lf.flush()
                     .await
                     .map_err(|e| format!("local flush failed: {e}"))?;

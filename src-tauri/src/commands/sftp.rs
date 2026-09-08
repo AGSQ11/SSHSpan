@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use notify::Watcher;
 use tauri::{AppHandle, Manager};
+use tokio::io::AsyncWriteExt;
 
 use std::sync::Arc as StdArc;
 
@@ -25,6 +26,36 @@ fn sftp_from_session(
     app.state::<SftpRegistry>()
         .get(session_id)
         .ok_or_else(|| CmdError("SFTP is not open for this session — switch to SFTP first.".into()))
+}
+
+/// Render a russh-sftp error as a clean, single-layer message.
+///
+/// russh-sftp's `Status` Display is "{status_code}: {error_message}", which
+/// for a bare SSH_FXP_FAILURE with no message becomes "Failure: " (or
+/// "Failure: Failure" when the server echoes the code name as the message).
+/// Re-wrapping that in "download failed: …" produced the user-facing
+/// "download failed: Failure: Failure" toast that hid the real cause.
+/// This helper surfaces the status code meaningfully instead.
+pub(crate) fn sftp_error_detail(e: russh_sftp::client::error::Error) -> String {
+    match e {
+        russh_sftp::client::error::Error::Status(status) => {
+            let code = status.status_code as u32;
+            let msg = status.error_message.trim();
+            // A message that just repeats the code name ("Failure") adds nothing.
+            let code_name = status.status_code.to_string();
+            if msg.is_empty() || msg == code_name {
+                format!("SFTP server returned {code_name} (code {code}) with no further detail")
+            } else {
+                format!("{code_name} (code {code}): {msg}")
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// `CmdError` wrapper around [`sftp_error_detail`] with a stage prefix.
+fn describe_sftp_error(stage: &str, e: russh_sftp::client::error::Error) -> CmdError {
+    CmdError(format!("{stage} failed: {}", sftp_error_detail(e)))
 }
 
 /// Open the SFTP subsystem on a live session (lazily, on first SFTP switch).
@@ -150,23 +181,86 @@ pub async fn sftp_download(
     local: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
-    let mut remote_file = sftp
-        .open(&remote)
-        .await
-        .map_err(|e| CmdError(format!("open failed: {e}")))?;
-    let mut local_file = tokio::fs::File::create(&local)
-        .await
-        .map_err(|e| CmdError(e.to_string()))?;
-    tokio::io::copy(&mut remote_file, &mut local_file)
-        .await
-        .map_err(|e| CmdError(format!("download failed: {e}")))?;
-    // Await the SFTP CLOSE response so a completed transfer is not reported
-    // while the remote handle is still being flushed/closed.
-    remote_file
-        .close()
-        .await
-        .map_err(|e| CmdError(format!("download close failed: {e}")))?;
+    download_to(&sftp, &remote, &local).await?;
     Ok(serde_json::json!({ "ok": true, "local": local }))
+}
+
+/// Download `remote` into local path `local`, robust against SFTP servers
+/// that answer a read crossing EOF with SSH_FX_FAILURE instead of a short
+/// read (seen in the wild on some sftp-server bridges/gateways; reproduced
+/// against the dev-sshd fixture in EOF-FAILURE mode — the exact
+/// "download failed: Failure: Failure" report).
+///
+/// Two defenses:
+/// 1. Size-clamped reads: stat the file first and never request bytes past
+///    EOF. `tokio::io::copy` always asks for a full 8 KiB buffer, so its
+///    final read crosses EOF on any file whose size is not a multiple of
+///    8 KiB — fatal against such servers.
+/// 2. Tolerant close: if the server answers the CLOSE of a fully-copied
+///    read handle with SSH_FX_FAILURE, the data has already landed locally,
+///    so the transfer is treated as complete (logged, not failed).
+pub async fn download_to(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+    local: &str,
+) -> Result<(), CmdError> {
+    use tokio::io::AsyncReadExt;
+
+    let size = sftp
+        .metadata(remote)
+        .await
+        .map_err(|e| describe_sftp_error("stat", e))?
+        .size
+        .unwrap_or(0);
+
+    let mut remote_file = sftp
+        .open(remote)
+        .await
+        .map_err(|e| describe_sftp_error("open", e))?;
+    let mut local_file = tokio::fs::File::create(local)
+        .await
+        .map_err(|e| CmdError(format!("local create failed: {e}")))?;
+
+    // 32 KiB chunks, each clamped to the remaining bytes. A short read (<
+    // requested) means EOF on well-behaved servers; the size clamp means we
+    // never ask past EOF on any server.
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut done: u64 = 0;
+    while done < size {
+        let want = ((size - done) as usize).min(buf.len());
+        let n = remote_file
+            .read(&mut buf[..want])
+            .await
+            .map_err(|e| CmdError(format!("download failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        local_file
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| CmdError(format!("local write failed: {e}")))?;
+        done += n as u64;
+    }
+    local_file
+        .flush()
+        .await
+        .map_err(|e| CmdError(format!("local flush failed: {e}")))?;
+    drop(local_file);
+
+    if done < size {
+        return Err(CmdError(format!(
+            "download incomplete: got {done} of {size} bytes from {remote}"
+        )));
+    }
+
+    // Await the SFTP CLOSE response so a completed transfer is not reported
+    // while the remote handle is still being flushed/closed. Some servers
+    // reply FAILURE to CLOSE of a read handle even after a clean copy; the
+    // bytes are already local, so that is a warning, not a failure.
+    if let Err(e) = remote_file.close().await {
+        log::warn!("[sshspan-sftp] close after download of {remote}: {e}");
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -271,17 +365,7 @@ pub async fn sftp_open_for_edit(
         &session_id[..8.min(session_id.len())]
     ));
 
-    let mut remote_file = sftp
-        .open(&remote)
-        .await
-        .map_err(|e| CmdError(format!("open failed: {e}")))?;
-    let mut local_file = tokio::fs::File::create(&local)
-        .await
-        .map_err(|e| CmdError(e.to_string()))?;
-    tokio::io::copy(&mut remote_file, &mut local_file)
-        .await
-        .map_err(|e| CmdError(format!("download failed: {e}")))?;
-    drop(local_file);
+    download_to(&sftp, &remote, &local.display().to_string()).await?;
     let local_str = local.display().to_string();
 
     let key = format!("{session_id}:{remote}");
@@ -994,4 +1078,71 @@ pub fn sftp_stage_path(name: String) -> CmdResult<serde_json::Value> {
         .map(|c| if c == '/' || c == 92 as char { '_' } else { c })
         .collect();
     Ok(serde_json::json!({ "path": edit_temp_dir().join(safe).display().to_string() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_err(
+        code: russh_sftp::protocol::StatusCode,
+        msg: &str,
+    ) -> russh_sftp::client::error::Error {
+        russh_sftp::client::error::Error::Status(russh_sftp::protocol::Status {
+            id: 1,
+            status_code: code,
+            error_message: msg.to_string(),
+            language_tag: "en-US".to_string(),
+        })
+    }
+
+    #[test]
+    fn sftp_error_detail_bare_failure_not_doubled() {
+        // The exact user report: bare SSH_FX_FAILURE whose message repeats
+        // the code name. Old rendering chained to "Failure: Failure".
+        let e = status_err(russh_sftp::protocol::StatusCode::Failure, "Failure");
+        assert_eq!(
+            sftp_error_detail(e),
+            "SFTP server returned Failure (code 4) with no further detail"
+        );
+    }
+
+    #[test]
+    fn sftp_error_detail_empty_message() {
+        let e = status_err(russh_sftp::protocol::StatusCode::Failure, "");
+        assert_eq!(
+            sftp_error_detail(e),
+            "SFTP server returned Failure (code 4) with no further detail"
+        );
+    }
+
+    #[test]
+    fn sftp_error_detail_real_message_preserved() {
+        let e = status_err(
+            russh_sftp::protocol::StatusCode::PermissionDenied,
+            "Permission denied",
+        );
+        assert_eq!(
+            sftp_error_detail(e),
+            "SFTP server returned Permission denied (code 3) with no further detail"
+        );
+        let e = status_err(
+            russh_sftp::protocol::StatusCode::NoSuchFile,
+            "/home/x/telus: no such file",
+        );
+        assert_eq!(
+            sftp_error_detail(e),
+            "No such file (code 2): /home/x/telus: no such file"
+        );
+    }
+
+    #[test]
+    fn stage_path_sanitizes_separators() {
+        let r = sftp_stage_path("a/b\\c".into()).unwrap();
+        let p = r["path"].as_str().unwrap();
+        assert!(
+            p.ends_with("a_b_c"),
+            "path separators must be flattened: {p}"
+        );
+    }
 }
