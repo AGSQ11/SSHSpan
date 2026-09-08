@@ -722,7 +722,7 @@ function renderCategoryChips(targetEl, ids, { removable, onRemove, onClickPath }
 
 // ─── app state ─────────────────────────────────────────────────────────────
 
-const state = {
+const state = window.state = {
   hasVault: false,
   unlocked: false,
   vaultMode: 'unlock',
@@ -913,6 +913,54 @@ function clearKeysUI() {
   updateBreadcrumb();
   updateCatFilterButton();
 }
+
+function openTerminalContextMenu(x, y, tabId) {
+  closeKeyConnectMenu();
+  const tab = state.sessions.get(tabId);
+  if (!tab) return;
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.id = 'keyConnectMenu';
+  const mk = (label, icon, fn) => {
+    const b = document.createElement('button');
+    b.className = 'ctx-item';
+    b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
+    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
+    menu.appendChild(b);
+    return b;
+  };
+  mk('Copy', 'copy', () => window.terminalCopySelection(tabId));
+  mk('Copy all to clipboard', 'copy', () => window.terminalCopyAll(tabId));
+  mk('Paste', 'clipboard', async () => window.terminalPaste(tabId, await window.terminalReadClipboard()));
+  menu.appendChild(document.createElement('hr')).className = 'ctx-sep';
+  mk('Clear scrollback', 'eraser', () => window.terminalClearScrollback(tabId));
+  mk('Reset terminal', 'rotate-ccw', () => window.terminalReset(tabId));
+  menu.appendChild(document.createElement('hr')).className = 'ctx-sep';
+  mk('New session', 'plus', () => { const srv = state.servers.find(s => s.id === tab.serverId); if (srv) openSessionTab(srv); });
+  mk('Duplicate session', 'copy', () => { const srv = state.servers.find(s => s.id === tab.serverId); if (srv) openSessionTab(srv); });
+  const restart = mk('Restart session', 'refresh-cw', () => reconnectActiveTab());
+  const sftpAction = mk(tab.mode === 'sftp' ? 'Switch to terminal' : 'Switch to SFTP', 'folder-tree', () => window.toggleSshSftpMode());
+  if (!window.tabSessionLive(tabId)) {
+    sftpAction.disabled = true;
+    if (tab.ended) restart.disabled = false;
+  }
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  document.body.appendChild(menu);
+  const onAway = (ev) => {
+    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
+    closeKeyConnectMenu();
+  };
+  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+}
+
+function markTerminalBell(tabId) {
+  const tab = state.sessions.get(tabId);
+  if (!tab) return;
+  tab.bell = true;
+  renderTermTabs();
+}
+window.markTerminalBell = markTerminalBell;
 
 function updateSelectionHint() {
   const n = state.deploySelected.size;
@@ -1679,6 +1727,18 @@ async function loadSettings() {
   });
   mkRow('Confirm before deleting keys', confirmDelete);
 
+  const confirmPaste = document.createElement('input');
+  confirmPaste.type = 'checkbox';
+  confirmPaste.checked = state.settings.confirmMultiLinePaste !== '0';
+  confirmPaste.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'confirmMultiLinePaste', value: confirmPaste.checked ? '1' : '0' });
+      state.settings.confirmMultiLinePaste = confirmPaste.checked ? '1' : '0';
+      toast('Saved.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Confirm before pasting multiple terminal lines', confirmPaste);
+
   const autoUpdate = document.createElement('input');
   autoUpdate.type = 'checkbox';
   autoUpdate.checked = state.settings.autoUpdateCheck !== false;
@@ -1724,6 +1784,101 @@ async function loadSettings() {
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   mkRow('Show hidden files in SFTP by default', sftpHidden);
+
+  const termScrollback = document.createElement('input');
+  termScrollback.type = 'number';
+  termScrollback.min = '1000';
+  termScrollback.max = '50000';
+  termScrollback.step = '1000';
+  termScrollback.value = state.settings.terminalScrollback || 5000;
+  termScrollback.addEventListener('change', async () => {
+    const v = Math.max(1000, Math.min(50000, parseInt(termScrollback.value, 10) || 5000));
+    termScrollback.value = v;
+    try {
+      await call('settings_set', { key: 'terminalScrollback', value: String(v) });
+      state.settings.terminalScrollback = String(v);
+      if (typeof window.terminalApplySettings === 'function') window.terminalApplySettings();
+      toast('Terminal scrollback updated.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Terminal scrollback lines', termScrollback);
+
+  const termBell = document.createElement('select');
+  termBell.innerHTML = '<option value="visual">Visual</option><option value="sound">Sound</option><option value="silent">Silent</option>';
+  termBell.value = state.settings.terminalBell || 'visual';
+  termBell.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'terminalBell', value: termBell.value });
+      state.settings.terminalBell = termBell.value;
+      toast('Terminal bell updated.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Terminal bell', termBell);
+
+  const termBackspace = document.createElement('select');
+  termBackspace.innerHTML = '<option value="default">Delete (0x7f)</option><option value="backspace">Backspace (0x08)</option>';
+  termBackspace.value = state.settings.terminalBackspace || 'default';
+  termBackspace.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'terminalBackspace', value: termBackspace.value });
+      state.settings.terminalBackspace = termBackspace.value;
+      toast('Backspace compatibility updated; it applies to new terminals.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Backspace key sends', termBackspace);
+
+  const termHomeEnd = document.createElement('select');
+  termHomeEnd.innerHTML = '<option value="default">xterm/Home+End standard</option><option value="rxvt">rxvt/Home+End compatibility</option>';
+  termHomeEnd.value = state.settings.terminalHomeEnd || 'default';
+  termHomeEnd.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'terminalHomeEnd', value: termHomeEnd.value });
+      state.settings.terminalHomeEnd = termHomeEnd.value;
+      toast('Home/End compatibility updated; it applies to new terminals.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Home/End key mode', termHomeEnd);
+
+  const termAppCursor = document.createElement('select');
+  termAppCursor.innerHTML = '<option value="default">Allow application cursor keys</option><option value="disabled">Disable application cursor keys</option>';
+  termAppCursor.value = state.settings.terminalAppCursorKeys || 'default';
+  termAppCursor.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'terminalAppCursorKeys', value: termAppCursor.value });
+      state.settings.terminalAppCursorKeys = termAppCursor.value;
+      toast('Cursor-key compatibility updated; it applies to new terminals.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Application cursor keys', termAppCursor);
+
+  const termAppKeypad = document.createElement('select');
+  termAppKeypad.innerHTML = '<option value="default">Allow application keypad</option><option value="disabled">Disable application keypad</option>';
+  termAppKeypad.value = state.settings.terminalAppKeypad || 'default';
+  termAppKeypad.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'terminalAppKeypad', value: termAppKeypad.value });
+      state.settings.terminalAppKeypad = termAppKeypad.value;
+      toast('Keypad compatibility updated; it applies to new terminals.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Application keypad', termAppKeypad);
+
+  const termKeepalive = document.createElement('input');
+  termKeepalive.type = 'number';
+  termKeepalive.min = '0';
+  termKeepalive.max = '3600';
+  termKeepalive.step = '15';
+  termKeepalive.value = state.settings.terminalKeepaliveSeconds || 0;
+  termKeepalive.addEventListener('change', async () => {
+    const v = Math.max(0, Math.min(3600, parseInt(termKeepalive.value, 10) || 0));
+    termKeepalive.value = v;
+    try {
+      await call('settings_set', { key: 'terminalKeepaliveSeconds', value: String(v) });
+      state.settings.terminalKeepaliveSeconds = String(v);
+      toast('SSH keepalive updated; it applies to new connections.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('SSH keepalive interval (seconds, 0=off)', termKeepalive);
 
   loadKnownHosts();
 }
@@ -1914,6 +2069,11 @@ function wire() {
   for (const b of document.querySelectorAll('.nav-item')) {
     b.addEventListener('click', () => switchView(b.dataset.view));
   }
+  el('terminalBody').addEventListener('contextmenu', (ev) => {
+    if (!state.activeTabId) return;
+    ev.preventDefault();
+    openTerminalContextMenu(ev.clientX, ev.clientY, state.activeTabId);
+  });
 
   // topbar
   el('lockBtn').addEventListener('click', lockNow);
@@ -2647,6 +2807,7 @@ function activateSessionSurface(tabId) {
   const tab = state.sessions.get(tabId);
   if (!tab) return;
   window.__activeSessionSurface = tabId;
+  tab.bell = false;
   state.activeTabId = tabId;
   if (tab.mode === 'sftp') {
     if (typeof window.showSftpForTab !== 'function') return;
@@ -2706,7 +2867,7 @@ function renderTermTabs() {
   const addBtn = el('termTabAdd');
   for (const [tabId, tab] of state.sessions) {
     const chip = document.createElement('div');
-    chip.className = 'term-tab' + (tabId === state.activeTabId ? ' active' : '') + (tab.ended ? ' ended' : '');
+    chip.className = 'term-tab' + (tabId === state.activeTabId ? ' active' : '') + (tab.ended ? ' ended' : '') + (tab.bell ? ' bell' : '');
     const dot = document.createElement('span');
     dot.className = 'term-tab-dot' + (window.tabSessionLive(tabId) ? ' live' : '');
     const name = document.createElement('span');
@@ -2722,6 +2883,11 @@ function renderTermTabs() {
     chip.appendChild(name);
     chip.appendChild(close);
     chip.addEventListener('click', () => activateSessionTab(tabId));
+    chip.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      activateSessionTab(tabId);
+      openTerminalContextMenu(ev.clientX, ev.clientY, tabId);
+    });
     strip.insertBefore(chip, addBtn);
   }
 }
