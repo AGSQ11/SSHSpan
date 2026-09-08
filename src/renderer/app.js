@@ -428,7 +428,15 @@ function openCatMenu(cat, anchor) {
   m.style.position = 'fixed';
   m.style.top = (r.bottom + 2) + 'px';
   m.style.left = Math.max(4, r.right - 170) + 'px';
+  // The stylesheet (.cat-menu) sets right:4px for its position:absolute variant.
+  // With position:fixed + left set inline and width:auto, keeping right:4px would
+  // stretch the box from `left` to the viewport's right edge (full-width menu).
+  m.style.right = 'auto';
   document.body.appendChild(m);
+  // Keep the dropdown inside the viewport horizontally (shrink-to-fit width).
+  const vr = m.getBoundingClientRect();
+  const overflow = vr.right - (window.innerWidth - 4);
+  if (overflow > 0) m.style.left = Math.max(4, vr.left - overflow) + 'px';
   openMenu = m;
   setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
   m.addEventListener('click', async (e) => {
