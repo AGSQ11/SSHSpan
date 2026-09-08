@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::AppHandle;
 
+fn default_category_scope() -> String {
+    "key".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyRecord {
     pub id: String,
@@ -40,6 +44,9 @@ pub struct Category {
     pub id: String,
     pub name: String,
     pub parent_id: Option<String>,
+    /// `key` categories organize SSH keys; `host` categories organize saved servers.
+    #[serde(default = "default_category_scope")]
+    pub scope: String,
     pub color: Option<String>,
     pub sort_index: i64,
     pub created_at: DateTime<Utc>,
@@ -263,6 +270,7 @@ impl Database {
                     id          TEXT PRIMARY KEY,
                     name        TEXT NOT NULL,
                     parent_id   TEXT,
+                    scope       TEXT NOT NULL DEFAULT 'key',
                     color       TEXT,
                     sort_index  INTEGER NOT NULL DEFAULT 0,
                     created_at  TEXT NOT NULL,
@@ -273,6 +281,10 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+            let _ =
+                sqlx::query("ALTER TABLE categories ADD COLUMN scope TEXT NOT NULL DEFAULT 'key'")
+                    .execute(&self.pool)
+                    .await;
             sqlx::query(
                 "CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id)",
             )
@@ -341,6 +353,10 @@ impl Database {
                 .execute(&self.pool)
                 .await;
             let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_updated_at TEXT")
+                .execute(&self.pool)
+                .await;
+            // Existing categories are key-scoped; do not silently reuse them for hosts.
+            let _ = sqlx::query("UPDATE servers SET category_id = NULL WHERE category_id IS NOT NULL AND category_id NOT IN (SELECT id FROM categories WHERE scope = 'host')")
                 .execute(&self.pool)
                 .await;
 
@@ -651,7 +667,7 @@ impl Database {
     pub fn list_categories(&self) -> Result<Vec<Category>> {
         block(async {
             let rows = sqlx::query(
-                "SELECT id, name, parent_id, color, sort_index, created_at, updated_at \
+                "SELECT id, name, parent_id, scope, color, sort_index, created_at, updated_at \
                  FROM categories \
                  ORDER BY CASE WHEN parent_id IS NULL THEN 0 ELSE 1 END, sort_index, name",
             )
@@ -664,7 +680,7 @@ impl Database {
     pub fn get_category(&self, id: &str) -> Result<Option<Category>> {
         block(async {
             let row = sqlx::query(
-                "SELECT id, name, parent_id, color, sort_index, created_at, updated_at FROM categories WHERE id = ?"
+                "SELECT id, name, parent_id, scope, color, sort_index, created_at, updated_at FROM categories WHERE id = ?"
             )
             .bind(id)
             .fetch_optional(&self.pool)
@@ -676,12 +692,13 @@ impl Database {
     pub fn insert_category(&self, c: &Category) -> Result<()> {
         block(async {
             sqlx::query(
-                "INSERT INTO categories (id, name, parent_id, color, sort_index, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO categories (id, name, parent_id, scope, color, sort_index, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&c.id)
             .bind(&c.name)
             .bind(&c.parent_id)
+            .bind(&c.scope)
             .bind(&c.color)
             .bind(c.sort_index)
             .bind(c.created_at.to_rfc3339())
@@ -695,10 +712,11 @@ impl Database {
     pub fn update_category(&self, c: &Category) -> Result<()> {
         block(async {
             sqlx::query(
-                "UPDATE categories SET name = ?, parent_id = ?, color = ?, sort_index = ?, updated_at = ? WHERE id = ?"
+                "UPDATE categories SET name = ?, parent_id = ?, scope = ?, color = ?, sort_index = ?, updated_at = ? WHERE id = ?"
             )
             .bind(&c.name)
             .bind(&c.parent_id)
+            .bind(&c.scope)
             .bind(&c.color)
             .bind(c.sort_index)
             .bind(c.updated_at.to_rfc3339())
@@ -916,6 +934,7 @@ impl Database {
             id: row.get("id"),
             name: row.get("name"),
             parent_id: row.get("parent_id"),
+            scope: row.try_get("scope").unwrap_or_else(|_| "key".to_string()),
             color: row.get("color"),
             sort_index: row.get::<i64, _>("sort_index"),
             created_at: DateTime::parse_from_rfc3339(row.get::<String, _>("created_at").as_str())
@@ -949,6 +968,10 @@ impl Database {
     /// it is created with a deterministic id derived from the path so
     /// re-imports converge to the same uuid.
     pub fn ensure_category_path(&self, path: &str) -> Result<Option<String>> {
+        self.ensure_category_path_scoped(path, "key")
+    }
+
+    pub fn ensure_category_path_scoped(&self, path: &str, scope: &str) -> Result<Option<String>> {
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if segments.is_empty() {
             return Ok(None);
@@ -967,7 +990,7 @@ impl Database {
             let existing: Option<Category> = {
                 let rows = self.list_categories()?;
                 rows.into_iter()
-                    .find(|c| c.name == seg && c.parent_id == current_parent)
+                    .find(|c| c.name == seg && c.parent_id == current_parent && c.scope == scope)
             };
             if let Some(c) = existing {
                 let cid = c.id.clone();
@@ -975,12 +998,12 @@ impl Database {
                 current_parent = Some(cid);
             } else {
                 // Create a new node with a deterministic id from the full path.
-                let id = format!("path-{:x}", short_hash(&full_path));
+                let id = format!("path-{:x}", short_hash(&format!("{scope}/{full_path}")));
                 let now = Utc::now();
                 let max_si = self
                     .list_categories()?
                     .into_iter()
-                    .filter(|c| c.parent_id == current_parent)
+                    .filter(|c| c.parent_id == current_parent && c.scope == scope)
                     .map(|c| c.sort_index)
                     .max()
                     .unwrap_or(-1);
@@ -988,6 +1011,7 @@ impl Database {
                     id: id.clone(),
                     name: seg.to_string(),
                     parent_id: current_parent.clone(),
+                    scope: scope.to_string(),
                     color: None,
                     sort_index: max_si + 1,
                     created_at: now,
@@ -1213,6 +1237,8 @@ impl Database {
                     };
                     let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("imported");
                     let parent = c.get("parent_id").and_then(|v| v.as_str());
+                    let scope = c.get("scope").and_then(|v| v.as_str()).unwrap_or("key");
+                    let scope = if scope == "host" { "host" } else { "key" };
                     let color = c.get("color").and_then(|v| v.as_str());
                     let sort = c.get("sort_index").and_then(|v| v.as_i64()).unwrap_or(0);
                     let created = c.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
@@ -1221,12 +1247,12 @@ impl Database {
                         .and_then(|v| v.as_str())
                         .unwrap_or(created);
                     sqlx::query(
-                        "INSERT INTO categories (id, name, parent_id, color, sort_index, created_at, updated_at) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?) \
-                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, parent_id=excluded.parent_id, \
+                        "INSERT INTO categories (id, name, parent_id, scope, color, sort_index, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, parent_id=excluded.parent_id, scope=excluded.scope, \
                            color=excluded.color, sort_index=excluded.sort_index, updated_at=excluded.updated_at",
                     )
-                    .bind(id).bind(name).bind(parent).bind(color).bind(sort).bind(created).bind(updated)
+                    .bind(id).bind(name).bind(parent).bind(scope).bind(color).bind(sort).bind(created).bind(updated)
                     .execute(&mut *tx).await?;
                     cats_n += 1;
                 }
@@ -1281,6 +1307,11 @@ impl Database {
                             .await?;
                         for cid in cats {
                             if let Some(cid) = cid.as_str() {
+                                let is_key = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM categories WHERE id = ? AND scope = 'key'")
+                                    .bind(cid).fetch_one(&mut *tx).await.unwrap_or(0) > 0;
+                                if !is_key {
+                                    continue;
+                                }
                                 sqlx::query("INSERT OR IGNORE INTO key_categories (key_id, category_id) VALUES (?, ?)")
                                     .bind(id).bind(cid).execute(&mut *tx).await?;
                                 kc_n += 1;
@@ -1300,6 +1331,21 @@ impl Database {
                         continue;
                     };
                     let s = |f: &str| sv.get(f).and_then(|v| v.as_str());
+                    let category_id = match s("category_id") {
+                        Some(cid)
+                            if sqlx::query_scalar::<_, i64>(
+                                "SELECT COUNT(*) FROM categories WHERE id = ? AND scope = 'host'",
+                            )
+                            .bind(cid)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .unwrap_or(0)
+                                > 0 =>
+                        {
+                            Some(cid)
+                        }
+                        _ => None,
+                    };
                     sqlx::query(
                         "INSERT INTO servers (id, name, host, port, username, key_id, pem_path, auth_method, \
                            saved_password, category_id, color, last_connected_at, created_at, updated_at) \
@@ -1319,7 +1365,7 @@ impl Database {
                     .bind(s("pem_path"))
                     .bind(s("auth_method").unwrap_or("publickey"))
                     .bind(s("saved_password"))
-                    .bind(s("category_id"))
+                    .bind(category_id)
                     .bind(s("color"))
                     .bind(s("last_connected_at"))
                     .bind(s("created_at").unwrap_or(""))

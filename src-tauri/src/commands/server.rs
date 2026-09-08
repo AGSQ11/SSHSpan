@@ -92,6 +92,16 @@ pub fn server_save(
     }
 
     let db = &app.state::<AppState>().db;
+    if let Some(cid) = category_id.as_deref() {
+        let valid = db
+            .list_categories()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .any(|c| c.id == cid && c.scope == "host");
+        if !valid {
+            return Err(CmdError("Server category must be a host category.".into()).into());
+        }
+    }
     let now = chrono::Utc::now();
 
     // Seal the saved password with the vault password if provided.

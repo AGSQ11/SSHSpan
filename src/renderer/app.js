@@ -140,10 +140,12 @@ function vaultStatusHTML(unlocked, hasVault) {
 
 // ─── category tree helpers ─────────────────────────────────────────────────
 
+function currentCategoryScope() { return state.view === 'connect' ? 'host' : 'key'; }
+
 function rebuildCategoryIndex() {
   state.catsById = new Map();
   state.childrenOf = new Map();
-  for (const c of state.categories) {
+  for (const c of state.categories.filter(c => c.scope === state.categoryScope)) {
     state.catsById.set(c.id, c);
     const key = c.parent_id || ''; // empty string for roots
     if (!state.childrenOf.has(key)) state.childrenOf.set(key, []);
@@ -152,7 +154,7 @@ function rebuildCategoryIndex() {
   for (const list of state.childrenOf.values()) list.sort((a, b) => a.sort_index - b.sort_index || a.name.localeCompare(b.name));
 }
 
-function catById(id) { return state.catsById.get(id); }
+function catById(id) { return state.catsById.get(id) || state.categories.find(c => c.id === id); }
 
 function childrenOf(parentId) {
   return state.childrenOf.get(parentId || '') || [];
@@ -173,6 +175,15 @@ function directKeyCount(catId) {
   for (const ids of Object.values(state.keyCategories)) if (ids.includes(catId)) n++;
   return n;
 }
+
+function directHostCount(catId) {
+  return state.servers.filter(s => s.categoryId === catId).length;
+}
+
+function activeCategoryId() { return state.activeCategoryByScope[state.categoryScope] || 'all'; }
+
+function categoryIdsForScope(scope) { return state.categories.filter(c => c.scope === scope).map(c => c.id); }
+function categoryCount(catId) { return state.categoryScope === 'host' ? directHostCount(catId) : directKeyCount(catId); }
 
 function totalKeyCountFor(catId) {
   // direct + descendants
@@ -211,10 +222,11 @@ function filteredKeys() {
   const q = el('searchInput').value.trim().toLowerCase();
   const type = el('typeFilter').value;
   let pool = state.keys;
-  if (state.activeCategoryId === 'uncategorized') {
+  const activeCat = activeCategoryId();
+  if (activeCat === 'uncategorized') {
     pool = state.keys.filter(k => (state.keyCategories[k.id] || []).length === 0);
-  } else if (state.activeCategoryId !== 'all') {
-    pool = keysInCategoryRecursive(state.activeCategoryId);
+  } else if (activeCat !== 'all') {
+    pool = keysInCategoryRecursive(activeCat);
   }
   return pool.filter(k => {
     if (type && k.key_type !== type) {
@@ -235,7 +247,7 @@ function catNodeEl(cat, depth) {
   row.dataset.id = cat.id;
   row.dataset.depth = String(depth);
   row.draggable = true;
-  if (state.activeCategoryId === cat.id) row.classList.add('active');
+  if (activeCategoryId() === cat.id) row.classList.add('active');
 
   const kids = childrenOf(cat.id);
   const chev = document.createElement('span');
@@ -260,7 +272,7 @@ function catNodeEl(cat, depth) {
 
   const cnt = document.createElement('span');
   cnt.className = 'cat-count';
-  const n = directKeyCount(cat.id);
+  const n = categoryCount(cat.id);
   cnt.textContent = n;
   row.appendChild(cnt);
 
@@ -291,17 +303,17 @@ function renderCategoryTree() {
   if (!tree) return;
   tree.innerHTML = '';
   const panel = el('catPanel');
-  if (panel) panel.hidden = state.categories.length === 0 && !state.orphans;
+  if (panel) panel.hidden = state.categories.filter(c => c.scope === state.categoryScope).length === 0 && !state.orphans;
   if (state.orphans) {
     const u = document.createElement('div');
     u.className = 'cat-node uncategorized';
     u.dataset.id = 'uncategorized';
     u.dataset.depth = '0';
-    if (state.activeCategoryId === 'uncategorized') u.classList.add('active');
+    if (activeCategoryId() === 'uncategorized') u.classList.add('active');
     const chev = document.createElement('span'); chev.className = 'cat-chevron leaf'; u.appendChild(chev);
     const catIco = document.createElement('span'); catIco.className = 'cat-ico'; catIco.innerHTML = ico('folder'); u.appendChild(catIco);
-    const lbl = document.createElement('span'); lbl.className = 'cat-label'; lbl.textContent = 'Uncategorized'; u.appendChild(lbl);
-    const cnt = document.createElement('span'); cnt.className = 'cat-count'; cnt.textContent = uncategorizedKeyCount(); u.appendChild(cnt);
+    const lbl = document.createElement('span'); lbl.className = 'cat-label'; lbl.textContent = state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized keys'; u.appendChild(lbl);
+    const cnt = document.createElement('span'); cnt.className = 'cat-count'; cnt.textContent = state.categoryScope === 'host' ? state.servers.filter(s => !s.categoryId).length : uncategorizedKeyCount(); u.appendChild(cnt);
     u.addEventListener('click', () => setActiveCategory('uncategorized'));
     tree.appendChild(u);
   }
@@ -315,11 +327,12 @@ function toggleCatExpanded(id) {
 }
 
 function setActiveCategory(id) {
-  if (state.activeCategoryId === id) id = 'all';
-  state.activeCategoryId = id;
+  if (activeCategoryId() === id) id = 'all';
+  state.activeCategoryByScope[state.categoryScope] = id;
   renderCategoryTree();
   updateBreadcrumb();
-  renderKeyList();
+  if (state.categoryScope === 'host') renderServerList();
+  else renderKeyList();
   updateCatFilterButton();
   updateSelectionHint();
 }
@@ -329,8 +342,9 @@ function setActiveCategory(id) {
 async function loadCategories() {
   const res = await call('category_list');
   state.categories = res.categories || [];
+  state.categoryScope = currentCategoryScope();
   state.keyCategories = res.allKeyCategories || {};
-  state.orphans = !!res.orphans;
+  state.orphans = state.categoryScope === 'host' ? !!res.hostOrphans : !!res.orphans;
   rebuildCategoryIndex();
   renderCategoryTree();
   updateBreadcrumb();
@@ -339,7 +353,7 @@ async function loadCategories() {
 
 async function createCategory(name, parentId, color) {
   if (!name) return null;
-  const cat = await call('category_create', { name, parentId, color });
+  const cat = await call('category_create', { name, parentId, color, scope: state.categoryScope });
   await loadCategories();
   return cat;
 }
@@ -352,8 +366,8 @@ async function deleteCategory(id) {
   try {
     const res = await call('category_delete', { id });
     await loadCategories();
-    if (state.activeCategoryId === id) setActiveCategory('all');
-    renderKeyList();
+    if (activeCategoryId() === id) setActiveCategory('all');
+    if (state.categoryScope === 'host') renderServerList(); else renderKeyList();
     toast(`Category "${cat.name}" deleted.` + (res.reassigned && res.reassigned.length ? ` ${res.reassigned.length} child(ren) reassigned.` : ''), 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
@@ -371,6 +385,7 @@ async function moveCategoryPrompt(id) {
   // opens the picker in single-select mode for choosing a new parent
   openCategoryPicker({
     title: 'Move to…',
+    scope: state.categoryScope,
     initial: [],
     single: true,
     onSave: async (parentIds) => {
@@ -486,27 +501,28 @@ function attachCatDnD(row, cat, depth) {
 
 function updateBreadcrumb() {
   const bc = el('breadcrumb'); if (!bc) return;
-  if (state.view !== 'keys') { bc.hidden = true; return; }
+  if (state.view !== 'keys' && state.view !== 'connect') { bc.hidden = true; return; }
   let path = [];
-  if (state.activeCategoryId === 'uncategorized') path = ['Uncategorized'];
-  else if (state.activeCategoryId !== 'all') {
-    const segs = catPath(state.activeCategoryId);
+  const activeCat = activeCategoryId();
+  if (activeCat === 'uncategorized') path = [state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized keys'];
+  else if (activeCat !== 'all') {
+    const segs = catPath(activeCat);
     path = segs;
   }
   if (!path.length) { bc.hidden = true; return; }
   bc.hidden = false;
   bc.innerHTML = '';
   const rootLink = document.createElement('a');
-  rootLink.href = '#'; rootLink.textContent = 'Keys';
+  rootLink.href = '#'; rootLink.textContent = state.categoryScope === 'host' ? 'Hosts' : 'Keys';
   rootLink.addEventListener('click', (e) => { e.preventDefault(); setActiveCategory('all'); });
   bc.appendChild(rootLink);
   // for normal category path, walk segments and add clickable ancestors
-  if (state.activeCategoryId === 'uncategorized') {
+  if (activeCat === 'uncategorized') {
     const sep = document.createElement('span'); sep.className = 'crumb-sep'; sep.textContent = '/'; bc.appendChild(sep);
-    const cur = document.createElement('span'); cur.className = 'crumb-current'; cur.textContent = 'Uncategorized'; bc.appendChild(cur);
+    const cur = document.createElement('span'); cur.className = 'crumb-current'; cur.textContent = state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized keys'; bc.appendChild(cur);
   } else {
-    const segs = catPath(state.activeCategoryId);
-    const ids = []; let cur = catById(state.activeCategoryId);
+    const segs = catPath(activeCat);
+    const ids = []; let cur = catById(activeCat);
     while (cur) { ids.unshift(cur.id); cur = cur.parent_id ? catById(cur.parent_id) : null; }
     for (let i = 0; i < segs.length; i++) {
       const sep = document.createElement('span'); sep.className = 'crumb-sep'; sep.textContent = '/'; bc.appendChild(sep);
@@ -530,21 +546,25 @@ function updateCatFilterButton() {
   const btn = el('catFilterBtn'); if (!btn) return;
   btn.disabled = false;
   const lbl = el('catFilterLabel'); if (!lbl) return;
-  if (state.activeCategoryId === 'all') {
-    lbl.textContent = 'All categories';
+  if (activeCategoryId() === 'all') {
+    lbl.textContent = state.categoryScope === 'host' ? 'All hosts' : 'All categories';
     btn.classList.remove('active');
-  } else if (state.activeCategoryId === 'uncategorized') {
-    lbl.textContent = 'Uncategorized';
+  } else if (activeCategoryId() === 'uncategorized') {
+    lbl.textContent = state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized';
     btn.classList.add('active');
   } else {
-    lbl.textContent = catPathString(state.activeCategoryId);
+    lbl.textContent = catPathString(activeCategoryId());
     btn.classList.add('active');
   }
 }
 
 // ─── multi-select picker (shared widget) ──────────────────────────────────
 
-function openCategoryPicker({ title, initial, single, onSave }) {
+function openCategoryPicker({ title, initial, single, onSave, scope }) {
+  if (scope) {
+    state.categoryScope = scope;
+    rebuildCategoryIndex();
+  }
   state.pickerSelected = new Set(initial || []);
   state.pickerSingle = !!single;
   state.pickerCallback = onSave;
@@ -616,6 +636,7 @@ function renderPickerTree(filter) {
   const tree = el('pickerTree');
   tree.innerHTML = '';
   const lower = (filter || '').toLowerCase();
+  const scopedCategories = state.categories.filter(c => c.scope === state.categoryScope);
   const rows = [];
   const matches = (name) => !lower || name.toLowerCase().includes(lower);
   const walk = (cat, depth) => {
@@ -626,7 +647,7 @@ function renderPickerTree(filter) {
     for (const c of childrenOf(cat.id)) walk(c, depth + 1);
   };
   for (const c of childrenOf(null)) walk(c, 0);
-  if (state.categories.length === 0) {
+  if (scopedCategories.length === 0) {
     tree.innerHTML = '<div class="picker-empty">No categories yet. Create one in the sidebar.</div>';
     renderPickerSelection(); return;
   }
@@ -711,9 +732,11 @@ const state = {
   settings: {},
   view: 'keys',
   // category tree
-  categories: [],            // flat list, ordered for tree display
+  categories: [],            // current-scope categories, ordered for tree display
   catsById: new Map(),       // id -> category
   childrenOf: new Map(),     // parent_id (string|null) -> [category]
+  categoryScope: 'key',
+  activeCategoryByScope: { key: 'all', host: 'all' },
   keyCategories: {},         // keyId -> [catId]
   orphans: false,            // true when at least one key has no categories
   activeCategoryId: 'all',   // 'all' | 'uncategorized' | categoryId
@@ -944,7 +967,7 @@ function renderKeyList() {
   if (rows.length === 0) return;
 
   // When a category filter is active, render a single (un-grouped) flat list.
-  if (state.activeCategoryId !== 'all') {
+  if (activeCategoryId() !== 'all') {
     const flat = document.createElement('div');
     flat.className = 'key-group';
     for (const k of rows) flat.appendChild(keyRowEl(k));
@@ -1849,6 +1872,10 @@ const VIEW_SUBS = {
 
 async function switchView(view) {
   state.view = view;
+  state.categoryScope = currentCategoryScope();
+  rebuildCategoryIndex();
+  state.orphans = state.categoryScope === 'host' ? state.servers.some(s => !s.categoryId) : uncategorizedKeyCount() > 0;
+  renderCategoryTree();
   for (const b of document.querySelectorAll('.nav-item')) {
     b.classList.toggle('active', b.dataset.view === view);
   }
@@ -1864,10 +1891,12 @@ async function switchView(view) {
   }
   if (view === 'audit') await loadAudit();
   if (view === 'keys') {
+    state.categoryScope = 'key'; rebuildCategoryIndex(); renderCategoryTree();
     renderKeyList();
     updateSelectionHint();
   }
   if (view === 'connect') {
+    state.categoryScope = 'host'; rebuildCategoryIndex(); renderCategoryTree();
     applyNavLockState();
     if (state.unlocked) {
       await loadServers();
@@ -1909,9 +1938,11 @@ function wire() {
   el('searchInput').addEventListener('input', renderKeyList);
   el('typeFilter').addEventListener('change', renderKeyList);
   el('catFilterBtn').addEventListener('click', () => {
+    const scope = currentCategoryScope();
     openCategoryPicker({
-      title: 'Filter by category',
-      initial: state.activeCategoryId !== 'all' && state.activeCategoryId !== 'uncategorized' ? [state.activeCategoryId] : [],
+      title: scope === 'host' ? 'Filter hosts by category' : 'Filter keys by category',
+      scope,
+      initial: activeCategoryId() !== 'all' && activeCategoryId() !== 'uncategorized' ? [activeCategoryId()] : [],
       single: true,
       onSave: (ids) => {
         if (ids.length) setActiveCategory(ids[0]);
@@ -1920,6 +1951,7 @@ function wire() {
     });
   });
   el('catAddRootBtn').addEventListener('click', () => addCategoryPrompt(null));
+  el('catFilterBtn').setAttribute('aria-label', 'Filter current view by category');
   el('detailCopyPublicBtn').addEventListener('click', copyPublic);
   el('detailDeleteBtn').addEventListener('click', deleteSelected);
   el('detailExportBtn').addEventListener('click', exportSelected);
@@ -1929,6 +1961,7 @@ function wire() {
     const render = () => renderCategoryChips(chipEl, getCurrent(), { removable: true, onRemove: (id) => setCurrent(getCurrent().filter(x => x !== id)) });
     btnEl.addEventListener('click', () => openCategoryPicker({
       title: 'Assign categories',
+      scope: 'key',
       initial: getCurrent(),
       onSave: (ids) => { setCurrent(ids); render(); },
     }));
@@ -2106,6 +2139,7 @@ function wire() {
   el('srvBrowseCategoryBtn').addEventListener('click', () => {
     openCategoryPicker({
       title: 'Server category',
+      scope: 'host',
       initial: state._pendingServerCategory ? [state._pendingServerCategory] : [],
       single: true,
       onSave: (ids) => {
@@ -2221,17 +2255,33 @@ async function loadServers() {
     toast(e.message || String(e), 'err');
   }
   renderServerList();
+  if (state.view === 'connect') { state.orphans = state.servers.some(s => !s.categoryId); renderCategoryTree(); }
 }
 
 function currentSelectedServer() {
   return state.servers.find(s => s.id === state.connectSelectedId) || null;
 }
 
+function hostsInCategoryRecursive(catId) {
+  const ids = new Set();
+  const stack = [catId];
+  while (stack.length) {
+    const id = stack.pop();
+    for (const s of state.servers) if (s.categoryId === id) ids.add(s.id);
+    for (const child of childrenOf(id)) stack.push(child.id);
+  }
+  return state.servers.filter(s => ids.has(s.id));
+}
+
 function renderServerList() {
   const list = el('serverList');
   const empty = el('serverEmpty');
   const filter = (el('serverSearch').value || '').toLowerCase().trim();
-  const filtered = !filter ? state.servers : state.servers.filter(s => {
+  const activeCat = activeCategoryId();
+  let categoryPool = state.servers;
+  if (activeCat === 'uncategorized') categoryPool = state.servers.filter(s => !s.categoryId);
+  else if (activeCat !== 'all') categoryPool = hostsInCategoryRecursive(activeCat);
+  const filtered = !filter ? categoryPool : categoryPool.filter(s => {
     return [s.name, s.host, s.username, s.keyName].filter(Boolean)
       .some(v => v.toLowerCase().includes(filter));
   });
