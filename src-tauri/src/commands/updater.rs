@@ -23,8 +23,18 @@ struct GhRelease {
     assets: Vec<GhAsset>,
 }
 
-fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+/// Running app version, from `tauri.conf.json` via Tauri's `PackageInfo`.
+///
+/// Deliberately NOT `env!("CARGO_PKG_VERSION")`: the release workflow syncs
+/// the tag into `package.json` / `tauri.conf.json` / `Cargo.toml` at build
+/// time, and `tauri.conf.json` is the one Tauri itself bakes into the binary
+/// when `version` is set there (tauri-codegen prefers it over
+/// `CARGO_PKG_VERSION`). Reading it back from the app handle keeps the
+/// updater's notion of "what am I running" tied to the same source of truth
+/// the installer metadata uses, so a stale Cargo.toml can never make a
+/// freshly-installed build offer an "update" to itself.
+fn current_version(app: &AppHandle) -> String {
+    app.package_info().version.to_string()
 }
 
 /// Pick the release asset matching the running OS / package ecosystem.
@@ -62,20 +72,25 @@ fn pick_asset_for_os(assets: &[GhAsset]) -> Option<&GhAsset> {
 fn is_newer(candidate_tag: &str, current: &str) -> bool {
     let strip = |s: &str| s.trim().trim_start_matches('v').to_string();
     let (cand, cur) = (strip(candidate_tag), strip(current));
+    if cand == cur {
+        // Defensive short-circuit: never offer an "update" to the version we
+        // are already running, regardless of what the tag parsing does.
+        return false;
+    }
     match (
         semver::Version::parse(&cand),
         semver::Version::parse(cur.as_str()),
     ) {
-        (Ok(a), Ok(b)) => a > b,
-        _ => cand != cur, // unparsable tags: only flag a genuine difference
+        (Ok(a), Ok(b)) => a > b, // strictly newer only — never a downgrade
+        _ => false,              // unparsable tag: never nag the user over an unknown format
     }
 }
 
 /// Check GitHub for the latest release and, if newer, report the asset URL for
 /// this OS. Never installs anything — the renderer asks the user first.
 #[tauri::command]
-pub async fn update_check() -> CmdResult<serde_json::Value> {
-    let current = current_version();
+pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
+    let current = current_version(&app);
     let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Check")
         .timeout(std::time::Duration::from_secs(15))
@@ -92,7 +107,7 @@ pub async fn update_check() -> CmdResult<serde_json::Value> {
         .await
         .map_err(|e| CmdError(format!("Could not parse GitHub response: {e}")))?;
 
-    let available = is_newer(&rel.tag_name, current);
+    let available = is_newer(&rel.tag_name, &current);
     let asset_url = if available {
         pick_asset_for_os(&rel.assets).map(|a| a.browser_download_url.clone())
     } else {
@@ -196,4 +211,61 @@ pub async fn update_download_and_run(
         app_for_exit.exit(0);
     });
     Ok(serde_json::json!({ "ok": true, "installer": dest.display().to_string() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer;
+
+    // ── Equal versions: never offer an "update" to ourselves ─────────────────
+    #[test]
+    fn same_version_is_not_newer() {
+        assert!(!is_newer("1.7.0", "1.7.0"));
+        assert!(!is_newer("v1.7.0", "1.7.0"));
+        assert!(!is_newer("v1.7.0", "v1.7.0"));
+        assert!(!is_newer(" 1.7.0 ", "1.7.0"));
+    }
+
+    // ── Older running, newer remote: offer the update ───────────────────────
+    #[test]
+    fn newer_remote_is_newer() {
+        assert!(is_newer("1.7.0", "1.4.0"));
+        assert!(is_newer("v1.7.0", "1.4.0"));
+        assert!(is_newer("1.10.0", "1.9.0")); // numeric compare, not lexicographic
+        assert!(is_newer("2.0.0", "1.99.99"));
+        assert!(is_newer("1.7.1", "1.7.0"));
+    }
+
+    // ── Newer running, older remote: never offer a downgrade ────────────────
+    #[test]
+    fn older_remote_is_not_newer() {
+        assert!(!is_newer("1.4.0", "1.7.0"));
+        assert!(!is_newer("v1.4.0", "v1.7.0"));
+        assert!(!is_newer("1.9.0", "1.10.0"));
+        assert!(!is_newer("1.7.0", "1.7.1"));
+    }
+
+    // ── Unparsable tags: fail closed (no nag over an unknown format) ────────
+    #[test]
+    fn unparsable_tag_is_not_newer() {
+        assert!(!is_newer("latest", "1.7.0"));
+        assert!(!is_newer("nightly-2026-09-08", "1.7.0"));
+        assert!(!is_newer("1.7", "1.7.0")); // not full semver
+    }
+
+    // ── Regression for the reported bug ─────────────────────────────────────
+    // Shipped 1.7.0 binaries self-reported CARGO_PKG_VERSION = 1.4.0 while
+    // GitHub's latest tag was v1.7.0, so the app offered an "update" to the
+    // version it was already running. Equal after normalization must never
+    // be flagged, whatever the tag's spelling.
+    #[test]
+    fn regression_self_reported_stale_version_not_newer() {
+        // The exact user-visible failure: tag v1.7.0 vs running "1.4.0" is a
+        // real difference and WOULD be newer — this asserts it is detected
+        // (true), which is why the version *source* had to be fixed. With the
+        // fix, the running version is 1.7.0 and the equal-version short-
+        // circuit keeps the banner away.
+        assert!(is_newer("v1.7.0", "1.4.0"));
+        assert!(!is_newer("v1.7.0", "1.7.0"));
+    }
 }

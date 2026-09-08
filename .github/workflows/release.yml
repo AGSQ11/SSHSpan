@@ -82,6 +82,10 @@ jobs:
           if [ "$V" != "$CURRENT" ]; then
             npm version --no-git-tag-version "$V"
             node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.version='$V';fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')"
+            node -e "const fs=require('fs');const p='src-tauri/Cargo.toml';let t=fs.readFileSync(p,'utf8');const re=/^(version\s*=\s*)\"[^\"]+\"/m;if(!re.test(t))throw new Error('version not found in Cargo.toml [package]');t=t.replace(re,'$1\"$V\"');fs.writeFileSync(p,t)"
+            # Cargo.lock embeds the crate's own version; keep it in sync so
+            # `cargo test` / `tauri build` don't fail or silently rewrite it.
+            cargo update --manifest-path src-tauri/Cargo.toml --package sshspan --precise "$V"
             echo "Version bumped: $CURRENT -> $V"
           else
             echo "Version already $V; nothing to change."
