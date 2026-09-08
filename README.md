@@ -35,6 +35,37 @@ configure.
   Test button, deploy-preview fixes, and a batch of audited bug fixes.
 - Full history in the [changelog](CHANGELOG.md).
 
+## Screenshots
+
+A quick tour of the desktop UI:
+
+<table>
+  <tr>
+    <td width="50%"><img src="screenshots/keys-view.png" alt="SSHSpan key management view"></td>
+    <td width="50%"><img src="screenshots/ssh-view.png" alt="SSHSpan embedded SSH terminal"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Keys and categories</strong><br>Manage encrypted keys in scoped category trees.</td>
+    <td align="center"><strong>Embedded SSH client</strong><br>Connect with a saved server and use the integrated terminal.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="screenshots/sftp-view.png" alt="SSHSpan SFTP dual-pane file browser"></td>
+    <td width="50%"><img src="screenshots/deploy-view.png" alt="SSHSpan SSH deployment view"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>SFTP file browser</strong><br>Browse remote files, use the dual-pane view, and queue transfers.</td>
+    <td align="center"><strong>SSH deployment</strong><br>Preview and manage generated SSH config entries.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="screenshots/audit-view.png" alt="SSHSpan audit log view"></td>
+    <td width="50%"><img src="screenshots/settings-view.png" alt="SSHSpan settings view"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Audit log</strong><br>Review an append-only record of sensitive vault and connection actions.</td>
+    <td align="center"><strong>Settings</strong><br>Configure transfer concurrency and other desktop preferences.</td>
+  </tr>
+</table>
+
 ## Features
 
 ### Keys
