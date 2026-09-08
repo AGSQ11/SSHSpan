@@ -363,12 +363,21 @@ pub async fn start_interactive(
                 (Pty::ECHO, 1),
                 (Pty::ICANON, 1),
                 (Pty::ISIG, 1),
+                (Pty::IUTF8, 1),
                 (Pty::OPOST, 1),
                 (Pty::ONLCR, 1),
             ],
         )
         .await
         .map_err(|e| anyhow::anyhow!("PTY request failed: {e}"))?;
+    // The PTY term is what OpenSSH normally uses for TERM, but also send the
+    // environment request for servers that derive shell behavior from env.
+    // Do not wait for a reply: AcceptEnv policy may reject it even though the
+    // PTY and interactive shell are otherwise valid.
+    channel
+        .set_env(false, "TERM", "xterm-256color")
+        .await
+        .map_err(|e| anyhow::anyhow!("TERM environment request failed: {e}"))?;
     channel
         .request_shell(true)
         .await
