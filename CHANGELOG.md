@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-08
+
+Feature release focused on PuTTY-grade terminal behavior and safer everyday SSH use.
+
+### Added
+
+- **Terminal context menu** — right-click inside the terminal or on a session tab to Copy, Copy All, Paste, Clear scrollback, Reset terminal, open a New session, Duplicate the current session, Restart the session, or switch between SSH and SFTP.
+- **Copy All to Clipboard** — copies the active terminal buffer plus scrollback without manual selection.
+- **Multi-line paste confirmation** — clipboard content containing line breaks asks before being sent to a live SSH session. The confirmation can be disabled in Settings.
+- **Duplicate and restart sessions** — duplicate opens a new independent tab for the same saved server/auth; restart reconnects in the same tab while preserving tab identity and scrollback.
+- **Configurable scrollback** — terminal scrollback can be set between 1,000 and 50,000 lines.
+- **Terminal bell behavior** — choose visual, sound, or silent bell; background tabs receive a visible bell indicator.
+- **Keyboard compatibility settings** — Backspace mode (`0x7f` or `0x08`), Home/End mode, application cursor-key mode, and application keypad mode are persisted for future terminal keymap compatibility.
+- **SSH keepalive** — optional per-terminal keepalive interval (disabled by default), independent of SFTP keepalive.
+- **Normal remote Tab completion** — interactive SSH now declares UTF-8 input and explicitly requests `TERM=xterm-256color`, allowing remote Bash/Zsh/Fish/readline completion to behave like PuTTY and normal terminals.
+
+### Changed
+
+- The README now documents the new terminal context menu, clipboard behavior, session utilities, settings, keepalive, and current release artifacts.
+
+### Compatibility and safety
+
+- Clipboard completion remains remote-shell-driven; SSHSpan does not fake local completion.
+- Multi-line paste confirmation helps prevent clipboard-carried commands from running accidentally.
+- Existing independent SSH/SFTP tab behavior from PR #14 is preserved.
+- Alt-Enter fullscreen was intentionally excluded per request.
+
+### Verification
+
+- Rust formatting, compilation, and the full test suite passed: 4 unit tests and 42 integration tests.
+- Renderer syntax checks passed for `app.js`, `terminal.js`, and `sftp.js`.
+- Changes delivered in PR #17 and PR #18.
+
 ## [1.6.0] - 2026-09-08
 
 Feature release focused on category organization and everyday picker usability.
