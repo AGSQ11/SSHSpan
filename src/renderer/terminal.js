@@ -32,6 +32,87 @@ const tclip = (window.__TAURI__ && window.__TAURI__.clipboardManager) || null;
 const sshTabs = new Map();   // tabId -> {term, fitAddon, hostEl, sessionId, pollHandle, dataSub, sessionEnded, gotFirstData}
 let activeTabId = null;
 
+function terminalSetting(name, fallback) {
+  const settings = window.state && window.state.settings ? window.state.settings : {};
+  const value = settings[name];
+  return value === undefined || value === null || value === '' ? fallback : value;
+}
+
+function terminalScrollback() {
+  const value = parseInt(terminalSetting('terminalScrollback', '5000'), 10);
+  if (!Number.isFinite(value)) return 5000;
+  return Math.max(1000, Math.min(50000, value));
+}
+
+function terminalBellMode() {
+  return terminalSetting('terminalBell', 'visual');
+}
+
+function terminalHomeEndMode() {
+  return terminalSetting('terminalHomeEnd', 'default');
+}
+
+function terminalAppCursorKeys() {
+  return terminalSetting('terminalAppCursorKeys', 'default');
+}
+
+function terminalAppKeypad() {
+  return terminalSetting('terminalAppKeypad', 'default');
+}
+
+
+function terminalKeepaliveSeconds() {
+  const value = parseInt(terminalSetting('terminalKeepaliveSeconds', '0'), 10);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.max(15, Math.min(3600, value));
+}
+
+function sendTerminalBytes(rec, data) {
+  if (!rec || !rec.sessionId) return Promise.resolve(false);
+  const encoder = new TextEncoder();
+  return tcore.invoke('terminal_send', {
+    sessionId: rec.sessionId,
+    bytes: Array.from(encoder.encode(data)),
+  }).then(() => true).catch(() => false);
+}
+
+function terminalBufferText(rec) {
+  if (!rec) return '';
+  try {
+    const active = rec.term.buffer.active;
+    const lines = [];
+    for (let i = 0; i < active.length; i++) {
+      const line = active.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    return lines.join('\n');
+  } catch (e) {
+    return '';
+  }
+}
+
+function markTerminalBell(tabId) {
+  if (tabId === activeTabId) return;
+  if (typeof window.markTerminalBell === 'function') window.markTerminalBell(tabId);
+}
+
+function playTerminalBell() {
+  try {
+    const ctx = window.__sshBellAudio || (window.__sshBellAudio = new (window.AudioContext || window.webkitAudioContext)());
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 880;
+    gain.gain.value = 0.04;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.08);
+  } catch (e) {}
+}
+
+
 function copyText(text) {
   if (!text) return;
   if (tclip) { tclip.writeText(text).catch(() => {}); return; }
@@ -74,7 +155,14 @@ function wireTerminalClipboard(t) {
       if (!e.ctrlKey || !e.shiftKey) return;
       const k = e.key.toLowerCase();
       if (k === 'c') { const sel = t.getSelection(); if (sel) { copyText(sel); e.preventDefault(); } }
-      else if (k === 'v') { e.preventDefault(); readClipboard().then(txt => { if (txt) t.paste(txt); }); }
+      else if (k === 'v') {
+        e.preventDefault();
+        readClipboard().then(txt => {
+          if (!txt) return;
+          if (typeof window.terminalPaste === 'function' && t.__sshspanTabId) window.terminalPaste(t.__sshspanTabId, txt);
+          else t.paste(txt);
+        });
+      }
     });
   } catch (e) {}
 }
@@ -113,9 +201,10 @@ function createTabTerminal(tabId) {
       selectionForeground: '#ffffff',
       selectionInactiveBackground: '#1d3252',
     },
-    scrollback: 5000,
+    scrollback: terminalScrollback(),
     convertEol: false,
     allowProposedApi: true,
+    windowsMode: terminalSetting('terminalBackspace', 'default') === 'backspace',
   });
 
   let fitAddon = null;
@@ -127,15 +216,22 @@ function createTabTerminal(tabId) {
     try { term.loadAddon(new WebLinksCtor()); } catch (e) {}
   }
 
+  term.__sshspanTabId = tabId;
   term.open(host);
   requestAnimationFrame(() => requestAnimationFrame(() => {
     try { fitAddon && fitAddon.fit(); } catch (e) {}
   }));
   wireTerminalClipboard(term);
+  term.onBell(() => {
+    const mode = terminalBellMode();
+    if (mode === 'silent') return;
+    markTerminalBell(tabId);
+    if (mode === 'sound') playTerminalBell();
+  });
 
   const record = {
     term, fitAddon, hostEl: host,
-    sessionId: null, pollHandle: null, dataSub: null,
+    sessionId: null, pollHandle: null, dataSub: null, keepaliveHandle: null,
     sessionEnded: false, gotFirstData: false,
   };
   sshTabs.set(tabId, record);
@@ -179,6 +275,7 @@ function destroyTabTerminal(tabId) {
   const rec = sshTabs.get(tabId);
   if (!rec) return;
   if (rec.pollHandle) clearInterval(rec.pollHandle);
+  if (rec.keepaliveHandle) clearInterval(rec.keepaliveHandle);
   try { rec.dataSub && rec.dataSub.dispose(); } catch (e) {}
   try { rec.term.dispose(); } catch (e) {}
   rec.hostEl.remove();
@@ -197,6 +294,17 @@ function tabSessionLive(tabId) {
 function setTabSession(tabId, sessionId) {
   const rec = tabRecord(tabId);
   if (rec) rec.sessionId = sessionId;
+}
+
+function startTabKeepalive(rec) {
+  if (!rec || !rec.sessionId) return;
+  if (rec.keepaliveHandle) clearInterval(rec.keepaliveHandle);
+  const seconds = terminalKeepaliveSeconds();
+  if (!seconds) return;
+  rec.keepaliveHandle = setInterval(() => {
+    if (!rec.sessionId || rec.sessionEnded) return;
+    tcore.invoke('terminal_keepalive', { sessionId: rec.sessionId }).catch(() => {});
+  }, seconds * 1000);
 }
 
 function fitActiveTerminal() {
@@ -281,6 +389,7 @@ function terminalConnectInTab(tabId, server, opts) {
       rec.sessionEnded = true;
       rec.sessionId = null;
       if (rec.pollHandle) { clearInterval(rec.pollHandle); rec.pollHandle = null; }
+      if (rec.keepaliveHandle) { clearInterval(rec.keepaliveHandle); rec.keepaliveHandle = null; }
       try { dataSub.dispose(); } catch (e) {}
       try { t.writeln('\r\n\x1b[1;33m[connection closed]\x1b[0m'); } catch (e) {}
       if (typeof window.onSessionClosed === 'function') window.onSessionClosed(tabId);
@@ -293,6 +402,8 @@ function terminalConnectInTab(tabId, server, opts) {
       }
       const sessionId = r.sessionId;
       rec.sessionId = sessionId;
+      rec.tabId = tabId;
+      startTabKeepalive(rec);
       trace(tabId, `[sshspan] session established (id=${sessionId.slice(0, 8)}…) — waiting for remote output`);
       if (!rec.gotFirstData) {
         trace(tabId, '[sshspan] NOTE: no channel data yet. If this is the last line you see, the IPC Channel is not delivering.');
@@ -345,3 +456,48 @@ window.terminalResetActive = terminalResetActive;
 window.terminalSetStatus = terminalSetStatus;
 window.tabRecord = tabRecord;
 window.terminalConnectInTab = terminalConnectInTab;
+window.terminalSendText = (tabId, text) => sendTerminalBytes(tabRecord(tabId), text);
+window.terminalCopySelection = (tabId) => {
+  const rec = tabRecord(tabId);
+  if (!rec) return false;
+  const text = rec.term.getSelection();
+  if (text) copyText(text);
+  return !!text;
+};
+window.terminalCopyAll = (tabId) => {
+  const text = terminalBufferText(tabRecord(tabId));
+  if (text) copyText(text);
+  return !!text;
+};
+window.terminalClearScrollback = (tabId) => {
+  const rec = tabRecord(tabId);
+  if (rec) rec.term.clear();
+};
+window.terminalReset = (tabId) => {
+  const rec = tabRecord(tabId);
+  if (!rec) return;
+  rec.term.reset();
+  setTimeout(() => { try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {} }, 30);
+};
+window.terminalPaste = async (tabId, text) => {
+  if (typeof text !== 'string' || !text) return false;
+  const needsConfirm = terminalSetting('confirmMultiLinePaste', '1') !== '0';
+  if (needsConfirm && (text.includes('\n') || text.includes('\r'))) {
+    const lines = text.split(/\r\n|\r|\n/).length;
+    if (!window.confirm(`Paste ${lines} lines into this SSH session? Review clipboard content before running commands.`)) return false;
+  }
+  return sendTerminalBytes(tabRecord(tabId), text);
+};
+window.terminalReadClipboard = readClipboard;
+window.terminalApplySettings = () => {
+  const scrollback = terminalScrollback();
+  for (const rec of sshTabs.values()) {
+    try { rec.term.options.scrollback = scrollback; } catch (e) {}
+  }
+};
+window.terminalModeSettings = () => ({
+  backspace: terminalSetting('terminalBackspace', 'default'),
+  homeEnd: terminalHomeEndMode(),
+  appCursorKeys: terminalAppCursorKeys(),
+  appKeypad: terminalAppKeypad(),
+});

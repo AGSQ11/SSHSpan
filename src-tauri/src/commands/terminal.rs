@@ -234,6 +234,13 @@ pub fn terminal_resize(
 }
 
 #[tauri::command]
+pub fn terminal_keepalive(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
+    let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
+    ssh_client::session_send(&registry, &session_id, b"\x00".to_vec()).map_err(anyhow_cmd)?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+#[tauri::command]
 pub fn terminal_disconnect(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
     let server_name = registry

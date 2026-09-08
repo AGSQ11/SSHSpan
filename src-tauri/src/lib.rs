@@ -121,6 +121,7 @@ pub fn run() {
             terminal_send,
             terminal_resize,
             terminal_disconnect,
+            terminal_keepalive,
             terminal_list,
             server_test,
             known_hosts_list,

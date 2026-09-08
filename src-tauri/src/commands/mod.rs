@@ -1480,6 +1480,14 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
         "sftpParallel",
         "sftpShowHidden",
         "sftpDualPane",
+        "terminalScrollback",
+        "terminalBackspace",
+        "terminalHomeEnd",
+        "terminalAppCursorKeys",
+        "terminalAppKeypad",
+        "terminalBell",
+        "terminalKeepaliveSeconds",
+        "confirmMultiLinePaste",
     ];
     let mut settings = serde_json::Map::new();
     for key in &keys {

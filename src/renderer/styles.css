@@ -1401,6 +1401,8 @@ label:focus-within { color: var(--text); }
   background: var(--accent-weak);
 }
 .term-tab.ended { opacity: 0.55; }
+.term-tab.bell { border-color: rgba(var(--warn-rgb), 0.7); box-shadow: 0 0 0 1px rgba(var(--warn-rgb), 0.18) inset; }
+.term-tab.bell .term-tab-dot { background: var(--warn); box-shadow: 0 0 0 3px rgba(var(--warn-rgb), 0.15); }
 .term-tab-dot {
   width: 8px; height: 8px;
   border-radius: 50%;
