@@ -1013,24 +1013,52 @@ label:focus-within { color: var(--text); }
 /* ==========================================================================
    Picker modal
    ========================================================================== */
-.picker-modal { width: 460px; }
-.picker-search { margin-bottom: 8px; }
+.picker-modal {
+  width: min(440px, calc(100vw - 32px));
+  max-height: min(560px, calc(100vh - 48px));
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.picker-modal .modal-body {
+  min-height: 0;
+  padding: 12px 14px 10px;
+  gap: 10px;
+}
+.picker-search { margin: 0; flex: none; }
 .picker-tree {
-  display: flex; flex-direction: column; gap: 1px;
-  max-height: 360px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 2px;
+  min-height: 84px; max-height: 276px; overflow-y: auto;
   border: 1px solid var(--line); border-radius: var(--r-sm);
-  background: var(--bg-elev);
-  padding: 6px;
+  background: var(--bg-elev); padding: 5px;
 }
 .picker-row {
   display: flex; align-items: center; gap: 8px;
-  padding: 5px 6px;
-  border-radius: 5px;
-  cursor: pointer;
-  font-size: 12.5px;
-  color: var(--text-dim);
+  min-height: 34px; padding: 6px 7px;
+  border-radius: 6px; cursor: pointer;
+  font-size: 12.5px; color: var(--text-dim);
 }
-.picker-row:hover { background: var(--panel-3); color: var(--text); }
+.picker-row:hover, .picker-row.active { background: var(--panel-3); color: var(--text); }
+.picker-empty { padding: 22px 12px; text-align: center; color: var(--text-faint); font-size: 12px; }
+.picker-selection {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 5px;
+  min-height: 22px; max-height: 70px; overflow-y: auto;
+}
+.picker-selection-label { color: var(--text-faint); font-size: 11px; margin-right: 2px; }
+.picker-chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 190px;
+  padding: 3px 5px 3px 8px; border: 1px solid var(--line);
+  border-radius: 999px; background: var(--panel-3); color: var(--text-dim);
+  font-size: 11px;
+}
+.picker-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-chip-remove, .picker-clear {
+  appearance: none; border: 0; background: transparent; cursor: pointer;
+  color: var(--text-faint); padding: 1px; line-height: 1;
+}
+.picker-chip-remove { width: 15px; height: 15px; }
+.picker-chip-remove:hover, .picker-clear:hover { color: var(--text); }
+.picker-clear { font-size: 11px; text-decoration: underline; margin-left: auto; }
 .picker-row.partial .picker-box { background: var(--accent); }
 .picker-row.partial .picker-box::after { background: var(--bg); }
 .picker-row[data-depth="0"] { font-weight: 600; color: var(--text); }
