@@ -34,3 +34,6 @@ coverage/
 .buildtmp/
 .zcode/
 src-tauri/target/
+
+# Local security-audit scratch (Semgrep rules + findings — never commit)
+.semgrep*
