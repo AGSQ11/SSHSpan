@@ -435,6 +435,60 @@ fn db_multiple_config_keys() {
     assert_eq!(db.get_config("key3").unwrap().as_deref(), Some("value3"));
 }
 
+/// Regression: corrupt/legacy/tampered non-RFC3339 timestamps in the DB must
+/// not panic the row mappers (they crashed list_keys / list_categories /
+/// list_audit — and with them the whole Tauri command). The mappers now fall
+/// back to `Utc::now()` like `row_to_server` always did.
+#[test]
+fn db_malformed_timestamps_fall_back_instead_of_panicking() {
+    use chrono::Datelike;
+
+    let db = get_test_db();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Same shape as Database::migrate() — only the columns the row
+        // mappers read are load-bearing here.
+        sqlx::query("CREATE TABLE IF NOT EXISTS keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_type TEXT NOT NULL, public_key TEXT NOT NULL, private_key_encrypted TEXT NOT NULL, fingerprint_sha256 TEXT NOT NULL, fingerprint_md5 TEXT NOT NULL, comment TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deployed INTEGER DEFAULT 0, deploy_path TEXT, bitwarden_id TEXT, bitwarden_sync INTEGER DEFAULT 0, bitwarden_revision_ts TEXT, bitwarden_updated_at TEXT)").execute(&db.pool).await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, scope TEXT NOT NULL DEFAULT 'key', color TEXT, sort_index INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)").execute(&db.pool).await.unwrap();
+
+        // Keys: one corrupt row (legacy "YYYY-MM-DD HH:MM:SS"), one valid control.
+        sqlx::query("INSERT INTO keys (id, name, key_type, public_key, private_key_encrypted, fingerprint_sha256, fingerprint_md5, comment, created_at, updated_at) VALUES ('k-corrupt', 'corrupt', 'ssh-ed25519', 'pub', 'priv', 'SHA256:x', 'x', '', '2023-01-02 03:04:05', 'not-a-timestamp'), ('k-ok', 'ok', 'ssh-ed25519', 'pub', 'priv', 'SHA256:y', 'y', '', '2023-01-02T03:04:05+00:00', '2023-01-02T03:04:05+00:00')").execute(&db.pool).await.unwrap();
+
+        // Categories: same mix.
+        sqlx::query("INSERT INTO categories (id, name, parent_id, scope, color, sort_index, created_at, updated_at) VALUES ('c-corrupt', 'corrupt', NULL, 'key', NULL, 0, '2023-01-02 03:04:05', 'garbage'), ('c-ok', 'ok', NULL, 'key', NULL, 1, '2023-01-02T03:04:05+00:00', '2023-01-02T03:04:05+00:00')").execute(&db.pool).await.unwrap();
+
+        // Audit log: corrupt timestamp row + a valid one.
+        sqlx::query("INSERT INTO audit_log (action, key_id, details, timestamp) VALUES ('vault.unlock', NULL, 'corrupt', '1690000000'), ('vault.unlock', NULL, 'ok', '2023-01-02T03:04:05+00:00')").execute(&db.pool).await.unwrap();
+    });
+
+    // These three calls used to panic on the corrupt rows; now the mappers
+    // must return records with fallback timestamps.
+    let keys = db.list_keys().unwrap();
+    assert_eq!(keys.len(), 2);
+    let corrupt_key = keys.iter().find(|k| k.id == "k-corrupt").unwrap();
+    let ok_key = keys.iter().find(|k| k.id == "k-ok").unwrap();
+    // Fallback: parse failure lands near now, not near 2023 / the epoch.
+    assert!(corrupt_key.created_at.year() >= 2024);
+    assert!(corrupt_key.updated_at.year() >= 2024);
+    // Valid rows keep their stored timestamp (2023-01-02T03:04:05Z).
+    assert_eq!(ok_key.created_at.to_rfc3339(), "2023-01-02T03:04:05+00:00");
+
+    let categories = db.list_categories().unwrap();
+    assert_eq!(categories.len(), 2);
+    let corrupt_cat = categories.iter().find(|c| c.id == "c-corrupt").unwrap();
+    let ok_cat = categories.iter().find(|c| c.id == "c-ok").unwrap();
+    assert!(corrupt_cat.created_at.year() >= 2024);
+    assert!(corrupt_cat.updated_at.year() >= 2024);
+    assert_eq!(ok_cat.created_at.to_rfc3339(), "2023-01-02T03:04:05+00:00");
+
+    let audit = db.list_audit(10).unwrap();
+    assert_eq!(audit.len(), 2);
+    let corrupt_audit = audit.iter().find(|a| a.details == "corrupt").unwrap();
+    let ok_audit = audit.iter().find(|a| a.details == "ok").unwrap();
+    assert!(corrupt_audit.timestamp.year() >= 2024);
+    assert_eq!(ok_audit.timestamp.to_rfc3339(), "2023-01-02T03:04:05+00:00");
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  Vault Lifecycle (create → unlock → lock → unlock with wrong password)
 // ═════════════════════════════════════════════════════════════════════════════
