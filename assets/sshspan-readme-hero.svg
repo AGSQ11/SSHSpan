@@ -1,63 +1,234 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="640" viewBox="0 0 1600 640">
-<defs>
-  <linearGradient id="bg" x1="0" x2="1"><stop offset="0" stop-color="#0f1115"/><stop offset="1" stop-color="#111827"/></linearGradient>
-  <linearGradient id="logo" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#3b82f6"/><stop offset="1" stop-color="#6ea8ff"/></linearGradient>
-  <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000" flood-opacity=".45"/></filter>
-</defs>
-<rect width="1600" height="640" fill="url(#bg)"/>
-<g opacity=".22" stroke="#2d3748" stroke-width="1">
-  <path d="M920 0V640"/><path d="M960 0V640"/><path d="M1000 0V640"/><path d="M1040 0V640"/><path d="M1080 0V640"/><path d="M1120 0V640"/><path d="M1160 0V640"/><path d="M1200 0V640"/><path d="M1240 0V640"/><path d="M1280 0V640"/><path d="M1320 0V640"/><path d="M1360 0V640"/><path d="M1400 0V640"/><path d="M1440 0V640"/><path d="M1480 0V640"/><path d="M1520 0V640"/><path d="M1560 0V640"/>
-  <path d="M900 0H1600"/><path d="M900 40H1600"/><path d="M900 80H1600"/><path d="M900 120H1600"/><path d="M900 160H1600"/><path d="M900 200H1600"/><path d="M900 240H1600"/><path d="M900 280H1600"/><path d="M900 320H1600"/><path d="M900 360H1600"/><path d="M900 400H1600"/><path d="M900 440H1600"/><path d="M900 480H1600"/><path d="M900 520H1600"/><path d="M900 560H1600"/><path d="M900 600H1600"/>
-</g>
-<g font-family="Segoe UI,Arial,sans-serif">
-  <rect x="92" y="92" width="94" height="94" rx="22" fill="url(#logo)" filter="url(#shadow)"/>
-  <text x="110" y="150" font-family="Consolas,monospace" font-size="34" font-weight="800" fill="#0b1020">&gt;_</text>
-  <text x="92" y="292" font-size="82" font-weight="800" fill="#e6e9ef">SSHSpan</text>
-  <text x="92" y="350" font-size="28" fill="#e6e9ef">Encrypted SSH key management.</text>
-  <text x="92" y="390" font-size="28" fill="#9aa3b2">Local-first. Cross-platform. Under your control.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="640" viewBox="0 0 1600 640" role="img" aria-label="SSHSpan animated project thumbnail">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070c14"/>
+      <stop offset="0.55" stop-color="#0a111b"/>
+      <stop offset="1" stop-color="#0c1724"/>
+    </linearGradient>
 
-  <g font-size="16" font-weight="700">
-    <rect x="92" y="432" width="188" height="38" rx="19" fill="#14223a" stroke="#2a3140"/>
-    <circle cx="108" cy="451" r="4" fill="#6ea8ff"/><text x="120" y="457" fill="#dfe5ef">AES-256-GCM vault</text>
-    <rect x="292" y="432" width="169" height="38" rx="19" fill="#102b1c" stroke="#2a3140"/>
-    <circle cx="308" cy="451" r="4" fill="#4ade80"/><text x="320" y="457" fill="#dfe5ef">Offline by design</text>
-    <rect x="473" y="432" width="164" height="38" rx="19" fill="#30250d" stroke="#2a3140"/>
-    <circle cx="489" cy="451" r="4" fill="#fbbf24"/><text x="501" y="457" fill="#dfe5ef">OpenSSH config</text>
+    <radialGradient id="leftGlow" cx="0.16" cy="0.2" r="0.75">
+      <stop offset="0" stop-color="#245ab6" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#245ab6" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="icon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#69a8ff"/>
+      <stop offset="1" stop-color="#4c89eb"/>
+    </linearGradient>
+
+    <linearGradient id="window" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#121925"/>
+      <stop offset="1" stop-color="#151e2a"/>
+    </linearGradient>
+
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#1b2330"/>
+      <stop offset="1" stop-color="#192331"/>
+    </linearGradient>
+
+    <linearGradient id="terminal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b1119"/>
+      <stop offset="1" stop-color="#081018"/>
+    </linearGradient>
+
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#6a7f9c" stroke-opacity="0.07" stroke-width="1"/>
+    </pattern>
+
+    <filter id="shadow" x="-20%" y="-20%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#000" flood-opacity="0.34"/>
+    </filter>
+
+    <clipPath id="typeClip">
+      <rect x="0" y="0" width="0" height="22">
+        <animate attributeName="width"
+                 dur="5.5s"
+                 repeatCount="indefinite"
+                 values="0;0;0;130;130;130;0"
+                 keyTimes="0;0.12;0.20;0.42;0.68;0.88;1"/>
+      </rect>
+    </clipPath>
+
+    <style>
+      .ui { font-family: Inter, "Segoe UI", Arial, sans-serif; }
+      .mono { font-family: "Cascadia Mono", Consolas, Menlo, monospace; }
+      .white { fill: #eef3fb; }
+      .body { fill: #d9e2f0; }
+      .muted { fill: #9ca9bd; }
+      .muted2 { fill: #7c8ba0; }
+      .panelStroke { stroke: #2b374c; stroke-width: 1.2; }
+    </style>
+  </defs>
+
+  <!-- background -->
+  <rect width="1600" height="640" fill="url(#bg)"/>
+  <rect width="1600" height="640" fill="url(#leftGlow)"/>
+  <rect x="830" width="770" height="640" fill="url(#grid)"/>
+
+  <!-- LEFT: keep close to original -->
+  <g class="ui">
+    <rect x="92" y="92" width="94" height="94" rx="22" fill="url(#icon)"/>
+    <path d="M116 128l15 15-15 15" fill="none" stroke="#07101a" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M135 157h18" fill="none" stroke="#07101a" stroke-width="4" stroke-linecap="round"/>
+
+    <text x="91" y="292" class="white" font-size="78" font-weight="800">SSHSpan</text>
+    <text x="92" y="349" class="body" font-size="30">Encrypted SSH key management.</text>
+    <text x="92" y="391" class="muted" font-size="25">Local-first. Cross-platform. Under your control.</text>
+
+    <g transform="translate(92 432)">
+      <rect width="188" height="40" rx="20" fill="#14294e" stroke="#2f62ad"/>
+      <circle cx="16" cy="20" r="4.5" fill="#72a9ff"/>
+      <text x="29" y="26" class="white" font-size="14" font-weight="700">AES-256-GCM vault</text>
+    </g>
+
+    <g transform="translate(292 432)">
+      <rect width="180" height="40" rx="20" fill="#15361f" stroke="#2d6940"/>
+      <circle cx="16" cy="20" r="4.5" fill="#4fde88"/>
+      <text x="29" y="26" class="white" font-size="14" font-weight="700">Embedded SSH client</text>
+    </g>
+
+    <g transform="translate(484 432)">
+      <rect width="162" height="40" rx="20" fill="#3b2d0a" stroke="#7a5b17"/>
+      <circle cx="16" cy="20" r="4.5" fill="#ffc247"/>
+      <text x="29" y="26" class="white" font-size="14" font-weight="700">Dual-pane SFTP</text>
+    </g>
+
+    <text x="92" y="520" class="muted2" font-size="17">host categories • audit log • Bitwarden sync • no telemetry</text>
+
+    <rect x="70" y="584" width="560" height="2" rx="1" fill="#29364c"/>
+    <rect x="70" y="584" width="160" height="3" rx="1.5" fill="#6ba8ff"/>
   </g>
-  <text x="92" y="526" font-size="18" fill="#6b7280">SSH keys • encrypted vault • reversible config deployment • optional vault sync</text>
 
-  <g filter="url(#shadow)">
-    <rect x="840" y="110" width="670" height="430" rx="22" fill="#151920" stroke="#2a3140" stroke-width="2"/>
+  <!-- RIGHT: one coherent app window -->
+  <g class="ui" filter="url(#shadow)">
+    <rect x="840" y="110" width="670" height="430" rx="22" fill="url(#window)" class="panelStroke"/>
+
+    <!-- title bar -->
+    <rect x="840" y="110" width="670" height="48" rx="22" fill="url(#bar)"/>
+    <rect x="840" y="136" width="670" height="22" fill="url(#bar)"/>
+    <circle cx="868" cy="134" r="5.5" fill="#ff6b68"/>
+    <circle cx="890" cy="134" r="5.5" fill="#ffc34b"/>
+    <circle cx="912" cy="134" r="5.5" fill="#58dc88"/>
+    <text x="1175" y="140" text-anchor="middle" class="muted" font-size="16" font-weight="700">SSHSpan</text>
+    <rect x="1444" y="122" width="54" height="24" rx="10" fill="#1d2b40" stroke="#33445f"/>
+    <text x="1471" y="139" text-anchor="middle" class="body" font-size="13" font-weight="700">v1.7</text>
+
+    <!-- sidebar -->
+    <rect x="840" y="158" width="166" height="382" fill="#0f1620"/>
+    <rect x="858" y="178" width="34" height="34" rx="8" fill="url(#icon)"/>
+    <path d="M870 189l8 8-8 8" fill="none" stroke="#07101a" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M880 205h9" fill="none" stroke="#07101a" stroke-width="2.4" stroke-linecap="round"/>
+    <text x="904" y="201" class="white" font-size="17" font-weight="800">SSHSpan</text>
+
+    <g font-size="14">
+      <text x="895" y="252" class="muted">Keys</text>
+      <rect x="853" y="268" width="139" height="38" rx="9" fill="#1b3157"/>
+      <text x="895" y="293" fill="#78b0ff">Hosts</text>
+      <text x="895" y="339" class="muted">Terminal</text>
+      <text x="895" y="385" class="muted">SFTP</text>
+      <text x="895" y="431" class="muted">Audit</text>
+      <text x="895" y="477" class="muted">Settings</text>
+    </g>
+
+    <g fill="none" stroke="#8fa1b9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M870 243c3-5 8-6 11-3 2 2 2 5 0 7-3 4-9 1-11-2zm11 3 8 8"/>
+      <rect x="867" y="279" width="16" height="11" rx="2"/><path d="M870 283h10M870 287h10"/>
+      <path d="M870 330l7 7-7 7M882 344h9"/>
+      <path d="M868 374h18v13h-18z"/>
+      <path d="M870 419h14v18h-14zM873 424h8M873 428h8M873 432h8"/>
+      <circle cx="877" cy="466" r="7"/><path d="M877 457v4M877 471v4M868 466h4M882 466h4"/>
+    </g>
+
+    <!-- status card -->
+    <rect x="854" y="486" width="138" height="40" rx="10" fill="#16202c" stroke="#2a3952"/>
+    <circle cx="872" cy="506" r="5.5" fill="#48de89">
+      <animate attributeName="opacity" dur="1.5s" repeatCount="indefinite" values="1;0.45;1"/>
+    </circle>
+    <text x="887" y="503" class="body" font-size="12.5">Vault unlocked</text>
+    <text x="887" y="519" class="muted2" font-size="11.5">Local only</text>
+
+    <!-- content header -->
+    <text x="1028" y="198" class="white" font-size="25" font-weight="800">Hosts</text>
+    <text x="1028" y="223" class="muted" font-size="13.5">Separate categories. One-click connect.</text>
+
+    <rect x="1380" y="174" width="105" height="38" rx="10" fill="#6ca9ff"/>
+    <text x="1432" y="199" text-anchor="middle" fill="#08111b" font-size="14" font-weight="800">+ New Host</text>
+
+    <!-- search -->
+    <rect x="1028" y="242" width="280" height="36" rx="9" fill="#161f2b" stroke="#2d3b55"/>
+    <circle cx="1050" cy="260" r="6.5" fill="none" stroke="#7587a2" stroke-width="2"/>
+    <path d="M1055 265l5 5" stroke="#7587a2" stroke-width="2" stroke-linecap="round"/>
+    <text x="1069" y="265" class="muted" font-size="13.5">Search hosts...</text>
+
+    <rect x="1320" y="242" width="165" height="36" rx="9" fill="#161f2b" stroke="#2d3b55"/>
+    <text x="1337" y="265" class="body" font-size="13.5">All categories</text>
+    <path d="M1456 255l6 6 6-6" fill="none" stroke="#8ca0bb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- categories -->
+    <text x="1028" y="313" class="white" font-size="15" font-weight="700">Host Categories</text>
+    <text x="1190" y="313" fill="#8eb8ff" font-size="21">+</text>
+
+    <text x="1044" y="350" class="body" font-size="13.5">All Hosts</text>
+    <rect x="1180" y="334" width="26" height="24" rx="10" fill="#203047"/>
+    <text x="1193" y="351" text-anchor="middle" class="body" font-size="12">12</text>
+
+    <rect x="1028" y="368" width="182" height="38" rx="10" fill="#20365e" stroke="#31528a"/>
+    <circle cx="1046" cy="387" r="5.5" fill="#ff6f75"/>
+    <text x="1060" y="392" class="white" font-size="13.5" font-weight="700">Production</text>
+    <rect x="1178" y="375" width="26" height="24" rx="10" fill="#38507e"/>
+    <text x="1191" y="392" text-anchor="middle" class="body" font-size="12">3</text>
+
+    <circle cx="1046" cy="423" r="5.5" fill="#65a6ff"/>
+    <text x="1060" y="428" class="muted" font-size="13.5">Staging</text>
+    <rect x="1178" y="411" width="26" height="24" rx="10" fill="#203047"/>
+    <text x="1191" y="428" text-anchor="middle" class="body" font-size="12">4</text>
+
+    <!-- host cards -->
+    <rect x="1230" y="303" width="255" height="68" rx="14" fill="#171f2b" stroke="#2d3b55"/>
+    <rect x="1230" y="379" width="255" height="68" rx="14" fill="#171f2b" stroke="#2d3b55"/>
+
+    <rect x="1248" y="326" width="22" height="22" rx="4" fill="#68a9ff"/>
+    <circle cx="1254" cy="333" r="1.8" fill="#0d1624"/>
+    <circle cx="1262" cy="333" r="1.8" fill="#0d1624"/>
+    <path d="M1253 340h10" stroke="#0d1624" stroke-width="2.1" stroke-linecap="round"/>
+
+    <rect x="1248" y="402" width="22" height="22" rx="4" fill="#68a9ff"/>
+    <circle cx="1254" cy="409" r="1.8" fill="#0d1624"/>
+    <circle cx="1262" cy="409" r="1.8" fill="#0d1624"/>
+    <path d="M1253 416h10" stroke="#0d1624" stroke-width="2.1" stroke-linecap="round"/>
+
+    <text x="1286" y="329" class="white" font-size="14" font-weight="700">prod-web-01</text>
+    <text x="1286" y="350" class="muted" font-size="12.5">ubuntu • 203.0.113.10</text>
+
+    <text x="1286" y="405" class="white" font-size="14" font-weight="700">prod-db</text>
+    <text x="1286" y="426" class="muted" font-size="12.5">ubuntu • 203.0.113.11</text>
+
+    <rect x="1411" y="316" width="52" height="25" rx="12.5" fill="#2a2b35" stroke="#4a4c5e"/>
+    <circle cx="1424" cy="328.5" r="5" fill="#ff6f75"/>
+    <text x="1435" y="333" class="body" font-size="11.5">Prod</text>
+
+    <rect x="1411" y="392" width="52" height="25" rx="12.5" fill="#2a2b35" stroke="#4a4c5e"/>
+    <circle cx="1424" cy="404.5" r="5" fill="#ff6f75"/>
+    <text x="1435" y="409" class="body" font-size="11.5">Prod</text>
+
+    <!-- integrated terminal; fully inside window -->
+    <rect x="1018" y="461" width="467" height="65" rx="12" fill="url(#terminal)" stroke="#2c3a53"/>
+    <rect x="1018" y="461" width="467" height="24" rx="12" fill="#1b2d47"/>
+    <rect x="1018" y="473" width="467" height="12" fill="#1b2d47"/>
+    <text x="1040" y="478" fill="#8abaff" font-size="13.5" font-weight="700">Terminal</text>
+    <text x="1110" y="478" class="muted" font-size="13.5">SFTP</text>
+
+    <text x="1040" y="505" class="mono" fill="#53e393" font-size="14">user@sshspan:~$</text>
+
+    <g transform="translate(1171 494)" clip-path="url(#typeClip)">
+      <text x="0" y="11" class="mono" fill="#edf3fb" font-size="14">ssh prod-web-01</text>
+    </g>
+
+    <text x="1330" y="505" class="mono" fill="#eef5ff" font-size="14">█
+      <animate attributeName="opacity" dur="1s" repeatCount="indefinite"
+               values="1;1;0;0;1" keyTimes="0;0.45;0.5;0.95;1"/>
+    </text>
+
+    <text x="1040" y="521" class="mono" fill="#79b0ff" font-size="11.5">Connected • host key verified • SFTP ready</text>
   </g>
-  <path d="M862 110H1488a22 22 0 0 1 22 22v26H840v-26a22 22 0 0 1 22-22z" fill="#1b2029"/>
-  <circle cx="867" cy="134" r="5" fill="#f87171"/><circle cx="889" cy="134" r="5" fill="#fbbf24"/><circle cx="911" cy="134" r="5" fill="#4ade80"/>
-  <text x="1140" y="139" font-size="15" font-weight="700" fill="#9aa3b2">SSHSpan</text>
-
-  <rect x="840" y="158" width="150" height="382" fill="#13171d"/>
-  <path d="M990 158V540" stroke="#2a3140"/>
-  <rect x="858" y="182" width="34" height="34" rx="9" fill="#6ea8ff"/>
-  <text x="865" y="204" font-family="Consolas,monospace" font-size="12" font-weight="800" fill="#0b1020">&gt;_</text>
-  <text x="901" y="204" font-size="15" font-weight="700" fill="#e6e9ef">SSHSpan</text>
-  <rect x="854" y="237" width="122" height="32" rx="7" fill="#1a2a43"/><text x="868" y="258" font-size="15" fill="#6ea8ff">Keys</text>
-  <text x="868" y="300" font-size="15" fill="#9aa3b2">SSH Config</text><text x="868" y="342" font-size="15" fill="#9aa3b2">Settings</text><text x="868" y="384" font-size="15" fill="#9aa3b2">Audit</text>
-  <rect x="854" y="482" width="122" height="34" rx="8" fill="#1b2029" stroke="#2a3140"/>
-  <circle cx="866" cy="499" r="4" fill="#4ade80"/><text x="878" y="504" font-size="12" fill="#9aa3b2">Vault unlocked</text>
-
-  <text x="1016" y="205" font-size="23" font-weight="700" fill="#e6e9ef">SSH Keys</text>
-  <text x="1016" y="236" font-size="15" fill="#6b7280">3 keys protected locally</text>
-  <rect x="1376" y="184" width="110" height="34" rx="8" fill="#6ea8ff"/><text x="1390" y="206" font-size="14" font-weight="700" fill="#0b1020">+ New Key</text>
-
-  <g>
-    <rect x="1016" y="255" width="470" height="76" rx="11" fill="#1b2029" stroke="#2a3140"/>
-    <circle cx="1042" cy="293" r="8" fill="none" stroke="#6ea8ff" stroke-width="3"/><path d="M1049 293h22m-8 0v7m8-7v5" stroke="#6ea8ff" stroke-width="3"/>
-    <text x="1080" y="282" font-size="15" font-weight="700" fill="#e6e9ef">prod-eu</text><text x="1080" y="307" font-family="Consolas,monospace" font-size="15" fill="#9aa3b2">ED25519   SHA256:Wg8X…6FM</text><circle cx="1462" cy="293" r="5" fill="#4ade80"/>
-    <rect x="1016" y="345" width="470" height="76" rx="11" fill="#1b2029" stroke="#2a3140"/>
-    <circle cx="1042" cy="383" r="8" fill="none" stroke="#6ea8ff" stroke-width="3"/><path d="M1049 383h22m-8 0v7m8-7v5" stroke="#6ea8ff" stroke-width="3"/>
-    <text x="1080" y="372" font-size="15" font-weight="700" fill="#e6e9ef">git-signing</text><text x="1080" y="397" font-family="Consolas,monospace" font-size="15" fill="#9aa3b2">RSA 4096   SHA256:J3sK…9Qp</text><circle cx="1462" cy="383" r="5" fill="#6ea8ff"/>
-    <rect x="1016" y="435" width="470" height="76" rx="11" fill="#1b2029" stroke="#2a3140"/>
-    <circle cx="1042" cy="473" r="8" fill="none" stroke="#6ea8ff" stroke-width="3"/><path d="M1049 473h22m-8 0v7m8-7v5" stroke="#6ea8ff" stroke-width="3"/>
-    <text x="1080" y="462" font-size="15" font-weight="700" fill="#e6e9ef">backup-node</text><text x="1080" y="487" font-family="Consolas,monospace" font-size="15" fill="#9aa3b2">ECDSA P-384   SHA256:K7dP…2Lm</text><circle cx="1462" cy="473" r="5" fill="#fbbf24"/>
-  </g>
-</g>
-<path d="M70 585H630" stroke="#2a3140" stroke-width="2"/><path d="M70 585H230" stroke="#6ea8ff" stroke-width="4"/>
 </svg>
