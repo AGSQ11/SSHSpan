@@ -1,7 +1,7 @@
 {
   "name": "sshspan",
   "productName": "SSHSpan",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Cross-platform SSH key manager and SSH client. Encrypted local vault, categories, Bitwarden sync, deploy, and an embedded PuTTY-grade terminal. Rust/Tauri core.",
   "author": {
     "name": "AGSQ11",
