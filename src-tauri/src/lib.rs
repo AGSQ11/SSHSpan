@@ -145,6 +145,7 @@ pub fn run() {
             sftp_queue_cancel,
             sftp_queue_retry,
             sftp_queue_clear_finished,
+            sftp_server_copy,
             sftp_search,
             sftp_bookmarks_list,
             sftp_bookmarks_save,

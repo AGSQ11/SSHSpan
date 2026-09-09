@@ -1027,28 +1027,23 @@ async function sftpOpenForEdit(tabId, fullPath, name) {
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
+// Server-to-server "Send to": enqueues a queue job that downloads from the
+// source and uploads to the target on fresh SFTP channels (the interactive
+// browse sessions are never used — some servers fail reads on the
+// long-lived channel). Progress shows in the transfer queue panel.
 async function sftpSendTo(fromTabId, fullPath, targetTab) {
   try {
     const name = fullPath.split('/').filter(Boolean).pop() || 'file';
     terminalSetStatus(`Sending ${name} to ${targetTab.serverName}…`);
-    const r = await sftpCall('sftp_download', {
-      sessionId: state.sessions.get(fromTabId)?.sessionId,
+    await sftpCall('sftp_server_copy', {
+      fromSessionId: state.sessions.get(fromTabId)?.sessionId,
       remote: fullPath,
-      local: await sftpTempPath(name),
-    });
-    await sftpCall('sftp_upload', {
-      sessionId: targetTab.sessionId,
-      local: r.local,
-      remote: sftpJoin(targetTab.sftpPath || '/', name),
+      targetSessionId: targetTab.sessionId,
+      targetDir: targetTab.sftpPath || '/',
     });
     terminalSetStatus(`Sent ${name} to ${targetTab.serverName}.`);
-    toast(`Sent ${name} to ${targetTab.serverName}.`, 'ok');
+    toast(`Sending ${name} to ${targetTab.serverName} — see Transfers.`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
-}
-
-async function sftpTempPath(name) {
-  const r = await call('sftp_stage_path', { name });
-  return r.path;
 }
 
 // ─── transfer queue panel ───────────────────────────────────────────────────
@@ -1157,13 +1152,24 @@ function renderQueuePanel() {
     const name = j.kind === 'upload'
       ? (j.remotePath || '').split('/').filter(Boolean).pop()
       : (j.remotePath || '').split('/').filter(Boolean).pop();
-    const dirLabel = j.kind === 'upload' ? '↑' : '↓';
-    const pct = j.size > 0 ? Math.min(100, (j.bytesDone / j.size) * 100) : (j.state === 'done' ? 100 : 0);
+    const dirLabel = j.kind === 'upload' ? '↑' : j.kind === 'serverCopy' ? '⇄' : '↓';
+    // serverCopy: bytesDone is overall (download half + upload half), so the
+    // progress bar maps 0..2×size onto 0..100%.
+    const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
+    const pct = totalUnits > 0
+      ? Math.min(100, (j.bytesDone / totalUnits) * 100)
+      : (j.state === 'done' ? 100 : 0);
+    const shownDone = j.kind === 'serverCopy'
+      ? Math.min(j.bytesDone || 0, j.size || 0)
+      : (j.bytesDone || 0);
 
     const info = document.createElement('div');
     info.className = 'sftp-queueinfo';
+    const route = j.kind === 'serverCopy' && j.targetServerName
+      ? `${escapeHtml(j.serverName || '')} → ${escapeHtml(j.targetServerName)}`
+      : escapeHtml(j.serverName || '');
     info.innerHTML = `<span class="sftp-queuename">${escapeHtml(dirLabel + ' ' + (name || '?'))}</span>
-      <span class="sftp-queuesub">${escapeHtml(j.serverName || '')} · ${formatSftpSize(j.bytesDone || 0)}${j.size ? ' / ' + formatSftpSize(j.size) : ''}${j.speed ? ' · ' + (j.speed / 1024).toFixed(1) + ' KB/s' : ''}${j.error ? ' · ' + escapeHtml(j.error) : ''}</span>`;
+      <span class="sftp-queuesub">${route} · ${formatSftpSize(shownDone || 0)}${j.size ? ' / ' + formatSftpSize(j.size) : ''}${j.speed ? ' · ' + (j.speed / 1024).toFixed(1) + ' KB/s' : ''}${j.error ? ' · ' + escapeHtml(j.error) : ''}</span>`;
     const bar = document.createElement('div');
     bar.className = 'sftp-queuebar';
     const fill = document.createElement('div');

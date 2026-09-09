@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
 use crate::ssh_client::SessionRegistry;
@@ -19,6 +19,11 @@ use crate::ssh_client::SessionRegistry;
 pub enum JobKind {
     Upload,
     Download,
+    /// Server-to-server copy ("Send to"): fresh-channel download from the
+    /// source session into a local temp staging file, then fresh-channel
+    /// upload to the target session. Never touches the interactive
+    /// SftpRegistry sessions.
+    ServerCopy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -48,6 +53,15 @@ pub struct TransferJob {
     #[serde(skip)]
     pub cancel: Option<Arc<AtomicBool>>,
     pub started_at: Option<std::time::SystemTime>,
+    /// ServerCopy only: target session (job's `session_id` is the SOURCE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_session_id: Option<String>,
+    /// ServerCopy only: target server name (display in the queue panel).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_server_name: Option<String>,
+    /// ServerCopy only: absolute remote destination path on the target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_remote_path: Option<String>,
 }
 
 impl TransferJob {
@@ -64,6 +78,9 @@ impl TransferJob {
             "state": self.state,
             "error": self.error,
             "speed": speed,
+            "targetSessionId": self.target_session_id,
+            "targetServerName": self.target_server_name,
+            "targetRemotePath": self.target_remote_path,
         })
     }
 }
@@ -93,14 +110,14 @@ impl TransferQueue {
 }
 
 /// Emit the full queue state to the renderer.
-pub fn emit_queue(app: &AppHandle) {
+pub fn emit_queue<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let q = app.state::<TransferQueue>();
     let jobs = q.snapshot();
     let _ = app.emit("sftp-queue", serde_json::json!({ "jobs": jobs }));
 }
 
 /// Fetch the live SFTP channel-count setting (1..=4, default 2).
-fn parallel_limit(app: &AppHandle) -> usize {
+fn parallel_limit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> usize {
     app.state::<crate::AppState>()
         .db
         .get_config("setting.sftpParallel")
@@ -119,11 +136,43 @@ pub struct QueuedItem {
     pub local_path: String,
     pub remote_path: String,
     pub size: u64,
+    /// ServerCopy only: target session id, server name, and absolute remote
+    /// destination path on the target server.
+    pub target: Option<ServerCopyTarget>,
+}
+
+/// Destination half of a server-to-server copy job.
+pub struct ServerCopyTarget {
+    pub session_id: String,
+    pub server_name: String,
+    pub remote_path: String,
+}
+
+impl QueuedItem {
+    /// Plain upload/download item (no copy target).
+    pub fn simple(
+        kind: JobKind,
+        session_id: String,
+        server_name: String,
+        local_path: String,
+        remote_path: String,
+        size: u64,
+    ) -> Self {
+        Self {
+            kind,
+            session_id,
+            server_name,
+            local_path,
+            remote_path,
+            size,
+            target: None,
+        }
+    }
 }
 
 /// Add jobs and kick the dispatcher. `items` are fully-expanded file pairs
 /// (directories were expanded by the caller).
-pub fn enqueue(app: &AppHandle, items: Vec<QueuedItem>) {
+pub fn enqueue<R: tauri::Runtime>(app: &tauri::AppHandle<R>, items: Vec<QueuedItem>) {
     let q = app.state::<TransferQueue>();
     {
         let mut guard = q.jobs.lock().unwrap();
@@ -142,6 +191,9 @@ pub fn enqueue(app: &AppHandle, items: Vec<QueuedItem>) {
                 error: None,
                 cancel: None,
                 started_at: None,
+                target_session_id: item.target.as_ref().map(|t| t.session_id.clone()),
+                target_server_name: item.target.as_ref().map(|t| t.server_name.clone()),
+                target_remote_path: item.target.as_ref().map(|t| t.remote_path.clone()),
             });
         }
     }
@@ -154,11 +206,19 @@ pub fn enqueue(app: &AppHandle, items: Vec<QueuedItem>) {
 /// Spawn workers for queued jobs while fewer than the limit are active.
 /// Cheap to call repeatedly: each call checks state under the lock and only
 /// spawns when there is work and capacity.
-pub fn dispatch(app: &AppHandle) {
+pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let q = app.state::<TransferQueue>();
     let limit = parallel_limit(app);
 
-    let to_start: Vec<(u64, String, JobKind, String, String, u64)> = {
+    let to_start: Vec<(
+        u64,
+        String,
+        JobKind,
+        String,
+        String,
+        u64,
+        Option<ServerCopyTarget>,
+    )> = {
         let mut guard = q.jobs.lock().unwrap();
         let active = guard.iter().filter(|j| j.state == JobState::Active).count();
         let mut capacity = limit.saturating_sub(active);
@@ -174,6 +234,18 @@ pub fn dispatch(app: &AppHandle) {
                 j.state = JobState::Active;
                 j.cancel = Some(Arc::new(AtomicBool::new(false)));
                 j.started_at = Some(std::time::SystemTime::now());
+                let target = match (
+                    j.target_session_id.clone(),
+                    j.target_server_name.clone(),
+                    j.target_remote_path.clone(),
+                ) {
+                    (Some(sid), Some(name), Some(path)) => Some(ServerCopyTarget {
+                        session_id: sid,
+                        server_name: name,
+                        remote_path: path,
+                    }),
+                    _ => None,
+                };
                 started.push((
                     j.id,
                     j.session_id.clone(),
@@ -181,6 +253,7 @@ pub fn dispatch(app: &AppHandle) {
                     j.local_path.clone(),
                     j.remote_path.clone(),
                     j.size,
+                    target,
                 ));
                 capacity -= 1;
             }
@@ -194,18 +267,18 @@ pub fn dispatch(app: &AppHandle) {
     let gen = q.generation.load(Ordering::SeqCst);
     drop(q);
 
-    for (id, session_id, kind, local, remote, size) in to_start {
+    for (id, session_id, kind, local, remote, size, target) in to_start {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            run_job(app, gen, id, session_id, kind, local, remote, size).await;
+            run_job(app, gen, id, session_id, kind, local, remote, size, target).await;
         });
     }
 }
 
 /// Ask the SSH session actor for a fresh SFTP channel (browse session stays
 /// untouched — each transfer gets its own channel over the same connection).
-async fn open_transfer_channel(
-    app: &AppHandle,
+async fn open_transfer_channel<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     session_id: &str,
 ) -> Result<russh_sftp::client::SftpSession, String> {
     let tx = app
@@ -225,15 +298,20 @@ async fn open_transfer_channel(
 /// the final read never crosses EOF — some SFTP servers answer such reads
 /// with SSH_FX_FAILURE instead of a short read, which would fail the whole
 /// transfer on the last chunk.
-async fn copy_with_progress<R, W>(
-    app: &AppHandle,
+/// `progress_offset` is added to the copied count when reporting job
+/// progress, so a multi-leg transfer can show its overall position (0 for
+/// plain uploads/downloads).
+async fn copy_with_progress<RT, R, W>(
+    app: &tauri::AppHandle<RT>,
     job_id: u64,
     reader: &mut R,
     writer: &mut W,
     cancel: Arc<AtomicBool>,
     max_read: Option<u64>,
+    progress_offset: u64,
 ) -> Result<u64, String>
 where
+    RT: tauri::Runtime,
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -275,7 +353,7 @@ where
             if dt > 0.0 {
                 speed = (done - last_bytes) as f64 / dt;
             }
-            update_progress(app, job_id, done, Some(speed));
+            update_progress(app, job_id, progress_offset + done, Some(speed));
             last_emit = now;
             last_bytes = done;
         }
@@ -285,7 +363,12 @@ where
     Ok(done)
 }
 
-fn update_progress(app: &AppHandle, job_id: u64, bytes_done: u64, speed: Option<f64>) {
+fn update_progress<RT: tauri::Runtime>(
+    app: &tauri::AppHandle<RT>,
+    job_id: u64,
+    bytes_done: u64,
+    speed: Option<f64>,
+) {
     let q = app.state::<TransferQueue>();
     let job_json = {
         let mut guard = q.jobs.lock().unwrap();
@@ -303,7 +386,12 @@ fn update_progress(app: &AppHandle, job_id: u64, bytes_done: u64, speed: Option<
 }
 
 /// Set a job's terminal state and emit it.
-fn finish_job(app: &AppHandle, job_id: u64, state: JobState, error: Option<String>) {
+fn finish_job<RT: tauri::Runtime>(
+    app: &tauri::AppHandle<RT>,
+    job_id: u64,
+    state: JobState,
+    error: Option<String>,
+) {
     let q = app.state::<TransferQueue>();
     let job_json = {
         let mut guard = q.jobs.lock().unwrap();
@@ -327,8 +415,112 @@ fn finish_job(app: &AppHandle, job_id: u64, state: JobState, error: Option<Strin
     dispatch(app);
 }
 
-async fn run_job(
-    app: AppHandle,
+/// Deletes a staged temp file when dropped (best-effort). Guarantees the
+/// staging file never outlives the job: success, failure, cancel, and
+/// worker panic all drop the guard, so the file is removed on every exit
+/// path (FileZilla removes the temp file once the transfer is cleared).
+struct StageGuard(std::path::PathBuf);
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "[sshspan-sftp] could not remove staged copy {}: {e}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+}
+
+/// Run one server-to-server copy: fresh-channel download from the source
+/// session into a temp staging file, then fresh-channel upload to the target
+/// session. Never touches the interactive SftpRegistry sessions — both legs
+/// get their own channel over the respective SSH connections, exactly like
+/// plain queue downloads/uploads (that is what makes this path work on
+/// servers whose interactive channel fails reads with SSH_FX_FAILURE).
+async fn run_server_copy<RT: tauri::Runtime>(
+    app: &tauri::AppHandle<RT>,
+    job_id: u64,
+    source_session: &str,
+    source_remote: &str,
+    target: &ServerCopyTarget,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let file_name = source_remote.rsplit('/').next().unwrap_or("file");
+    // Staged copy lives in the same 0700 temp dir + unpredictable-name
+    // convention as edit/"Send to" staging (see sftp::staged_file_name).
+    let stage = crate::sftp::edit_temp_dir().join(format!(
+        "sendto-{}",
+        crate::sftp::staged_file_name(file_name)
+    ));
+    // Drop guard: removed on success, failure, cancel, and panic alike.
+    let _guard = StageGuard(stage.clone());
+
+    // ── leg 1: download from the SOURCE via a fresh channel ──────────────
+    let sftp = open_transfer_channel(app, source_session).await?;
+    let mut rf = sftp.open(source_remote).await.map_err(|e| {
+        format!(
+            "remote open failed: {}",
+            crate::commands::sftp::sftp_error_detail(e)
+        )
+    })?;
+    let size = sftp
+        .metadata(source_remote)
+        .await
+        .map_err(|e| {
+            format!(
+                "remote stat failed: {}",
+                crate::commands::sftp::sftp_error_detail(e)
+            )
+        })?
+        .size
+        .unwrap_or(0);
+    let mut lf = tokio::fs::File::create(&stage)
+        .await
+        .map_err(|e| format!("local create failed: {e}"))?;
+    // Size-clamped reads (EOF-crossing read defense), progress = first half.
+    copy_with_progress(app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size), 0).await?;
+    lf.flush()
+        .await
+        .map_err(|e| format!("local flush failed: {e}"))?;
+    drop(lf);
+    // Tolerant close, same as download_to: a FAILURE reply to CLOSE after a
+    // fully-copied read handle means the data already landed.
+    if let Err(e) = rf.close().await {
+        log::warn!("[sshspan-sftp] close after copy of {source_remote}: {e}");
+    }
+    drop(sftp);
+
+    // ── leg 2: upload to the TARGET via a second fresh channel ───────────
+    let target_sftp = open_transfer_channel(app, &target.session_id).await?;
+    let mut lf = tokio::fs::File::open(&stage)
+        .await
+        .map_err(|e| format!("local open failed: {e}"))?;
+    let mut rf = target_sftp.create(&target.remote_path).await.map_err(|e| {
+        format!(
+            "remote create failed: {}",
+            crate::commands::sftp::sftp_error_detail(e)
+        )
+    })?;
+    // Progress = second half of the overall copy.
+    copy_with_progress(
+        app,
+        job_id,
+        &mut lf,
+        &mut rf,
+        cancel.clone(),
+        Some(size),
+        size,
+    )
+    .await?;
+    rf.close().await.map_err(|e| format!("close failed: {e}"))?;
+    Ok(())
+}
+
+async fn run_job<RT: tauri::Runtime + 'static>(
+    app: tauri::AppHandle<RT>,
     _gen: u64,
     job_id: u64,
     session_id: String,
@@ -336,6 +528,7 @@ async fn run_job(
     local: String,
     remote: String,
     size: u64,
+    target: Option<ServerCopyTarget>,
 ) {
     let cancel = {
         let q = app.state::<TransferQueue>();
@@ -350,53 +543,71 @@ async fn run_job(
         return;
     };
 
-    let result: Result<(), String> = async {
-        let sftp = open_transfer_channel(&app, &session_id).await?;
-        match kind {
-            JobKind::Upload => {
-                let mut lf = tokio::fs::File::open(&local)
-                    .await
-                    .map_err(|e| format!("local open failed: {e}"))?;
-                let mut rf = sftp
-                    .create(&remote)
-                    .await
-                    .map_err(|e| format!("remote open failed: {e}"))?;
-                copy_with_progress(&app, job_id, &mut lf, &mut rf, cancel.clone(), None).await?;
-                rf.close().await.map_err(|e| format!("close failed: {e}"))?;
-            }
-            JobKind::Download => {
-                let mut rf = sftp.open(&remote).await.map_err(|e| {
-                    format!(
-                        "remote open failed: {}",
-                        crate::commands::sftp::sftp_error_detail(e)
-                    )
-                })?;
-                // Clamp reads to the file size so the final chunk never
-                // crosses EOF (see copy_with_progress doc comment).
-                let size = sftp
-                    .metadata(&remote)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "remote stat failed: {}",
-                            crate::commands::sftp::sftp_error_detail(e)
-                        )
-                    })?
-                    .size
-                    .unwrap_or(0);
-                let mut lf = tokio::fs::File::create(&local)
-                    .await
-                    .map_err(|e| format!("local create failed: {e}"))?;
-                copy_with_progress(&app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size))
-                    .await?;
-                lf.flush()
-                    .await
-                    .map_err(|e| format!("local flush failed: {e}"))?;
-            }
+    let result: Result<(), String> = match (kind, target) {
+        (JobKind::ServerCopy, Some(target)) => {
+            run_server_copy(&app, job_id, &session_id, &remote, &target, cancel).await
         }
-        Ok(())
-    }
-    .await;
+        (JobKind::ServerCopy, None) => Err("server copy job is missing its target".into()),
+        (kind, _) => {
+            async {
+                let sftp = open_transfer_channel(&app, &session_id).await?;
+                match kind {
+                    JobKind::Upload => {
+                        let mut lf = tokio::fs::File::open(&local)
+                            .await
+                            .map_err(|e| format!("local open failed: {e}"))?;
+                        let mut rf = sftp
+                            .create(&remote)
+                            .await
+                            .map_err(|e| format!("remote open failed: {e}"))?;
+                        copy_with_progress(&app, job_id, &mut lf, &mut rf, cancel.clone(), None, 0)
+                            .await?;
+                        rf.close().await.map_err(|e| format!("close failed: {e}"))?;
+                    }
+                    JobKind::Download => {
+                        let mut rf = sftp.open(&remote).await.map_err(|e| {
+                            format!(
+                                "remote open failed: {}",
+                                crate::commands::sftp::sftp_error_detail(e)
+                            )
+                        })?;
+                        // Clamp reads to the file size so the final chunk never
+                        // crosses EOF (see copy_with_progress doc comment).
+                        let size = sftp
+                            .metadata(&remote)
+                            .await
+                            .map_err(|e| {
+                                format!(
+                                    "remote stat failed: {}",
+                                    crate::commands::sftp::sftp_error_detail(e)
+                                )
+                            })?
+                            .size
+                            .unwrap_or(0);
+                        let mut lf = tokio::fs::File::create(&local)
+                            .await
+                            .map_err(|e| format!("local create failed: {e}"))?;
+                        copy_with_progress(
+                            &app,
+                            job_id,
+                            &mut rf,
+                            &mut lf,
+                            cancel.clone(),
+                            Some(size),
+                            0,
+                        )
+                        .await?;
+                        lf.flush()
+                            .await
+                            .map_err(|e| format!("local flush failed: {e}"))?;
+                    }
+                    JobKind::ServerCopy => unreachable!("handled above"),
+                }
+                Ok(())
+            }
+            .await
+        }
+    };
 
     match result {
         Ok(()) => finish_job(&app, job_id, JobState::Done, None),
@@ -407,7 +618,7 @@ async fn run_job(
 }
 
 /// Cancel one job (active jobs abort at their next chunk; queued flip state).
-pub fn cancel_job(app: &AppHandle, job_id: u64) {
+pub fn cancel_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
     let q = app.state::<TransferQueue>();
     let mut guard = q.jobs.lock().unwrap();
     if let Some(j) = guard.iter_mut().find(|j| j.id == job_id) {
@@ -424,7 +635,7 @@ pub fn cancel_job(app: &AppHandle, job_id: u64) {
 }
 
 /// Re-queue a failed/cancelled job.
-pub fn retry_job(app: &AppHandle, job_id: u64) {
+pub fn retry_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
     let q = app.state::<TransferQueue>();
     {
         let mut guard = q.jobs.lock().unwrap();
@@ -443,7 +654,7 @@ pub fn retry_job(app: &AppHandle, job_id: u64) {
 }
 
 /// Remove Done/Failed/Cancelled jobs from the list.
-pub fn clear_finished(app: &AppHandle) {
+pub fn clear_finished<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
     let q = app.state::<TransferQueue>();
     q.jobs.lock().unwrap().retain(|j| {
         !matches!(
@@ -455,14 +666,16 @@ pub fn clear_finished(app: &AppHandle) {
     emit_queue(app);
 }
 
-/// Cancel everything belonging to a session (disconnect/lock).
-pub fn cancel_for_session(app: &AppHandle, session_id: &str) {
+/// Cancel everything belonging to a session (disconnect/lock). A
+/// ServerCopy job belongs to BOTH its source and target sessions.
+pub fn cancel_for_session<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, session_id: &str) {
     let q = app.state::<TransferQueue>();
     {
         let mut guard = q.jobs.lock().unwrap();
         for j in guard.iter_mut() {
-            if j.session_id == session_id && matches!(j.state, JobState::Queued | JobState::Active)
-            {
+            let owns =
+                j.session_id == session_id || j.target_session_id.as_deref() == Some(session_id);
+            if owns && matches!(j.state, JobState::Queued | JobState::Active) {
                 if let Some(c) = &j.cancel {
                     c.store(true, Ordering::SeqCst);
                 }
@@ -476,14 +689,16 @@ pub fn cancel_for_session(app: &AppHandle, session_id: &str) {
     emit_queue(app);
 }
 
-/// True when the session has active or queued jobs.
-pub fn session_busy(app: &AppHandle, session_id: &str) -> bool {
+/// True when the session has active or queued jobs (as source OR as the
+/// target of a server copy).
+pub fn session_busy<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, session_id: &str) -> bool {
     app.state::<TransferQueue>()
         .jobs
         .lock()
         .unwrap()
         .iter()
         .any(|j| {
-            j.session_id == session_id && matches!(j.state, JobState::Queued | JobState::Active)
+            (j.session_id == session_id || j.target_session_id.as_deref() == Some(session_id))
+                && matches!(j.state, JobState::Queued | JobState::Active)
         })
 }
