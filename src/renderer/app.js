@@ -2370,7 +2370,7 @@ async function manualUpdateCheck() {
         `Download and run the installer for this OS?`);
       if (install) {
         toast('Downloading installer…', 'info');
-        await call('update_download_and_run', { url: r.assetUrl, version: r.version });
+        await call('update_download_and_run', { url: r.assetUrl, version: r.version, expectedSha256: r.assetDigest });
         // The app exits itself right after spawning the installer.
       }
     } else {
