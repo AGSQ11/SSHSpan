@@ -147,15 +147,57 @@ pub fn edit_temp_dir() -> std::path::PathBuf {
 
 /// Sanitize a remote file name for use as a local staged-file base name:
 /// flattens path separators so a hostile remote name cannot escape the temp
-/// dir, and strips characters that are invalid in Windows file names.
+/// dir, strips characters that are invalid in Windows file names, trims
+/// trailing dots/spaces (Windows strips them, which could otherwise
+/// re-expose a blocked extension), and neutralizes reserved device names.
 fn sanitize_stage_base(name: &str) -> String {
-    name.chars()
+    let mut s: String = name
+        .chars()
         .map(|c| match c {
             '/' | '\\' => '_',
             ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
             _ => c,
         })
-        .collect()
+        .collect();
+    // Windows filenames cannot end in dots or spaces; the OS strips them,
+    // so `notes.scr.` would land on disk as `notes.scr`. Trim first so the
+    // extension check below always sees the on-disk name.
+    while s.ends_with('.') || s.ends_with(' ') {
+        s.pop();
+    }
+    if s.is_empty() {
+        return String::new();
+    }
+    // Reserved DOS device names apply to the stem (the part before the final
+    // dot): `CON`, `NUL.txt`, `COM1.exe` all resolve to devices. If the stem
+    // is a device name, prefix it so the staged file is a regular file.
+    let stem = s.rsplit_once('.').map_or(s.as_str(), |(stem, _)| stem);
+    if is_windows_device_name(stem) {
+        s.insert(0, '_');
+    }
+    s
+}
+
+/// Windows reserved device names: CON, PRN, AUX, NUL, COM1-9, LPT1-9
+/// (case-insensitive).
+fn is_windows_device_name(stem: &str) -> bool {
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    DEVICES.iter().any(|d| d.eq_ignore_ascii_case(stem))
+}
+
+/// Extensions that must never be preserved on a staged edit file: opening one
+/// via the OS shell would execute it (ShellExecute honors the extension) or
+/// otherwise hand it to a dangerous handler. Case-insensitive.
+const BLOCKED_STAGE_EXTENSIONS: [&str; 24] = [
+    "exe", "scr", "bat", "cmd", "com", "pif", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf",
+    "wsh", "hta", "msi", "msp", "lnk", "url", "reg", "dll", "cpl", "inf", "jar",
+];
+
+fn is_blocked_stage_extension(ext: &str) -> bool {
+    BLOCKED_STAGE_EXTENSIONS.iter().any(|b| b.eq_ignore_ascii_case(ext))
 }
 
 /// Unpredictable staged-file name for a remote file: `{base}.{uuid}.{ext}`
@@ -163,21 +205,38 @@ fn sanitize_stage_base(name: &str) -> String {
 /// local user from pre-creating or guessing the path of a file that will
 /// hold remote (potentially secret) contents; the sanitized base and the
 /// original extension are preserved so the editor association still works.
+///
+/// If the remote extension is executable/dangerous (e.g. `.scr`, `.exe`), it
+/// is NEVER preserved — the staged name is forced to end in `.txt` so the OS
+/// shell opens it in an editor instead of executing it. A remote name that is
+/// only a blocked extension (`.scr`) or empty stages as `file.{uuid}.txt`.
 pub fn staged_file_name(remote_name: &str) -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let base = sanitize_stage_base(remote_name);
-    let base = if base.is_empty() {
-        "file".to_string()
-    } else {
-        base
-    };
+    let base = if base.is_empty() { "file" } else { &base };
     match base.rsplit_once('.') {
         // Preserve a non-empty extension, limiting it to a sane length so a
-        // dot-heavy name cannot produce a pathologically long tail.
+        // dot-heavy name cannot produce a pathologically long tail — unless
+        // the extension is executable/dangerous, in which case the staged
+        // name is forced to `.txt` (drop the blocked tail from the base so
+        // the result cannot end in e.g. `.scr.txt.scr`-style residue).
         Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 16 => {
-            format!("{stem}.{id}.{ext}")
+            if is_blocked_stage_extension(ext) {
+                format!("{stem}.{id}.txt")
+            } else {
+                format!("{stem}.{id}.{ext}")
+            }
         }
-        _ => format!("{base}-{id}"),
+        // No usable stem/extension. If the whole name is a blocked extension
+        // (`.scr` sanitizes to `.scr`, stem empty) stage as inert text; other
+        // extension-less names keep the suffix form.
+        _ => {
+            if base.starts_with('.') && base.len() > 1 && is_blocked_stage_extension(&base[1..]) {
+                format!("file.{id}.txt")
+            } else {
+                format!("{base}-{id}")
+            }
+        }
     }
 }
 
@@ -328,6 +387,71 @@ mod tests {
         // the base and gets the no-extension suffix form.
         let a = staged_file_name("v1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17");
         assert!(a.ends_with(".17"), "base must be preserved verbatim: {a}");
+    }
+
+    #[test]
+    fn staged_name_forces_txt_for_blocked_extensions() {
+        for name in ["evil.scr", "x.EXE", "run.ps1", "doc.msi", "link.url", "shell.cpl", "app.jar", "setup.inf"] {
+            let a = staged_file_name(name);
+            assert!(a.ends_with(".txt"), "blocked extension must stage as .txt: {name} → {a}");
+            let ext = a.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+            assert!(
+                !is_blocked_stage_extension(&ext),
+                "staged name must not end in a blocked extension: {name} → {a}"
+            );
+        }
+        // The uuid component and sanitized base survive the rewrite.
+        let a = staged_file_name("evil.scr");
+        assert!(a.starts_with("evil."), "base must be preserved: {a}");
+        let middle = a.strip_prefix("evil.").and_then(|s| s.strip_suffix(".txt")).expect("evil.{uuid}.txt");
+        assert_eq!(middle.len(), 32, "expected a 32-hex-char uuid: {a}");
+    }
+
+    #[test]
+    fn staged_name_blocked_extension_with_trailing_dot() {
+        // Windows strips a trailing dot, so `notes.txt.` would land on disk as
+        // `notes.txt`; and `evil.scr.` would land as `evil.scr` (executable).
+        // The sanitizer trims the dot first, so the blocked check still fires.
+        let a = staged_file_name("notes.txt.");
+        assert!(a.ends_with(".txt"), "trailing dot must not break staging: {a}");
+        assert!(a.starts_with("notes."), "base must be preserved: {a}");
+
+        let a = staged_file_name("evil.scr.");
+        assert!(a.ends_with(".txt"), "blocked ext behind a trailing dot must still be forced to .txt: {a}");
+        assert!(a.starts_with("evil."), "base must be preserved: {a}");
+    }
+
+    #[test]
+    fn staged_name_neutralizes_windows_device_names() {
+        // A base that is only a device name gets a `_` prefix so the staged
+        // file is a regular file, not a device.
+        let a = staged_file_name("CON");
+        assert!(a.starts_with("_CON"), "device name must be prefixed: {a}");
+
+        // Device name with a (blocked) extension: the stem is the device
+        // name, so the prefix applies AND the extension is forced to .txt.
+        // Policy: `CON.exe` → `_CON.{uuid}.txt` — never a device, never
+        // executable.
+        let a = staged_file_name("CON.exe");
+        assert!(a.starts_with("_CON."), "device stem must be prefixed: {a}");
+        assert!(a.ends_with(".txt"), "blocked extension must stage as .txt: {a}");
+
+        // Device name with a benign extension keeps the extension.
+        let a = staged_file_name("NUL.log");
+        assert!(a.starts_with("_NUL."), "device stem must be prefixed: {a}");
+        assert!(a.ends_with(".log"), "benign extension must be preserved: {a}");
+    }
+
+    #[test]
+    fn staged_name_bare_blocked_extension_and_empty() {
+        // A remote name that is only an extension stages deterministically as
+        // an inert text file.
+        let a = staged_file_name(".scr");
+        assert!(a.starts_with("file."), "bare blocked extension must stage as file.*: {a}");
+        assert!(a.ends_with(".txt"), "bare blocked extension must stage as .txt: {a}");
+
+        // Empty name keeps the existing deterministic fallback.
+        assert!(staged_file_name("").starts_with("file-"));
     }
 
     #[test]

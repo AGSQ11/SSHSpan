@@ -1728,9 +1728,34 @@ pub fn settings_set(app: AppHandle, key: String, value: String) -> CmdResult<ser
 //  SYSTEM commands
 // ═════════════════════════════════════════════════════════════════════════════
 
+/// Contract: `system_open_external` accepts only an existing, absolute local
+/// filesystem path. URIs (`https:`, `file:`, `ms-settings:`, …) are rejected —
+/// the renderer's only call site passes the staged temp-file path returned by
+/// `sftp_open_for_edit`, and unrestricted `opener::open` would otherwise hand
+/// arbitrary schemes to the OS shell. A single-letter drive prefix (`C:\…` or
+/// `C:/…` on Windows) is a path, not a URI scheme.
 #[tauri::command]
 pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
-    opener::open(&url).map_err(|e| e.to_string())?;
+    let p = std::path::Path::new(&url);
+    if !p.is_absolute() {
+        return Err("system_open_external only accepts absolute local file paths.".into());
+    }
+    // Reject URI schemes: `^[a-zA-Z][a-zA-Z0-9+.-]*:` before any path
+    // separator, except a 1-char drive letter (Windows `C:`).
+    let prefix_before_sep = url
+        .split(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or("");
+    if let Some(scheme_end) = prefix_before_sep.find(':') {
+        let scheme = &prefix_before_sep[..scheme_end];
+        if scheme.len() != 1 || !scheme.chars().next().unwrap().is_ascii_alphabetic() {
+            return Err("system_open_external does not accept URLs, only local file paths.".into());
+        }
+    }
+    if !p.is_file() {
+        return Err("system_open_external: path does not exist.".into());
+    }
+    opener::open(p).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
