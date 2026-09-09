@@ -13,7 +13,10 @@ use tokio::io::AsyncWriteExt;
 
 use std::sync::Arc as StdArc;
 
-use crate::sftp::{edit_temp_dir, EditRegistry, EditWatch, KeepaliveRegistry, SftpRegistry};
+use crate::sftp::{
+    edit_temp_dir, staged_file_name, EditRegistry, EditWatch, KeepaliveRegistry, SftpRegistry,
+    STAGE_FILE_MAX_AGE,
+};
 use crate::ssh_client::SessionRegistry;
 use crate::AppState;
 
@@ -360,9 +363,17 @@ pub async fn sftp_open_for_edit(
     if file_name.is_empty() {
         return Err(CmdError("Cannot edit a directory path.".into()));
     }
-    let local = edit_temp_dir().join(format!(
-        "{}-{file_name}",
-        &session_id[..8.min(session_id.len())]
+    // Best-effort prune of staged copies left behind by crashed/killed
+    // sessions (only files directly inside sshspan-edit, older than a day).
+    let temp_dir = edit_temp_dir();
+    crate::sftp::prune_stale_stage_files(&temp_dir, STAGE_FILE_MAX_AGE);
+    // Unpredictable staged name: the file can hold secret remote contents,
+    // so its path must not be guessable by other local users (the dir is
+    // 0700, this is defense in depth for the pre-existing-dir case).
+    let local = temp_dir.join(format!(
+        "{}-{}",
+        &session_id[..8.min(session_id.len())],
+        staged_file_name(&file_name)
     ));
 
     download_to(&sftp, &remote, &local.display().to_string()).await?;
@@ -423,6 +434,14 @@ pub async fn sftp_open_for_edit(
                 };
                 if tokio::io::copy(&mut lf, &mut rf).await.is_ok() {
                     eprintln!("[sshspan-sftp] synced back {remote} on {session}");
+                    // The staged file deliberately stays for the life of the
+                    // edit session: the watcher only uploads-on-change, it
+                    // never re-downloads, and deleting a path a third-party
+                    // editor may hold open makes editors recreate an
+                    // empty/stale buffer on the next save — clobbering the
+                    // remote file. Cleanup happens on session close, vault
+                    // lock/teardown (EditRegistry::stop*), explicit
+                    // sftp_close_edit, or the 24h stale prune.
                 }
             });
         })
@@ -1071,13 +1090,13 @@ pub async fn sftp_keepalive_start(
 }
 
 /// Staging path for cross-server "Send to" transfers (Rust temp dir).
+/// The staged file can hold secret remote contents, so its name carries a
+/// random component (audit hardening; see [`staged_file_name`]).
 #[tauri::command]
 pub fn sftp_stage_path(name: String) -> CmdResult<serde_json::Value> {
-    let safe: String = name
-        .chars()
-        .map(|c| if c == '/' || c == 92 as char { '_' } else { c })
-        .collect();
-    Ok(serde_json::json!({ "path": edit_temp_dir().join(safe).display().to_string() }))
+    Ok(
+        serde_json::json!({ "path": edit_temp_dir().join(staged_file_name(&name)).display().to_string() }),
+    )
 }
 
 #[cfg(test)]
@@ -1137,12 +1156,25 @@ mod tests {
     }
 
     #[test]
-    fn stage_path_sanitizes_separators() {
+    fn stage_path_sanitizes_separators_and_randomizes() {
         let r = sftp_stage_path("a/b\\c".into()).unwrap();
         let p = r["path"].as_str().unwrap();
+        let name = p.rsplit(std::path::MAIN_SEPARATOR).next().unwrap();
         assert!(
-            p.ends_with("a_b_c"),
+            !name.contains('/') && !name.contains('\\'),
             "path separators must be flattened: {p}"
+        );
+        // Base name must survive sanitization...
+        assert!(
+            name.starts_with("a_b_c"),
+            "sanitized base must be preserved: {p}"
+        );
+        // ...plus carry a random component.
+        let r2 = sftp_stage_path("a/b\\c".into()).unwrap();
+        assert_ne!(
+            p,
+            r2["path"].as_str().unwrap(),
+            "staged paths must not be predictable"
         );
     }
 }

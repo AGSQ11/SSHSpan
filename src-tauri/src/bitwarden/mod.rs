@@ -118,12 +118,24 @@ pub struct BitwardenClient {
     email: String,
     master_password: zeroize::Zeroizing<String>,
     device_id: String,
-    pub access_token: Option<String>,
-    refresh_token: Option<String>,
+    pub access_token: Option<zeroize::Zeroizing<String>>,
+    refresh_token: Option<zeroize::Zeroizing<String>>,
     token_expires_at: u64,
-    pub master_key: Option<[u8; 32]>,
-    pub stretched_key: Option<[u8; 64]>,
-    pub user_key: Option<[u8; 64]>,
+    pub master_key: Option<zeroize::Zeroizing<[u8; 32]>>,
+    pub stretched_key: Option<zeroize::Zeroizing<[u8; 64]>>,
+    pub user_key: Option<zeroize::Zeroizing<[u8; 64]>>,
+}
+
+impl Drop for BitwardenClient {
+    fn drop(&mut self) {
+        // Clear every in-memory secret when the client is dropped: master
+        // key, stretched key, user key, access/refresh tokens. The master
+        // password is zeroized by its own `Zeroizing` wrapper on drop;
+        // replacing it here also covers the still-live client during drop.
+        // This mirrors the `Zeroize`/`ZeroizeOnDrop` pattern used by the
+        // vault/master-password code (see crypto/vault.rs).
+        self.close();
+    }
 }
 
 impl BitwardenClient {
@@ -190,14 +202,14 @@ impl BitwardenClient {
         }
 
         let kdf = self.prelogin().await?;
-        self.master_key = Some(bitwarden::derive_master_key(
+        self.master_key = Some(zeroize::Zeroizing::new(bitwarden::derive_master_key(
             &self.master_password,
             &self.email,
             &kdf,
-        )?);
-        self.stretched_key = Some(bitwarden::stretch_master_key(
+        )?));
+        self.stretched_key = Some(zeroize::Zeroizing::new(bitwarden::stretch_master_key(
             self.master_key.as_ref().unwrap(),
-        ));
+        )));
         self.login_with_password().await?;
         Ok(kdf)
     }
@@ -272,18 +284,18 @@ impl BitwardenClient {
             );
         }
 
-        self.access_token = Some(
+        self.access_token = Some(zeroize::Zeroizing::new(
             data.get("access_token")
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .ok_or_else(|| {
                     anyhow::anyhow!("Token response did not include an access token.")
                 })?,
-        );
+        ));
         self.refresh_token = data
             .get("refresh_token")
             .and_then(|v| v.as_str())
-            .map(String::from);
+            .map(|s| zeroize::Zeroizing::new(s.to_string()));
         let expires_in = data
             .get("expires_in")
             .and_then(|v| v.as_u64())
@@ -293,7 +305,7 @@ impl BitwardenClient {
     }
 
     async fn login_with_password(&mut self) -> Result<()> {
-        let master_key = *self.master_key.as_ref().unwrap();
+        let master_key = **self.master_key.as_ref().unwrap();
         let hash = bitwarden::master_password_hash(&master_key, &self.master_password);
         let email = self.email.clone();
         let device_id = self.device_id.clone();
@@ -354,7 +366,11 @@ impl BitwardenClient {
         for attempt in 0..2u32 {
             self.ensure_token().await?;
             let url = format!("{}{}", self.base_url, path);
-            let token = self.access_token.clone().unwrap_or_default();
+            let token = self
+                .access_token
+                .as_ref()
+                .map(|t| t.as_str().to_string())
+                .unwrap_or_default();
             let mut req = self
                 .http
                 .request(method.parse().unwrap(), &url)
@@ -389,7 +405,7 @@ impl BitwardenClient {
 
         // Decrypt user key from profile
         if let Some(profile_key) = profile.and_then(|p| p.get("key")).and_then(|k| k.as_str()) {
-            let stretched = *self.stretched_key.as_ref().unwrap();
+            let stretched = **self.stretched_key.as_ref().unwrap();
             let user_key_bytes = bitwarden::decrypt_to_bytes(profile_key, &stretched)?;
 
             match user_key_bytes.len() {
@@ -397,7 +413,7 @@ impl BitwardenClient {
                     // Modern v1 user key: raw enc(32) || mac(32).
                     let mut uk = [0u8; 64];
                     uk.copy_from_slice(&user_key_bytes);
-                    self.user_key = Some(uk);
+                    self.user_key = Some(zeroize::Zeroizing::new(uk));
                 }
                 88 => {
                     // Legacy: the 64-byte key stored as base64 text.
@@ -414,7 +430,7 @@ impl BitwardenClient {
                     }
                     let mut uk = [0u8; 64];
                     uk.copy_from_slice(&decoded);
-                    self.user_key = Some(uk);
+                    self.user_key = Some(zeroize::Zeroizing::new(uk));
                 }
                 other => {
                     // Diagnostics must NOT include the key material itself —
@@ -442,7 +458,7 @@ impl BitwardenClient {
         }
 
         // Decrypt folder names
-        let user_key = self.user_key.as_ref().unwrap();
+        let user_key = **self.user_key.as_ref().unwrap();
         let mut folders = Vec::new();
         for f in data
             .get("folders")
@@ -457,7 +473,7 @@ impl BitwardenClient {
                 .to_string();
             let name_enc = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let name = self
-                .decrypt_field_inner(name_enc, user_key)
+                .decrypt_field_inner(name_enc, &user_key)
                 .unwrap_or_default();
             let revision_date = f
                 .get("revisionDate")
@@ -510,8 +526,9 @@ impl BitwardenClient {
         let user_key = self
             .user_key
             .as_ref()
+            .map(|k| **k)
             .ok_or_else(|| anyhow::anyhow!("Not logged in (no user key)"))?;
-        self.decrypt_field_inner(enc_string, user_key)
+        self.decrypt_field_inner(enc_string, &user_key)
     }
 
     fn decrypt_field_inner(&self, enc_string: &str, user_key: &[u8; 64]) -> Result<String> {
@@ -523,8 +540,9 @@ impl BitwardenClient {
         let user_key = self
             .user_key
             .as_ref()
+            .map(|k| **k)
             .ok_or_else(|| anyhow::anyhow!("Not logged in (no user key)"))?;
-        bitwarden::encrypt_string(plaintext, user_key)
+        bitwarden::encrypt_string(plaintext, &user_key)
     }
 
     pub async fn create_folder(&mut self, name: &str) -> Result<serde_json::Value> {
@@ -565,12 +583,26 @@ impl BitwardenClient {
         self.api_request("PUT", &path, Some(cipher)).await
     }
 
+    /// Wipe every in-memory secret: keys and tokens are zeroized in place
+    /// (the `Some(...)` stays, but the contents are all-zero), and the master
+    /// password is replaced, dropping (and thereby zeroizing) the old value.
     pub fn close(&mut self) {
-        self.access_token = None;
-        self.refresh_token = None;
-        self.master_key = None;
-        self.stretched_key = None;
-        self.user_key = None;
+        use zeroize::Zeroize;
+        if let Some(t) = self.access_token.as_mut() {
+            t.zeroize();
+        }
+        if let Some(t) = self.refresh_token.as_mut() {
+            t.zeroize();
+        }
+        if let Some(k) = self.master_key.as_mut() {
+            k.zeroize();
+        }
+        if let Some(k) = self.stretched_key.as_mut() {
+            k.zeroize();
+        }
+        if let Some(k) = self.user_key.as_mut() {
+            k.zeroize();
+        }
         self.master_password = zeroize::Zeroizing::new(String::new());
     }
 }
@@ -741,5 +773,92 @@ mod tests {
         );
         let data = read_body_capped_json(resp).await.unwrap();
         assert_eq!(data.get("access_token").unwrap(), "t");
+    }
+
+    #[test]
+    fn close_zeroizes_key_and_token_fields() {
+        // The fields are populated through normal code paths (connect/
+        // token_request/sync); this verifies close() clears whatever is in
+        // them. Zeroizing<T> zeroizes T in place, so the Some(_) stays while
+        // the contents become all-zero / empty.
+        let mut client = BitwardenClient::new(
+            "https://vault.example.com",
+            "user@example.com",
+            "correct horse battery staple",
+            "device",
+        )
+        .unwrap();
+        // Simulate a logged-in state without network access: these are the
+        // exact assignments the real code paths make (modulo Zeroizing::new).
+        client.master_key = Some(zeroize::Zeroizing::new([0xA5u8; 32]));
+        client.stretched_key = Some(zeroize::Zeroizing::new([0x5Au8; 64]));
+        client.user_key = Some(zeroize::Zeroizing::new([0xC3u8; 64]));
+        client.access_token = Some(zeroize::Zeroizing::new("at-secret".to_string()));
+        client.refresh_token = Some(zeroize::Zeroizing::new("rt-secret".to_string()));
+
+        client.close();
+
+        assert!(
+            client
+                .master_key
+                .as_ref()
+                .map(|k| k.iter().all(|&b| b == 0))
+                .unwrap_or(true),
+            "master key must be zero after close()"
+        );
+        assert!(
+            client
+                .stretched_key
+                .as_ref()
+                .map(|k| k.iter().all(|&b| b == 0))
+                .unwrap_or(true),
+            "stretched key must be zero after close()"
+        );
+        assert!(
+            client
+                .user_key
+                .as_ref()
+                .map(|k| k.iter().all(|&b| b == 0))
+                .unwrap_or(true),
+            "user key must be zero after close()"
+        );
+        assert!(
+            client
+                .access_token
+                .as_ref()
+                .map(|t| t.is_empty())
+                .unwrap_or(true),
+            "access token must be zeroed after close()"
+        );
+        assert!(
+            client
+                .refresh_token
+                .as_ref()
+                .map(|t| t.is_empty())
+                .unwrap_or(true),
+            "refresh token must be zeroed after close()"
+        );
+        assert!(client.master_password.is_empty());
+    }
+
+    #[test]
+    fn drop_clears_key_fields() {
+        // Drop must route through close() (same zeroization) without
+        // panicking. The actual in-place clearing of each field is proven by
+        // close_zeroizes_key_and_token_fields; here a client with populated
+        // secrets is dropped and the test asserts drop completed.
+        let mut client = BitwardenClient::new(
+            "https://vault.example.com",
+            "user@example.com",
+            "correct horse battery staple",
+            "device",
+        )
+        .unwrap();
+        client.master_key = Some(zeroize::Zeroizing::new([0xA5u8; 32]));
+        client.stretched_key = Some(zeroize::Zeroizing::new([0x5Au8; 64]));
+        client.user_key = Some(zeroize::Zeroizing::new([0xC3u8; 64]));
+        client.access_token = Some(zeroize::Zeroizing::new("at-secret".to_string()));
+        client.refresh_token = Some(zeroize::Zeroizing::new("rt-secret".to_string()));
+        drop(client); // Drop → close() → zeroized; must not panic.
     }
 }
