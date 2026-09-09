@@ -246,6 +246,10 @@ pub async fn run_sync(
             .as_ref()
             .and_then(|n| client.decrypt_field(n).ok())
             .unwrap_or_else(|| "imported key".to_string());
+        // Remote cipher names are arbitrary text but become Host aliases in
+        // ~/.ssh/config on deploy — sanitize rather than skipping the item,
+        // and leave an audit trail of the mapping.
+        let name = sanitize_sync_name(db, &name);
 
         // Import the private key
         let key_data = match crate::crypto::keys::import_openssh_private(&priv_pem, None) {
@@ -605,6 +609,9 @@ async fn pull_remote_item(
         .as_ref()
         .and_then(|n| client.decrypt_field(n).ok())
         .unwrap_or_else(|| row.name.clone());
+    // Remote cipher names are arbitrary text but become Host aliases in
+    // ~/.ssh/config on deploy — sanitize rather than failing the item.
+    let name = sanitize_sync_name(db, &name);
 
     let key_data = if priv_pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
         crate::crypto::keys::import_openssh_private(&priv_pem, None).ok()
@@ -676,6 +683,24 @@ async fn pull_remote_item(
         db.set_key_categories(&updated.id, &resolved)?;
     }
     Ok(())
+}
+
+/// Sanitize a remotely-sourced key name for vault storage. A name that
+/// already passes validation is kept verbatim; anything that couldn't be a
+/// single `Host` token is mapped through `sanitize_key_name` (invalid runs →
+/// `-`) and logged to the audit trail. Sync must not drop an item over its
+/// name, so the mapping is total.
+fn sanitize_sync_name(db: &Database, raw: &str) -> String {
+    if crate::crypto::keys::validate_key_name(raw).is_ok() {
+        return raw.to_string();
+    }
+    let sanitized = crate::crypto::keys::sanitize_key_name(raw);
+    let _ = db.add_audit(
+        "keys.name_sanitized",
+        None,
+        &format!("{raw:?} -> {sanitized:?}"),
+    );
+    sanitized
 }
 
 /// Seal a private key for local storage. Never substitutes a placeholder:
@@ -1089,5 +1114,28 @@ mod tests {
                 .contains("refusing to use sealed ciphertext"),
             "error must identify the refused fallback, got: {err}"
         );
+    }
+
+    fn test_db() -> Database {
+        Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-test-{}.db", uuid::Uuid::new_v4())),
+        )
+        .expect("failed to open test database")
+    }
+
+    #[test]
+    fn sanitize_sync_name_maps_invalid_cipher_names() {
+        let db = test_db();
+        // A cipher name carrying a config-injection payload is sanitized into
+        // a single Host token instead of failing the sync item.
+        assert_eq!(
+            sanitize_sync_name(&db, "x\nHost *\n ProxyCommand evil"),
+            "x-Host-*--ProxyCommand-evil"
+        );
+        assert_eq!(sanitize_sync_name(&db, "my deploy key"), "my-deploy-key");
+        // Valid names pass through verbatim.
+        assert_eq!(sanitize_sync_name(&db, "deploy-key-1"), "deploy-key-1");
+        // Every sanitized output must itself pass validation.
+        assert!(crate::crypto::keys::validate_key_name(&sanitize_sync_name(&db, "a\tb\nc")).is_ok());
     }
 }
