@@ -1541,7 +1541,7 @@ async function importFromSshConfig(anchorEl) {
     for (const h of hosts) {
       const b = document.createElement('button');
       b.className = 'ctx-item';
-      const label = `${h.host} <small>(${escapeHtml(h.user || '?')}@${escapeHtml(h.hostname || h.host)}:${h.port || 22})</small>`;
+      const label = `${escapeHtml(h.host)} <small>(${escapeHtml(h.user || '?')}@${escapeHtml(h.hostname || h.host)}:${h.port || 22})</small>`;
       b.innerHTML = `${ico('server')}<span>${label}</span>`;
       b.addEventListener('click', () => {
         closeKeyConnectMenu();
