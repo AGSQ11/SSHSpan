@@ -61,6 +61,31 @@ fn describe_sftp_error(stage: &str, e: russh_sftp::client::error::Error) -> CmdE
     CmdError(format!("{stage} failed: {}", sftp_error_detail(e)))
 }
 
+/// Read-loop error on an open SFTP file handle: russh-sftp surfaces raw
+/// read failures as `std::io::Error` wrapping the protocol-level error
+/// (e.g. a bare SSH_FX_FAILURE). Unwrap the wrapper's Display chain so the
+/// message goes through [`sftp_error_detail`] instead of the raw doubled
+/// "Failure: Failure" text.
+fn describe_download_read_error(e: std::io::Error) -> CmdError {
+    use std::error::Error as _;
+    // The client Error enum is private from the protocol module; match on
+    // the Display text is fragile, so walk the source chain and try the
+    // public client error type first, then fall back to the raw message.
+    let mut src: Option<&(dyn std::error::Error + 'static)> = e.source();
+    let mut detail = None;
+    while let Some(err) = src {
+        if let Some(status) = err.downcast_ref::<russh_sftp::client::error::Error>() {
+            detail = Some(sftp_error_detail(status.clone()));
+            break;
+        }
+        src = err.source();
+    }
+    match detail {
+        Some(d) => CmdError(format!("download failed: {d}")),
+        None => CmdError(format!("download failed: {e}")),
+    }
+}
+
 /// Open the SFTP subsystem on a live session (lazily, on first SFTP switch).
 #[tauri::command]
 pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
@@ -234,7 +259,7 @@ pub async fn download_to(
         let n = remote_file
             .read(&mut buf[..want])
             .await
-            .map_err(|e| CmdError(format!("download failed: {e}")))?;
+            .map_err(|e| describe_download_read_error(e))?;
         if n == 0 {
             break;
         }
@@ -510,14 +535,14 @@ fn expand_upload(
         Err(_) => return,
     };
     if md.is_file() {
-        out.push(QueuedItem {
-            kind: JobKind::Upload,
-            session_id: session_id.clone(),
-            server_name: server_name.clone(),
-            local_path: local.display().to_string(),
-            remote_path: remote,
-            size: md.len(),
-        });
+        out.push(QueuedItem::simple(
+            JobKind::Upload,
+            session_id.clone(),
+            server_name.clone(),
+            local.display().to_string(),
+            remote,
+            md.len(),
+        ));
         return;
     }
     let Ok(entries) = std::fs::read_dir(&local) else {
@@ -619,8 +644,8 @@ fn sanitize_remote_name(name: &str) -> Option<String> {
     // with or without an extension: `CON`, `con.txt`, `NUL.tar.gz`.
     let stem = sanitized.split('.').next().unwrap_or("");
     const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if RESERVED.contains(&stem.to_uppercase().as_str()) {
         return None;
@@ -682,17 +707,19 @@ fn expand_download(
             // still originates from the server's view of the filesystem.
             let raw = remote.rsplit('/').next().unwrap_or("file");
             let Some(local) = safe_join_under(&root, &local_dir, raw) else {
-                log::warn!("[sshspan-sftp] skipping download of {remote}: unsafe local name {raw:?}");
+                log::warn!(
+                    "[sshspan-sftp] skipping download of {remote}: unsafe local name {raw:?}"
+                );
                 return Ok(out);
             };
-            out.push(QueuedItem {
-                kind: JobKind::Download,
+            out.push(QueuedItem::simple(
+                JobKind::Download,
                 session_id,
                 server_name,
-                local_path: local.display().to_string(),
-                remote_path: remote,
-                size: md.size.unwrap_or(0),
-            });
+                local.display().to_string(),
+                remote,
+                md.size.unwrap_or(0),
+            ));
             return Ok(out);
         }
         let raw_dir = remote.rsplit('/').next().unwrap_or("dir");
@@ -757,6 +784,10 @@ pub async fn sftp_queue_add(
     } else {
         JobKind::Download
     };
+    // ServerCopy jobs are enqueued via `sftp_server_copy`, never here.
+    if !matches!(kind, JobKind::Upload | JobKind::Download) {
+        return Err(CmdError("unsupported direction.".into()));
+    }
     let server_name = app
         .state::<StdArc<SessionRegistry>>()
         .list()
@@ -822,6 +853,8 @@ pub async fn sftp_queue_add(
                 .map_err(CmdError)?;
             }
         }
+        // ServerCopy never reaches here (guarded above).
+        JobKind::ServerCopy => unreachable!("guarded above"),
     }
 
     let count = jobs.len();
@@ -855,6 +888,67 @@ pub fn sftp_queue_retry(app: AppHandle, job_id: u64) -> CmdResult<serde_json::Va
 pub fn sftp_queue_clear_finished(app: AppHandle) -> CmdResult<serde_json::Value> {
     q_clear(&app);
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Server-to-server copy ("Send to <server>"): enqueue one ServerCopy job
+/// that downloads from the source session and uploads to the target session,
+/// each on its own FRESH SFTP channel (the interactive browse sessions are
+/// never used — some servers fail reads on the long-lived channel with
+/// SSH_FX_FAILURE). The transfer queue panel shows progress; a temp staging
+/// file is created by the worker and always removed on completion.
+#[tauri::command]
+pub async fn sftp_server_copy(
+    app: AppHandle,
+    from_session_id: String,
+    remote: String,
+    target_session_id: String,
+    target_dir: String,
+) -> CmdResult<serde_json::Value> {
+    if from_session_id == target_session_id {
+        return Err(CmdError(
+            "Source and target are the same connection.".into(),
+        ));
+    }
+    if remote.is_empty() || target_dir.is_empty() {
+        return Err(CmdError(
+            "Source path and target directory are required.".into(),
+        ));
+    }
+    let registry = app.state::<StdArc<SessionRegistry>>();
+    let server_name = |sid: &str| {
+        registry
+            .list()
+            .into_iter()
+            .find(|(id, _, _, _, _)| id == sid)
+            .map(|(_, name, _, _, _)| name)
+    };
+    let Some(source_server) = server_name(&from_session_id) else {
+        return Err(CmdError("Source session not found.".into()));
+    };
+    let Some(target_server) = server_name(&target_session_id) else {
+        return Err(CmdError("Target session not found.".into()));
+    };
+
+    let name = remote.rsplit('/').next().unwrap_or("file");
+    let target_path = format!("{}/{}", target_dir.trim_end_matches('/'), name);
+
+    q_enqueue(
+        &app,
+        vec![QueuedItem {
+            kind: JobKind::ServerCopy,
+            session_id: from_session_id,
+            server_name: source_server,
+            local_path: String::new(), // no user-visible local path; worker stages a temp file
+            remote_path: remote,
+            size: 0, // stat'd by the worker on a fresh channel
+            target: Some(tfq::ServerCopyTarget {
+                session_id: target_session_id,
+                server_name: target_server,
+                remote_path: target_path.clone(),
+            }),
+        }],
+    );
+    Ok(serde_json::json!({ "ok": true, "target": target_path }))
 }
 
 // ─── recursive remote search ───────────────────────────────────────────────
@@ -1373,8 +1467,17 @@ mod tests {
     #[test]
     fn sanitize_rejects_windows_reserved_devices() {
         for dev in [
-            "CON", "con", "CON.exe", "NUL", "nul.txt", "PRN.log", "AUX", "COM1", "com9.tar.gz",
-            "LPT1", "lpt9",
+            "CON",
+            "con",
+            "CON.exe",
+            "NUL",
+            "nul.txt",
+            "PRN.log",
+            "AUX",
+            "COM1",
+            "com9.tar.gz",
+            "LPT1",
+            "lpt9",
         ] {
             assert_eq!(sanitize_remote_name(dev), None, "must reject {dev:?}");
         }
@@ -1412,11 +1515,20 @@ mod tests {
         // Trailing dots/spaces are stripped so the queued path matches what
         // actually lands on disk (Win32 strips them silently).
         assert_eq!(sanitize_remote_name("name. "), Some("name".to_string()));
-        assert_eq!(sanitize_remote_name("trailing..."), Some("trailing".to_string()));
+        assert_eq!(
+            sanitize_remote_name("trailing..."),
+            Some("trailing".to_string())
+        );
         // Control characters cannot appear in Windows file names.
-        assert_eq!(sanitize_remote_name("a\tb\u{0}c"), Some("a_b_c".to_string()));
+        assert_eq!(
+            sanitize_remote_name("a\tb\u{0}c"),
+            Some("a_b_c".to_string())
+        );
         // Ordinary names pass through untouched, Unicode included.
-        assert_eq!(sanitize_remote_name("résumé v2.txt"), Some("résumé v2.txt".to_string()));
+        assert_eq!(
+            sanitize_remote_name("résumé v2.txt"),
+            Some("résumé v2.txt".to_string())
+        );
         assert_eq!(sanitize_remote_name("a..b"), Some("a..b".to_string()));
     }
 
