@@ -278,38 +278,247 @@ pub fn vault_change_password(
 
     let db = &app.state::<AppState>().db;
     let keys = db.list_keys().map_err(|e| e.to_string())?;
-    let mut migrated = Vec::with_capacity(keys.len());
-    for mut key in keys {
-        let plaintext =
-            match crate::crypto::vault::unseal(&current_password, &key.private_key_encrypted) {
-                Ok(bytes) => bytes,
-                Err(_e) if !key.private_key_encrypted.trim_start().starts_with('{') => {
-                    // Pre-vault-encryption records stored raw key bytes as text.
-                    key.private_key_encrypted.as_bytes().to_vec()
-                }
-                Err(e) => return Err(format!("Cannot re-encrypt key {}: {e}", key.id).into()),
-            };
-        key.private_key_encrypted =
-            crate::crypto::vault::seal(&new_password, &plaintext).map_err(|e| e.to_string())?;
-        key.updated_at = chrono::Utc::now();
-        migrated.push(key);
-    }
+    let servers = db.list_servers().map_err(|e| e.to_string())?;
+    // Everything is re-encrypted in memory first; if any record fails to
+    // unseal, the whole change is aborted and nothing is persisted.
+    let migration = migrate_vault_records(keys, servers, &current_password, &new_password)?;
 
     let hashed = hash_master_password(&new_password).map_err(CmdError::from)?;
-    for key in &migrated {
+    for key in &migration.keys {
         db.update_key(key).map_err(|e| e.to_string())?;
+    }
+    for server in &migration.servers {
+        db.update_server(server).map_err(|e| e.to_string())?;
     }
     db.set_config(MASTER_HASH_KEY, &hashed)
         .map_err(|e| e.to_string())?;
-    let reencrypted = migrated.len() as u32;
+    let reencrypted = migration.keys.len() as u32;
     db.add_audit(
         "vault.password_changed",
         None,
-        &format!("Re-encrypted {reencrypted} key(s)"),
+        &format!(
+            "Re-encrypted {reencrypted} key(s), {} saved server password(s)",
+            migration.servers.len()
+        ),
     )
     .map_err(|e| e.to_string())?;
     app.state::<VaultPasswordStore>().set(new_password);
     Ok(serde_json::json!({ "ok": true, "reencrypted": reencrypted }))
+}
+
+/// Result of re-sealing all vault-protected records with a new password.
+#[derive(Debug)]
+struct VaultMigration {
+    keys: Vec<KeyRecord>,
+    /// Only servers that actually had a saved password to re-seal.
+    servers: Vec<db::ServerRecord>,
+}
+
+/// Unseal every stored private key and saved server password with the current
+/// vault password and re-seal them with the new one, in memory. Any unseal
+/// failure aborts the whole migration (nothing is persisted by this function).
+fn migrate_vault_records(
+    keys: Vec<KeyRecord>,
+    servers: Vec<db::ServerRecord>,
+    current_password: &str,
+    new_password: &str,
+) -> CmdResult<VaultMigration> {
+    let mut migrated_keys = Vec::with_capacity(keys.len());
+    for mut key in keys {
+        let plaintext =
+            match crate::crypto::vault::unseal(current_password, &key.private_key_encrypted) {
+                Ok(bytes) => bytes,
+                Err(e) => return Err(format!("Cannot re-encrypt key {}: {e}", key.id).into()),
+            };
+        key.private_key_encrypted =
+            crate::crypto::vault::seal(new_password, &plaintext).map_err(|e| e.to_string())?;
+        key.updated_at = chrono::Utc::now();
+        migrated_keys.push(key);
+    }
+
+    // Saved server passwords are sealed with the same vault password, so they
+    // must be re-sealed too — otherwise every stored server password becomes
+    // unrecoverable after the change.
+    let mut migrated_servers = Vec::with_capacity(servers.len());
+    for mut server in servers {
+        if let Some(sealed_pw) = server.saved_password.as_ref() {
+            let plaintext = match crate::crypto::vault::unseal(current_password, sealed_pw) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(format!(
+                        "Cannot re-encrypt saved password for server {}: {e}",
+                        server.name
+                    )
+                    .into());
+                }
+            };
+            server.saved_password =
+                Some(crate::crypto::vault::seal(new_password, &plaintext).map_err(CmdError::from)?);
+            server.updated_at = chrono::Utc::now();
+            migrated_servers.push(server);
+        }
+    }
+
+    Ok(VaultMigration {
+        keys: migrated_keys,
+        servers: migrated_servers,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-process SQLite database against a temp file, exercising the real
+    /// migrations and the real insert/update/list methods.
+    fn test_db() -> db::Database {
+        db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-test-{}.db", uuid::Uuid::new_v4())),
+        )
+        .expect("failed to open test database")
+    }
+
+    fn sample_server(id: &str, saved_password: Option<&str>, vault_pw: &str) -> db::ServerRecord {
+        db::ServerRecord {
+            id: id.to_string(),
+            name: format!("server-{id}"),
+            host: "10.0.0.1".into(),
+            port: 22,
+            username: "root".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "password".into(),
+            saved_password: saved_password
+                .map(|p| crate::crypto::vault::seal(vault_pw, p.as_bytes()).expect("seal failed")),
+            category_id: None,
+            color: None,
+            last_connected_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            bitwarden_id: None,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        }
+    }
+
+    fn sample_key(id: &str, vault_pw: &str) -> KeyRecord {
+        KeyRecord {
+            id: id.to_string(),
+            name: format!("key-{id}"),
+            key_type: "ed25519".into(),
+            public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake test".into(),
+            private_key_encrypted: crate::crypto::vault::seal(vault_pw, b"fake-private-key")
+                .expect("seal failed"),
+            fingerprint_sha256: "SHA256:fake".into(),
+            fingerprint_md5: "MD5:fake".into(),
+            comment: String::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deployed: false,
+            deploy_path: None,
+            bitwarden_id: None,
+            bitwarden_sync: false,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+            category_ids: Vec::new(),
+        }
+    }
+
+    /// Changing the master password must re-seal saved server passwords, and
+    /// the re-sealed values must persist through the real db update path.
+    #[test]
+    fn change_password_reencrypts_saved_server_passwords() {
+        let db = test_db();
+        let old_pw = "old-master-pw";
+        let new_pw = "new-master-pw";
+
+        db.insert_server(&sample_server("srv-a", Some("s3cret-password"), old_pw))
+            .unwrap();
+        db.insert_server(&sample_server("srv-b", None, old_pw))
+            .unwrap();
+        db.insert_key(&sample_key("key-a", old_pw)).unwrap();
+
+        let keys = db.list_keys().unwrap();
+        let servers = db.list_servers().unwrap();
+        let migration = migrate_vault_records(keys, servers, old_pw, new_pw).unwrap();
+        assert_eq!(migration.keys.len(), 1);
+        assert_eq!(
+            migration.servers.len(),
+            1,
+            "only srv-a had a saved password"
+        );
+        for server in &migration.servers {
+            db.update_server(server).unwrap();
+        }
+        for key in &migration.keys {
+            db.update_key(key).unwrap();
+        }
+
+        // Re-read from the db: the sealed blob must have changed and must
+        // unseal with the NEW password, not the old one.
+        let stored = db.list_servers().unwrap();
+        let srv_a = stored.iter().find(|s| s.id == "srv-a").unwrap();
+        let plain = crate::crypto::vault::unseal(new_pw, srv_a.saved_password.as_ref().unwrap())
+            .expect("saved password must unseal with the NEW master password");
+        assert_eq!(plain, b"s3cret-password");
+        assert!(
+            crate::crypto::vault::unseal(old_pw, srv_a.saved_password.as_ref().unwrap()).is_err(),
+            "saved password must NOT unseal with the OLD master password"
+        );
+
+        // Server without a saved password is untouched (still None, not migrated).
+        let srv_b = stored.iter().find(|s| s.id == "srv-b").unwrap();
+        assert!(srv_b.saved_password.is_none());
+
+        // Keys are re-sealed too.
+        let key = db.get_key("key-a").unwrap().unwrap();
+        let key_plain = crate::crypto::vault::unseal(new_pw, &key.private_key_encrypted).unwrap();
+        assert_eq!(key_plain, b"fake-private-key");
+    }
+
+    /// A corrupted/unopenable sealed value must abort the whole migration —
+    /// no silent plaintext fallback, no partial re-encryption.
+    #[test]
+    fn change_password_aborts_on_unsealable_blob() {
+        let db = test_db();
+        let mut server = sample_server("srv-bad", Some("pw"), "old-master-pw");
+        // Simulate a record sealed under a DIFFERENT (unknown) password.
+        server.saved_password =
+            Some(crate::crypto::vault::seal("some-other-password", b"pw").expect("seal failed"));
+        db.insert_server(&server).unwrap();
+
+        let keys = db.list_keys().unwrap();
+        let servers = db.list_servers().unwrap();
+        let err = migrate_vault_records(keys, servers, "old-master-pw", "new-master-pw")
+            .expect_err("migration must fail");
+        assert!(
+            err.0.contains("srv-bad"),
+            "error must name the server: {}",
+            err.0
+        );
+
+        // Nothing was persisted — the stored blob still fails with the old pw.
+        let stored = db.get_server("srv-bad").unwrap().unwrap();
+        assert!(crate::crypto::vault::unseal(
+            "old-master-pw",
+            stored.saved_password.as_ref().unwrap()
+        )
+        .is_err());
+    }
+
+    /// The plaintext fallback is gone: raw (non-JSON) key material must be
+    /// rejected instead of silently passed through.
+    #[test]
+    fn change_password_rejects_plaintext_key_records() {
+        let mut key = sample_key("key-plain", "old-master-pw");
+        key.private_key_encrypted = "RAWKEYMATERIAL-not-json".into();
+
+        let result = migrate_vault_records(vec![key], Vec::new(), "old-master-pw", "new-master-pw");
+        assert!(
+            result.is_err(),
+            "must not treat encrypted column as plaintext"
+        );
+    }
 }
 
 #[tauri::command]

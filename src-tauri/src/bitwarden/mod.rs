@@ -110,7 +110,7 @@ pub struct BitwardenClient {
     pub base_url: String,
     server_url: String,
     email: String,
-    master_password: String,
+    master_password: zeroize::Zeroizing<String>,
     device_id: String,
     pub access_token: Option<String>,
     refresh_token: Option<String>,
@@ -136,7 +136,7 @@ impl BitwardenClient {
             base_url: String::new(),
             server_url: server_url.to_string(),
             email: email.to_string(),
-            master_password: master_password.to_string(),
+            master_password: zeroize::Zeroizing::new(master_password.to_string()),
             device_id: device_id.to_string(),
             access_token: None,
             refresh_token: None,
@@ -150,6 +150,15 @@ impl BitwardenClient {
     /// Validate URL (incl. DNS), derive the master key, and authenticate.
     /// Returns the prelogin KDF config used.
     pub async fn connect(&mut self) -> Result<KdfParams> {
+        let result = self.connect_inner().await;
+        if result.is_err() {
+            // Never leave the raw master password in memory on a failed connect.
+            self.master_password = zeroize::Zeroizing::new(String::new());
+        }
+        result
+    }
+
+    async fn connect_inner(&mut self) -> Result<KdfParams> {
         self.base_url = resolve_safe_server_url(&self.server_url)?;
         if !self.email.contains('@') {
             anyhow::bail!("A valid account email is required.");
@@ -399,19 +408,21 @@ impl BitwardenClient {
                     self.user_key = Some(uk);
                 }
                 other => {
-                    // Diagnostics: dump the full plaintext so an unknown
-                    // account-key format can be identified precisely.
-                    let full_hex: String =
-                        user_key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    // Diagnostics must NOT include the key material itself —
+                    // report only the length and a short non-reversible digest.
+                    use sha2::{Digest, Sha256};
+                    let digest = Sha256::digest(&user_key_bytes);
+                    let digest_prefix: String =
+                        digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
                     let printable = user_key_bytes
                         .iter()
                         .take(96)
                         .all(|b| b.is_ascii_graphic() || *b == b' ' || *b == b'=');
                     let last_byte = *user_key_bytes.last().unwrap_or(&0);
                     anyhow::bail!(
-                        "Unsupported account key format (length {}) hex={} ascii={} last_byte={}",
+                        "Unsupported account key format (length {}) sha256_prefix={} ascii={} last_byte={}",
                         other,
-                        full_hex,
+                        digest_prefix,
                         printable,
                         last_byte
                     );
@@ -551,6 +562,7 @@ impl BitwardenClient {
         self.master_key = None;
         self.stretched_key = None;
         self.user_key = None;
+        self.master_password = zeroize::Zeroizing::new(String::new());
     }
 }
 
