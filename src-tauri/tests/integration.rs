@@ -303,18 +303,6 @@ fn key_format_variants() {
 //  Database Operations (direct, no Tauri runtime needed)
 // ═════════════════════════════════════════════════════════════════════════════
 
-fn create_test_db() -> Database {
-    // Use a unique temp path per test to avoid conflicts
-    let db_path = std::env::temp_dir().join(format!(
-        "sshspan_test_{}.db",
-        uuid::Uuid::new_v4().to_string().replace('-', "")
-    ));
-    // We can't call Database::new(app) without a Tauri app, so we create it directly
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let pool = sqlx::SqlitePool::connect_lazy(&db_url).unwrap();
-    Database { pool, db_path }
-}
-
 fn get_test_db() -> Database {
     let db_path = std::env::temp_dir().join(format!(
         "sshspan_test_{}.db",
@@ -704,7 +692,7 @@ fn bitwarden_config_empty_strings() {
 fn key_full_roundtrip_ed25519() {
     // 1. Generate
     let key = keys::generate_key_pair(KeyType::Ed25519, None, "full-rt".to_string()).unwrap();
-    let fp_orig = keys::compute_fingerprint_sha256(&key.public_key);
+    let _fp_orig = keys::compute_fingerprint_sha256(&key.public_key);
 
     // 2. Export public key
     let pub_exported = keys::export_public_key(&key, KeyFormat::OpenSsh).unwrap();
