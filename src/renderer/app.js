@@ -783,7 +783,9 @@ function showVaultModal(mode) {
   pw.value = ''; confirm.value = ''; current.value = '';
   pw.hidden = false;
   confirm.hidden = mode !== 'create' && mode !== 'change';
-  current.hidden = true;
+  // The current password is re-typed instead of being cached in state, so the
+  // master password is never retained in renderer memory after unlock.
+  current.hidden = mode !== 'change';
   if (mode === 'create') {
     title.textContent = 'Create your vault';
     text.textContent = 'Choose a master password. It encrypts every private key at rest (scrypt + AES-256-GCM). There is no recovery \u2014 if you lose it, the keys are gone.';
@@ -881,8 +883,10 @@ function clearConnectView() {
 
 async function submitVaultModal() {
   const mode = state.vaultMode;
-  const pw = el('vaultPassword').value;
+  const pwEl = el('vaultPassword');
+  const pw = pwEl.value;
   const confirm = el('vaultPasswordConfirm').value;
+  const current = el('vaultPasswordCurrent').value;
   try {
     if (mode === 'create') {
       if (pw.length < 8) throw new Error('Master password must be at least 8 characters.');
@@ -892,17 +896,19 @@ async function submitVaultModal() {
     } else if (mode === 'change') {
       if (pw.length < 8) throw new Error('New password must be at least 8 characters.');
       if (pw !== confirm) throw new Error('Passwords do not match.');
-      await call('vault_change_password', { currentPassword: state.currentPassword || '', newPassword: pw });
+      if (!current) throw new Error('Enter your current master password.');
+      await call('vault_change_password', { currentPassword: current, newPassword: pw });
       toast('Master password changed; all keys re-encrypted.', 'ok');
     } else {
       await call('vault_unlock', { password: pw });
-      state.currentPassword = pw;
       toast('Vault unlocked.', 'ok');
     }
+    // Never leave submitted passwords in the DOM inputs.
+    pwEl.value = ''; el('vaultPasswordConfirm').value = ''; el('vaultPasswordCurrent').value = '';
     await refreshVaultStatus();
   } catch (e) {
     toast(e.message || String(e), 'err');
-    el('vaultPassword').select();
+    pwEl.select();
   }
 }
 
