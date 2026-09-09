@@ -12,7 +12,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # ─── Core Tauri ──────────────────────────────────────────────────────────────
-tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+# No "devtools" feature: WebView2 DevTools must not ship in release builds;
+# debug builds keep devtools via Tauri's default dev behavior.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 
 # ─── Tauri plugins ──────────────────────────────────────────────────────────
 tauri-plugin-fs = "2"
