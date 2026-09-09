@@ -534,11 +534,138 @@ fn expand_upload(
     }
 }
 
+/// Length in UTF-16 code units (the Windows file-name limit's unit). Chars
+/// outside the BMP count as two, matching Win32 behavior.
+fn sanitized_len_utf16(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
+}
+
+/// Sanitize a single remote-supplied file name for use as a local file name
+/// on the destination filesystem. Returns `None` for names that must be
+/// skipped entirely (they signal a hostile or broken server, not a file we
+/// can safely materialize).
+///
+/// Threat model: a malicious/compromised SFTP server controls ReadDir entry
+/// names verbatim. A name containing separators, `..` segments, drive
+/// letters, or Windows device names must never reach `Path::join`, or the
+/// queued download would write outside the user-chosen destination
+/// (e.g. `../../Windows/Start Menu/Programs/Startup/x.exe`).
+///
+/// Policy (input → action):
+/// - `/`, `\` anywhere → reject: the name is a path, not a file name, and
+///   flattening it would silently materialize a file the user can't match
+///   back to what the server listed.
+/// - Any `..` path segment (`..`, `a/../b`, `a/..`), or leading `..`-free
+///   but dot-only names like `....` (Windows strips trailing dots, so
+///   `....` would land as `..`) → reject.
+/// - Drive-letter prefixes (`C:`, `C:\evil`, `c:relative`) → reject: on
+///   Windows `join` with such a name discards the base directory entirely.
+/// - Absolute-path prefixes (`/etc`, `\\server\share`) → reject.
+/// - Windows reserved device names — CON, PRN, AUX, NUL, COM1-9, LPT1-9,
+///   case-insensitive, with or without extension (`CON.exe`, `NUL.txt`) →
+///   reject: creating them redirects to a device or fails unpredictably.
+/// - Empty / whitespace-only → reject.
+/// - Windows-invalid characters `:*?"<>|` → sanitize to `_` (same mapping
+///   as [`crate::sftp::sanitize_stage_base`], kept inline so the queue path
+///   has no hidden coupling to the staging code).
+/// - Trailing dots or spaces → strip (Windows would drop them anyway, but
+///   the local name then differs from the remote one, so do it explicitly).
+/// - Result empty after sanitization → reject.
+fn sanitize_remote_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Reject anything that carries path structure. `Path::is_absolute` alone
+    // misses `C:relative` and `\\server`, so separators and drive letters are
+    // checked explicitly.
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return None;
+    }
+    // Drive letter: exactly one ASCII alpha followed by ':', at the start.
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    // Dot-only names (`..`, `....`): Windows strips trailing dots, so these
+    // collapse to `.`/`..` on disk and become traversal components. Reject.
+    // `a..b` is a legal (if odd) name and stays.
+    if trimmed.chars().all(|c| c == '.') {
+        return None;
+    }
+    // NTFS/ReFS component limit is 255 UTF-16 units; longer names cannot be
+    // created locally, so the job would just fail at write time anyway.
+    if sanitized_len_utf16(trimmed) > 255 {
+        return None;
+    }
+    let mut sanitized: String = trimmed
+        .chars()
+        .map(|c| match c {
+            ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            // Control characters are invalid in Windows file names.
+            c if (c as u32) < 0x20 => '_',
+            _ => c,
+        })
+        .collect();
+    // Trailing dots/spaces are stripped by Win32; strip here so the queue's
+    // path and the file on disk agree.
+    while sanitized.ends_with('.') || sanitized.ends_with(' ') {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() || sanitized.chars().all(|c| c == '.') {
+        return None;
+    }
+    // Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9),
+    // with or without an extension: `CON`, `con.txt`, `NUL.tar.gz`.
+    let stem = sanitized.split('.').next().unwrap_or("");
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.to_uppercase().as_str()) {
+        return None;
+    }
+    Some(sanitized)
+}
+
+/// Join a sanitized remote name under `dir` and verify the result stays under
+/// the canonical destination `root`. Returns `None` (caller skips the entry)
+/// when the join would escape — the belt-and-braces check behind
+/// [`sanitize_remote_name`], so even a missed sanitization case cannot queue
+/// an out-of-root write.
+fn safe_join_under(root: &std::path::Path, dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let name = sanitize_remote_name(name)?;
+    let joined = dir.join(&name);
+    // Structural check: every component the join added must be normal. A
+    // `..` segment, drive-letter prefix, or root prefix inserted by a future
+    // sanitizer regression shows up here as a non-normal component.
+    let mut components = joined.components();
+    for expected in dir.components() {
+        match components.next() {
+            Some(actual) if actual == expected => {}
+            _ => return None,
+        }
+    }
+    if !components.all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return None;
+    }
+    // Containment: the result must stay under the canonical destination root
+    // (`dir` itself is root or a canonicalized descendant of it).
+    if !joined.starts_with(root) {
+        return None;
+    }
+    Some(joined)
+}
+
 /// Expand a remote directory into download jobs (recursive); a file becomes one.
+///
+/// `root` is the canonicalized user-chosen destination; every local path
+/// queued by this walk is verified to stay under it.
 fn expand_download(
     sftp: Arc<russh_sftp::client::SftpSession>,
     remote: String,
     local_dir: PathBuf,
+    root: PathBuf,
     session_id: String,
     server_name: String,
     out: Vec<QueuedItem>,
@@ -550,31 +677,60 @@ fn expand_download(
             .await
             .map_err(|e| format!("stat {remote}: {e}"))?;
         if !md.is_dir() {
-            let name = remote.rsplit('/').next().unwrap_or("file");
+            // Single file: its name comes from the user-picked remote path
+            // (not a ReadDir entry), but sanitize anyway — the path string
+            // still originates from the server's view of the filesystem.
+            let raw = remote.rsplit('/').next().unwrap_or("file");
+            let Some(local) = safe_join_under(&root, &local_dir, raw) else {
+                log::warn!("[sshspan-sftp] skipping download of {remote}: unsafe local name {raw:?}");
+                return Ok(out);
+            };
             out.push(QueuedItem {
                 kind: JobKind::Download,
                 session_id,
                 server_name,
-                local_path: local_dir.join(name).display().to_string(),
+                local_path: local.display().to_string(),
                 remote_path: remote,
                 size: md.size.unwrap_or(0),
             });
             return Ok(out);
         }
-        let dir_name = remote.rsplit('/').next().unwrap_or("dir");
-        let target_dir = local_dir.join(dir_name);
+        let raw_dir = remote.rsplit('/').next().unwrap_or("dir");
+        let Some(target_dir) = safe_join_under(&root, &local_dir, raw_dir) else {
+            log::warn!(
+                "[sshspan-sftp] skipping download dir {remote}: unsafe local name {raw_dir:?}"
+            );
+            return Ok(out);
+        };
         let _ = tokio::fs::create_dir_all(&target_dir).await;
+        // create_dir_all above may have been raced by another queued job
+        // creating a symlinked directory; re-anchor the walk at the canonical
+        // path so subsequent joins stay under the real root.
+        let target_dir = tokio::fs::canonicalize(&target_dir)
+            .await
+            .unwrap_or(target_dir);
+        if !target_dir.starts_with(&root) {
+            log::warn!(
+                "[sshspan-sftp] skipping download dir {remote}: {} escapes destination root",
+                target_dir.display()
+            );
+            return Ok(out);
+        }
         let mut entries = sftp
             .read_dir(&remote)
             .await
             .map_err(|e| format!("list {remote}: {e}"))?;
         while let Some(entry) = entries.next() {
             let name = entry.file_name().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
             let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
             out = expand_download(
                 sftp.clone(),
                 child_remote,
                 target_dir.clone(),
+                root.clone(),
                 session_id.clone(),
                 server_name.clone(),
                 out,
@@ -639,6 +795,12 @@ pub async fn sftp_queue_add(
                 .map(PathBuf::from)
                 .unwrap_or_else(crate::sftp::edit_temp_dir);
             let _ = tokio::fs::create_dir_all(&dest).await;
+            // Anchor every queued local path at the canonical destination:
+            // the walk below joins remote-supplied names onto this root and
+            // verifies the result stays under it.
+            let root = tokio::fs::canonicalize(&dest)
+                .await
+                .map_err(|e| CmdError(format!("destination not accessible: {e}")))?;
             for item in &items {
                 let remote = item
                     .get("remote")
@@ -650,7 +812,8 @@ pub async fn sftp_queue_add(
                 jobs = expand_download(
                     sftp.clone(),
                     remote.to_string(),
-                    dest.clone(),
+                    root.clone(),
+                    root.clone(),
                     session_id.clone(),
                     server_name.clone(),
                     jobs,
@@ -1176,5 +1339,138 @@ mod tests {
             r2["path"].as_str().unwrap(),
             "staged paths must not be predictable"
         );
+    }
+
+    // ─── download-name sanitization (hostile SFTP server) ────────────────────
+
+    #[test]
+    fn sanitize_rejects_traversal_and_path_structure() {
+        // Every entry here is attacker-controlled ReadDir output; all must be
+        // skipped, never flattened into a writable local name.
+        for hostile in [
+            "..",
+            "../x",
+            "../../Windows/Start Menu/Programs/Startup/x.exe",
+            "..\\x",
+            "..\\..\\evil",
+            "/etc/passwd",
+            "\\Windows\\evil",
+            "\\\\server\\share\\evil",
+            "C:\\evil",
+            "c:relative",
+            "....", // Windows strips trailing dots → collapses to ".."
+            "...",
+            "a/..",
+        ] {
+            assert_eq!(
+                sanitize_remote_name(hostile),
+                None,
+                "must reject {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_rejects_windows_reserved_devices() {
+        for dev in [
+            "CON", "con", "CON.exe", "NUL", "nul.txt", "PRN.log", "AUX", "COM1", "com9.tar.gz",
+            "LPT1", "lpt9",
+        ] {
+            assert_eq!(sanitize_remote_name(dev), None, "must reject {dev:?}");
+        }
+        // Not device names: the reserved check is on the stem only.
+        assert!(sanitize_remote_name("console.txt").is_some());
+        assert!(sanitize_remote_name("com1x").is_some());
+        assert!(sanitize_remote_name("nully").is_some());
+    }
+
+    #[test]
+    fn sanitize_rejects_empty_and_oversized() {
+        assert_eq!(sanitize_remote_name(""), None);
+        assert_eq!(sanitize_remote_name("   "), None);
+        // 256 UTF-16 units: one past the Windows component limit.
+        let too_long = "a".repeat(256);
+        assert_eq!(sanitize_remote_name(&too_long), None);
+        // 255 is the limit itself and must still pass.
+        let max = "a".repeat(255);
+        assert!(sanitize_remote_name(&max).is_some());
+        // A name made only of invalid characters still yields a writable
+        // local name (weird-but-safe → sanitize, not skip).
+        assert_eq!(sanitize_remote_name(":"), Some("_".to_string()));
+        assert_eq!(sanitize_remote_name("***"), Some("___".to_string()));
+    }
+
+    #[test]
+    fn sanitize_flattens_weird_but_safe_names() {
+        // Windows-invalid characters become underscores — the file lands
+        // under the destination, just with a locally-legal name. (A colon
+        // in position 2 would be a drive letter; "back:up" is not one.)
+        assert_eq!(
+            sanitize_remote_name("back:up*name?with\"chars\"<and>|"),
+            Some("back_up_name_with_chars__and__".to_string())
+        );
+        // Trailing dots/spaces are stripped so the queued path matches what
+        // actually lands on disk (Win32 strips them silently).
+        assert_eq!(sanitize_remote_name("name. "), Some("name".to_string()));
+        assert_eq!(sanitize_remote_name("trailing..."), Some("trailing".to_string()));
+        // Control characters cannot appear in Windows file names.
+        assert_eq!(sanitize_remote_name("a\tb\u{0}c"), Some("a_b_c".to_string()));
+        // Ordinary names pass through untouched, Unicode included.
+        assert_eq!(sanitize_remote_name("résumé v2.txt"), Some("résumé v2.txt".to_string()));
+        assert_eq!(sanitize_remote_name("a..b"), Some("a..b".to_string()));
+    }
+
+    #[test]
+    fn safe_join_under_keeps_normal_names_in_root() {
+        let root = std::env::temp_dir().join("sshspan-test-join");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            safe_join_under(&root, &root, "file.txt"),
+            Some(root.join("file.txt"))
+        );
+        // Nested recursion: a subdirectory the walk descended into still
+        // joins under the same canonical root.
+        let sub = root.join("sub");
+        assert_eq!(
+            safe_join_under(&root, &sub, "deep.bin"),
+            Some(sub.join("deep.bin"))
+        );
+        // A dir name with a locally-invalid char is sanitized, not dropped.
+        let joined = safe_join_under(&root, &root, "backup:2024");
+        assert_eq!(joined, Some(root.join("backup_2024")));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn safe_join_under_skips_hostile_names_at_any_depth() {
+        // The hostile names the walk can meet in a ReadDir — at the root or
+        // deep inside recursion (the invariant only holds if every level
+        // re-checks, since each level's `dir` is a fresh descendant).
+        let root = std::env::temp_dir().join("sshspan-test-join-hostile");
+        std::fs::create_dir_all(&root).unwrap();
+        let deep = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        for hostile in [
+            "..",
+            "../evil",
+            "..\\..\\evil",
+            "C:\\evil",
+            "\\\\srv\\share",
+            "....",
+            "CON",
+            "",
+        ] {
+            assert_eq!(
+                safe_join_under(&root, &deep, hostile),
+                None,
+                "must skip {hostile:?} even deep in the walk"
+            );
+        }
+        // And the sibling normal file next to a hostile entry still joins.
+        assert_eq!(
+            safe_join_under(&root, &deep, "ok.txt"),
+            Some(deep.join("ok.txt"))
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
