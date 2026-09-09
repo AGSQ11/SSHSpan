@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-09-09
+
+Security and stability patch release. A comprehensive review of the codebase
+uncovered and resolved a critical key-export defect, several data-loss and
+server-side request forgery (SSRF) risks, an unverified auto-update path, and a
+cross-site scripting (XSS) vector, alongside a set of robustness fixes. **All
+users are encouraged to update**, particularly anyone who exports private keys
+or syncs with Bitwarden.
+
+### Security
+
+- **Critical: encrypted PKCS#8 export rewritten to real PBES2.** Exporting a
+  private key in "PKCS#8 (encrypted)" form previously produced a file that
+  (a) could never be decrypted back — the encryption salt was never written
+  into the output, (b) derived the cipher IV from the same value as the
+  encryption key, and (c) printed that IV in cleartext in the file header,
+  disclosing half of the AES key and enabling fast offline passphrase
+  guessing. The output was also a legacy OpenSSL PEM body mislabeled as
+  PKCS#8, which standard tools refused to read. The exporter now emits a
+  standards-compliant RFC 8018 PBES2 `EncryptedPrivateKeyInfo`: a fresh random
+  salt and an independent random IV, both embedded in the file, with the key
+  derived via PBKDF2-HMAC-SHA256 (100,000 rounds). Exports now decrypt
+  correctly in OpenSSL, PuTTYgen, and other PBES2-aware tools, and no longer
+  leak key material.
+- **Bitwarden sync can no longer silently destroy keys or server passwords.**
+  On an encryption (seal) failure during sync, the app previously wrote an
+  *empty* value in place of a private key — and in the update path could
+  overwrite a previously-good stored key — while reporting success. A
+  decryption (unseal) failure during push could likewise send the encrypted
+  blob to the server as if it were the key. Sync now skips or fails the
+  affected item with a clear, logged error instead of writing placeholder or
+  ciphertext data. The same protection now covers saved server passwords.
+- **Closed a DNS-rebinding gap in the SSRF guard.** The Bitwarden server-URL
+  check validated the host's IP address at configuration time, but the
+  connection re-resolved DNS afterwards, so a hostile DNS answer could swap a
+  safe address for an internal one at connect time. DNS resolution is now
+  filtered again at connect time through a custom resolver, so a rebound
+  private/link-local address can never be dialed.
+- **Auto-update downloads are now verified and bounded.** The updater
+  previously downloaded the installer into memory with no size limit, no
+  integrity check, and followed redirects without re-validating the
+  destination. It now streams the download to disk with a hard size cap,
+  verifies the file's SHA-256 against the digest published with the GitHub
+  release (refusing to run it on any mismatch), re-validates the host allow
+  list on any redirect, rejects non-HTTPS URLs, and writes to a uniquely-named,
+  exclusively-created temporary file. The release-manifest request is size
+  capped as well, and the download host allow list no longer accepts
+  look-alike domains.
+- **Fixed cross-site scripting via `~/.ssh/config`.** A Host name from the
+  user's SSH config was inserted into the import menu's HTML without escaping,
+  so a malicious Host line could inject markup into the app window. The value
+  is now escaped like the other fields.
+
+### Fixed
+
+- **Updater no longer offers the version you are already running.** The
+  running version is now read from the packaged app metadata rather than a
+  stale value, and the version comparison is more robust.
+- **Database no longer panics on malformed timestamps.** Rows with an
+  unparseable RFC3339 timestamp now fall back to the current time instead of
+  crashing (five sites in keys, categories, and the audit log).
+- **Changing the master password now re-encrypts saved server passwords.**
+  Previously these were left encrypted under the old password and became
+  unreadable after a password change (data loss). The master password is also
+  scrubbed from memory on use.
+- **PPK import hardened against denial of service.** PuTTY-PPK Argon2
+  parameters (memory, passes, parallelism, salt length) are now bounded before
+  allocation, so a crafted key file cannot force an out-of-memory abort.
+- **Bitwarden HTTP layer hardened.** Redirects are no longer followed
+  (a redirect could previously leak credentials to an internal host), response
+  bodies are size capped, and a refresh token is only consumed after a
+  successful request.
+- **SFTP downloads no longer fail against strict servers.** Some SFTP servers
+  answer a read that crosses end-of-file with a failure status instead of a
+  short read; downloads now read only up to the known file size, so "Send to"
+  and queued transfers succeed. Error messages for server-side failures are
+  now clear instead of a doubled "Failure: Failure".
+- **SFTP edit staging hardened.** Temporary copies of edited remote files are
+  created with owner-only permissions and unpredictable names, and are cleaned
+  up when the session closes, when the vault locks, or after 24 hours.
+
+### Changed
+
+- **Bitwarden client credentials are zeroed from memory on use.** The client
+  master key, stretched key, user key, and access/refresh tokens are now wiped
+  when the client is closed or dropped, matching how the vault master password
+  is already handled.
+
+### Verification
+
+- Rust formatting, compilation, and the full test suite passed on the merged
+  release state: 69 unit tests and 43 integration tests, including new
+  coverage for the PBES2 export round-trip, sync error handling, the SSRF
+  resolver, updater verification, and SFTP staging.
+- The encrypted PKCS#8 export was additionally verified end-to-end by
+  decrypting it with OpenSSL.
+- Renderer syntax checks passed for the updated JavaScript.
+
 ## [1.7.0] - 2026-09-08
 
 Feature release focused on PuTTY-grade terminal behavior and safer everyday SSH use.
