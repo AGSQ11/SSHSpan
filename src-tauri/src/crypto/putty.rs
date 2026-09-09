@@ -54,6 +54,7 @@ enum Argon2Flavour {
     Id,
 }
 
+#[derive(Debug)]
 struct ParsedPpk {
     version: PpkVersion,
     algorithm_name: String,
@@ -73,6 +74,81 @@ struct ParsedPpk {
 /// import command to route between OpenSSH / PPK parsers).
 pub fn looks_like_ppk(data: &str) -> bool {
     data.trim_start().starts_with("PuTTY-User-Key-File-")
+}
+
+// ─── Argon2 parameter bounds (DoS hardening) ────────────────────────────────
+//
+// These fields come straight from the file being imported. Without upper
+// bounds, a crafted .ppk can claim e.g. 4 TiB of Argon2 memory or billions
+// of passes and turn a mere import into a memory/CPU denial of service.
+// PuTTY's own defaults are far below these caps (memory ~8 MiB, passes 1-4,
+// parallelism 1, 16-byte salt), so legitimate keys are unaffected.
+
+/// Maximum accepted `Argon2-Memory` value, in KiB (1 GiB).
+const ARGON2_MAX_MEMORY_KIB: u32 = 1_048_576;
+/// Maximum accepted `Argon2-Passes` value.
+const ARGON2_MAX_PASSES: u32 = 256;
+/// Maximum accepted `Argon2-Parallelism` value.
+const ARGON2_MAX_PARALLELISM: u32 = 64;
+/// Maximum accepted `Argon2-Salt` hex-string length (64 decoded bytes).
+const ARGON2_MAX_SALT_HEX_LEN: usize = 128;
+
+fn validate_argon2_memory(memory_kb: u32) -> anyhow::Result<()> {
+    if memory_kb == 0 {
+        anyhow::bail!("Argon2-Memory must be at least 1 KiB");
+    }
+    if memory_kb > ARGON2_MAX_MEMORY_KIB {
+        anyhow::bail!("Argon2-Memory too large ({memory_kb} KiB; max {ARGON2_MAX_MEMORY_KIB} KiB)");
+    }
+    Ok(())
+}
+
+fn validate_argon2_passes(passes: u32) -> anyhow::Result<()> {
+    if passes == 0 {
+        anyhow::bail!("Argon2-Passes must be at least 1");
+    }
+    if passes > ARGON2_MAX_PASSES {
+        anyhow::bail!("Argon2-Passes too large ({passes}; max {ARGON2_MAX_PASSES})");
+    }
+    Ok(())
+}
+
+fn validate_argon2_parallelism(parallelism: u32) -> anyhow::Result<()> {
+    if parallelism == 0 {
+        anyhow::bail!("Argon2-Parallelism must be at least 1");
+    }
+    if parallelism > ARGON2_MAX_PARALLELISM {
+        anyhow::bail!("Argon2-Parallelism too large ({parallelism}; max {ARGON2_MAX_PARALLELISM})");
+    }
+    Ok(())
+}
+
+fn validate_argon2_salt_len(salt_len: usize) -> anyhow::Result<()> {
+    if salt_len == 0 {
+        anyhow::bail!("Argon2-Salt must not be empty");
+    }
+    if salt_len > ARGON2_MAX_SALT_HEX_LEN / 2 {
+        anyhow::bail!(
+            "Argon2-Salt too long ({salt_len} bytes; max {} bytes)",
+            ARGON2_MAX_SALT_HEX_LEN / 2
+        );
+    }
+    Ok(())
+}
+
+/// Full cross-field check (used as defense in depth after parsing an
+/// encrypted v3 file).
+fn validate_argon2_params(
+    memory_kb: u32,
+    passes: u32,
+    parallelism: u32,
+    salt_len: usize,
+) -> anyhow::Result<()> {
+    validate_argon2_memory(memory_kb)?;
+    validate_argon2_passes(passes)?;
+    validate_argon2_parallelism(parallelism)?;
+    validate_argon2_salt_len(salt_len)?;
+    Ok(())
 }
 
 fn parse_ppk_file(data: &str) -> anyhow::Result<ParsedPpk> {
@@ -132,19 +208,32 @@ fn parse_ppk_file(data: &str) -> anyhow::Result<ParsedPpk> {
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Bad Argon2-Memory"))?;
+            validate_argon2_memory(argon2_memory_kb)?;
         } else if let Some(v) = line.strip_prefix("Argon2-Passes:") {
             argon2_passes = v
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Bad Argon2-Passes"))?;
+            validate_argon2_passes(argon2_passes)?;
         } else if let Some(v) = line.strip_prefix("Argon2-Parallelism:") {
             argon2_parallelism = v
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Bad Argon2-Parallelism"))?;
+            validate_argon2_parallelism(argon2_parallelism)?;
         } else if let Some(v) = line.strip_prefix("Argon2-Salt:") {
+            // Cap the hex string BEFORE decoding: a multi-megabyte salt line
+            // would otherwise allocate unconditionally.
+            let salt_hex = v.trim();
+            if salt_hex.len() > ARGON2_MAX_SALT_HEX_LEN {
+                anyhow::bail!(
+                    "Argon2-Salt too long ({} hex chars; max {ARGON2_MAX_SALT_HEX_LEN})",
+                    salt_hex.len()
+                );
+            }
             argon2_salt =
-                hex::decode(v.trim()).map_err(|e| anyhow::anyhow!("Bad Argon2-Salt hex: {e}"))?;
+                hex::decode(salt_hex).map_err(|e| anyhow::anyhow!("Bad Argon2-Salt hex: {e}"))?;
+            validate_argon2_salt_len(argon2_salt.len())?;
         } else if let Some(v) = line.strip_prefix("Private-Lines:") {
             let n: usize = v
                 .trim()
@@ -165,6 +254,21 @@ fn parse_ppk_file(data: &str) -> anyhow::Result<ParsedPpk> {
 
     if public_blob.is_empty() {
         anyhow::bail!("PPK file has no public key data");
+    }
+
+    // Defense in depth for encrypted v3 files: the per-field checks above
+    // run at parse time, but only when Argon2 fields are actually present.
+    // Encrypted v3 keys always carry all four fields, so a complete
+    // cross-field check here catches any combination that slipped through
+    // (e.g. a file whose only KDF field is a salt). Unencrypted files and
+    // v2 files legitimately have no Argon2 parameters at all.
+    if version == PpkVersion::V3 && encrypted {
+        validate_argon2_params(
+            argon2_memory_kb,
+            argon2_passes,
+            argon2_parallelism,
+            argon2_salt.len(),
+        )?;
     }
 
     Ok(ParsedPpk {
@@ -671,4 +775,130 @@ fn encode_private_blob(keypair: &KeypairData) -> anyhow::Result<Vec<u8>> {
         _ => anyhow::bail!("Unsupported key type for PPK export"),
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validator_rejects_oversized_memory() {
+        // 4294967295 KiB would be ~4 TiB of Argon2 memory (u32::MAX).
+        let err = validate_argon2_params(u32::MAX, 4, 1, 16)
+            .expect_err("oversized memory must be rejected");
+        assert!(err.to_string().contains("Argon2-Memory too large"));
+    }
+
+    #[test]
+    fn validator_rejects_zero_and_oversized_passes() {
+        assert!(validate_argon2_params(8192, 0, 1, 16).is_err());
+        let err = validate_argon2_params(8192, 257, 1, 16).expect_err("passes > 256 rejected");
+        assert!(err.to_string().contains("Argon2-Passes too large"));
+    }
+
+    #[test]
+    fn validator_rejects_zero_and_oversized_parallelism() {
+        assert!(validate_argon2_params(8192, 4, 0, 16).is_err());
+        let err = validate_argon2_params(8192, 4, 65, 16).expect_err("parallelism > 64 rejected");
+        assert!(err.to_string().contains("Argon2-Parallelism too large"));
+    }
+
+    #[test]
+    fn validator_rejects_empty_and_oversized_salt() {
+        assert!(validate_argon2_params(8192, 4, 1, 0).is_err());
+        let err = validate_argon2_params(8192, 4, 1, 65).expect_err("salt > 64 bytes rejected");
+        assert!(err.to_string().contains("Argon2-Salt too long"));
+    }
+
+    #[test]
+    fn validator_accepts_boundaries_and_putty_defaults() {
+        // Exactly at the caps: 1 GiB memory, 256 passes, 64 parallelism,
+        // 64-byte salt.
+        assert!(validate_argon2_params(1_048_576, 256, 64, 64).is_ok());
+        // PuTTY's own defaults (8 MiB / 4 passes / 1 lane / 16-byte salt).
+        assert!(validate_argon2_params(8192, 4, 1, 16).is_ok());
+        // Minimal valid values.
+        assert!(validate_argon2_params(1, 1, 1, 1).is_ok());
+    }
+
+    /// Minimal v3 PPK header skeleton that reaches the Argon2 validation
+    /// during parsing. The public blob is a placeholder; parsing fails on
+    /// Argon2 bounds long before any key material is needed.
+    fn ppk_header_with_argon2(
+        memory: &str,
+        passes: &str,
+        parallelism: &str,
+        salt_hex: &str,
+    ) -> String {
+        format!(
+            "PuTTY-User-Key-File-3: ssh-ed25519\n\
+             Encryption: aes256-cbc\n\
+             Comment: test\n\
+             Public-Lines: 1\n\
+             AAAA\n\
+             Key-Derivation: Argon2id\n\
+             Argon2-Memory: {memory}\n\
+             Argon2-Passes: {passes}\n\
+             Argon2-Parallelism: {parallelism}\n\
+             Argon2-Salt: {salt_hex}\n"
+        )
+    }
+
+    #[test]
+    fn parse_rejects_huge_argon2_memory_before_any_kdf() {
+        // u32::MAX KiB (~4 TiB) is in-range for the u32 parse but far past
+        // the 1 GiB cap; it must be rejected at parse time, before any
+        // Argon2 allocation.
+        let data = ppk_header_with_argon2("4294967295", "4", "1", &"ab".repeat(16));
+        let err = parse_ppk_file(&data).expect_err("huge memory must be rejected at parse time");
+        assert!(err.to_string().contains("Argon2-Memory too large"));
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_memory_as_bad_value() {
+        // 99999999999 doesn't fit in u32 at all; rejected during parsing.
+        let data = ppk_header_with_argon2("99999999999", "4", "1", &"ab".repeat(16));
+        let err = parse_ppk_file(&data).expect_err("out-of-range memory must be rejected");
+        assert!(err.to_string().contains("Bad Argon2-Memory"));
+    }
+
+    #[test]
+    fn parse_rejects_huge_salt_before_decoding() {
+        // 5 KB of hex (2.5 KB decoded) — far past the 128-hex-char cap.
+        let data = ppk_header_with_argon2("8192", "4", "1", &"ab".repeat(2500));
+        let err = parse_ppk_file(&data).expect_err("huge salt must be rejected at parse time");
+        assert!(err.to_string().contains("Argon2-Salt too long"));
+    }
+
+    #[test]
+    fn parse_rejects_zero_memory() {
+        let data = ppk_header_with_argon2("0", "4", "1", &"ab".repeat(16));
+        let err = parse_ppk_file(&data).expect_err("zero memory must be rejected");
+        assert!(err.to_string().contains("Argon2-Memory must be at least"));
+    }
+
+    #[test]
+    fn parse_accepts_sane_argon2_parameters() {
+        // PuTTY's own defaults must sail through parsing (the file is
+        // incomplete as a key, but Argon2 validation itself must pass).
+        let data = ppk_header_with_argon2("8192", "4", "1", &"ab".repeat(16));
+        let parsed = match parse_ppk_file(&data) {
+            Ok(p) => p,
+            Err(e) => panic!("sane Argon2 parameters must not be rejected: {e}"),
+        };
+        assert_eq!(parsed.argon2_memory_kb, 8192);
+        assert_eq!(parsed.argon2_passes, 4);
+        assert_eq!(parsed.argon2_parallelism, 1);
+        assert_eq!(parsed.argon2_salt.len(), 16);
+    }
+
+    #[test]
+    fn parse_accepts_boundary_memory_exactly_1_gib() {
+        let data = ppk_header_with_argon2("1048576", "4", "1", &"ab".repeat(16));
+        let parsed = match parse_ppk_file(&data) {
+            Ok(p) => p,
+            Err(e) => panic!("1 GiB memory boundary must be accepted: {e}"),
+        };
+        assert_eq!(parsed.argon2_memory_kb, 1_048_576);
+    }
 }
