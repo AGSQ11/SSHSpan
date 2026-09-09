@@ -21,6 +21,70 @@ const MAX_MANIFEST_BYTES: u64 = 10 * 1024 * 1024;
 /// instead of filling the disk.
 const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Hard cap for the detached minisign signature (`.minisig`) downloaded
+/// alongside the installer. A real minisign signature file is ~200 bytes;
+/// 4 KiB is generous headroom while still refusing to buffer anything
+/// hostile served in its place.
+const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
+
+/// minisign public key (base64 body of `minisign.pub`, i.e. the SECOND line
+/// of the key file — algorithm bytes + key id + Ed25519 key, base64-encoded).
+///
+/// PROVISIONING: the SHA-256 asset digest returned by the GitHub API comes
+/// from the same release that serves the installer, so it only proves the
+/// download matches the release — not that the release itself is trusted.
+/// This embedded key closes that gap: the release workflow signs every
+/// installer with the minisign SECRET key (GitHub secret
+/// `MINISIGN_SECRET_KEY`) and uploads the `.minisig` files as release
+/// assets; `update_download_and_run` refuses to run an installer whose
+/// signature does not verify against this PUBLIC key, which lives in the
+/// source tree and cannot be changed by whoever controls the release.
+///
+/// Until the maintainer generates a keypair this stays a PLACEHOLDER and
+/// verification is SKIPPED with a logged warning (the GitHub digest check
+/// still applies — current behavior). To provision:
+///   1. `minisign -G -W` (creates an unencrypted minisign.pub + minisign.key;
+///      the -W is required because the release workflow signs
+///      non-interactively).
+///   2. Repository settings → Secrets → Actions → new secret
+///      `MINISIGN_SECRET_KEY` whose value is the ENTIRE contents of
+///      `minisign.key` (both lines).
+///   3. Replace the string below with the base64 body of `minisign.pub`
+///      (the second line, starting with `RW`). See the CHANGELOG
+///      "Unreleased" section for the full checklist.
+const MINISIGN_PUBLIC_KEY: &str = "PLACEHOLDER-REPLACE-WITH-BASE64-PUBLIC-KEY";
+
+/// Marker value of `MINISIGN_PUBLIC_KEY` before the maintainer provisions
+/// the real key; matched by full equality.
+const MINISIGN_PUBLIC_KEY_PLACEHOLDER: &str = "PLACEHOLDER-REPLACE-WITH-BASE64-PUBLIC-KEY";
+
+/// True when the minisign public key has been provisioned (i.e. is not the
+/// build-time placeholder). When false, signature verification is skipped
+/// with a warning and the GitHub digest check alone decides — matching the
+/// pre-signing behavior so releases keep working while the keypair is
+/// being set up. Parameterized over the key so tests can exercise both
+/// states regardless of whether the shipped const is still the placeholder.
+fn minisign_key_provisioned(key: &str) -> bool {
+    key != MINISIGN_PUBLIC_KEY_PLACEHOLDER
+}
+
+/// Verify a downloaded installer blob against a minisign `.minisig` file
+/// body using the embedded public key. Fails closed on ANY problem: bad
+/// base64, wrong key id, wrong key, tampered content, or a mangled trusted
+/// comment (the global signature covers both).
+fn verify_minisign_signature(installer: &[u8], sig_body: &str) -> CmdResult<()> {
+    let pubkey = minisign_verify::PublicKey::from_base64(MINISIGN_PUBLIC_KEY)
+        .map_err(|e| CmdError(format!("Embedded minisign public key is invalid: {e}")))?;
+    let signature = minisign_verify::Signature::decode(sig_body)
+        .map_err(|e| CmdError(format!("Release signature is unparseable: {e}")))?;
+    // `false` = refuse legacy (non-prehashed) signatures: the release
+    // workflow's minisign signs in the default pre-hashed mode, so anything
+    // else was not produced by it.
+    pubkey
+        .verify(installer, &signature, false)
+        .map_err(|e| CmdError(format!("Release signature verification FAILED: {e}")))
+}
+
 #[derive(Deserialize)]
 struct GhAsset {
     name: String,
@@ -210,6 +274,65 @@ pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
     }))
 }
 
+/// Download the `<installer-url>.minisig` sibling of the (post-redirect)
+/// installer URL through the same validate-allowlist + manual-redirect +
+/// revalidation + size-cap discipline as the installer itself, returning
+/// the body as a string. ANY failure — including a 404 for an unsigned
+/// asset, a network error, or an oversized body — returns Err; the caller
+/// decides (fail-closed) what to do with it.
+async fn download_minisig(
+    client: &reqwest::Client,
+    final_installer_url: &url::Url,
+) -> CmdResult<String> {
+    // GitHub serves release assets and their .minisig siblings from the same
+    // host and path, so appending the suffix to the FINAL (post-redirect)
+    // URL lands on the right asset even after the release-download →
+    // objects/release-assets redirect hop.
+    let mut sig_url_str = final_installer_url.as_str().to_string();
+    sig_url_str.push_str(".minisig");
+    let mut current_url = validate_asset_url(&sig_url_str)?;
+
+    // Same single-manual-redirect loop as the installer download: every hop
+    // re-validated against the same allowlist.
+    let mut resp = None;
+    for _ in 0..2 {
+        let r = client
+            .get(current_url.as_str())
+            .send()
+            .await
+            .map_err(|e| CmdError(format!("Signature download failed: {e}")))?;
+        if r.status().is_redirection() {
+            let location = r
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+                .ok_or_else(|| CmdError("Signature redirect without a Location header.".into()))?;
+            let next = current_url
+                .join(&location)
+                .map_err(|e| CmdError(format!("Bad signature redirect target: {e}")))?;
+            current_url = validate_asset_url(next.as_str())?;
+            continue;
+        }
+        resp = Some(
+            r.error_for_status()
+                .map_err(|e| CmdError(format!("Signature download failed: {e}")))?,
+        );
+        break;
+    }
+    let resp = resp.ok_or_else(|| {
+        CmdError("Signature download redirected more than once; refusing to follow.".into())
+    })?;
+
+    // read_body_capped handles the 4 KiB cap (content-length pre-check plus
+    // streaming accumulation) exactly like the manifest read.
+    let body = read_body_capped(resp, MAX_SIGNATURE_BYTES, "release signature").await?;
+    if body.is_empty() {
+        return Err(CmdError("Downloaded release signature is empty.".into()));
+    }
+    String::from_utf8(body).map_err(|_| CmdError("Release signature is not valid UTF-8.".into()))
+}
+
 /// Download the chosen installer to a temp path, launch it detached, and exit
 /// the app so the installer isn't blocked by our own running process.
 /// The renderer must only call this after the user explicitly approved.
@@ -347,6 +470,48 @@ pub async fn update_download_and_run(
         // tamper guarantee — the renderer in this repo always sends the
         // digest, so in practice this arm is unreachable for shipped builds.
         None => { /* no digest provided: non-empty size verified above */ }
+    }
+
+    // Signature verification: the digest above proves the download matches
+    // the release, but both the binary and its digest come from the same
+    // GitHub API response — whoever can alter one can alter the other. The
+    // minisign signature closes that gap by binding the installer to a key
+    // embedded in this binary. With the key provisioned this is fail-closed
+    // (missing/invalid signature = delete the installer and refuse to run);
+    // until then it is skipped with a warning (digest check only), so
+    // pre-provisioning builds keep updating.
+    if minisign_key_provisioned(MINISIGN_PUBLIC_KEY) {
+        // ANY signature problem — 404 (unsigned asset), network failure,
+        // oversized body, unparseable or invalid signature — deletes the
+        // installer and refuses to run it. There is deliberately no
+        // "unsigned release, carry on" path once the key is provisioned.
+        let sig = match download_minisig(&client, &current_url).await {
+            Ok(sig) => sig,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err(e);
+            }
+        };
+        // The installer was streamed to disk; re-read it for verification
+        // (bounded by the size cap already enforced during download).
+        let installer = match tokio::fs::read(&dest).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err(CmdError(format!(
+                    "Could not re-read downloaded installer: {e}"
+                )));
+            }
+        };
+        if let Err(e) = verify_minisign_signature(&installer, &sig) {
+            let _ = tokio::fs::remove_file(&dest).await;
+            return Err(e);
+        }
+    } else {
+        log::warn!(
+            "MINISIGN_PUBLIC_KEY is still the build-time placeholder; \
+             skipping release-signature verification (GitHub digest check only)."
+        );
     }
 
     // Launch the installer detached.
@@ -682,5 +847,165 @@ mod tests {
         // circuit keeps the banner away.
         assert!(is_newer("v1.7.0", "1.4.0"));
         assert!(!is_newer("v1.7.0", "1.7.0"));
+    }
+
+    // ── minisign release-signature verification ─────────────────────────────
+    // The vectors below were generated with a fixed-seed Ed25519 keypair in
+    // the exact wire format the minisign CLI writes (verified against
+    // jedisct1/minisign's sign() for the signed-message layout: the raw
+    // BLAKE2b-512 of the file in pre-hashed mode, and sig || trusted-comment
+    // body for the global signature). scripts/gen_minisign_test_vector.py
+    // regenerates them.
+
+    /// Base64 public key of the test keypair (seed = SHA-256 of
+    /// "sshspan-test-seed-v1"; key id = BLAKE2b-8(pk)).
+    const TEST_MINISIGN_PUBKEY: &str = "RWRZlujGKpcBlfJ1Dj473IeWDsZcPcuqvbspGCvLyHO5VAtOuZKpXfcB";
+
+    /// Test payload the signatures below cover.
+    const TEST_BLOB: &[u8] = b"SSHSpan minisign unit-test payload";
+
+    /// Valid minisign (pre-hashed, "ED") signature over TEST_BLOB.
+    const TEST_SIG_GOOD: &str = "untrusted comment: signature from minisign secret key
+RURZlujGKpcBldENeLIUcGNlFb9xFwGX+iU02JbswtWWQcwT/WyI+zphVZmp33Z68qq7K87GPIrQ5pq8bDM5D5cq4jrREOolrw4=
+trusted comment: sshspan-updater-test
+Zo4gaiQqoL1Jfr9KXg5zhLPR2W1kR6V9kt/NEr/E06UHQiCABaoXZC2Y8FZgL6TjOS3mB2J7N8PLYKufka2IAg==";
+
+    /// Valid minisign signature over DIFFERENT content (b"tampered bytes") —
+    /// a well-formed signature that must still fail against TEST_BLOB.
+    const TEST_SIG_OTHER_BLOB: &str = "untrusted comment: signature from minisign secret key
+RURZlujGKpcBlV9Y3Of2Aq8JpnTqJciEKaKsGZN1PEnSLAvM32YiLeMCo5j0nqtZFXxi79QXGTljTGHWm2+nVcfC4PFn+TTfsAM=
+trusted comment: sshspan-updater-test
+SWYMI+zOPB2iL5kCX2udBtoWCA9aGT7AvUVmT4Xa1CDTDUadQKeArHOsgGjFxnV/3xtgKHY5t3aUFcma2FDgBg==";
+
+    /// verify_with_key runs the same verification update_download_and_run
+    /// performs, but against a caller-chosen key so tests can exercise the
+    /// provisioned path without touching the shipped placeholder const.
+    fn verify_with_key(key_b64: &str, blob: &[u8], sig_body: &str) -> Result<(), String> {
+        let pubkey =
+            minisign_verify::PublicKey::from_base64(key_b64).map_err(|e| format!("key: {e}"))?;
+        let signature =
+            minisign_verify::Signature::decode(sig_body).map_err(|e| format!("sig: {e}"))?;
+        pubkey
+            .verify(blob, &signature, false)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn minisign_placeholder_key_is_detected_as_unprovisioned() {
+        // Detection is full-string equality against the placeholder, in both
+        // directions: the placeholder means "skip verification" and any real
+        // key string means "verify". Written against the helper rather than
+        // the shipped const so the test keeps passing once the maintainer
+        // provisions the real key (the release workflow runs cargo test).
+        assert!(!minisign_key_provisioned(MINISIGN_PUBLIC_KEY_PLACEHOLDER));
+        assert!(minisign_key_provisioned(TEST_MINISIGN_PUBKEY));
+        assert!(minisign_key_provisioned(""));
+    }
+
+    #[test]
+    fn minisign_good_signature_verifies() {
+        verify_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, TEST_SIG_GOOD)
+            .expect("a real minisign pre-hashed signature over the exact bytes must verify");
+    }
+
+    #[test]
+    fn minisign_tampered_content_is_rejected() {
+        let err = verify_with_key(
+            TEST_MINISIGN_PUBKEY,
+            b"SSHSpan minisign unit-test payloaX", // one flipped byte
+            TEST_SIG_GOOD,
+        )
+        .expect_err("tampered content must fail verification");
+        assert!(
+            err.contains("failed"),
+            "expected a signature failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn minisign_signature_of_other_content_is_rejected() {
+        // Even a perfectly valid signature (over different bytes) must not
+        // verify against TEST_BLOB — this is the release-asset substitution
+        // case: attacker uploads their own installer + its own valid sig.
+        let err = verify_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, TEST_SIG_OTHER_BLOB)
+            .expect_err("a signature over different content must be rejected");
+        assert!(
+            err.contains("failed"),
+            "expected a signature failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn minisign_wrong_key_is_rejected() {
+        // A different (valid-format) Ed25519 key: the signature's key id
+        // does not match, so verification fails before any crypto runs.
+        // Second half of the test pubkey with the first bytes of the real
+        // one kept — valid format, different key id/key.
+        let wrong_key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        let err = verify_with_key(wrong_key, TEST_BLOB, TEST_SIG_GOOD)
+            .expect_err("a signature from a different key must be rejected");
+        assert!(
+            err.contains("different key"),
+            "expected a key-id mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn minisign_mangled_signature_is_rejected() {
+        for bad in [
+            "",                                   // empty body
+            "not base64 at all\n///\nx\ny",       // garbage
+            "untrusted comment: x\nQUJD=",        // truncated base64
+            "untrusted comment: x\n\n\n\n",       // missing fields
+            "untrusted comment: x\nRURZlujGKpcBldENeLIUcGNlFb9xFwGX+iU02JbswtWWQcwT/WyI+zphVZmp33Z68qq7K87GPIrQ5pq8bDM5D5cq4jrREOolrw4=\ntrusted comment: x\nQUJD", // no global signature
+        ] {
+            assert!(
+                verify_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, bad).is_err(),
+                "mangled signature body must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    // ── .minisig URL derivation + download cap ──────────────────────────────
+
+    #[test]
+    fn minisig_url_is_derived_from_final_installer_url() {
+        // The sibling suffix must land on the same host/path as the FINAL
+        // (post-redirect) asset URL, and must pass the same allowlist.
+        let final_url =
+            validate_asset_url("https://release-assets.githubusercontent.com/799989282/a.exe")
+                .unwrap();
+        let mut sig = final_url.as_str().to_string();
+        sig.push_str(".minisig");
+        let parsed = validate_asset_url(&sig).expect(".minisig sibling must be allowlisted");
+        assert_eq!(
+            parsed.as_str(),
+            "https://release-assets.githubusercontent.com/799989282/a.exe.minisig"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_minisig_body_is_rejected() {
+        // A .minisig served in place of the real one must be refused by the
+        // same capped-read discipline as the manifest.
+        let resp = make_response(200, &[], vec![b'x'; MAX_SIGNATURE_BYTES as usize + 1]);
+        let err = read_body_capped(resp, MAX_SIGNATURE_BYTES, "release signature")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large") || msg.contains("exceeded"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn minisig_body_within_cap_is_read_intact() {
+        let body = TEST_SIG_GOOD.as_bytes().to_vec();
+        let resp = make_response(200, &[], body.clone());
+        let bytes = read_body_capped(resp, MAX_SIGNATURE_BYTES, "release signature")
+            .await
+            .unwrap();
+        assert_eq!(bytes, body);
     }
 }

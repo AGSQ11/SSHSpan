@@ -121,6 +121,94 @@ jobs:
             echo "Changes in this release — see [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)." > RELEASE_BODY.md
           fi
 
+      # ── Release signing (minisign) ──────────────────────────────────────────
+      # Every installer gets a detached minisign signature (`.minisig`) which
+      # the in-app updater verifies against the public key embedded in
+      # src-tauri/src/commands/updater.rs (MINISIGN_PUBLIC_KEY). This binds the
+      # installer to the source tree, so replacing BOTH the binary and its
+      # GitHub-computed SHA-256 digest (repo/token compromise) is no longer
+      # enough to push a malicious update.
+      #
+      # MAINTAINER SETUP (one-time, see CHANGELOG "Unreleased" for details):
+      #   1. Install minisign (https://jedisct1.github.io/minisign/) and run
+      #      `minisign -G -W` locally (the -W keeps the secret key unencrypted,
+      #      which this workflow requires; keep the file itself secret).
+      #   2. Repo Settings → Secrets and variables → Actions → new secret
+      #      MINISIGN_SECRET_KEY whose value is the ENTIRE minisign.key file
+      #      (both lines: comment line + base64 secret key line).
+      #   3. Paste the base64 body of minisign.pub (the second line, starting
+      #      with "RW") into the MINISIGN_PUBLIC_KEY const in
+      #      src-tauri/src/commands/updater.rs, replacing the placeholder.
+      # Until the secret exists this step is skipped with a warning and the
+      # release proceeds unsigned (the updater likewise falls back to the
+      # GitHub digest check while that const is still the placeholder).
+      - name: Sign installers with minisign
+        id: minisign_sign
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          # Pinned upstream release (jedisct1/minisign) + SHA-256 of the
+          # downloaded archive, so a substituted "signer" is itself refused.
+          MINISIGN_VERSION: '0.12'
+          MINISIGN_SHA256_LINUX: '9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73'
+          MINISIGN_SHA256_WIN64: '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479'
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY is not configured; skipping release signing. See the workflow comment above this step for the provisioning steps."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # minisign is not preinstalled on the runners: download the pinned
+          # upstream release archive and verify it by SHA-256 before use.
+          case "$(uname -s)" in
+            Linux)
+              url="https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz"
+              expected="${MINISIGN_SHA256_LINUX}" ;;
+            MINGW*|MSYS*|CYGWIN*)
+              url="https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-win64.zip"
+              expected="${MINISIGN_SHA256_WIN64}" ;;
+            *)
+              echo "::error::Unsupported runner OS for the pinned minisign download."; exit 1 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/minisign-dl" "$url"
+          actual="$(sha256sum "$RUNNER_TEMP/minisign-dl" | cut -d' ' -f1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::minisign download checksum mismatch (expected $expected, got $actual); refusing to sign with it."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/minisign-bin"
+          case "$url" in
+            # Archives contain minisign-<ver>-<os>/<arch>/minisign[.exe];
+            # keep the inner directory tree and call the right binary below.
+            *.tar.gz) tar -xzf "$RUNNER_TEMP/minisign-dl" -C "$RUNNER_TEMP/minisign-bin" ;;
+            *.zip)    unzip -oq "$RUNNER_TEMP/minisign-dl" -d "$RUNNER_TEMP/minisign-bin" ;;
+          esac
+          minisign_bin="$(find "$RUNNER_TEMP/minisign-bin" -type f -name 'minisign*' | grep -E 'x86_64.*/(minisign|minisign.exe)$' | head -n1)"
+          if [ -z "$minisign_bin" ]; then
+            echo "::error::Could not locate the x86_64 minisign binary in the extracted archive."; exit 1
+          fi
+          # Write the secret key to a temp file (minisign reads keys from
+          # files), sign every bundled installer, then remove the key. The
+          # signing key must be an UNENCRYPTED key generated with -W.
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$keyfile"
+          chmod 600 "$keyfile"
+          signed=0
+          while IFS= read -r -d '' artifact; do
+            "$minisign_bin" -S -s "$keyfile" -m "$artifact" \
+              -t "SSHSpan release ${GITHUB_REF_NAME}"
+            signed=$((signed + 1))
+          done < <(find src-tauri/target -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' \) \
+            -path '*/release/bundle/*' -print0)
+          if [ "$signed" -eq 0 ]; then
+            echo "::error::No installer artifacts found to sign."; exit 1
+          fi
+          echo "Signed $signed installer(s); .minisig files will be attached to the release."
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
       - name: Attach artifacts to the GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -129,3 +217,16 @@ jobs:
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: ${{ matrix.artifacts }}
+      - name: Attach minisign signatures to the GitHub release
+        # Runs only when the signing step actually signed (secret present).
+        # Each matrix leg uploads only the .minisig files it produced; the
+        # other platform's globs do not match on this runner, which the
+        # action tolerates (fail_on_unmatched_files defaults to false here).
+        uses: softprops/action-gh-release@v2
+        if: steps.minisign_sign.outputs.signed == 'true'
+        with:
+          files: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.minisig
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi.minisig
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb.minisig
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm.minisig

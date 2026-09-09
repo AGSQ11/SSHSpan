@@ -49,6 +49,7 @@ hmac = "0.12"                     # HMAC-SHA256 (Bitwarden MAC, PPK MAC)
 sha1 = "0.10"                     # SHA-1 (PPK v2 key derivation)
 sha2 = "0.10"                     # SHA-256 / SHA-512
 md-5 = "0.7"                      # MD5 (legacy SSH fingerprint)
+minisign-verify = "0.2"           # minisign/Ed25519 updater signature verification
 
 # ─── Crypto: asymmetric keys ────────────────────────────────────────────────
 rsa = { version = "0.9", features = ["pem"] }

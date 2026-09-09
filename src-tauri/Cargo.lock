@@ -6570,6 +6570,7 @@ dependencies = [
  "http",
  "log",
  "md-5 0.7.0",
+ "minisign-verify",
  "notify",
  "opener",
  "p256 0.13.2",
