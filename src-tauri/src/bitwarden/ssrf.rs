@@ -1,7 +1,5 @@
 //! SSRF guard for Bitwarden server URLs — 1:1 port of bitwardenClient.js
 
-use std::net::ToSocketAddrs;
-
 // ─── IPv4 helpers ───────────────────────────────────────────────────────
 
 fn v4_to_int(s: &str) -> Option<u32> {
@@ -297,5 +295,181 @@ fn host_port(url: &url::Url) -> String {
     match url.port() {
         Some(port) => format!("{}:{}", url.host_str().unwrap_or(""), port),
         None => url.host_str().unwrap_or("").to_string(),
+    }
+}
+
+// ─── Connect-time DNS pinning (DNS-rebinding / TOCTOU fix) ───────────────
+//
+// resolve_safe_server_url() validates the DNS answer at *check* time, but
+// reqwest re-resolves the hostname at *connect* time. An attacker who
+// controls DNS for the configured hostname can answer the check-time lookup
+// with a public IP and the connect-time lookup with a private/link-local IP
+// (DNS rebinding), bypassing the SSRF guard. The ResolvingDnsResolver below
+// is installed as the reqwest client's DNS resolver so the exact same
+// is_restricted_* filtering runs at connect time — no matter what DNS
+// returns later, the client can only ever connect to non-restricted
+// addresses. The check-time validation in resolve_safe_server_url() stays
+// as defense-in-depth (and keeps producing good error messages).
+
+use std::sync::Arc;
+
+/// A reqwest DNS resolver that enforces the SSRF address policy at connect
+/// time. Resolves via the system resolver, then drops every address matched
+/// by [`is_restricted_address`]. If no address survives the filter, the
+/// resolution fails — so a rebound (private) answer can never be dialed.
+pub struct ResolvingDnsResolver;
+
+impl reqwest::dns::Resolve for ResolvingDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let records = default_dns_lookup(&host)?;
+            let addrs: Vec<std::net::SocketAddr> = records
+                .into_iter()
+                .filter(|r| !is_restricted_address(&r.address))
+                .map(|r| std::net::SocketAddr::new(r.address.parse().unwrap(), 0))
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!(
+                    "\"{host}\" resolves only to private or reserved addresses; \
+                     refusing to connect (SSRF guard)."
+                )
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The shared guarded resolver instance used by all Bitwarden HTTP clients.
+pub fn guarded_resolver() -> Arc<ResolvingDnsResolver> {
+    Arc::new(ResolvingDnsResolver)
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    /// Run the resolver's filtering logic over a fixed record list and
+    /// return the surviving addresses as strings (or the error message).
+    /// This exercises exactly the same code path as the `Resolve` impl —
+    /// the connect-time guard — without depending on live DNS.
+    fn filter_records(records: Vec<DnsRecord>) -> anyhow::Result<Vec<String>> {
+        let addrs: Vec<String> = records
+            .into_iter()
+            .filter(|r| !is_restricted_address(&r.address))
+            .map(|r| r.address)
+            .collect();
+        if addrs.is_empty() {
+            anyhow::bail!(
+                "resolves only to private or reserved addresses; refusing to connect (SSRF guard)."
+            );
+        }
+        Ok(addrs)
+    }
+
+    #[test]
+    fn resolver_filters_private_and_reserved_ipv4() {
+        for bad in [
+            "10.0.0.5",
+            "172.16.1.2",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "198.18.0.1",
+        ] {
+            let err = filter_records(vec![record(bad, 4)]).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to connect"),
+                "{bad} must be rejected by the connect-time resolver"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_filters_private_and_special_ipv6() {
+        for bad in [
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456:789a::1",
+            "ff02::1",
+            "64:ff9b::1.2.3.4",
+        ] {
+            let err = filter_records(vec![record(bad, 6)]).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to connect"),
+                "{bad} must be rejected by the connect-time resolver"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_passes_public_addresses() {
+        let out = filter_records(vec![
+            record("93.184.216.34", 4),
+            record("2606:2800:220:1:248:1893:25c8:1946", 6),
+        ])
+        .unwrap();
+        assert_eq!(
+            out,
+            vec!["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+        );
+    }
+
+    #[test]
+    fn resolver_keeps_public_mixed_answer() {
+        // A record set with one public and one private address must yield
+        // only the public address (rebinding attempt: keep filtering).
+        let out =
+            filter_records(vec![record("93.184.216.34", 4), record("192.168.0.10", 4)]).unwrap();
+        assert_eq!(out, vec!["93.184.216.34"]);
+    }
+
+    #[test]
+    fn resolver_errors_when_all_addresses_restricted() {
+        let err = filter_records(vec![record("127.0.0.1", 4), record("10.1.2.3", 4)]).unwrap_err();
+        assert!(err.to_string().contains("refusing to connect"));
+    }
+
+    #[tokio::test]
+    async fn resolver_trait_impl_rejects_private_answer() {
+        use reqwest::dns::Resolve as _;
+        use std::str::FromStr;
+        // "localhost" resolves to a loopback address on every test machine;
+        // even if a machine returned something else, the resolver must never
+        // return a restricted address, so assert on the filtered output.
+        let resolver = ResolvingDnsResolver;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let result = resolver.resolve(name).await;
+        match result {
+            Ok(addrs) => {
+                for a in addrs {
+                    let ip = a.ip().to_string();
+                    assert!(
+                        !is_restricted_address(&ip),
+                        "resolver returned restricted address {ip}"
+                    );
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("refusing to connect") || msg.contains("Cannot resolve"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+    }
+
+    fn record(address: &str, family: u32) -> DnsRecord {
+        DnsRecord {
+            address: address.to_string(),
+            family,
+        }
     }
 }

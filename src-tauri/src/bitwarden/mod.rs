@@ -142,9 +142,15 @@ impl BitwardenClient {
         // Bearer token and request body to an internal target. The official
         // Bitwarden identity/API endpoints do not redirect in normal
         // operation, so any 3xx here is treated as an error instead.
+        // DNS rebinding (TOCTOU) fix: resolve_safe_server_url() validates the
+        // DNS answer at check time, but reqwest re-resolves at connect time.
+        // The guarded resolver applies the same private/reserved-address
+        // filtering at connect time, so a rebound DNS answer pointing at an
+        // internal host can never be dialed (see ssrf.rs).
         let http = HttpClient::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
+            .dns_resolver(ssrf::guarded_resolver())
             .build()?;
 
         Ok(Self {
@@ -571,10 +577,13 @@ impl BitwardenClient {
 
 /// Best-effort anonymous server probe used by "Test connection".
 pub async fn probe_server_version(base_url: &str) -> Option<String> {
-    // Same no-redirect policy as the main client (see BitwardenClient::new).
+    // Same no-redirect policy as the main client (see BitwardenClient::new),
+    // and the same guarded DNS resolver so the rebinding protection applies
+    // to this client as well.
     let client = HttpClient::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
+        .dns_resolver(ssrf::guarded_resolver())
         .build()
         .ok()?;
     let url = format!("{}/api/config", base_url);
