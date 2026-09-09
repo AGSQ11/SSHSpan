@@ -210,6 +210,89 @@ fn ed25519_public_to_spki(pubkey32: &[u8]) -> Vec<u8> {
     der_sequence(&content)
 }
 
+// ─── PBES2 EncryptedPrivateKeyInfo (RFC 8018 / RFC 5958) ────────────────────
+
+/// OID for PBES2 (RFC 8018 §A.4): 1.2.840.113549.1.5.13
+const OID_PBES2: &[u32] = &[1, 2, 840, 113549, 1, 5, 13];
+/// OID for PBKDF2 (RFC 8018 §A.2): 1.2.840.113549.1.5.12
+const OID_PBKDF2: &[u32] = &[1, 2, 840, 113549, 1, 5, 12];
+/// OID for aes256-CBC (NIST AES): 2.16.840.1.101.3.4.1.42
+const OID_AES256_CBC: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 1, 42];
+/// OID for hmacWithSHA256 (RFC 8018 §B.2): 1.2.840.113549.2.9
+const OID_HMAC_WITH_SHA256: &[u32] = &[1, 2, 840, 113549, 2, 9];
+
+/// Build a DER-encoded RFC 8018 PBES2 `EncryptedPrivateKeyInfo` (RFC 5958 §3):
+///
+/// ```text
+/// EncryptedPrivateKeyInfo ::= SEQUENCE {
+///   encryptionAlgorithm AlgorithmIdentifier,  -- id-PBES2 + PBES2-params
+///   encryptedData        OCTET STRING }
+///
+/// PBES2-params ::= SEQUENCE {
+///   keyDerivationFunc AlgorithmIdentifier,    -- id-PBKDF2 + PBKDF2-params
+///   encryptionScheme  AlgorithmIdentifier }   -- id-aes256-CBC + IV
+///
+/// PBKDF2-params ::= SEQUENCE {
+///   salt            OCTET STRING,
+///   iterationCount  INTEGER,
+///   prf             AlgorithmIdentifier }     -- id-hmacWithSHA256
+/// ```
+///
+/// All parameters (salt, iteration count, IV) are serialized so any
+/// standards-compliant consumer (`openssl pkcs8`, PuTTYgen, ...) can decrypt
+/// the ciphertext given only the passphrase.
+pub fn encrypt_private_key_info_pbes2_der(
+    salt: &[u8],
+    iterations: u32,
+    iv: &[u8],
+    ciphertext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    if iv.len() != 16 {
+        anyhow::bail!("AES-256-CBC IV must be 16 bytes, got {}", iv.len());
+    }
+
+    // prf AlgorithmIdentifier (no parameters, per RFC 8018 examples)
+    let prf_alg_id = der_sequence(&der_oid(OID_HMAC_WITH_SHA256));
+
+    // PBKDF2-params ::= SEQUENCE { salt OCTET STRING, iterationCount INTEGER,
+    //                               prf AlgorithmIdentifier }
+    let mut pbkdf2_params = Vec::new();
+    pbkdf2_params.extend(der_octet_string(salt));
+    pbkdf2_params.extend(der_integer_u64(iterations as u64));
+    pbkdf2_params.extend(&prf_alg_id);
+    let pbkdf2_params = der_sequence(&pbkdf2_params);
+
+    // keyDerivationFunc AlgorithmIdentifier
+    let mut kdf_alg_id = Vec::new();
+    kdf_alg_id.extend(der_oid(OID_PBKDF2));
+    kdf_alg_id.extend(&pbkdf2_params);
+    let kdf_alg_id = der_sequence(&kdf_alg_id);
+
+    // encryptionScheme AlgorithmIdentifier: id-aes256-CBC + IV OCTET STRING
+    let mut enc_scheme = Vec::new();
+    enc_scheme.extend(der_oid(OID_AES256_CBC));
+    enc_scheme.extend(der_octet_string(iv));
+    let enc_scheme = der_sequence(&enc_scheme);
+
+    // PBES2-params
+    let mut pbes2_params = Vec::new();
+    pbes2_params.extend(&kdf_alg_id);
+    pbes2_params.extend(&enc_scheme);
+    let pbes2_params = der_sequence(&pbes2_params);
+
+    // encryptionAlgorithm AlgorithmIdentifier: id-PBES2 + PBES2-params
+    let mut alg_id = Vec::new();
+    alg_id.extend(der_oid(OID_PBES2));
+    alg_id.extend(&pbes2_params);
+    let alg_id = der_sequence(&alg_id);
+
+    // EncryptedPrivateKeyInfo
+    let mut epki = Vec::new();
+    epki.extend(&alg_id);
+    epki.extend(der_octet_string(ciphertext));
+    Ok(der_sequence(&epki))
+}
+
 // ─── Minimal DER primitives (sequence/octet-string/bit-string/integer/oid) ─
 // Only what's needed above; all lengths here are small so short-form
 // length encoding is used, with a long-form fallback for correctness.
@@ -250,6 +333,24 @@ fn der_bit_string(content: &[u8]) -> Vec<u8> {
 
 fn der_integer_u8(v: u8) -> Vec<u8> {
     der_tlv(0x02, &[v])
+}
+
+/// DER INTEGER from a non-negative u64 (minimal big-endian, with a leading
+/// zero byte when the high bit of the top byte would make it look negative).
+fn der_integer_u64(v: u64) -> Vec<u8> {
+    if v == 0 {
+        return der_tlv(0x02, &[0]);
+    }
+    let be = v.to_be_bytes();
+    let first_nonzero = be.iter().position(|&b| b != 0).unwrap();
+    let trimmed = &be[first_nonzero..];
+    if trimmed[0] & 0x80 != 0 {
+        let mut content = vec![0u8];
+        content.extend_from_slice(trimmed);
+        der_tlv(0x02, &content)
+    } else {
+        der_tlv(0x02, trimmed)
+    }
 }
 
 fn der_oid(arcs: &[u32]) -> Vec<u8> {
