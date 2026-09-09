@@ -7,7 +7,6 @@
 //! Lives under examples/, not src/bin/ — see the comment in dev-sshd.rs.
 
 use russh::client::{self, Handle};
-use russh::keys::PrivateKey;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 

@@ -12,7 +12,6 @@
 //! Shell channels echo (with a prompt); the "sftp" subsystem serves a real
 //! filesystem rooted at %TEMP%/sshspan-dev-root (created with sample files).
 
-use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{
@@ -314,16 +313,17 @@ impl russh_sftp::server::Handler for FsSftp {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        let abs = self.abs(&path);
         if let Some(mode) = attrs.permissions {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                let abs = self.abs(&path);
                 let _ = std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(mode));
             }
             #[cfg(windows)]
             {
-                let _ = mode; // read-only toggle not modeled on Windows fixture
+                // read-only toggle not modeled on the Windows fixture
+                let _ = (mode, &path);
             }
         }
         Ok(Status {
