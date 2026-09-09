@@ -115,3 +115,9 @@ semver = "1"                    # Release version comparison (update check)
 russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }
 log = "0.4"                        # surfaces russh-sftp's internal warn!() (dev tooling)
 env_logger = "0.11"                # used by examples/dev-sshd.rs + examples/sftp-smoke.rs (dev tooling only)
+
+[dev-dependencies]
+# Unit-test support for the Bitwarden HTTP hardening: building synthetic
+# reqwest Response values from http::Response (version already in the
+# dependency tree via reqwest/hyper).
+http = "1"
