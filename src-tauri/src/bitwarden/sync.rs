@@ -263,8 +263,13 @@ pub async fn run_sync(
         .unwrap_or_default();
         let fingerprint = crate::crypto::keys::compute_fingerprint_sha256(&key_data.public_key);
         let fingerprint_md5 = crate::crypto::keys::compute_fingerprint_md5(&key_data.public_key);
-        let sealed =
-            crate::crypto::vault::seal(vault_password, &key_data.private_key).unwrap_or_default();
+        let sealed = match seal_private_key(vault_password, &key_data.private_key) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(serde_json::json!({"cipher_id": cipher.id, "error": e.to_string()}));
+                continue;
+            }
+        };
 
         let key_record = KeyRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -483,9 +488,9 @@ async fn push_local_key(
     db: &Database,
     vault_password: &str,
 ) -> Result<()> {
-    // Decrypt the private key
-    let private_bytes = crate::crypto::vault::unseal(vault_password, &row.private_key_encrypted)
-        .or_else(|_| Ok::<Vec<u8>, anyhow::Error>(row.private_key_encrypted.as_bytes().to_vec()))?;
+    // Decrypt the private key. A failed unseal must abort the push — the
+    // sealed ciphertext is never valid key material.
+    let private_bytes = unseal_private_key(vault_password, &row.private_key_encrypted)?;
 
     // Export as OpenSSH
     let key_type = crate::crypto::keys::KeyType::from_db_tag(&row.key_type)?;
@@ -612,8 +617,7 @@ async fn pull_remote_item(
             crate::crypto::keys::export_public_key(&kd, crate::crypto::keys::KeyFormat::OpenSsh)
                 .unwrap_or_default();
         let fingerprint = crate::crypto::keys::compute_fingerprint_sha256(&kd.public_key);
-        let sealed =
-            crate::crypto::vault::seal(vault_password, &kd.private_key).unwrap_or_default();
+        let sealed = seal_private_key(vault_password, &kd.private_key)?;
 
         let mut updated = row.clone();
         updated.name = name;
@@ -672,6 +676,25 @@ async fn pull_remote_item(
         db.set_key_categories(&updated.id, &resolved)?;
     }
     Ok(())
+}
+
+/// Seal a private key for local storage. Never substitutes a placeholder:
+/// a seal failure propagates so callers skip the item or abort with a
+/// clear error instead of persisting an empty ciphertext.
+fn seal_private_key(vault_password: &str, private_key: &[u8]) -> Result<String> {
+    crate::crypto::vault::seal(vault_password, private_key)
+        .map_err(|e| anyhow::anyhow!("vault seal failed during sync; refusing to store key: {e}"))
+}
+
+/// Unseal a stored private key. Never falls back to the sealed ciphertext:
+/// if the entry cannot be decrypted with the vault password, the error
+/// propagates so the key is neither pushed nor overwritten.
+fn unseal_private_key(vault_password: &str, sealed: &str) -> Result<Vec<u8>> {
+    crate::crypto::vault::unseal(vault_password, sealed).map_err(|e| {
+        anyhow::anyhow!(
+            "vault unseal failed during sync; refusing to use sealed ciphertext as key: {e}"
+        )
+    })
 }
 
 /// Parse an authorized_keys line back into raw SSH wire-format public key bytes.
@@ -938,7 +961,11 @@ async fn pull_remote_server(
     updated.key_id = key_id;
     updated.category_id = category_id.or_else(|| sv.category_id.clone());
     updated.saved_password = match password_plain {
-        Some(p) if !p.is_empty() => crate::crypto::vault::seal(vault_password, p.as_bytes()).ok(),
+        Some(p) if !p.is_empty() => Some(
+            crate::crypto::vault::seal(vault_password, p.as_bytes()).map_err(|e| {
+                anyhow::anyhow!("vault seal failed for saved password; refusing to store it: {e}")
+            })?,
+        ),
         _ => None,
     };
     updated.updated_at = chrono::Utc::now();
@@ -993,9 +1020,13 @@ async fn pull_new_server(
         pem_path: None,
         auth_method: auth_method.unwrap_or_else(|| "publickey".to_string()),
         saved_password: match password_plain {
-            Some(p) if !p.is_empty() => {
-                crate::crypto::vault::seal(vault_password, p.as_bytes()).ok()
-            }
+            Some(p) if !p.is_empty() => Some(
+                crate::crypto::vault::seal(vault_password, p.as_bytes()).map_err(|e| {
+                    anyhow::anyhow!(
+                        "vault seal failed for saved password; refusing to store it: {e}"
+                    )
+                })?,
+            ),
             _ => None,
         },
         category_id,
@@ -1009,4 +1040,54 @@ async fn pull_new_server(
     };
     db.insert_server(&record)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_PW: &str = "test-vault-password";
+
+    #[test]
+    fn seal_private_key_round_trips() {
+        let key = b"raw-ed25519-private-bytes";
+        let sealed =
+            seal_private_key(TEST_PW, key).expect("seal must succeed with a valid password");
+        assert!(!sealed.is_empty(), "sealed output must never be empty");
+        let unsealed = unseal_private_key(TEST_PW, &sealed).expect("unseal must succeed");
+        assert_eq!(unsealed, key);
+    }
+
+    // NOTE: seal_private_key has no unit-testable failure path here — the
+    // underlying crypto::vault::seal is deterministic-success for any
+    // password (Argon2 accepts even empty passwords), and adding a failure
+    // injection point would mean changing the crypto, which is out of scope.
+    // Its contract — error propagation instead of an empty-ciphertext
+    // substitute — is enforced by the type system (Result return, no
+    // unwrap_or_default at call sites) and verified by inspection.
+
+    #[test]
+    fn unseal_private_key_never_returns_ciphertext() {
+        // Wrong password: unseal must fail rather than hand back anything
+        // derived from the sealed blob.
+        let sealed = seal_private_key(TEST_PW, b"private-key-bytes").unwrap();
+        let result = unseal_private_key("wrong-password", &sealed);
+        let err = result.expect_err("unseal with a wrong password must fail");
+        assert!(
+            err.to_string()
+                .contains("refusing to use sealed ciphertext"),
+            "error must identify the refused fallback, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unseal_private_key_rejects_corrupted_entry() {
+        let result = unseal_private_key(TEST_PW, "not-json-at-all");
+        let err = result.expect_err("unseal of a corrupted entry must fail");
+        assert!(
+            err.to_string()
+                .contains("refusing to use sealed ciphertext"),
+            "error must identify the refused fallback, got: {err}"
+        );
+    }
 }
