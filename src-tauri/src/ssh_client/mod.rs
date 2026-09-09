@@ -157,12 +157,33 @@ impl client::Handler for TerminalHandler {
         match self.db.get_known_host(&self.host) {
             Ok(Some(known)) => {
                 // Known host: accept only if the presented key matches what we stored.
-                Ok(known.host_key == presented_b64)
+                let accepted = known.host_key == presented_b64;
+                if !accepted {
+                    // Mismatch is hard-failed; leave an audit trail so a
+                    // silent MITM attempt is visible after the fact.
+                    let _ = self.db.add_audit(
+                        "known_hosts.mismatch_rejected",
+                        None,
+                        &format!(
+                            "{} (expected {})",
+                            &self.host,
+                            hostkey_fingerprint_display(&known.host_key)
+                        ),
+                    );
+                }
+                Ok(accepted)
             }
             Ok(None) => {
-                // First sight: TOFU-accept and store.
+                // First sight: TOFU-accept and store. The user never gets a
+                // prompt here, so at minimum record what was trusted and
+                // let the connect path surface a notice in the terminal.
                 let fp = fingerprint_of_blob(&presented_b64).unwrap_or_default();
                 let _ = self.db.add_known_host(&self.host, &presented_b64, &fp);
+                let _ = self.db.add_audit(
+                    "known_hosts.trust_on_first_use",
+                    None,
+                    &format!("{} (SHA256:{})", &self.host, fp),
+                );
                 Ok(true)
             }
             Err(_) => Ok(false),
@@ -185,6 +206,25 @@ pub fn hostkey_fingerprint_display(blob_b64: &str) -> String {
     fingerprint_of_blob(blob_b64)
         .map(|f| format!("SHA256:{f}"))
         .unwrap_or_else(|| "?".into())
+}
+
+/// Decide whether a first-trust notice should be shown for a connection:
+/// the host had no known_hosts entry before connecting, so TOFU stored a new
+/// key during the handshake. `pre_connect_known_host` is the lookup made
+/// BEFORE `client::connect` (the race between the two is benign — the notice
+/// is informational, and the authoritative record is the
+/// `known_hosts.trust_on_first_use` audit entry).
+pub fn first_trust_notice(
+    pre_connect_known_host: Option<&crate::db::KnownHost>,
+    host: &str,
+    fingerprint_display: &str,
+) -> Option<String> {
+    if pre_connect_known_host.is_some() {
+        return None;
+    }
+    Some(format!(
+        "\r\n\x1b[1;33mTrusted new host key for {host} ({fingerprint_display}) — manage in Known Hosts.\x1b[0m\r\n"
+    ))
 }
 
 /// Everything needed to open one connection.
@@ -318,6 +358,13 @@ pub async fn start_interactive(
     let target_host = params.server.host.clone();
     let target_port = params.server.port;
 
+    // Pre-check made BEFORE connecting: if the host has no known_hosts entry,
+    // the TOFU handler below will store a new key during the handshake. The
+    // lookup result drives the informational first-trust notice; the small
+    // race with the handler's own lookup is benign (a notice is advisory,
+    // the audit entry is authoritative).
+    let pre_connect_known_host = db.get_known_host(&target_host).ok().flatten();
+
     let config = Arc::new(base_client_config());
     let handler = TerminalHandler {
         host: target_host.clone(),
@@ -414,6 +461,26 @@ pub async fn start_interactive(
     );
     if let Err(e) = on_data.send(banner) {
         eprintln!("[sshspan-terminal] channel send failed right after connect: {e}");
+    }
+
+    // First-time trust: the TOFU handler stored a new host key during this
+    // handshake — tell the user what fingerprint they now trust.
+    if let Some(notice) = db
+        .get_known_host(&target_host)
+        .ok()
+        .flatten()
+        .map(|kh| kh.fingerprint_sha256)
+        .and_then(|fp| {
+            first_trust_notice(
+                pre_connect_known_host.as_ref(),
+                &target_host,
+                &format!("SHA256:{fp}"),
+            )
+        })
+    {
+        if let Err(e) = on_data.send(notice) {
+            eprintln!("[sshspan-terminal] first-trust notice send failed: {e}");
+        }
     }
 
     // The spawned task owns the russh session handle (it is not Clone), so
@@ -531,5 +598,34 @@ pub fn session_resize(
 pub fn session_disconnect(registry: &SessionRegistry, session_id: &str) {
     if let Some(handle) = registry.remove(session_id) {
         drop(handle); // input_tx dropped => task recv() returns None => clean shutdown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known_host() -> crate::db::KnownHost {
+        crate::db::KnownHost {
+            host: "example.com".into(),
+            host_key: "AAAAblob".into(),
+            fingerprint_sha256: "abc123".into(),
+            first_seen: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn first_trust_notice_only_fires_on_first_sight() {
+        // Pre-check found no entry => TOFU stored a new key => notice.
+        let notice = first_trust_notice(None, "example.com", "SHA256:abc123");
+        assert!(notice.is_some());
+        let text = notice.unwrap();
+        assert!(text.contains("example.com"));
+        assert!(text.contains("SHA256:abc123"));
+        assert!(text.contains("Known Hosts"));
+
+        // Host already known before connecting => no notice.
+        let known = known_host();
+        assert!(first_trust_notice(Some(&known), "example.com", "SHA256:abc123").is_none());
     }
 }

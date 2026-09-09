@@ -547,17 +547,32 @@ pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<s
     let _pw = vault_password(&app)?;
     let mut imported = 0;
     for item in &keys {
+        // Imported names become Host aliases in ~/.ssh/config — a name that
+        // can't be a single Host token is sanitized instead of rejecting the
+        // whole import (same mapping the Bitwarden sync uses).
+        let raw_name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("imported")
+            .to_string();
+        let name = if keys::validate_key_name(&raw_name).is_ok() {
+            raw_name
+        } else {
+            let sanitized = keys::sanitize_key_name(&raw_name);
+            let _ = app.state::<AppState>().db.add_audit(
+                "keys.name_sanitized",
+                None,
+                &format!("{raw_name:?} -> {sanitized:?}"),
+            );
+            sanitized
+        };
         let key_record = KeyRecord {
             id: item
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            name: item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("imported")
-                .to_string(),
+            name,
             key_type: item
                 .get("key_type")
                 .and_then(|v| v.as_str())
@@ -750,6 +765,26 @@ pub fn vault_backup_restore(
         app.state::<AppState>()
             .db
             .add_audit("vault.backup_restored", None, &counts.to_string());
+    // A restore can silently swap stored host keys for hosts the user already
+    // trusts; that deserves its own visible audit entry.
+    if counts
+        .get("knownHostsReplaced")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        > 0
+    {
+        let _ = app.state::<AppState>().db.add_audit(
+            "known_hosts.restored_replaced",
+            None,
+            &format!(
+                "{} host key(s) replaced by restore",
+                counts
+                    .get("knownHostsReplaced")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            ),
+        );
+    }
     Ok(
         serde_json::json!({ "ok": true, "counts": counts, "passwordReLinked": reused_backup_password }),
     )
@@ -910,6 +945,9 @@ pub fn key_generate(
     let comment_str = comment.clone().unwrap_or_default();
     let name_str =
         name.unwrap_or_else(|| format!("{}-{}", key_type, &Uuid::new_v4().to_string()[..8]));
+    // Names become Host aliases in ~/.ssh/config — reject anything that could
+    // break out of a single Host token before it ever reaches the vault.
+    keys::validate_key_name(&name_str)?;
 
     let key_data =
         keys::generate_key_pair(kt, bits, comment_str.clone()).map_err(|e| e.to_string())?;
@@ -995,6 +1033,9 @@ pub fn key_import(
     }
 
     let name_str = name.unwrap_or_else(|| format!("imported-{}", &Uuid::new_v4().to_string()[..8]));
+    // Names become Host aliases in ~/.ssh/config — reject anything that could
+    // break out of a single Host token before it ever reaches the vault.
+    keys::validate_key_name(&name_str)?;
     let sealed_private =
         crate::crypto::vault::seal(&pw, &key_data.private_key).map_err(|e| e.to_string())?;
 
@@ -1381,6 +1422,9 @@ pub fn key_create_with_categories(
     let comment_str = comment.clone().unwrap_or_default();
     let name_str =
         name.unwrap_or_else(|| format!("{}-{}", key_type, &Uuid::new_v4().to_string()[..8]));
+    // Names become Host aliases in ~/.ssh/config — reject anything that could
+    // break out of a single Host token before it ever reaches the vault.
+    keys::validate_key_name(&name_str)?;
 
     let key_data =
         keys::generate_key_pair(kt, bits, comment_str.clone()).map_err(|e| e.to_string())?;

@@ -1288,6 +1288,21 @@ impl Database {
                         continue;
                     };
                     let s = |f: &str| k.get(f).and_then(|v| v.as_str());
+                    // Names become Host aliases in ~/.ssh/config — restore
+                    // payloads (possibly from older vaults or other sources)
+                    // are sanitized rather than rejecting the whole restore.
+                    let raw_name = s("name").unwrap_or("imported");
+                    let name = if crate::crypto::keys::validate_key_name(raw_name).is_ok() {
+                        raw_name.to_string()
+                    } else {
+                        let sanitized = crate::crypto::keys::sanitize_key_name(raw_name);
+                        let _ = self.add_audit(
+                            "keys.name_sanitized",
+                            None,
+                            &format!("{raw_name:?} -> {sanitized:?}"),
+                        );
+                        sanitized
+                    };
                     sqlx::query(
                         "INSERT INTO keys (id, name, key_type, public_key, private_key_encrypted, \
                            fingerprint_sha256, fingerprint_md5, comment, created_at, updated_at, \
@@ -1303,7 +1318,7 @@ impl Database {
                            bitwarden_updated_at=excluded.bitwarden_updated_at",
                     )
                     .bind(id)
-                    .bind(s("name").unwrap_or("imported"))
+                    .bind(name)
                     .bind(s("key_type").unwrap_or("rsa"))
                     .bind(s("public_key").unwrap_or(""))
                     .bind(s("private_key_encrypted").unwrap_or(""))
@@ -1398,6 +1413,7 @@ impl Database {
                 }
             }
 
+            let mut hosts_replaced = 0u32;
             if let Some(arr) = data.get("known_hosts").and_then(|v| v.as_array()) {
                 for h in arr {
                     let Some(host) = h
@@ -1413,6 +1429,18 @@ impl Database {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let seen = h.get("first_seen").and_then(|v| v.as_str()).unwrap_or("");
+                    // Count replacements before upserting: a host that
+                    // already exists with a DIFFERENT key is about to be
+                    // silently overwritten — the caller surfaces this.
+                    let existing_key = sqlx::query_scalar::<_, String>(
+                        "SELECT host_key FROM known_hosts WHERE host = ?",
+                    )
+                    .bind(host)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if existing_key.is_some_and(|k| k != host_key) {
+                        hosts_replaced += 1;
+                    }
                     sqlx::query(
                         "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
                          VALUES (?, ?, ?, ?) \
@@ -1443,7 +1471,8 @@ impl Database {
             tx.commit().await?;
             Ok(serde_json::json!({
                 "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
-                "servers": servers_n, "knownHosts": hosts_n, "settings": settings_n,
+                "servers": servers_n, "knownHosts": hosts_n,
+                "knownHostsReplaced": hosts_replaced, "settings": settings_n,
             }))
         })
     }

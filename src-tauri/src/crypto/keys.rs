@@ -219,6 +219,115 @@ pub fn compute_fingerprint_md5(public_key: &[u8]) -> String {
     ssh_fingerprint_md5(public_key)
 }
 
+/// Maximum length of a key name. Names are also deployed as `Host` aliases
+/// in the user's OpenSSH config; a short cap keeps the config readable and
+/// the DB index small.
+pub const MAX_KEY_NAME_LEN: usize = 64;
+
+/// Validate a vault key name.
+///
+/// Constraints (why):
+/// - Deployed keys are aliased as a `Host <pattern>` token in the user's
+///   OpenSSH config, so the name must be a single whitespace-free token —
+///   whitespace would end the pattern and let the next token be re-parsed
+///   as a second pattern (or, with a newline, as a fresh directive line).
+/// - No control characters (`\n`, `\r`, `\t`, NUL, …): they cannot appear in
+///   a config value without enabling line/directive injection.
+/// - Printable characters only, non-empty after trimming, no leading or
+///   trailing whitespace, and at most [`MAX_KEY_NAME_LEN`] chars.
+pub fn validate_key_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("Key name cannot be empty or only whitespace.".into());
+    }
+    if name.chars().count() > MAX_KEY_NAME_LEN {
+        return Err(format!(
+            "Key name must be at most {MAX_KEY_NAME_LEN} characters."
+        ));
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err("Key name cannot contain control characters.".into());
+    }
+    if name.chars().any(|c| c.is_whitespace()) {
+        return Err(
+            "Key name cannot contain whitespace — it is used as a single Host alias in the SSH config."
+                .into(),
+        );
+    }
+    if name.chars().any(|c| !is_printable_char(c)) {
+        return Err("Key name must contain only printable characters.".into());
+    }
+    Ok(())
+}
+
+/// A printable char: not a control, format, surrogate, private-use, or
+/// unassigned code point. Restricting to Graphic (letters, marks, numbers,
+/// punctuation, symbols) + ASCII space (excluded separately by the
+/// whitespace rule above) keeps names renderable in every UI surface.
+fn is_printable_char(c: char) -> bool {
+    if c.is_control() {
+        return false;
+    }
+    let cp = c as u32;
+    // Surrogates can't appear in a Rust char; D800–DFFF listed for clarity.
+    // Unassigned/private-use planes and the Cn/Co/Co-format ranges are
+    // excluded conservatively: anything outside the graphic planes plus a
+    // few well-known printable blocks is rejected.
+    matches!(c, '\u{20}'..='\u{7E}')            // ASCII graphic
+        || matches!(c, '\u{A0}'..='\u{10FFFF}' if !is_non_printable_code_point(cp))
+}
+
+/// Code-point ranges that hold no graphic characters (Cf format chars,
+/// private-use areas, noncharacters). Conservative: anything in these
+/// ranges is treated as non-printable.
+fn is_non_printable_code_point(cp: u32) -> bool {
+    matches!(cp,
+        0xAD                                  // SOFT HYPHEN (Cf)
+        | 0x600..=0x605                       // Arabic number signs (Cf)
+        | 0x61C                               // ALM (Cf)
+        | 0x6DD                               // Arabic end of ayah (Cf)
+        | 0x70F                               // Syriac abbreviation mark (Cf)
+        | 0x8E2                               // Arabic wakha (Cf)
+        | 0x180E                              // Mongolian vowel separator (Cf)
+        | 0x200B..=0x200F                     // ZWSP..RLM (Cf) — ZWSP is whitespace-adjacent
+        | 0x202A..=0x202E                     // bidi controls (Cf)
+        | 0x2060..=0x2064                     // word joiner etc. (Cf)
+        | 0x2066..=0x206F                     // bidi isolates (Cf)
+        | 0xFEFF                              // BOM (Cf)
+        | 0xFFF9..=0xFFFB                     // interlinear annotation (Cf)
+        | 0xE000..=0xF8FF                     // private use area
+        | 0xF0000..=0xFFFFD                   // supplementary PUA-A
+        | 0x100000..=0x10FFFD                 // supplementary PUA-B
+        | 0xFDD0..=0xFDEF                     // noncharacters
+    ) || (cp & 0xFFFE) == 0xFFFE              // noncharacter endings
+}
+
+/// Sanitize an arbitrary name into one that passes [`validate_key_name`]:
+/// each invalid character (whitespace, control, non-printable) is replaced
+/// with `-`. If the result is empty or overlong, falls back to a truncated /
+/// placeholder form so the mapping is total (used by import paths that must
+/// not reject the whole item, and at deploy time for legacy stored names).
+pub fn sanitize_key_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || c.is_whitespace() || !is_printable_char(c) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let chars: Vec<char> = out.chars().collect();
+    if chars.len() > MAX_KEY_NAME_LEN {
+        out = chars[..MAX_KEY_NAME_LEN].iter().collect();
+    }
+    if out.trim_matches('-').is_empty() {
+        // Everything mapped to '-' (empty or all-invalid input).
+        out = "key".to_string();
+    }
+    out
+}
+
 /// Export private key in various formats
 pub fn export_private_key(
     key_data: &PrivateKeyData,
@@ -389,6 +498,85 @@ fn encrypt_pkcs8_with_passphrase(pkcs8_der: &[u8], passphrase: &str) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_key_name_accepts_single_token_names() {
+        assert!(validate_key_name("deploy-key-1").is_ok());
+        assert!(validate_key_name("github.com").is_ok());
+        assert!(validate_key_name("web*prod").is_ok());
+        assert!(validate_key_name(&"a".repeat(MAX_KEY_NAME_LEN)).is_ok());
+    }
+
+    #[test]
+    fn validate_key_name_rejects_config_injection_payloads() {
+        // Each payload would break out of a single `Host <token>` line if it
+        // reached ~/.ssh/config unvalidated.
+        for payload in [
+            "x\nHost *\n ProxyCommand evil",
+            "x\rHost *",
+            "x\n",
+            "x\r",
+            "x\tHost *",
+            "x Host *",       // space ends the pattern
+            " Host",          // leading whitespace
+            "Host ",          // trailing whitespace
+            "",               // empty
+            "   ",            // whitespace-only
+            "x\u{0}y",        // NUL
+            "x\u{7}y",        // bell
+        ] {
+            assert!(
+                validate_key_name(payload).is_err(),
+                "payload {payload:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_key_name_rejects_overlong_names() {
+        let too_long = "a".repeat(MAX_KEY_NAME_LEN + 1);
+        assert!(validate_key_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn sanitize_key_name_maps_invalid_runs_to_dashes() {
+        assert_eq!(sanitize_key_name("my deploy key"), "my-deploy-key");
+        assert_eq!(
+            sanitize_key_name("x\nHost *\n ProxyCommand evil"),
+            "x-Host-*--ProxyCommand-evil"
+        );
+        assert_eq!(sanitize_key_name("x\r\ny"), "x--y");
+    }
+
+    #[test]
+    fn sanitize_key_name_output_always_validates() {
+        for input in [
+            "",
+            " ",
+            "\n",
+            "\n\n\n",
+            "\t\r",
+            "x\nHost *",
+            "  leading",
+            "trailing  ",
+        ] {
+            let out = sanitize_key_name(input);
+            assert!(
+                validate_key_name(&out).is_ok(),
+                "sanitize({input:?}) = {out:?} must pass validation"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_key_name_truncates_to_cap_and_passes_through_valid() {
+        let long = "a b\nc".repeat(40);
+        let out = sanitize_key_name(&long);
+        assert!(out.chars().count() <= MAX_KEY_NAME_LEN);
+        assert!(validate_key_name(&out).is_ok());
+
+        assert_eq!(sanitize_key_name("already-fine"), "already-fine");
+    }
 
     /// Minimal DER TLV reader for the round-trip test: reads the TLV starting
     /// at `pos` and returns (tag, content range, position of the next TLV).

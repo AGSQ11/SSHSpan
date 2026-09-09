@@ -54,9 +54,29 @@ impl SshService {
         let config_service = SshConfigService::new()?;
         let mut config = config_service.read()?;
 
-        let host = host_alias.unwrap_or(key_name);
+        // The alias is used both as the `Host` pattern and as the key for
+        // matching an existing stanza below. Legacy vaults may hold names
+        // that can't be a single Host token (e.g. containing spaces) —
+        // derive a sanitized alias once and use it for both, so a re-deploy
+        // of the same key updates the same stanza instead of creating a new
+        // one each time. New names are already validated at every create
+        // entry point; this is the compatibility path.
+        let host = match host_alias {
+            Some(alias) if crate::crypto::keys::validate_key_name(alias).is_ok() => {
+                alias.to_string()
+            }
+            Some(alias) => crate::crypto::keys::sanitize_key_name(alias),
+            None if crate::crypto::keys::validate_key_name(key_name).is_ok() => {
+                key_name.to_string()
+            }
+            None => crate::crypto::keys::sanitize_key_name(key_name),
+        };
 
-        // Check if host already exists
+        // Check if host already exists. An existing match is a legitimate
+        // update (re-deploy of the same key): the alias can only come from a
+        // validated key name or the sanitize mapping above, both of which
+        // are single Host tokens, so a match cannot hijack an unrelated
+        // stanza the user didn't already associate with this key.
         if let Some(existing) = config.hosts.iter_mut().find(|h| h.host == host) {
             existing.identity_file = Some(private_path.to_string_lossy().to_string());
             existing.identities_only = Some(true);
