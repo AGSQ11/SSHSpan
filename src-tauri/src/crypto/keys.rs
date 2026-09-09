@@ -345,34 +345,282 @@ fn export_rfc4716_public(key_data: &PrivateKeyData) -> anyhow::Result<String> {
     Ok(output)
 }
 
-/// Encrypt PKCS#8 DER private key with a passphrase (PBES2 style, AES-256-CBC)
+/// Encrypt PKCS#8 DER private key with a passphrase as a real RFC 8018
+/// PBES2 `EncryptedPrivateKeyInfo` (RFC 5958 §3), DER-encoded and PEM-wrapped.
+///
+/// Scheme: PBES2 { PBKDF2-HMAC-SHA256 (16-byte random salt, 100_000
+/// iterations) → 32-byte key, AES-256-CBC with a fresh random IV }. Both the
+/// salt and the IV are serialized inside the DER so the output is decryptable
+/// by external tools (`openssl pkcs8`, PuTTYgen) and never uses the legacy
+/// OpenSSL `Proc-Type`/`DEK-Info` PEM encryption headers.
 fn encrypt_pkcs8_with_passphrase(pkcs8_der: &[u8], passphrase: &str) -> anyhow::Result<String> {
     use aes::Aes256;
     use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     use pbkdf2::pbkdf2_hmac_array;
     use sha2::Sha256;
 
+    const PBKDF2_ITERATIONS: u32 = 100_000;
     let salt = generate_random_vec(16);
-    let key: [u8; 32] = pbkdf2_hmac_array::<Sha256, 32>(passphrase.as_bytes(), &salt, 100_000);
-    let iv: [u8; 16] = pbkdf2_hmac_array::<Sha256, 16>(passphrase.as_bytes(), &salt, 100_000);
+    let iv = generate_random_vec(16);
 
+    // Derive only the AES key from the passphrase (never the IV).
+    let key: [u8; 32] =
+        pbkdf2_hmac_array::<Sha256, 32>(passphrase.as_bytes(), &salt, PBKDF2_ITERATIONS);
+
+    // AES-256-CBC encrypt with PKCS#7 padding.
     let mut buf = pkcs8_der.to_vec();
     let pt_len = buf.len();
     buf.resize(pt_len + 16, 0);
-    let ct = cbc::Encryptor::<Aes256>::new(&key.into(), &iv.into())
+    let ct = cbc::Encryptor::<Aes256>::new_from_slices(&key, &iv)
+        .expect("AES-256 key is 32 bytes and IV is 16 bytes")
         .encrypt_padded_mut::<Pkcs7>(&mut buf, pt_len)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let ct = ct.to_vec();
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_vec();
 
-    let mut pem = String::new();
-    pem.push_str("-----BEGIN ENCRYPTED PRIVATE KEY-----\n");
-    pem.push_str("Proc-Type: 4,ENCRYPTED\n");
-    pem.push_str(&format!("DEK-Info: AES-256-CBC,{}\n\n", hex::encode(iv)));
-    let b64 = Base64::encode_string(&ct);
-    for chunk in b64.as_bytes().chunks(64) {
-        pem.push_str(&String::from_utf8_lossy(chunk));
-        pem.push('\n');
+    let der = crate::crypto::pkcs8::encrypt_private_key_info_pbes2_der(
+        &salt,
+        PBKDF2_ITERATIONS,
+        &iv,
+        &ct,
+    )?;
+    pem_wrap("ENCRYPTED PRIVATE KEY", &der)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal DER TLV reader for the round-trip test: reads the TLV starting
+    /// at `pos` and returns (tag, content range, position of the next TLV).
+    /// Supports short- and long-form lengths (the ciphertext OCTET STRING is
+    /// large enough to need long-form).
+    fn read_tlv(buf: &[u8], pos: usize) -> (u8, std::ops::Range<usize>, usize) {
+        assert!(pos + 2 <= buf.len(), "truncated TLV header");
+        let tag = buf[pos];
+        let first = buf[pos + 1];
+        let (header_len, len) = if first & 0x80 == 0 {
+            (2usize, first as usize)
+        } else {
+            let num_bytes = (first & 0x7f) as usize;
+            assert!(num_bytes > 0 && num_bytes <= 8, "unsupported length form");
+            assert!(
+                pos + 2 + num_bytes <= buf.len(),
+                "truncated long-form length"
+            );
+            let len = buf[pos + 2..pos + 2 + num_bytes]
+                .iter()
+                .fold(0usize, |acc, b| (acc << 8) | *b as usize);
+            (2 + num_bytes, len)
+        };
+        let next = pos + header_len + len;
+        assert!(next <= buf.len(), "TLV content overruns buffer");
+        (tag, pos + header_len..next, next)
     }
-    pem.push_str("-----END ENCRYPTED PRIVATE KEY-----\n");
-    Ok(pem)
+
+    /// Test-only counterpart of `encrypt_pkcs8_with_passphrase`: parse a PBES2
+    /// EncryptedPrivateKeyInfo, re-derive the key, and AES-256-CBC decrypt.
+    fn decrypt_pbes2_pem(pem: &str, passphrase: &str) -> anyhow::Result<Vec<u8>> {
+        use aes::Aes256;
+        use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+        use pbkdf2::pbkdf2_hmac_array;
+        use sha2::Sha256;
+
+        let body = pem
+            .strip_prefix("-----BEGIN ENCRYPTED PRIVATE KEY-----\n")
+            .and_then(|b| b.strip_suffix("-----END ENCRYPTED PRIVATE KEY-----\n"))
+            .ok_or_else(|| anyhow::anyhow!("missing PEM header/footer"))?;
+        let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let der = Base64::decode_vec(&body).map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
+
+        // EncryptedPrivateKeyInfo ::= SEQUENCE { algId, encryptedData }
+        let (tag, epki, _) = read_tlv(&der, 0);
+        assert_eq!(tag, 0x30, "outer SEQUENCE");
+        let der = &der[epki];
+        let mut pos = 0;
+
+        // encryptionAlgorithm AlgorithmIdentifier (PBES2)
+        let (tag, alg_content, next) = read_tlv(der, pos);
+        assert_eq!(tag, 0x30, "encryptionAlgorithm SEQUENCE");
+        pos = next;
+        let alg = &der[alg_content];
+
+        // AlgorithmIdentifier ::= SEQUENCE { OID, PBES2-params }
+        let (tag, oid_range, next) = read_tlv(alg, 0);
+        assert_eq!(tag, 0x06, "id-PBES2 OID");
+        assert_eq!(
+            &alg[oid_range],
+            &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x05, 0x0D]
+        );
+        // PBES2-params ::= SEQUENCE { kdf AlgId, encScheme AlgId }
+        let (tag, pbes2_range, _) = read_tlv(alg, next);
+        assert_eq!(tag, 0x30, "PBES2-params SEQUENCE");
+        let pbes2 = &alg[pbes2_range];
+
+        // keyDerivationFunc
+        let (tag, kdf_range, next) = read_tlv(pbes2, 0);
+        assert_eq!(tag, 0x30, "keyDerivationFunc SEQUENCE");
+        let kdf = &pbes2[kdf_range];
+        // encryptionScheme
+        let (tag, enc_range, _) = read_tlv(pbes2, next);
+        assert_eq!(tag, 0x30, "encryptionScheme SEQUENCE");
+        let enc = &pbes2[enc_range];
+
+        // kdf: OID id-PBKDF2 + PBKDF2-params SEQUENCE
+        let (tag, _, next) = read_tlv(kdf, 0);
+        assert_eq!(tag, 0x06, "id-PBKDF2 OID");
+        let (tag, params_range, _) = read_tlv(kdf, next);
+        assert_eq!(tag, 0x30, "PBKDF2-params SEQUENCE");
+        let params = &kdf[params_range];
+        // PBKDF2-params: salt OCTET STRING, iterationCount INTEGER, prf AlgId
+        let (tag, salt_range, next) = read_tlv(params, 0);
+        assert_eq!(tag, 0x04, "salt OCTET STRING");
+        let salt = params[salt_range].to_vec();
+        let (tag, iter_range, next) = read_tlv(params, next);
+        assert_eq!(tag, 0x02, "iterationCount INTEGER");
+        let iterations = params[iter_range]
+            .iter()
+            .fold(0u32, |acc, b| (acc << 8) | *b as u32);
+        let (tag, _, _) = read_tlv(params, next);
+        assert_eq!(tag, 0x30, "prf AlgorithmIdentifier");
+
+        // enc scheme: OID id-aes256-CBC + IV OCTET STRING
+        let (tag, _, next) = read_tlv(enc, 0);
+        assert_eq!(tag, 0x06, "id-aes256-CBC OID");
+        let (tag, iv_range, _) = read_tlv(enc, next);
+        assert_eq!(tag, 0x04, "IV OCTET STRING");
+        let iv = enc[iv_range].to_vec();
+
+        // encryptedData OCTET STRING (last child of the outer sequence)
+        let (tag, ct_range, end) = read_tlv(der, pos);
+        assert_eq!(tag, 0x04, "encryptedData OCTET STRING");
+        assert_eq!(end, der.len(), "trailing garbage after encryptedData");
+        let ciphertext = der[ct_range].to_vec();
+
+        let key: [u8; 32] =
+            pbkdf2_hmac_array::<Sha256, 32>(passphrase.as_bytes(), &salt, iterations);
+        let mut buf = ciphertext;
+        let pt = cbc::Decryptor::<Aes256>::new_from_slices(&key, &iv)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .decrypt_padded_mut::<Pkcs7>(&mut buf)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(pt.to_vec())
+    }
+
+    #[test]
+    fn pbes2_export_round_trip() {
+        let der = vec![0x30, 0x03, 0x02, 0x01, 0x00, 0xAB, 0xCD]; // arbitrary DER-ish blob
+        let pem =
+            encrypt_pkcs8_with_passphrase(&der, "correct horse battery staple").expect("encrypt");
+        let recovered =
+            decrypt_pbes2_pem(&pem, "correct horse battery staple").expect("decrypt round trip");
+        assert_eq!(recovered, der);
+    }
+
+    #[test]
+    fn pbes2_export_wrong_passphrase_fails() {
+        let der = vec![0x30, 0x03, 0x02, 0x01, 0x00, 0xAB, 0xCD];
+        let pem = encrypt_pkcs8_with_passphrase(&der, "right").expect("encrypt");
+        assert!(decrypt_pbes2_pem(&pem, "wrong").is_err());
+    }
+
+    #[test]
+    fn pbes2_export_pem_shape() {
+        let pem = encrypt_pkcs8_with_passphrase(&[0x01, 0x02, 0x03], "pass").expect("encrypt");
+        assert!(pem.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----\n"));
+        assert!(pem.ends_with("-----END ENCRYPTED PRIVATE KEY-----\n"));
+        assert!(!pem.contains("Proc-Type"));
+        assert!(!pem.contains("DEK-Info"));
+    }
+
+    #[test]
+    fn pbes2_export_randomized() {
+        let der = vec![0x42u8; 64];
+        let a = encrypt_pkcs8_with_passphrase(&der, "same pass").expect("encrypt");
+        let b = encrypt_pkcs8_with_passphrase(&der, "same pass").expect("encrypt");
+        assert_ne!(a, b, "random salt+IV must yield different ciphertexts");
+    }
+
+    #[test]
+    fn pbes2_der_reparseable_by_der_crate() {
+        use der::asn1::{ObjectIdentifier, OctetStringRef};
+        use der::{Reader, SliceReader};
+
+        let salt = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let ct = [0xAAu8; 32];
+        let der_bytes =
+            crate::crypto::pkcs8::encrypt_private_key_info_pbes2_der(&salt, 100_000, &iv, &ct)
+                .expect("build der");
+
+        // EncryptedPrivateKeyInfo ::= SEQUENCE { algId, encryptedData }
+        let mut outer = SliceReader::new(&der_bytes).expect("slice reader");
+        let (alg_bytes, data) = outer
+            .sequence(|r| {
+                let alg = r.tlv_bytes().expect("algId TLV").to_vec();
+                let data: OctetStringRef = r.decode().expect("encryptedData");
+                Ok((alg, data))
+            })
+            .expect("parse EncryptedPrivateKeyInfo");
+        assert_eq!(data.as_bytes(), &ct);
+
+        // AlgorithmIdentifier ::= SEQUENCE { OID id-PBES2, PBES2-params }
+        let mut alg = SliceReader::new(&alg_bytes).expect("slice reader");
+        let (pbes2_oid, pbes2_bytes) = alg
+            .sequence(|r| {
+                let oid: ObjectIdentifier = r.decode().expect("OID");
+                let params = r.tlv_bytes().expect("PBES2-params TLV").to_vec();
+                Ok((oid, params))
+            })
+            .expect("parse encryptionAlgorithm");
+        assert_eq!(pbes2_oid.to_string(), "1.2.840.113549.1.5.13");
+
+        // PBES2-params ::= SEQUENCE { keyDerivationFunc, encryptionScheme }
+        let mut pbes2 = SliceReader::new(&pbes2_bytes).expect("slice reader");
+        let (kdf_bytes, enc_bytes) = pbes2
+            .sequence(|r| {
+                let kdf = r.tlv_bytes().expect("kdf TLV").to_vec();
+                let enc = r.tlv_bytes().expect("enc TLV").to_vec();
+                Ok((kdf, enc))
+            })
+            .expect("parse PBES2-params");
+
+        // keyDerivationFunc ::= SEQUENCE { OID id-PBKDF2, PBKDF2-params }
+        let mut kdf = SliceReader::new(&kdf_bytes).expect("slice reader");
+        let (kdf_oid, salt_os, iter_count, prf_oid) = kdf
+            .sequence(|r| {
+                let oid: ObjectIdentifier = r.decode().expect("OID");
+                let (salt, iterations, prf) = r.sequence(|r| {
+                    let salt: OctetStringRef = r.decode().expect("salt");
+                    let iterations: u32 = r.decode().expect("iterationCount");
+                    let prf: ObjectIdentifier = r
+                        .sequence(|r| {
+                            let oid: ObjectIdentifier = r.decode().expect("prf OID");
+                            Ok(oid)
+                        })
+                        .expect("parse prf AlgorithmIdentifier");
+                    Ok((salt, iterations, prf))
+                })?;
+                Ok((oid, salt, iterations, prf))
+            })
+            .expect("parse keyDerivationFunc");
+        assert_eq!(kdf_oid.to_string(), "1.2.840.113549.1.5.12");
+        assert_eq!(salt_os.as_bytes(), &salt);
+        assert_eq!(iter_count, 100_000);
+        assert_eq!(prf_oid.to_string(), "1.2.840.113549.2.9");
+
+        // encryptionScheme ::= SEQUENCE { OID id-aes256-CBC, IV OCTET STRING }
+        let mut enc = SliceReader::new(&enc_bytes).expect("slice reader");
+        let (enc_oid, enc_iv) = enc
+            .sequence(|r| {
+                let oid: ObjectIdentifier = r.decode().expect("OID");
+                let iv: OctetStringRef = r.decode().expect("IV");
+                Ok((oid, iv))
+            })
+            .expect("parse encryptionScheme");
+        assert_eq!(enc_oid.to_string(), "2.16.840.1.101.3.4.1.42");
+        assert_eq!(enc_iv.as_bytes(), &iv);
+
+        // Sanity: the whole outer structure consumed exactly the input.
+        assert!(outer.is_finished(), "trailing bytes after outer SEQUENCE");
+    }
 }
