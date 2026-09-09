@@ -6567,6 +6567,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "hmac 0.12.1",
+ "http",
  "log",
  "md-5 0.7.0",
  "notify",

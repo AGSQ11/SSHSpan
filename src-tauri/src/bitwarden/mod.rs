@@ -22,6 +22,12 @@ use crate::bitwarden::ssrf::resolve_safe_server_url;
 use crate::crypto::bitwarden::{self, KdfParams};
 
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Hard cap on any single response body. A malicious or misbehaving vault
+/// server could otherwise stream an unbounded body into memory and OOM the
+/// app (`resp.json()` / `resp.text()` read everything). 50 MB is orders of
+/// magnitude above what any Bitwarden identity/API endpoint legitimately
+/// returns (a full vault sync is typically well under a few MB).
+const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024;
 const CLIENT_ID: &str = "cli"; // first-party client id
 const DEVICE_TYPE: &str = "14"; // SDK
 
@@ -127,7 +133,17 @@ impl BitwardenClient {
         master_password: &str,
         device_id: &str,
     ) -> Result<Self> {
+        // SSRF hardening: never follow redirects. resolve_safe_server_url()
+        // validates the initial URL (scheme, no userinfo, DNS resolution,
+        // no private/link-local/loopback targets), but reqwest's default
+        // policy silently follows up to 20 redirects — a malicious or
+        // compromised vault server could 302 to http://169.254.169.254/
+        // or http://127.0.0.1/ and the client would follow it, leaking the
+        // Bearer token and request body to an internal target. The official
+        // Bitwarden identity/API endpoints do not redirect in normal
+        // operation, so any 3xx here is treated as an error instead.
         let http = HttpClient::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
             .build()?;
 
@@ -180,12 +196,13 @@ impl BitwardenClient {
             .send()
             .await?;
 
+        reject_redirect(resp.status())?;
         if !resp.status().is_success() {
             anyhow::bail!("Server prelogin failed (HTTP {}).", resp.status());
         }
         // Read the body tolerantly and pick only the fields we need — PBKDF2
         // accounts send kdfMemory/kdfParallelism as explicit null.
-        let data: serde_json::Value = resp.json().await?;
+        let data: serde_json::Value = read_body_capped_json(resp).await?;
         let num = |k: &str| data.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         Ok(KdfParams {
             kdf_type: num("kdf"),
@@ -205,10 +222,12 @@ impl BitwardenClient {
             .send()
             .await?;
 
+        reject_redirect(resp.status())?;
+
         // Read the body tolerantly first — a failed login returns a JSON
         // error page that must not crash decoding. Non-JSON bodies are fine.
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = read_body_capped_text(resp).await.unwrap_or_default();
         let data: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
@@ -246,24 +265,6 @@ impl BitwardenClient {
                     anyhow::anyhow!("Token response did not include an access token.")
                 })?,
         );
-        let token_preview = self
-            .access_token
-            .as_ref()
-            .map(|t| {
-                let parts: Vec<&str> = t.split('.').collect();
-                if parts.len() >= 2 {
-                    format!(
-                        "{}...{} ({} chars total)",
-                        &parts[0][..10.min(parts[0].len())],
-                        &parts[parts.len() - 1][parts[parts.len() - 1].len() - 8..],
-                        t.len()
-                    )
-                } else {
-                    format!("{} chars", t.len())
-                }
-            })
-            .unwrap_or_default();
-        eprintln!("token: {token_preview}");
         self.refresh_token = data
             .get("refresh_token")
             .and_then(|v| v.as_str())
@@ -302,7 +303,11 @@ impl BitwardenClient {
         if now_millis() < self.token_expires_at {
             return Ok(());
         }
-        let refresh = match self.refresh_token.take() {
+        // Don't consume the refresh token until the request succeeds: a
+        // transient network failure must not lock the user out of the vault.
+        // token_request() only overwrites refresh_token on success, so on
+        // failure the old token stays in place and the next sync retries.
+        let refresh = match self.refresh_token.clone() {
             Some(r) => r,
             None => anyhow::bail!("Session expired and no refresh token is available."),
         };
@@ -351,15 +356,13 @@ impl BitwardenClient {
                 self.token_expires_at = 0; // force refresh
                 continue;
             }
+            reject_redirect(resp.status())?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let detail = resp.text().await.unwrap_or_default();
+                let detail = read_body_capped_text(resp).await.unwrap_or_default();
                 anyhow::bail!("Vault request {method} {path} failed (HTTP {status}): {detail}");
             }
-            return resp
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}"));
+            return read_body_capped_json(resp).await;
         }
         anyhow::bail!("Vault request failed after token refresh.");
     }
@@ -556,7 +559,9 @@ impl BitwardenClient {
 
 /// Best-effort anonymous server probe used by "Test connection".
 pub async fn probe_server_version(base_url: &str) -> Option<String> {
+    // Same no-redirect policy as the main client (see BitwardenClient::new).
     let client = HttpClient::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
         .build()
         .ok()?;
@@ -565,10 +570,68 @@ pub async fn probe_server_version(base_url: &str) -> Option<String> {
     if !resp.status().is_success() {
         return None;
     }
-    let data: serde_json::Value = resp.json().await.ok()?;
+    let data: serde_json::Value = read_body_capped_json(resp).await.ok()?;
     data.get("version")
         .and_then(|v| v.as_str())
         .map(String::from)
+}
+
+// ─── Response hardening helpers ─────────────────────────────────────────
+
+/// Reject redirect responses. The client is built with
+/// `redirect::Policy::none()`, so a 3xx lands here instead of being
+/// silently followed (see the SSRF notes in `BitwardenClient::new`).
+/// The Bitwarden identity/API endpoints never redirect in normal operation;
+/// a 3xx means either a misconfigured reverse proxy or something hostile.
+fn reject_redirect(status: reqwest::StatusCode) -> Result<()> {
+    if status.is_redirection() {
+        anyhow::bail!(
+            "Vault server returned a redirect (HTTP {}), which is not allowed. \
+             Check the server URL — the vault server must serve the Bitwarden \
+             API directly without redirects.",
+            status
+        );
+    }
+    Ok(())
+}
+
+/// Read a response body into a byte buffer, enforcing [`MAX_RESPONSE_BYTES`].
+/// The cap is checked against `Content-Length` up front (fast rejection) and
+/// against the accumulated bytes during streaming, so an oversized body stops
+/// the read instead of exhausting memory — even when the server lies about
+/// (or omits) `Content-Length`.
+async fn read_body_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RESPONSE_BYTES {
+            anyhow::bail!(
+                "Vault server response too large ({len} bytes, limit {MAX_RESPONSE_BYTES})."
+            );
+        }
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > MAX_RESPONSE_BYTES {
+            anyhow::bail!(
+                "Vault server response exceeded the {} byte limit.",
+                MAX_RESPONSE_BYTES
+            );
+        }
+    }
+    Ok(body)
+}
+
+/// Read a response body as text with the size cap enforced.
+async fn read_body_capped_text(resp: reqwest::Response) -> Result<String> {
+    let bytes = read_body_capped(resp).await?;
+    String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("Vault server response is not valid UTF-8."))
+}
+
+/// Read and parse a JSON response body with the size cap enforced.
+async fn read_body_capped_json(resp: reqwest::Response) -> Result<serde_json::Value> {
+    let text = read_body_capped_text(resp).await?;
+    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Failed to parse response: {e}"))
 }
 
 fn now_millis() -> u64 {
@@ -576,4 +639,86 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic reqwest Response with the given status, headers and
+    /// body — no network needed. reqwest 0.12 implements
+    /// `From<http::Response<T>> for Response`, so unit tests can exercise
+    /// the hardening helpers directly.
+    fn make_response(status: u16, headers: &[(&str, &str)], body: Vec<u8>) -> reqwest::Response {
+        let mut builder = http::Response::builder().status(status);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(body).unwrap().into()
+    }
+
+    #[tokio::test]
+    async fn redirect_statuses_are_rejected() {
+        for status in [301u16, 302, 303, 307, 308] {
+            let resp = make_response(status, &[], b"moved".to_vec());
+            // Simulate what api_request/prelogin/token_request do before
+            // reading the body.
+            let err = reject_redirect(resp.status()).unwrap_err();
+            assert!(
+                err.to_string().contains("redirect"),
+                "status {status} must be rejected as a redirect"
+            );
+        }
+    }
+
+    #[test]
+    fn non_redirect_statuses_pass_the_guard() {
+        assert!(reject_redirect(reqwest::StatusCode::OK).is_ok());
+        assert!(reject_redirect(reqwest::StatusCode::UNAUTHORIZED).is_ok());
+        assert!(reject_redirect(reqwest::StatusCode::BAD_REQUEST).is_ok());
+    }
+
+    #[tokio::test]
+    async fn body_within_cap_is_read_intact() {
+        let body = b"{\"kdf\":1,\"kdfIterations\":600000}".to_vec();
+        let resp = make_response(200, &[("content-length", "31")], body.clone());
+        let bytes = read_body_capped(resp).await.unwrap();
+        assert_eq!(bytes, body);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected() {
+        // A body one byte over the cap must fail the read. Note that a
+        // synthetic reqwest Response built from a Full body reports an exact
+        // size hint, so this exercises whichever guard fires first: the
+        // content_length() pre-check or the streaming accumulation check.
+        // Either way the read must not buffer the oversized body.
+        let oversized = (MAX_RESPONSE_BYTES + 1) as usize;
+        let resp = make_response(200, &[], vec![b'x'; oversized]);
+        let err = read_body_capped(resp).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large") || msg.contains("exceeded"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_at_cap_is_allowed() {
+        let at_cap = MAX_RESPONSE_BYTES as usize;
+        let resp = make_response(200, &[], vec![0u8; at_cap]);
+        let bytes = read_body_capped(resp).await.unwrap();
+        assert_eq!(bytes.len(), at_cap);
+    }
+
+    #[tokio::test]
+    async fn capped_json_parses_normal_payloads() {
+        let resp = make_response(
+            200,
+            &[("content-type", "application/json")],
+            b"{\"access_token\":\"t\",\"refresh_token\":\"r\",\"expires_in\":3600}".to_vec(),
+        );
+        let data = read_body_capped_json(resp).await.unwrap();
+        assert_eq!(data.get("access_token").unwrap(), "t");
+    }
 }
