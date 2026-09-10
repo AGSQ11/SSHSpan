@@ -367,6 +367,8 @@ async function refreshSftpPanel(tabId, opts = {}) {
     pathBox.onclick = () => { copyText(tab.sftpPath).then(ok => ok && toast('Path copied.', 'ok')); };
     renderEntries(tabId);
     if (tab.dualPane) refreshLocalPane(tabId);
+    if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
+    if (typeof sftpCmpEnsureButtons === 'function') sftpCmpEnsureButtons(tabId);
     updateFsInfo(tabId);
   } catch (e) {
     toast(e.message || String(e), 'err');
@@ -446,6 +448,7 @@ function renderEntries(tabId) {
     });
     tr.addEventListener('dblclick', () => {
       if (entry.isDir) {
+        if (typeof sftpSyncRemoteNav === 'function' && sftpSyncRemoteNav(tabId, entry.name)) return;
         tab.sftpPath = sftpJoin(tab.sftpPath, entry.name);
         refreshSftpPanel(tabId);
       } else {
@@ -505,6 +508,7 @@ function formatSftpSize(bytes) {
 function sftpNavigateUp(tabId) {
   const tab = sftpTab(tabId);
   if (!tab) return;
+  if (typeof sftpSyncRemoteUp === 'function' && sftpSyncRemoteUp(tabId)) return;
   tab.sftpPath = sftpParent(tab.sftpPath);
   refreshSftpPanel(tabId);
 }
@@ -892,6 +896,8 @@ function toggleDualPane(tabId) {
     splitter.hidden = !tab.dualPane;
   }
   if (tab.dualPane) refreshLocalPane(tabId);
+  // ── agent-e: apply persisted comparison mode + recompute when dual opens ──
+  if (typeof sftpCmpApplyPersisted === 'function') sftpCmpApplyPersisted(tabId);
   // Persist the preference globally.
   state.sftpDualPane = tab.dualPane;
   call('settings_set', { key: 'sftpDualPane', value: tab.dualPane ? '1' : '0' }).catch(() => {});
@@ -912,6 +918,7 @@ async function refreshLocalPane(tabId) {
     for (const entry of r.entries || []) {
       const tr = document.createElement('tr');
       tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
+      tr.dataset.name = entry.name;
       tr.dataset.isdir = entry.isDir ? '1' : '0';
       const tdName = document.createElement('td');
       tdName.textContent = (entry.isDir ? '📁 ' : '📄 ') + entry.name;
@@ -922,6 +929,7 @@ async function refreshLocalPane(tabId) {
       tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
       tr.addEventListener('dblclick', () => {
         if (entry.isDir) {
+          if (typeof sftpSyncLocalNav === 'function' && sftpSyncLocalNav(tabId, entry.name)) return;
           const sep = tab.localPath.endsWith('\\') || tab.localPath.endsWith('/') ? '' : '/';
           tab.localPath = tab.localPath + sep + entry.name;
           refreshLocalPane(tabId);
@@ -937,6 +945,9 @@ async function refreshLocalPane(tabId) {
       });
       tbody.appendChild(tr);
     }
+    // ── agent-e: cache local entries + re-run comparison after local refresh ──
+    tab._localEntries = r.entries || [];
+    if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
   } catch (e) {
     toast(e.message || String(e), 'err');
   }
@@ -950,6 +961,7 @@ function joinLocal(dir, name) {
 function localNavigateUp(tabId) {
   const tab = sftpTab(tabId);
   if (!tab || !tab.localPath) return;
+  if (typeof sftpSyncLocalUp === 'function' && sftpSyncLocalUp(tabId)) return;
   const sep = tab.localPath.includes('\\') && !tab.localPath.includes('/') ? '\\' : '/';
   const parts = tab.localPath.split(sep).filter(Boolean);
   parts.pop();
@@ -1259,6 +1271,339 @@ document.addEventListener('drop', (ev) => {
   } catch { /* ignore malformed payloads */ }
 });
 
+// ─── directory comparison (agent-e) ─────────────────────────────────────────
+//
+// FileZilla-parity directory comparison: tint rows in both panes to show which
+// files exist on only one side (yellow) or differ between sides (red), in two
+// modes — by file size or by modification time. Self-contained section; hooks
+// in refreshSftpPanel / refreshLocalPane / renderEntries call sftpCmpAfterRefresh
+// guarded with typeof checks, so merging with parallel work stays clean.
+
+// mtime comparison tolerance in ms — two files whose mtimes differ by less
+// than this are considered identical (clock skew + FAT-style 2s granularity).
+const sftpCmpMtimeToleranceMs = 60 * 1000;
+
+// Per-tab comparison mode: null (off) | 'size' | 'mtime'. Global preference
+// persisted via settings key "sftpCmpMode"; applied per tab on demand.
+const sftpCmpTabs = new Map(); // tabId -> 'size' | 'mtime'
+
+function sftpCmpModeOf(tabId) {
+  return sftpCmpTabs.get(tabId) || null;
+}
+
+function sftpCmpPersistedMode() {
+  const v = state.settings?.sftpCmpMode;
+  return v === 'size' || v === 'mtime' ? v : null;
+}
+
+/// Cycle the active tab's comparison mode: off → size → mtime → off.
+/// Also exposed as window.sftpCmpToggle(tabId) for toolbar wiring.
+async function sftpCmpToggle(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  if (!tab.dualPane) {
+    toast('Directory comparison needs the dual pane open.', 'info');
+    return;
+  }
+  const cur = sftpCmpModeOf(tabId);
+  const next = cur === null ? 'size' : cur === 'size' ? 'mtime' : null;
+  if (next) sftpCmpTabs.set(tabId, next);
+  else sftpCmpTabs.delete(tabId);
+  // Persist the last-used mode ('' when turned off from mtime → default off).
+  call('settings_set', { key: 'sftpCmpMode', value: next || '' }).catch(() => {});
+  sftpLog(tabId, `directory comparison: ${next ? 'by ' + (next === 'size' ? 'file size' : 'modified time') : 'off'}`);
+  sftpCmpUpdateButton(tabId);
+  if (next) sftpCmpRun(tabId);
+  else sftpCmpClear(tabId);
+}
+
+/// Apply the persisted mode to a tab when its dual pane opens (called from
+/// toggleDualPane via the guarded hook below).
+function sftpCmpApplyPersisted(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab || !tab.dualPane) { sftpCmpTabs.delete(tabId); return; }
+  const persisted = sftpCmpPersistedMode();
+  if (persisted) sftpCmpTabs.set(tabId, persisted);
+  else sftpCmpTabs.delete(tabId);
+  sftpCmpUpdateButton(tabId);
+  if (persisted) sftpCmpRun(tabId);
+  else sftpCmpClear(tabId);
+}
+
+/// Hook invoked (guarded, idempotent) after every remote/local refresh.
+/// No-op when the pane is closed or comparison is off for this tab.
+function sftpCmpAfterRefresh(tabId) {
+  sftpCmpEnsureButtons(tabId);
+  const tab = sftpTab(tabId);
+  if (!tab || !tab.dualPane) return;
+  if (!sftpCmpModeOf(tabId)) return;
+  sftpCmpRun(tabId);
+}
+
+/// Compute the comparison between tab._localEntries and tab._entries and
+/// tint rows in both panes. Files only — directories stay neutral.
+function sftpCmpRun(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab || !tab.dualPane) return;
+  const mode = sftpCmpModeOf(tabId);
+  if (!mode) return;
+  const remoteTbody = document.getElementById('sftpTbody-' + tabId);
+  const localTbody = document.getElementById('sftpLocalTbody-' + tabId);
+  if (!remoteTbody || !localTbody) return;
+
+  const remote = (tab._entries || []).filter(e => !e.isDir);
+  const local = (tab._localEntries || []).filter(e => !e.isDir);
+  const remoteByName = new Map(remote.map(e => [e.name, e]));
+  const localByName = new Map(local.map(e => [e.name, e]));
+
+  const cls = { remote: new Map(), local: new Map() }; // name → class
+  let onlyLocal = 0, onlyRemote = 0, differ = 0, same = 0;
+  for (const e of local) {
+    if (!remoteByName.has(e.name)) { cls.local.set(e.name, 'sftp-cmp-only'); onlyLocal++; continue; }
+    const r = remoteByName.get(e.name);
+    let diff;
+    if (mode === 'size') diff = (e.size || 0) !== (r.size || 0);
+    else diff = Math.abs((e.modifiedMs || 0) - (r.modifiedMs || 0)) > sftpCmpMtimeToleranceMs;
+    if (diff) { cls.local.set(e.name, 'sftp-cmp-diff'); cls.remote.set(e.name, 'sftp-cmp-diff'); differ++; }
+    else { cls.local.set(e.name, 'sftp-cmp-same'); cls.remote.set(e.name, 'sftp-cmp-same'); same++; }
+  }
+  for (const e of remote) {
+    if (localByName.has(e.name)) continue;
+    cls.remote.set(e.name, 'sftp-cmp-only'); onlyRemote++;
+  }
+
+  sftpCmpPaint(remoteTbody, cls.remote);
+  sftpCmpPaint(localTbody, cls.local);
+  sftpLog(tabId, `compare (${mode === 'size' ? 'by size' : 'by mtime'}): ${onlyLocal} only-local, ${onlyRemote} only-remote, ${differ} differ, ${same} identical`);
+}
+
+/// Remove all comparison classes from both panes (mode turned off).
+function sftpCmpClear(tabId) {
+  const remoteTbody = document.getElementById('sftpTbody-' + tabId);
+  const localTbody = document.getElementById('sftpLocalTbody-' + tabId);
+  if (remoteTbody) for (const tr of remoteTbody.querySelectorAll('.sftp-cmp-only, .sftp-cmp-diff, .sftp-cmp-same')) {
+    tr.classList.remove('sftp-cmp-only', 'sftp-cmp-diff', 'sftp-cmp-same');
+  }
+  if (localTbody) for (const tr of localTbody.querySelectorAll('.sftp-cmp-only, .sftp-cmp-diff, .sftp-cmp-same')) {
+    tr.classList.remove('sftp-cmp-only', 'sftp-cmp-diff', 'sftp-cmp-same');
+  }
+}
+
+/// Apply a name→class map to one pane's rows (files only; dirs stay neutral).
+function sftpCmpPaint(tbody, map) {
+  for (const tr of tbody.querySelectorAll('.sftp-entry')) {
+    tr.classList.remove('sftp-cmp-only', 'sftp-cmp-diff', 'sftp-cmp-same');
+    if (tr.dataset.isdir === '1') continue;
+    const c = map.get(tr.dataset.name);
+    if (c) tr.classList.add(c);
+  }
+}
+
+/// Toolbar affordance without touching the toolbar block in buildSftpPanel:
+/// append "Compare" / "Sync browse" ghost buttons once, after the panel exists.
+function sftpCmpEnsureButtons(tabId) {
+  const panel = document.getElementById('sftpPanel-' + tabId);
+  if (!panel) return;
+  const toolbar = panel.querySelector('.sftp-toolbar');
+  if (!toolbar) return;
+  if (toolbar.querySelector('.sftp-cmp-btn')) return; // idempotent
+
+  const mkBtn = (cls, icon, title, label, fn) => {
+    const b = document.createElement('button');
+    b.className = 'ghost-btn ' + cls;
+    b.title = title;
+    b.innerHTML = `${ico(icon)}<span>${label}</span>`;
+    b.addEventListener('click', fn);
+    return b;
+  };
+  const cmpBtn = mkBtn('sftp-cmp-btn', 'eye', 'Compare directories (Ctrl+Y): off → by size → by mtime', 'Compare', () => sftpCmpToggle(tabId));
+  const syncBtn = mkBtn('sftp-sync-btn', 'folder-tree', 'Synchronized browsing (Ctrl+Shift+B): mirror navigation in both panes', 'Sync browse', () => sftpSyncToggle(tabId));
+  // Insert before the path input so the buttons stay grouped with the others.
+  const pathBox = toolbar.querySelector('.sftp-path');
+  toolbar.insertBefore(cmpBtn, pathBox);
+  toolbar.insertBefore(syncBtn, pathBox);
+  sftpCmpUpdateButton(tabId);
+  sftpSyncUpdateButton(tabId);
+}
+
+/// Reflect the current comparison mode on the Compare button (label + .active).
+function sftpCmpUpdateButton(tabId) {
+  const btn = document.querySelector(`#sftpPanel-${tabId} .sftp-cmp-btn`);
+  if (!btn) return;
+  const mode = sftpCmpModeOf(tabId);
+  btn.classList.toggle('active', !!mode);
+  const span = btn.querySelector('span');
+  if (span) span.textContent = mode === 'size' ? 'Cmp·size' : mode === 'mtime' ? 'Cmp·mtime' : 'Compare';
+  btn.title = mode
+    ? `Comparing by ${mode === 'size' ? 'file size' : 'modified time'} — click or Ctrl+Y to change`
+    : 'Compare directories (Ctrl+Y): off → by size → by mtime';
+}
+
+// Keyboard shortcut: Ctrl+Y cycles comparison in the active SFTP tab.
+document.addEventListener('keydown', (ev) => {
+  if (!(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'y') return;
+  const tab = sftpTab(state.activeTabId);
+  if (!tab || tab.mode !== 'sftp') return;
+  const panel = document.getElementById('sftpPanel-' + tab.tabId);
+  if (!panel) return;
+  ev.preventDefault();
+  sftpCmpToggle(tab.tabId);
+});
+
+// ─── synchronized browsing (agent-e) ────────────────────────────────────────
+//
+// FileZilla-parity synchronized browsing: when enabled with the dual pane
+// open, navigating into a directory (or up) on one side mirrors the other.
+// The anchor is the local↔remote path pair at the moment sync is enabled —
+// mirroring is structural (same subdir name / one level up), not an absolute
+// path mapping. If the mirrored directory doesn't exist, sync is suspended
+// with a toast until the two sides realign at a shared level.
+
+const sftpSyncTabs = new Set(); // tabIds with synchronized browsing ON
+
+function sftpSyncIsOn(tabId) {
+  return sftpSyncTabs.has(tabId);
+}
+
+async function sftpSyncToggle(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  if (!tab.dualPane) {
+    toast('Synchronized browsing needs the dual pane open.', 'info');
+    return;
+  }
+  if (sftpSyncTabs.has(tabId)) {
+    sftpSyncTabs.delete(tabId);
+    sftpLog(tabId, 'synchronized browsing: off');
+  } else {
+    if (!tab.localPath || !tab.sftpPath) {
+      toast('Both panes must finish loading before enabling sync.', 'info');
+      return;
+    }
+    sftpSyncTabs.add(tabId);
+    sftpLog(tabId, `synchronized browsing: on (anchored at ${tab.localPath} ⇄ ${tab.sftpPath})`);
+  }
+  sftpSyncUpdateButton(tabId);
+}
+
+/// Reflect the sync state on the Sync browse button.
+function sftpSyncUpdateButton(tabId) {
+  const btn = document.querySelector(`#sftpPanel-${tabId} .sftp-sync-btn`);
+  if (!btn) return;
+  btn.classList.toggle('active', sftpSyncTabs.has(tabId));
+  btn.title = sftpSyncTabs.has(tabId)
+    ? 'Synchronized browsing is ON — click or Ctrl+Shift+B to turn off'
+    : 'Synchronized browsing (Ctrl+Shift+B): mirror navigation in both panes';
+}
+
+/// True if sync should mirror this tab right now (pane open, both sides
+/// loaded, sync enabled, not suspended).
+function sftpSyncActive(tabId) {
+  const tab = sftpTab(tabId);
+  return !!(tab && tab.dualPane && sftpSyncTabs.has(tabId) && tab.localPath && tab.sftpPath);
+}
+
+/// Suspend sync for this tab and explain why (missing mirror directory).
+function sftpSyncSuspend(tabId, side, name) {
+  if (!sftpSyncTabs.delete(tabId)) return;
+  toast(`${side} ${name} doesn't exist — sync paused for this level`, 'warn');
+  sftpLog(tabId, `synchronized browsing suspended: ${side} "${name}" has no mirror`);
+  sftpSyncUpdateButton(tabId);
+}
+
+/// Remote dblclick into subdir `name`. Returns true when sync handled the
+/// navigation. The local target is verified first; the remote side always
+/// navigates (it's where the dblclick happened), the local side mirrors only
+/// if sync is still on. tab.localPath is set BEFORE any refresh so the
+/// refreshLocalPane nested in refreshSftpPanel lists the new directory.
+function sftpSyncRemoteNav(tabId, name) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  const targetLocal = joinLocal(tab.localPath, name);
+  const targetRemote = sftpJoin(tab.sftpPath, name);
+  sftpCall('sftp_local_list', { path: targetLocal })
+    .then(() => {
+      const mirror = sftpSyncIsOn(tabId); // may have been toggled off mid-flight
+      tab.sftpPath = targetRemote;        // remote always navigates (origin of the dblclick)
+      if (mirror) tab.localPath = targetLocal;
+      refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+    })
+    .catch(() => {
+      // Local mirror missing: remote still navigates, sync suspends.
+      tab.sftpPath = targetRemote;
+      refreshSftpPanel(tabId);
+      sftpSyncSuspend(tabId, 'local', name);
+    });
+  return true;
+}
+
+/// Local dblclick into subdir `name`. Returns true when sync handled the
+/// navigation. Remote existence is checked against the cached listing of
+/// the current remote directory.
+function sftpSyncLocalNav(tabId, name) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  const remoteHasDir = (tab._entries || []).some(e => e.isDir && e.name === name);
+  tab.localPath = joinLocal(tab.localPath, name);
+  if (!remoteHasDir) {
+    refreshLocalPane(tabId);
+    sftpSyncSuspend(tabId, 'remote', name);
+    return true;
+  }
+  tab.sftpPath = sftpJoin(tab.sftpPath, name);
+  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  return true;
+}
+
+/// Remote "Up" with sync. Returns true when handled. Both paths are updated
+/// before any refresh (avoids an old-listing race between the two panes).
+function sftpSyncRemoteUp(tabId) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  const upRemote = sftpParent(tab.sftpPath);
+  const upLocal = sftpSyncParentLocal(tab.localPath);
+  tab.sftpPath = upRemote;
+  tab.localPath = upLocal;
+  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  return true;
+}
+
+/// Local "Up" with sync. Returns true when handled.
+function sftpSyncLocalUp(tabId) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  if (!tab.localPath) { refreshLocalPane(tabId); return true; } // nothing above local root
+  const upLocal = sftpSyncParentLocal(tab.localPath);
+  const upRemote = sftpParent(tab.sftpPath);
+  tab.localPath = upLocal;
+  tab.sftpPath = upRemote;
+  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  return true;
+}
+
+/// Parent of a local path, mirroring localNavigateUp's separator handling.
+/// Returns '' at/above the local root (home).
+function sftpSyncParentLocal(p) {
+  const sep = p.includes('\\') && !p.includes('/') ? '\\' : '/';
+  const parts = p.split(sep).filter(Boolean);
+  parts.pop();
+  if (!parts.length) return '';
+  let up = parts.join(sep);
+  if (sep === '/') up = '/' + up;
+  return up;
+}
+
+// Keyboard shortcut: Ctrl+Shift+B toggles synchronized browsing.
+document.addEventListener('keydown', (ev) => {
+  if (!(ev.ctrlKey || ev.metaKey) || !ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'b') return;
+  const tab = sftpTab(state.activeTabId);
+  if (!tab || tab.mode !== 'sftp') return;
+  const panel = document.getElementById('sftpPanel-' + tab.tabId);
+  if (!panel) return;
+  ev.preventDefault();
+  sftpSyncToggle(tab.tabId);
+});
+
 // ─── exports ────────────────────────────────────────────────────────────────
 
 window.toggleSshSftpMode = toggleSshSftpMode;
@@ -1266,3 +1611,5 @@ window.refreshSftpPanel = refreshSftpPanel;
 window.showSshForTab = showSshForTab;
 window.showSftpForTab = showSftpForTab;
 window.sftpQueueDownloads = queueDownloads;
+window.sftpCmpToggle = sftpCmpToggle;
+window.sftpSyncToggle = sftpSyncToggle;

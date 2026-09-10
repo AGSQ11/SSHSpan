@@ -1572,3 +1572,32 @@ label:focus-within { color: var(--text); }
   background: var(--accent-weak);
 }
 .sftp-upload-row td { color: var(--warn) !important; font-style: italic; }
+
+/* ─── directory comparison tints (agent-e) ─────────────────────────────
+   FileZilla-style: yellow = only on this side, red = differs between
+   sides, green = identical. Subtle background tint + thin left border,
+   consistent with .sftp-entry.selected. --warn-rgb is not defined in the
+   token block, so warn tints use the literal #f5b544 components. */
+.sftp-entry.sftp-cmp-only {
+  background: rgba(245, 181, 68, 0.10);
+  box-shadow: inset 3px 0 var(--warn);
+}
+.sftp-entry.sftp-cmp-only td:first-child { color: var(--warn); }
+.sftp-entry.sftp-cmp-diff {
+  background: rgba(var(--danger-rgb), 0.10);
+  box-shadow: inset 3px 0 var(--danger);
+}
+.sftp-entry.sftp-cmp-diff td:first-child { color: var(--danger); }
+.sftp-entry.sftp-cmp-same {
+  background: rgba(var(--ok-rgb), 0.07);
+  box-shadow: inset 3px 0 var(--ok);
+}
+.sftp-entry.sftp-cmp-only:hover,
+.sftp-entry.sftp-cmp-diff:hover,
+.sftp-entry.sftp-cmp-same:hover { filter: brightness(1.25); }
+/* Selected rows keep their selection styling visible on top of tints. */
+.sftp-entry.sftp-cmp-only.selected,
+.sftp-entry.sftp-cmp-diff.selected,
+.sftp-entry.sftp-cmp-same.selected {
+  background: var(--accent-weak);
+}
