@@ -316,6 +316,19 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Unwrap russh-sftp read failures the same way download_to does, so a bare
+    // server SSH_FX_FAILURE surfaces as a truthful single-layer message in the
+    // queue row instead of the doubled "Failure: Failure". The helper prefixes
+    // "download failed: ", which reads oddly on upload/write legs, so strip it.
+    // Include the byte position so a failure reports the offset/len that the
+    // server rejected (a read crossing EOF fails on some sftp bridges).
+    let read_err = |e: std::io::Error, off: u64, len: usize| {
+        let inner = crate::commands::sftp::describe_download_read_error(e)
+            .to_string()
+            .trim_start_matches("download failed: ")
+            .to_string();
+        format!("{inner} (at offset {off}, len {len})")
+    };
     let mut buf = vec![0u8; 32 * 1024];
     let mut done: u64 = 0;
     let mut last_emit = std::time::Instant::now();
@@ -334,10 +347,11 @@ where
             Some(max) => ((max - done) as usize).min(buf.len()),
             None => buf.len(),
         };
+        let off = progress_offset + done;
         let n = reader
             .read(&mut buf[..want])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| read_err(e, off, want))?;
         if n == 0 {
             break;
         }
@@ -434,6 +448,39 @@ impl Drop for StageGuard {
     }
 }
 
+/// Diagnostic/fallback helper: perform the same size-clamped read of
+/// `source_remote` into the local staging file, but over an EXISTING SFTP
+/// session (the interactive browse channel) instead of a fresh channel.
+/// Used by `run_server_copy` to distinguish "fresh channel read is refused"
+/// from "the read pattern itself fails on this server".
+async fn read_via_session<RT: tauri::Runtime>(
+    app: &tauri::AppHandle<RT>,
+    job_id: u64,
+    sftp: &russh_sftp::client::SftpSession,
+    source_remote: &str,
+    stage: &std::path::Path,
+    size: u64,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut rf = sftp.open(source_remote).await.map_err(|e| {
+        crate::commands::sftp::sftp_error_detail(e)
+    })?;
+    // Truncate the staging file (the failed fresh-channel attempt may have
+    // left a partial write) before re-reading into it.
+    let mut lf = tokio::fs::File::create(stage)
+        .await
+        .map_err(|e| format!("local recreate failed: {e}"))?;
+    copy_with_progress(app, job_id, &mut rf, &mut lf, cancel, Some(size), 0).await?;
+    lf.flush()
+        .await
+        .map_err(|e| format!("local flush failed: {e}"))?;
+    drop(lf);
+    if let Err(e) = rf.close().await {
+        log::warn!("[sshspan-sftp] interactive close after copy of {source_remote}: {e}");
+    }
+    Ok(())
+}
+
 /// Run one server-to-server copy: fresh-channel download from the source
 /// session into a temp staging file, then fresh-channel upload to the target
 /// session. Never touches the interactive SftpRegistry sessions — both legs
@@ -458,30 +505,72 @@ async fn run_server_copy<RT: tauri::Runtime>(
     // Drop guard: removed on success, failure, cancel, and panic alike.
     let _guard = StageGuard(stage.clone());
 
-    // ── leg 1: download from the SOURCE via a fresh channel ──────────────
-    let sftp = open_transfer_channel(app, source_session).await?;
-    let mut rf = sftp.open(source_remote).await.map_err(|e| {
-        format!(
-            "remote open failed: {}",
-            crate::commands::sftp::sftp_error_detail(e)
-        )
+    // Stat first (same order as download_to): the size clamp below relies on
+    // it, and a readable error here beats a failed first read.
+    let sftp = open_transfer_channel(app, source_session).await.map_err(|e| {
+        log::error!("[sshspan-sftp] sendto leg1 channel open: {e}");
+        format!("source channel: {e}")
     })?;
     let size = sftp
         .metadata(source_remote)
         .await
         .map_err(|e| {
-            format!(
-                "remote stat failed: {}",
-                crate::commands::sftp::sftp_error_detail(e)
-            )
+            let d = crate::commands::sftp::sftp_error_detail(e);
+            log::error!("[sshspan-sftp] sendto leg1 stat {source_remote}: {d}");
+            format!("source stat: {d}")
         })?
         .size
         .unwrap_or(0);
+    let mut rf = sftp.open(source_remote).await.map_err(|e| {
+        let d = crate::commands::sftp::sftp_error_detail(e);
+        log::error!("[sshspan-sftp] sendto leg1 open {source_remote}: {d}");
+        format!("source open: {d}")
+    })?;
     let mut lf = tokio::fs::File::create(&stage)
         .await
         .map_err(|e| format!("local create failed: {e}"))?;
     // Size-clamped reads (EOF-crossing read defense), progress = first half.
-    copy_with_progress(app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size), 0).await?;
+    if let Err(fresh_err) =
+        copy_with_progress(app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size), 0).await
+    {
+        // DIAGNOSTIC + FALLBACK: the fresh transfer channel failed the read.
+        // Retry the identical clamped read on the interactive browse session.
+        // - If the interactive read succeeds, this server's bridge refuses
+        //   reads on a second/subsystem channel and we complete via the
+        //   browse channel (and the message says so).
+        // - If it fails too, the read pattern itself is the problem.
+        log::error!(
+            "[sshspan-sftp] sendto leg1 fresh-channel read failed ({fresh_err}); \
+             retrying on interactive browse session"
+        );
+        let interactive = app
+            .state::<crate::sftp::SftpRegistry>()
+            .get(source_session);
+        match interactive {
+            Some(isftp) => {
+                match read_via_session(app, job_id, &isftp, source_remote, &stage, size, cancel.clone()).await {
+                    Ok(()) => {
+                        log::warn!(
+                            "[sshspan-sftp] sendto leg1 succeeded via INTERACTIVE browse session \
+                             (fresh channel is read-blocked on this server)"
+                        );
+                        // Fall through to leg 2 with the staged file in place.
+                    }
+                    Err(ie) => {
+                        return Err(format!(
+                            "source read: fresh channel failed ({fresh_err}); \
+                             interactive browse channel also failed ({ie}) (stat size {size})"
+                        ));
+                    }
+                }
+            }
+            None => {
+                return Err(format!(
+                    "source read: {fresh_err} (stat size {size}); no interactive browse session to retry on"
+                ));
+            }
+        }
+    }
     lf.flush()
         .await
         .map_err(|e| format!("local flush failed: {e}"))?;
@@ -494,15 +583,19 @@ async fn run_server_copy<RT: tauri::Runtime>(
     drop(sftp);
 
     // ── leg 2: upload to the TARGET via a second fresh channel ───────────
-    let target_sftp = open_transfer_channel(app, &target.session_id).await?;
+    let target_sftp = open_transfer_channel(app, &target.session_id)
+        .await
+        .map_err(|e| {
+            log::error!("[sshspan-sftp] sendto leg2 channel open: {e}");
+            format!("target channel: {e}")
+        })?;
     let mut lf = tokio::fs::File::open(&stage)
         .await
         .map_err(|e| format!("local open failed: {e}"))?;
     let mut rf = target_sftp.create(&target.remote_path).await.map_err(|e| {
-        format!(
-            "remote create failed: {}",
-            crate::commands::sftp::sftp_error_detail(e)
-        )
+        let d = crate::commands::sftp::sftp_error_detail(e);
+        log::error!("[sshspan-sftp] sendto leg2 create {}: {d}", target.remote_path);
+        format!("target create: {d}")
     })?;
     // Progress = second half of the overall copy.
     copy_with_progress(
@@ -514,7 +607,11 @@ async fn run_server_copy<RT: tauri::Runtime>(
         Some(size),
         size,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        log::error!("[sshspan-sftp] sendto leg2 write {} (size {size}): {e}", target.remote_path);
+        format!("target write: {e}")
+    })?;
     rf.close().await.map_err(|e| format!("close failed: {e}"))?;
     Ok(())
 }

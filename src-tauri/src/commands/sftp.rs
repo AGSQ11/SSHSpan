@@ -66,7 +66,7 @@ fn describe_sftp_error(stage: &str, e: russh_sftp::client::error::Error) -> CmdE
 /// (e.g. a bare SSH_FX_FAILURE). Unwrap the wrapper's Display chain so the
 /// message goes through [`sftp_error_detail`] instead of the raw doubled
 /// "Failure: Failure" text.
-fn describe_download_read_error(e: std::io::Error) -> CmdError {
+pub(crate) fn describe_download_read_error(e: std::io::Error) -> CmdError {
     use std::error::Error as _;
     // The client Error enum is private from the protocol module; match on
     // the Display text is fragile, so walk the source chain and try the
