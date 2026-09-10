@@ -519,8 +519,25 @@ pub fn sftp_close(app: AppHandle, session_id: String) -> CmdResult<serde_json::V
 
 use crate::sftp::queue::{
     self as tfq, clear_finished as q_clear, emit_queue, enqueue as q_enqueue, retry_job as q_retry,
-    JobKind, QueuedItem,
+    JobKind, QueuedItem, ResumeMode,
 };
+
+/// Resolve the resume mode for a queue-add call: explicit argument wins,
+/// otherwise the stored default (`setting.sftpResumeDefault`, itself
+/// defaulting to "ask" — the UI layer resolves Ask before enqueue).
+fn resolve_resume_mode(app: &AppHandle, resume: Option<&str>) -> ResumeMode {
+    let raw = match resume.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => app
+            .state::<AppState>()
+            .db
+            .get_config("setting.sftpResumeDefault")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "ask".to_string()),
+    };
+    ResumeMode::from_str_loose(&raw)
+}
 
 /// Expand a local directory into upload jobs (recursive); a file becomes one.
 fn expand_upload(
@@ -528,6 +545,7 @@ fn expand_upload(
     remote: String,
     session_id: String,
     server_name: String,
+    resume: ResumeMode,
     out: &mut Vec<QueuedItem>,
 ) {
     let md = match std::fs::metadata(&local) {
@@ -535,14 +553,16 @@ fn expand_upload(
         Err(_) => return,
     };
     if md.is_file() {
-        out.push(QueuedItem::simple(
-            JobKind::Upload,
-            session_id.clone(),
-            server_name.clone(),
-            local.display().to_string(),
-            remote,
-            md.len(),
-        ));
+        out.push(QueuedItem {
+            kind: JobKind::Upload,
+            session_id: session_id.clone(),
+            server_name: server_name.clone(),
+            local_path: local.display().to_string(),
+            remote_path: remote,
+            size: md.len(),
+            target: None,
+            resume: Some(resume),
+        });
         return;
     }
     let Ok(entries) = std::fs::read_dir(&local) else {
@@ -555,7 +575,7 @@ fn expand_upload(
             remote.trim_end_matches('/'),
             e.file_name().to_string_lossy()
         );
-        expand_upload(child, rname, session_id.clone(), server_name.clone(), out);
+        expand_upload(child, rname, session_id.clone(), server_name.clone(), resume, out);
     }
 }
 
@@ -693,6 +713,7 @@ fn expand_download(
     root: PathBuf,
     session_id: String,
     server_name: String,
+    resume: ResumeMode,
     out: Vec<QueuedItem>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<QueuedItem>, String>> + Send>> {
     Box::pin(async move {
@@ -712,14 +733,16 @@ fn expand_download(
                 );
                 return Ok(out);
             };
-            out.push(QueuedItem::simple(
-                JobKind::Download,
+            out.push(QueuedItem {
+                kind: JobKind::Download,
                 session_id,
                 server_name,
-                local.display().to_string(),
-                remote,
-                md.size.unwrap_or(0),
-            ));
+                local_path: local.display().to_string(),
+                remote_path: remote,
+                size: md.size.unwrap_or(0),
+                target: None,
+                resume: Some(resume),
+            });
             return Ok(out);
         }
         let raw_dir = remote.rsplit('/').next().unwrap_or("dir");
@@ -760,6 +783,7 @@ fn expand_download(
                 root.clone(),
                 session_id.clone(),
                 server_name.clone(),
+                resume,
                 out,
             )
             .await?;
@@ -778,6 +802,7 @@ pub async fn sftp_queue_add(
     direction: String,             // "upload" | "download"
     items: Vec<serde_json::Value>, // [{local, remote}] — remote for downloads may be a dir
     dest_dir: Option<String>,      // local dir for downloads
+    resume: Option<String>,        // "overwrite" | "resume" | "ask" (default: setting.sftpResumeDefault)
 ) -> CmdResult<serde_json::Value> {
     let kind = if direction == "upload" {
         JobKind::Upload
@@ -788,6 +813,9 @@ pub async fn sftp_queue_add(
     if !matches!(kind, JobKind::Upload | JobKind::Download) {
         return Err(CmdError("unsupported direction.".into()));
     }
+    // Ask/Overwrite/Resume — resolved once here, threaded into every
+    // expanded job.
+    let resume = resolve_resume_mode(&app, resume.as_deref());
     let server_name = app
         .state::<StdArc<SessionRegistry>>()
         .list()
@@ -816,6 +844,7 @@ pub async fn sftp_queue_add(
                     remote.to_string(),
                     session_id.clone(),
                     server_name.clone(),
+                    resume,
                     &mut jobs,
                 );
             }
@@ -847,6 +876,7 @@ pub async fn sftp_queue_add(
                     root.clone(),
                     session_id.clone(),
                     server_name.clone(),
+                    resume,
                     jobs,
                 )
                 .await
@@ -941,6 +971,7 @@ pub async fn sftp_server_copy(
             local_path: String::new(), // no user-visible local path; worker stages a temp file
             remote_path: remote,
             size: 0, // stat'd by the worker on a fresh channel
+            resume: None,
             target: Some(tfq::ServerCopyTarget {
                 session_id: target_session_id,
                 server_name: target_server,
