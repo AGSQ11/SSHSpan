@@ -1799,6 +1799,32 @@ async function loadSettings() {
   });
   mkRow('Show hidden files in SFTP by default', sftpHidden);
 
+  // Conflict default actions (the "Always use this action" checkbox in the
+  // transfer conflict dialog writes the same keys). Values are mirrored
+  // into window.sftpConflictDefaults so sftp.js sees them without a reload.
+  const conflictOptions = '<option value="ask">Ask every time</option>' +
+    '<option value="overwrite">Overwrite</option>' +
+    '<option value="skip">Skip</option>' +
+    '<option value="rename">Rename (auto)</option>' +
+    '<option value="resume">Resume</option>';
+  const mkConflictRow = (labelText, key) => {
+    const sel = document.createElement('select');
+    sel.innerHTML = conflictOptions;
+    sel.value = (state.settings && state.settings[key]) ||
+      (window.sftpConflictDefaults && window.sftpConflictDefaults[key]) || 'ask';
+    sel.addEventListener('change', async () => {
+      try {
+        await call('settings_set', { key, value: sel.value });
+        if (state.settings) state.settings[key] = sel.value;
+        if (window.sftpConflictDefaults) window.sftpConflictDefaults[key] = sel.value;
+        toast('Saved.', 'ok');
+      } catch (e) { toast(e.message || String(e), 'err'); }
+    });
+    mkRow(labelText, sel);
+  };
+  mkConflictRow('Upload when the file exists', 'sftpConflictUpload');
+  mkConflictRow('Download when the file exists', 'sftpConflictDownload');
+
   const termScrollback = document.createElement('input');
   termScrollback.type = 'number';
   termScrollback.min = '1000';

@@ -545,6 +545,33 @@
     </div>
   </div>
 
+  <!-- SFTP transfer overwrite-conflict modal (FileZilla "file already exists") -->
+  <div class="modal-backdrop" id="conflictModal" hidden>
+    <div class="modal">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="file-text"></span>
+          <h2 id="conflictTitle">Target file already exists</h2>
+        </div>
+        <button class="icon-btn" id="conflictCloseBtn" title="Close"></button>
+      </header>
+      <div class="modal-body">
+        <p id="conflictSummary" class="hint"></p>
+        <div class="conflict-list" id="conflictList"></div>
+        <label class="toggle-chip">
+          <input type="checkbox" id="conflictAlways" />
+          <span class="toggle-box"></span>
+          <span id="conflictAlwaysLabel">Always use this action for this direction</span>
+        </label>
+      </div>
+      <footer class="modal-footer">
+        <span class="hint" id="conflictHint">Skip removes a file from this batch.</span>
+        <button id="conflictCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="conflictApplyBtn" class="primary-btn">Continue</button>
+      </footer>
+    </div>
+  </div>
+
   <script src="icons.js"></script>
   <script src="app.js"></script>
   <!-- vendor/xterm.js, addon-fit.js, addon-web-links.js and terminal.js are
