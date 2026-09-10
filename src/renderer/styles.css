@@ -1557,6 +1557,37 @@ label:focus-within { color: var(--text); }
 .chmod-grid tbody th { text-align: left; font-size: 13px; color: var(--text); }
 .chmod-grid input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
 
+/* overwrite-conflict dialog (FileZilla "file already exists") */
+.conflict-list {
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: 320px; overflow: auto;
+  margin: 8px 0;
+}
+.conflict-item {
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; background: var(--panel-2);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.conflict-item-head { display: flex; align-items: center; gap: 8px; }
+.conflict-dir { color: var(--accent); font-weight: 600; font-size: 13px; }
+.conflict-name {
+  font-size: 13px; color: var(--text); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.conflict-cmp {
+  display: flex; flex-wrap: wrap; column-gap: 14px; row-gap: 2px;
+  font-size: 11px; color: var(--text-dim);
+  font-family: var(--mono, 'JetBrains Mono', 'Menlo', monospace);
+}
+.conflict-note { color: var(--warn); }
+.conflict-actions { display: flex; flex-wrap: wrap; gap: 6px 12px; padding-top: 2px; }
+.conflict-action {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text); cursor: pointer;
+}
+.conflict-action input[type="radio"] { accent-color: var(--accent); }
+.conflict-action.disabled { color: var(--text-faint); cursor: not-allowed; }
+
 .sftp-drop-hint {
   margin-top: 10px;
   border: 1px dashed var(--line-strong);

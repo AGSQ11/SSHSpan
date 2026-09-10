@@ -411,7 +411,8 @@ function renderEntries(tabId) {
     const tdName = document.createElement('td');
     tdName.textContent = (entry.isDir ? '📁 ' : '📄 ') + entry.name;
     const tdSize = document.createElement('td');
-    tdSize.textContent = entry.isDir ? '—' : formatSftpSize(entry.size);
+    tdSize.textContent = entry.isDir ? '' : formatSftpSize(entry.size);
+    if (entry.isDir) tdSize.title = 'Directory';
     const tdMod = document.createElement('td');
     tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
     tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
@@ -546,7 +547,7 @@ async function updateFsInfo(tabId) {
     if (r && r.supported) {
       const free = formatSftpSize(r.freeBytes || 0);
       const total = formatSftpSize(r.totalBytes || 0);
-      el.textContent = `— ${free} free of ${total}${r.readOnly ? ' (read-only)' : ''}`;
+      el.textContent = `${free} free of ${total}${r.readOnly ? ' (read-only)' : ''}`;
     } else {
       el.textContent = '';
     }
@@ -916,7 +917,8 @@ async function refreshLocalPane(tabId) {
       const tdName = document.createElement('td');
       tdName.textContent = (entry.isDir ? '📁 ' : '📄 ') + entry.name;
       const tdSize = document.createElement('td');
-      tdSize.textContent = entry.isDir ? '—' : formatSftpSize(entry.size);
+      tdSize.textContent = entry.isDir ? '' : formatSftpSize(entry.size);
+      if (entry.isDir) tdSize.title = 'Directory';
       const tdMod = document.createElement('td');
       tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
       tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
@@ -980,10 +982,39 @@ async function queueDownloads(tabId, remotePaths) {
     return;
   }
   try {
+    // Conflict check: does <dir>/<name> already exist locally? Directory
+    // sources are expanded server-side later, so only plain files are
+    // pre-checked (FileZilla does the same for its existence dialog).
+    const localEntries = await sftpLocalEntryMap(dir);
+    const conflicts = [];
+    for (const p of remotePaths) {
+      const name = p.split('/').filter(Boolean).pop();
+      if (!name) continue;
+      const dest = localEntries.get(name);
+      if (dest) conflicts.push({ remote: p, name, destDir: dir, destEntry: dest });
+    }
+    const decided = await resolveBatchConflicts(tabId, 'download', conflicts);
+    if (!decided) return; // user cancelled the whole batch
+    const survivors = [];
+    for (const p of remotePaths) {
+      const d = decided.find(x => x.remote === p);
+      if (d) {
+        if (d.action === 'skip') continue;
+        // `localName` is the renamed destination for Agent B's backend
+        // update; today the backend derives the local name from the remote
+        // basename and ignores it (falls back to overwrite).
+        const item = { remote: d.remote, resume: d.action };
+        if (d.localName) item.localName = d.localName;
+        survivors.push(item);
+      } else {
+        survivors.push({ remote: p, resume: 'overwrite' });
+      }
+    }
+    if (!survivors.length) { sftpLog(tabId, 'download batch empty after conflict decisions'); return; }
     const r = await sftpCall('sftp_queue_add', {
       sessionId: tab.sessionId,
       direction: 'download',
-      items: remotePaths.map(p => ({ remote: p })),
+      items: survivors,
       destDir: dir,
     });
     sftpLog(tabId, `queued ${r.added} download(s) → ${dir}`);
@@ -995,14 +1026,323 @@ async function queueUploads(tabId, pairs) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   try {
+    // Conflict check: stat each remote destination. sftp_list_dir on the
+    // target directory gives existence + size + mtime in one round-trip
+    // for the whole batch (sftp_get_permissions stats one path at a time
+    // and returns no size/mtime for the comparison display).
+    const byDir = new Map();
+    for (const { local, remote } of pairs) {
+      const dir = remote.slice(0, remote.lastIndexOf('/')) || '/';
+      if (!byDir.has(dir)) byDir.set(dir, []);
+      byDir.get(dir).push({ local, remote });
+    }
+    const remoteEntries = new Map(); // dir -> Map(name -> entry)
+    const conflicts = [];
+    for (const [dir, group] of byDir) {
+      try {
+        const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: dir });
+        remoteEntries.set(dir, new Map((r.entries || []).map(e => [e.name, e])));
+      } catch (e) {
+        // Destination dir unreadable/missing — no conflict possible; the
+        // backend will surface the real error if the upload can't proceed.
+        continue;
+      }
+      for (const { local, remote } of group) {
+        const name = remote.split('/').filter(Boolean).pop();
+        const dest = remoteEntries.get(dir).get(name);
+        if (dest) conflicts.push({ local, remote, destDir: dir, destEntry: dest });
+      }
+    }
+    const decided = await resolveBatchConflicts(tabId, 'upload', conflicts);
+    if (!decided) return; // user cancelled the whole batch
+    const items = [];
+    for (const pair of pairs) {
+      const d = decided.find(x => x.remote === pair.remote && x.local === pair.local);
+      if (d) {
+        if (d.action === 'skip') continue;
+        // NOTE: resume:'resume' is honored by the backend once the
+        // resume/.part update lands (Agent B); today the backend treats it
+        // as a plain overwrite — acceptable interim fallback.
+        items.push({ local: pair.local, remote: d.action === 'rename' ? d.renameRemote : pair.remote, resume: d.action });
+      } else {
+        items.push({ local: pair.local, remote: pair.remote, resume: 'overwrite' });
+      }
+    }
+    if (!items.length) { sftpLog(tabId, 'upload batch empty after conflict decisions'); return; }
     const r = await sftpCall('sftp_queue_add', {
       sessionId: tab.sessionId,
       direction: 'upload',
-      items: pairs,
+      items,
     });
     sftpLog(tabId, `queued ${r.added} upload(s)`);
     if (r.added > 0) toast(`${r.added} upload(s) queued.`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+// ─── overwrite-conflict handling (FileZilla "file already exists") ──────────
+
+const CONFLICT_ACTIONS = ['overwrite', 'skip', 'rename', 'resume'];
+
+/// Read a local directory once and index it by file name.
+async function sftpLocalEntryMap(dir) {
+  const r = await sftpCall('sftp_local_list', { path: dir });
+  const map = new Map();
+  for (const e of r.entries || []) map.set(e.name, e);
+  return map;
+}
+
+/// Load the persisted default action for a direction. NOTE: settings_get
+/// only returns whitelisted keys, so a value written by settings_set is
+/// seen via the in-session mirror below; across restarts it reads as 'ask'
+/// until the two keys are added to the backend whitelist (one-line change
+/// owned by the backend agents).
+const sftpConflictDefaults = { sftpConflictUpload: 'ask', sftpConflictDownload: 'ask' };
+
+function sftpConflictDefault(direction) {
+  const key = direction === 'upload' ? 'sftpConflictUpload' : 'sftpConflictDownload';
+  let v = (state.settings && state.settings[key]) || sftpConflictDefaults[key] || 'ask';
+  // Download rename needs the backend `localName` field (remote-basename
+  // derivation can't be redirected today) — asking beats silently
+  // overwriting when the user asked for a rename.
+  if (direction === 'download' && v === 'rename') v = 'ask';
+  return CONFLICT_ACTIONS.includes(v) && v !== 'ask' ? v : 'ask';
+}
+
+/// Split "name.ext" into ["name", ".ext"] (dotless names get no suffix).
+function splitExt(name) {
+  const i = name.lastIndexOf('.');
+  return i > 0 ? [name.slice(0, i), name.slice(i)] : [name, ''];
+}
+
+/// First name of the form "name (n).ext" (n starting at 1) that is NOT
+/// taken in `taken` — the FileZilla auto-rename scheme. The original name
+/// is already taken (that's why we're renaming).
+function sftpFreeName(name, taken) {
+  const [base, ext] = splitExt(name);
+  for (let n = 1; n < 1000; n++) {
+    const candidate = `${base} (${n})${ext}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${base}-${Date.now()}${ext}`;
+}
+
+function sftpConflictMtimeNote(srcMs, dstMs) {
+  if (!srcMs || !dstMs || srcMs === dstMs) return '';
+  const srcNewer = srcMs > dstMs;
+  return srcNewer ? 'Source is newer' : 'Source is older';
+}
+
+function fmtSftpTime(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+}
+
+/// Decide the action for every conflict in a batch. Returns an array of
+/// { ..., action, renameRemote?/localName? } for the conflicted items only,
+/// or null when the user cancels the whole batch. Non-conflicting items are
+/// never blocked — they enqueue as overwrite.
+async function resolveBatchConflicts(tabId, direction, conflicts) {
+  if (!conflicts.length) return [];
+  const tab = sftpTab(tabId);
+  const defaults = sftpConflictDefault(direction);
+  if (defaults !== 'ask') {
+    // Persisted non-ask default: apply silently (FileZilla behavior).
+    const applied = conflicts.map(c => applyConflictAction(c, defaults, direction));
+    sftpLog(tabId, `${conflicts.length} conflict(s) auto-${defaults} (setting)`);
+    return applied;
+  }
+  if (!tab) return conflicts.map(() => ({ action: 'overwrite' }));
+
+  return await new Promise(resolve => {
+    const modal = document.getElementById('conflictModal');
+    if (!modal) { resolve(conflicts.map(c => applyConflictAction(c, 'overwrite', direction))); return; }
+    const title = document.getElementById('conflictTitle');
+    const summary = document.getElementById('conflictSummary');
+    const listEl = document.getElementById('conflictList');
+    const always = document.getElementById('conflictAlways');
+    const alwaysLabel = document.getElementById('conflictAlwaysLabel');
+    const applyBtn = document.getElementById('conflictApplyBtn');
+    const cancelBtn = document.getElementById('conflictCancelBtn');
+    const closeBtn = document.getElementById('conflictCloseBtn');
+    const hint = document.getElementById('conflictHint');
+
+    const isUp = direction === 'upload';
+    title.textContent = conflicts.length === 1
+      ? 'Target file already exists'
+      : `${conflicts.length} target files already exist`;
+    summary.textContent = isUp
+      ? 'The remote file already exists. Choose what to do with each upload:'
+      : 'The local file already exists. Choose what to do with each download:';
+    always.checked = false;
+    alwaysLabel.textContent = `Always use this action for ${isUp ? 'uploads' : 'downloads'}`;
+    hint.textContent = 'Skip removes a file from this batch.';
+
+    // Source side info (for size/mtime comparison). Uploads: stat the local
+    // files via the local pane's dir; downloads: stat remote via list_dir of
+    // the parent (already fetched by the caller when possible — refetch here
+    // to keep this self-contained).
+    listEl.innerHTML = '';
+    const rows = [];
+    let srcEntryPromise;
+    if (isUp) {
+      // Local source stats — group by source dir.
+      srcEntryPromise = (async () => {
+        const dirs = new Map();
+        for (const c of conflicts) {
+          const dir = c.local.slice(0, Math.max(c.local.lastIndexOf('/'), c.local.lastIndexOf('\\')));
+          if (!dirs.has(dir)) dirs.set(dir, null);
+        }
+        for (const dir of dirs.keys()) {
+          try { dirs.set(dir, await sftpLocalEntryMap(dir)); } catch { /* leave null */ }
+        }
+        return dirs;
+      })();
+    }
+
+    const mkRow = (c, idx) => {
+      const srcName = isUp ? c.local.split(/[\\/]/).filter(Boolean).pop() : c.remote.split('/').filter(Boolean).pop();
+      const row = document.createElement('div');
+      row.className = 'conflict-item';
+
+      const head = document.createElement('div');
+      head.className = 'conflict-item-head';
+      head.innerHTML = `<span class="conflict-dir">${isUp ? '↑' : '↓'}</span>
+        <span class="conflict-name">${escapeHtml(srcName || '?')}</span>`;
+      row.appendChild(head);
+
+      const cmp = document.createElement('div');
+      cmp.className = 'conflict-cmp';
+      const srcCell = document.createElement('span');
+      const dstCell = document.createElement('span');
+      srcCell.textContent = '…'; dstCell.textContent = '…';
+      cmp.appendChild(srcCell); cmp.appendChild(dstCell);
+      row.appendChild(cmp);
+      // Fill in source stats asynchronously.
+      if (isUp) {
+        srcEntryPromise.then(dirs => {
+          const dir = c.local.slice(0, Math.max(c.local.lastIndexOf('/'), c.local.lastIndexOf('\\')));
+          const e = (dirs.get(dir) || new Map()).get(srcName);
+          renderConflictCmp(srcCell, dstCell, e, c.destEntry, isUp);
+        }).catch(() => renderConflictCmp(srcCell, dstCell, null, c.destEntry, isUp));
+      } else {
+        (async () => {
+          try {
+            const parent = c.remote.slice(0, c.remote.lastIndexOf('/')) || '/';
+            const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: parent });
+            const e = (r.entries || []).find(x => x.name === srcName);
+            renderConflictCmp(srcCell, dstCell, e, c.destEntry, isUp);
+          } catch { renderConflictCmp(srcCell, dstCell, null, c.destEntry, isUp); }
+        })();
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'conflict-actions';
+      for (const act of CONFLICT_ACTIONS) {
+        const id = `conflict-${idx}-${act}`;
+        const rb = document.createElement('input');
+        rb.type = 'radio';
+        rb.name = `conflict-action-${idx}`;
+        rb.id = id;
+        rb.value = act;
+        rb.checked = act === 'overwrite';
+        if (act === 'resume') {
+          rb.disabled = true;
+          rb.title = 'Resume needs the next backend update';
+        } else if (act === 'rename' && !isUp) {
+          rb.disabled = true;
+          rb.title = 'Download rename needs the next backend update';
+        }
+        const lab = document.createElement('label');
+        lab.className = 'conflict-action' + (rb.disabled ? ' disabled' : '');
+        lab.htmlFor = id;
+        if (rb.title) lab.title = rb.title;
+        const names = { overwrite: 'Overwrite', skip: 'Skip', rename: 'Rename', resume: 'Resume' };
+        lab.appendChild(rb);
+        lab.appendChild(document.createTextNode(names[act]));
+        actions.appendChild(lab);
+      }
+      row.appendChild(actions);
+      listEl.appendChild(row);
+      return { row, c, actions };
+    };
+
+    for (let i = 0; i < conflicts.length; i++) rows.push(mkRow(conflicts[i], i));
+
+    const close = () => {
+      modal.hidden = true;
+      applyBtn.onclick = null; cancelBtn.onclick = null; closeBtn.onclick = null; modal.onclick = null;
+    };
+    const finish = () => {
+      const out = [];
+      for (const { c, actions } of rows) {
+        const sel = actions.querySelector('input[type="radio"]:checked');
+        const act = sel ? sel.value : 'overwrite';
+        out.push(applyConflictAction(c, act, direction));
+      }
+      if (always.checked) {
+        // The "always" action is the first row's choice (all rows start at
+        // the same default and FileZilla applies one action to the rest).
+        const first = out[0] ? out[0].action : 'overwrite';
+        const key = direction === 'upload' ? 'sftpConflictUpload' : 'sftpConflictDownload';
+        call('settings_set', { key, value: first }).then(() => {
+          sftpConflictDefaults[key] = first;
+          if (state.settings) state.settings[key] = first;
+        }).catch(() => {});
+        sftpLog(tabId, `default for ${direction} conflicts: ${first}`);
+      }
+      close();
+      resolve(out);
+    };
+    applyBtn.onclick = finish;
+    cancelBtn.onclick = () => { close(); resolve(null); };
+    closeBtn.onclick = () => { close(); resolve(null); };
+    modal.onclick = (ev) => { if (ev.target === modal) { close(); resolve(null); } };
+
+    modal.hidden = false;
+    applyBtn.focus();
+  });
+}
+
+function renderConflictCmp(srcCell, dstCell, srcEntry, dstEntry, isUp) {
+  const one = (e, side) => {
+    if (!e) return `${side}: unknown`;
+    const bits = [formatSftpSize(e.size || 0), fmtSftpTime(e.modifiedMs)];
+    return `${side}: ${bits[0]} · ${bits[1]}`;
+  };
+  srcCell.textContent = one(srcEntry, 'Source');
+  dstCell.textContent = one(dstEntry, 'Target');
+  const note = sftpConflictMtimeNote(srcEntry && srcEntry.modifiedMs, dstEntry && dstEntry.modifiedMs);
+  if (note) {
+    const n = document.createElement('span');
+    n.className = 'conflict-note';
+    n.textContent = note;
+    srcCell.parentElement.appendChild(n);
+  }
+}
+
+/// Attach the chosen action to a conflict record. Rename computes the free
+/// name against the destination listing (plus names already claimed by this
+/// batch) and reports the adjusted destination:
+///   upload → renameRemote (new remote path, applied today)
+///   download → localName (honored by the backend once Agent B's update
+///              lands; today the remote basename wins = overwrite)
+function applyConflictAction(c, action, direction, extraTaken) {
+  const out = { ...c, action };
+  if (action !== 'rename') return out;
+  const name = direction === 'upload'
+    ? c.remote.split('/').filter(Boolean).pop()
+    : (c.destEntry && c.destEntry.name) || c.remote.split('/').filter(Boolean).pop();
+  const taken = new Set(extraTaken || []);
+  if (c.destEntry && c.destEntry.name) taken.add(c.destEntry.name);
+  const free = sftpFreeName(name, taken);
+  if (direction === 'upload') {
+    const dir = c.remote.slice(0, c.remote.lastIndexOf('/')) || '/';
+    out.renameRemote = sftpJoin(dir, free);
+  } else {
+    out.localName = free;
+  }
+  return out;
 }
 
 async function sftpDownloadTo(tabId, fullPath, name) {
@@ -1266,3 +1606,4 @@ window.refreshSftpPanel = refreshSftpPanel;
 window.showSshForTab = showSshForTab;
 window.showSftpForTab = showSftpForTab;
 window.sftpQueueDownloads = queueDownloads;
+window.sftpConflictDefaults = sftpConflictDefaults;
