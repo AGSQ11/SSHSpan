@@ -297,7 +297,9 @@ async fn open_transfer_channel<R: tauri::Runtime>(
 /// `max_read` clamps each read (downloads pass the remaining file size) so
 /// the final read never crosses EOF — some SFTP servers answer such reads
 /// with SSH_FX_FAILURE instead of a short read, which would fail the whole
-/// transfer on the last chunk.
+/// transfer on the last chunk. When the remote size is unknown, callers pass
+/// `Some(u64::MAX)`: an effectively unclamped stream that still survives the
+/// "unknown size treated as 0 → silent empty file" failure mode.
 /// `progress_offset` is added to the copied count when reporting job
 /// progress, so a multi-leg transfer can show its overall position (0 for
 /// plain uploads/downloads).
@@ -373,6 +375,11 @@ where
         }
     }
     writer.flush().await.map_err(|e| e.to_string())?;
+    // russh-sftp 2.4.0 File: poll_shutdown drains pending write ACKs and
+    // sends the SFTP CLOSE, setting `closed = true`. File::close() calls
+    // shutdown() again, which is a no-op on an already-closed file (the
+    // future state was cleared), so caller-side `rf.close()` after this is
+    // a cheap no-op, not a double CLOSE.
     writer.shutdown().await.map_err(|e| e.to_string())?;
     Ok(done)
 }
@@ -519,8 +526,11 @@ async fn run_server_copy<RT: tauri::Runtime>(
             log::error!("[sshspan-sftp] sendto leg1 stat {source_remote}: {d}");
             format!("source stat: {d}")
         })?
-        .size
-        .unwrap_or(0);
+        .size;
+    // Unknown remote size must never mean "0-byte file": clamp to an
+    // effectively unbounded stream so the copy reads until a real short read
+    // (the EOF signal on well-behaved servers).
+    let size = size.unwrap_or(u64::MAX);
     let mut rf = sftp.open(source_remote).await.map_err(|e| {
         let d = crate::commands::sftp::sftp_error_detail(e);
         log::error!("[sshspan-sftp] sendto leg1 open {source_remote}: {d}");
@@ -530,19 +540,31 @@ async fn run_server_copy<RT: tauri::Runtime>(
         .await
         .map_err(|e| format!("local create failed: {e}"))?;
     // Size-clamped reads (EOF-crossing read defense), progress = first half.
-    if let Err(fresh_err) =
-        copy_with_progress(app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size), 0).await
-    {
+    let fresh_result =
+        copy_with_progress(app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size), 0).await;
+    if let Err(fresh_err) = fresh_result {
         // DIAGNOSTIC + FALLBACK: the fresh transfer channel failed the read.
-        // Retry the identical clamped read on the interactive browse session.
-        // - If the interactive read succeeds, this server's bridge refuses
-        //   reads on a second/subsystem channel and we complete via the
-        //   browse channel (and the message says so).
-        // - If it fails too, the read pattern itself is the problem.
+        // Retry the identical clamped read on the interactive browse session —
+        // but only after releasing every resource from the failed attempt, so
+        // the retry is an independent test of the channel, not a side effect
+        // of a half-open handle or a locked staging file.
         log::error!(
             "[sshspan-sftp] sendto leg1 fresh-channel read failed ({fresh_err}); \
-             retrying on interactive browse session"
+             cleaning up before interactive-channel retry"
         );
+        // 1. Flush + drop the local staging file so the retry can recreate it
+        //    (Windows refuses a second create on a file still open).
+        let _ = lf.flush().await;
+        drop(lf);
+        // 2. Close the failed fresh remote read handle.
+        if let Err(e) = rf.close().await {
+            log::warn!(
+                "[sshspan-sftp] close of failed fresh handle for {source_remote}: {e}"
+            );
+        }
+        // 3. Drop the fresh channel's SFTP session entirely.
+        drop(sftp);
+
         let interactive = app
             .state::<crate::sftp::SftpRegistry>()
             .get(source_session);
@@ -570,17 +592,20 @@ async fn run_server_copy<RT: tauri::Runtime>(
                 ));
             }
         }
+    } else {
+        lf.flush()
+            .await
+            .map_err(|e| format!("local flush failed: {e}"))?;
+        drop(lf);
+        // Tolerant close, same as download_to: a FAILURE reply to CLOSE after a
+        // fully-copied read handle means the data already landed.
+        if let Err(e) = rf.close().await {
+            log::warn!(
+                "[sshspan-sftp] close after copy of {source_remote}: {e}"
+            );
+        }
+        drop(sftp);
     }
-    lf.flush()
-        .await
-        .map_err(|e| format!("local flush failed: {e}"))?;
-    drop(lf);
-    // Tolerant close, same as download_to: a FAILURE reply to CLOSE after a
-    // fully-copied read handle means the data already landed.
-    if let Err(e) = rf.close().await {
-        log::warn!("[sshspan-sftp] close after copy of {source_remote}: {e}");
-    }
-    drop(sftp);
 
     // ── leg 2: upload to the TARGET via a second fresh channel ───────────
     let target_sftp = open_transfer_channel(app, &target.session_id)
@@ -679,8 +704,12 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                                     crate::commands::sftp::sftp_error_detail(e)
                                 )
                             })?
-                            .size
-                            .unwrap_or(0);
+                            .size;
+                        // Unknown remote size must never mean "0-byte file":
+                        // clamp to an effectively unbounded stream so the copy
+                        // reads until a real short read (the EOF signal on
+                        // well-behaved servers).
+                        let size = size.unwrap_or(u64::MAX);
                         let mut lf = tokio::fs::File::create(&local)
                             .await
                             .map_err(|e| format!("local create failed: {e}"))?;
