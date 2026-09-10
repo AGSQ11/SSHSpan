@@ -131,6 +131,7 @@ pub fn run() {
             sftp_mkdir,
             sftp_remove,
             sftp_rename,
+            sftp_set_mtime,
             sftp_download,
             sftp_upload,
             sftp_open_for_edit,

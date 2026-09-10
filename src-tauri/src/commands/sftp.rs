@@ -201,6 +201,32 @@ pub async fn sftp_rename(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Set a remote file's mtime (and atime) via SFTP setstat — the remote half
+/// of "preserve timestamps of transferred files". Exposed so the renderer can
+/// apply timestamps for non-queue flows; the queue applies it automatically
+/// on upload legs when `preserveTs` was passed to `sftp_queue_add`.
+/// Servers that refuse SETSTAT surface the error to the caller.
+#[tauri::command]
+pub async fn sftp_set_mtime(
+    app: AppHandle,
+    session_id: String,
+    path: String,
+    mtime_ms: i64,
+) -> CmdResult<serde_json::Value> {
+    let sftp = sftp_from_session(&app, &session_id)?;
+    if mtime_ms < 0 {
+        return Err(CmdError("mtime must be a Unix timestamp in milliseconds.".into()));
+    }
+    let secs = (mtime_ms / 1000) as u32;
+    let mut attrs = russh_sftp::protocol::FileAttributes::default();
+    attrs.mtime = Some(secs);
+    attrs.atime = Some(secs);
+    sftp.set_metadata(&path, attrs)
+        .await
+        .map_err(|e| CmdError(format!("setstat failed: {e}")))?;
+    Ok(serde_json::json!({ "ok": true, "mtime": secs }))
+}
+
 #[tauri::command]
 pub async fn sftp_download(
     app: AppHandle,
@@ -528,6 +554,7 @@ fn expand_upload(
     remote: String,
     session_id: String,
     server_name: String,
+    preserve_ts: bool,
     out: &mut Vec<QueuedItem>,
 ) {
     let md = match std::fs::metadata(&local) {
@@ -535,14 +562,16 @@ fn expand_upload(
         Err(_) => return,
     };
     if md.is_file() {
-        out.push(QueuedItem::simple(
+        let mut item = QueuedItem::simple(
             JobKind::Upload,
             session_id.clone(),
             server_name.clone(),
             local.display().to_string(),
             remote,
             md.len(),
-        ));
+        );
+        item.preserve_ts = Some(preserve_ts);
+        out.push(item);
         return;
     }
     let Ok(entries) = std::fs::read_dir(&local) else {
@@ -555,7 +584,14 @@ fn expand_upload(
             remote.trim_end_matches('/'),
             e.file_name().to_string_lossy()
         );
-        expand_upload(child, rname, session_id.clone(), server_name.clone(), out);
+        expand_upload(
+            child,
+            rname,
+            session_id.clone(),
+            server_name.clone(),
+            preserve_ts,
+            out,
+        );
     }
 }
 
@@ -778,6 +814,7 @@ pub async fn sftp_queue_add(
     direction: String,             // "upload" | "download"
     items: Vec<serde_json::Value>, // [{local, remote}] — remote for downloads may be a dir
     dest_dir: Option<String>,      // local dir for downloads
+    preserve_ts: Option<bool>,     // preserve source mtime on upload legs
 ) -> CmdResult<serde_json::Value> {
     let kind = if direction == "upload" {
         JobKind::Upload
@@ -788,6 +825,7 @@ pub async fn sftp_queue_add(
     if !matches!(kind, JobKind::Upload | JobKind::Download) {
         return Err(CmdError("unsupported direction.".into()));
     }
+    let preserve_ts = preserve_ts.unwrap_or(false);
     let server_name = app
         .state::<StdArc<SessionRegistry>>()
         .list()
@@ -816,6 +854,7 @@ pub async fn sftp_queue_add(
                     remote.to_string(),
                     session_id.clone(),
                     server_name.clone(),
+                    preserve_ts,
                     &mut jobs,
                 );
             }
@@ -941,6 +980,7 @@ pub async fn sftp_server_copy(
             local_path: String::new(), // no user-visible local path; worker stages a temp file
             remote_path: remote,
             size: 0, // stat'd by the worker on a fresh channel
+            preserve_ts: None, // preserve not threaded through Send to (yet)
             target: Some(tfq::ServerCopyTarget {
                 session_id: target_session_id,
                 server_name: target_server,

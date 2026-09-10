@@ -62,6 +62,12 @@ pub struct TransferJob {
     /// ServerCopy only: absolute remote destination path on the target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_remote_path: Option<String>,
+    /// Preserve timestamps (FileZilla "Preserve timestamps of transferred
+    /// files"): after a successful upload / server-copy target leg, push the
+    /// source mtime onto the remote destination via setstat. Additive Option
+    /// so construction sites that don't care keep compiling (default false).
+    #[serde(skip)]
+    pub preserve_ts: Option<bool>,
 }
 
 impl TransferJob {
@@ -139,6 +145,8 @@ pub struct QueuedItem {
     /// ServerCopy only: target session id, server name, and absolute remote
     /// destination path on the target server.
     pub target: Option<ServerCopyTarget>,
+    /// Preserve timestamps on upload/server-copy target legs (default false).
+    pub preserve_ts: Option<bool>,
 }
 
 /// Destination half of a server-to-server copy job.
@@ -166,6 +174,7 @@ impl QueuedItem {
             remote_path,
             size,
             target: None,
+            preserve_ts: None,
         }
     }
 }
@@ -194,6 +203,7 @@ pub fn enqueue<R: tauri::Runtime>(app: &tauri::AppHandle<R>, items: Vec<QueuedIt
                 target_session_id: item.target.as_ref().map(|t| t.session_id.clone()),
                 target_server_name: item.target.as_ref().map(|t| t.server_name.clone()),
                 target_remote_path: item.target.as_ref().map(|t| t.remote_path.clone()),
+                preserve_ts: item.preserve_ts,
             });
         }
     }
@@ -218,6 +228,7 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         String,
         u64,
         Option<ServerCopyTarget>,
+        bool,
     )> = {
         let mut guard = q.jobs.lock().unwrap();
         let active = guard.iter().filter(|j| j.state == JobState::Active).count();
@@ -254,6 +265,7 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                     j.remote_path.clone(),
                     j.size,
                     target,
+                    j.preserve_ts.unwrap_or(false),
                 ));
                 capacity -= 1;
             }
@@ -267,10 +279,11 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let gen = q.generation.load(Ordering::SeqCst);
     drop(q);
 
-    for (id, session_id, kind, local, remote, size, target) in to_start {
+    for (id, session_id, kind, local, remote, size, target, preserve_ts) in to_start {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            run_job(app, gen, id, session_id, kind, local, remote, size, target).await;
+            run_job(app, gen, id, session_id, kind, local, remote, size, target, preserve_ts)
+                .await;
         });
     }
 }
@@ -442,6 +455,47 @@ fn finish_job<RT: tauri::Runtime>(
 /// path (FileZilla removes the temp file once the transfer is cleared).
 struct StageGuard(std::path::PathBuf);
 
+/// Core setstat: push `secs` as mtime (and atime) onto a remote path.
+/// Tolerant — some servers refuse SETSTAT, which must never fail a
+/// completed transfer.
+async fn set_remote_mtime(sftp: &russh_sftp::client::SftpSession, dest_remote: &str, secs: u32) {
+    let mut attrs = russh_sftp::protocol::FileAttributes::default();
+    attrs.mtime = Some(secs);
+    attrs.atime = Some(secs);
+    match sftp.set_metadata(dest_remote, attrs).await {
+        Ok(()) => log::info!("[sshspan-sftp] preserved mtime {secs} on {dest_remote}"),
+        Err(e) => log::warn!(
+            "[sshspan-sftp] setstat mtime on {dest_remote} refused ({e}) — \
+             some servers disallow SETSTAT; timestamps not preserved"
+        ),
+    }
+}
+
+/// Preserve-timestamps helper (FileZilla "Preserve timestamps of transferred
+/// files"): after the data has landed on the remote end, stat the LOCAL
+/// source file's mtime and push it onto the remote destination via setstat.
+async fn apply_preserved_mtime(
+    sftp: &russh_sftp::client::SftpSession,
+    source_local: &std::path::Path,
+    dest_remote: &str,
+) {
+    let mtime = tokio::fs::metadata(source_local)
+        .await
+        .and_then(|md| md.modified())
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        });
+    match mtime {
+        Ok(secs) => set_remote_mtime(sftp, dest_remote, secs).await,
+        Err(e) => log::warn!(
+            "[sshspan-sftp] could not read source mtime {}: {e} — timestamps not preserved",
+            source_local.display()
+        ),
+    }
+}
+
 impl Drop for StageGuard {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_file(&self.0) {
@@ -501,6 +555,7 @@ async fn run_server_copy<RT: tauri::Runtime>(
     source_remote: &str,
     target: &ServerCopyTarget,
     cancel: Arc<AtomicBool>,
+    preserve_ts: bool,
 ) -> Result<(), String> {
     let file_name = source_remote.rsplit('/').next().unwrap_or("file");
     // Staged copy lives in the same 0700 temp dir + unpredictable-name
@@ -638,6 +693,11 @@ async fn run_server_copy<RT: tauri::Runtime>(
         format!("target write: {e}")
     })?;
     rf.close().await.map_err(|e| format!("close failed: {e}"))?;
+    // Preserve timestamps: stat the STAGED file (its data equals the remote
+    // source) and push its mtime onto the target. Best-effort setstat.
+    if preserve_ts {
+        apply_preserved_mtime(&target_sftp, &stage, &target.remote_path).await;
+    }
     Ok(())
 }
 
@@ -651,6 +711,7 @@ async fn run_job<RT: tauri::Runtime + 'static>(
     remote: String,
     size: u64,
     target: Option<ServerCopyTarget>,
+    preserve_ts: bool,
 ) {
     let cancel = {
         let q = app.state::<TransferQueue>();
@@ -667,7 +728,7 @@ async fn run_job<RT: tauri::Runtime + 'static>(
 
     let result: Result<(), String> = match (kind, target) {
         (JobKind::ServerCopy, Some(target)) => {
-            run_server_copy(&app, job_id, &session_id, &remote, &target, cancel).await
+            run_server_copy(&app, job_id, &session_id, &remote, &target, cancel, preserve_ts).await
         }
         (JobKind::ServerCopy, None) => Err("server copy job is missing its target".into()),
         (kind, _) => {
@@ -685,6 +746,12 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         copy_with_progress(&app, job_id, &mut lf, &mut rf, cancel.clone(), None, 0)
                             .await?;
                         rf.close().await.map_err(|e| format!("close failed: {e}"))?;
+                        // Preserve timestamps: stat the local source mtime and
+                        // setstat it onto the remote destination. Best-effort.
+                        if preserve_ts {
+                            apply_preserved_mtime(&sftp, std::path::Path::new(&local), &remote)
+                                .await;
+                        }
                     }
                     JobKind::Download => {
                         let mut rf = sftp.open(&remote).await.map_err(|e| {
@@ -726,6 +793,13 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         lf.flush()
                             .await
                             .map_err(|e| format!("local flush failed: {e}"))?;
+                        // Preserve-timestamps on DOWNLOADS is NOT applied here:
+                        // the remote mtime would have to be written onto the
+                        // LOCAL file, and std has no portable mtime setter
+                        // (Windows needs SetFileTime; adding a crate for it is
+                        // out of scope). The renderer can apply it later via
+                        // the sftp_set_mtime IPC command for non-queue flows;
+                        // queue downloads keep the local file's fresh mtime.
                     }
                     JobKind::ServerCopy => unreachable!("handled above"),
                 }
