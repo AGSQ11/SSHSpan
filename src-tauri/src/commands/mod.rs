@@ -1733,6 +1733,13 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
         "sftpParallel",
         "sftpShowHidden",
         "sftpDualPane",
+        // FileZilla-parity transfer behavior (renderer mirror only works
+        // in-session unless these load at startup).
+        "sftpConflictUpload",
+        "sftpConflictDownload",
+        "sftpPreserveTs",
+        "sftpCmpMode",
+        "sftpResumeDefault",
         "terminalScrollback",
         "terminalBackspace",
         "terminalHomeEnd",
