@@ -26,19 +26,20 @@ fn key_pem_for_id(
     db: &Database,
     vault_pw: &str,
     key_id: &str,
-) -> Result<String, String> {
+) -> Result<zeroize::Zeroizing<String>, String> {
     let key = db
         .get_key(key_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Key not found: {key_id}"))?;
     let key_data = super::load_private_key_data(app, &key, vault_pw)
         .map_err(|e| format!("Could not load vault key \"{}\": {e}", key.name))?;
-    crate::crypto::keys::export_private_key(
+    let pem = crate::crypto::keys::export_private_key(
         &key_data,
         crate::crypto::keys::KeyFormat::OpenSsh,
         None,
     )
-    .map_err(|e| format!("Could not serialize key \"{}\" for SSH: {e}", key.name))
+    .map_err(|e| format!("Could not serialize key \"{}\" for SSH: {e}", key.name))?;
+    Ok(zeroize::Zeroizing::new(pem))
 }
 
 /// Decrypt a server's saved password (sealed with the same vault master) if one is stored.
@@ -46,14 +47,15 @@ fn saved_pw_for_server(
     _db: &Database,
     vault_pw: &str,
     server: &db::ServerRecord,
-) -> Result<Option<String>, String> {
+) -> Result<Option<zeroize::Zeroizing<String>>, String> {
     match &server.saved_password {
         Some(sealed) => {
             let bytes = crate::crypto::vault::unseal(vault_pw, sealed)
                 .map_err(|_| "Failed to decrypt saved password.".to_string())?;
-            Ok(Some(String::from_utf8(bytes).map_err(|_| {
+            let pw = String::from_utf8(bytes).map_err(|_| {
                 "Saved password is not valid UTF-8.".to_string()
-            })?))
+            })?;
+            Ok(Some(zeroize::Zeroizing::new(pw)))
         }
         None => Ok(None),
     }
@@ -64,6 +66,10 @@ fn saved_pw_for_server(
 /// `override_username` / `override_key_id` come from the renderer's "Use this
 /// key to connect…" right-click flow — when the user picks a key right on a key
 /// row, we want to keep the server's saved username but swap the key.
+///
+/// The `key_pem` and `password` fields are wrapped in `zeroize::Zeroizing`
+/// so secret material is wiped from memory once the connect/auth path is
+/// done with it.
 fn resolve_for_server(
     app: &AppHandle,
     db: &Database,
@@ -82,8 +88,8 @@ fn resolve_for_server(
     let username = override_username.unwrap_or_else(|| server.username.clone());
     let auth_method = server.auth_method.clone();
 
-    let mut key_pem: Option<String> = None;
-    let mut password: Option<String> = None;
+    let mut key_pem: Option<zeroize::Zeroizing<String>> = None;
+    let mut password: Option<zeroize::Zeroizing<String>> = None;
 
     // publickey: prefer the override key (from key context menu), then the server's key_id, then its pem_path.
     if auth_method == "publickey" {
@@ -91,13 +97,15 @@ fn resolve_for_server(
             key_pem = Some(key_pem_for_id(app, db, vault_pw, &kid)?);
         } else if let Some(p) = override_pem_path.or_else(|| server.pem_path.clone()) {
             // Read PEM from disk — leaves the file untouched, treats it as a public key on the SSH server side.
-            key_pem =
-                Some(std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?);
+            key_pem = Some(zeroize::Zeroizing::new(
+                std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?
+            ));
         }
     } else if auth_method == "password" || auth_method == "keyboard-interactive" {
         // Prefer the runtime prompt (always), then the saved password.
         password = prompt_password
             .filter(|p| !p.is_empty())
+            .map(zeroize::Zeroizing::new)
             .or(saved_pw_for_server(db, vault_pw, &server)?.filter(|p| !p.is_empty()));
     }
 
@@ -315,6 +323,7 @@ pub async fn server_test(
         let handler = ssh_client::TerminalHandler {
             host: host_for_handler,
             db: db_for_handler,
+            port: resolved.server.port,
         };
         let mut session = russh::client::connect(
             config,

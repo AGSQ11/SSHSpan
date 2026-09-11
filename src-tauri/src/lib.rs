@@ -172,8 +172,27 @@ pub fn run() {
             update_check,
             update_download_and_run,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        // Best-effort lifecycle teardown: Tauri v2's desktop run loop does NOT
+        // expose OS suspend/lock events (WindowEvent::Suspended/Resumed are
+        // mobile-only).  We therefore reuse the existing `vault_lock` teardown
+        // when the app is about to exit.  This clears the in-memory master
+        // password and stops live sessions, but it cannot cover an OS suspend
+        // that leaves the process alive.  A true OS-suspend handler would need a
+        // platform-specific crate (e.g. `windows` on Win32) and is out of scope
+        // for this fix.
+        .run(|_app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
+                let _ = _app_handle
+                    .state::<crate::commands::VaultPasswordStore>()
+                    .clear();
+                _app_handle
+                    .state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
+                    .kill_all();
+            }
+            _ => {}
+        });
 }
 
 /// Create system tray with menu
