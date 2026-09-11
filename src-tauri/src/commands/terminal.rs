@@ -71,7 +71,6 @@ fn resolve_for_server(
     server_id: &str,
     override_username: Option<String>,
     override_key_id: Option<String>,
-    override_pem_path: Option<String>,
     prompt_password: Option<String>,
 ) -> Result<ResolvedConnection, String> {
     let server = db
@@ -89,10 +88,15 @@ fn resolve_for_server(
     if auth_method == "publickey" {
         if let Some(kid) = override_key_id.or_else(|| server.key_id.clone()) {
             key_pem = Some(key_pem_for_id(app, db, vault_pw, &kid)?);
-        } else if let Some(p) = override_pem_path.or_else(|| server.pem_path.clone()) {
+        } else if let Some(p) = server.pem_path.clone() {
             // Read PEM from disk — leaves the file untouched, treats it as a public key on the SSH server side.
-            key_pem =
-                Some(std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?);
+            // This is a stored setting set by the user via the UI; validate it exists and is a regular file.
+            let path = std::path::Path::new(&p);
+            if !path.is_file() {
+                return Err(format!("PEM path does not exist or is not a file: {p}"));
+            }
+            let _ = db.add_audit("connect.pem_path_used", None, &p);
+            key_pem = Some(std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?);
         }
     } else if auth_method == "password" || auth_method == "keyboard-interactive" {
         // Prefer the runtime prompt (always), then the saved password.
@@ -129,7 +133,6 @@ pub async fn terminal_connect(
     on_data: Channel<String>,
     override_username: Option<String>,
     override_key_id: Option<String>,
-    override_pem_path: Option<String>,
     prompt_password: Option<String>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
@@ -146,7 +149,6 @@ pub async fn terminal_connect(
         &server_id,
         override_username,
         override_key_id,
-        override_pem_path,
         prompt_password,
     )
     .map_err(CmdError)?;
@@ -297,7 +299,6 @@ pub async fn server_test(
         &db,
         &vault_pw,
         &server_id,
-        None,
         None,
         None,
         prompt_password,
