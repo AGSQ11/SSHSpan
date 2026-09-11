@@ -866,7 +866,30 @@ async fn run_server_copy<RT: tauri::Runtime>(
         log::error!("[sshspan-sftp] sendto leg2 write {} (size {size}): {e}", tpart);
         format!("target write: {e}")
     })?;
-    rf.close().await.map_err(|e| format!("close failed: {e}"))?;
+    // Tolerant close: a FAILURE reply to CLOSE after a fully-written .part
+    // (e.g. a server that reports "No such file" for the handle) does not mean
+    // the data is missing — leg-1 read-close and download_to already treat this
+    // as benign. Verify the .part actually landed (size matches what we wrote)
+    // before trusting it for the rename, so we never rename an empty file.
+    if let Err(e) = rf.close().await {
+        let expected = size;
+        match target_sftp.metadata(&tpart).await {
+            Ok(md) if expected == u64::MAX || md.size == Some(expected) => {
+                log::warn!(
+                    "[sshspan-sftp] sendto leg2 close of {tpart} failed ({e}) but size matches; proceeding"
+                );
+            }
+            Ok(md) => {
+                return Err(format!(
+                    "target close failed ({e}) and staged size {:?} != expected {expected}",
+                    md.size
+                ));
+            }
+            Err(se) => {
+                return Err(format!("target close failed ({e}); staged stat also failed: {se}"));
+            }
+        }
+    }
     // Some servers refuse rename-over-an-existing-file; the .part is fully
     // uploaded at this point, so removing the final name first is a safe retry.
     if let Err(e) = target_sftp.rename(&tpart, &target.remote_path).await {
@@ -987,7 +1010,27 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                             offset,
                         )
                         .await?;
-                        rf.close().await.map_err(|e| format!("close failed: {e}"))?;
+                        // Tolerant close (same rationale as ServerCopy leg-2):
+                        // a FAILURE on CLOSE after a fully-written .part does not
+                        // mean the data is missing. Verify size before the rename.
+                        if let Err(e) = rf.close().await {
+                            match sftp.metadata(&rpart).await {
+                                Ok(md) if md.size == Some(lsize) => {
+                                    log::warn!(
+                                        "[sshspan-sftp] upload close of {rpart} failed ({e}) but size matches; proceeding"
+                                    );
+                                }
+                                Ok(md) => {
+                                    return Err(format!(
+                                        "close failed ({e}) and staged size {:?} != expected {lsize}",
+                                        md.size
+                                    ));
+                                }
+                                Err(se) => {
+                                    return Err(format!("close failed ({e}); staged stat also failed: {se}"));
+                                }
+                            }
+                        }
                         // Some servers refuse rename-over-an-existing file;
                         // the .part is complete here, so removing the final
                         // name first is a safe retry.
