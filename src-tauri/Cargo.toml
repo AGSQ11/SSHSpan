@@ -17,9 +17,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 
 # ─── Tauri plugins ──────────────────────────────────────────────────────────
-tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-shell = "2"
 tauri-plugin-process = "2"
 tauri-plugin-os = "2"
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }

@@ -8,6 +8,7 @@ pub mod terminal;
 pub mod updater;
 
 use std::fs;
+use directories::ProjectDirs;
 use tauri::AppHandle;
 use tauri::Manager;
 use uuid::Uuid;
@@ -519,6 +520,31 @@ mod tests {
             "must not treat encrypted column as plaintext"
         );
     }
+
+    /// Relative paths are rejected for backup export.
+    #[test]
+    fn validate_export_path_rejects_relative() {
+        assert!(validate_export_path("relative.txt").is_err());
+    }
+
+    /// Paths pointing back into the app data dir are rejected.
+    #[test]
+    fn validate_export_path_rejects_app_data_dir() {
+        use directories::ProjectDirs;
+        let app_data = ProjectDirs::from("org", "sshspan", "SSHSpan")
+            .expect("project dirs")
+            .data_dir()
+            .to_path_buf();
+        let target = app_data.join("backup.json");
+        assert!(validate_export_path(&target.display().to_string()).is_err());
+    }
+
+    /// An absolute path outside the app data / system dirs is accepted.
+    #[test]
+    fn validate_export_path_accepts_good_path() {
+        let tmp = std::env::temp_dir().join("sshspan-export-test.txt");
+        assert!(validate_export_path(&tmp.display().to_string()).is_ok());
+    }
 }
 
 #[tauri::command]
@@ -815,11 +841,73 @@ pub fn system_pick_save_path(
 /// Write UTF-8 text to an absolute path (used for vault backup export).
 #[tauri::command]
 pub fn system_write_text_file(path: String, contents: String) -> CmdResult<serde_json::Value> {
+    validate_export_path(&path)?;
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = fs::create_dir_all(parent);
     }
     fs::write(&path, contents).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Reject paths that are not absolute or that would write into the app data
+/// directory / system directories. Used by the limited number of commands that
+/// accept a renderer-supplied local filesystem target.
+fn validate_export_path(path: &str) -> CmdResult<()> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err("Path must be absolute.".into());
+    }
+
+    let normalized = p
+        .canonicalize()
+        .unwrap_or_else(|_| p.to_path_buf());
+
+    if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
+        let app_data_dir = app_data.data_dir();
+        if normalized.starts_with(app_data_dir) {
+            return Err("Writing into the application data directory is not allowed.".into());
+        }
+    }
+
+    if is_system_path(&normalized) {
+        return Err("Writing into a system directory is not allowed.".into());
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn is_system_path(p: &std::path::Path) -> bool {
+    if let Some(s) = p.as_os_str().to_str() {
+        let lower = s.to_lowercase();
+        if lower.starts_with("C:\\windows") || lower.starts_with("C:\\program files") {
+            return true;
+        }
+        if let Ok(windir) = std::env::var("WINDIR") {
+            let windir_norm = std::path::Path::new(&windir)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::Path::new(&windir).to_path_buf());
+            if let Ok(canonical) = p.canonicalize() {
+                if canonical.starts_with(windir_norm) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_system_path(p: &std::path::Path) -> bool {
+    if let Ok(canonical) = p.canonicalize() {
+        let system_dirs = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/etc", "/lib", "/lib64", "/usr/lib", "/usr/lib64"];
+        for dir in &system_dirs {
+            if canonical.starts_with(dir) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

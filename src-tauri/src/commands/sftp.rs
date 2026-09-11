@@ -21,6 +21,33 @@ use crate::ssh_client::SessionRegistry;
 use crate::AppState;
 
 use super::{CmdError, CmdResult};
+use directories::ProjectDirs;
+
+/// Reject non-absolute `local` paths and paths whose canonicalized parent
+/// would fall inside the app data directory. Mirrors the denylist used by
+/// `system_write_text_file`.
+fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err("Local path must be absolute.".into());
+    }
+
+    let parent = match p.parent() {
+        Some(parent) => parent,
+        None => return Err("Local path has no parent directory.".into()),
+    };
+
+    let normalized = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+
+    if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
+        let app_data_dir = app_data.data_dir();
+        if normalized.starts_with(app_data_dir) {
+            return Err("Writing into the application data directory is not allowed.".into());
+        }
+    }
+
+    Ok(())
+}
 
 fn sftp_from_session(
     app: &AppHandle,
@@ -235,6 +262,7 @@ pub async fn sftp_download(
     local: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
+    validate_sftp_local_path(&local)?;
     download_to(&sftp, &remote, &local).await?;
     Ok(serde_json::json!({ "ok": true, "local": local }))
 }
@@ -325,6 +353,7 @@ pub async fn sftp_upload(
     remote: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
+    validate_sftp_local_path(&local)?;
     let local_path = PathBuf::from(&local);
     let metadata = tokio::fs::metadata(&local_path)
         .await

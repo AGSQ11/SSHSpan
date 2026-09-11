@@ -369,7 +369,6 @@ function terminalConnectInTab(tabId, server, opts) {
       onData: onData,
       overrideUsername: opts && opts.overrideUsername,
       overrideKeyId: opts && opts.overrideKeyId,
-      overridePemPath: opts && opts.overridePemPath,
       promptPassword: opts && opts.promptPassword,
     };
 
