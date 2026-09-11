@@ -24,6 +24,7 @@ pub async fn run_sync(
     servers_folder_name: &str,
     db: &Database,
     vault_password: &str,
+    allow_remote_overwrite: bool,
 ) -> Result<serde_json::Value> {
     let mut client = BitwardenClient::new(server_url, email, master_password, device_id)?;
     client.connect().await?;
@@ -121,6 +122,8 @@ pub async fn run_sync(
     let mut linked = 0usize;
     let mut conflicts = 0usize;
     let mut remote_deleted = 0usize;
+    let mut skipped_overwrites = 0usize;
+    let mut skipped_new = 0usize;
     let mut errors = Vec::new();
 
     // ─── Pass 1: local → remote ──────────────────────────────────────────
@@ -198,13 +201,17 @@ pub async fn run_sync(
             }
         } else {
             // Pull remote into local
-            match pull_remote_item(&mut client, cipher, row, db, vault_password).await {
-                Ok(()) => {
-                    updated_local += 1;
+            if allow_remote_overwrite {
+                match pull_remote_item(&mut client, cipher, row, db, vault_password).await {
+                    Ok(()) => {
+                        updated_local += 1;
+                    }
+                    Err(e) => {
+                        errors.push(serde_json::json!({"name": row.name, "error": e.to_string()}));
+                    }
                 }
-                Err(e) => {
-                    errors.push(serde_json::json!({"name": row.name, "error": e.to_string()}));
-                }
+            } else {
+                skipped_overwrites += 1;
             }
         }
     }
@@ -304,60 +311,63 @@ pub async fn run_sync(
         };
 
         // Check for duplicate by fingerprint
-        let existing = db.list_keys().unwrap_or_default();
-        if !existing
-            .iter()
-            .any(|k| k.fingerprint_sha256 == key_record.fingerprint_sha256)
-        {
-            if db.insert_key(&key_record).is_ok() {
-                // Resolve SSHSpan category metadata from the cipher's `notes`.
-                if let Some(notes_enc) = cipher.notes.as_ref() {
-                    if let Ok(plain) = client.decrypt_field(notes_enc) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&plain) {
-                            if let Some(arr) = v
-                                .get("sshspan")
-                                .and_then(|s| s.get("categories"))
-                                .and_then(|c| c.as_array())
-                            {
-                                let resolved: Vec<String> = arr
-                                    .iter()
-                                    .filter_map(|item| {
-                                        let id = item
-                                            .get("id")
-                                            .and_then(|i| i.as_str())
-                                            .map(String::from);
-                                        let path = item
-                                            .get("path")
-                                            .and_then(|p| p.as_str())
-                                            .map(String::from);
-                                        match (id, path) {
-                                            (Some(id), _)
-                                                if db
-                                                    .get_category(&id)
+        if allow_remote_overwrite {
+            let existing = db.list_keys().unwrap_or_default();
+            if !existing
+                .iter()
+                .any(|k| k.fingerprint_sha256 == key_record.fingerprint_sha256)
+            {
+                if db.insert_key(&key_record).is_ok() {
+                    // Resolve SSHSpan category metadata from the cipher's `notes`.
+                    if let Some(notes_enc) = cipher.notes.as_ref() {
+                        if let Ok(plain) = client.decrypt_field(notes_enc) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&plain) {
+                                if let Some(arr) = v
+                                    .get("sshspan")
+                                    .and_then(|s| s.get("categories"))
+                                    .and_then(|c| c.as_array())
+                                {
+                                    let resolved: Vec<String> = arr
+                                        .iter()
+                                        .filter_map(|item| {
+                                            let id = item
+                                                .get("id")
+                                                .and_then(|i| i.as_str())
+                                                .map(String::from);
+                                            let path = item
+                                                .get("path")
+                                                .and_then(|p| p.as_str())
+                                                .map(String::from);
+                                            match (id, path) {
+                                                (Some(id), _)
+                                                    if db
+                                                        .get_category(&id)
+                                                        .ok()
+                                                        .flatten()
+                                                        .is_some() =>
+                                                {
+                                                    Some(id)
+                                                }
+                                                (_, Some(path)) => db
+                                                    .ensure_category_path_scoped(&path, "key")
                                                     .ok()
-                                                    .flatten()
-                                                    .is_some() =>
-                                            {
-                                                Some(id)
+                                                    .flatten(),
+                                                _ => None,
                                             }
-                                            (_, Some(path)) => db
-                                                .ensure_category_path_scoped(&path, "key")
-                                                .ok()
-                                                .flatten(),
-                                            _ => None,
-                                        }
-                                    })
-                                    .collect();
-                                let _ = db.set_key_categories(&key_record.id, &resolved);
+                                        })
+                                        .collect();
+                                    let _ = db.set_key_categories(&key_record.id, &resolved);
+                                }
                             }
                         }
                     }
+                    pulled += 1;
+                } else {
+                    errors.push(serde_json::json!({"cipher_id": cipher.id, "error": "db insert failed"}));
                 }
-                pulled += 1;
-            } else {
-                errors
-                    .push(serde_json::json!({"cipher_id": cipher.id, "error": "db insert failed"}));
             }
+        } else {
+            skipped_new += 1;
         }
     }
 
@@ -480,6 +490,8 @@ pub async fn run_sync(
         "serversUpdatedRemote": servers_updated_remote,
         "serversPulled": servers_pulled,
         "serversUpdatedLocal": servers_updated_local,
+        "skippedOverwrites": skipped_overwrites,
+        "skippedNew": skipped_new,
         "errors": errors,
     }))
 }

@@ -243,6 +243,20 @@ pub fn resolve_safe_server_url(server_url: &str) -> anyhow::Result<String> {
     if host.is_empty() {
         anyhow::bail!("Server URL has no hostname.");
     }
+
+    // Plain HTTP is forbidden for vault traffic: it would send master-password
+    // hashes, Bearer tokens, and vault ciphertext across the network
+    // unencrypted. Allow it only for loopback targets where self-hosters test
+    // Vaultwarden locally (127.0.0.0/8 and ::1). The loopback check reuses the
+    // same restricted-address helpers already applied below, so IPv6 literals
+    // and IPv4-mapped loopback are handled consistently.
+    let is_loopback = host == "localhost"
+        || (host.contains(':') && is_restricted_ipv6(&host))
+        || v4_to_int(&host).is_some_and(|n| in_cidr4(n, 0x7F000000, 8));
+    if scheme == "http" && !is_loopback {
+        anyhow::bail!("Server URL must use https://. Plain http:// is only allowed for loopback hosts.");
+    }
+
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
         anyhow::bail!(
             "Local hostnames are not allowed. Use the public hostname of your vault server."
@@ -419,6 +433,44 @@ mod resolver_tests {
             out,
             vec!["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
         );
+    }
+
+    #[test]
+    fn resolver_rejects_plain_http_for_public_host() {
+        for bad in [
+            "http://bitwarden.example.com",
+            "http://vault.example.com:8080/path",
+        ] {
+            let err = resolve_safe_server_url(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("must use https://"),
+                "{bad} must be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_allows_plain_http_for_loopback() {
+        for ok in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.100",
+            "http://[::1]:8080",
+        ] {
+            // These will fail DNS resolution in CI, but the scheme/host
+            // validation itself should not be the blocker. The error, if
+            // any, must NOT be the https-only message.
+            match resolve_safe_server_url(ok) {
+                Err(e) => {
+                    assert!(
+                        !e.to_string().contains("must use https://"),
+                        "{ok} should not fail with https-only error: {e}"
+                    );
+                }
+                Ok(base) => {
+                    assert!(base.starts_with("http://"), "{ok} normalized to {base}");
+                }
+            }
+        }
     }
 
     #[test]

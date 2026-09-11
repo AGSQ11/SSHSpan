@@ -1718,7 +1718,10 @@ pub async fn bitwarden_test_connection(app: AppHandle) -> CmdResult<serde_json::
 }
 
 #[tauri::command]
-pub async fn bitwarden_sync(app: AppHandle) -> CmdResult<serde_json::Value> {
+pub async fn bitwarden_sync(
+    app: AppHandle,
+    allow_remote_overwrite: Option<bool>,
+) -> CmdResult<serde_json::Value> {
     let config = app
         .state::<AppState>()
         .db
@@ -1765,6 +1768,7 @@ pub async fn bitwarden_sync(app: AppHandle) -> CmdResult<serde_json::Value> {
         &servers_folder_name,
         &db,
         &pw,
+        allow_remote_overwrite.unwrap_or(false),
     )
     .await
     .map_err(|e| e.to_string())?;
