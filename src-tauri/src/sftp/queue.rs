@@ -76,6 +76,40 @@ pub fn part_path(dest: &str) -> String {
     format!("{dest}{PART_SUFFIX}")
 }
 
+/// Best-effort ensure the parent directory of `remote_path` exists on the
+/// target SFTP server, creating each missing level. Errors are logged and
+/// swallowed — the subsequent open will surface a real failure if the dir is
+/// genuinely not creatable. Used so a folder Send-to can place nested files
+/// under directories that don't exist yet on the target.
+async fn ensure_remote_dir(sftp: &russh_sftp::client::SftpSession, remote_path: &str) {
+    let Some(parent) = remote_path.rsplit_once('/').map(|(p, _)| p) else {
+        return;
+    };
+    let parent = if parent.is_empty() { "/" } else { parent };
+    if parent == "/" {
+        return;
+    }
+    // Walk down from the root, creating each missing component.
+    let mut cur = String::new();
+    for seg in parent.split('/').filter(|s| !s.is_empty()) {
+        cur.push('/');
+        cur.push_str(seg);
+        match sftp.metadata(&cur).await {
+            Ok(md) if md.is_dir() => continue,
+            Ok(_) => {
+                log::warn!("[sshspan-sftp] ensure_remote_dir: {cur} exists but is not a directory");
+                return;
+            }
+            Err(_) => {
+                if let Err(e) = sftp.create_dir(&cur).await {
+                    // A concurrent job may have created it first; only log.
+                    log::debug!("[sshspan-sftp] ensure_remote_dir mkdir {cur}: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// Alignment check shared by both directions: a `.part` is resumable only
 /// when its length is a strict prefix of a known total. A partial that
 /// equals or exceeds the total is stale garbage from a different source; an
@@ -423,7 +457,7 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 
 /// Ask the SSH session actor for a fresh SFTP channel (browse session stays
 /// untouched — each transfer gets its own channel over the same connection).
-async fn open_transfer_channel<R: tauri::Runtime>(
+pub(crate) async fn open_transfer_channel<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     session_id: &str,
 ) -> Result<russh_sftp::client::SftpSession, String> {
@@ -835,6 +869,11 @@ async fn run_server_copy<RT: tauri::Runtime>(
             .await
             .map_err(|e| format!("local seek to resume offset failed: {e}"))?;
     }
+    // Ensure the destination's parent directory exists on the target. A folder
+    // Send-to expands into nested per-file jobs, and the target SFTP server does
+    // not create missing parents on open — without this the copy of a nested
+    // file fails at open with "No such file".
+    ensure_remote_dir(&target_sftp, &target.remote_path).await;
     let mut rf = target_sftp.open_with_flags(
         &tpart,
         if offset > 0 {

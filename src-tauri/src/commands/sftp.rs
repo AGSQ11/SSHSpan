@@ -989,6 +989,14 @@ pub fn sftp_queue_clear_finished(app: AppHandle) -> CmdResult<serde_json::Value>
 /// never used — some servers fail reads on the long-lived channel with
 /// SSH_FX_FAILURE). The transfer queue panel shows progress; a temp staging
 /// file is created by the worker and always removed on completion.
+///
+/// Directories are expanded recursively into per-file jobs (a directory
+/// cannot be read as a file — reading one fails at offset 0). Each child file
+/// keeps the folder structure under `<target_dir>/<dir-name>/...`. Directory
+/// names come from the source server's listing, so every remote path segment
+/// is passed through `sanitize_remote_name` before it is joined into the
+/// target path (defense-in-depth against a hostile source server planting
+/// `..` segments in the destination path).
 #[tauri::command]
 pub async fn sftp_server_copy(
     app: AppHandle,
@@ -1022,11 +1030,35 @@ pub async fn sftp_server_copy(
         return Err(CmdError("Target session not found.".into()));
     };
 
-    let name = remote.rsplit('/').next().unwrap_or("file");
-    let target_path = format!("{}/{}", target_dir.trim_end_matches('/'), name);
+    // Open a fresh channel to the source to stat + walk (mirrors expand_download).
+    let sftp = crate::sftp::queue::open_transfer_channel(&app, &from_session_id)
+        .await
+        .map_err(CmdError)?;
+    let md = sftp
+        .metadata(&remote)
+        .await
+        .map_err(|e| CmdError(format!("stat {remote}: {e}")))?;
 
-    q_enqueue(
-        &app,
+    let name = remote.rsplit('/').next().unwrap_or("file");
+    let base_target = format!("{}/{}", target_dir.trim_end_matches('/'), name);
+
+    let jobs = if md.is_dir() {
+        expand_server_copy(
+            &sftp,
+            remote,
+            base_target.clone(),
+            from_session_id,
+            source_server,
+            tfq::ServerCopyTarget {
+                session_id: target_session_id,
+                server_name: target_server,
+                remote_path: String::new(), // filled per-file by the walker
+            },
+            Vec::new(),
+        )
+        .await
+        .map_err(CmdError)?
+    } else {
         vec![QueuedItem {
             kind: JobKind::ServerCopy,
             session_id: from_session_id,
@@ -1039,11 +1071,91 @@ pub async fn sftp_server_copy(
             target: Some(tfq::ServerCopyTarget {
                 session_id: target_session_id,
                 server_name: target_server,
-                remote_path: target_path.clone(),
+                remote_path: base_target.clone(),
             }),
-        }],
-    );
-    Ok(serde_json::json!({ "ok": true, "target": target_path }))
+        }]
+    };
+
+    if jobs.is_empty() {
+        return Err(CmdError("Nothing to send (empty or unreadable folder).".into()));
+    }
+    let n = jobs.len();
+    q_enqueue(&app, jobs);
+    Ok(serde_json::json!({ "ok": true, "target": base_target, "count": n }))
+}
+
+/// Recursively expand a remote directory into per-file ServerCopy jobs.
+/// `target_base` is the destination directory on the target that mirrors the
+/// source directory being walked. Child file/dir names come from the source
+/// server's directory listing (attacker-influenceable on a hostile source),
+/// so each segment is sanitized before joining into the target path.
+fn expand_server_copy(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_dir: String,
+    target_base: String,
+    from_session_id: String,
+    source_server: String,
+    target: tfq::ServerCopyTarget,
+    out: Vec<QueuedItem>,
+) -> Pin<Box<dyn Future<Output = Result<Vec<QueuedItem>, String>> + Send + '_>> {
+    Box::pin(async move {
+        let mut out = out;
+        let mut entries = sftp
+            .read_dir(&remote_dir)
+            .await
+            .map_err(|e| format!("list {remote_dir}: {e}"))?;
+        while let Some(entry) = entries.next() {
+            let name = entry.file_name().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let Some(safe) = sanitize_remote_name(&name) else {
+                log::warn!(
+                    "[sshspan-sftp] send-to: skipping unsafe remote name {name:?} under {remote_dir}"
+                );
+                continue;
+            };
+            let child_remote = format!("{}/{}", remote_dir.trim_end_matches('/'), safe);
+            let child_target = format!("{}/{}", target_base.trim_end_matches('/'), safe);
+            let cmd = sftp
+                .metadata(&child_remote)
+                .await
+                .map_err(|e| format!("stat {child_remote}: {e}"))?;
+            if cmd.is_dir() {
+                out = expand_server_copy(
+                    sftp,
+                    child_remote,
+                    child_target,
+                    from_session_id.clone(),
+                    source_server.clone(),
+                    tfq::ServerCopyTarget {
+                        session_id: target.session_id.clone(),
+                        server_name: target.server_name.clone(),
+                        remote_path: String::new(),
+                    },
+                    out,
+                )
+                .await?;
+            } else {
+                out.push(QueuedItem {
+                    kind: JobKind::ServerCopy,
+                    session_id: from_session_id.clone(),
+                    server_name: source_server.clone(),
+                    local_path: String::new(),
+                    remote_path: child_remote,
+                    size: cmd.size.unwrap_or(0),
+                    resume: None,
+                    preserve_ts: None,
+                    target: Some(tfq::ServerCopyTarget {
+                        session_id: target.session_id.clone(),
+                        server_name: target.server_name.clone(),
+                        remote_path: child_target,
+                    }),
+                });
+            }
+        }
+        Ok(out)
+    })
 }
 
 // ─── recursive remote search ───────────────────────────────────────────────
