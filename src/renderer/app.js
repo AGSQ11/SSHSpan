@@ -1984,10 +1984,16 @@ async function backupRestore() {
 
 function finishRestore(r) {
   const c = r.counts;
-  el('backupStatus').textContent = `Restored: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+  let msg = `Restored: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+  el('backupStatus').textContent = msg;
   loadKeys();
   loadServers();
-  toast('Backup restored.', 'ok');
+  const conflicts = c.knownHostsConflicts || 0;
+  if (conflicts > 0) {
+    toast(`Backup restored, but ${conflicts} host-key pin(s) were NOT overwritten (conflicting keys kept). Check Known Hosts.`, 'err');
+  } else {
+    toast('Backup restored.', 'ok');
+  }
 }
 async function loadKnownHosts() {
   const body = el('knownHostsBody');
