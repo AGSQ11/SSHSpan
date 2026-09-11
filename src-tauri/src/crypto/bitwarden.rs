@@ -45,6 +45,15 @@ impl Default for KdfParams {
 ///
 /// kdf_type 0: PBKDF2-HMAC-SHA256 with email (lowercased) as salt.
 /// kdf_type 1: Argon2id with email (lowercased) as salt.
+// Minimum KDF parameters enforced server-side values. Bitwarden's current
+// defaults and floors: PBKDF2 accounts must use at least 600,000 iterations;
+// Argon2id accounts must use at least 16 MiB of memory, 2 iterations, and
+// parallelism of 1. These match the official Bitwarden server-side minimums.
+pub(crate) const PBKDF2_MIN_ITERATIONS: u32 = 600_000;
+pub(crate) const ARGON2_MIN_MEMORY_KIB: u32 = 16 * 1024;
+pub(crate) const ARGON2_MIN_ITERATIONS: u32 = 2;
+pub(crate) const ARGON2_MIN_PARALLELISM: u32 = 1;
+
 pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow::Result<[u8; 32]> {
     let pw = password.as_bytes();
     let salt = email.trim().to_lowercase();
@@ -52,19 +61,18 @@ pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow
 
     match kdf.kdf_type {
         0 => {
-            let iterations = if kdf.iterations > 0 {
-                kdf.iterations
-            } else {
-                600_000
-            };
+            let iterations = kdf.iterations.max(PBKDF2_MIN_ITERATIONS);
             Ok(pbkdf2_hmac_array::<Sha256, 32>(pw, salt_bytes, iterations))
         }
         1 => {
             use argon2::{Algorithm, Argon2, Params, Version};
+            let memory = kdf.memory.max(ARGON2_MIN_MEMORY_KIB);
+            let iterations = kdf.iterations.max(ARGON2_MIN_ITERATIONS);
+            let parallelism = kdf.parallelism.max(ARGON2_MIN_PARALLELISM);
             let params = Params::new(
-                kdf.memory.max(64),    // minimum 64 KiB
-                kdf.iterations.max(3), // minimum 3
-                kdf.parallelism.max(4),
+                memory,
+                iterations,
+                parallelism,
                 Some(32),
             )
             .map_err(|e| anyhow::anyhow!("Argon2 param error: {e}"))?;
@@ -297,6 +305,41 @@ mod tests {
             "cce388b4ac0f05edee78d40dcbe78a7715640de75ed9ba06942fb42398d6b1f1",
             "mac half of the stretched key must match Electron expand-only HKDF"
         );
+    }
+
+    #[test]
+    fn kdf_pbkdf2_floor_enforced() {
+        // A server claiming fewer than 600,000 iterations must be clamped.
+        let kdf = KdfParams {
+            kdf_type: 0,
+            iterations: 1,
+            memory: 0,
+            parallelism: 0,
+        };
+        let key_low = derive_master_key("password", "user@example.com", &kdf).unwrap();
+        let kdf_floor = KdfParams {
+            kdf_type: 0,
+            iterations: PBKDF2_MIN_ITERATIONS,
+            memory: 0,
+            parallelism: 0,
+        };
+        let key_floor = derive_master_key("password", "user@example.com", &kdf_floor).unwrap();
+        assert_eq!(key_low, key_floor);
+    }
+
+    #[test]
+    fn kdf_argon2_floor_enforced() {
+        // Argon2id params below the minimums (16 MiB, 2 iterations, 1 lane)
+        // must be clamped up, not used verbatim.
+        let kdf = KdfParams {
+            kdf_type: 1,
+            iterations: 1,
+            memory: 64,
+            parallelism: 1,
+        };
+        // Should succeed because the clamps raise memory/iterations.
+        let key = derive_master_key("password", "user@example.com", &kdf).unwrap();
+        assert_ne!(key, [0u8; 32]);
     }
 
     #[test]

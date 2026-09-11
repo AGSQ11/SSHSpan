@@ -231,11 +231,17 @@ impl BitwardenClient {
         // accounts send kdfMemory/kdfParallelism as explicit null.
         let data: serde_json::Value = read_body_capped_json(resp).await?;
         let num = |k: &str| data.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        // Enforce Bitwarden's server-side KDF minimums. A malicious or
+        // misconfigured server cannot claim a low iteration count to speed
+        // up offline cracking. Argon2id floors: m >= 16 MiB, t >= 2, p >= 1.
+        let iterations = num("kdfIterations").max(crate::crypto::bitwarden::PBKDF2_MIN_ITERATIONS);
+        let memory = num("kdfMemory").max(crate::crypto::bitwarden::ARGON2_MIN_MEMORY_KIB);
+        let parallelism = num("kdfParallelism").max(crate::crypto::bitwarden::ARGON2_MIN_PARALLELISM);
         Ok(KdfParams {
             kdf_type: num("kdf"),
-            iterations: num("kdfIterations"),
-            memory: num("kdfMemory"),
-            parallelism: num("kdfParallelism"),
+            iterations,
+            memory,
+            parallelism,
         })
     }
 

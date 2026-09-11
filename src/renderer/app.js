@@ -1669,12 +1669,24 @@ async function bwTest() {
   }
 }
 
-async function bwSyncNow() {
+async function bwSyncNow(allowRemoteOverwrite) {
   const btn = el('bwSyncNowBtn');
   btn.disabled = true;
   setBwStatus('Syncing\u2026', 'syncing');
   try {
-    const s = await call('bitwarden_sync');
+    const s = await call('bitwarden_sync', { allow_remote_overwrite: allowRemoteOverwrite === true });
+    const skipped = (s.skippedOverwrites || 0) + (s.skippedNew || 0);
+    if (skipped > 0 && !allowRemoteOverwrite) {
+      const msg = [
+        'Remote changes need your approval:',
+        s.skippedOverwrites ? s.skippedOverwrites + ' local overwrite(s)' : null,
+        s.skippedNew ? s.skippedNew + ' new remote item(s)' : null,
+      ];
+      const detail = msg.filter(Boolean).join(', ');
+      if (window.confirm(detail + '. Apply them now?')) {
+        return await bwSyncNow(true);
+      }
+    }
     const parts = [];
     if (s.pushed) parts.push(s.pushed + ' pushed');
     if (s.pulled) parts.push(s.pulled + ' pulled');

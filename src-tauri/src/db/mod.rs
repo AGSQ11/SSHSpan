@@ -1413,7 +1413,7 @@ impl Database {
                 }
             }
 
-            let mut hosts_replaced = 0u32;
+            let mut known_hosts_conflicts = 0u32;
             if let Some(arr) = data.get("known_hosts").and_then(|v| v.as_array()) {
                 for h in arr {
                     let Some(host) = h
@@ -1429,9 +1429,10 @@ impl Database {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let seen = h.get("first_seen").and_then(|v| v.as_str()).unwrap_or("");
-                    // Count replacements before upserting: a host that
-                    // already exists with a DIFFERENT key is about to be
-                    // silently overwritten — the caller surfaces this.
+                    // Security: never overwrite an existing host-key pin from a
+                    // backup, because a malicious backup could pin an attacker-
+                    // controlled key. New hosts are still added. Conflicts are
+                    // counted so the caller can surface them.
                     let existing_key = sqlx::query_scalar::<_, String>(
                         "SELECT host_key FROM known_hosts WHERE host = ?",
                     )
@@ -1439,7 +1440,8 @@ impl Database {
                     .fetch_optional(&mut *tx)
                     .await?;
                     if existing_key.is_some_and(|k| k != host_key) {
-                        hosts_replaced += 1;
+                        known_hosts_conflicts += 1;
+                        continue;
                     }
                     sqlx::query(
                         "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
@@ -1472,7 +1474,8 @@ impl Database {
             Ok(serde_json::json!({
                 "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
                 "servers": servers_n, "knownHosts": hosts_n,
-                "knownHostsReplaced": hosts_replaced, "settings": settings_n,
+                "knownHostsReplaced": 0u32,
+                "knownHostsConflicts": known_hosts_conflicts, "settings": settings_n,
             }))
         })
     }
