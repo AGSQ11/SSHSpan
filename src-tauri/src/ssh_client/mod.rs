@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64ct::Encoding;
+use zeroize::Zeroizing;
 use russh::client::{self, Handle};
 use russh::keys::*;
 use russh::Pty;
@@ -127,11 +128,20 @@ impl SessionRegistry {
     }
 }
 
+/// Key used for a host-key pin in the `known_hosts` table. Pins are scoped
+/// to `host:port` so the same hostname on different ports cannot share or
+/// clobber each other.
+pub fn known_host_key(host: &str, port: u16) -> String {
+    format!("{}:{}", host, port)
+}
+
 /// The russh client handler. Its only job is host-key verification (TOFU);
 /// the interactive I/O runs on the channel side in the spawned task.
 pub struct TerminalHandler {
     /// host used as the key in the known_hosts table
     pub host: String,
+    /// port used as part of the known_hosts key
+    pub port: u16,
     /// database handle for host-key lookups
     pub db: Database,
 }
@@ -154,7 +164,9 @@ impl client::Handler for TerminalHandler {
             }
         };
 
-        match self.db.get_known_host(&self.host) {
+        let host_key = known_host_key(&self.host, self.port);
+
+        match self.db.get_known_host(&host_key) {
             Ok(Some(known)) => {
                 // Known host: accept only if the presented key matches what we stored.
                 let accepted = known.host_key == presented_b64;
@@ -166,7 +178,7 @@ impl client::Handler for TerminalHandler {
                         None,
                         &format!(
                             "{} (expected {})",
-                            &self.host,
+                            &host_key,
                             hostkey_fingerprint_display(&known.host_key)
                         ),
                     );
@@ -178,11 +190,11 @@ impl client::Handler for TerminalHandler {
                 // prompt here, so at minimum record what was trusted and
                 // let the connect path surface a notice in the terminal.
                 let fp = fingerprint_of_blob(&presented_b64).unwrap_or_default();
-                let _ = self.db.add_known_host(&self.host, &presented_b64, &fp);
+                let _ = self.db.add_known_host(&host_key, &presented_b64, &fp);
                 let _ = self.db.add_audit(
                     "known_hosts.trust_on_first_use",
                     None,
-                    &format!("{} (SHA256:{})", &self.host, fp),
+                    &format!("{} (SHA256:{})", &host_key, fp),
                 );
                 Ok(true)
             }
@@ -234,9 +246,9 @@ pub struct ConnectParams {
     pub auth_method: String,
     /// Decrypted private-key PEM text (in-memory), when auth_method == publickey
     /// and the key lives in the vault.
-    pub key_pem: Option<String>,
+    pub key_pem: Option<Zeroizing<String>>,
     /// Password when auth_method == password (plaintext, in-memory only).
-    pub password: Option<String>,
+    pub password: Option<Zeroizing<String>>,
 }
 
 /// Streamed (interactive) session error sentinel types used across IPC.
@@ -314,14 +326,17 @@ pub async fn authenticate(
                         ));
                     }
                     client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                        let mut responses = Vec::new();
+                        let password = params.password.as_deref().map(|s| s.as_str()).unwrap_or("");
+                        let mut responses: Vec<Zeroizing<String>> = Vec::new();
                         for _prompt in &prompts {
                             // v1: only a saved password is offered; prompts that need
                             // other input (2FA codes, OTP) cannot be answered offline.
-                            responses.push(params.password.clone().unwrap_or_default());
+                            responses.push(Zeroizing::new(password.to_string()));
                         }
                         response = session
-                            .authenticate_keyboard_interactive_respond(responses)
+                            .authenticate_keyboard_interactive_respond(
+                                responses.iter().map(|r| r.to_string()).collect(),
+                            )
                             .await?;
                     }
                 }
@@ -342,8 +357,8 @@ pub struct ResolvedConnection {
     pub server: ServerRecord,
     pub username: String,
     pub auth_method: String,
-    pub key_pem: Option<String>,
-    pub password: Option<String>,
+    pub key_pem: Option<Zeroizing<String>>,
+    pub password: Option<Zeroizing<String>>,
 }
 
 /// Connect, authenticate, request a PTY shell, register the session and stream
@@ -357,17 +372,19 @@ pub async fn start_interactive(
 ) -> anyhow::Result<String> {
     let target_host = params.server.host.clone();
     let target_port = params.server.port;
+    let known_host_lookup = known_host_key(&target_host, target_port);
 
     // Pre-check made BEFORE connecting: if the host has no known_hosts entry,
     // the TOFU handler below will store a new key during the handshake. The
     // lookup result drives the informational first-trust notice; the small
     // race with the handler's own lookup is benign (a notice is advisory,
     // the audit entry is authoritative).
-    let pre_connect_known_host = db.get_known_host(&target_host).ok().flatten();
+    let pre_connect_known_host = db.get_known_host(&known_host_lookup).ok().flatten();
 
     let config = Arc::new(base_client_config());
     let handler = TerminalHandler {
         host: target_host.clone(),
+        port: target_port,
         db: db.clone(),
     };
 
@@ -466,7 +483,7 @@ pub async fn start_interactive(
     // First-time trust: the TOFU handler stored a new host key during this
     // handshake — tell the user what fingerprint they now trust.
     if let Some(notice) = db
-        .get_known_host(&target_host)
+        .get_known_host(&known_host_lookup)
         .ok()
         .flatten()
         .map(|kh| kh.fingerprint_sha256)
