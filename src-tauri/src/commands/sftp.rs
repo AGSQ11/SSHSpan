@@ -1043,7 +1043,10 @@ pub async fn sftp_server_copy(
     let base_target = format!("{}/{}", target_dir.trim_end_matches('/'), name);
 
     let jobs = if md.is_dir() {
-        expand_server_copy(
+        let visited = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // Bound the walk so a stalled/pathological source server surfaces an
+        // error instead of leaving "Sending…" frozen forever.
+        let walk = expand_server_copy(
             &sftp,
             remote,
             base_target.clone(),
@@ -1055,9 +1058,16 @@ pub async fn sftp_server_copy(
                 remote_path: String::new(), // filled per-file by the walker
             },
             Vec::new(),
-        )
-        .await
-        .map_err(CmdError)?
+            visited,
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(120), walk).await {
+            Ok(r) => r.map_err(CmdError)?,
+            Err(_) => {
+                return Err(CmdError(
+                    "Folder scan timed out (source server too slow or unresponsive).".into(),
+                ))
+            }
+        }
     } else {
         vec![QueuedItem {
             kind: JobKind::ServerCopy,
@@ -1089,6 +1099,17 @@ pub async fn sftp_server_copy(
 /// source directory being walked. Child file/dir names come from the source
 /// server's directory listing (attacker-influenceable on a hostile source),
 /// so each segment is sanitized before joining into the target path.
+///
+/// Robustness guards (a naive walk freezes on real-world trees):
+/// - `symlink_metadata` is used so a symlink is classified by the link itself,
+///   not its target. `metadata` FOLLOWS symlinks — a symlink cycle (e.g.
+///   `a -> ..`, common in app dirs like mailcow-dockerized) would otherwise
+///   recurse without end and hang the Send-to with an empty queue.
+/// - Non-regular files (symlinks, sockets, FIFOs, devices) are skipped: they
+///   can't be opened as a file and would stall the read leg.
+/// - A path-prefix visited-set breaks directory cycles that survive the above.
+/// - A hard cap on expanded jobs prevents a pathological tree from flooding
+///   the queue.
 fn expand_server_copy(
     sftp: &russh_sftp::client::SftpSession,
     remote_dir: String,
@@ -1097,14 +1118,28 @@ fn expand_server_copy(
     source_server: String,
     target: tfq::ServerCopyTarget,
     out: Vec<QueuedItem>,
+    visited: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<QueuedItem>, String>> + Send + '_>> {
     Box::pin(async move {
+        const MAX_EXPANDED: usize = 10_000;
         let mut out = out;
+        // Cycle guard: don't re-enter a directory we've already walked.
+        {
+            let mut seen = visited.lock().unwrap();
+            if !seen.insert(remote_dir.clone()) {
+                log::warn!("[sshspan-sftp] send-to: cycle detected at {remote_dir}, skipping");
+                return Ok(out);
+            }
+        }
         let mut entries = sftp
             .read_dir(&remote_dir)
             .await
             .map_err(|e| format!("list {remote_dir}: {e}"))?;
         while let Some(entry) = entries.next() {
+            if out.len() >= MAX_EXPANDED {
+                log::warn!("[sshspan-sftp] send-to: hit {MAX_EXPANDED} file cap, truncating walk");
+                return Ok(out);
+            }
             let name = entry.file_name().to_string();
             if name == "." || name == ".." {
                 continue;
@@ -1117,11 +1152,19 @@ fn expand_server_copy(
             };
             let child_remote = format!("{}/{}", remote_dir.trim_end_matches('/'), safe);
             let child_target = format!("{}/{}", target_base.trim_end_matches('/'), safe);
+            // symlink_metadata: classify the entry itself so symlinks are not
+            // followed (a followed link can point to an ancestor → infinite
+            // recursion, or outside the tree → unexpected data).
             let cmd = sftp
-                .metadata(&child_remote)
+                .symlink_metadata(&child_remote)
                 .await
                 .map_err(|e| format!("stat {child_remote}: {e}"))?;
-            if cmd.is_dir() {
+            let ftype = cmd.file_type();
+            if ftype.is_symlink() {
+                log::debug!("[sshspan-sftp] send-to: skipping symlink {child_remote}");
+                continue;
+            }
+            if ftype.is_dir() {
                 out = expand_server_copy(
                     sftp,
                     child_remote,
@@ -1134,9 +1177,13 @@ fn expand_server_copy(
                         remote_path: String::new(),
                     },
                     out,
+                    visited.clone(),
                 )
                 .await?;
             } else {
+                // Regular file. Note: file_type() is `Other` when a server omits
+                // permission bits, so treat anything that is neither dir nor
+                // symlink as copyable rather than silently dropping it.
                 out.push(QueuedItem {
                     kind: JobKind::ServerCopy,
                     session_id: from_session_id.clone(),
