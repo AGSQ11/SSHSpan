@@ -185,14 +185,27 @@ is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Security
 
-Private keys are encrypted at rest (AES-256-GCM, bcrypt-pbkdf2 KDF) and only ever decrypted
-in-process. The master password is never persisted - only a verification hash. Host keys are
-pinned trust-on-first-use. See [docs/SECURITY.md](docs/SECURITY.md) and
-[docs/PRIVACY.md](docs/PRIVACY.md).
+Private keys are encrypted at rest (AES-256-GCM, Argon2id key derivation) and only ever
+decrypted in-process. The master password is never persisted - only a verification hash.
+Host keys are pinned on first use after an explicit trust prompt. See
+[docs/SECURITY.md](docs/SECURITY.md) and [docs/PRIVACY.md](docs/PRIVACY.md).
 
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+## Disclaimer
+
+SSHSpan is a personal project. It was built for my own use, and published under MIT
+in case it is useful to someone else.
+
+**It has not had a third-party security audit.** It handles private keys,
+passphrases and server credentials, so understand what that means before you
+point it at anything you care about.
+
+If you intend to rely on it, read the source first or build from it. If you
+find something wrong, open an issue - that is more useful to everyone than a
+disclaimer is.
 
 ## Project statistics
 
