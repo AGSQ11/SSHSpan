@@ -1099,33 +1099,46 @@ pub async fn sftp_server_copy(
     let name = remote.rsplit('/').next().unwrap_or("file");
     let base_target = format!("{}/{}", target_dir.trim_end_matches('/'), name);
 
-    let jobs = if md.is_dir() {
+    if md.is_dir() {
+        // Stream the walk: enqueue per-file jobs in batches as the tree is
+        // scanned so transfers start immediately (workers run in parallel with
+        // the walk) instead of waiting for a full scan of a huge tree. The
+        // command returns after the scan completes; scan errors surface here
+        // while already-queued jobs keep running.
         let visited = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        // Bound the walk so a stalled/pathological source server surfaces an
-        // error instead of leaving "Sending…" frozen forever.
+        let scanned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let walk = expand_server_copy(
+            &app,
             &sftp,
             remote,
             base_target.clone(),
             from_session_id,
             source_server,
-            tfq::ServerCopyTarget {
-                session_id: target_session_id,
-                server_name: target_server,
-                remote_path: String::new(), // filled per-file by the walker
-            },
-            Vec::new(),
+            target_session_id,
+            target_server,
             visited,
+            scanned.clone(),
         );
-        match tokio::time::timeout(std::time::Duration::from_secs(120), walk).await {
-            Ok(r) => r.map_err(CmdError)?,
-            Err(_) => {
-                return Err(CmdError(
-                    "Folder scan timed out (source server too slow or unresponsive).".into(),
-                ))
-            }
+        // Bounded so a stalled/pathological source surfaces an error instead of
+        // leaving "Sending…" frozen forever.
+        if tokio::time::timeout(std::time::Duration::from_secs(120), walk)
+            .await
+            .is_err()
+        {
+            return Err(CmdError(
+                "Folder scan timed out (source server too slow or unresponsive).".into(),
+            ));
         }
-    } else {
+        let n = scanned.load(std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            return Err(CmdError("Nothing to send (empty or unreadable folder).".into()));
+        }
+        return Ok(serde_json::json!({ "ok": true, "target": base_target, "count": n }));
+    }
+
+    // Single file: enqueue one job (worker stats it on a fresh channel).
+    q_enqueue(
+        &app,
         vec![QueuedItem {
             kind: JobKind::ServerCopy,
             session_id: from_session_id,
@@ -1140,64 +1153,62 @@ pub async fn sftp_server_copy(
                 server_name: target_server,
                 remote_path: base_target.clone(),
             }),
-        }]
-    };
-
-    if jobs.is_empty() {
-        return Err(CmdError("Nothing to send (empty or unreadable folder).".into()));
-    }
-    let n = jobs.len();
-    q_enqueue(&app, jobs);
-    Ok(serde_json::json!({ "ok": true, "target": base_target, "count": n }))
+        }],
+    );
+    Ok(serde_json::json!({ "ok": true, "target": base_target, "count": 1 }))
 }
 
-/// Recursively expand a remote directory into per-file ServerCopy jobs.
-/// `target_base` is the destination directory on the target that mirrors the
-/// source directory being walked. Child file/dir names come from the source
-/// server's directory listing (attacker-influenceable on a hostile source),
-/// so each segment is sanitized before joining into the target path.
+/// Recursively expand a remote directory into per-file ServerCopy jobs,
+/// ENQUEUING them in batches as the walk proceeds so transfers start
+/// immediately and overlap the scan (a full scan-then-enqueue of a huge tree
+/// reads as a frozen "Sending…" on a slow link). Returns the count scanned.
+///
+/// Child names come from the source server's directory listing
+/// (attacker-influenceable on a hostile source), so each segment is sanitized
+/// before joining into the target path. Entry type/size come from the
+/// listing's own attributes — no per-file round-trip stat.
 ///
 /// Robustness guards (a naive walk freezes on real-world trees):
-/// - `symlink_metadata` is used so a symlink is classified by the link itself,
-///   not its target. `metadata` FOLLOWS symlinks — a symlink cycle (e.g.
-///   `a -> ..`, common in app dirs like mailcow-dockerized) would otherwise
-///   recurse without end and hang the Send-to with an empty queue.
-/// - Non-regular files (symlinks, sockets, FIFOs, devices) are skipped: they
-///   can't be opened as a file and would stall the read leg.
+/// - Symlinks are classified from the listing and skipped, never followed (a
+///   followed link can point to an ancestor → infinite recursion).
 /// - A path-prefix visited-set breaks directory cycles that survive the above.
-/// - A hard cap on expanded jobs prevents a pathological tree from flooding
+/// - A hard cap on scanned files prevents a pathological tree from flooding
 ///   the queue.
-fn expand_server_copy(
-    sftp: &russh_sftp::client::SftpSession,
+#[allow(clippy::too_many_arguments)]
+fn expand_server_copy<'a>(
+    app: &'a AppHandle,
+    sftp: &'a russh_sftp::client::SftpSession,
     remote_dir: String,
     target_base: String,
     from_session_id: String,
     source_server: String,
-    target: tfq::ServerCopyTarget,
-    out: Vec<QueuedItem>,
+    target_session_id: String,
+    target_server: String,
     visited: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-) -> Pin<Box<dyn Future<Output = Result<Vec<QueuedItem>, String>> + Send + '_>> {
+    scanned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         const MAX_EXPANDED: usize = 10_000;
-        let mut out = out;
+        const FLUSH_EVERY: usize = 64; // enqueue this many files at a time
         // Cycle guard: don't re-enter a directory we've already walked.
         {
             let mut seen = visited.lock().unwrap();
             if !seen.insert(remote_dir.clone()) {
                 log::warn!("[sshspan-sftp] send-to: cycle detected at {remote_dir}, skipping");
-                return Ok(out);
+                return Ok(());
             }
         }
         let mut entries = sftp
             .read_dir(&remote_dir)
             .await
             .map_err(|e| format!("list {remote_dir}: {e}"))?;
+        let mut batch: Vec<QueuedItem> = Vec::new();
         while let Some(entry) = entries.next() {
-            if out.len() >= MAX_EXPANDED {
+            if scanned.load(std::sync::atomic::Ordering::SeqCst) >= MAX_EXPANDED {
                 log::warn!("[sshspan-sftp] send-to: hit {MAX_EXPANDED} file cap, truncating walk");
-                return Ok(out);
+                break;
             }
-            let name = entry.file_name().to_string();
+            let name = entry.file_name();
             if name == "." || name == ".." {
                 continue;
             }
@@ -1209,56 +1220,63 @@ fn expand_server_copy(
             };
             let child_remote = format!("{}/{}", remote_dir.trim_end_matches('/'), safe);
             let child_target = format!("{}/{}", target_base.trim_end_matches('/'), safe);
-            // symlink_metadata: classify the entry itself so symlinks are not
-            // followed (a followed link can point to an ancestor → infinite
-            // recursion, or outside the tree → unexpected data).
-            let cmd = sftp
-                .symlink_metadata(&child_remote)
-                .await
-                .map_err(|e| format!("stat {child_remote}: {e}"))?;
-            let ftype = cmd.file_type();
+            // Classify from the listing's own attributes (symlink-aware): no
+            // per-file stat round-trip. Symlinks are skipped, never followed.
+            let md = entry.metadata();
+            let ftype = md.file_type();
             if ftype.is_symlink() {
                 log::debug!("[sshspan-sftp] send-to: skipping symlink {child_remote}");
                 continue;
             }
             if ftype.is_dir() {
-                out = expand_server_copy(
+                // Flush pending files before recursing so ordering stays
+                // breadth-friendly and the queue keeps filling.
+                if !batch.is_empty() {
+                    scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
+                    q_enqueue(app, std::mem::take(&mut batch));
+                }
+                expand_server_copy(
+                    app,
                     sftp,
                     child_remote,
                     child_target,
                     from_session_id.clone(),
                     source_server.clone(),
-                    tfq::ServerCopyTarget {
-                        session_id: target.session_id.clone(),
-                        server_name: target.server_name.clone(),
-                        remote_path: String::new(),
-                    },
-                    out,
+                    target_session_id.clone(),
+                    target_server.clone(),
                     visited.clone(),
+                    scanned.clone(),
                 )
                 .await?;
             } else {
-                // Regular file. Note: file_type() is `Other` when a server omits
-                // permission bits, so treat anything that is neither dir nor
-                // symlink as copyable rather than silently dropping it.
-                out.push(QueuedItem {
+                // Regular file. file_type() is `Other` when a server omits
+                // permission bits, so treat non-dir/non-symlink as copyable.
+                batch.push(QueuedItem {
                     kind: JobKind::ServerCopy,
                     session_id: from_session_id.clone(),
                     server_name: source_server.clone(),
                     local_path: String::new(),
                     remote_path: child_remote,
-                    size: cmd.size.unwrap_or(0),
+                    size: md.size.unwrap_or(0),
                     resume: None,
                     preserve_ts: None,
                     target: Some(tfq::ServerCopyTarget {
-                        session_id: target.session_id.clone(),
-                        server_name: target.server_name.clone(),
+                        session_id: target_session_id.clone(),
+                        server_name: target_server.clone(),
                         remote_path: child_target,
                     }),
                 });
+                if batch.len() >= FLUSH_EVERY {
+                    scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
+                    q_enqueue(app, std::mem::take(&mut batch));
+                }
             }
         }
-        Ok(out)
+        if !batch.is_empty() {
+            scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
+            q_enqueue(app, batch);
+        }
+        Ok(())
     })
 }
 
