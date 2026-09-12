@@ -36,6 +36,23 @@ function sftpParent(dir) {
   return idx <= 0 ? '/' : trimmed.slice(0, idx);
 }
 
+// `settings_get` returns a fixed allowlist of keys plus every `sftpLocalDir:`
+// row read by prefix, so a per-server default round-trips through the same
+// config table as every other setting and arrives in `state.settings` like
+// the rest. Read it from there rather than keeping a second copy anywhere.
+function sftpSettingGet(key, fallback) {
+  const v = state.settings && state.settings[key];
+  return v === undefined || v === null ? fallback : v;
+}
+
+/// Namespaced settings key for a server's remembered local-pane directory
+/// (Task 6). Prefixed so it can't collide with any flat setting name, and
+/// keyed by the server's stable id (not its display name, which can repeat
+/// or be edited) or session id (which changes every connection).
+function sftpLocalDirKey(serverId) {
+  return 'sftpLocalDir:' + (serverId || 'unknown');
+}
+
 /// Ensure the tab record has all the SFTP fields this module uses.
 function sftpTabState(tab) {
   if (!tab.sftpSelected) tab.sftpSelected = new Set();
@@ -44,7 +61,10 @@ function sftpTabState(tab) {
   if (!tab.log) tab.log = [];
   if (!tab.showHidden) tab.showHidden = state.settings?.sftpShowHidden === '1';
   if (tab.dualPane === undefined) tab.dualPane = state.sftpDualPane === true;
-  if (!tab.localPath) tab.localPath = '';
+  // Per-server default local directory, if the user has set one (Task 6);
+  // falls back to '' (the OS home directory, sftp_local_list's own default)
+  // exactly like before this existed.
+  if (!tab.localPath) tab.localPath = sftpSettingGet(sftpLocalDirKey(tab.serverId), '');
   if (tab.sftpPreserveTs === undefined) tab.sftpPreserveTs = state.settings?.sftpPreserveTs === '1';
   // Permissions/Owner columns default ON; toggleable per the toolbar button
   // (they widen the table noticeably, so narrow windows may prefer them off -
@@ -351,11 +371,15 @@ function buildSftpPanel(tabId) {
   });
   localPath.addEventListener('focus', () => localPath.select());
   const localCopy = mkPathCopy(() => sftpTab(tabId)?.localPath || '');
+  // Task 6: remember the local pane's current directory as this server's
+  // default so future SFTP sessions with it open here instead of home.
+  const localSetDefault = mkBtn('star', 'Set as default local directory for this server', () => sftpSetLocalDirDefault(tabId), null);
   localHead.appendChild(localTitle);
   localHead.appendChild(localUp);
   localHead.appendChild(localHome);
   localHead.appendChild(localPath);
   localHead.appendChild(localCopy);
+  localHead.appendChild(localSetDefault);
   const localTable = document.createElement('table');
   localTable.className = 'sftp-table';
   const localThead = document.createElement('thead');
@@ -1844,8 +1868,35 @@ async function refreshLocalPane(tabId) {
   try {
     await sftpUiLocalLoad(tabId);
   } catch (e) {
+    // A per-server default directory (Task 6) can go stale - deleted since,
+    // or remembered from a different machine sharing the same vault. Fall
+    // back to the OS home directory once rather than leaving the pane stuck
+    // on a path that no longer resolves on this one.
+    const tab = sftpTab(tabId);
+    if (tab && tab.localPath) {
+      tab.localPath = '';
+      try { await sftpUiLocalLoad(tabId); return; } catch (e2) { toast(e2.message || String(e2), 'err'); return; }
+    }
     toast(e.message || String(e), 'err');
   }
+}
+
+/// Remember the local pane's current directory as this server's default
+/// starting point (Task 6) - see sftpLocalDirKey for the settings key shape.
+function sftpSetLocalDirDefault(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  if (!tab.localPath) {
+    toast('Navigate the local pane somewhere first.', 'info');
+    return;
+  }
+  const key = sftpLocalDirKey(tab.serverId);
+  const dir = tab.localPath;
+  // Keep state.settings in step so reopening the panel in this same session
+  // sees the new default without waiting for the next settings_get.
+  if (state.settings) state.settings[key] = dir;
+  call('settings_set', { key, value: dir }).catch(() => {});
+  toast(`Default local directory for ${tab.serverName || 'this server'} set to ${tab.localPath}`, 'ok');
 }
 
 function joinLocal(dir, name) {
@@ -2323,8 +2374,40 @@ async function sftpSendTo(fromTabId, fullPath, targetTab) {
 
 const queueJobs = new Map(); // id -> job
 let queueUnlisten = null;
+// Which tab is visible. Paused jobs (user-paused, or restored from a
+// previous run - see sftpQueueJobResumable) fold into "queued" rather than
+// getting a 4th tab: they're still "waiting their turn", just deliberately
+// held, and the row rendering (paused fill color, Resume action, the
+// restored-jobs banner) already carries the distinction that matters.
 let queueTab = 'queued'; // which tab is visible: queued | failed | done
 let sftpUiQueueH = null; // persisted queue-panel height (px) set by the drag handle
+
+// Pause/resume glyphs aren't in the shared ICONS table (icons.js is out of
+// scope for this pass) - inline the same feather-style stroke icons locally
+// so the buttons match every other icon-btn in look.
+const Q_ICON_PAUSE = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>';
+const Q_ICON_RESUME = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 4 20 12 6 20 6 4"/></svg>';
+
+/// True when some tab holds a live session matching this id - i.e. resuming
+/// this job can actually reach a server rather than failing immediately.
+/// Restored jobs point at a sessionId from the previous run, which no longer
+/// exists once the app has restarted.
+function sftpQueueLiveSession(sessionId) {
+  if (!sessionId) return false;
+  return [...state.sessions.values()].some(t => t.sessionId === sessionId);
+}
+
+/// A paused job is only safely resumable when every session it touches is
+/// still live - for a serverCopy that means both the source AND the target.
+/// resume_job (Rust) doesn't check this itself; it just flips the state to
+/// Queued and lets the job fail on its next attempt, which would blow away
+/// the helpful "needs reconnect" error a restored job carries. So the
+/// renderer checks first and refuses to offer a Resume that can't work.
+function sftpQueueJobResumable(j) {
+  if (!sftpQueueLiveSession(j.sessionId)) return false;
+  if (j.kind === 'serverCopy' && j.targetSessionId && !sftpQueueLiveSession(j.targetSessionId)) return false;
+  return true;
+}
 
 function wireQueueEvents() {
   if (queueUnlisten) return;
@@ -2341,6 +2424,19 @@ function wireQueueEvents() {
     renderQueuePanel();
   }).then(un => { queueUnlisten = un; });
 }
+
+/// Countdown ticker for auto-retry backoffs (Task 2). A single shared
+/// interval for the module's whole lifetime - never one per row - so there
+/// is nothing to leak as rows are rebuilt on every render or the panel is
+/// hidden: it just checks whether any job currently needs a tick and no-ops
+/// otherwise. renderQueuePanel() is idempotent (it always redraws the full
+/// list from queueJobs), so re-invoking it here is exactly as safe as the
+/// backend pushing another sftp-queue event.
+setInterval(() => {
+  if (!document.getElementById('sftpQueueList')) return;
+  const retrying = [...queueJobs.values()].some(j => j.state === 'queued' && j.retryAt);
+  if (retrying) renderQueuePanel();
+}, 1000);
 
 /// ETA from remaining bytes / speed. '-' when speed is 0/unknown or all done.
 /// serverCopy progress counts both halves, so remaining uses 2×size (matching
@@ -2408,6 +2504,18 @@ function buildQueuePanel() {
   }
   const headActions = document.createElement('div');
   headActions.className = 'sftp-queueactions-head';
+  const pauseAllBtn = document.createElement('button');
+  pauseAllBtn.className = 'ghost-btn';
+  pauseAllBtn.textContent = 'Pause all';
+  pauseAllBtn.title = 'Pause every active and queued transfer';
+  pauseAllBtn.addEventListener('click', async () => {
+    try { await call('sftp_queue_pause_all'); } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  const resumeAllBtn = document.createElement('button');
+  resumeAllBtn.className = 'ghost-btn';
+  resumeAllBtn.textContent = 'Resume all';
+  resumeAllBtn.title = 'Resume every paused transfer whose session is still connected';
+  resumeAllBtn.addEventListener('click', () => sftpQueueResumeAllResumable());
   const clearBtn = document.createElement('button');
   clearBtn.className = 'ghost-btn';
   clearBtn.textContent = 'Clear finished';
@@ -2418,11 +2526,21 @@ function buildQueuePanel() {
     }
     renderQueuePanel();
   });
+  headActions.appendChild(pauseAllBtn);
+  headActions.appendChild(resumeAllBtn);
   headActions.appendChild(clearBtn);
   head.appendChild(title);
   head.appendChild(summary);
   head.appendChild(tabs);
   head.appendChild(headActions);
+
+  // Restored-transfer banner (Task 5): hidden until renderQueuePanel finds a
+  // paused job whose session died with the previous run (see
+  // sftpQueueJobResumable). Plain textContent below - only ever a count.
+  const restoredBanner = document.createElement('div');
+  restoredBanner.className = 'sftp-queuebanner';
+  restoredBanner.id = 'sftpQueueRestoredBanner';
+  restoredBanner.hidden = true;
 
   // Column header row + scrolling rows (table-like grid).
   const colhead = document.createElement('div');
@@ -2443,9 +2561,31 @@ function buildQueuePanel() {
 
   panel.appendChild(handle);
   panel.appendChild(head);
+  panel.appendChild(restoredBanner);
   panel.appendChild(colhead);
   panel.appendChild(list);
   return panel;
+}
+
+/// "Resume all" (Task 1/5): sftp_queue_resume_all (Rust) resumes every
+/// Paused job unconditionally, with no idea which sessions are actually
+/// still connected. Calling it directly here would blow past the whole
+/// point of Task 5 - a restored job with a dead session would get bounced
+/// straight to Failed, losing its helpful "reconnect to X" message. So this
+/// resumes jobs one at a time, only the ones sftpQueueJobResumable() says
+/// can actually reach a server, and reports how many were left behind.
+async function sftpQueueResumeAllResumable() {
+  const paused = [...queueJobs.values()].filter(j => j.state === 'paused');
+  const resumable = paused.filter(sftpQueueJobResumable);
+  const skipped = paused.length - resumable.length;
+  if (!resumable.length) {
+    toast(skipped ? 'Those paused transfers need a reconnect first.' : 'Nothing paused to resume.', 'info');
+    return;
+  }
+  await Promise.all(resumable.map(j =>
+    call('sftp_queue_resume', { jobId: j.id }).catch(e => toast(e.message || String(e), 'err'))
+  ));
+  if (skipped) toast(`Resumed ${resumable.length} - ${skipped} more need a reconnect first.`, 'info');
 }
 
 function renderQueuePanel() {
@@ -2462,22 +2602,37 @@ function renderQueuePanel() {
   const jobs = [...queueJobs.values()];
   const active = jobs.filter(j => j.state === 'active');
   const queued = jobs.filter(j => j.state === 'queued');
+  const paused = jobs.filter(j => j.state === 'paused');
   const failed = jobs.filter(j => j.state === 'failed');
   const done = jobs.filter(j => j.state === 'done');
 
   const aggSpeed = active.reduce((s, j) => s + (j.speed || 0), 0);
-  summary.textContent = active.length
-    ? `${active.length} active · ${(aggSpeed / 1024).toFixed(1)} KB/s`
-    : queued.length ? `${queued.length} queued` : (failed.length ? `${failed.length} failed` : '');
+  const summaryParts = [];
+  if (active.length) summaryParts.push(`${active.length} active · ${(aggSpeed / 1024).toFixed(1)} KB/s`);
+  if (queued.length) summaryParts.push(`${queued.length} queued`);
+  if (paused.length) summaryParts.push(`${paused.length} paused`);
+  if (!summaryParts.length && failed.length) summaryParts.push(`${failed.length} failed`);
+  summary.textContent = summaryParts.join(' · ');
+
+  // Restored-transfer banner (Task 5): only the jobs a Resume click would
+  // actually fail on - see sftpQueueJobResumable.
+  const staleRestored = paused.filter(j => !sftpQueueJobResumable(j));
+  const banner = document.getElementById('sftpQueueRestoredBanner');
+  if (banner) {
+    banner.hidden = staleRestored.length === 0;
+    banner.textContent = staleRestored.length === 1
+      ? '1 transfer from a previous session is paused - reconnect to that server to resume it.'
+      : `${staleRestored.length} transfers from a previous session are paused - reconnect to those servers to resume them.`;
+  }
 
   const shown = queueTab === 'queued'
-    ? [...active, ...queued]
+    ? [...active, ...queued, ...paused]
     : queueTab === 'failed' ? failed : done;
 
   list.innerHTML = '';
   for (const j of shown.slice(-100).reverse()) {
     const row = document.createElement('div');
-    row.className = 'sftp-queueitem';
+    row.className = 'sftp-queueitem q-state-' + j.state;
     const name = j.kind === 'upload'
       ? (j.remotePath || '').split('/').filter(Boolean).pop()
       : (j.remotePath || '').split('/').filter(Boolean).pop();
@@ -2489,6 +2644,9 @@ function renderQueuePanel() {
     // serverCopy: bytesDone is overall (download half + upload half), so the
     // progress bar maps 0..2×size onto 0..100%.
     const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
+    // Paused/queued jobs keep whatever bytesDone the backend last reported
+    // (the .part on disk is untouched by pausing), so this naturally holds
+    // the bar's position instead of zeroing it - nothing extra needed here.
     const pct = totalUnits > 0
       ? Math.min(100, (j.bytesDone / totalUnits) * 100)
       : (j.state === 'done' ? 100 : 0);
@@ -2504,22 +2662,77 @@ function renderQueuePanel() {
       : formatSftpSize(shownDone || 0);
     const speed = j.speed ? (j.speed / 1024).toFixed(1) + ' KB/s' : '-';
     const eta = sftpUiQueueEta(j, shownDone);
+    // Verify badge (Task 4): a small marker on jobs that ran (or will run)
+    // with post-transfer SHA-256 verification, so the extra traffic/time
+    // it costs isn't a silent surprise when watching the queue.
+    const verifyBadge = j.verify
+      ? `<span class="q-verify" title="Verifying with SHA-256 after transfer">${ico('shield-check')}</span>`
+      : '';
+    // Auto-retry countdown (Task 2): a backoff-queued job carries
+    // attempts > 0 and a future retryAt, plus a human error like
+    // "connection reset — retrying (2/3)". Pull just the "(2/3)" back out
+    // of that string rather than hardcoding the retry cap here, so the two
+    // stay in sync automatically; the full backend message is still the
+    // tooltip. A single shared ticker (see setInterval above) redraws this
+    // once a second - no per-row timer to leak.
+    const retrySecs = (j.state === 'queued' && j.retryAt)
+      ? Math.max(0, Math.ceil((j.retryAt - Date.now()) / 1000))
+      : null;
+    let errDisplay = j.error || '';
+    let errClass = '';
+    if (retrySecs !== null) {
+      const m = errDisplay.match(/\((\d+\/\d+)\)\s*$/);
+      errDisplay = `retrying in ${retrySecs}s${m ? ' (' + m[1] + ')' : ''}`;
+      errClass = ' retrying';
+    } else if (j.state === 'paused' && j.error) {
+      errClass = ' info'; // restored/paused note, not a failure - don't paint it red
+    }
 
     row.innerHTML = `
       <span class="q-cell q-dir">${dirIcon}</span>
-      <span class="q-cell q-name" title="${escapeHtml(name || '')}">${escapeHtml(name || '?')}</span>
+      <span class="q-cell q-name" title="${escapeHtml(name || '')}">${verifyBadge}${escapeHtml(name || '?')}</span>
       <span class="q-cell q-route" title="${route}">${route}</span>
       <span class="q-cell q-prog">
-        <span class="sftp-queuebar"><span class="sftp-queuefill${j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : ''}" style="width:${pct}%"></span></span>
+        <span class="sftp-queuebar"><span class="sftp-queuefill${j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : j.state === 'paused' ? ' paused' : ''}" style="width:${pct}%"></span></span>
         <span class="q-progtext">${progress}</span>
       </span>
       <span class="q-cell q-speed">${speed}</span>
       <span class="q-cell q-eta">${eta}</span>
-      <span class="q-cell q-err" title="${escapeHtml(j.error || '')}">${escapeHtml(j.error || '')}</span>`;
+      <span class="q-cell q-err${errClass}" title="${escapeHtml(j.error || '')}">${escapeHtml(errDisplay)}</span>`;
 
     const actions = document.createElement('span');
     actions.className = 'q-cell q-act sftp-queueactions';
     if (j.state === 'active' || j.state === 'queued') {
+      const pause = document.createElement('button');
+      pause.className = 'icon-btn';
+      pause.title = 'Pause';
+      pause.innerHTML = Q_ICON_PAUSE;
+      pause.addEventListener('click', () => call('sftp_queue_pause', { jobId: j.id }));
+      actions.appendChild(pause);
+      const cancel = document.createElement('button');
+      cancel.className = 'icon-btn';
+      cancel.title = 'Cancel';
+      cancel.innerHTML = ico('x');
+      cancel.addEventListener('click', () => call('sftp_queue_cancel', { jobId: j.id }));
+      actions.appendChild(cancel);
+    } else if (j.state === 'paused') {
+      const resumable = sftpQueueJobResumable(j);
+      const resume = document.createElement('button');
+      resume.className = resumable ? 'icon-btn' : 'icon-btn disabled';
+      resume.innerHTML = Q_ICON_RESUME;
+      if (resumable) {
+        resume.title = 'Resume';
+        resume.addEventListener('click', () => call('sftp_queue_resume', { jobId: j.id }));
+      } else {
+        // Session from the previous run (or a since-closed tab) is gone -
+        // resume_job would just fail the job. Disabled, not wired.
+        resume.title = `Reconnect to "${j.serverName || 'the server'}" to resume`;
+        resume.disabled = true;
+      }
+      actions.appendChild(resume);
+      // Cancel is the way off a paused row that can never resume — a job
+      // restored from a previous run whose session is gone. cancel_job
+      // transitions Paused as well as Queued, so this is not a no-op.
       const cancel = document.createElement('button');
       cancel.className = 'icon-btn';
       cancel.title = 'Cancel';

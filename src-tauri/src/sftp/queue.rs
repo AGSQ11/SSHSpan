@@ -2018,7 +2018,13 @@ pub fn cancel_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
                 if let Some(c) = &j.cancel {
                     c.store(true, Ordering::SeqCst);
                 }
-                if j.state == JobState::Queued {
+                // Queued and Paused both have no worker to wind down, so the
+                // transition happens here; an Active job is finalized by its
+                // worker when it notices the flag. Paused matters especially
+                // for a job restored from a previous run whose session is
+                // gone: resume cannot start it, so without this it could
+                // never leave the queue at all.
+                if matches!(j.state, JobState::Queued | JobState::Paused) {
                     j.state = JobState::Cancelled;
                 }
                 Some(j.to_row())

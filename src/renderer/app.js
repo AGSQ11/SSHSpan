@@ -1822,6 +1822,96 @@ async function loadSettings() {
   });
   mkRow('Show hidden files in SFTP by default', sftpHidden);
 
+  // sftpMaxBps and sftpVerifyTransfers below aren't in settings_get's
+  // (Rust) key allowlist, so unlike every setting above, this renderer can
+  // never read the persisted value back through settings_get - there's no
+  // generic "read one key" command either. settings_set is still the
+  // source of truth (it writes the same setting.<key> row every setting
+  // uses, and the queue backend reads it directly - see set_rate_limit /
+  // verify_enabled in queue.rs), but redisplaying the current value here on
+  // next launch needs its own copy; sftpSettingCacheGet/Set (sftp.js) keep
+  // one in localStorage, which - like the rest of a Tauri webview's storage
+  // - persists on disk across restarts same as the DB does.
+  const cacheGet = (k, d) => (typeof window.sftpSettingCacheGet === 'function' ? window.sftpSettingCacheGet(k, d) : d);
+  const cacheSet = (k, v) => { if (typeof window.sftpSettingCacheSet === 'function') window.sftpSettingCacheSet(k, v); };
+
+  // Bandwidth throttle (Task 3): stored as whole bytes/sec (sftpMaxBps), but
+  // shown as a magnitude + KB/s-or-MB/s unit with an explicit Unlimited
+  // toggle - nobody thinks in raw bytes/sec.
+  const bpsStored = parseInt(cacheGet('sftpMaxBps', '0'), 10) || 0;
+  const bpsWrap = document.createElement('span');
+  bpsWrap.className = 'settings-combo';
+  const bpsUnlimited = document.createElement('input');
+  bpsUnlimited.type = 'checkbox';
+  bpsUnlimited.checked = bpsStored === 0;
+  const bpsNum = document.createElement('input');
+  bpsNum.type = 'number';
+  bpsNum.min = '1';
+  bpsNum.max = '1000000';
+  const bpsUnit = document.createElement('select');
+  bpsUnit.innerHTML = '<option value="1024">KB/s</option><option value="1048576">MB/s</option>';
+  if (bpsStored > 0 && bpsStored % 1048576 === 0) {
+    bpsUnit.value = '1048576';
+    bpsNum.value = bpsStored / 1048576;
+  } else {
+    bpsUnit.value = '1024';
+    bpsNum.value = bpsStored > 0 ? Math.max(1, Math.round(bpsStored / 1024)) : 512;
+  }
+  bpsNum.disabled = bpsUnlimited.checked;
+  bpsUnit.disabled = bpsUnlimited.checked;
+  const bpsUnlimitedTag = document.createElement('span');
+  bpsUnlimitedTag.className = 'settings-combo-tag';
+  bpsUnlimitedTag.textContent = 'Unlimited';
+  bpsUnlimitedTag.addEventListener('click', () => {
+    bpsUnlimited.checked = !bpsUnlimited.checked;
+    bpsUnlimited.dispatchEvent(new Event('change'));
+  });
+  const applyThrottle = async () => {
+    bpsNum.disabled = bpsUnlimited.checked;
+    bpsUnit.disabled = bpsUnlimited.checked;
+    const mag = Math.max(1, Math.min(1000000, parseInt(bpsNum.value, 10) || 1));
+    bpsNum.value = mag;
+    const bytesPerSec = bpsUnlimited.checked ? 0 : mag * parseInt(bpsUnit.value, 10);
+    try {
+      await call('settings_set', { key: 'sftpMaxBps', value: String(bytesPerSec) });
+      cacheSet('sftpMaxBps', String(bytesPerSec));
+      // Also push it live - settings_set alone only takes effect on the
+      // NEXT transfer (restore_pending re-reads it at startup); workers
+      // already running re-check rate_bps every chunk, so this applies the
+      // change to them immediately instead of making the user wait.
+      await call('sftp_queue_set_rate_limit', { bytesPerSec });
+      state.settings.sftpMaxBps = String(bytesPerSec);
+      toast(bytesPerSec === 0
+        ? 'Bandwidth limit removed.'
+        : `Bandwidth limit set to ${mag} ${bpsUnit.value === '1048576' ? 'MB/s' : 'KB/s'}.`, 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  };
+  bpsUnlimited.addEventListener('change', applyThrottle);
+  bpsNum.addEventListener('change', applyThrottle);
+  bpsUnit.addEventListener('change', applyThrottle);
+  bpsWrap.appendChild(bpsUnlimited);
+  bpsWrap.appendChild(bpsUnlimitedTag);
+  bpsWrap.appendChild(bpsNum);
+  bpsWrap.appendChild(bpsUnit);
+  mkRow('SFTP bandwidth limit (all transfers, shared)', bpsWrap);
+
+  // Verify toggle (Task 4): off by default - the label states the actual
+  // cost up front rather than burying it in a tooltip, since re-reading
+  // both sides to hash them roughly doubles the traffic a transfer uses.
+  const sftpVerify = document.createElement('input');
+  sftpVerify.type = 'checkbox';
+  sftpVerify.checked = cacheGet('sftpVerifyTransfers', 'false') === 'true';
+  sftpVerify.addEventListener('change', async () => {
+    const value = sftpVerify.checked ? 'true' : 'false';
+    try {
+      await call('settings_set', { key: 'sftpVerifyTransfers', value });
+      cacheSet('sftpVerifyTransfers', value);
+      state.settings.sftpVerifyTransfers = value;
+      toast('Saved.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Verify transfers with SHA-256 after upload/download (re-reads both sides - roughly doubles transfer traffic)', sftpVerify);
+
   // Conflict default actions (the "Always use this action" checkbox in the
   // transfer conflict dialog writes the same keys). Values are mirrored
   // into window.sftpConflictDefaults so sftp.js sees them without a reload.

@@ -652,6 +652,39 @@ impl Database {
         })
     }
 
+    /// Every config row whose key starts with `prefix`, as (key, value).
+    ///
+    /// `settings_get` exposes a fixed allowlist of keys to the renderer so
+    /// that secrets living in the same table (`bwSync.*`) can never be read
+    /// out through it. That works only for keys known at compile time; a
+    /// per-server setting is one key per server id and cannot be enumerated
+    /// in advance. This narrows the same boundary to a prefix instead: the
+    /// caller names the family it wants, not the whole table.
+    ///
+    /// `_` and `%` in the prefix are escaped so a key containing either is
+    /// matched literally rather than as a LIKE wildcard.
+    pub fn list_config_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let pattern = format!(
+            "{}%",
+            prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        block(async {
+            let rows = sqlx::query(
+                "SELECT key, value FROM config WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+            )
+            .bind(pattern)
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get("key"), r.get("value")))
+                .collect())
+        })
+    }
+
     // ── Audit log ──────────────────────────────────────────────────────────
 
     pub fn add_audit(&self, action: &str, key_id: Option<&str>, details: &str) -> Result<()> {

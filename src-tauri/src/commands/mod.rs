@@ -2133,6 +2133,11 @@ pub fn audit_list(app: AppHandle, limit: Option<i64>) -> CmdResult<serde_json::V
 //  SETTINGS commands
 // ═════════════════════════════════════════════════════════════════════════════
 
+/// Key prefix for the per-server default local directory (`sftpLocalDir:<id>`).
+/// Shared by `settings_get`'s prefix read and `settings_set`'s validation so
+/// the two can never disagree about what the family is called.
+const SFTP_LOCAL_DIR_PREFIX: &str = "sftpLocalDir:";
+
 #[tauri::command]
 pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
     let keys = [
@@ -2152,6 +2157,8 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
         "sftpPreserveTs",
         "sftpCmpMode",
         "sftpResumeDefault",
+        "sftpMaxBps",
+        "sftpVerifyTransfers",
         "terminalScrollback",
         "terminalBackspace",
         "terminalHomeEnd",
@@ -2170,6 +2177,20 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
             .map_err(|e| e.to_string())?
         {
             settings.insert(key.to_string(), serde_json::Value::String(val));
+        }
+    }
+    // Per-server defaults are one key per server id, so they cannot live in
+    // the fixed list above. Read the family by prefix instead, which keeps
+    // the allowlist boundary that stops `bwSync.*` secrets in the same table
+    // from being readable here.
+    for (key, val) in app
+        .state::<AppState>()
+        .db
+        .list_config_prefix(&format!("setting.{SFTP_LOCAL_DIR_PREFIX}"))
+        .map_err(|e| e.to_string())?
+    {
+        if let Some(bare) = key.strip_prefix("setting.") {
+            settings.insert(bare.to_string(), serde_json::Value::String(val));
         }
     }
     Ok(serde_json::Value::Object(settings))
