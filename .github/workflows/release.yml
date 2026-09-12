@@ -176,7 +176,11 @@ jobs:
               echo "::error::Unsupported runner OS for the pinned minisign download."; exit 1 ;;
           esac
           curl -fsSL -o "$RUNNER_TEMP/minisign-dl" "$url"
-          actual="$(sha256sum "$RUNNER_TEMP/minisign-dl" | cut -d' ' -f1)"
+          # Hash a bare filename from inside RUNNER_TEMP: on Windows the
+          # absolute path contains backslashes, and GNU coreutils escapes an
+          # output line with a leading '\' when the filename does — which
+          # broke the string comparison below ("got \37b6003…" ≠ expected).
+          actual="$(cd "$RUNNER_TEMP" && sha256sum minisign-dl | cut -d' ' -f1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error::minisign download checksum mismatch (expected $expected, got $actual); refusing to sign with it."
             exit 1
