@@ -185,9 +185,11 @@ download path is hardened:
 - **SHA-256 verification** against GitHub's computed asset digest before execution.
 - **minisign release signature** verified against a public key embedded in the binary —
   which binds the installer to the source tree even if the GitHub repo/token is compromised.
-  Until the maintainer provisions the signing key (`MINISIGN_SECRET_KEY` secret + embedded
-  public key, see CHANGELOG "Unreleased"), releases ship unsigned and the digest check
-  alone applies; the updater logs this state at startup.
+  The key was provisioned on 2026-09-12 (key id `D67C45BA942239D8`; the secret lives in the
+  `MINISIGN_SECRET_KEY` Actions secret and the maintainer's offline backup, never in the
+  repository). Verification is fail-closed: a missing or invalid signature refuses the
+  update, so releases published before provisioning cannot serve as auto-update sources
+  for provisioned builds.
 
 ## Threat model
 
@@ -269,5 +271,6 @@ These are deliberate, documented trade-offs, not bugs:
   and do not share them.
 - Review the audit log periodically for unexpected key creation, deletion, export, deploy,
   or host-key trust events.
-- Provision the minisign release key (CHANGELOG "Unreleased" checklist) so auto-updates are
-  signature-verified end to end.
+- Keep the minisign signing key backed up offline (losing it means losing the ability to
+  sign updates); if it is ever compromised, rotate it by replacing both the
+  `MINISIGN_SECRET_KEY` secret and the embedded public key in the same release.

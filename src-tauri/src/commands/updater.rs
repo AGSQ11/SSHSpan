@@ -30,29 +30,25 @@ const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 /// minisign public key (base64 body of `minisign.pub`, i.e. the SECOND line
 /// of the key file — algorithm bytes + key id + Ed25519 key, base64-encoded).
 ///
-/// PROVISIONING: the SHA-256 asset digest returned by the GitHub API comes
-/// from the same release that serves the installer, so it only proves the
-/// download matches the release — not that the release itself is trusted.
-/// This embedded key closes that gap: the release workflow signs every
-/// installer with the minisign SECRET key (GitHub secret
-/// `MINISIGN_SECRET_KEY`) and uploads the `.minisig` files as release
-/// assets; `update_download_and_run` refuses to run an installer whose
-/// signature does not verify against this PUBLIC key, which lives in the
-/// source tree and cannot be changed by whoever controls the release.
+/// The SHA-256 asset digest returned by the GitHub API comes from the same
+/// release that serves the installer, so it only proves the download matches
+/// the release — not that the release itself is trusted. This embedded key
+/// closes that gap: the release workflow signs every installer with the
+/// minisign SECRET key (GitHub secret `MINISIGN_SECRET_KEY`) and uploads the
+/// `.minisig` files as release assets; `update_download_and_run` refuses to
+/// run an installer whose signature does not verify against this PUBLIC key,
+/// which lives in the source tree and cannot be changed by whoever controls
+/// the release.
 ///
-/// Until the maintainer generates a keypair this stays a PLACEHOLDER and
-/// verification is SKIPPED with a logged warning (the GitHub digest check
-/// still applies — current behavior). To provision:
-///   1. `minisign -G -W` (creates an unencrypted minisign.pub + minisign.key;
-///      the -W is required because the release workflow signs
-///      non-interactively).
-///   2. Repository settings → Secrets → Actions → new secret
-///      `MINISIGN_SECRET_KEY` whose value is the ENTIRE contents of
-///      `minisign.key` (both lines).
-///   3. Replace the string below with the base64 body of `minisign.pub`
-///      (the second line, starting with `RW`). See the CHANGELOG
-///      "Unreleased" section for the full checklist.
-const MINISIGN_PUBLIC_KEY: &str = "PLACEHOLDER-REPLACE-WITH-BASE64-PUBLIC-KEY";
+/// Key provisioned 2026-09-12 (key id D67C45BA942239D8). The secret key is
+/// NOT in the repository — it lives in the `MINISIGN_SECRET_KEY` Actions
+/// secret and in the maintainer's offline backup. From this build on,
+/// signature verification is FAIL-CLOSED: a missing, invalid, or unsigned
+/// `.minisig` refuses the update. Releases older than the first signed one
+/// cannot be auto-update sources for provisioned builds. To rotate: generate
+/// a new pair (`minisign -G -W`), replace this const, and update the
+/// `MINISIGN_SECRET_KEY` secret in the same release.
+const MINISIGN_PUBLIC_KEY: &str = "RWTYOSKUukV81mdaGcLXYzZmZNrPbxlpBqedq7f7kb/PnK87ALjqn055";
 
 /// Marker value of `MINISIGN_PUBLIC_KEY` before the maintainer provisions
 /// the real key; matched by full equality.
@@ -1011,6 +1007,18 @@ SWYMI+zOPB2iL5kCX2udBtoWCA9aGT7AvUVmT4Xa1CDTDUadQKeArHOsgGjFxnV/3xtgKHY5t3aUFcma
         assert!(!minisign_key_provisioned(MINISIGN_PUBLIC_KEY_PLACEHOLDER));
         assert!(minisign_key_provisioned(TEST_MINISIGN_PUBKEY));
         assert!(minisign_key_provisioned(""));
+    }
+
+    #[test]
+    fn shipped_minisign_key_is_provisioned_and_wellformed() {
+        // Guards against the placeholder ever sneaking back into the build:
+        // the shipped const must be a real (provisioned, parseable) key so
+        // signature verification stays fail-closed.
+        assert!(minisign_key_provisioned(MINISIGN_PUBLIC_KEY));
+        assert!(
+            minisign_verify::PublicKey::from_base64(MINISIGN_PUBLIC_KEY).is_ok(),
+            "shipped minisign public key must parse"
+        );
     }
 
     #[test]

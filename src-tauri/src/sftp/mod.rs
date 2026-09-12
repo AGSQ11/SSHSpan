@@ -224,16 +224,24 @@ fn is_windows_device_name(stem: &str) -> bool {
     DEVICES.iter().any(|d| d.eq_ignore_ascii_case(stem))
 }
 
-/// Extensions that must never be preserved on a staged edit file: opening one
-/// via the OS shell would execute it (ShellExecute honors the extension) or
-/// otherwise hand it to a dangerous handler. Case-insensitive.
-const BLOCKED_STAGE_EXTENSIONS: [&str; 24] = [
-    "exe", "scr", "bat", "cmd", "com", "pif", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf",
-    "wsh", "hta", "msi", "msp", "lnk", "url", "reg", "dll", "cpl", "inf", "jar",
+/// Extensions that may be preserved on a staged edit file: plain-text/data
+/// formats whose OS handler opens an editor or viewer, never a program that
+/// executes its input. EVERYTHING ELSE — including every unknown extension —
+/// is forced to `.txt`. This is an allowlist rather than the old executable
+/// denylist on purpose: a denylist ages badly (each new executable/packaged
+/// format is a gap until someone adds it), while the edit flow is text-editor
+/// based anyway, so an unknown extension has no honest handler to preserve.
+/// The staged name does not affect what is uploaded back — the original
+/// remote path is untouched — so collapsing names to `.txt` costs nothing
+/// except a default-app association.
+const INERT_STAGE_EXTENSIONS: [&str; 25] = [
+    "txt", "text", "log", "md", "markdown", "rst", "cfg", "conf", "ini", "cnf", "json", "yaml",
+    "yml", "toml", "xml", "css", "csv", "tsv", "sql", "pem", "crt", "cer", "key", "pub",
+    "properties",
 ];
 
-fn is_blocked_stage_extension(ext: &str) -> bool {
-    BLOCKED_STAGE_EXTENSIONS.iter().any(|b| b.eq_ignore_ascii_case(ext))
+fn is_inert_stage_extension(ext: &str) -> bool {
+    INERT_STAGE_EXTENSIONS.iter().any(|b| b.eq_ignore_ascii_case(ext))
 }
 
 /// Unpredictable staged-file name for a remote file: `{base}.{uuid}.{ext}`
@@ -242,32 +250,33 @@ fn is_blocked_stage_extension(ext: &str) -> bool {
 /// hold remote (potentially secret) contents; the sanitized base and the
 /// original extension are preserved so the editor association still works.
 ///
-/// If the remote extension is executable/dangerous (e.g. `.scr`, `.exe`), it
-/// is NEVER preserved — the staged name is forced to end in `.txt` so the OS
-/// shell opens it in an editor instead of executing it. A remote name that is
-/// only a blocked extension (`.scr`) or empty stages as `file.{uuid}.txt`.
+/// If the remote extension is not on the inert allowlist (executable,
+/// packaged, binary, or simply unknown — e.g. `.scr`, `.exe`, `.7z`), it is
+/// NEVER preserved — the staged name is forced to end in `.txt` so the OS
+/// shell opens it in an editor instead of handing it to whatever handler the
+/// extension maps to. A remote name that is only a non-inert extension
+/// (`.scr`) or empty stages as `file.{uuid}.txt`.
 pub fn staged_file_name(remote_name: &str) -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let base = sanitize_stage_base(remote_name);
     let base = if base.is_empty() { "file" } else { &base };
     match base.rsplit_once('.') {
         // Preserve a non-empty extension, limiting it to a sane length so a
-        // dot-heavy name cannot produce a pathologically long tail — unless
-        // the extension is executable/dangerous, in which case the staged
-        // name is forced to `.txt` (drop the blocked tail from the base so
-        // the result cannot end in e.g. `.scr.txt.scr`-style residue).
+        // dot-heavy name cannot produce a pathologically long tail — but only
+        // if the extension is on the inert allowlist; anything else stages as
+        // `.txt`.
         Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 16 => {
-            if is_blocked_stage_extension(ext) {
-                format!("{stem}.{id}.txt")
-            } else {
+            if is_inert_stage_extension(ext) {
                 format!("{stem}.{id}.{ext}")
+            } else {
+                format!("{stem}.{id}.txt")
             }
         }
-        // No usable stem/extension. If the whole name is a blocked extension
-        // (`.scr` sanitizes to `.scr`, stem empty) stage as inert text; other
-        // extension-less names keep the suffix form.
+        // No usable stem/extension. Three cases: no extension at all
+        // ("Makefile") and bare inert extensions (".conf") keep the suffix
+        // form; a bare NON-inert extension (".scr") stages as inert text.
         _ => {
-            if base.starts_with('.') && base.len() > 1 && is_blocked_stage_extension(&base[1..]) {
+            if base.starts_with('.') && base.len() > 1 && !is_inert_stage_extension(&base[1..]) {
                 format!("file.{id}.txt")
             } else {
                 format!("{base}-{id}")
@@ -419,21 +428,43 @@ mod tests {
     #[test]
     fn staged_name_rejects_empty_and_long_extensions() {
         assert!(staged_file_name("").starts_with("file-"));
-        // A dot-heavy name whose "extension" is >16 chars keeps its dots in
-        // the base and gets the no-extension suffix form.
+        // A dot-heavy name whose "extension" is non-inert stages as inert
+        // text: the base survives, the tail does not.
         let a = staged_file_name("v1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17");
-        assert!(a.ends_with(".17"), "base must be preserved verbatim: {a}");
+        assert!(a.starts_with("v1.2.3."), "base must be preserved: {a}");
+        assert!(a.ends_with(".txt"), "non-inert tail must collapse to .txt: {a}");
+        // A genuinely over-long "extension" (>16 chars) takes the no-
+        // extension suffix form instead: base preserved, uuid appended.
+        let b = staged_file_name("v1.2.3.verylongextensionnamethatexceedssixteen");
+        assert!(
+            b.starts_with("v1.2.3.verylongextensionnamethatexceedssixteen-"),
+            "over-long extension must take the suffix form: {b}"
+        );
     }
 
     #[test]
-    fn staged_name_forces_txt_for_blocked_extensions() {
-        for name in ["evil.scr", "x.EXE", "run.ps1", "doc.msi", "link.url", "shell.cpl", "app.jar", "setup.inf"] {
+    fn staged_name_forces_txt_for_non_inert_extensions() {
+        // Known-executable names and — the point of the allowlist — every
+        // UNKNOWN/binary extension stage as .txt; only inert text formats
+        // keep their extension.
+        for name in [
+            "evil.scr", "x.EXE", "run.ps1", "doc.msi", "link.url", "shell.cpl", "app.jar",
+            "setup.inf", "app.7z", "doc.docx", "image.jpg", "page.html", "setup.msix",
+            "data.db", "archive.tar.gz", "script.py",
+        ] {
             let a = staged_file_name(name);
-            assert!(a.ends_with(".txt"), "blocked extension must stage as .txt: {name} → {a}");
+            assert!(a.ends_with(".txt"), "non-inert extension must stage as .txt: {name} → {a}");
+        }
+        for name in [
+            "notes.txt", "server.conf", "app.ini", "config.yaml", "data.json", "cert.pem",
+            "report.csv", "readme.md", "style.css", "backup.log",
+        ] {
+            let a = staged_file_name(name);
             let ext = a.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-            assert!(
-                !is_blocked_stage_extension(&ext),
-                "staged name must not end in a blocked extension: {name} → {a}"
+            let src_ext = name.rsplit('.').next().unwrap().to_ascii_lowercase();
+            assert_eq!(
+                ext, src_ext,
+                "inert extension must be preserved: {name} → {a}"
             );
         }
         // The uuid component and sanitized base survive the rewrite.
@@ -444,16 +475,17 @@ mod tests {
     }
 
     #[test]
-    fn staged_name_blocked_extension_with_trailing_dot() {
+    fn staged_name_non_inert_extension_with_trailing_dot() {
         // Windows strips a trailing dot, so `notes.txt.` would land on disk as
         // `notes.txt`; and `evil.scr.` would land as `evil.scr` (executable).
-        // The sanitizer trims the dot first, so the blocked check still fires.
+        // The sanitizer trims the dot first, so the allowlist check still
+        // sees the true extension.
         let a = staged_file_name("notes.txt.");
         assert!(a.ends_with(".txt"), "trailing dot must not break staging: {a}");
         assert!(a.starts_with("notes."), "base must be preserved: {a}");
 
         let a = staged_file_name("evil.scr.");
-        assert!(a.ends_with(".txt"), "blocked ext behind a trailing dot must still be forced to .txt: {a}");
+        assert!(a.ends_with(".txt"), "non-inert ext behind a trailing dot must still be forced to .txt: {a}");
         assert!(a.starts_with("evil."), "base must be preserved: {a}");
     }
 
@@ -479,12 +511,16 @@ mod tests {
     }
 
     #[test]
-    fn staged_name_bare_blocked_extension_and_empty() {
-        // A remote name that is only an extension stages deterministically as
-        // an inert text file.
+    fn staged_name_bare_extension_and_empty() {
+        // A remote name that is only a NON-INERT extension stages
+        // deterministically as an inert text file.
         let a = staged_file_name(".scr");
-        assert!(a.starts_with("file."), "bare blocked extension must stage as file.*: {a}");
-        assert!(a.ends_with(".txt"), "bare blocked extension must stage as .txt: {a}");
+        assert!(a.starts_with("file."), "bare non-inert extension must stage as file.*: {a}");
+        assert!(a.ends_with(".txt"), "bare non-inert extension must stage as .txt: {a}");
+
+        // A bare INERT extension keeps the suffix form (editor association).
+        let a = staged_file_name(".conf");
+        assert!(a.starts_with(".conf-"), "bare inert extension keeps the suffix form: {a}");
 
         // Empty name keeps the existing deterministic fallback.
         assert!(staged_file_name("").starts_with("file-"));
