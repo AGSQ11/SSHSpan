@@ -15,23 +15,10 @@
     "core:path:default",
     "core:menu:default",
 
-    "fs:default",
-    "fs:allow-exists",
-    "fs:allow-mkdir",
-    "fs:allow-read-file",
-    "fs:allow-read-dir",
-    "fs:allow-write-file",
-    "fs:allow-remove",
-    "fs:allow-rename",
-    "fs:allow-stat",
-
     "dialog:default",
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-message",
-
-    "shell:default",
-    "shell:allow-execute",
 
     "process:default",
     "process:allow-exit",
@@ -46,8 +33,6 @@
     "notification:default",
     "notification:allow-notify",
 
-    "opener:default",
-    "opener:allow-open-url",
     "opener:allow-reveal-item-in-dir",
 
     "clipboard-manager:default",

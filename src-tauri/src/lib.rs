@@ -41,9 +41,7 @@ impl AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
@@ -62,6 +60,10 @@ pub fn run() {
 
             // Vault password lives in memory only; cleared on lock / quit
             app.manage(VaultPasswordStore::new());
+            // Save-dialog-approved write targets (system_write_text_file gate)
+            app.manage(commands::DialogPathStore::new());
+            // Master-password guess backoff (unlock / change-password)
+            app.manage(commands::UnlockThrottle::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -93,6 +95,7 @@ pub fn run() {
             key_generate,
             key_import,
             key_export,
+            key_export_to_file,
             key_delete,
             key_list,
             key_get,
@@ -125,12 +128,14 @@ pub fn run() {
             terminal_list,
             server_test,
             known_hosts_list,
+            known_hosts_check,
             known_hosts_forget,
             sftp_open,
             sftp_list_dir,
             sftp_mkdir,
             sftp_remove,
             sftp_rename,
+            sftp_set_mtime,
             sftp_download,
             sftp_upload,
             sftp_open_for_edit,
@@ -164,6 +169,7 @@ pub fn run() {
             audit_list,
             // System commands
             system_open_external,
+            system_open_url,
             system_show_item_in_folder,
             system_select_file,
             system_pick_save_path,
@@ -171,8 +177,27 @@ pub fn run() {
             update_check,
             update_download_and_run,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        // Best-effort lifecycle teardown: Tauri v2's desktop run loop does NOT
+        // expose OS suspend/lock events (WindowEvent::Suspended/Resumed are
+        // mobile-only).  We therefore reuse the existing `vault_lock` teardown
+        // when the app is about to exit.  This clears the in-memory master
+        // password and stops live sessions, but it cannot cover an OS suspend
+        // that leaves the process alive.  A true OS-suspend handler would need a
+        // platform-specific crate (e.g. `windows` on Win32) and is out of scope
+        // for this fix.
+        .run(|_app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
+                let _ = _app_handle
+                    .state::<crate::commands::VaultPasswordStore>()
+                    .clear();
+                _app_handle
+                    .state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
+                    .kill_all();
+            }
+            _ => {}
+        });
 }
 
 /// Create system tray with menu

@@ -21,6 +21,39 @@ use crate::ssh_client::SessionRegistry;
 use crate::AppState;
 
 use super::{CmdError, CmdResult};
+use directories::ProjectDirs;
+
+/// Reject non-absolute `local` paths and paths whose canonicalized parent
+/// would fall inside the app data directory or a system directory. The app
+/// data rule mirrors `system_write_text_file`; the system-dir rule reuses the
+/// same denylist, so a (hypothetically compromised) renderer cannot aim SFTP
+/// downloads at `C:\Windows`, `/etc`, or friends either.
+fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err("Local path must be absolute.".into());
+    }
+
+    let parent = match p.parent() {
+        Some(parent) => parent,
+        None => return Err("Local path has no parent directory.".into()),
+    };
+
+    let normalized = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+
+    if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
+        let app_data_dir = app_data.data_dir();
+        if normalized.starts_with(app_data_dir) {
+            return Err("Writing into the application data directory is not allowed.".into());
+        }
+    }
+
+    if super::is_system_path(&normalized) {
+        return Err("Writing into a system directory is not allowed.".into());
+    }
+
+    Ok(())
+}
 
 fn sftp_from_session(
     app: &AppHandle,
@@ -66,7 +99,7 @@ fn describe_sftp_error(stage: &str, e: russh_sftp::client::error::Error) -> CmdE
 /// (e.g. a bare SSH_FX_FAILURE). Unwrap the wrapper's Display chain so the
 /// message goes through [`sftp_error_detail`] instead of the raw doubled
 /// "Failure: Failure" text.
-fn describe_download_read_error(e: std::io::Error) -> CmdError {
+pub(crate) fn describe_download_read_error(e: std::io::Error) -> CmdError {
     use std::error::Error as _;
     // The client Error enum is private from the protocol module; match on
     // the Display text is fragile, so walk the source chain and try the
@@ -176,15 +209,72 @@ pub async fn sftp_remove(
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
     if is_dir {
-        sftp.remove_dir(&path)
-            .await
-            .map_err(|e| CmdError(format!("rmdir failed: {e}")))?;
+        // Recursive delete: rmdir only succeeds on an EMPTY directory, so a
+        // folder with contents must be emptied depth-first first.
+        remove_remote_tree(&sftp, &path).await.map_err(CmdError)?;
     } else {
         sftp.remove_file(&path)
             .await
             .map_err(|e| CmdError(format!("rm failed: {e}")))?;
     }
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Depth-first recursive delete of a remote directory tree. Children are
+/// removed before their parent (rmdir requires an empty dir). Symlinks are
+/// unlinked, never followed — `symlink_metadata` classifies the link itself.
+fn remove_remote_tree<'a>(
+    sftp: &'a russh_sftp::client::SftpSession,
+    path: &'a str,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut first_err: Option<String> = None;
+        let mut entries = sftp
+            .read_dir(path)
+            .await
+            .map_err(|e| format!("list {path}: {e}"))?;
+        while let Some(entry) = entries.next() {
+            let name = entry.file_name().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child = format!("{}/{}", path.trim_end_matches('/'), name);
+            let md = match sftp.symlink_metadata(&child).await {
+                Ok(m) => m,
+                Err(e) => {
+                    // A child that vanishes mid-walk (or is unreadable) should
+                    // not abort the whole delete — record and keep going.
+                    if first_err.is_none() {
+                        first_err = Some(format!("stat {child}: {e}"));
+                    }
+                    continue;
+                }
+            };
+            let ft = md.file_type();
+            let res = if ft.is_symlink() || !ft.is_dir() {
+                // Symlinks and plain files are unlinked; a symlink is never followed.
+                sftp.remove_file(&child)
+                    .await
+                    .map_err(|e| format!("rm {child}: {e}"))
+            } else {
+                remove_remote_tree(sftp, &child).await
+            };
+            if let Err(e) = res {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        // rmdir regardless, so a partially-emptied dir still goes away when it
+        // became empty; surface the first child error only if the dir remains.
+        if let Err(e) = sftp.remove_dir(path).await {
+            return Err(match first_err {
+                Some(fe) => format!("{fe} (rmdir {path}: {e})"),
+                None => format!("rmdir {path}: {e}"),
+            });
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -201,6 +291,32 @@ pub async fn sftp_rename(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Set a remote file's mtime (and atime) via SFTP setstat — the remote half
+/// of "preserve timestamps of transferred files". Exposed so the renderer can
+/// apply timestamps for non-queue flows; the queue applies it automatically
+/// on upload legs when `preserveTs` was passed to `sftp_queue_add`.
+/// Servers that refuse SETSTAT surface the error to the caller.
+#[tauri::command]
+pub async fn sftp_set_mtime(
+    app: AppHandle,
+    session_id: String,
+    path: String,
+    mtime_ms: i64,
+) -> CmdResult<serde_json::Value> {
+    let sftp = sftp_from_session(&app, &session_id)?;
+    if mtime_ms < 0 {
+        return Err(CmdError("mtime must be a Unix timestamp in milliseconds.".into()));
+    }
+    let secs = (mtime_ms / 1000) as u32;
+    let mut attrs = russh_sftp::protocol::FileAttributes::default();
+    attrs.mtime = Some(secs);
+    attrs.atime = Some(secs);
+    sftp.set_metadata(&path, attrs)
+        .await
+        .map_err(|e| CmdError(format!("setstat failed: {e}")))?;
+    Ok(serde_json::json!({ "ok": true, "mtime": secs }))
+}
+
 #[tauri::command]
 pub async fn sftp_download(
     app: AppHandle,
@@ -209,6 +325,7 @@ pub async fn sftp_download(
     local: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
+    validate_sftp_local_path(&local)?;
     download_to(&sftp, &remote, &local).await?;
     Ok(serde_json::json!({ "ok": true, "local": local }))
 }
@@ -249,10 +366,10 @@ pub async fn download_to(
         .await
         .map_err(|e| CmdError(format!("local create failed: {e}")))?;
 
-    // 32 KiB chunks, each clamped to the remaining bytes. A short read (<
-    // requested) means EOF on well-behaved servers; the size clamp means we
-    // never ask past EOF on any server.
-    let mut buf = vec![0u8; 32 * 1024];
+    // 256 KiB chunks (matches russh-sftp's max_packet_len), each clamped to the
+    // remaining bytes. A short read (< requested) means EOF on well-behaved
+    // servers; the size clamp means we never ask past EOF on any server.
+    let mut buf = vec![0u8; 256 * 1024];
     let mut done: u64 = 0;
     while done < size {
         let want = ((size - done) as usize).min(buf.len());
@@ -299,6 +416,7 @@ pub async fn sftp_upload(
     remote: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
+    validate_sftp_local_path(&local)?;
     let local_path = PathBuf::from(&local);
     let metadata = tokio::fs::metadata(&local_path)
         .await
@@ -519,30 +637,83 @@ pub fn sftp_close(app: AppHandle, session_id: String) -> CmdResult<serde_json::V
 
 use crate::sftp::queue::{
     self as tfq, clear_finished as q_clear, emit_queue, enqueue as q_enqueue, retry_job as q_retry,
-    JobKind, QueuedItem,
+    JobKind, QueuedItem, ResumeMode,
 };
 
+/// Resolve the resume mode for a queue-add call: explicit argument wins,
+/// otherwise the stored default (`setting.sftpResumeDefault`, itself
+/// defaulting to "ask" — the UI layer resolves Ask before enqueue).
+fn resolve_resume_mode(app: &AppHandle, resume: Option<&str>) -> ResumeMode {
+    let raw = match resume.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => app
+            .state::<AppState>()
+            .db
+            .get_config("setting.sftpResumeDefault")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "ask".to_string()),
+    };
+    ResumeMode::from_str_loose(&raw)
+}
+
 /// Expand a local directory into upload jobs (recursive); a file becomes one.
+///
+/// Symlink-aware and cycle-breaking: recursion only ever enters REAL
+/// directories. A symlinked directory is never followed (following one can
+/// loop — `ln -s .. up` — and recurse until the stack overflows); a symlinked
+/// FILE is uploaded by following the link exactly one level (File::open
+/// resolves it; there is no recursion, hence no cycle).
 fn expand_upload(
     local: PathBuf,
     remote: String,
     session_id: String,
     server_name: String,
+    resume: ResumeMode,
+    preserve_ts: bool,
     out: &mut Vec<QueuedItem>,
 ) {
-    let md = match std::fs::metadata(&local) {
+    // symlink_metadata (lstat): classifies the entry itself, never follows.
+    let md = match std::fs::symlink_metadata(&local) {
         Ok(m) => m,
         Err(_) => return,
     };
+    if md.is_symlink() {
+        match std::fs::metadata(&local) {
+            Ok(target) if target.is_file() => {
+                out.push(QueuedItem {
+                    kind: JobKind::Upload,
+                    session_id: session_id.clone(),
+                    server_name: server_name.clone(),
+                    local_path: local.display().to_string(),
+                    remote_path: remote,
+                    size: target.len(),
+                    target: None,
+                    resume: Some(resume),
+                    preserve_ts: Some(preserve_ts),
+                });
+            }
+            _ => {
+                log::warn!(
+                    "[sshspan-sftp] upload: skipping symlinked directory {} (symlink cycles are not followed)",
+                    local.display()
+                );
+            }
+        }
+        return;
+    }
     if md.is_file() {
-        out.push(QueuedItem::simple(
-            JobKind::Upload,
-            session_id.clone(),
-            server_name.clone(),
-            local.display().to_string(),
-            remote,
-            md.len(),
-        ));
+        out.push(QueuedItem {
+            kind: JobKind::Upload,
+            session_id: session_id.clone(),
+            server_name: server_name.clone(),
+            local_path: local.display().to_string(),
+            remote_path: remote,
+            size: md.len(),
+            target: None,
+            resume: Some(resume),
+            preserve_ts: Some(preserve_ts),
+        });
         return;
     }
     let Ok(entries) = std::fs::read_dir(&local) else {
@@ -555,7 +726,7 @@ fn expand_upload(
             remote.trim_end_matches('/'),
             e.file_name().to_string_lossy()
         );
-        expand_upload(child, rname, session_id.clone(), server_name.clone(), out);
+        expand_upload(child, rname, session_id.clone(), server_name.clone(), resume, preserve_ts, out);
     }
 }
 
@@ -693,6 +864,7 @@ fn expand_download(
     root: PathBuf,
     session_id: String,
     server_name: String,
+    resume: ResumeMode,
     out: Vec<QueuedItem>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<QueuedItem>, String>> + Send>> {
     Box::pin(async move {
@@ -712,14 +884,19 @@ fn expand_download(
                 );
                 return Ok(out);
             };
-            out.push(QueuedItem::simple(
-                JobKind::Download,
+            out.push(QueuedItem {
+                kind: JobKind::Download,
                 session_id,
                 server_name,
-                local.display().to_string(),
-                remote,
-                md.size.unwrap_or(0),
-            ));
+                local_path: local.display().to_string(),
+                remote_path: remote,
+                size: md.size.unwrap_or(0),
+                target: None,
+                resume: Some(resume),
+                // Downloads never preserve timestamps (std has no portable
+                // local-mtime setter; see the download leg in queue.rs).
+                preserve_ts: None,
+            });
             return Ok(out);
         }
         let raw_dir = remote.rsplit('/').next().unwrap_or("dir");
@@ -760,6 +937,7 @@ fn expand_download(
                 root.clone(),
                 session_id.clone(),
                 server_name.clone(),
+                resume,
                 out,
             )
             .await?;
@@ -778,6 +956,8 @@ pub async fn sftp_queue_add(
     direction: String,             // "upload" | "download"
     items: Vec<serde_json::Value>, // [{local, remote}] — remote for downloads may be a dir
     dest_dir: Option<String>,      // local dir for downloads
+    resume: Option<String>,        // "overwrite" | "resume" | "ask" (default: setting.sftpResumeDefault)
+    preserve_ts: Option<bool>,     // preserve source mtime on upload legs
 ) -> CmdResult<serde_json::Value> {
     let kind = if direction == "upload" {
         JobKind::Upload
@@ -788,6 +968,10 @@ pub async fn sftp_queue_add(
     if !matches!(kind, JobKind::Upload | JobKind::Download) {
         return Err(CmdError("unsupported direction.".into()));
     }
+    // Ask/Overwrite/Resume — resolved once here, threaded into every
+    // expanded job.
+    let resume = resolve_resume_mode(&app, resume.as_deref());
+    let preserve_ts = preserve_ts.unwrap_or(false);
     let server_name = app
         .state::<StdArc<SessionRegistry>>()
         .list()
@@ -816,6 +1000,8 @@ pub async fn sftp_queue_add(
                     remote.to_string(),
                     session_id.clone(),
                     server_name.clone(),
+                    resume,
+                    preserve_ts,
                     &mut jobs,
                 );
             }
@@ -847,6 +1033,7 @@ pub async fn sftp_queue_add(
                     root.clone(),
                     session_id.clone(),
                     server_name.clone(),
+                    resume,
                     jobs,
                 )
                 .await
@@ -896,6 +1083,14 @@ pub fn sftp_queue_clear_finished(app: AppHandle) -> CmdResult<serde_json::Value>
 /// never used — some servers fail reads on the long-lived channel with
 /// SSH_FX_FAILURE). The transfer queue panel shows progress; a temp staging
 /// file is created by the worker and always removed on completion.
+///
+/// Directories are expanded recursively into per-file jobs (a directory
+/// cannot be read as a file — reading one fails at offset 0). Each child file
+/// keeps the folder structure under `<target_dir>/<dir-name>/...`. Directory
+/// names come from the source server's listing, so every remote path segment
+/// is passed through `sanitize_remote_name` before it is joined into the
+/// target path (defense-in-depth against a hostile source server planting
+/// `..` segments in the destination path).
 #[tauri::command]
 pub async fn sftp_server_copy(
     app: AppHandle,
@@ -929,9 +1124,56 @@ pub async fn sftp_server_copy(
         return Err(CmdError("Target session not found.".into()));
     };
 
-    let name = remote.rsplit('/').next().unwrap_or("file");
-    let target_path = format!("{}/{}", target_dir.trim_end_matches('/'), name);
+    // Open a fresh channel to the source to stat + walk (mirrors expand_download).
+    let sftp = crate::sftp::queue::open_transfer_channel(&app, &from_session_id)
+        .await
+        .map_err(CmdError)?;
+    let md = sftp
+        .metadata(&remote)
+        .await
+        .map_err(|e| CmdError(format!("stat {remote}: {e}")))?;
 
+    let name = remote.rsplit('/').next().unwrap_or("file");
+    let base_target = format!("{}/{}", target_dir.trim_end_matches('/'), name);
+
+    if md.is_dir() {
+        // Stream the walk: enqueue per-file jobs in batches as the tree is
+        // scanned so transfers start immediately (workers run in parallel with
+        // the walk) instead of waiting for a full scan of a huge tree. The
+        // command returns after the scan completes; scan errors surface here
+        // while already-queued jobs keep running.
+        let visited = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let scanned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let walk = expand_server_copy(
+            &app,
+            &sftp,
+            remote,
+            base_target.clone(),
+            from_session_id,
+            source_server,
+            target_session_id,
+            target_server,
+            visited,
+            scanned.clone(),
+        );
+        // Bounded so a stalled/pathological source surfaces an error instead of
+        // leaving "Sending…" frozen forever.
+        if tokio::time::timeout(std::time::Duration::from_secs(120), walk)
+            .await
+            .is_err()
+        {
+            return Err(CmdError(
+                "Folder scan timed out (source server too slow or unresponsive).".into(),
+            ));
+        }
+        let n = scanned.load(std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            return Err(CmdError("Nothing to send (empty or unreadable folder).".into()));
+        }
+        return Ok(serde_json::json!({ "ok": true, "target": base_target, "count": n }));
+    }
+
+    // Single file: enqueue one job (worker stats it on a fresh channel).
     q_enqueue(
         &app,
         vec![QueuedItem {
@@ -941,14 +1183,138 @@ pub async fn sftp_server_copy(
             local_path: String::new(), // no user-visible local path; worker stages a temp file
             remote_path: remote,
             size: 0, // stat'd by the worker on a fresh channel
+            resume: None,
+            preserve_ts: None, // preserve not threaded through Send to (yet)
             target: Some(tfq::ServerCopyTarget {
                 session_id: target_session_id,
                 server_name: target_server,
-                remote_path: target_path.clone(),
+                remote_path: base_target.clone(),
             }),
         }],
     );
-    Ok(serde_json::json!({ "ok": true, "target": target_path }))
+    Ok(serde_json::json!({ "ok": true, "target": base_target, "count": 1 }))
+}
+
+/// Recursively expand a remote directory into per-file ServerCopy jobs,
+/// ENQUEUING them in batches as the walk proceeds so transfers start
+/// immediately and overlap the scan (a full scan-then-enqueue of a huge tree
+/// reads as a frozen "Sending…" on a slow link). Returns the count scanned.
+///
+/// Child names come from the source server's directory listing
+/// (attacker-influenceable on a hostile source), so each segment is sanitized
+/// before joining into the target path. Entry type/size come from the
+/// listing's own attributes — no per-file round-trip stat.
+///
+/// Robustness guards (a naive walk freezes on real-world trees):
+/// - Symlinks are classified from the listing and skipped, never followed (a
+///   followed link can point to an ancestor → infinite recursion).
+/// - A path-prefix visited-set breaks directory cycles that survive the above.
+/// - A hard cap on scanned files prevents a pathological tree from flooding
+///   the queue.
+#[allow(clippy::too_many_arguments)]
+fn expand_server_copy<'a>(
+    app: &'a AppHandle,
+    sftp: &'a russh_sftp::client::SftpSession,
+    remote_dir: String,
+    target_base: String,
+    from_session_id: String,
+    source_server: String,
+    target_session_id: String,
+    target_server: String,
+    visited: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    scanned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        const MAX_EXPANDED: usize = 10_000;
+        const FLUSH_EVERY: usize = 64; // enqueue this many files at a time
+        // Cycle guard: don't re-enter a directory we've already walked.
+        {
+            let mut seen = visited.lock().unwrap();
+            if !seen.insert(remote_dir.clone()) {
+                log::warn!("[sshspan-sftp] send-to: cycle detected at {remote_dir}, skipping");
+                return Ok(());
+            }
+        }
+        let mut entries = sftp
+            .read_dir(&remote_dir)
+            .await
+            .map_err(|e| format!("list {remote_dir}: {e}"))?;
+        let mut batch: Vec<QueuedItem> = Vec::new();
+        while let Some(entry) = entries.next() {
+            if scanned.load(std::sync::atomic::Ordering::SeqCst) >= MAX_EXPANDED {
+                log::warn!("[sshspan-sftp] send-to: hit {MAX_EXPANDED} file cap, truncating walk");
+                break;
+            }
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let Some(safe) = sanitize_remote_name(&name) else {
+                log::warn!(
+                    "[sshspan-sftp] send-to: skipping unsafe remote name {name:?} under {remote_dir}"
+                );
+                continue;
+            };
+            let child_remote = format!("{}/{}", remote_dir.trim_end_matches('/'), safe);
+            let child_target = format!("{}/{}", target_base.trim_end_matches('/'), safe);
+            // Classify from the listing's own attributes (symlink-aware): no
+            // per-file stat round-trip. Symlinks are skipped, never followed.
+            let md = entry.metadata();
+            let ftype = md.file_type();
+            if ftype.is_symlink() {
+                log::debug!("[sshspan-sftp] send-to: skipping symlink {child_remote}");
+                continue;
+            }
+            if ftype.is_dir() {
+                // Flush pending files before recursing so ordering stays
+                // breadth-friendly and the queue keeps filling.
+                if !batch.is_empty() {
+                    scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
+                    q_enqueue(app, std::mem::take(&mut batch));
+                }
+                expand_server_copy(
+                    app,
+                    sftp,
+                    child_remote,
+                    child_target,
+                    from_session_id.clone(),
+                    source_server.clone(),
+                    target_session_id.clone(),
+                    target_server.clone(),
+                    visited.clone(),
+                    scanned.clone(),
+                )
+                .await?;
+            } else {
+                // Regular file. file_type() is `Other` when a server omits
+                // permission bits, so treat non-dir/non-symlink as copyable.
+                batch.push(QueuedItem {
+                    kind: JobKind::ServerCopy,
+                    session_id: from_session_id.clone(),
+                    server_name: source_server.clone(),
+                    local_path: String::new(),
+                    remote_path: child_remote,
+                    size: md.size.unwrap_or(0),
+                    resume: None,
+                    preserve_ts: None,
+                    target: Some(tfq::ServerCopyTarget {
+                        session_id: target_session_id.clone(),
+                        server_name: target_server.clone(),
+                        remote_path: child_target,
+                    }),
+                });
+                if batch.len() >= FLUSH_EVERY {
+                    scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
+                    q_enqueue(app, std::mem::take(&mut batch));
+                }
+            }
+        }
+        if !batch.is_empty() {
+            scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
+            q_enqueue(app, batch);
+        }
+        Ok(())
+    })
 }
 
 // ─── recursive remote search ───────────────────────────────────────────────

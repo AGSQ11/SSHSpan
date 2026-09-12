@@ -213,7 +213,16 @@ function createTabTerminal(tabId) {
     try { term.loadAddon(fitAddon); } catch (e) { fitAddon = null; }
   }
   if (WebLinksCtor) {
-    try { term.loadAddon(new WebLinksCtor()); } catch (e) {}
+    try {
+      // Route clicks through the backend allowlist (system_open_url accepts
+      // http/https only) instead of the addon's default window.open, so a
+      // terminal link can never hand a non-web scheme to the OS shell. The
+      // addon regex itself only linkifies http(s), this is defense in depth.
+      term.loadAddon(new WebLinksCtor((_event, uri) => {
+        tcore.invoke('system_open_url', { url: uri })
+          .catch((e) => console.warn('[sshspan-terminal] link open refused:', e));
+      }));
+    } catch (e) {}
   }
 
   term.__sshspanTabId = tabId;
@@ -369,9 +378,34 @@ function terminalConnectInTab(tabId, server, opts) {
       onData: onData,
       overrideUsername: opts && opts.overrideUsername,
       overrideKeyId: opts && opts.overrideKeyId,
-      overridePemPath: opts && opts.overridePemPath,
       promptPassword: opts && opts.promptPassword,
     };
+
+    // Host-key consent (StrictHostKeyChecking semantics): the backend refuses
+    // an UNPINNED host unless allowTofu was granted, and it is granted only
+    // here — after the user explicitly accepts the first-trust prompt.
+    try {
+      const known = await tcore.invoke('known_hosts_check', {
+        host: server.host,
+        port: server.port || 22,
+      });
+      if (known && known.known === false) {
+        const okTrust = window.confirm(
+          '“' + server.host + ':' + (server.port || 22) + '” is not in Known Hosts yet.\n\n' +
+          'Trust this host on first connection (TOFU)?\n' +
+          'The fingerprint will be shown in the terminal and recorded in the audit log.'
+        );
+        if (!okTrust) {
+          trace(tabId, '[sshspan] connection cancelled — host not trusted');
+          return reject(new Error('Connection cancelled — host is not trusted yet.'));
+        }
+        args.allowTofu = true;
+      }
+    } catch (e) {
+      if (e && String((e && e.message) || e).indexOf('not trusted') !== -1) return reject(e);
+      // known_hosts_check itself failed: proceed WITHOUT consent — the
+      // backend stays strict and refuses an unknown host on its own.
+    }
 
     const encoder = new TextEncoder();
     const dataSub = t.onData(async (data) => {

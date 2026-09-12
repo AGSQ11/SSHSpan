@@ -2,8 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src ipc: http://tauri.localhost" />
+  <!-- CSP is defined once in src-tauri/tauri.conf.json (app.security.csp);
+       Tauri injects it and adds the ipc: entries it needs. A second meta CSP
+       here would silently INTERSECT with it and drift (it already lacked the
+       Bitwarden connect-src entries), so it is deliberately not repeated. -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SSHSpan</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔐</text></svg>" />
@@ -541,6 +543,33 @@
       <footer class="modal-footer">
         <button id="chmodCancelBtn" class="ghost-btn">Cancel</button>
         <button id="chmodApplyBtn" class="primary-btn">Apply</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- SFTP transfer overwrite-conflict modal (FileZilla "file already exists") -->
+  <div class="modal-backdrop" id="conflictModal" hidden>
+    <div class="modal">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="file-text"></span>
+          <h2 id="conflictTitle">Target file already exists</h2>
+        </div>
+        <button class="icon-btn" id="conflictCloseBtn" title="Close"></button>
+      </header>
+      <div class="modal-body">
+        <p id="conflictSummary" class="hint"></p>
+        <div class="conflict-list" id="conflictList"></div>
+        <label class="toggle-chip">
+          <input type="checkbox" id="conflictAlways" />
+          <span class="toggle-box"></span>
+          <span id="conflictAlwaysLabel">Always use this action for this direction</span>
+        </label>
+      </div>
+      <footer class="modal-footer">
+        <span class="hint" id="conflictHint">Skip removes a file from this batch.</span>
+        <button id="conflictCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="conflictApplyBtn" class="primary-btn">Continue</button>
       </footer>
     </div>
   </div>

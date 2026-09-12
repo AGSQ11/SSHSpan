@@ -388,6 +388,18 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+            // Migration: port-qualify legacy bare-host known_hosts pins.
+            // Existing rows stored the host as a bare hostname; all new rows
+            // use "host:port". Appending ":22" matches the historical default
+            // port and keeps pins for the same hostname on different ports
+            // independent. IPv6 addresses that were stored bare also receive
+            // ":22" because they were saved without bracket/port decoration.
+            let _ = sqlx::query(
+                "UPDATE known_hosts SET host = host || ':22' WHERE host NOT LIKE '%:%'",
+            )
+            .execute(&self.pool)
+            .await;
+
             Ok::<_, anyhow::Error>(())
         })
     }
@@ -1413,7 +1425,7 @@ impl Database {
                 }
             }
 
-            let mut hosts_replaced = 0u32;
+            let mut known_hosts_conflicts = 0u32;
             if let Some(arr) = data.get("known_hosts").and_then(|v| v.as_array()) {
                 for h in arr {
                     let Some(host) = h
@@ -1429,9 +1441,10 @@ impl Database {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let seen = h.get("first_seen").and_then(|v| v.as_str()).unwrap_or("");
-                    // Count replacements before upserting: a host that
-                    // already exists with a DIFFERENT key is about to be
-                    // silently overwritten — the caller surfaces this.
+                    // Security: never overwrite an existing host-key pin from a
+                    // backup, because a malicious backup could pin an attacker-
+                    // controlled key. New hosts are still added. Conflicts are
+                    // counted so the caller can surface them.
                     let existing_key = sqlx::query_scalar::<_, String>(
                         "SELECT host_key FROM known_hosts WHERE host = ?",
                     )
@@ -1439,7 +1452,8 @@ impl Database {
                     .fetch_optional(&mut *tx)
                     .await?;
                     if existing_key.is_some_and(|k| k != host_key) {
-                        hosts_replaced += 1;
+                        known_hosts_conflicts += 1;
+                        continue;
                     }
                     sqlx::query(
                         "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
@@ -1472,7 +1486,8 @@ impl Database {
             Ok(serde_json::json!({
                 "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
                 "servers": servers_n, "knownHosts": hosts_n,
-                "knownHostsReplaced": hosts_replaced, "settings": settings_n,
+                "knownHostsReplaced": 0u32,
+                "knownHostsConflicts": known_hosts_conflicts, "settings": settings_n,
             }))
         })
     }
@@ -1480,6 +1495,74 @@ impl Database {
 
 /// FNV-1a 32-bit hash of the string, formatted as 8 lowercase hex chars.
 /// Used to derive a short deterministic id from a category path.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The port-qualifying migration must rewrite legacy bare-host pins to
+    /// "host:22" and leave already-qualified pins untouched.
+    #[test]
+    fn known_hosts_migration_port_qualifies_bare_host() {
+        let db_path = std::env::temp_dir().join(format!(
+            "sshspan-known-hosts-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open_at(db_path).expect("open test db");
+
+        // Simulate a pre-migration row (bare hostname).
+        block(async {
+            sqlx::query(
+                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) VALUES (?, ?, ?, ?)",
+            )
+            .bind("example.com")
+            .bind("fake-key-blob")
+            .bind("aa:bb:cc")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+
+        // Running migrate() again should qualify the bare host.
+        db.migrate().expect("migrate should succeed");
+
+        let hosts = db.list_known_hosts().expect("list known hosts");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].host, "example.com:22");
+    }
+
+    /// Already-qualified pins (e.g., from a backup restore) must not accumulate
+    /// extra ":22" suffixes on each migration.
+    #[test]
+    fn known_hosts_migration_idempotent_for_qualified_host() {
+        let db_path = std::env::temp_dir().join(format!(
+            "sshspan-known-hosts-qualified-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open_at(db_path).expect("open test db");
+
+        block(async {
+            sqlx::query(
+                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) VALUES (?, ?, ?, ?)",
+            )
+            .bind("example.com:2222")
+            .bind("fake-key-blob")
+            .bind("aa:bb:cc")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+
+        db.migrate().expect("migrate should succeed");
+        db.migrate().expect("second migrate should be idempotent");
+
+        let hosts = db.list_known_hosts().expect("list known hosts");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].host, "example.com:2222");
+    }
+}
+
 fn short_hash(s: &str) -> u32 {
     let mut h: u32 = 0x811c9dc5;
     for b in s.as_bytes() {
@@ -1490,8 +1573,12 @@ fn short_hash(s: &str) -> u32 {
 }
 
 fn get_db_path(_app: &AppHandle) -> Result<PathBuf> {
-    // Test override: SSHSPAN_DB=<path> isolates a dev instance from the
-    // real vault (used by the local e2e rig).
+    // Dev/test override: SSHSPAN_DB=<path> isolates a dev instance from the
+    // real vault (used by the local e2e rig). Compiled only into debug
+    // builds: in a release build, any process that can set this variable at
+    // launch could otherwise silently redirect the whole vault to a database
+    // it controls (a master-password phishing setup).
+    #[cfg(debug_assertions)]
     if let Ok(p) = std::env::var("SSHSPAN_DB") {
         if !p.trim().is_empty() {
             return Ok(PathBuf::from(p));

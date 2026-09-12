@@ -45,6 +45,7 @@ function sftpTabState(tab) {
   if (!tab.showHidden) tab.showHidden = state.settings?.sftpShowHidden === '1';
   if (tab.dualPane === undefined) tab.dualPane = state.sftpDualPane === true;
   if (!tab.localPath) tab.localPath = '';
+  if (tab.sftpPreserveTs === undefined) tab.sftpPreserveTs = state.settings?.sftpPreserveTs === '1';
   return tab;
 }
 
@@ -151,7 +152,7 @@ function buildSftpPanel(tabId) {
   panel.id = 'sftpPanel-' + tabId;
   panel.style.display = 'none';
 
-  // ── toolbar ──
+  // ── toolbar (every button carries a short label; the row wraps, never clips) ──
   const toolbar = document.createElement('div');
   toolbar.className = 'sftp-toolbar';
   const mkBtn = (icon, title, fn, label) => {
@@ -162,33 +163,39 @@ function buildSftpPanel(tabId) {
     b.addEventListener('click', fn);
     return b;
   };
+  const mkPathCopy = (getter) => {
+    const b = document.createElement('button');
+    b.className = 'icon-btn sftp-pathcopy';
+    b.title = 'Copy path';
+    b.innerHTML = ico('copy');
+    b.addEventListener('click', () => {
+      const p = getter();
+      if (p) copyText(p).then(ok => ok && toast('Path copied.', 'ok'));
+    });
+    return b;
+  };
 
   const upBtn = mkBtn('arrow-up', 'Parent directory', () => sftpNavigateUp(tabId), 'Up');
   const refreshBtn = mkBtn('refresh-cw', 'Refresh', () => refreshSftpPanel(tabId), 'Refresh');
   const mkdirBtn = mkBtn('folder-plus', 'New folder', () => sftpMkdirPrompt(tabId), 'Folder');
   const newFileBtn = mkBtn('file-text', 'New empty file', () => sftpTouchPrompt(tabId), 'File');
-  const bookmarkBtn = mkBtn('star', 'Bookmarks', (ev) => openBookmarkMenu(ev, tabId));
-  const searchBtn = mkBtn('search', 'Search recursively (in current tree)', () => toggleSearchBar(tabId));
+  const bookmarkBtn = mkBtn('star', 'Bookmarks', (ev) => openBookmarkMenu(ev, tabId), 'Bookmarks');
+  const searchBtn = mkBtn('search', 'Search recursively (in current tree)', () => toggleSearchBar(tabId), 'Search');
   const hiddenBtn = mkBtn('eye', 'Show/hide dotfiles', () => {
     const tab = sftpTabState(sftpTab(tabId));
     tab.showHidden = !tab.showHidden;
     hiddenBtn.classList.toggle('active', tab.showHidden);
     refreshSftpPanel(tabId, { keepScroll: true });
-  });
-  const dualBtn = mkBtn('folder-open', 'Toggle local pane', () => toggleDualPane(tabId));
+  }, 'Hidden');
+  const dualBtn = mkBtn('folder-open', 'Toggle local pane', () => toggleDualPane(tabId), 'Dual');
   const logBtn = mkBtn('history', 'Activity log', () => {
     const log = document.getElementById('sftpLog-' + tabId);
     if (log) log.hidden = !log.hidden;
-  });
-
-  const pathBox = document.createElement('input');
-  pathBox.className = 'sftp-path';
-  pathBox.readOnly = true;
-  pathBox.title = 'Click to copy path';
-
-  const fsInfo = document.createElement('span');
-  fsInfo.className = 'sftp-fsinfo';
-  fsInfo.id = 'sftpFsInfo-' + tabId;
+  }, 'Log');
+  {
+    const t = sftpTab(tabId);
+    if (t && sftpTabState(t).showHidden) hiddenBtn.classList.add('active');
+  }
 
   toolbar.appendChild(upBtn);
   toolbar.appendChild(refreshBtn);
@@ -199,8 +206,6 @@ function buildSftpPanel(tabId) {
   toolbar.appendChild(hiddenBtn);
   toolbar.appendChild(dualBtn);
   toolbar.appendChild(logBtn);
-  toolbar.appendChild(pathBox);
-  toolbar.appendChild(fsInfo);
 
   // ── search bar (hidden until toggled) ──
   const searchBar = document.createElement('div');
@@ -230,9 +235,30 @@ function buildSftpPanel(tabId) {
     }
   });
 
-  // ── remote listing ──
+  // ── remote site: slim header (label + editable path + copy) + listing ──
   const remotePane = document.createElement('div');
   remotePane.className = 'sftp-pane sftp-remote';
+  const remoteHead = document.createElement('div');
+  remoteHead.className = 'sftp-panehead';
+  const remoteTitle = document.createElement('span');
+  remoteTitle.className = 'sftp-panetitle';
+  remoteTitle.textContent = 'Remote site';
+  const pathBox = document.createElement('input');
+  pathBox.className = 'sftp-path';
+  pathBox.id = 'sftpPath-' + tabId;
+  pathBox.placeholder = '/remote/path — Enter to navigate';
+  pathBox.spellcheck = false;
+  pathBox.autocomplete = 'off';
+  pathBox.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); sftpUiNavigateRemote(tabId, pathBox.value.trim()); }
+    else if (ev.key === 'Escape') { pathBox.value = sftpTab(tabId)?.sftpPath || ''; pathBox.blur(); }
+  });
+  pathBox.addEventListener('focus', () => pathBox.select());
+  const remoteCopy = mkPathCopy(() => sftpTab(tabId)?.sftpPath || '');
+  remoteHead.appendChild(remoteTitle);
+  remoteHead.appendChild(pathBox);
+  remoteHead.appendChild(remoteCopy);
+
   const table = document.createElement('table');
   table.className = 'sftp-table';
   const thead = document.createElement('thead');
@@ -255,20 +281,27 @@ function buildSftpPanel(tabId) {
   tbody.id = 'sftpTbody-' + tabId;
   table.appendChild(thead);
   table.appendChild(tbody);
-  remotePane.appendChild(table);
+  const tableWrap = document.createElement('div');
+  tableWrap.className = 'sftp-tablewrap';
+  tableWrap.appendChild(table);
+  remotePane.appendChild(remoteHead);
+  remotePane.appendChild(tableWrap);
 
   // Empty-area click clears selection.
   tbody.addEventListener('click', (ev) => {
     if (ev.target === tbody) clearSelection(tabId);
   });
 
-  // ── local pane (dual mode) ──
+  // ── local pane (dual mode): slim header with editable path + listing ──
   const localPane = document.createElement('div');
   localPane.className = 'sftp-pane sftp-local';
   localPane.id = 'sftpLocalPane-' + tabId;
   localPane.hidden = true;
-  const localToolbar = document.createElement('div');
-  localToolbar.className = 'sftp-toolbar';
+  const localHead = document.createElement('div');
+  localHead.className = 'sftp-panehead';
+  const localTitle = document.createElement('span');
+  localTitle.className = 'sftp-panetitle';
+  localTitle.textContent = 'Local site';
   const localUp = mkBtn('arrow-up', 'Parent directory', () => localNavigateUp(tabId), 'Up');
   const localHome = mkBtn('folder', 'Home', () => {
     const tab = sftpTab(tabId);
@@ -277,21 +310,34 @@ function buildSftpPanel(tabId) {
   }, 'Home');
   const localPath = document.createElement('input');
   localPath.className = 'sftp-path';
-  localPath.readOnly = true;
   localPath.id = 'sftpLocalPath-' + tabId;
-  localToolbar.appendChild(localUp);
-  localToolbar.appendChild(localHome);
-  localToolbar.appendChild(localPath);
+  localPath.placeholder = 'Local path — Enter to navigate';
+  localPath.spellcheck = false;
+  localPath.autocomplete = 'off';
+  localPath.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); sftpUiNavigateLocal(tabId, localPath.value.trim()); }
+    else if (ev.key === 'Escape') { localPath.value = sftpTab(tabId)?.localPath || ''; localPath.blur(); }
+  });
+  localPath.addEventListener('focus', () => localPath.select());
+  const localCopy = mkPathCopy(() => sftpTab(tabId)?.localPath || '');
+  localHead.appendChild(localTitle);
+  localHead.appendChild(localUp);
+  localHead.appendChild(localHome);
+  localHead.appendChild(localPath);
+  localHead.appendChild(localCopy);
   const localTable = document.createElement('table');
   localTable.className = 'sftp-table';
-  const localHead = document.createElement('thead');
-  localHead.innerHTML = `<tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
+  const localThead = document.createElement('thead');
+  localThead.innerHTML = `<tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
   const localBody = document.createElement('tbody');
   localBody.id = 'sftpLocalTbody-' + tabId;
-  localTable.appendChild(localHead);
+  localTable.appendChild(localThead);
   localTable.appendChild(localBody);
-  localPane.appendChild(localToolbar);
-  localPane.appendChild(localTable);
+  const localWrap = document.createElement('div');
+  localWrap.className = 'sftp-tablewrap';
+  localWrap.appendChild(localTable);
+  localPane.appendChild(localHead);
+  localPane.appendChild(localWrap);
 
   // ── splitter (drag to resize) ──
   const splitter = document.createElement('div');
@@ -316,25 +362,178 @@ function buildSftpPanel(tabId) {
   log.id = 'sftpLog-' + tabId;
   log.hidden = true;
 
-  // ── drop hint ──
-  const hint = document.createElement('div');
-  hint.className = 'sftp-drop-hint';
-  hint.textContent = '⬇ Drag files here from your file manager to upload';
-
   const panes = document.createElement('div');
   panes.className = 'sftp-panes';
   panes.appendChild(localPane);
   panes.appendChild(splitter);
   panes.appendChild(remotePane);
 
+  // ── drop overlay ──
+  // Hidden by default; appears only while a drag hovers the panel (wireSftpDrop
+  // toggles the .dragover class). No permanent strip — the panes keep full height.
+  const panesWrap = document.createElement('div');
+  panesWrap.className = 'sftp-paneswrap';
+  const hint = document.createElement('div');
+  hint.className = 'sftp-drop-hint';
+  hint.textContent = 'Drop files to upload to the current remote directory';
+  panesWrap.appendChild(panes);
+  panesWrap.appendChild(hint);
+
+  // ── status bar ──
+  const statusBar = document.createElement('div');
+  statusBar.className = 'sftp-statusbar';
+  statusBar.id = 'sftpStatusBar-' + tabId;
+  const statLeft = document.createElement('span');
+  statLeft.className = 'sftp-status-left';
+  statLeft.id = 'sftpStatusLeft-' + tabId;
+  const statFs = document.createElement('span');
+  statFs.className = 'sftp-fsinfo';
+  statFs.id = 'sftpFsInfo-' + tabId; // relocated here from the toolbar; id kept for updateFsInfo
+  statusBar.appendChild(statLeft);
+  statusBar.appendChild(statFs);
+
   panel.appendChild(toolbar);
   panel.appendChild(searchBar);
-  panel.appendChild(panes);
+  panel.appendChild(panesWrap);
   panel.appendChild(log);
-  panel.appendChild(hint);
+  panel.appendChild(statusBar);
 
   wireSftpDrop(panel, tabId, hint);
+  wireSftpPaneDnd(tabId);
+  ensureSftpPreserveTsToggle(tabId);
   return panel;
+}
+
+// ─── preserve-timestamps toggle (FileZilla: "Preserve timestamps of
+// transferred files") ────────────────────────────────────────────────────────
+
+/// Idempotent: append the toggle next to the hidden-files button if absent
+/// (never restructure the toolbar — G owns that block; this appends only).
+function ensureSftpPreserveTsToggle(tabId) {
+  const panel = document.getElementById('sftpPanel-' + tabId);
+  if (!panel || document.getElementById('sftpPreserveTsBtn-' + tabId)) return;
+  const toolbar = panel.querySelector('.sftp-toolbar');
+  const hiddenBtn = [...toolbar.querySelectorAll('button')].find(b => b.title === 'Show/hide dotfiles');
+  if (!toolbar) return;
+  const tab = sftpTabState(sftpTab(tabId));
+  const btn = document.createElement('button');
+  btn.className = 'ghost-btn';
+  btn.id = 'sftpPreserveTsBtn-' + tabId;
+  btn.title = 'Preserve timestamps of transferred files';
+  btn.innerHTML = ico('history');
+  btn.classList.toggle('active', !!tab.sftpPreserveTs);
+  btn.addEventListener('click', () => window.sftpPreserveTsToggle(tabId));
+  toolbar.insertBefore(btn, hiddenBtn ? hiddenBtn.nextSibling : null);
+}
+
+/// Toggle per-tab preserve-timestamps; persists the global default setting.
+function sftpPreserveTsToggle(tabId) {
+  const tab = sftpTabState(sftpTab(tabId));
+  if (!tab) return;
+  tab.sftpPreserveTs = !tab.sftpPreserveTs;
+  const btn = document.getElementById('sftpPreserveTsBtn-' + tabId);
+  if (btn) btn.classList.toggle('active', tab.sftpPreserveTs);
+  state.settings = state.settings || {};
+  state.settings.sftpPreserveTs = tab.sftpPreserveTs ? '1' : '0';
+  call('settings_set', { key: 'sftpPreserveTs', value: tab.sftpPreserveTs ? '1' : '0' }).catch(() => {});
+  sftpLog(tabId, `preserve timestamps ${tab.sftpPreserveTs ? 'ON' : 'OFF'}`);
+}
+window.sftpPreserveTsToggle = sftpPreserveTsToggle;
+
+// ─── UI helpers: entry icons, editable path bars, status bar ─────────────────
+
+/// Lucide folder/file icon span for listing rows (replaces 📁/📄 emoji).
+function sftpEntryIcon(isDir) {
+  const span = document.createElement('span');
+  span.className = 'sftp-eicon' + (isDir ? ' is-dir' : '');
+  span.innerHTML = ico(isDir ? 'folder' : 'file-text');
+  return span;
+}
+
+/// Validate a remote path candidate: '/'-prefixed, no empty segments.
+function sftpUiNormalizeRemotePath(input) {
+  if (!input || !input.startsWith('/')) return null;
+  const parts = input.split('/').filter(Boolean);
+  const rebuilt = '/' + parts.join('/');
+  return { path: rebuilt === '/' ? '/' : rebuilt, parts };
+}
+
+/// Enter in the remote path box: navigate; on failure toast and revert.
+async function sftpUiNavigateRemote(tabId, input) {
+  const tab = sftpTab(tabId);
+  const box = document.getElementById('sftpPath-' + tabId);
+  if (!tab || !box) return;
+  const norm = sftpUiNormalizeRemotePath(input);
+  if (!norm) {
+    toast('Remote paths must start with /', 'err');
+    box.value = tab.sftpPath || '/';
+    return;
+  }
+  if (norm.path === tab.sftpPath) { box.value = tab.sftpPath; return; }
+  const prev = tab.sftpPath;
+  tab.sftpPath = norm.path;
+  try {
+    // Fetch and adopt directly (a single round trip over the SSH channel).
+    const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: norm.path });
+    tab.sftpPath = r.path || norm.path;
+    tab._entries = r.entries || [];
+    box.value = tab.sftpPath;
+    renderEntries(tabId);
+    if (tab.dualPane) refreshLocalPane(tabId);
+    updateFsInfo(tabId);
+  } catch (e) {
+    tab.sftpPath = prev;
+    box.value = prev;
+    toast(e.message || String(e), 'err');
+  }
+}
+
+/// Enter in the local path box: navigate; on failure toast and revert.
+async function sftpUiNavigateLocal(tabId, input) {
+  const tab = sftpTab(tabId);
+  const box = document.getElementById('sftpLocalPath-' + tabId);
+  if (!tab || !box || !input) return;
+  if (input === tab.localPath) { box.value = tab.localPath; return; }
+  const prev = tab.localPath;
+  tab.localPath = input;
+  try {
+    await sftpUiLocalLoad(tabId); // adopts the canonical path + renders
+  } catch (e) {
+    tab.localPath = prev;
+    box.value = prev || '';
+    toast(e.message || String(e), 'err');
+  }
+}
+
+/// Recompute the status-bar text (counts / selection / local count) for a tab.
+function sftpUpdateStatusBar(tabId) {
+  const tab = sftpTab(tabId);
+  const el = document.getElementById('sftpStatusLeft-' + tabId);
+  if (!tab || !el) return;
+  sftpTabState(tab);
+  const entries = (tab._entries || []).filter(e => tab.showHidden || !e.name.startsWith('.'));
+  const total = entries.length;
+  const sel = tab.sftpSelected ? [...tab.sftpSelected] : [];
+  let text;
+  if (sel.length) {
+    let size = 0, unknown = false;
+    for (const n of sel) {
+      const ent = entries.find(e => e.name === n);
+      if (!ent) continue;
+      if (ent.isDir || ent.size == null) unknown = true;
+      else size += ent.size;
+    }
+    const sizeStr = unknown && size ? `${formatSftpSize(size)}+` : formatSftpSize(size);
+    text = `${total} item${total === 1 ? '' : 's'} · ${sel.length} selected · ${sizeStr}`;
+  } else {
+    text = `${total} item${total === 1 ? '' : 's'}`;
+  }
+  if (tab.dualPane) {
+    // _localEntries is the cached local-entry ARRAY (see sftpUiLocalLoad).
+    const localTotal = (tab._localEntries || []).length;
+    if (localTotal) text += ` · local: ${localTotal} item${localTotal === 1 ? '' : 's'}`;
+  }
+  el.textContent = text;
 }
 
 // ─── entry rendering (remote) ───────────────────────────────────────────────
@@ -346,6 +545,7 @@ function clearSelection(tabId) {
   tab.sftpSelected.clear();
   const tbody = document.getElementById('sftpTbody-' + tabId);
   if (tbody) for (const r of tbody.querySelectorAll('.sftp-entry.selected')) r.classList.remove('selected');
+  sftpUpdateStatusBar(tabId);
 }
 
 function toggleRowSelected(tr, on) {
@@ -357,16 +557,17 @@ async function refreshSftpPanel(tabId, opts = {}) {
   if (!tab) return;
   sftpTabState(tab);
   const tbody = document.getElementById('sftpTbody-' + tabId);
-  const pathBox = document.querySelector('#sftpPanel-' + tabId + ' .sftp-path');
   if (!tbody) return;
   try {
     const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: tab.sftpPath });
     tab.sftpPath = r.path || tab.sftpPath;
     tab._entries = r.entries || [];
-    if (pathBox) pathBox.value = tab.sftpPath;
-    pathBox.onclick = () => { copyText(tab.sftpPath).then(ok => ok && toast('Path copied.', 'ok')); };
+    const pathBox = document.getElementById('sftpPath-' + tabId);
+    if (pathBox && document.activeElement !== pathBox) pathBox.value = tab.sftpPath;
     renderEntries(tabId);
     if (tab.dualPane) refreshLocalPane(tabId);
+    if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
+    if (typeof sftpCmpEnsureButtons === 'function') sftpCmpEnsureButtons(tabId);
     updateFsInfo(tabId);
   } catch (e) {
     toast(e.message || String(e), 'err');
@@ -409,9 +610,18 @@ function renderEntries(tabId) {
     tr.dataset.isdir = entry.isDir ? '1' : '0';
     tr.dataset.name = entry.name;
     const tdName = document.createElement('td');
-    tdName.textContent = (entry.isDir ? '📁 ' : '📄 ') + entry.name;
+    tdName.className = 'sftp-tdname';
+    tdName.appendChild(sftpEntryIcon(entry.isDir));
+    tdName.appendChild(document.createTextNode(entry.name));
     const tdSize = document.createElement('td');
-    tdSize.textContent = entry.isDir ? '—' : formatSftpSize(entry.size);
+    if (entry.isDir) {
+      // Directory size: muted placeholder, not missing metadata.
+      tdSize.className = 'sftp-dirsize';
+      tdSize.textContent = '—';
+      tdSize.title = 'Directory';
+    } else {
+      tdSize.textContent = formatSftpSize(entry.size);
+    }
     const tdMod = document.createElement('td');
     tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
     tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
@@ -420,6 +630,19 @@ function renderEntries(tabId) {
     tr.tabIndex = 0;
     tr.title = entry.isDir ? 'Double-click to open folder' : 'Double-click to download';
     if (tab.sftpSelected.has(entry.name)) tr.classList.add('selected');
+
+    // Draggable to the local pane (download) or another remote dir (move).
+    tr.draggable = true;
+    tr.addEventListener('dragstart', (ev) => {
+      const payload = {
+        tabId,
+        path: sftpJoin(tab.sftpPath, entry.name),
+        name: entry.name,
+        isDir: !!entry.isDir,
+      };
+      ev.dataTransfer.setData('text/sftp-remote', JSON.stringify(payload));
+      ev.dataTransfer.effectAllowed = 'copyMove';
+    });
 
     tr.addEventListener('click', (ev) => {
       if (ev.ctrlKey || ev.metaKey) {
@@ -443,9 +666,11 @@ function renderEntries(tabId) {
         toggleRowSelected(tr, true);
         lastClicked = entry.name;
       }
+      sftpUpdateStatusBar(tabId);
     });
     tr.addEventListener('dblclick', () => {
       if (entry.isDir) {
+        if (typeof sftpSyncRemoteNav === 'function' && sftpSyncRemoteNav(tabId, entry.name)) return;
         tab.sftpPath = sftpJoin(tab.sftpPath, entry.name);
         refreshSftpPanel(tabId);
       } else {
@@ -473,6 +698,7 @@ function renderEntries(tabId) {
     });
     tbody.appendChild(tr);
   }
+  sftpUpdateStatusBar(tabId);
 }
 
 // Ctrl+A within the panel selects all rows.
@@ -493,6 +719,7 @@ document.addEventListener('keydown', (ev) => {
       toggleRowSelected(row, true);
     }
   }
+  sftpUpdateStatusBar(active.tabId);
 });
 
 function formatSftpSize(bytes) {
@@ -505,6 +732,7 @@ function formatSftpSize(bytes) {
 function sftpNavigateUp(tabId) {
   const tab = sftpTab(tabId);
   if (!tab) return;
+  if (typeof sftpSyncRemoteUp === 'function' && sftpSyncRemoteUp(tabId)) return;
   tab.sftpPath = sftpParent(tab.sftpPath);
   refreshSftpPanel(tabId);
 }
@@ -546,7 +774,7 @@ async function updateFsInfo(tabId) {
     if (r && r.supported) {
       const free = formatSftpSize(r.freeBytes || 0);
       const total = formatSftpSize(r.totalBytes || 0);
-      el.textContent = `— ${free} free of ${total}${r.readOnly ? ' (read-only)' : ''}`;
+      el.textContent = `${free} free of ${total}${r.readOnly ? ' (read-only)' : ''}`;
     } else {
       el.textContent = '';
     }
@@ -598,17 +826,17 @@ function openSftpFileMenu(x, y, tabId, entry) {
   mk(multi ? `Delete ${selected.length} items` : 'Delete', 'trash-2', async () => {
     const paths = selectedPaths.length ? selectedPaths : [fullPath];
     if (!confirm(`Delete ${paths.length === 1 ? `"${paths[0]}"` : paths.length + ' items'}?`)) return;
-    let ok = 0, fail = 0;
+    let ok = 0, fail = 0, lastErr = null;
     for (const p of paths) {
       const name = p.split('/').filter(Boolean).pop();
       const isDir = (tab._entries || []).find(e => e.name === name)?.isDir ?? false;
       try {
         await sftpCall('sftp_remove', { sessionId: tab.sessionId, path: p, isDir });
         ok++;
-      } catch { fail++; }
+      } catch (e) { fail++; lastErr = (e && (e.message || e.error)) || String(e); }
     }
     sftpLog(tabId, `delete ${ok} item(s)${fail ? `, ${fail} failed` : ''}`);
-    if (fail) toast(`${ok} deleted, ${fail} failed.`, 'err');
+    if (fail) toast(`${ok} deleted, ${fail} failed.${lastErr ? ' ' + lastErr : ''}`, 'err');
     await refreshSftpPanel(tabId);
   });
   mk('Copy path', 'copy', () => copyText(fullPath).then(ok => ok && toast('Path copied.', 'ok')));
@@ -623,6 +851,7 @@ function openSftpFileMenu(x, y, tabId, entry) {
         toggleRowSelected(row, true);
       }
     }
+    sftpUpdateStatusBar(tabId);
   });
 
   // Send to → other connected SFTP tabs (download → temp → upload).
@@ -785,7 +1014,7 @@ async function runSearch(tabId, query) {
     if (count > 50) return; // render only first 50
     const item = document.createElement('div');
     item.className = 'sftp-searchitem';
-    item.textContent = (p.isDir ? '📁 ' : '📄 ') + p.path;
+    item.innerHTML = `<span class="sftp-eicon${p.isDir ? ' is-dir' : ''}">${ico(p.isDir ? 'folder' : 'file-text')}</span>${escapeHtml(p.path)}`;
     item.title = 'Navigate to containing folder';
     item.addEventListener('click', () => {
       const parent = p.path.slice(0, p.path.lastIndexOf('/')) || '/';
@@ -892,51 +1121,80 @@ function toggleDualPane(tabId) {
     splitter.hidden = !tab.dualPane;
   }
   if (tab.dualPane) refreshLocalPane(tabId);
+  // ── agent-e: apply persisted comparison mode + recompute when dual opens ──
+  if (typeof sftpCmpApplyPersisted === 'function') sftpCmpApplyPersisted(tabId);
   // Persist the preference globally.
   state.sftpDualPane = tab.dualPane;
   call('settings_set', { key: 'sftpDualPane', value: tab.dualPane ? '1' : '0' }).catch(() => {});
 }
 
-async function refreshLocalPane(tabId) {
+/// Core local-pane refresh: lists, renders rows, updates path + status bar.
+/// Throws on failure (callers decide whether to toast/revert).
+async function sftpUiLocalLoad(tabId) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   const tbody = document.getElementById('sftpLocalTbody-' + tabId);
   const pathEl = document.getElementById('sftpLocalPath-' + tabId);
   if (!tbody) return;
-  try {
-    const r = await sftpCall('sftp_local_list', { path: tab.localPath || '' });
-    tab.localPath = r.path || tab.localPath;
-    tab._localHome = r.home;
-    if (pathEl) pathEl.value = tab.localPath;
-    tbody.innerHTML = '';
-    for (const entry of r.entries || []) {
-      const tr = document.createElement('tr');
-      tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
-      tr.dataset.isdir = entry.isDir ? '1' : '0';
-      const tdName = document.createElement('td');
-      tdName.textContent = (entry.isDir ? '📁 ' : '📄 ') + entry.name;
-      const tdSize = document.createElement('td');
-      tdSize.textContent = entry.isDir ? '—' : formatSftpSize(entry.size);
-      const tdMod = document.createElement('td');
-      tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
-      tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
-      tr.addEventListener('dblclick', () => {
-        if (entry.isDir) {
-          const sep = tab.localPath.endsWith('\\') || tab.localPath.endsWith('/') ? '' : '/';
-          tab.localPath = tab.localPath + sep + entry.name;
-          refreshLocalPane(tabId);
-        } else {
-          // Upload this local file to the current remote dir via the queue.
-          queueUploads(tabId, [{ local: joinLocal(tab.localPath, entry.name), remote: sftpJoin(tab.sftpPath, entry.name) }]);
-        }
-      });
-      // Draggable to the remote pane.
-      tr.draggable = true;
-      tr.addEventListener('dragstart', (ev) => {
-        ev.dataTransfer.setData('text/sftp-local', JSON.stringify({ path: joinLocal(tab.localPath, entry.name), name: entry.name }));
-      });
-      tbody.appendChild(tr);
+  const r = await sftpCall('sftp_local_list', { path: tab.localPath || '' });
+  tab.localPath = r.path || tab.localPath;
+  tab._localHome = r.home;
+  // _localEntries is the cached ARRAY of local entries (Agent E's comparison
+  // consumes it; the status bar derives the count via .length).
+  tab._localEntries = r.entries || [];
+  if (pathEl && document.activeElement !== pathEl) pathEl.value = tab.localPath;
+  tbody.innerHTML = '';
+  for (const entry of r.entries || []) {
+    const tr = document.createElement('tr');
+    tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
+    tr.dataset.isdir = entry.isDir ? '1' : '0';
+    tr.dataset.name = entry.name;
+    const tdName = document.createElement('td');
+    tdName.className = 'sftp-tdname';
+    tdName.appendChild(sftpEntryIcon(entry.isDir));
+    tdName.appendChild(document.createTextNode(entry.name));
+    const tdSize = document.createElement('td');
+    if (entry.isDir) {
+      tdSize.className = 'sftp-dirsize';
+      tdSize.textContent = '—';
+      tdSize.title = 'Directory';
+    } else {
+      tdSize.textContent = formatSftpSize(entry.size);
     }
+    const tdMod = document.createElement('td');
+    tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
+    tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
+    tr.addEventListener('dblclick', () => {
+      if (entry.isDir) {
+        if (typeof sftpSyncLocalNav === 'function' && sftpSyncLocalNav(tabId, entry.name)) return;
+        const sep = tab.localPath.endsWith('\\') || tab.localPath.endsWith('/') ? '' : '/';
+        tab.localPath = tab.localPath + sep + entry.name;
+        refreshLocalPane(tabId);
+      } else {
+        // Upload this local file to the current remote dir via the queue.
+        queueUploads(tabId, [{ local: joinLocal(tab.localPath, entry.name), remote: sftpJoin(tab.sftpPath, entry.name) }]);
+      }
+    });
+    // Draggable to the remote pane (upload) or a remote dir row (upload into).
+    tr.draggable = true;
+    tr.addEventListener('dragstart', (ev) => {
+      ev.dataTransfer.setData('text/sftp-local', JSON.stringify({
+        tabId, path: joinLocal(tab.localPath, entry.name), name: entry.name, isDir: !!entry.isDir,
+      }));
+      ev.dataTransfer.effectAllowed = 'copy';
+    });
+    tbody.appendChild(tr);
+  }
+  sftpUpdateStatusBar(tabId);
+  // Re-run directory comparison with the fresh local entries (no-op when the
+  // pane is closed or comparison is off).
+  if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
+}
+
+/// Public local-pane refresh: swallows errors with a toast (existing callers).
+async function refreshLocalPane(tabId) {
+  try {
+    await sftpUiLocalLoad(tabId);
   } catch (e) {
     toast(e.message || String(e), 'err');
   }
@@ -950,6 +1208,7 @@ function joinLocal(dir, name) {
 function localNavigateUp(tabId) {
   const tab = sftpTab(tabId);
   if (!tab || !tab.localPath) return;
+  if (typeof sftpSyncLocalUp === 'function' && sftpSyncLocalUp(tabId)) return;
   const sep = tab.localPath.includes('\\') && !tab.localPath.includes('/') ? '\\' : '/';
   const parts = tab.localPath.split(sep).filter(Boolean);
   parts.pop();
@@ -961,6 +1220,32 @@ function localNavigateUp(tabId) {
 }
 
 // ─── downloads / uploads via the queue ──────────────────────────────────────
+
+/// Download remote paths into an EXPLICIT local dir (drag onto a folder),
+/// bypassing queueDownloads' local-pane-cwd default. Falls back to it when
+/// the local pane hasn't loaded a path yet.
+async function queueDownloadsInto(tabId, remotePaths, dir) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  sftpTabState(tab);
+  if (!tab.dualPane) toggleDualPane(tabId);
+  const target = dir || tab.localPath;
+  if (!target) {
+    queueDownloads(tabId, remotePaths);
+    return;
+  }
+  try {
+    const r = await sftpCall('sftp_queue_add', {
+      sessionId: tab.sessionId,
+      direction: 'download',
+      items: remotePaths.map(p => ({ remote: p })),
+      destDir: target,
+      preserveTs: !!tab.sftpPreserveTs,
+    });
+    sftpLog(tabId, `queued ${r.added} download(s) → ${target}`);
+    if (r.added > 0) toast(`${r.added} download(s) → ${target}`, 'ok');
+  } catch (e) { toast(e.message || String(e), 'err'); }
+}
 
 async function queueDownloads(tabId, remotePaths) {
   const tab = sftpTab(tabId);
@@ -980,11 +1265,41 @@ async function queueDownloads(tabId, remotePaths) {
     return;
   }
   try {
+    // Conflict check: does <dir>/<name> already exist locally? Directory
+    // sources are expanded server-side later, so only plain files are
+    // pre-checked (FileZilla does the same for its existence dialog).
+    const localEntries = await sftpLocalEntryMap(dir);
+    const conflicts = [];
+    for (const p of remotePaths) {
+      const name = p.split('/').filter(Boolean).pop();
+      if (!name) continue;
+      const dest = localEntries.get(name);
+      if (dest) conflicts.push({ remote: p, name, destDir: dir, destEntry: dest });
+    }
+    const decided = await resolveBatchConflicts(tabId, 'download', conflicts);
+    if (!decided) return; // user cancelled the whole batch
+    const survivors = [];
+    for (const p of remotePaths) {
+      const d = decided.find(x => x.remote === p);
+      if (d) {
+        if (d.action === 'skip') continue;
+        // `localName` is the renamed destination for Agent B's backend
+        // update; today the backend derives the local name from the remote
+        // basename and ignores it (falls back to overwrite).
+        const item = { remote: d.remote, resume: d.action };
+        if (d.localName) item.localName = d.localName;
+        survivors.push(item);
+      } else {
+        survivors.push({ remote: p, resume: 'overwrite' });
+      }
+    }
+    if (!survivors.length) { sftpLog(tabId, 'download batch empty after conflict decisions'); return; }
     const r = await sftpCall('sftp_queue_add', {
       sessionId: tab.sessionId,
       direction: 'download',
-      items: remotePaths.map(p => ({ remote: p })),
+      items: survivors,
       destDir: dir,
+      preserveTs: !!tab.sftpPreserveTs,
     });
     sftpLog(tabId, `queued ${r.added} download(s) → ${dir}`);
     if (r.added > 0) toast(`${r.added} download(s) → ${dir}`, 'ok');
@@ -995,14 +1310,324 @@ async function queueUploads(tabId, pairs) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   try {
+    // Conflict check: stat each remote destination. sftp_list_dir on the
+    // target directory gives existence + size + mtime in one round-trip
+    // for the whole batch (sftp_get_permissions stats one path at a time
+    // and returns no size/mtime for the comparison display).
+    const byDir = new Map();
+    for (const { local, remote } of pairs) {
+      const dir = remote.slice(0, remote.lastIndexOf('/')) || '/';
+      if (!byDir.has(dir)) byDir.set(dir, []);
+      byDir.get(dir).push({ local, remote });
+    }
+    const remoteEntries = new Map(); // dir -> Map(name -> entry)
+    const conflicts = [];
+    for (const [dir, group] of byDir) {
+      try {
+        const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: dir });
+        remoteEntries.set(dir, new Map((r.entries || []).map(e => [e.name, e])));
+      } catch (e) {
+        // Destination dir unreadable/missing — no conflict possible; the
+        // backend will surface the real error if the upload can't proceed.
+        continue;
+      }
+      for (const { local, remote } of group) {
+        const name = remote.split('/').filter(Boolean).pop();
+        const dest = remoteEntries.get(dir).get(name);
+        if (dest) conflicts.push({ local, remote, destDir: dir, destEntry: dest });
+      }
+    }
+    const decided = await resolveBatchConflicts(tabId, 'upload', conflicts);
+    if (!decided) return; // user cancelled the whole batch
+    const items = [];
+    for (const pair of pairs) {
+      const d = decided.find(x => x.remote === pair.remote && x.local === pair.local);
+      if (d) {
+        if (d.action === 'skip') continue;
+        // NOTE: resume:'resume' is honored by the backend once the
+        // resume/.part update lands (Agent B); today the backend treats it
+        // as a plain overwrite — acceptable interim fallback.
+        items.push({ local: pair.local, remote: d.action === 'rename' ? d.renameRemote : pair.remote, resume: d.action });
+      } else {
+        items.push({ local: pair.local, remote: pair.remote, resume: 'overwrite' });
+      }
+    }
+    if (!items.length) { sftpLog(tabId, 'upload batch empty after conflict decisions'); return; }
     const r = await sftpCall('sftp_queue_add', {
       sessionId: tab.sessionId,
       direction: 'upload',
-      items: pairs,
+      items,
+      preserveTs: !!tab.sftpPreserveTs,
     });
     sftpLog(tabId, `queued ${r.added} upload(s)`);
     if (r.added > 0) toast(`${r.added} upload(s) queued.`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+// ─── overwrite-conflict handling (FileZilla "file already exists") ──────────
+
+const CONFLICT_ACTIONS = ['overwrite', 'skip', 'rename', 'resume'];
+
+/// Read a local directory once and index it by file name.
+async function sftpLocalEntryMap(dir) {
+  const r = await sftpCall('sftp_local_list', { path: dir });
+  const map = new Map();
+  for (const e of r.entries || []) map.set(e.name, e);
+  return map;
+}
+
+/// Load the persisted default action for a direction. NOTE: settings_get
+/// only returns whitelisted keys, so a value written by settings_set is
+/// seen via the in-session mirror below; across restarts it reads as 'ask'
+/// until the two keys are added to the backend whitelist (one-line change
+/// owned by the backend agents).
+const sftpConflictDefaults = { sftpConflictUpload: 'ask', sftpConflictDownload: 'ask' };
+
+function sftpConflictDefault(direction) {
+  const key = direction === 'upload' ? 'sftpConflictUpload' : 'sftpConflictDownload';
+  let v = (state.settings && state.settings[key]) || sftpConflictDefaults[key] || 'ask';
+  // Download rename needs the backend `localName` field (remote-basename
+  // derivation can't be redirected today) — asking beats silently
+  // overwriting when the user asked for a rename.
+  if (direction === 'download' && v === 'rename') v = 'ask';
+  return CONFLICT_ACTIONS.includes(v) && v !== 'ask' ? v : 'ask';
+}
+
+/// Split "name.ext" into ["name", ".ext"] (dotless names get no suffix).
+function splitExt(name) {
+  const i = name.lastIndexOf('.');
+  return i > 0 ? [name.slice(0, i), name.slice(i)] : [name, ''];
+}
+
+/// First name of the form "name (n).ext" (n starting at 1) that is NOT
+/// taken in `taken` — the FileZilla auto-rename scheme. The original name
+/// is already taken (that's why we're renaming).
+function sftpFreeName(name, taken) {
+  const [base, ext] = splitExt(name);
+  for (let n = 1; n < 1000; n++) {
+    const candidate = `${base} (${n})${ext}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${base}-${Date.now()}${ext}`;
+}
+
+function sftpConflictMtimeNote(srcMs, dstMs) {
+  if (!srcMs || !dstMs || srcMs === dstMs) return '';
+  const srcNewer = srcMs > dstMs;
+  return srcNewer ? 'Source is newer' : 'Source is older';
+}
+
+function fmtSftpTime(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+}
+
+/// Decide the action for every conflict in a batch. Returns an array of
+/// { ..., action, renameRemote?/localName? } for the conflicted items only,
+/// or null when the user cancels the whole batch. Non-conflicting items are
+/// never blocked — they enqueue as overwrite.
+async function resolveBatchConflicts(tabId, direction, conflicts) {
+  if (!conflicts.length) return [];
+  const tab = sftpTab(tabId);
+  const defaults = sftpConflictDefault(direction);
+  if (defaults !== 'ask') {
+    // Persisted non-ask default: apply silently (FileZilla behavior).
+    const applied = conflicts.map(c => applyConflictAction(c, defaults, direction));
+    sftpLog(tabId, `${conflicts.length} conflict(s) auto-${defaults} (setting)`);
+    return applied;
+  }
+  if (!tab) return conflicts.map(() => ({ action: 'overwrite' }));
+
+  return await new Promise(resolve => {
+    const modal = document.getElementById('conflictModal');
+    if (!modal) { resolve(conflicts.map(c => applyConflictAction(c, 'overwrite', direction))); return; }
+    const title = document.getElementById('conflictTitle');
+    const summary = document.getElementById('conflictSummary');
+    const listEl = document.getElementById('conflictList');
+    const always = document.getElementById('conflictAlways');
+    const alwaysLabel = document.getElementById('conflictAlwaysLabel');
+    const applyBtn = document.getElementById('conflictApplyBtn');
+    const cancelBtn = document.getElementById('conflictCancelBtn');
+    const closeBtn = document.getElementById('conflictCloseBtn');
+    const hint = document.getElementById('conflictHint');
+
+    const isUp = direction === 'upload';
+    title.textContent = conflicts.length === 1
+      ? 'Target file already exists'
+      : `${conflicts.length} target files already exist`;
+    summary.textContent = isUp
+      ? 'The remote file already exists. Choose what to do with each upload:'
+      : 'The local file already exists. Choose what to do with each download:';
+    always.checked = false;
+    alwaysLabel.textContent = `Always use this action for ${isUp ? 'uploads' : 'downloads'}`;
+    hint.textContent = 'Skip removes a file from this batch.';
+
+    // Source side info (for size/mtime comparison). Uploads: stat the local
+    // files via the local pane's dir; downloads: stat remote via list_dir of
+    // the parent (already fetched by the caller when possible — refetch here
+    // to keep this self-contained).
+    listEl.innerHTML = '';
+    const rows = [];
+    let srcEntryPromise;
+    if (isUp) {
+      // Local source stats — group by source dir.
+      srcEntryPromise = (async () => {
+        const dirs = new Map();
+        for (const c of conflicts) {
+          const dir = c.local.slice(0, Math.max(c.local.lastIndexOf('/'), c.local.lastIndexOf('\\')));
+          if (!dirs.has(dir)) dirs.set(dir, null);
+        }
+        for (const dir of dirs.keys()) {
+          try { dirs.set(dir, await sftpLocalEntryMap(dir)); } catch { /* leave null */ }
+        }
+        return dirs;
+      })();
+    }
+
+    const mkRow = (c, idx) => {
+      const srcName = isUp ? c.local.split(/[\\/]/).filter(Boolean).pop() : c.remote.split('/').filter(Boolean).pop();
+      const row = document.createElement('div');
+      row.className = 'conflict-item';
+
+      const head = document.createElement('div');
+      head.className = 'conflict-item-head';
+      head.innerHTML = `<span class="conflict-dir">${isUp ? '↑' : '↓'}</span>
+        <span class="conflict-name">${escapeHtml(srcName || '?')}</span>`;
+      row.appendChild(head);
+
+      const cmp = document.createElement('div');
+      cmp.className = 'conflict-cmp';
+      const srcCell = document.createElement('span');
+      const dstCell = document.createElement('span');
+      srcCell.textContent = '…'; dstCell.textContent = '…';
+      cmp.appendChild(srcCell); cmp.appendChild(dstCell);
+      row.appendChild(cmp);
+      // Fill in source stats asynchronously.
+      if (isUp) {
+        srcEntryPromise.then(dirs => {
+          const dir = c.local.slice(0, Math.max(c.local.lastIndexOf('/'), c.local.lastIndexOf('\\')));
+          const e = (dirs.get(dir) || new Map()).get(srcName);
+          renderConflictCmp(srcCell, dstCell, e, c.destEntry, isUp);
+        }).catch(() => renderConflictCmp(srcCell, dstCell, null, c.destEntry, isUp));
+      } else {
+        (async () => {
+          try {
+            const parent = c.remote.slice(0, c.remote.lastIndexOf('/')) || '/';
+            const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: parent });
+            const e = (r.entries || []).find(x => x.name === srcName);
+            renderConflictCmp(srcCell, dstCell, e, c.destEntry, isUp);
+          } catch { renderConflictCmp(srcCell, dstCell, null, c.destEntry, isUp); }
+        })();
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'conflict-actions';
+      for (const act of CONFLICT_ACTIONS) {
+        const id = `conflict-${idx}-${act}`;
+        const rb = document.createElement('input');
+        rb.type = 'radio';
+        rb.name = `conflict-action-${idx}`;
+        rb.id = id;
+        rb.value = act;
+        rb.checked = act === 'overwrite';
+        if (act === 'resume') {
+          rb.disabled = true;
+          rb.title = 'Resume needs the next backend update';
+        } else if (act === 'rename' && !isUp) {
+          rb.disabled = true;
+          rb.title = 'Download rename needs the next backend update';
+        }
+        const lab = document.createElement('label');
+        lab.className = 'conflict-action' + (rb.disabled ? ' disabled' : '');
+        lab.htmlFor = id;
+        if (rb.title) lab.title = rb.title;
+        const names = { overwrite: 'Overwrite', skip: 'Skip', rename: 'Rename', resume: 'Resume' };
+        lab.appendChild(rb);
+        lab.appendChild(document.createTextNode(names[act]));
+        actions.appendChild(lab);
+      }
+      row.appendChild(actions);
+      listEl.appendChild(row);
+      return { row, c, actions };
+    };
+
+    for (let i = 0; i < conflicts.length; i++) rows.push(mkRow(conflicts[i], i));
+
+    const close = () => {
+      modal.hidden = true;
+      applyBtn.onclick = null; cancelBtn.onclick = null; closeBtn.onclick = null; modal.onclick = null;
+    };
+    const finish = () => {
+      const out = [];
+      for (const { c, actions } of rows) {
+        const sel = actions.querySelector('input[type="radio"]:checked');
+        const act = sel ? sel.value : 'overwrite';
+        out.push(applyConflictAction(c, act, direction));
+      }
+      if (always.checked) {
+        // The "always" action is the first row's choice (all rows start at
+        // the same default and FileZilla applies one action to the rest).
+        const first = out[0] ? out[0].action : 'overwrite';
+        const key = direction === 'upload' ? 'sftpConflictUpload' : 'sftpConflictDownload';
+        call('settings_set', { key, value: first }).then(() => {
+          sftpConflictDefaults[key] = first;
+          if (state.settings) state.settings[key] = first;
+        }).catch(() => {});
+        sftpLog(tabId, `default for ${direction} conflicts: ${first}`);
+      }
+      close();
+      resolve(out);
+    };
+    applyBtn.onclick = finish;
+    cancelBtn.onclick = () => { close(); resolve(null); };
+    closeBtn.onclick = () => { close(); resolve(null); };
+    modal.onclick = (ev) => { if (ev.target === modal) { close(); resolve(null); } };
+
+    modal.hidden = false;
+    applyBtn.focus();
+  });
+}
+
+function renderConflictCmp(srcCell, dstCell, srcEntry, dstEntry, isUp) {
+  const one = (e, side) => {
+    if (!e) return `${side}: unknown`;
+    const bits = [formatSftpSize(e.size || 0), fmtSftpTime(e.modifiedMs)];
+    return `${side}: ${bits[0]} · ${bits[1]}`;
+  };
+  srcCell.textContent = one(srcEntry, 'Source');
+  dstCell.textContent = one(dstEntry, 'Target');
+  const note = sftpConflictMtimeNote(srcEntry && srcEntry.modifiedMs, dstEntry && dstEntry.modifiedMs);
+  if (note) {
+    const n = document.createElement('span');
+    n.className = 'conflict-note';
+    n.textContent = note;
+    srcCell.parentElement.appendChild(n);
+  }
+}
+
+/// Attach the chosen action to a conflict record. Rename computes the free
+/// name against the destination listing (plus names already claimed by this
+/// batch) and reports the adjusted destination:
+///   upload → renameRemote (new remote path, applied today)
+///   download → localName (honored by the backend once Agent B's update
+///              lands; today the remote basename wins = overwrite)
+function applyConflictAction(c, action, direction, extraTaken) {
+  const out = { ...c, action };
+  if (action !== 'rename') return out;
+  const name = direction === 'upload'
+    ? c.remote.split('/').filter(Boolean).pop()
+    : (c.destEntry && c.destEntry.name) || c.remote.split('/').filter(Boolean).pop();
+  const taken = new Set(extraTaken || []);
+  if (c.destEntry && c.destEntry.name) taken.add(c.destEntry.name);
+  const free = sftpFreeName(name, taken);
+  if (direction === 'upload') {
+    const dir = c.remote.slice(0, c.remote.lastIndexOf('/')) || '/';
+    out.renameRemote = sftpJoin(dir, free);
+  } else {
+    out.localName = free;
+  }
+  return out;
 }
 
 async function sftpDownloadTo(tabId, fullPath, name) {
@@ -1051,6 +1676,7 @@ async function sftpSendTo(fromTabId, fullPath, targetTab) {
 const queueJobs = new Map(); // id -> job
 let queueUnlisten = null;
 let queueTab = 'queued'; // which tab is visible: queued | failed | done
+let sftpUiQueueH = null; // persisted queue-panel height (px) set by the drag handle
 
 function wireQueueEvents() {
   if (queueUnlisten) return;
@@ -1068,12 +1694,49 @@ function wireQueueEvents() {
   }).then(un => { queueUnlisten = un; });
 }
 
+/// ETA from remaining bytes / speed. '—' when speed is 0/unknown or all done.
+/// serverCopy progress counts both halves, so remaining uses 2×size (matching
+/// the progress bar's totalUnits).
+function sftpUiQueueEta(j, shownDone) {
+  if (j.state === 'done') return '—';
+  const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
+  const done = j.kind === 'serverCopy' ? (j.bytesDone || 0) : (shownDone || 0);
+  const remaining = totalUnits > 0 ? Math.max(0, totalUnits - done) : 0;
+  const speed = j.speed || 0;
+  if (speed <= 0 || remaining <= 0) return '—';
+  const secs = Math.ceil(remaining / speed);
+  if (secs < 60) return secs + 's';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+  return h + 'h ' + m + 'm';
+}
+
 function buildQueuePanel() {
   const panel = document.createElement('div');
   panel.className = 'sftp-queuepanel';
   panel.id = 'sftpQueuePanel';
   panel.style.display = 'none';
 
+  // Top-edge drag handle: resize the panel vertically.
+  const handle = document.createElement('div');
+  handle.className = 'sftp-queuehandle';
+  handle.title = 'Drag to resize the transfer panel';
+  let qDrag = null;
+  handle.addEventListener('mousedown', (ev) => {
+    const rect = panel.getBoundingClientRect();
+    qDrag = { startY: ev.clientY, startH: rect.height };
+    ev.preventDefault();
+  });
+  document.addEventListener('mousemove', (ev) => {
+    if (!qDrag) return;
+    const h = Math.min(window.innerHeight * 0.7, Math.max(120, qDrag.startH - (ev.clientY - qDrag.startY)));
+    sftpUiQueueH = Math.round(h);
+    panel.style.height = sftpUiQueueH + 'px';
+  });
+  document.addEventListener('mouseup', () => { qDrag = null; });
+
+  // Head: title / summary / tabs / actions. Extra action buttons (pause,
+  // priority, …) append to .sftp-queueactions-head without layout changes.
   const head = document.createElement('div');
   head.className = 'sftp-queuehead';
   const title = document.createElement('span');
@@ -1095,6 +1758,8 @@ function buildQueuePanel() {
     });
     tabs.appendChild(b);
   }
+  const headActions = document.createElement('div');
+  headActions.className = 'sftp-queueactions-head';
   const clearBtn = document.createElement('button');
   clearBtn.className = 'ghost-btn';
   clearBtn.textContent = 'Clear finished';
@@ -1105,16 +1770,32 @@ function buildQueuePanel() {
     }
     renderQueuePanel();
   });
+  headActions.appendChild(clearBtn);
   head.appendChild(title);
   head.appendChild(summary);
   head.appendChild(tabs);
-  head.appendChild(clearBtn);
+  head.appendChild(headActions);
+
+  // Column header row + scrolling rows (table-like grid).
+  const colhead = document.createElement('div');
+  colhead.className = 'sftp-queuecols';
+  colhead.innerHTML = `
+    <span class="q-col q-dir"></span>
+    <span class="q-col q-name">Filename</span>
+    <span class="q-col q-route">Route</span>
+    <span class="q-col q-prog">Progress</span>
+    <span class="q-col q-speed">Speed</span>
+    <span class="q-col q-eta">ETA</span>
+    <span class="q-col q-err">Error</span>
+    <span class="q-col q-act"></span>`;
 
   const list = document.createElement('div');
   list.className = 'sftp-queuelist';
   list.id = 'sftpQueueList';
 
+  panel.appendChild(handle);
   panel.appendChild(head);
+  panel.appendChild(colhead);
   panel.appendChild(list);
   return panel;
 }
@@ -1152,7 +1833,11 @@ function renderQueuePanel() {
     const name = j.kind === 'upload'
       ? (j.remotePath || '').split('/').filter(Boolean).pop()
       : (j.remotePath || '').split('/').filter(Boolean).pop();
-    const dirLabel = j.kind === 'upload' ? '↑' : j.kind === 'serverCopy' ? '⇄' : '↓';
+    const dirIcon = j.kind === 'upload'
+      ? `<span class="q-dirarrow up" title="Upload">${ico('file-up')}</span>`
+      : j.kind === 'serverCopy'
+        ? `<span class="q-dirarrow copy" title="Server to server">${ico('send')}</span>`
+        : `<span class="q-dirarrow down" title="Download">${ico('download')}</span>`;
     // serverCopy: bytesDone is overall (download half + upload half), so the
     // progress bar maps 0..2×size onto 0..100%.
     const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
@@ -1163,24 +1848,29 @@ function renderQueuePanel() {
       ? Math.min(j.bytesDone || 0, j.size || 0)
       : (j.bytesDone || 0);
 
-    const info = document.createElement('div');
-    info.className = 'sftp-queueinfo';
     const route = j.kind === 'serverCopy' && j.targetServerName
       ? `${escapeHtml(j.serverName || '')} → ${escapeHtml(j.targetServerName)}`
       : escapeHtml(j.serverName || '');
-    info.innerHTML = `<span class="sftp-queuename">${escapeHtml(dirLabel + ' ' + (name || '?'))}</span>
-      <span class="sftp-queuesub">${route} · ${formatSftpSize(shownDone || 0)}${j.size ? ' / ' + formatSftpSize(j.size) : ''}${j.speed ? ' · ' + (j.speed / 1024).toFixed(1) + ' KB/s' : ''}${j.error ? ' · ' + escapeHtml(j.error) : ''}</span>`;
-    const bar = document.createElement('div');
-    bar.className = 'sftp-queuebar';
-    const fill = document.createElement('div');
-    fill.className = 'sftp-queuefill' + (j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : '');
-    fill.style.width = pct + '%';
-    bar.appendChild(fill);
-    row.appendChild(info);
-    row.appendChild(bar);
+    const progress = j.size
+      ? `${formatSftpSize(shownDone || 0)} / ${formatSftpSize(j.size)}`
+      : formatSftpSize(shownDone || 0);
+    const speed = j.speed ? (j.speed / 1024).toFixed(1) + ' KB/s' : '—';
+    const eta = sftpUiQueueEta(j, shownDone);
 
-    const actions = document.createElement('div');
-    actions.className = 'sftp-queueactions';
+    row.innerHTML = `
+      <span class="q-cell q-dir">${dirIcon}</span>
+      <span class="q-cell q-name" title="${escapeHtml(name || '')}">${escapeHtml(name || '?')}</span>
+      <span class="q-cell q-route" title="${route}">${route}</span>
+      <span class="q-cell q-prog">
+        <span class="sftp-queuebar"><span class="sftp-queuefill${j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : ''}" style="width:${pct}%"></span></span>
+        <span class="q-progtext">${progress}</span>
+      </span>
+      <span class="q-cell q-speed">${speed}</span>
+      <span class="q-cell q-eta">${eta}</span>
+      <span class="q-cell q-err" title="${escapeHtml(j.error || '')}">${escapeHtml(j.error || '')}</span>`;
+
+    const actions = document.createElement('span');
+    actions.className = 'q-cell q-act sftp-queueactions';
     if (j.state === 'active' || j.state === 'queued') {
       const cancel = document.createElement('button');
       cancel.className = 'icon-btn';
@@ -1232,31 +1922,539 @@ function wireSftpDrop(panel, tabId, hint) {
       hint.classList.remove('dragover');
     } else if (event.payload.type === 'drop') {
       hint.classList.remove('dragover');
+      const tab = state.sessions.get(state.activeTabId);
+      if (!tab || tab.mode !== 'sftp') return;
       const paths = event.payload.paths || [];
+      if (!paths.length) return;
+      // Target the hovered pane: over a remote DIRECTORY row the upload goes
+      // INTO that folder; over the remote pane generally it goes to the
+      // remote cwd. Over the local pane an OS drop can only mean an upload to
+      // the remote cwd (the local pane can't receive OS files meaningfully).
+      let remoteDir = tab.sftpPath;
+      const pos = event.payload.position; // window coords (physical px)
+      if (pos && typeof document.elementFromPoint === 'function') {
+        const dpr = window.devicePixelRatio || 1;
+        const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr);
+        const row = el && el.closest ? el.closest('tr.sftp-entry') : null;
+        const panel = el && el.closest ? el.closest('.sftp-panel') : null;
+        if (panel && panel.id === 'sftpPanel-' + tab.tabId &&
+            row && row.dataset.isdir === '1' &&
+            el.closest('.sftp-remote')) {
+          remoteDir = sftpJoin(tab.sftpPath, row.dataset.name);
+        }
+      }
       const pairs = paths.map(p => {
         const name = p.split(/[\\/]/).filter(Boolean).pop() || 'file';
-        return { local: p, remote: sftpJoin(tab.sftpPath, name) };
+        return { local: p, remote: sftpJoin(remoteDir, name) };
       });
-      if (pairs.length) queueUploads(tab.tabId, pairs);
+      queueUploads(tab.tabId, pairs);
     }
   });
 }
 
-// Remote pane accepts drops from the local pane (HTML5 DnD).
+// ─── two-pane drag & drop (FileZilla parity) ─────────────────────────────────
+
+// Affordance styles injected once (styles.css is shared; keep this scoped and
+// idempotent so parallel edits to the stylesheet don't collide).
+function ensureSftpDndStyles() {
+  if (document.getElementById('sftpDndStyles')) return;
+  const style = document.createElement('style');
+  style.id = 'sftpDndStyles';
+  style.textContent = `
+    .sftp-pane.drag-over { outline: 2px dashed var(--accent); outline-offset: -4px; background: var(--accent-weak); }
+    .sftp-entry.drop-target td { background: var(--accent-weak) !important; box-shadow: inset 3px 0 var(--accent); }`;
+  document.head.appendChild(style);
+}
+ensureSftpDndStyles();
+
+const SFTP_DND_TYPES = ['text/sftp-local', 'text/sftp-remote'];
+
+function sftpDndPayload(ev) {
+  for (const type of SFTP_DND_TYPES) {
+    if (ev.dataTransfer.types.includes(type)) {
+      try {
+        const raw = ev.dataTransfer.getData(type);
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        return { type, data };
+      } catch { return null; } // malformed payload — ignore the gesture
+    }
+  }
+  return null;
+}
+
+function clearSftpDropHighlights(panel) {
+  if (!panel) return;
+  for (const el of panel.querySelectorAll('.drop-target')) el.classList.remove('drop-target');
+  for (const el of panel.querySelectorAll('.drag-over')) el.classList.remove('drag-over');
+}
+
+/// Highlight the element under a drag: a DIRECTORY row wins (drop-into-folder),
+/// otherwise the pane itself (drop-into-cwd).
+function highlightSftpDropTarget(ev) {
+  const panel = ev.target.closest ? ev.target.closest('.sftp-panel') : null;
+  const root = panel || document.getElementById('sftpBody') || document;
+  // Clear previous highlights anywhere in the active panel.
+  for (const el of root.querySelectorAll('.drop-target')) el.classList.remove('drop-target');
+  for (const el of root.querySelectorAll('.drag-over')) el.classList.remove('drag-over');
+  const row = ev.target.closest ? ev.target.closest('tr.sftp-entry') : null;
+  if (row && row.dataset.isdir === '1') {
+    row.classList.add('drop-target');
+    return row;
+  }
+  const pane = ev.target.closest ? ev.target.closest('.sftp-pane') : null;
+  if (pane) pane.classList.add('drag-over');
+  return null;
+}
+
+/// Local row double-click already uploads; this handles the local tbody as a
+/// DROP TARGET for text/sftp-remote (remote → local download). Event
+/// delegation on the tbody, added once per panel via wireSftpPaneDnd.
+function wireSftpPaneDnd(tabId) {
+  const localBody = document.getElementById('sftpLocalTbody-' + tabId);
+  const remoteBody = document.getElementById('sftpTbody-' + tabId);
+  if (localBody && !localBody._sftpDndWired) {
+    localBody._sftpDndWired = true;
+    localBody.addEventListener('dragover', (ev) => {
+      if (!ev.dataTransfer.types.includes('text/sftp-remote')) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'copy';
+      highlightSftpDropTarget(ev);
+    });
+    localBody.addEventListener('drop', async (ev) => {
+      const payload = sftpDndPayload(ev);
+      if (!payload || payload.type !== 'text/sftp-remote') return;
+      ev.preventDefault();
+      ev.stopPropagation(); // don't double-fire the pane-level handler
+      clearSftpDropHighlights(ev.target.closest('.sftp-panel'));
+      const { data } = payload;
+      const tab = sftpTab(tabId);
+      if (!tab || tab.mode !== 'sftp') return;
+      // Over a local DIRECTORY row → download into that dir; else pane cwd.
+      const row = ev.target.closest('tr.sftp-entry');
+      if (row && row.dataset.isdir === '1' && tab.localPath) {
+        const dir = joinLocal(tab.localPath, row.dataset.name);
+        queueDownloadsInto(tabId, [data.path], dir);
+      } else {
+        queueDownloads(tabId, [data.path]);
+      }
+    });
+  }
+  if (remoteBody && !remoteBody._sftpDndWired) {
+    remoteBody._sftpDndWired = true;
+    remoteBody.addEventListener('dragover', (ev) => {
+      if (!SFTP_DND_TYPES.some(t => ev.dataTransfer.types.includes(t))) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = ev.dataTransfer.types.includes('text/sftp-remote')
+        ? 'move' : 'copy';
+      highlightSftpDropTarget(ev);
+    });
+    remoteBody.addEventListener('drop', async (ev) => {
+      const payload = sftpDndPayload(ev);
+      if (!payload) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      clearSftpDropHighlights(ev.target.closest('.sftp-panel'));
+      const tab = sftpTab(tabId);
+      if (!tab || tab.mode !== 'sftp') return;
+      const row = ev.target.closest('tr.sftp-entry');
+      const overDir = row && row.dataset.isdir === '1' ? row.dataset.name : null;
+      if (payload.type === 'text/sftp-local') {
+        // local → remote: upload into the hovered dir, else the remote cwd.
+        const target = overDir ? sftpJoin(tab.sftpPath, overDir) : tab.sftpPath;
+        queueUploads(tabId, [{ local: payload.data.path, remote: sftpJoin(target, payload.data.name) }]);
+      } else if (payload.type === 'text/sftp-remote') {
+        // remote → remote: MOVE via rename when dropped on a different dir.
+        if (!overDir) return; // same-dir drop is a no-op
+        const from = payload.data.path;
+        const to = sftpJoin(sftpJoin(tab.sftpPath, overDir), payload.data.name);
+        if (from === to) return;
+        if (!confirm(`Move "${payload.data.name}" to "${sftpJoin(tab.sftpPath, overDir)}"?`)) return;
+        try {
+          await sftpCall('sftp_rename', { sessionId: tab.sessionId, from, to });
+          sftpLog(tabId, `move ${payload.data.name} → ${to}`);
+          await refreshSftpPanel(tabId);
+        } catch (e) { toast(e.message || String(e), 'err'); }
+      }
+    });
+  }
+}
+
+// Document-level dragover: prevent default for our custom types. The tbody
+// delegations own the row/pane affordances; this just keeps the drop allowed
+// over pane chrome and empty tbody areas.
 document.addEventListener('dragover', (ev) => {
-  if (ev.dataTransfer.types.includes('text/sftp-local')) ev.preventDefault();
+  if (SFTP_DND_TYPES.some(t => ev.dataTransfer.types.includes(t))) {
+    ev.preventDefault();
+  }
 });
 document.addEventListener('drop', (ev) => {
-  if (!ev.dataTransfer.types.includes('text/sftp-local')) return;
+  const payload = sftpDndPayload(ev);
+  if (!payload) return;
   ev.preventDefault();
-  const raw = ev.dataTransfer.getData('text/sftp-local');
-  if (!raw) return;
   const tab = sftpTab(state.activeTabId);
   if (!tab || tab.mode !== 'sftp') return;
-  try {
-    const { path, name } = JSON.parse(raw);
-    queueUploads(tab.tabId, [{ local: path, remote: sftpJoin(tab.sftpPath, name) }]);
-  } catch { /* ignore malformed payloads */ }
+  clearSftpDropHighlights(document.getElementById('sftpPanel-' + tab.tabId));
+  // Only handle drops NOT on a directory row (those were consumed by the
+  // tbody delegation with stopPropagation; this is the belt-and-braces path
+  // for drops over pane chrome / empty tbody areas).
+  const row = ev.target.closest ? ev.target.closest('tr.sftp-entry') : null;
+  if (row && row.dataset.isdir === '1') return;
+  if (payload.type === 'text/sftp-local') {
+    // Local → remote pane cwd (upload). If the drop was over the LOCAL pane,
+    // a local→local move is not supported — treat as no-op.
+    if (ev.target.closest && ev.target.closest('.sftp-local')) return;
+    queueUploads(tab.tabId, [{ local: payload.data.path, remote: sftpJoin(tab.sftpPath, payload.data.name) }]);
+  } else if (payload.type === 'text/sftp-remote') {
+    // Remote → local pane cwd (download). Over the remote pane itself the
+    // row handler already managed it; a bare pane drop is a no-op.
+    if (ev.target.closest && ev.target.closest('.sftp-remote')) return;
+    if (!ev.target.closest || !ev.target.closest('.sftp-local')) return;
+    queueDownloads(tab.tabId, [payload.data.path]);
+  }
+});
+
+// Dragleave cleanup: clear stale highlights when a drag exits the pane.
+document.addEventListener('dragleave', (ev) => {
+  if (!SFTP_DND_TYPES.some(t => ev.dataTransfer.types.includes(t))) return;
+  const pane = ev.target.closest ? ev.target.closest('.sftp-pane') : null;
+  if (pane && !pane.contains(ev.relatedTarget)) {
+    pane.classList.remove('drag-over');
+    for (const el of pane.querySelectorAll('.drop-target')) el.classList.remove('drop-target');
+  }
+});
+
+// ─── directory comparison (agent-e) ─────────────────────────────────────────
+//
+// FileZilla-parity directory comparison: tint rows in both panes to show which
+// files exist on only one side (yellow) or differ between sides (red), in two
+// modes — by file size or by modification time. Self-contained section; hooks
+// in refreshSftpPanel / refreshLocalPane / renderEntries call sftpCmpAfterRefresh
+// guarded with typeof checks, so merging with parallel work stays clean.
+
+// mtime comparison tolerance in ms — two files whose mtimes differ by less
+// than this are considered identical (clock skew + FAT-style 2s granularity).
+const sftpCmpMtimeToleranceMs = 60 * 1000;
+
+// Per-tab comparison mode: null (off) | 'size' | 'mtime'. Global preference
+// persisted via settings key "sftpCmpMode"; applied per tab on demand.
+const sftpCmpTabs = new Map(); // tabId -> 'size' | 'mtime'
+
+function sftpCmpModeOf(tabId) {
+  return sftpCmpTabs.get(tabId) || null;
+}
+
+function sftpCmpPersistedMode() {
+  const v = state.settings?.sftpCmpMode;
+  return v === 'size' || v === 'mtime' ? v : null;
+}
+
+/// Cycle the active tab's comparison mode: off → size → mtime → off.
+/// Also exposed as window.sftpCmpToggle(tabId) for toolbar wiring.
+async function sftpCmpToggle(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  if (!tab.dualPane) {
+    toast('Directory comparison needs the dual pane open.', 'info');
+    return;
+  }
+  const cur = sftpCmpModeOf(tabId);
+  const next = cur === null ? 'size' : cur === 'size' ? 'mtime' : null;
+  if (next) sftpCmpTabs.set(tabId, next);
+  else sftpCmpTabs.delete(tabId);
+  // Persist the last-used mode ('' when turned off from mtime → default off).
+  call('settings_set', { key: 'sftpCmpMode', value: next || '' }).catch(() => {});
+  sftpLog(tabId, `directory comparison: ${next ? 'by ' + (next === 'size' ? 'file size' : 'modified time') : 'off'}`);
+  sftpCmpUpdateButton(tabId);
+  if (next) sftpCmpRun(tabId);
+  else sftpCmpClear(tabId);
+}
+
+/// Apply the persisted mode to a tab when its dual pane opens (called from
+/// toggleDualPane via the guarded hook below).
+function sftpCmpApplyPersisted(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab || !tab.dualPane) { sftpCmpTabs.delete(tabId); return; }
+  const persisted = sftpCmpPersistedMode();
+  if (persisted) sftpCmpTabs.set(tabId, persisted);
+  else sftpCmpTabs.delete(tabId);
+  sftpCmpUpdateButton(tabId);
+  if (persisted) sftpCmpRun(tabId);
+  else sftpCmpClear(tabId);
+}
+
+/// Hook invoked (guarded, idempotent) after every remote/local refresh.
+/// No-op when the pane is closed or comparison is off for this tab.
+function sftpCmpAfterRefresh(tabId) {
+  sftpCmpEnsureButtons(tabId);
+  const tab = sftpTab(tabId);
+  if (!tab || !tab.dualPane) return;
+  if (!sftpCmpModeOf(tabId)) return;
+  sftpCmpRun(tabId);
+}
+
+/// Compute the comparison between tab._localEntries and tab._entries and
+/// tint rows in both panes. Files only — directories stay neutral.
+function sftpCmpRun(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab || !tab.dualPane) return;
+  const mode = sftpCmpModeOf(tabId);
+  if (!mode) return;
+  const remoteTbody = document.getElementById('sftpTbody-' + tabId);
+  const localTbody = document.getElementById('sftpLocalTbody-' + tabId);
+  if (!remoteTbody || !localTbody) return;
+
+  const remote = (tab._entries || []).filter(e => !e.isDir);
+  const local = (tab._localEntries || []).filter(e => !e.isDir);
+  const remoteByName = new Map(remote.map(e => [e.name, e]));
+  const localByName = new Map(local.map(e => [e.name, e]));
+
+  const cls = { remote: new Map(), local: new Map() }; // name → class
+  let onlyLocal = 0, onlyRemote = 0, differ = 0, same = 0;
+  for (const e of local) {
+    if (!remoteByName.has(e.name)) { cls.local.set(e.name, 'sftp-cmp-only'); onlyLocal++; continue; }
+    const r = remoteByName.get(e.name);
+    let diff;
+    if (mode === 'size') diff = (e.size || 0) !== (r.size || 0);
+    else diff = Math.abs((e.modifiedMs || 0) - (r.modifiedMs || 0)) > sftpCmpMtimeToleranceMs;
+    if (diff) { cls.local.set(e.name, 'sftp-cmp-diff'); cls.remote.set(e.name, 'sftp-cmp-diff'); differ++; }
+    else { cls.local.set(e.name, 'sftp-cmp-same'); cls.remote.set(e.name, 'sftp-cmp-same'); same++; }
+  }
+  for (const e of remote) {
+    if (localByName.has(e.name)) continue;
+    cls.remote.set(e.name, 'sftp-cmp-only'); onlyRemote++;
+  }
+
+  sftpCmpPaint(remoteTbody, cls.remote);
+  sftpCmpPaint(localTbody, cls.local);
+  sftpLog(tabId, `compare (${mode === 'size' ? 'by size' : 'by mtime'}): ${onlyLocal} only-local, ${onlyRemote} only-remote, ${differ} differ, ${same} identical`);
+}
+
+/// Remove all comparison classes from both panes (mode turned off).
+function sftpCmpClear(tabId) {
+  const remoteTbody = document.getElementById('sftpTbody-' + tabId);
+  const localTbody = document.getElementById('sftpLocalTbody-' + tabId);
+  if (remoteTbody) for (const tr of remoteTbody.querySelectorAll('.sftp-cmp-only, .sftp-cmp-diff, .sftp-cmp-same')) {
+    tr.classList.remove('sftp-cmp-only', 'sftp-cmp-diff', 'sftp-cmp-same');
+  }
+  if (localTbody) for (const tr of localTbody.querySelectorAll('.sftp-cmp-only, .sftp-cmp-diff, .sftp-cmp-same')) {
+    tr.classList.remove('sftp-cmp-only', 'sftp-cmp-diff', 'sftp-cmp-same');
+  }
+}
+
+/// Apply a name→class map to one pane's rows (files only; dirs stay neutral).
+function sftpCmpPaint(tbody, map) {
+  for (const tr of tbody.querySelectorAll('.sftp-entry')) {
+    tr.classList.remove('sftp-cmp-only', 'sftp-cmp-diff', 'sftp-cmp-same');
+    if (tr.dataset.isdir === '1') continue;
+    const c = map.get(tr.dataset.name);
+    if (c) tr.classList.add(c);
+  }
+}
+
+/// Toolbar affordance without touching the toolbar block in buildSftpPanel:
+/// append "Compare" / "Sync browse" ghost buttons once, after the panel exists.
+function sftpCmpEnsureButtons(tabId) {
+  const panel = document.getElementById('sftpPanel-' + tabId);
+  if (!panel) return;
+  const toolbar = panel.querySelector('.sftp-toolbar');
+  if (!toolbar) return;
+  if (toolbar.querySelector('.sftp-cmp-btn')) return; // idempotent
+
+  const mkBtn = (cls, icon, title, label, fn) => {
+    const b = document.createElement('button');
+    b.className = 'ghost-btn ' + cls;
+    b.title = title;
+    b.innerHTML = `${ico(icon)}<span>${label}</span>`;
+    b.addEventListener('click', fn);
+    return b;
+  };
+  const cmpBtn = mkBtn('sftp-cmp-btn', 'eye', 'Compare directories (Ctrl+Y): off → by size → by mtime', 'Compare', () => sftpCmpToggle(tabId));
+  const syncBtn = mkBtn('sftp-sync-btn', 'folder-tree', 'Synchronized browsing (Ctrl+Shift+B): mirror navigation in both panes', 'Sync browse', () => sftpSyncToggle(tabId));
+  // Insert before the path input so the buttons stay grouped with the others.
+  const pathBox = toolbar.querySelector('.sftp-path');
+  toolbar.insertBefore(cmpBtn, pathBox);
+  toolbar.insertBefore(syncBtn, pathBox);
+  sftpCmpUpdateButton(tabId);
+  sftpSyncUpdateButton(tabId);
+}
+
+/// Reflect the current comparison mode on the Compare button (label + .active).
+function sftpCmpUpdateButton(tabId) {
+  const btn = document.querySelector(`#sftpPanel-${tabId} .sftp-cmp-btn`);
+  if (!btn) return;
+  const mode = sftpCmpModeOf(tabId);
+  btn.classList.toggle('active', !!mode);
+  const span = btn.querySelector('span');
+  if (span) span.textContent = mode === 'size' ? 'Cmp·size' : mode === 'mtime' ? 'Cmp·mtime' : 'Compare';
+  btn.title = mode
+    ? `Comparing by ${mode === 'size' ? 'file size' : 'modified time'} — click or Ctrl+Y to change`
+    : 'Compare directories (Ctrl+Y): off → by size → by mtime';
+}
+
+// Keyboard shortcut: Ctrl+Y cycles comparison in the active SFTP tab.
+document.addEventListener('keydown', (ev) => {
+  if (!(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'y') return;
+  const tab = sftpTab(state.activeTabId);
+  if (!tab || tab.mode !== 'sftp') return;
+  const panel = document.getElementById('sftpPanel-' + tab.tabId);
+  if (!panel) return;
+  ev.preventDefault();
+  sftpCmpToggle(tab.tabId);
+});
+
+// ─── synchronized browsing (agent-e) ────────────────────────────────────────
+//
+// FileZilla-parity synchronized browsing: when enabled with the dual pane
+// open, navigating into a directory (or up) on one side mirrors the other.
+// The anchor is the local↔remote path pair at the moment sync is enabled —
+// mirroring is structural (same subdir name / one level up), not an absolute
+// path mapping. If the mirrored directory doesn't exist, sync is suspended
+// with a toast until the two sides realign at a shared level.
+
+const sftpSyncTabs = new Set(); // tabIds with synchronized browsing ON
+
+function sftpSyncIsOn(tabId) {
+  return sftpSyncTabs.has(tabId);
+}
+
+async function sftpSyncToggle(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  if (!tab.dualPane) {
+    toast('Synchronized browsing needs the dual pane open.', 'info');
+    return;
+  }
+  if (sftpSyncTabs.has(tabId)) {
+    sftpSyncTabs.delete(tabId);
+    sftpLog(tabId, 'synchronized browsing: off');
+  } else {
+    if (!tab.localPath || !tab.sftpPath) {
+      toast('Both panes must finish loading before enabling sync.', 'info');
+      return;
+    }
+    sftpSyncTabs.add(tabId);
+    sftpLog(tabId, `synchronized browsing: on (anchored at ${tab.localPath} ⇄ ${tab.sftpPath})`);
+  }
+  sftpSyncUpdateButton(tabId);
+}
+
+/// Reflect the sync state on the Sync browse button.
+function sftpSyncUpdateButton(tabId) {
+  const btn = document.querySelector(`#sftpPanel-${tabId} .sftp-sync-btn`);
+  if (!btn) return;
+  btn.classList.toggle('active', sftpSyncTabs.has(tabId));
+  btn.title = sftpSyncTabs.has(tabId)
+    ? 'Synchronized browsing is ON — click or Ctrl+Shift+B to turn off'
+    : 'Synchronized browsing (Ctrl+Shift+B): mirror navigation in both panes';
+}
+
+/// True if sync should mirror this tab right now (pane open, both sides
+/// loaded, sync enabled, not suspended).
+function sftpSyncActive(tabId) {
+  const tab = sftpTab(tabId);
+  return !!(tab && tab.dualPane && sftpSyncTabs.has(tabId) && tab.localPath && tab.sftpPath);
+}
+
+/// Suspend sync for this tab and explain why (missing mirror directory).
+function sftpSyncSuspend(tabId, side, name) {
+  if (!sftpSyncTabs.delete(tabId)) return;
+  toast(`${side} ${name} doesn't exist — sync paused for this level`, 'warn');
+  sftpLog(tabId, `synchronized browsing suspended: ${side} "${name}" has no mirror`);
+  sftpSyncUpdateButton(tabId);
+}
+
+/// Remote dblclick into subdir `name`. Returns true when sync handled the
+/// navigation. The local target is verified first; the remote side always
+/// navigates (it's where the dblclick happened), the local side mirrors only
+/// if sync is still on. tab.localPath is set BEFORE any refresh so the
+/// refreshLocalPane nested in refreshSftpPanel lists the new directory.
+function sftpSyncRemoteNav(tabId, name) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  const targetLocal = joinLocal(tab.localPath, name);
+  const targetRemote = sftpJoin(tab.sftpPath, name);
+  sftpCall('sftp_local_list', { path: targetLocal })
+    .then(() => {
+      const mirror = sftpSyncIsOn(tabId); // may have been toggled off mid-flight
+      tab.sftpPath = targetRemote;        // remote always navigates (origin of the dblclick)
+      if (mirror) tab.localPath = targetLocal;
+      refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+    })
+    .catch(() => {
+      // Local mirror missing: remote still navigates, sync suspends.
+      tab.sftpPath = targetRemote;
+      refreshSftpPanel(tabId);
+      sftpSyncSuspend(tabId, 'local', name);
+    });
+  return true;
+}
+
+/// Local dblclick into subdir `name`. Returns true when sync handled the
+/// navigation. Remote existence is checked against the cached listing of
+/// the current remote directory.
+function sftpSyncLocalNav(tabId, name) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  const remoteHasDir = (tab._entries || []).some(e => e.isDir && e.name === name);
+  tab.localPath = joinLocal(tab.localPath, name);
+  if (!remoteHasDir) {
+    refreshLocalPane(tabId);
+    sftpSyncSuspend(tabId, 'remote', name);
+    return true;
+  }
+  tab.sftpPath = sftpJoin(tab.sftpPath, name);
+  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  return true;
+}
+
+/// Remote "Up" with sync. Returns true when handled. Both paths are updated
+/// before any refresh (avoids an old-listing race between the two panes).
+function sftpSyncRemoteUp(tabId) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  const upRemote = sftpParent(tab.sftpPath);
+  const upLocal = sftpSyncParentLocal(tab.localPath);
+  tab.sftpPath = upRemote;
+  tab.localPath = upLocal;
+  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  return true;
+}
+
+/// Local "Up" with sync. Returns true when handled.
+function sftpSyncLocalUp(tabId) {
+  if (!sftpSyncActive(tabId)) return false;
+  const tab = sftpTab(tabId);
+  if (!tab.localPath) { refreshLocalPane(tabId); return true; } // nothing above local root
+  const upLocal = sftpSyncParentLocal(tab.localPath);
+  const upRemote = sftpParent(tab.sftpPath);
+  tab.localPath = upLocal;
+  tab.sftpPath = upRemote;
+  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  return true;
+}
+
+/// Parent of a local path, mirroring localNavigateUp's separator handling.
+/// Returns '' at/above the local root (home).
+function sftpSyncParentLocal(p) {
+  const sep = p.includes('\\') && !p.includes('/') ? '\\' : '/';
+  const parts = p.split(sep).filter(Boolean);
+  parts.pop();
+  if (!parts.length) return '';
+  let up = parts.join(sep);
+  if (sep === '/') up = '/' + up;
+  return up;
+}
+
+// Keyboard shortcut: Ctrl+Shift+B toggles synchronized browsing.
+document.addEventListener('keydown', (ev) => {
+  if (!(ev.ctrlKey || ev.metaKey) || !ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'b') return;
+  const tab = sftpTab(state.activeTabId);
+  if (!tab || tab.mode !== 'sftp') return;
+  const panel = document.getElementById('sftpPanel-' + tab.tabId);
+  if (!panel) return;
+  ev.preventDefault();
+  sftpSyncToggle(tab.tabId);
 });
 
 // ─── exports ────────────────────────────────────────────────────────────────
@@ -1266,3 +2464,6 @@ window.refreshSftpPanel = refreshSftpPanel;
 window.showSshForTab = showSshForTab;
 window.showSftpForTab = showSftpForTab;
 window.sftpQueueDownloads = queueDownloads;
+window.sftpConflictDefaults = sftpConflictDefaults;
+window.sftpCmpToggle = sftpCmpToggle;
+window.sftpSyncToggle = sftpSyncToggle;

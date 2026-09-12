@@ -125,16 +125,52 @@ impl EditRegistry {
 /// on Unix it is created with mode 0700 so other local users cannot read
 /// staged file contents. Windows `%TEMP%` is already per-user (ACLs), so no
 /// permission change is needed there.
+///
+/// Hostile pre-plant defense: on shared-temp filesystems (Linux `/tmp`) a
+/// local attacker can pre-create `sshspan-edit` as a SYMLINK to a directory
+/// they own; the victim's staged files would then land in attacker-readable
+/// space and the 0700 chmod would merely re-apply to the attacker's own dir.
+/// The creation below therefore never follows a symlinked or non-directory
+/// path: `create_dir` (not `create_dir_all`) fails on an existing name, and
+/// an existing entry is accepted only when `symlink_metadata` reports a REAL
+/// directory (lstat never follows the link). Anything else falls back to a
+/// random per-call directory so the feature still works in that environment.
 pub fn edit_temp_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("sshspan-edit");
-    let _ = std::fs::create_dir_all(&dir);
+    let usable = match std::fs::create_dir(&dir) {
+        Ok(()) => true, // we just created it — it cannot be a symlink
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(&dir) {
+                // symlink_metadata().is_dir() is true only for a real
+                // directory; a symlink reports is_symlink() (is_dir() false).
+                Ok(md) if md.is_dir() => true,
+                _ => false,
+            }
+        }
+        Err(_) => false,
+    };
+    let dir = if usable {
+        dir
+    } else {
+        let fallback = std::env::temp_dir().join(format!(
+            "sshspan-edit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        log::warn!(
+            "[sshspan-sftp] {} is missing, not a directory, or a symlink (possible tampering); using fallback {}",
+            dir.display(),
+            fallback.display()
+        );
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // create_dir_all leaves the mode at umask default (typically 0755),
-        // and an existing dir may predate this hardening — reassert 0700.
-        // Best-effort: a failure to chmod is ignored like the create above,
-        // but is logged so a misconfigured environment is visible.
+        // create_dir leaves the mode at umask default (typically 0755), and an
+        // existing dir may predate this hardening — reassert 0700. Best-effort:
+        // a failure to chmod is ignored like the create above, but is logged
+        // so a misconfigured environment is visible.
         if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
             log::warn!(
                 "[sshspan-sftp] could not restrict permissions on {}: {e}",

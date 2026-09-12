@@ -30,8 +30,24 @@ impl SshService {
         let private_path = ssh_dir.join(&key_filename);
         let public_path = ssh_dir.join(format!("{}.pub", key_filename));
 
-        // Write private key
-        fs::write(&private_path, private_key_pem)?;
+        // Write the private key with restrictive permissions from the FIRST
+        // byte on disk: creating it via fs::write (umask default, typically
+        // 0644) and chmodding afterwards leaves a window where the key is
+        // world-readable to anything watching ~/.ssh. mode(0o600) applies at
+        // create time on Unix; the explicit chmod below stays as a reassert
+        // for pre-existing files (re-deploy over an older key).
+        use std::io::Write as _;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut private_file = opts.open(&private_path)?;
+        private_file.write_all(private_key_pem.as_bytes())?;
+        private_file.flush()?;
+        drop(private_file);
 
         // Set permissions: 600 on Unix, handle Windows ACL
         #[cfg(unix)]
@@ -43,8 +59,16 @@ impl SshService {
 
         #[cfg(windows)]
         {
-            // Use icacls to restrict to current user
-            restrict_windows_file(&private_path)?;
+            // Use icacls to restrict to current user. A FAILED restriction is
+            // not survivable for a private key: fail the deploy and remove
+            // the file rather than leave readable key material behind.
+            if let Err(e) = restrict_windows_file(&private_path) {
+                let _ = fs::remove_file(&private_path);
+                let _ = fs::remove_file(&public_path);
+                return Err(anyhow::anyhow!(
+                    "Could not restrict private-key file permissions: {e}"
+                ));
+            }
         }
 
         // Write public key
@@ -241,7 +265,7 @@ fn get_ssh_dir() -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn restrict_windows_file(path: &PathBuf) -> Result<()> {
+pub(crate) fn restrict_windows_file(path: &PathBuf) -> Result<()> {
     use std::process::Command;
 
     // Get current user SID
@@ -251,26 +275,51 @@ fn restrict_windows_file(path: &PathBuf) -> Result<()> {
         .arg("csv")
         .output()?;
 
+    if !output.status.success() {
+        anyhow::bail!("whoami /user failed with status {}", output.status);
+    }
+
     let output_str = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = output_str.lines().collect();
 
-    if lines.len() >= 2 {
+    let sid = if lines.len() >= 2 {
         let parts: Vec<&str> = lines[1].split(',').collect();
         if parts.len() >= 2 {
-            let sid = parts[1].trim_matches('"');
-
-            // Remove inheritance and set explicit permissions
-            let _ = Command::new("icacls")
-                .arg(path)
-                .arg("/inheritance:r")
-                .output();
-
-            let _ = Command::new("icacls")
-                .arg(path)
-                .arg("/grant:r")
-                .arg(format!("{}:F", sid))
-                .output();
+            Some(parts[1].trim_matches('"').to_string())
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    let Some(sid) = sid else {
+        anyhow::bail!("could not parse the current user SID from whoami output");
+    };
+
+    // Remove inheritance and set explicit permissions. Both steps must
+    // actually succeed — a silently-skipped restriction leaves the private
+    // key under the default (inherited) ACL.
+    let remove_inheritance = Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .output()?;
+    if !remove_inheritance.status.success() {
+        anyhow::bail!(
+            "icacls /inheritance:r failed: {}",
+            String::from_utf8_lossy(&remove_inheritance.stderr).trim()
+        );
+    }
+
+    let grant = Command::new("icacls")
+        .arg(path)
+        .arg("/grant:r")
+        .arg(format!("{}:F", sid))
+        .output()?;
+    if !grant.status.success() {
+        anyhow::bail!(
+            "icacls /grant:r failed: {}",
+            String::from_utf8_lossy(&grant.stderr).trim()
+        );
     }
 
     Ok(())

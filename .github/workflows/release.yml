@@ -32,11 +32,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.platform }}
     steps:
+      # Third-party actions are pinned to full commit SHAs (version in a
+      # comment): a mutable tag that ever moves would otherwise run attacker
+      # code in a workflow that holds contents:write and the release signing
+      # key. Update deliberately by bumping the SHA.
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Node.js (Tauri CLI)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -45,10 +49,10 @@ jobs:
         run: npm ci
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           workspaces: src-tauri
 
@@ -210,7 +214,7 @@ jobs:
           echo "signed=true" >> "$GITHUB_OUTPUT"
 
       - name: Attach artifacts to the GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: RELEASE_BODY.md
           generate_release_notes: true
@@ -222,7 +226,7 @@ jobs:
         # Each matrix leg uploads only the .minisig files it produced; the
         # other platform's globs do not match on this runner, which the
         # action tolerates (fail_on_unmatched_files defaults to false here).
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         if: steps.minisign_sign.outputs.signed == 'true'
         with:
           files: |

@@ -230,6 +230,50 @@ fn validate_asset_url(raw: &str) -> CmdResult<url::Url> {
     Ok(parsed)
 }
 
+/// The only GitHub repository whose release assets may be downloaded and
+/// executed. The host allowlist above admits every public GitHub repo; the
+/// renderer supplies the initial URL, so without an owner/repo pin a
+/// compromised renderer could point the updater at any other repository's
+/// release asset and have it downloaded AND executed. Redirect hops are still
+/// validated against the host allowlist only, because GitHub redirects
+/// release downloads to `objects.githubusercontent.com` /
+/// `release-assets.githubusercontent.com` paths that do not carry the
+/// owner/repo prefix — the pin applies to the renderer-supplied URL, which is
+/// the only hop an attacker controls directly.
+const RELEASE_REPO_PREFIX: &str = "/AGSQ11/SSHSpan/releases/download/";
+
+/// Validate the INITIAL installer URL handed over by the renderer: HTTPS,
+/// GitHub host allowlist, AND the AGSQ11/SSHSpan releases-download path.
+fn validate_initial_asset_url(raw: &str) -> CmdResult<url::Url> {
+    let parsed = validate_asset_url(raw)?;
+    let host_ok = parsed.host_str() == Some("github.com");
+    let path_ok = parsed.path().starts_with(RELEASE_REPO_PREFIX);
+    if !(host_ok && path_ok) {
+        return Err(CmdError(
+            "Refusing to download: the installer URL must be an \
+             AGSQ11/SSHSpan GitHub release asset."
+                .into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Restrict `version` to filename-safe characters before it is interpolated
+/// into the installer temp path. The renderer supplies this string, so a
+/// hostile value must not be able to steer the temp path outside the temp
+/// directory (`..`/`..\` lose their separators and collapse harmlessly).
+fn sanitize_version_for_filename(version: &str) -> String {
+    let filtered: String = version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+        .collect();
+    if filtered.is_empty() {
+        "unknown".into()
+    } else {
+        filtered
+    }
+}
+
 /// Check GitHub for the latest release and, if newer, report the asset URL for
 /// this OS. Never installs anything — the renderer asks the user first.
 #[tauri::command]
@@ -348,8 +392,9 @@ pub async fn update_download_and_run(
     version: String,
     expected_sha256: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    // Only accept installer URLs from our GitHub releases domain.
-    let mut current_url = validate_asset_url(&url)?;
+    // Only accept installer URLs from OUR GitHub releases (owner/repo pinned,
+    // not just the github.com host).
+    let mut current_url = validate_initial_asset_url(&url)?;
 
     let ext = if url.contains(".msi") {
         ".msi"
@@ -362,7 +407,10 @@ pub async fn update_download_and_run(
     };
     // Exclusive-create temp path with a random suffix: a pre-planted file at
     // a predictable name can never be reused, and create_new() below fails
-    // if the path somehow already exists.
+    // if the path somehow already exists. `version` comes from the renderer,
+    // so it is filtered to filename-safe characters first — a hostile value
+    // must not be able to steer the temp path outside the temp directory.
+    let version = sanitize_version_for_filename(&version);
     let rand_suffix = uuid::Uuid::new_v4().simple().to_string();
     let dest =
         std::env::temp_dir().join(format!("sshspan-{}-update-{}{}", version, rand_suffix, ext));
@@ -567,6 +615,69 @@ mod tests {
     }
 
     // ── Host allowlist ───────────────────────────────────────────────────────
+
+    // ── Repo-pinned initial URL ─────────────────────────────────────────────
+    // The renderer supplies the initial URL; it must point at OUR releases,
+    // not merely at github.com (any other public repo's release asset must be
+    // refused). Redirect hops keep using the host-only allowlist because
+    // GitHub's CDN redirect targets don't carry the owner/repo prefix.
+
+    #[test]
+    fn initial_url_accepts_our_release_assets() {
+        for url in [
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/SSHSpan_1.7.2_x64-setup.exe",
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/SSHSpan_1.7.2_x64_en-US.msi",
+        ] {
+            assert!(
+                validate_initial_asset_url(url).is_ok(),
+                "expected own release asset to pass: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_url_rejects_other_repos_and_cdn_hosts() {
+        for url in [
+            // Another public repo: host passes, owner/repo does not.
+            "https://github.com/EVIL/malware/releases/download/v1/payload.exe",
+            // Path confusion must not slip past the prefix check.
+            "https://github.com/AGSQ11/SSHSpan-evil/releases/download/v1/x.exe",
+            "https://github.com/AGSQ11/SSHSpanOther/releases/download/v1/x.exe",
+            // CDN host directly (renderer must hand over the github.com URL).
+            "https://objects.githubusercontent.com/github-production-release/x",
+            // Not github.com at all.
+            "https://evil.example.com/a.exe",
+        ] {
+            assert!(
+                validate_initial_asset_url(url).is_err(),
+                "expected rejection of {url}"
+            );
+        }
+    }
+
+    // ── Version-to-filename sanitization ────────────────────────────────────
+    // `version` is renderer-supplied and interpolated into the installer temp
+    // path; path separators must never survive the filter.
+
+    #[test]
+    fn version_sanitizer_strips_path_steering() {
+        for hostile in [
+            "../../evil",
+            "..\\..\\evil",
+            "1.7.2/../../Users/x/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/x",
+            "C:\\Users\\x\\Startup\\x",
+            "\0:nul",
+        ] {
+            let out = sanitize_version_for_filename(hostile);
+            assert!(
+                !out.contains('/') && !out.contains('\\') && !out.contains(':') && !out.contains('\0'),
+                "sanitized version {hostile:?} -> {out:?} must not contain path structure"
+            );
+        }
+        assert_eq!(sanitize_version_for_filename("../../evil"), "....evil");
+        assert_eq!(sanitize_version_for_filename(""), "unknown");
+        assert_eq!(sanitize_version_for_filename("1.7.2-1"), "1.7.2-1");
+    }
 
     #[test]
     fn allowlist_accepts_github_hosts() {

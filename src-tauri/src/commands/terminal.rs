@@ -26,19 +26,20 @@ fn key_pem_for_id(
     db: &Database,
     vault_pw: &str,
     key_id: &str,
-) -> Result<String, String> {
+) -> Result<zeroize::Zeroizing<String>, String> {
     let key = db
         .get_key(key_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Key not found: {key_id}"))?;
     let key_data = super::load_private_key_data(app, &key, vault_pw)
         .map_err(|e| format!("Could not load vault key \"{}\": {e}", key.name))?;
-    crate::crypto::keys::export_private_key(
+    let pem = crate::crypto::keys::export_private_key(
         &key_data,
         crate::crypto::keys::KeyFormat::OpenSsh,
         None,
     )
-    .map_err(|e| format!("Could not serialize key \"{}\" for SSH: {e}", key.name))
+    .map_err(|e| format!("Could not serialize key \"{}\" for SSH: {e}", key.name))?;
+    Ok(zeroize::Zeroizing::new(pem))
 }
 
 /// Decrypt a server's saved password (sealed with the same vault master) if one is stored.
@@ -46,14 +47,15 @@ fn saved_pw_for_server(
     _db: &Database,
     vault_pw: &str,
     server: &db::ServerRecord,
-) -> Result<Option<String>, String> {
+) -> Result<Option<zeroize::Zeroizing<String>>, String> {
     match &server.saved_password {
         Some(sealed) => {
             let bytes = crate::crypto::vault::unseal(vault_pw, sealed)
                 .map_err(|_| "Failed to decrypt saved password.".to_string())?;
-            Ok(Some(String::from_utf8(bytes).map_err(|_| {
+            let pw = String::from_utf8(bytes).map_err(|_| {
                 "Saved password is not valid UTF-8.".to_string()
-            })?))
+            })?;
+            Ok(Some(zeroize::Zeroizing::new(pw)))
         }
         None => Ok(None),
     }
@@ -64,6 +66,10 @@ fn saved_pw_for_server(
 /// `override_username` / `override_key_id` come from the renderer's "Use this
 /// key to connect…" right-click flow — when the user picks a key right on a key
 /// row, we want to keep the server's saved username but swap the key.
+///
+/// The `key_pem` and `password` fields are wrapped in `zeroize::Zeroizing`
+/// so secret material is wiped from memory once the connect/auth path is
+/// done with it.
 fn resolve_for_server(
     app: &AppHandle,
     db: &Database,
@@ -71,7 +77,6 @@ fn resolve_for_server(
     server_id: &str,
     override_username: Option<String>,
     override_key_id: Option<String>,
-    override_pem_path: Option<String>,
     prompt_password: Option<String>,
 ) -> Result<ResolvedConnection, String> {
     let server = db
@@ -82,22 +87,30 @@ fn resolve_for_server(
     let username = override_username.unwrap_or_else(|| server.username.clone());
     let auth_method = server.auth_method.clone();
 
-    let mut key_pem: Option<String> = None;
-    let mut password: Option<String> = None;
+    let mut key_pem: Option<zeroize::Zeroizing<String>> = None;
+    let mut password: Option<zeroize::Zeroizing<String>> = None;
 
     // publickey: prefer the override key (from key context menu), then the server's key_id, then its pem_path.
     if auth_method == "publickey" {
         if let Some(kid) = override_key_id.or_else(|| server.key_id.clone()) {
             key_pem = Some(key_pem_for_id(app, db, vault_pw, &kid)?);
-        } else if let Some(p) = override_pem_path.or_else(|| server.pem_path.clone()) {
+        } else if let Some(p) = server.pem_path.clone() {
             // Read PEM from disk — leaves the file untouched, treats it as a public key on the SSH server side.
-            key_pem =
-                Some(std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?);
+            // This is a stored setting set by the user via the UI; validate it exists and is a regular file.
+            let path = std::path::Path::new(&p);
+            if !path.is_file() {
+                return Err(format!("PEM path does not exist or is not a file: {p}"));
+            }
+            let _ = db.add_audit("connect.pem_path_used", None, &p);
+            key_pem = Some(zeroize::Zeroizing::new(
+                std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?
+            ));
         }
     } else if auth_method == "password" || auth_method == "keyboard-interactive" {
         // Prefer the runtime prompt (always), then the saved password.
         password = prompt_password
             .filter(|p| !p.is_empty())
+            .map(zeroize::Zeroizing::new)
             .or(saved_pw_for_server(db, vault_pw, &server)?.filter(|p| !p.is_empty()));
     }
 
@@ -129,8 +142,12 @@ pub async fn terminal_connect(
     on_data: Channel<String>,
     override_username: Option<String>,
     override_key_id: Option<String>,
-    override_pem_path: Option<String>,
     prompt_password: Option<String>,
+    // True only when the user explicitly consented (renderer confirm dialog,
+    // after `known_hosts_check` reported the host as unpinned) to trusting a
+    // NEW host key on first use. Absent/false = strict: an unpinned host is
+    // refused instead of silently trusted.
+    allow_tofu: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
     if vault_pw.is_empty() {
@@ -146,7 +163,6 @@ pub async fn terminal_connect(
         &server_id,
         override_username,
         override_key_id,
-        override_pem_path,
         prompt_password,
     )
     .map_err(CmdError)?;
@@ -171,12 +187,15 @@ pub async fn terminal_connect(
         db.clone(),
         registry.clone(),
         on_data,
+        allow_tofu.unwrap_or(false),
     ).await.map_err(|e| {
         let msg = e.to_string();
         let friendly = if msg.contains("Key exchange failed") || msg.contains("key exchange") {
             "The host rejected the connection during key exchange. If this host's fingerprint changed, forget it in the known_hosts list and retry.".to_string()
         } else if msg.to_lowercase().contains("host key") {
             "Host key mismatch. The server presented a different key than the one stored for this host — possible MITM, or the host was rebuilt. Forget it in known_hosts and retry.".to_string()
+        } else if msg.to_lowercase().contains("unknown key") {
+            "This host is not trusted yet and no consent to trust it was given. Reconnect and accept the host-key prompt, or add it via Known Hosts.".to_string()
         } else {
             msg
         };
@@ -280,11 +299,14 @@ pub fn terminal_list(app: AppHandle) -> CmdResult<serde_json::Value> {
 
 /// Quick connectivity check: open + authenticate + immediately close.
 /// Reports latency and any error verbatim so the renderer can surface it.
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn server_test(
     app: AppHandle,
     server_id: String,
     prompt_password: Option<String>,
+    // Same consent semantics as terminal_connect: trust a NEW host only when
+    // the user approved it in the renderer prompt.
+    allow_tofu: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
     if vault_pw.is_empty() {
@@ -297,7 +319,6 @@ pub async fn server_test(
         &db,
         &vault_pw,
         &server_id,
-        None,
         None,
         None,
         prompt_password,
@@ -315,6 +336,8 @@ pub async fn server_test(
         let handler = ssh_client::TerminalHandler {
             host: host_for_handler,
             db: db_for_handler,
+            port: resolved.server.port,
+            allow_tofu: allow_tofu.unwrap_or(false),
         };
         let mut session = russh::client::connect(
             config,
@@ -355,6 +378,8 @@ pub async fn server_test(
             let raw = e.to_string();
             let friendly = if raw.to_lowercase().contains("host key") {
                 "Host key mismatch. Forget it in known_hosts and retry.".to_string()
+            } else if raw.to_lowercase().contains("unknown key") {
+                "This host is not trusted yet and no consent to trust it was given. Retry and accept the host-key prompt.".to_string()
             } else if raw.contains("Key exchange") || raw.contains("key exchange") {
                 "Key exchange failed.".to_string()
             } else if raw.starts_with("Connect failed: ") {
@@ -387,6 +412,25 @@ pub fn known_hosts_list(app: AppHandle) -> CmdResult<serde_json::Value> {
         })
         .collect();
     Ok(serde_json::json!({ "hosts": arr }))
+}
+
+/// Pre-connect host-key lookup for the renderer's consent flow: is there a
+/// stored pin for `host:port`, and if so what fingerprint? The renderer calls
+/// this BEFORE `terminal_connect`/`server_test` and shows the trust prompt
+/// only for unpinned hosts; the connect commands refuse unpinned hosts unless
+/// the prompt was accepted (`allow_tofu: true`).
+#[tauri::command(rename_all = "camelCase")]
+pub fn known_hosts_check(app: AppHandle, host: String, port: u16) -> CmdResult<serde_json::Value> {
+    let key = crate::ssh_client::known_host_key(&host, port);
+    match app.state::<AppState>().db.get_known_host(&key) {
+        Ok(Some(known)) => Ok(serde_json::json!({
+            "known": true,
+            "fingerprintSha256": known.fingerprint_sha256,
+            "firstSeen": known.first_seen.to_rfc3339(),
+        })),
+        Ok(None) => Ok(serde_json::json!({ "known": false })),
+        Err(e) => Err(CmdError(e.to_string())),
+    }
 }
 
 #[tauri::command]

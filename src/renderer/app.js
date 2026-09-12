@@ -1338,12 +1338,23 @@ const EXPORT_EXT = {
   'authorized_keys': '.authorized_keys'
 };
 
+// Formats whose output is PRIVATE key material. These are exported through
+// `key_export_to_file` — the backend serializes straight into a user-chosen
+// file so the decrypted key never crosses the IPC boundary into the WebView.
+const PRIVATE_EXPORT_FORMATS = ['openssh-private', 'ppk', 'pkcs8', 'pkcs8-encrypted'];
+
 async function exportSelected() {
   if (!state.selectedId) return;
   const format = el('detailExportFormat').value;
   const passphrase = el('detailExportPass').value;
   const k = state.keys.find(x => x.id === state.selectedId);
   try {
+    if (PRIVATE_EXPORT_FORMATS.indexOf(format) !== -1) {
+      const r = await call('key_export_to_file', { id: state.selectedId, format, passphrase });
+      if (r.canceled) { toast('Export cancelled.', 'info'); return; }
+      toast('Exported ' + format + ' to ' + r.path, 'ok');
+      return;
+    }
     const out = await call('key_export', { id: state.selectedId, format, passphrase });
     const base = safeFileName(k ? k.name : state.selectedId);
     const ext = EXPORT_EXT[format] !== undefined ? EXPORT_EXT[format] : '.txt';
@@ -1669,12 +1680,24 @@ async function bwTest() {
   }
 }
 
-async function bwSyncNow() {
+async function bwSyncNow(allowRemoteOverwrite) {
   const btn = el('bwSyncNowBtn');
   btn.disabled = true;
   setBwStatus('Syncing\u2026', 'syncing');
   try {
-    const s = await call('bitwarden_sync');
+    const s = await call('bitwarden_sync', { allow_remote_overwrite: allowRemoteOverwrite === true });
+    const skipped = (s.skippedOverwrites || 0) + (s.skippedNew || 0);
+    if (skipped > 0 && !allowRemoteOverwrite) {
+      const msg = [
+        'Remote changes need your approval:',
+        s.skippedOverwrites ? s.skippedOverwrites + ' local overwrite(s)' : null,
+        s.skippedNew ? s.skippedNew + ' new remote item(s)' : null,
+      ];
+      const detail = msg.filter(Boolean).join(', ');
+      if (window.confirm(detail + '. Apply them now?')) {
+        return await bwSyncNow(true);
+      }
+    }
     const parts = [];
     if (s.pushed) parts.push(s.pushed + ' pushed');
     if (s.pulled) parts.push(s.pulled + ' pulled');
@@ -1798,6 +1821,32 @@ async function loadSettings() {
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   mkRow('Show hidden files in SFTP by default', sftpHidden);
+
+  // Conflict default actions (the "Always use this action" checkbox in the
+  // transfer conflict dialog writes the same keys). Values are mirrored
+  // into window.sftpConflictDefaults so sftp.js sees them without a reload.
+  const conflictOptions = '<option value="ask">Ask every time</option>' +
+    '<option value="overwrite">Overwrite</option>' +
+    '<option value="skip">Skip</option>' +
+    '<option value="rename">Rename (auto)</option>' +
+    '<option value="resume">Resume</option>';
+  const mkConflictRow = (labelText, key) => {
+    const sel = document.createElement('select');
+    sel.innerHTML = conflictOptions;
+    sel.value = (state.settings && state.settings[key]) ||
+      (window.sftpConflictDefaults && window.sftpConflictDefaults[key]) || 'ask';
+    sel.addEventListener('change', async () => {
+      try {
+        await call('settings_set', { key, value: sel.value });
+        if (state.settings) state.settings[key] = sel.value;
+        if (window.sftpConflictDefaults) window.sftpConflictDefaults[key] = sel.value;
+        toast('Saved.', 'ok');
+      } catch (e) { toast(e.message || String(e), 'err'); }
+    });
+    mkRow(labelText, sel);
+  };
+  mkConflictRow('Upload when the file exists', 'sftpConflictUpload');
+  mkConflictRow('Download when the file exists', 'sftpConflictDownload');
 
   const termScrollback = document.createElement('input');
   termScrollback.type = 'number';
@@ -1946,10 +1995,19 @@ async function backupRestore() {
 
 function finishRestore(r) {
   const c = r.counts;
-  el('backupStatus').textContent = `Restored: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+  let msg = `Restored: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
+  el('backupStatus').textContent = msg;
   loadKeys();
   loadServers();
-  toast('Backup restored.', 'ok');
+  const conflicts = c.knownHostsConflicts || 0;
+  const skipped = r.resealFailures || 0;
+  if (skipped > 0) {
+    toast(`Backup restored, but ${skipped} entrie(s) could not be decrypted with the backup password and were SKIPPED (keys not imported, saved passwords cleared). Re-sync or re-add them manually.`, 'err');
+  } else if (conflicts > 0) {
+    toast(`Backup restored, but ${conflicts} host-key pin(s) were NOT overwritten (conflicting keys kept). Check Known Hosts.`, 'err');
+  } else {
+    toast('Backup restored.', 'ok');
+  }
 }
 async function loadKnownHosts() {
   const body = el('knownHostsBody');
@@ -2694,7 +2752,24 @@ async function testSelectedServer(srv) {
   if (!srv) return;
   terminalSetStatus(`Testing ${srv.host}:${srv.port || 22}…`);
   try {
-    const result = await call('server_test', { serverId: srv.id });
+    // Host-key consent: the backend refuses an unpinned host unless the user
+    // accepted the first-trust prompt (same contract as terminal_connect).
+    let allowTofu;
+    const known = await call('known_hosts_check', { host: srv.host, port: srv.port || 22 });
+    if (known && known.known === false) {
+      const okTrust = window.confirm(
+        '“' + srv.host + ':' + (srv.port || 22) + '” is not in Known Hosts yet.\n\n' +
+        'Trust this host on first connection (TOFU)?\n' +
+        'The fingerprint will be recorded in the audit log.'
+      );
+      if (!okTrust) {
+        terminalSetStatus('Connection test cancelled.');
+        toast('Test cancelled — host is not trusted yet.', 'err');
+        return;
+      }
+      allowTofu = true;
+    }
+    const result = await call('server_test', { serverId: srv.id, allowTofu });
     if (result && result.ok === false) throw new Error(result.error || 'Connection test failed.');
     const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
     terminalSetStatus(`Connection OK${ms}`);
