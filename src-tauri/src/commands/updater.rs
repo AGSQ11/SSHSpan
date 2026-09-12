@@ -166,7 +166,8 @@ fn installer_ext(url: &str) -> &'static str {
     }
 }
 
-fn is_newer(candidate_tag: &str, current: &str) -> bool {    let strip = |s: &str| s.trim().trim_start_matches('v').to_string();
+fn is_newer(candidate_tag: &str, current: &str) -> bool {
+    let strip = |s: &str| s.trim().trim_start_matches('v').to_string();
     let (cand, cur) = (strip(candidate_tag), strip(current));
     if cand == cur {
         // Defensive short-circuit: never offer an "update" to the version we
@@ -450,8 +451,7 @@ pub async fn update_download_and_run(
         .and_then(|t| t.parent())
         .map(|d| d.to_path_buf())
         .unwrap_or_else(std::env::temp_dir);
-    let dest =
-        dest_dir.join(format!("sshspan-{}-update-{}{}", version, rand_suffix, ext));
+    let dest = dest_dir.join(format!("sshspan-{}-update-{}{}", version, rand_suffix, ext));
 
     let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Download")
