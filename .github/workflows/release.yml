@@ -29,6 +29,7 @@ jobs:
             artifacts: |
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.platform }}
     steps:
@@ -106,7 +107,7 @@ jobs:
         if: runner.os == 'Windows'
 
       - name: Build installers (Tauri)
-        run: npm run dist:linux -- --bundles deb,rpm
+        run: npm run dist:linux -- --bundles deb,rpm,appimage
         if: runner.os == 'Linux'
 
       - name: Extract release notes from CHANGELOG
@@ -209,7 +210,7 @@ jobs:
               -t "SSHSpan release ${GITHUB_REF_NAME}"
             signed=$((signed + 1))
           done < <(find src-tauri/target -type f \
-            \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' \) \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
             -path '*/release/bundle/*' -print0)
           if [ "$signed" -eq 0 ]; then
             echo "::error::No installer artifacts found to sign."; exit 1
@@ -238,3 +239,4 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi.minisig
             src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb.minisig
             src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm.minisig
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.minisig
