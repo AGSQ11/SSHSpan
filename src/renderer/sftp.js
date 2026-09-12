@@ -46,6 +46,10 @@ function sftpTabState(tab) {
   if (tab.dualPane === undefined) tab.dualPane = state.sftpDualPane === true;
   if (!tab.localPath) tab.localPath = '';
   if (tab.sftpPreserveTs === undefined) tab.sftpPreserveTs = state.settings?.sftpPreserveTs === '1';
+  // Permissions/Owner columns default ON; toggleable per the toolbar button
+  // (they widen the table noticeably, so narrow windows may prefer them off -
+  // the table wrapper also scrolls horizontally regardless, see styles.css).
+  if (tab.showOwnerCols === undefined) tab.showOwnerCols = state.settings?.sftpShowOwnerCols !== '0';
   return tab;
 }
 
@@ -176,7 +180,7 @@ function buildSftpPanel(tabId) {
   };
 
   const upBtn = mkBtn('arrow-up', 'Parent directory', () => sftpNavigateUp(tabId), 'Up');
-  const refreshBtn = mkBtn('refresh-cw', 'Refresh', () => refreshSftpPanel(tabId), 'Refresh');
+  const refreshBtn = mkBtn('refresh-cw', 'Refresh', () => refreshSftpPanel(tabId, { forceFresh: true }), 'Refresh');
   const mkdirBtn = mkBtn('folder-plus', 'New folder', () => sftpMkdirPrompt(tabId), 'Folder');
   const newFileBtn = mkBtn('file-text', 'New empty file', () => sftpTouchPrompt(tabId), 'File');
   const bookmarkBtn = mkBtn('star', 'Bookmarks', (ev) => openBookmarkMenu(ev, tabId), 'Bookmarks');
@@ -185,17 +189,32 @@ function buildSftpPanel(tabId) {
     const tab = sftpTabState(sftpTab(tabId));
     tab.showHidden = !tab.showHidden;
     hiddenBtn.classList.toggle('active', tab.showHidden);
-    refreshSftpPanel(tabId, { keepScroll: true });
+    // Client-side re-filter only: sftp_list_dir already returned the hidden
+    // entries (the server doesn't filter them), so this never needs a
+    // network round trip - just re-run the existing cached listing.
+    renderEntries(tabId);
+    if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
   }, 'Hidden');
   const dualBtn = mkBtn('folder-open', 'Toggle local pane', () => toggleDualPane(tabId), 'Dual');
+  const colsBtn = mkBtn('settings', 'Show/hide permissions & owner columns', () => {
+    const tab = sftpTabState(sftpTab(tabId));
+    tab.showOwnerCols = !tab.showOwnerCols;
+    colsBtn.classList.toggle('active', tab.showOwnerCols);
+    panel.classList.toggle('show-owner-cols', tab.showOwnerCols);
+    state.settings = state.settings || {};
+    state.settings.sftpShowOwnerCols = tab.showOwnerCols ? '1' : '0';
+    call('settings_set', { key: 'sftpShowOwnerCols', value: tab.showOwnerCols ? '1' : '0' }).catch(() => {});
+  }, 'Columns');
   const logBtn = mkBtn('history', 'Activity log', () => {
     const log = document.getElementById('sftpLog-' + tabId);
     if (log) log.hidden = !log.hidden;
   }, 'Log');
   {
-    const t = sftpTab(tabId);
-    if (t && sftpTabState(t).showHidden) hiddenBtn.classList.add('active');
+    const t = sftpTabState(sftpTab(tabId));
+    if (t && t.showHidden) hiddenBtn.classList.add('active');
+    if (t && t.showOwnerCols) colsBtn.classList.add('active');
   }
+  panel.classList.toggle('show-owner-cols', !!(sftpTab(tabId) && sftpTab(tabId).showOwnerCols));
 
   toolbar.appendChild(upBtn);
   toolbar.appendChild(refreshBtn);
@@ -204,6 +223,7 @@ function buildSftpPanel(tabId) {
   toolbar.appendChild(bookmarkBtn);
   toolbar.appendChild(searchBtn);
   toolbar.appendChild(hiddenBtn);
+  toolbar.appendChild(colsBtn);
   toolbar.appendChild(dualBtn);
   toolbar.appendChild(logBtn);
 
@@ -267,6 +287,8 @@ function buildSftpPanel(tabId) {
       <th data-sort="name">Name</th>
       <th data-sort="size">Size</th>
       <th data-sort="modified">Modified</th>
+      <th data-sort="permissions" class="col-extra">Permissions</th>
+      <th data-sort="owner" class="col-extra">Owner</th>
     </tr>`;
   thead.addEventListener('click', (ev) => {
     const th = ev.target.closest('th[data-sort]');
@@ -287,10 +309,19 @@ function buildSftpPanel(tabId) {
   remotePane.appendChild(remoteHead);
   remotePane.appendChild(tableWrap);
 
-  // Empty-area click clears selection.
-  tbody.addEventListener('click', (ev) => {
-    if (ev.target === tbody) clearSelection(tabId);
-  });
+  // Quick-find indicator (Task 8): hidden until the user types with a row
+  // focused; positioned over the pane (not the scrolling tablewrap) so it
+  // stays put regardless of scroll/virtualization state.
+  const quickFind = document.createElement('div');
+  quickFind.className = 'sftp-quickfind';
+  quickFind.id = 'sftpQuickFind-' + tabId;
+  quickFind.hidden = true;
+  remotePane.appendChild(quickFind);
+
+  // All row interaction (click/dblclick/keydown/contextmenu/dragstart,
+  // including the empty-area click-clears-selection case) is delegated once
+  // here rather than attached per-row - see sftpWireTbodyDelegation.
+  sftpWireTbodyDelegation(tabId);
 
   // ── local pane (dual mode): slim header with editable path + listing ──
   const localPane = document.createElement('div');
@@ -328,7 +359,7 @@ function buildSftpPanel(tabId) {
   const localTable = document.createElement('table');
   localTable.className = 'sftp-table';
   const localThead = document.createElement('thead');
-  localThead.innerHTML = `<tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
+  localThead.innerHTML = `<tr><th>Name</th><th>Size</th><th>Modified</th><th class="col-extra">Permissions</th><th class="col-extra">Owner</th></tr>`;
   const localBody = document.createElement('tbody');
   localBody.id = 'sftpLocalTbody-' + tabId;
   localTable.appendChild(localThead);
@@ -338,6 +369,9 @@ function buildSftpPanel(tabId) {
   localWrap.appendChild(localTable);
   localPane.appendChild(localHead);
   localPane.appendChild(localWrap);
+  // Local pane has no sort/selection UI (never did) - just the two
+  // delegated listeners it already had per-row (dblclick, dragstart).
+  sftpWireLocalTbodyDelegation(tabId);
 
   // ── splitter (drag to resize) ──
   const splitter = document.createElement('div');
@@ -443,9 +477,13 @@ window.sftpPreserveTsToggle = sftpPreserveTsToggle;
 // ─── UI helpers: entry icons, editable path bars, status bar ─────────────────
 
 /// Lucide folder/file icon span for listing rows (replaces 📁/📄 emoji).
-function sftpEntryIcon(isDir) {
+/// `isLink` overlays a small corner badge (CSS ::after, see .sftp-eicon.is-link
+/// in styles.css) - SSH_FXP_READDIR/lstat already told us it's a symlink, so
+/// the badge is free; what it points AT is resolved lazily on interaction,
+/// never here (see sftpResolveSymlink / sftpActivateEntry).
+function sftpEntryIcon(isDir, isLink) {
   const span = document.createElement('span');
-  span.className = 'sftp-eicon' + (isDir ? ' is-dir' : '');
+  span.className = 'sftp-eicon' + (isDir ? ' is-dir' : '') + (isLink ? ' is-link' : '');
   span.innerHTML = ico(isDir ? 'folder' : 'file-text');
   return span;
 }
@@ -473,10 +511,21 @@ async function sftpUiNavigateRemote(tabId, input) {
   const prev = tab.sftpPath;
   tab.sftpPath = norm.path;
   try {
-    // Fetch and adopt directly (a single round trip over the SSH channel).
-    const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: norm.path });
-    tab.sftpPath = r.path || norm.path;
-    tab._entries = r.entries || [];
+    // Cache-aware: a short-TTL hit skips the round trip entirely (Task 6).
+    const cached = sftpCacheGet(tab, norm.path);
+    let entries, canonicalPath;
+    if (cached) {
+      entries = cached.entries;
+      canonicalPath = cached.path;
+    } else {
+      const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: norm.path });
+      entries = r.entries || [];
+      canonicalPath = r.path || norm.path;
+      sftpCacheSet(tab, norm.path, entries, canonicalPath);
+    }
+    tab.sftpPath = canonicalPath;
+    sftpSetEntries(tab, entries);
+    tab._quickFind = ''; // navigating away drops an in-progress quick-find
     box.value = tab.sftpPath;
     renderEntries(tabId);
     if (tab.dualPane) refreshLocalPane(tabId);
@@ -511,14 +560,20 @@ function sftpUpdateStatusBar(tabId) {
   const el = document.getElementById('sftpStatusLeft-' + tabId);
   if (!tab || !el) return;
   sftpTabState(tab);
-  const entries = (tab._entries || []).filter(e => tab.showHidden || !e.name.startsWith('.'));
-  const total = entries.length;
+  // Hidden-filtered count (quick-find intentionally excluded - its own
+  // indicator shows "matched of shown"; this line is "how big is this dir").
+  const total = tab._sortedEntries
+    ? tab._sortedEntries.length
+    : (tab._entries || []).filter(e => tab.showHidden || !e.name.startsWith('.')).length;
+  // O(1) lookups (Task 5) - was entries.find() per selected item, O(n) each,
+  // so select-all on a 10k-entry directory was ~10^8 string comparisons.
+  const map = tab._entryMap || new Map((tab._entries || []).map(e => [e.name, e]));
   const sel = tab.sftpSelected ? [...tab.sftpSelected] : [];
   let text;
   if (sel.length) {
     let size = 0, unknown = false;
     for (const n of sel) {
-      const ent = entries.find(e => e.name === n);
+      const ent = map.get(n);
       if (!ent) continue;
       if (ent.isDir || ent.size == null) unknown = true;
       else size += ent.size;
@@ -552,16 +607,95 @@ function toggleRowSelected(tr, on) {
   tr.classList.toggle('selected', on);
 }
 
+// ─── directory listing cache (Task 6) ───────────────────────────────────────
+//
+// Short-TTL, per-tab, per-path cache so back/forward navigation (Up, a
+// bookmark, synchronized browsing, a search-result click) doesn't re-pay a
+// full SSH_FXP_READDIR round trip when the directory was just seen. Never
+// trusted past a mutation: mkdir/touch/rename/delete/chmod all force a fresh
+// read of the directory they touched, and the queue-completion listener
+// below drops a tab's whole cache whenever a transfer finishes for it. A
+// stale listing after a delete is worse than a slow one - when in doubt,
+// invalidate.
+
+const SFTP_DIR_CACHE_TTL_MS = 12000;
+
+function sftpCacheGet(tab, path) {
+  const hit = tab._dirCache && tab._dirCache.get(path);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > SFTP_DIR_CACHE_TTL_MS) { tab._dirCache.delete(path); return null; }
+  return hit;
+}
+
+function sftpCacheSet(tab, path, entries, canonicalPath) {
+  if (!tab._dirCache) tab._dirCache = new Map();
+  tab._dirCache.set(path, { entries, path: canonicalPath, ts: Date.now() });
+}
+
+function sftpCacheInvalidate(tab, path) {
+  if (tab && tab._dirCache) tab._dirCache.delete(path);
+}
+
+function sftpCacheInvalidateAll(tab) {
+  if (tab && tab._dirCache) tab._dirCache.clear();
+}
+
+/// Replace a tab's full entry list and rebuild the name→entry index used for
+/// O(1) lookups elsewhere (status bar totals/sizes - Task 5 - row activation,
+/// the context menu, drag payloads) instead of re-scanning the array per
+/// lookup.
+function sftpSetEntries(tab, entries) {
+  tab._entries = entries || [];
+  tab._entryMap = new Map(tab._entries.map(e => [e.name, e]));
+}
+
+// A finished transfer (upload/download/server-copy) landing in a directory
+// makes any cached listing of it stale. Rather than track exactly which
+// directory each job's destination was, drop the WHOLE per-tab cache for
+// every session id a finished job touches (its own sessionId, and -
+// for a "Send to" server copy - targetSessionId too). Cheap (a Map.clear())
+// and errs toward freshness. This registers its OWN 'sftp-queue' listener,
+// independent of the transfer-queue panel's (wireQueueEvents) - Tauri
+// supports multiple listeners per event, so this never has to touch that
+// code. sftpCacheInvalidatedJobIds dedupes so a job resent across repeated
+// snapshot broadcasts doesn't re-clear the cache indefinitely.
+const sftpCacheInvalidatedJobIds = new Set();
+function sftpWireQueueCacheInvalidation() {
+  sftpListen('sftp-queue', (ev) => {
+    for (const j of ev.payload.jobs || []) {
+      if (j.state !== 'done' || sftpCacheInvalidatedJobIds.has(j.id)) continue;
+      if (sftpCacheInvalidatedJobIds.size > 5000) sftpCacheInvalidatedJobIds.clear();
+      sftpCacheInvalidatedJobIds.add(j.id);
+      for (const t of state.sessions.values()) {
+        if (t.sessionId === j.sessionId || t.sessionId === j.targetSessionId) sftpCacheInvalidateAll(t);
+      }
+    }
+  }).catch(() => {});
+}
+sftpWireQueueCacheInvalidation();
+
 async function refreshSftpPanel(tabId, opts = {}) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   sftpTabState(tab);
   const tbody = document.getElementById('sftpTbody-' + tabId);
   if (!tbody) return;
+  const path = tab.sftpPath;
   try {
-    const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: tab.sftpPath });
-    tab.sftpPath = r.path || tab.sftpPath;
-    tab._entries = r.entries || [];
+    const cached = !opts.forceFresh && sftpCacheGet(tab, path);
+    let entries, canonicalPath;
+    if (cached) {
+      entries = cached.entries;
+      canonicalPath = cached.path;
+    } else {
+      const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path });
+      entries = r.entries || [];
+      canonicalPath = r.path || path;
+      sftpCacheSet(tab, path, entries, canonicalPath);
+    }
+    tab.sftpPath = canonicalPath;
+    sftpSetEntries(tab, entries);
+    tab._quickFind = ''; // a fresh listing drops an in-progress quick-find
     const pathBox = document.getElementById('sftpPath-' + tabId);
     if (pathBox && document.activeElement !== pathBox) pathBox.value = tab.sftpPath;
     renderEntries(tabId);
@@ -574,11 +708,256 @@ async function refreshSftpPanel(tabId, opts = {}) {
   }
 }
 
+/// Hidden-filtered + sorted view of a tab's full entry list. Stashed on
+/// tab._sortedEntries (the status bar's "total" count is read off it) so
+/// quick-find (Task 8) can filter on top of it per keystroke without
+/// re-sorting the whole directory every time.
+function sftpComputeSortedEntries(tab) {
+  const entries = (tab._entries || []).filter(e => tab.showHidden || !e.name.startsWith('.'));
+  const key = tab.sortKey, desc = tab.sortDesc;
+  entries.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; // dirs always first
+    let c = 0;
+    if (key === 'size') c = (a.size || 0) - (b.size || 0);
+    else if (key === 'modified') c = (a.modifiedMs || 0) - (b.modifiedMs || 0);
+    else if (key === 'permissions') c = (a.permissions ?? -1) - (b.permissions ?? -1);
+    else if (key === 'owner') {
+      const au = a.uid ?? -1, ag = a.gid ?? -1, bu = b.uid ?? -1, bg = b.gid ?? -1;
+      c = au - bu || ag - bg;
+    } else c = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    return desc ? -c : c;
+  });
+  tab._sortedEntries = entries;
+  return entries;
+}
+
+/// Type-to-filter (Task 8): a plain substring match layered on top of the
+/// sorted list above. Deliberately separate from the recursive server-side
+/// search bar (runSearch) - this only ever filters the CURRENT listing.
+function sftpApplyQuickFind(tab, sorted) {
+  const q = (tab._quickFind || '').toLowerCase();
+  if (!q) return sorted;
+  return sorted.filter(e => e.name.toLowerCase().includes(q));
+}
+
+function sftpUpdateQuickFindIndicator(tabId, totalShown, matched) {
+  const box = document.getElementById('sftpQuickFind-' + tabId);
+  const tab = sftpTab(tabId);
+  if (!box || !tab) return;
+  const q = tab._quickFind || '';
+  if (!q) { box.hidden = true; return; }
+  box.hidden = false;
+  box.textContent = `Filter: "${q}" - ${matched} of ${totalShown}`;
+}
+
+/// Sync .selected onto whatever rows are CURRENTLY mounted. With windowing
+/// (Task 4) that may be fewer than the full selection - rows outside the
+/// window pick up the class from tab.sftpSelected the next time they're
+/// built (sftpBuildRemoteRow checks it), so nothing is lost, just deferred.
+function sftpRefreshSelectionClasses(tabId) {
+  const tab = sftpTab(tabId);
+  const tbody = document.getElementById('sftpTbody-' + tabId);
+  if (!tab || !tbody) return;
+  for (const row of tbody.querySelectorAll('tr.sftp-entry')) {
+    toggleRowSelected(row, tab.sftpSelected.has(row.dataset.name));
+  }
+}
+
+/// Re-focus the row the user was on after a re-render tears down and rebuilds
+/// the DOM (rows are replaced wholesale, never patched in place - see
+/// sftpRenderRows). Without this, removing a focused row drops focus to
+/// <body>, and every handler above - being delegated to the tbody - would
+/// stop receiving keystrokes after a single keypress. While quick-find is
+/// active this doubles as "jump to the first match" (classic type-ahead).
+function sftpRestoreRowFocus(tabId, tbody, visible) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  const targetName = tab._quickFind ? (visible[0] && visible[0].name) : tab._focusedName;
+  if (!targetName) return;
+  const row = tbody.querySelector(`tr[data-name="${CSS.escape(targetName)}"]`);
+  if (!row) return;
+  tab._focusedName = targetName;
+  row.focus({ preventScroll: !tab._quickFind });
+  if (tab._quickFind) row.scrollIntoView({ block: 'nearest' });
+}
+
+/// Size cell for one row. Files: formatted byte count. Directories: a muted
+/// placeholder until "Calculate size" (Task 9, context menu) has run for
+/// this row - then a spinner while sftp_dir_size is in flight, then the
+/// result (a "+"-suffixed floor, with an explanatory tooltip, when the walk
+/// hit its cap rather than presenting a wrong exact total).
+function sftpFillSizeCell(td, entry) {
+  if (!entry.isDir) {
+    td.className = '';
+    td.title = '';
+    td.textContent = formatSftpSize(entry.size);
+    return;
+  }
+  const sz = entry._dirSize;
+  if (sz && sz.state === 'pending') {
+    td.className = 'sftp-dirsize';
+    td.textContent = '';
+    const sp = document.createElement('span');
+    sp.className = 'sftp-spinner';
+    td.appendChild(sp);
+    td.title = 'Calculating size...';
+  } else if (sz && sz.state === 'done') {
+    td.className = 'sftp-dirsize sftp-dirsize-done';
+    td.textContent = sz.truncated ? `${formatSftpSize(sz.bytes)}+` : formatSftpSize(sz.bytes);
+    td.title = sz.truncated
+      ? `Stopped at the walk's cap (50,000 entries / 120s) - actual size is at least this much. ${sz.files} file(s), ${sz.dirs} folder(s) scanned.`
+      : `${sz.files} file(s), ${sz.dirs} folder(s)`;
+  } else if (sz && sz.state === 'error') {
+    td.className = 'sftp-dirsize';
+    td.textContent = 'Error';
+    td.title = sz.error || 'Could not calculate size.';
+  } else {
+    td.className = 'sftp-dirsize';
+    td.textContent = '-';
+    td.title = 'Directory - right-click -> Calculate size';
+  }
+}
+
+/// Build one remote-pane <tr>. No per-row listeners live here - every
+/// interaction is delegated to the tbody once (sftpWireTbodyDelegation); this
+/// only sets the classes/dataset those delegated handlers key off of.
+function sftpBuildRemoteRow(tab, entry) {
+  const tr = document.createElement('tr');
+  tr.dataset.isdir = entry.isDir ? '1' : '0';
+  tr.dataset.islink = entry.isLink ? '1' : '0';
+  tr.dataset.name = entry.name;
+  tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
+  tr.tabIndex = 0;
+  tr.draggable = true;
+  tr.title = entry.isLink
+    ? 'Symlink - double-click to resolve and open'
+    : entry.isDir ? 'Double-click to open folder' : 'Double-click to download';
+  if (tab.sftpSelected.has(entry.name)) tr.classList.add('selected');
+
+  const tdName = document.createElement('td');
+  tdName.className = 'sftp-tdname';
+  tdName.appendChild(sftpEntryIcon(entry.isDir, entry.isLink));
+  tdName.appendChild(document.createTextNode(entry.name));
+
+  const tdSize = document.createElement('td');
+  sftpFillSizeCell(tdSize, entry);
+
+  const tdMod = document.createElement('td');
+  tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '-';
+
+  const tdPerm = document.createElement('td');
+  tdPerm.className = 'sftp-permcell col-extra';
+  tdPerm.textContent = formatMode(entry.permissions);
+  if (entry.permissions != null) tdPerm.title = '0' + (entry.permissions & 0o7777).toString(8);
+
+  const tdOwner = document.createElement('td');
+  tdOwner.className = 'sftp-ownercell col-extra';
+  tdOwner.textContent = (entry.uid == null && entry.gid == null) ? '—' : `${entry.uid ?? '?'}:${entry.gid ?? '?'}`;
+
+  tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
+  tr.appendChild(tdPerm); tr.appendChild(tdOwner);
+  return tr;
+}
+
+// ─── windowed rendering (Task 4) ────────────────────────────────────────────
+//
+// Below the threshold, just render every row - simplest, and correct for the
+// overwhelming common case (per-task guidance: don't virtualize what doesn't
+// need it). Above it, keep only the scrolled window of rows (plus a buffer)
+// mounted, framed by up to two spacer <tr>s that hold the scrollbar's total
+// height. Row height is measured off the first real row actually rendered
+// (font/zoom-dependent) rather than assumed, with a fallback constant for the
+// very first paint. No absolute positioning, no library - just two spacers.
+
+const SFTP_VIRTUALIZE_THRESHOLD = 300;
+const SFTP_ROW_BUFFER = 8;
+const SFTP_DEFAULT_ROW_H = 31;
+
+/// Render `entries` into `tbody`. `buildRowFn(entry)` builds one <tr>;
+/// `colCount` sizes the spacer rows' single spanning <td>.
+function sftpRenderRows(tbody, entries, buildRowFn, colCount) {
+  const wrap = tbody.closest('.sftp-tablewrap');
+  if (entries.length <= SFTP_VIRTUALIZE_THRESHOLD) {
+    sftpTeardownWindow(tbody);
+    tbody.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    for (const e of entries) frag.appendChild(buildRowFn(e));
+    tbody.appendChild(frag);
+    return;
+  }
+  let win = tbody._sftpWin;
+  if (!win) {
+    win = tbody._sftpWin = { rowH: SFTP_DEFAULT_ROW_H, measured: false };
+    win.onScroll = () => sftpReflowWindow(tbody);
+    if (wrap) wrap.addEventListener('scroll', win.onScroll);
+    if (wrap && typeof ResizeObserver !== 'undefined') {
+      win.ro = new ResizeObserver(() => sftpReflowWindow(tbody));
+      win.ro.observe(wrap);
+    }
+  }
+  win.entries = entries;
+  win.buildRowFn = buildRowFn;
+  win.colCount = colCount;
+  win.lastRange = null; // force a full rebuild of the visible slice
+  sftpReflowWindow(tbody);
+}
+
+function sftpTeardownWindow(tbody) {
+  const win = tbody._sftpWin;
+  if (!win) return;
+  const wrap = tbody.closest('.sftp-tablewrap');
+  if (wrap && win.onScroll) wrap.removeEventListener('scroll', win.onScroll);
+  if (win.ro) win.ro.disconnect();
+  tbody._sftpWin = null;
+}
+
+function sftpMakeSpacerRow(heightPx, colCount) {
+  const tr = document.createElement('tr');
+  tr.className = 'sftp-winspacer';
+  tr.style.height = heightPx + 'px';
+  const td = document.createElement('td');
+  td.colSpan = colCount || 1;
+  tr.appendChild(td);
+  return tr;
+}
+
+function sftpReflowWindow(tbody) {
+  const win = tbody._sftpWin;
+  const wrap = tbody.closest('.sftp-tablewrap');
+  if (!win || !wrap) return;
+  const entries = win.entries;
+  const total = entries.length;
+  const viewportH = wrap.clientHeight || 400;
+  let start = Math.floor(wrap.scrollTop / win.rowH) - SFTP_ROW_BUFFER;
+  let end = Math.ceil((wrap.scrollTop + viewportH) / win.rowH) + SFTP_ROW_BUFFER;
+  start = Math.max(0, start);
+  end = Math.min(total, Math.max(start, end));
+  if (win.lastRange && win.lastRange.start === start && win.lastRange.end === end) return;
+  win.lastRange = { start, end };
+
+  tbody.innerHTML = '';
+  const topH = start * win.rowH;
+  const bottomH = (total - end) * win.rowH;
+  if (topH > 0) tbody.appendChild(sftpMakeSpacerRow(topH, win.colCount));
+  const frag = document.createDocumentFragment();
+  for (let i = start; i < end; i++) frag.appendChild(win.buildRowFn(entries[i]));
+  tbody.appendChild(frag);
+  if (!win.measured) {
+    const first = tbody.querySelector('tr.sftp-entry');
+    if (first) {
+      const h = first.getBoundingClientRect().height;
+      if (h > 4) { win.rowH = h; win.measured = true; }
+    }
+  }
+  if (bottomH > 0) tbody.appendChild(sftpMakeSpacerRow(bottomH, win.colCount));
+}
+
 function renderEntries(tabId) {
   const tab = sftpTab(tabId);
   if (!tab || !tab._entries) return;
   const tbody = document.getElementById('sftpTbody-' + tabId);
   if (!tbody) return;
+  sftpWireTbodyDelegation(tabId); // idempotent - the panel already wires this once
   const thead = tbody.parentElement.querySelector('thead');
   if (thead) {
     for (const th of thead.querySelectorAll('th[data-sort]')) {
@@ -587,138 +966,243 @@ function renderEntries(tabId) {
     }
   }
   tab.sftpSelected = tab.sftpSelected || new Set();
-  // Keep only selections still present.
-  const names = new Set(tab._entries.map(e => e.name));
-  for (const n of [...tab.sftpSelected]) if (!names.has(n)) tab.sftpSelected.delete(n);
+  // Keep only selections still present (against the FULL entry list, not
+  // just what's hidden-filtered/quick-found/currently mounted).
+  for (const n of [...tab.sftpSelected]) if (!tab._entryMap || !tab._entryMap.has(n)) tab.sftpSelected.delete(n);
 
-  let entries = tab._entries.filter(e => tab.showHidden || !e.name.startsWith('.'));
-  const dir = tab.sftpPath;
-  const key = tab.sortKey, desc = tab.sortDesc;
-  entries.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; // dirs always first
-    let c = 0;
-    if (key === 'size') c = (a.size || 0) - (b.size || 0);
-    else if (key === 'modified') c = (a.modifiedMs || 0) - (b.modifiedMs || 0);
-    else c = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
-    return desc ? -c : c;
-  });
+  const sorted = sftpComputeSortedEntries(tab);
+  const visible = sftpApplyQuickFind(tab, sorted);
+  tab._visibleEntries = visible; // authoritative "all rows" for select-all/shift-range, not just what's mounted
+  tab._lastClicked = null; // shift-click anchor doesn't survive a re-render (sort/filter/hidden/quick-find change)
 
-  tbody.innerHTML = '';
-  let lastClicked = null;
-  for (const entry of entries) {
-    const tr = document.createElement('tr');
-    tr.dataset.isdir = entry.isDir ? '1' : '0';
-    tr.dataset.name = entry.name;
-    const tdName = document.createElement('td');
-    tdName.className = 'sftp-tdname';
-    tdName.appendChild(sftpEntryIcon(entry.isDir));
-    tdName.appendChild(document.createTextNode(entry.name));
-    const tdSize = document.createElement('td');
-    if (entry.isDir) {
-      // Directory size: muted placeholder, not missing metadata.
-      tdSize.className = 'sftp-dirsize';
-      tdSize.textContent = '-';
-      tdSize.title = 'Directory';
-    } else {
-      tdSize.textContent = formatSftpSize(entry.size);
-    }
-    const tdMod = document.createElement('td');
-    tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '-';
-    tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
-
-    tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
-    tr.tabIndex = 0;
-    tr.title = entry.isDir ? 'Double-click to open folder' : 'Double-click to download';
-    if (tab.sftpSelected.has(entry.name)) tr.classList.add('selected');
-
-    // Draggable to the local pane (download) or another remote dir (move).
-    tr.draggable = true;
-    tr.addEventListener('dragstart', (ev) => {
-      const payload = {
-        tabId,
-        path: sftpJoin(tab.sftpPath, entry.name),
-        name: entry.name,
-        isDir: !!entry.isDir,
-      };
-      ev.dataTransfer.setData('text/sftp-remote', JSON.stringify(payload));
-      ev.dataTransfer.effectAllowed = 'copyMove';
-    });
-
-    tr.addEventListener('click', (ev) => {
-      if (ev.ctrlKey || ev.metaKey) {
-        if (tab.sftpSelected.has(entry.name)) { tab.sftpSelected.delete(entry.name); toggleRowSelected(tr, false); }
-        else { tab.sftpSelected.add(entry.name); toggleRowSelected(tr, true); }
-        lastClicked = entry.name;
-      } else if (ev.shiftKey && lastClicked) {
-        // Range select from lastClicked to this entry.
-        const names = entries.map(e => e.name);
-        const i0 = names.indexOf(lastClicked), i1 = names.indexOf(entry.name);
-        if (i0 >= 0 && i1 >= 0) {
-          for (let i = Math.min(i0, i1); i <= Math.max(i0, i1); i++) tab.sftpSelected.add(names[i]);
-          for (const row of tbody.querySelectorAll('.sftp-entry')) {
-            toggleRowSelected(row, tab.sftpSelected.has(row.dataset.name));
-          }
-        }
-      } else {
-        tab.sftpSelected.clear();
-        for (const row of tbody.querySelectorAll('.sftp-entry.selected')) row.classList.remove('selected');
-        tab.sftpSelected.add(entry.name);
-        toggleRowSelected(tr, true);
-        lastClicked = entry.name;
-      }
-      sftpUpdateStatusBar(tabId);
-    });
-    tr.addEventListener('dblclick', () => {
-      if (entry.isDir) {
-        if (typeof sftpSyncRemoteNav === 'function' && sftpSyncRemoteNav(tabId, entry.name)) return;
-        tab.sftpPath = sftpJoin(tab.sftpPath, entry.name);
-        refreshSftpPanel(tabId);
-      } else {
-        // Queue the download to the last-used local dir (or temp dir).
-        queueDownloads(tabId, [sftpJoin(tab.sftpPath, entry.name)]);
-      }
-    });
-    tr.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') tr.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
-      else if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) {
-        ev.preventDefault();
-        const rect = tr.getBoundingClientRect();
-        openSftpFileMenu(rect.left + 12, rect.top + 12, tabId, entry);
-      }
-    });
-    tr.addEventListener('contextmenu', (ev) => {
-      ev.preventDefault();
-      if (!tab.sftpSelected.has(entry.name)) {
-        tab.sftpSelected.clear();
-        for (const row of tbody.querySelectorAll('.sftp-entry.selected')) row.classList.remove('selected');
-        tab.sftpSelected.add(entry.name);
-        toggleRowSelected(tr, true);
-      }
-      openSftpFileMenu(ev.clientX, ev.clientY, tabId, entry);
-    });
-    tbody.appendChild(tr);
-  }
+  sftpUpdateQuickFindIndicator(tabId, sorted.length, visible.length);
+  sftpRenderRows(tbody, visible, (e) => sftpBuildRemoteRow(tab, e), 5);
+  sftpRestoreRowFocus(tabId, tbody, visible);
   sftpUpdateStatusBar(tabId);
 }
 
-// Ctrl+A within the panel selects all rows.
+// ─── delegated row interaction (Task 3) ─────────────────────────────────────
+//
+// One listener per event type, attached ONCE to the tbody, instead of five
+// per row - a 20,000-entry directory used to mean ~100,000 live listeners.
+// Rows carry only data-* attributes; every handler below looks the actual
+// entry up by name (tab._entryMap, O(1)) rather than trusting anything wider
+// parsed back off the DOM.
+
+function sftpWireTbodyDelegation(tabId) {
+  const tbody = document.getElementById('sftpTbody-' + tabId);
+  if (!tbody || tbody._sftpDelegated) return;
+  tbody._sftpDelegated = true;
+
+  // Tracks which row is logically focused so sftpRestoreRowFocus can put
+  // focus back after a re-render replaces the DOM out from under it.
+  tbody.addEventListener('focusin', (ev) => {
+    const tr = ev.target.closest('tr.sftp-entry');
+    if (!tr) return;
+    const tab = sftpTab(tabId);
+    if (tab) tab._focusedName = tr.dataset.name;
+  });
+
+  tbody.addEventListener('click', (ev) => {
+    if (ev.target === tbody) { clearSelection(tabId); return; } // empty-area click
+    const tr = ev.target.closest('tr.sftp-entry');
+    if (!tr) return;
+    const tab = sftpTab(tabId);
+    const entry = tab && tab._entryMap && tab._entryMap.get(tr.dataset.name);
+    if (!tab || !entry) return;
+    const visible = tab._visibleEntries || [];
+    if (ev.ctrlKey || ev.metaKey) {
+      if (tab.sftpSelected.has(entry.name)) tab.sftpSelected.delete(entry.name);
+      else tab.sftpSelected.add(entry.name);
+      tab._lastClicked = entry.name;
+    } else if (ev.shiftKey && tab._lastClicked) {
+      // Range select from the anchor to this entry, over the FULL visible
+      // list (Task 4) - not just whatever happens to be mounted right now.
+      const names = visible.map(e => e.name);
+      const i0 = names.indexOf(tab._lastClicked), i1 = names.indexOf(entry.name);
+      if (i0 >= 0 && i1 >= 0) {
+        for (let i = Math.min(i0, i1); i <= Math.max(i0, i1); i++) tab.sftpSelected.add(names[i]);
+      }
+    } else {
+      tab.sftpSelected.clear();
+      tab.sftpSelected.add(entry.name);
+      tab._lastClicked = entry.name;
+    }
+    tab._focusedName = entry.name;
+    sftpRefreshSelectionClasses(tabId);
+    sftpUpdateStatusBar(tabId);
+  });
+
+  tbody.addEventListener('dblclick', (ev) => {
+    const tr = ev.target.closest('tr.sftp-entry');
+    if (!tr) return;
+    const tab = sftpTab(tabId);
+    const entry = tab && tab._entryMap && tab._entryMap.get(tr.dataset.name);
+    if (entry) sftpActivateEntry(tabId, entry);
+  });
+
+  tbody.addEventListener('contextmenu', (ev) => {
+    const tr = ev.target.closest('tr.sftp-entry');
+    if (!tr) return;
+    ev.preventDefault();
+    const tab = sftpTab(tabId);
+    const entry = tab && tab._entryMap && tab._entryMap.get(tr.dataset.name);
+    if (!tab || !entry) return;
+    if (!tab.sftpSelected.has(entry.name)) {
+      tab.sftpSelected.clear();
+      tab.sftpSelected.add(entry.name);
+      sftpRefreshSelectionClasses(tabId);
+    }
+    openSftpFileMenu(ev.clientX, ev.clientY, tabId, entry);
+  });
+
+  // Draggable to the local pane (download) or another remote dir (move).
+  tbody.addEventListener('dragstart', (ev) => {
+    const tr = ev.target.closest('tr.sftp-entry');
+    if (!tr) return;
+    const tab = sftpTab(tabId);
+    const entry = tab && tab._entryMap && tab._entryMap.get(tr.dataset.name);
+    if (!tab || !entry) return;
+    ev.dataTransfer.setData('text/sftp-remote', JSON.stringify({
+      tabId, path: sftpJoin(tab.sftpPath, entry.name), name: entry.name, isDir: !!entry.isDir,
+    }));
+    ev.dataTransfer.effectAllowed = 'copyMove';
+  });
+
+  tbody.addEventListener('keydown', (ev) => {
+    const tab = sftpTab(tabId);
+    if (!tab) return;
+    const tr = ev.target.closest('tr.sftp-entry');
+
+    if (ev.key === 'Enter' && tr) {
+      const entry = tab._entryMap && tab._entryMap.get(tr.dataset.name);
+      if (entry) sftpActivateEntry(tabId, entry);
+      return;
+    }
+    if (ev.key === 'F2' && tr) {
+      ev.preventDefault();
+      const entry = tab._entryMap && tab._entryMap.get(tr.dataset.name);
+      if (entry) sftpRenamePrompt(tabId, entry); // same code path as the context menu's Rename
+      return;
+    }
+    if ((ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) && tr) {
+      ev.preventDefault();
+      const entry = tab._entryMap && tab._entryMap.get(tr.dataset.name);
+      if (entry) {
+        if (!tab.sftpSelected.has(entry.name)) {
+          tab.sftpSelected.clear();
+          tab.sftpSelected.add(entry.name);
+          sftpRefreshSelectionClasses(tabId);
+        }
+        const rect = tr.getBoundingClientRect();
+        openSftpFileMenu(rect.left + 12, rect.top + 12, tabId, entry);
+      }
+      return;
+    }
+    if (ev.key === 'Escape') {
+      if (tab._quickFind) { ev.preventDefault(); tab._quickFind = ''; renderEntries(tabId); }
+      return;
+    }
+    // Type-to-filter (Task 8): a single printable character with no modifier
+    // starts/extends the quick-find. Starting a fresh session (was empty)
+    // scrolls to the top first so the first match is guaranteed mounted for
+    // sftpRestoreRowFocus to jump to.
+    if (ev.key && ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+      ev.preventDefault();
+      if (!tab._quickFind) {
+        const wrap = tbody.closest('.sftp-tablewrap');
+        if (wrap) wrap.scrollTop = 0;
+      }
+      tab._quickFind = (tab._quickFind || '') + ev.key;
+      renderEntries(tabId);
+    }
+  });
+}
+
+/// Activate a row (Enter / double-click): navigate into a directory, download
+/// a file, or - for a symlink - resolve it FIRST (lazily, on demand; never
+/// during listing render, see sftpEntryIcon's doc comment) and then do
+/// whichever of those two the target turns out to be. A dangling link toasts
+/// and does nothing else (Task 1).
+function sftpActivateEntry(tabId, entry) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  const full = sftpJoin(tab.sftpPath, entry.name);
+  if (entry.isLink) {
+    sftpResolveSymlink(tabId, full).then(r => {
+      if (!r || r.ok === false) {
+        toast(`Could not resolve "${entry.name}": ${(r && r.error) || 'unknown error'}`, 'err');
+        return;
+      }
+      sftpMarkLinkRow(tabId, entry.name, !!r.broken);
+      if (r.broken) {
+        toast(`"${entry.name}" is a broken symlink - its target doesn't exist.`, 'warn');
+        return;
+      }
+      if (r.isDir) {
+        if (typeof sftpSyncRemoteNav === 'function' && sftpSyncRemoteNav(tabId, entry.name)) return;
+        tab.sftpPath = full;
+        refreshSftpPanel(tabId);
+      } else {
+        queueDownloads(tabId, [full]);
+      }
+    });
+    return;
+  }
+  if (entry.isDir) {
+    if (typeof sftpSyncRemoteNav === 'function' && sftpSyncRemoteNav(tabId, entry.name)) return;
+    tab.sftpPath = full;
+    refreshSftpPanel(tabId);
+  } else {
+    // Queue the download to the last-used local dir (or temp dir).
+    queueDownloads(tabId, [full]);
+  }
+}
+
+/// Resolve a symlink's target (sftp_resolve_link), on demand, once - cached
+/// per path so re-activating the same link never re-pays the round trip.
+/// NEVER called while rendering a listing (that would cost one round trip
+/// per link in a link-heavy directory) - only from user interaction. A
+/// broken link comes back as `{ok:true, broken:true}` from the backend, not
+/// as a thrown error.
+function sftpResolveSymlink(tabId, fullPath) {
+  const tab = sftpTab(tabId);
+  if (!tab) return Promise.resolve(null);
+  if (!tab._linkCache) tab._linkCache = new Map();
+  if (tab._linkCache.has(fullPath)) return Promise.resolve(tab._linkCache.get(fullPath));
+  if (!tab._linkPending) tab._linkPending = new Map();
+  if (tab._linkPending.has(fullPath)) return tab._linkPending.get(fullPath);
+  const p = sftpCall('sftp_resolve_link', { sessionId: tab.sessionId, path: fullPath })
+    .then(r => { tab._linkCache.set(fullPath, r); return r; })
+    .catch(e => ({ ok: false, error: e.message || String(e) }))
+    .finally(() => { tab._linkPending.delete(fullPath); });
+  tab._linkPending.set(fullPath, p);
+  return p;
+}
+
+/// Reflect a resolved symlink's broken/ok state on its icon badge, if the row
+/// happens to still be mounted (windowing may have scrolled it away by now).
+function sftpMarkLinkRow(tabId, name, broken) {
+  const tr = document.querySelector(`#sftpTbody-${tabId} tr[data-name="${CSS.escape(name)}"]`);
+  const icon = tr && tr.querySelector('.sftp-eicon.is-link');
+  if (icon) icon.classList.toggle('broken', !!broken);
+}
+
+// Ctrl+A within the panel selects all rows - the full filtered list (Task 4:
+// hidden-file toggling and quick-find already narrowed tab._visibleEntries),
+// not just whatever the windowed renderer currently has mounted.
 document.addEventListener('keydown', (ev) => {
   if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== 'a') return;
   const active = sftpTab(state.activeTabId);
   if (!active || active.mode !== 'sftp') return;
   const panel = document.getElementById('sftpPanel-' + active.tabId);
   if (!panel) return;
-  const tbody = document.getElementById('sftpTbody-' + active.tabId);
-  if (!tbody) return;
   ev.preventDefault();
   sftpTabState(active);
+  const visible = active._visibleEntries || [];
   active.sftpSelected.clear();
-  for (const row of tbody.querySelectorAll('.sftp-entry')) {
-    if (!row.dataset.name.startsWith('.') || active.showHidden) {
-      active.sftpSelected.add(row.dataset.name);
-      toggleRowSelected(row, true);
-    }
-  }
+  for (const e of visible) active.sftpSelected.add(e.name);
+  sftpRefreshSelectionClasses(active.tabId);
   sftpUpdateStatusBar(active.tabId);
 });
 
@@ -727,6 +1211,36 @@ function formatSftpSize(bytes) {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
   return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+/// Classic `ls -l`-style mode string ("drwxr-xr-x") from a raw POSIX mode
+/// (st_mode, type bits included - see the Rust-side SftpEntry doc comment).
+/// Handles setuid/setgid/sticky (lower-case when the underlying x bit is
+/// also set, upper-case otherwise). Null (a Windows local, or a server that
+/// omitted it) renders as an em dash, never a guess.
+function formatMode(mode) {
+  if (mode == null) return '—';
+  let typeChar;
+  switch (mode & 0o170000) {
+    case 0o120000: typeChar = 'l'; break; // symlink
+    case 0o100000: typeChar = '-'; break; // regular file
+    case 0o040000: typeChar = 'd'; break; // directory
+    case 0o060000: typeChar = 'b'; break; // block device
+    case 0o020000: typeChar = 'c'; break; // char device
+    case 0o010000: typeChar = 'p'; break; // fifo
+    case 0o140000: typeChar = 's'; break; // socket
+    default: typeChar = '?';
+  }
+  const bits = [
+    [0o400, 'r'], [0o200, 'w'], [0o100, 'x'],
+    [0o040, 'r'], [0o020, 'w'], [0o010, 'x'],
+    [0o004, 'r'], [0o002, 'w'], [0o001, 'x'],
+  ];
+  const rwx = bits.map(([bit, ch]) => (mode & bit) ? ch : '-');
+  if (mode & 0o4000) rwx[2] = (mode & 0o100) ? 's' : 'S'; // setuid
+  if (mode & 0o2000) rwx[5] = (mode & 0o010) ? 's' : 'S'; // setgid
+  if (mode & 0o1000) rwx[8] = (mode & 0o001) ? 't' : 'T'; // sticky
+  return typeChar + rwx.join('');
 }
 
 function sftpNavigateUp(tabId) {
@@ -745,7 +1259,7 @@ async function sftpMkdirPrompt(tabId) {
     try {
       await sftpCall('sftp_mkdir', { sessionId: tab.sessionId, path: sftpJoin(tab.sftpPath, name) });
       sftpLog(tabId, `mkdir ${name}`);
-      await refreshSftpPanel(tabId);
+      await refreshSftpPanel(tabId, { forceFresh: true });
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
 }
@@ -758,7 +1272,7 @@ async function sftpTouchPrompt(tabId) {
     try {
       await sftpCall('sftp_touch', { sessionId: tab.sessionId, path: sftpJoin(tab.sftpPath, name) });
       sftpLog(tabId, `touch ${name}`);
-      await refreshSftpPanel(tabId);
+      await refreshSftpPanel(tabId, { forceFresh: true });
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
 }
@@ -805,6 +1319,58 @@ function sftpConfirmDelete(message, onYes) {
   el('deleteYesBtn').onclick = () => finish(true);
   el('deleteCancelBtn').onclick = () => finish(false);
   setTimeout(() => el('deleteYesBtn').focus(), 0);
+}
+
+/// Rename flow shared by the context menu's "Rename..." item and the F2
+/// keyboard shortcut (Task 7) - one code path, never duplicated.
+function sftpRenamePrompt(tabId, entry) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  const fullPath = sftpJoin(tab.sftpPath, entry.name);
+  promptModal('Rename', 'New name:', entry.name, async (newName) => {
+    if (!newName || newName === entry.name) return;
+    try {
+      await sftpCall('sftp_rename', { sessionId: tab.sessionId, from: fullPath, to: sftpJoin(tab.sftpPath, newName) });
+      sftpLog(tabId, `rename ${entry.name} → ${newName}`);
+      await refreshSftpPanel(tabId, { forceFresh: true });
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+}
+
+/// On-demand recursive directory size (Task 9, context menu "Calculate
+/// size"). Can take up to 120s (the walk's own server-side cap) - the size
+/// cell shows a spinner meanwhile and is patched in place when it resolves,
+/// without needing a full listing refresh (which would also cost a round
+/// trip and could race the calculation).
+async function sftpCalcDirSize(tabId, name) {
+  const tab = sftpTab(tabId);
+  if (!tab || !tab._entryMap) return;
+  const entry = tab._entryMap.get(name);
+  if (!entry || !entry.isDir) return;
+  if (entry._dirSize && entry._dirSize.state === 'pending') return; // already running
+  entry._dirSize = { state: 'pending' };
+  sftpPatchSizeCell(tabId, name, entry);
+  const fullPath = sftpJoin(tab.sftpPath, name);
+  try {
+    const r = await sftpCall('sftp_dir_size', { sessionId: tab.sessionId, path: fullPath });
+    entry._dirSize = { state: 'done', bytes: r.bytes || 0, files: r.files || 0, dirs: r.dirs || 0, truncated: !!r.truncated };
+    sftpLog(tabId, `size ${name}: ${formatSftpSize(r.bytes || 0)}${r.truncated ? '+ (capped)' : ''} (${r.files} files, ${r.dirs} dirs)`);
+  } catch (e) {
+    entry._dirSize = { state: 'error', error: e.message || String(e) };
+    toast(`Size failed for "${name}": ${e.message || e}`, 'err');
+  }
+  sftpPatchSizeCell(tabId, name, entry);
+}
+
+/// Patch just the size cell of a mounted row - the row may not be mounted
+/// right now (windowing scrolled it away), in which case nothing needs to
+/// happen here: sftpFillSizeCell reads entry._dirSize the next time this row
+/// is actually built.
+function sftpPatchSizeCell(tabId, name, entry) {
+  const tr = document.querySelector(`#sftpTbody-${tabId} tr[data-name="${CSS.escape(name)}"]`);
+  if (!tr) return;
+  const td = tr.children[1]; // name, SIZE, modified, permissions, owner
+  if (td) sftpFillSizeCell(td, entry);
 }
 
 /// Right-click menu for a remote file/dir (selection-aware).
