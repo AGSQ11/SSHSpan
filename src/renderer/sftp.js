@@ -826,17 +826,17 @@ function openSftpFileMenu(x, y, tabId, entry) {
   mk(multi ? `Delete ${selected.length} items` : 'Delete', 'trash-2', async () => {
     const paths = selectedPaths.length ? selectedPaths : [fullPath];
     if (!confirm(`Delete ${paths.length === 1 ? `"${paths[0]}"` : paths.length + ' items'}?`)) return;
-    let ok = 0, fail = 0;
+    let ok = 0, fail = 0, lastErr = null;
     for (const p of paths) {
       const name = p.split('/').filter(Boolean).pop();
       const isDir = (tab._entries || []).find(e => e.name === name)?.isDir ?? false;
       try {
         await sftpCall('sftp_remove', { sessionId: tab.sessionId, path: p, isDir });
         ok++;
-      } catch { fail++; }
+      } catch (e) { fail++; lastErr = e; }
     }
     sftpLog(tabId, `delete ${ok} item(s)${fail ? `, ${fail} failed` : ''}`);
-    if (fail) toast(`${ok} deleted, ${fail} failed.`, 'err');
+    if (fail) toast(`${ok} deleted, ${fail} failed.${lastErr ? ' ' + (lastErr.message || lastErr) : ''}`, 'err');
     await refreshSftpPanel(tabId);
   });
   mk('Copy path', 'copy', () => copyText(fullPath).then(ok => ok && toast('Path copied.', 'ok')));

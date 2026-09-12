@@ -203,15 +203,58 @@ pub async fn sftp_remove(
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
     if is_dir {
-        sftp.remove_dir(&path)
-            .await
-            .map_err(|e| CmdError(format!("rmdir failed: {e}")))?;
+        // Recursive delete: rmdir only succeeds on an EMPTY directory, so a
+        // folder with contents must be emptied depth-first first.
+        remove_remote_tree(&sftp, &path).await.map_err(CmdError)?;
     } else {
         sftp.remove_file(&path)
             .await
             .map_err(|e| CmdError(format!("rm failed: {e}")))?;
     }
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Depth-first recursive delete of a remote directory tree. Children are
+/// removed before their parent (rmdir requires an empty dir). Symlinks are
+/// unlinked, never followed — `symlink_metadata` classifies the link itself.
+fn remove_remote_tree<'a>(
+    sftp: &'a russh_sftp::client::SftpSession,
+    path: &'a str,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut entries = sftp
+            .read_dir(path)
+            .await
+            .map_err(|e| format!("list {path}: {e}"))?;
+        while let Some(entry) = entries.next() {
+            let name = entry.file_name().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child = format!("{}/{}", path.trim_end_matches('/'), name);
+            let md = sftp
+                .symlink_metadata(&child)
+                .await
+                .map_err(|e| format!("stat {child}: {e}"))?;
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                // Unlink the link; never recurse through it.
+                sftp.remove_file(&child)
+                    .await
+                    .map_err(|e| format!("rm symlink {child}: {e}"))?;
+            } else if ft.is_dir() {
+                remove_remote_tree(sftp, &child).await?;
+            } else {
+                sftp.remove_file(&child)
+                    .await
+                    .map_err(|e| format!("rm {child}: {e}"))?;
+            }
+        }
+        sftp.remove_dir(path)
+            .await
+            .map_err(|e| format!("rmdir {path}: {e}"))?;
+        Ok(())
+    })
 }
 
 #[tauri::command]
