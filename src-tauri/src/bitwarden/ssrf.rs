@@ -254,7 +254,9 @@ pub fn resolve_safe_server_url(server_url: &str) -> anyhow::Result<String> {
         || (host.contains(':') && is_restricted_ipv6(&host))
         || v4_to_int(&host).is_some_and(|n| in_cidr4(n, 0x7F000000, 8));
     if scheme == "http" && !is_loopback {
-        anyhow::bail!("Server URL must use https://. Plain http:// is only allowed for loopback hosts.");
+        anyhow::bail!(
+            "Server URL must use https://. Plain http:// is only allowed for loopback hosts."
+        );
     }
 
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {

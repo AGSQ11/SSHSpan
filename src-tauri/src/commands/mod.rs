@@ -7,8 +7,8 @@ pub mod sftp;
 pub mod terminal;
 pub mod updater;
 
-use std::fs;
 use directories::ProjectDirs;
+use std::fs;
 use tauri::AppHandle;
 use tauri::Manager;
 use uuid::Uuid;
@@ -1018,9 +1018,7 @@ pub fn system_write_text_file(
 ) -> CmdResult<serde_json::Value> {
     validate_export_path(&path)?;
     if !app.state::<DialogPathStore>().is_allowed(&path) {
-        return Err(
-            "Write target must be a path chosen in a save dialog this session.".into(),
-        );
+        return Err("Write target must be a path chosen in a save dialog this session.".into());
     }
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = fs::create_dir_all(parent);
@@ -1038,9 +1036,7 @@ fn validate_export_path(path: &str) -> CmdResult<()> {
         return Err("Path must be absolute.".into());
     }
 
-    let normalized = p
-        .canonicalize()
-        .unwrap_or_else(|_| p.to_path_buf());
+    let normalized = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
 
     if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
         let app_data_dir = app_data.data_dir();
@@ -1080,7 +1076,17 @@ pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
     if let Ok(canonical) = p.canonicalize() {
-        let system_dirs = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/etc", "/lib", "/lib64", "/usr/lib", "/usr/lib64"];
+        let system_dirs = [
+            "/bin",
+            "/sbin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/etc",
+            "/lib",
+            "/lib64",
+            "/usr/lib",
+            "/usr/lib64",
+        ];
         for dir in &system_dirs {
             if canonical.starts_with(dir) {
                 return true;
@@ -1480,8 +1486,7 @@ pub fn key_export_to_file(
     let mut file = opts
         .open(&path_str)
         .map_err(|e| CmdError(format!("Could not create export file: {e}")))?;
-    file.write_all(data.as_bytes())
-        .map_err(|e| e.to_string())?;
+    file.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
     file.flush().map_err(|e| e.to_string())?;
     drop(file);
 
@@ -2202,10 +2207,7 @@ pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
     }
     // Reject URI schemes: `^[a-zA-Z][a-zA-Z0-9+.-]*:` before any path
     // separator, except a 1-char drive letter (Windows `C:`).
-    let prefix_before_sep = url
-        .split(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or("");
+    let prefix_before_sep = url.split(|c| c == '/' || c == '\\').next().unwrap_or("");
     if let Some(scheme_end) = prefix_before_sep.find(':') {
         let scheme = &prefix_before_sep[..scheme_end];
         if scheme.len() != 1 || !scheme.chars().next().unwrap().is_ascii_alphabetic() {
@@ -2224,9 +2226,7 @@ pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
         .canonicalize()
         .map_err(|_| CmdError("system_open_external: path does not exist.".into()))?;
     if !resolved.starts_with(&staging_canon) {
-        return Err(
-            "system_open_external only opens files staged by SSHSpan.".into(),
-        );
+        return Err("system_open_external only opens files staged by SSHSpan.".into());
     }
     if !resolved.is_file() {
         return Err("system_open_external: path is not a regular file.".into());

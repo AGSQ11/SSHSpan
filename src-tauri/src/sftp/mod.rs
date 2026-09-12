@@ -152,10 +152,8 @@ pub fn edit_temp_dir() -> std::path::PathBuf {
     let dir = if usable {
         dir
     } else {
-        let fallback = std::env::temp_dir().join(format!(
-            "sshspan-edit-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let fallback =
+            std::env::temp_dir().join(format!("sshspan-edit-{}", uuid::Uuid::new_v4().simple()));
         log::warn!(
             "[sshspan-sftp] {} is missing, not a directory, or a symlink (possible tampering); using fallback {}",
             dir.display(),
@@ -218,8 +216,8 @@ fn sanitize_stage_base(name: &str) -> String {
 /// (case-insensitive).
 fn is_windows_device_name(stem: &str) -> bool {
     const DEVICES: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     DEVICES.iter().any(|d| d.eq_ignore_ascii_case(stem))
 }
@@ -235,13 +233,37 @@ fn is_windows_device_name(stem: &str) -> bool {
 /// remote path is untouched — so collapsing names to `.txt` costs nothing
 /// except a default-app association.
 const INERT_STAGE_EXTENSIONS: [&str; 25] = [
-    "txt", "text", "log", "md", "markdown", "rst", "cfg", "conf", "ini", "cnf", "json", "yaml",
-    "yml", "toml", "xml", "css", "csv", "tsv", "sql", "pem", "crt", "cer", "key", "pub",
+    "txt",
+    "text",
+    "log",
+    "md",
+    "markdown",
+    "rst",
+    "cfg",
+    "conf",
+    "ini",
+    "cnf",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "xml",
+    "css",
+    "csv",
+    "tsv",
+    "sql",
+    "pem",
+    "crt",
+    "cer",
+    "key",
+    "pub",
     "properties",
 ];
 
 fn is_inert_stage_extension(ext: &str) -> bool {
-    INERT_STAGE_EXTENSIONS.iter().any(|b| b.eq_ignore_ascii_case(ext))
+    INERT_STAGE_EXTENSIONS
+        .iter()
+        .any(|b| b.eq_ignore_ascii_case(ext))
 }
 
 /// Unpredictable staged-file name for a remote file: `{base}.{uuid}.{ext}`
@@ -432,7 +454,10 @@ mod tests {
         // text: the base survives, the tail does not.
         let a = staged_file_name("v1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17");
         assert!(a.starts_with("v1.2.3."), "base must be preserved: {a}");
-        assert!(a.ends_with(".txt"), "non-inert tail must collapse to .txt: {a}");
+        assert!(
+            a.ends_with(".txt"),
+            "non-inert tail must collapse to .txt: {a}"
+        );
         // A genuinely over-long "extension" (>16 chars) takes the no-
         // extension suffix form instead: base preserved, uuid appended.
         let b = staged_file_name("v1.2.3.verylongextensionnamethatexceedssixteen");
@@ -448,19 +473,46 @@ mod tests {
         // UNKNOWN/binary extension stage as .txt; only inert text formats
         // keep their extension.
         for name in [
-            "evil.scr", "x.EXE", "run.ps1", "doc.msi", "link.url", "shell.cpl", "app.jar",
-            "setup.inf", "app.7z", "doc.docx", "image.jpg", "page.html", "setup.msix",
-            "data.db", "archive.tar.gz", "script.py",
+            "evil.scr",
+            "x.EXE",
+            "run.ps1",
+            "doc.msi",
+            "link.url",
+            "shell.cpl",
+            "app.jar",
+            "setup.inf",
+            "app.7z",
+            "doc.docx",
+            "image.jpg",
+            "page.html",
+            "setup.msix",
+            "data.db",
+            "archive.tar.gz",
+            "script.py",
         ] {
             let a = staged_file_name(name);
-            assert!(a.ends_with(".txt"), "non-inert extension must stage as .txt: {name} → {a}");
+            assert!(
+                a.ends_with(".txt"),
+                "non-inert extension must stage as .txt: {name} → {a}"
+            );
         }
         for name in [
-            "notes.txt", "server.conf", "app.ini", "config.yaml", "data.json", "cert.pem",
-            "report.csv", "readme.md", "style.css", "backup.log",
+            "notes.txt",
+            "server.conf",
+            "app.ini",
+            "config.yaml",
+            "data.json",
+            "cert.pem",
+            "report.csv",
+            "readme.md",
+            "style.css",
+            "backup.log",
         ] {
             let a = staged_file_name(name);
-            let ext = a.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+            let ext = a
+                .rsplit_once('.')
+                .map(|(_, e)| e.to_ascii_lowercase())
+                .unwrap_or_default();
             let src_ext = name.rsplit('.').next().unwrap().to_ascii_lowercase();
             assert_eq!(
                 ext, src_ext,
@@ -470,7 +522,10 @@ mod tests {
         // The uuid component and sanitized base survive the rewrite.
         let a = staged_file_name("evil.scr");
         assert!(a.starts_with("evil."), "base must be preserved: {a}");
-        let middle = a.strip_prefix("evil.").and_then(|s| s.strip_suffix(".txt")).expect("evil.{uuid}.txt");
+        let middle = a
+            .strip_prefix("evil.")
+            .and_then(|s| s.strip_suffix(".txt"))
+            .expect("evil.{uuid}.txt");
         assert_eq!(middle.len(), 32, "expected a 32-hex-char uuid: {a}");
     }
 
@@ -481,11 +536,17 @@ mod tests {
         // The sanitizer trims the dot first, so the allowlist check still
         // sees the true extension.
         let a = staged_file_name("notes.txt.");
-        assert!(a.ends_with(".txt"), "trailing dot must not break staging: {a}");
+        assert!(
+            a.ends_with(".txt"),
+            "trailing dot must not break staging: {a}"
+        );
         assert!(a.starts_with("notes."), "base must be preserved: {a}");
 
         let a = staged_file_name("evil.scr.");
-        assert!(a.ends_with(".txt"), "non-inert ext behind a trailing dot must still be forced to .txt: {a}");
+        assert!(
+            a.ends_with(".txt"),
+            "non-inert ext behind a trailing dot must still be forced to .txt: {a}"
+        );
         assert!(a.starts_with("evil."), "base must be preserved: {a}");
     }
 
@@ -502,12 +563,18 @@ mod tests {
         // executable.
         let a = staged_file_name("CON.exe");
         assert!(a.starts_with("_CON."), "device stem must be prefixed: {a}");
-        assert!(a.ends_with(".txt"), "blocked extension must stage as .txt: {a}");
+        assert!(
+            a.ends_with(".txt"),
+            "blocked extension must stage as .txt: {a}"
+        );
 
         // Device name with a benign extension keeps the extension.
         let a = staged_file_name("NUL.log");
         assert!(a.starts_with("_NUL."), "device stem must be prefixed: {a}");
-        assert!(a.ends_with(".log"), "benign extension must be preserved: {a}");
+        assert!(
+            a.ends_with(".log"),
+            "benign extension must be preserved: {a}"
+        );
     }
 
     #[test]
@@ -515,12 +582,21 @@ mod tests {
         // A remote name that is only a NON-INERT extension stages
         // deterministically as an inert text file.
         let a = staged_file_name(".scr");
-        assert!(a.starts_with("file."), "bare non-inert extension must stage as file.*: {a}");
-        assert!(a.ends_with(".txt"), "bare non-inert extension must stage as .txt: {a}");
+        assert!(
+            a.starts_with("file."),
+            "bare non-inert extension must stage as file.*: {a}"
+        );
+        assert!(
+            a.ends_with(".txt"),
+            "bare non-inert extension must stage as .txt: {a}"
+        );
 
         // A bare INERT extension keeps the suffix form (editor association).
         let a = staged_file_name(".conf");
-        assert!(a.starts_with(".conf-"), "bare inert extension keeps the suffix form: {a}");
+        assert!(
+            a.starts_with(".conf-"),
+            "bare inert extension keeps the suffix form: {a}"
+        );
 
         // Empty name keeps the existing deterministic fallback.
         assert!(staged_file_name("").starts_with("file-"));

@@ -666,7 +666,10 @@ mod tests {
         ] {
             let out = sanitize_version_for_filename(hostile);
             assert!(
-                !out.contains('/') && !out.contains('\\') && !out.contains(':') && !out.contains('\0'),
+                !out.contains('/')
+                    && !out.contains('\\')
+                    && !out.contains(':')
+                    && !out.contains('\0'),
                 "sanitized version {hostile:?} -> {out:?} must not contain path structure"
             );
         }

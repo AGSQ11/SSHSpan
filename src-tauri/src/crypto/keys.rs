@@ -298,7 +298,7 @@ fn is_non_printable_code_point(cp: u32) -> bool {
         | 0xF0000..=0xFFFFD                   // supplementary PUA-A
         | 0x100000..=0x10FFFD                 // supplementary PUA-B
         | 0xFDD0..=0xFDEF                     // noncharacters
-    ) || (cp & 0xFFFE) == 0xFFFE              // noncharacter endings
+    ) || (cp & 0xFFFE) == 0xFFFE // noncharacter endings
 }
 
 /// Sanitize an arbitrary name into one that passes [`validate_key_name`]:
@@ -517,13 +517,13 @@ mod tests {
             "x\n",
             "x\r",
             "x\tHost *",
-            "x Host *",       // space ends the pattern
-            " Host",          // leading whitespace
-            "Host ",          // trailing whitespace
-            "",               // empty
-            "   ",            // whitespace-only
-            "x\u{0}y",        // NUL
-            "x\u{7}y",        // bell
+            "x Host *", // space ends the pattern
+            " Host",    // leading whitespace
+            "Host ",    // trailing whitespace
+            "",         // empty
+            "   ",      // whitespace-only
+            "x\u{0}y",  // NUL
+            "x\u{7}y",  // bell
         ] {
             assert!(
                 validate_key_name(payload).is_err(),

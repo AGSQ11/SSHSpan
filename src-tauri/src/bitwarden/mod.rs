@@ -236,7 +236,8 @@ impl BitwardenClient {
         // up offline cracking. Argon2id floors: m >= 16 MiB, t >= 2, p >= 1.
         let iterations = num("kdfIterations").max(crate::crypto::bitwarden::PBKDF2_MIN_ITERATIONS);
         let memory = num("kdfMemory").max(crate::crypto::bitwarden::ARGON2_MIN_MEMORY_KIB);
-        let parallelism = num("kdfParallelism").max(crate::crypto::bitwarden::ARGON2_MIN_PARALLELISM);
+        let parallelism =
+            num("kdfParallelism").max(crate::crypto::bitwarden::ARGON2_MIN_PARALLELISM);
         Ok(KdfParams {
             kdf_type: num("kdf"),
             iterations,

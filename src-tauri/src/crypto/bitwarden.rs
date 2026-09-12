@@ -69,13 +69,8 @@ pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow
             let memory = kdf.memory.max(ARGON2_MIN_MEMORY_KIB);
             let iterations = kdf.iterations.max(ARGON2_MIN_ITERATIONS);
             let parallelism = kdf.parallelism.max(ARGON2_MIN_PARALLELISM);
-            let params = Params::new(
-                memory,
-                iterations,
-                parallelism,
-                Some(32),
-            )
-            .map_err(|e| anyhow::anyhow!("Argon2 param error: {e}"))?;
+            let params = Params::new(memory, iterations, parallelism, Some(32))
+                .map_err(|e| anyhow::anyhow!("Argon2 param error: {e}"))?;
             let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
             let mut key = [0u8; 32];
             argon2
