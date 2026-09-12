@@ -613,10 +613,16 @@ function toggleRowSelected(tr, on) {
 // bookmark, synchronized browsing, a search-result click) doesn't re-pay a
 // full SSH_FXP_READDIR round trip when the directory was just seen. Never
 // trusted past a mutation: mkdir/touch/rename/delete/chmod all force a fresh
-// read of the directory they touched, and the queue-completion listener
-// below drops a tab's whole cache whenever a transfer finishes for it. A
-// stale listing after a delete is worse than a slow one - when in doubt,
-// invalidate.
+// read of the directory they touched (refreshSftpPanel's forceFresh option -
+// see openSftpFileMenu, sftpMkdirPrompt, sftpTouchPrompt, sftpRenamePrompt,
+// openChmodDialog); a cross-directory move (drag a remote row onto another
+// remote directory) additionally invalidates the drop target explicitly,
+// since that directory isn't the one being refreshed. The queue-completion
+// listener below drops a tab's whole cache whenever a transfer finishes for
+// it, and the session-disconnect hook further down drops it on disconnect so
+// a later reconnect can never surface a listing read under the old session.
+// The explicit Refresh toolbar button always passes forceFresh too. A stale
+// listing after a delete is worse than a slow one - when in doubt, invalidate.
 
 const SFTP_DIR_CACHE_TTL_MS = 12000;
 
@@ -673,6 +679,31 @@ function sftpWireQueueCacheInvalidation() {
   }).catch(() => {});
 }
 sftpWireQueueCacheInvalidation();
+
+// ─── cache disposal on disconnect (Task 6) ──────────────────────────────────
+//
+// onSessionClosed (defined in app.js, invoked by terminal.js when a session
+// drops - server-side hangup or the Disconnect button) keeps the SAME tab
+// object alive so Reconnect can reuse it; only tab.sftpReady/tab.sessionId
+// reset. Left alone, tab._dirCache would survive the disconnect intact, and
+// a reconnect (a new sessionId - possibly even a different account/keypair
+// against the same host) could then serve a listing read under the OLD
+// session. sftp.js loads after app.js assigns window.onSessionClosed (see
+// the module doc comment at the top of this file), so wrapping it here -
+// rather than editing app.js, which is off-limits - always captures the
+// real handler first and still runs it.
+//
+// An outright tab CLOSE needs no equivalent hook: closeSessionTab and
+// clearConnectView (both in app.js) delete the tab from state.sessions
+// outright, and _dirCache lives only on that now-unreferenced tab object,
+// so it is dropped for free once the object is garbage collected - nothing
+// else in this file indexes the cache by tabId independently of the tab.
+const sftpPrevOnSessionClosed = window.onSessionClosed;
+window.onSessionClosed = function sftpOnSessionClosedWithCacheDrop(tabId) {
+  const tab = sftpTab(tabId);
+  if (tab) sftpCacheInvalidateAll(tab);
+  if (typeof sftpPrevOnSessionClosed === 'function') sftpPrevOnSessionClosed(tabId);
+};
 
 async function refreshSftpPanel(tabId, opts = {}) {
   const tab = sftpTab(tabId);
@@ -1401,6 +1432,12 @@ function openSftpFileMenu(x, y, tabId, entry) {
     mk('Download as...', 'download', () => sftpDownloadTo(tabId, fullPath, entry.name));
     mk('Open with system app', 'pencil', () => sftpOpenForEdit(tabId, fullPath, entry.name));
   }
+  // Directory-only (Task 9): sftpCalcDirSize does the round trip and patches
+  // the row's size cell in place - grouped with the other info/properties
+  // items, ahead of Rename/Delete rather than beside them.
+  if (entry.isDir) {
+    mk('Calculate size', 'hard-drive', () => sftpCalcDirSize(tabId, entry.name));
+  }
   mk('File permissions...', 'settings', () => openChmodDialog(tabId, multi ? selectedPaths : [fullPath], entry));
   mk(multi ? `Rename... (${selected[0]} +${selected.length - 1})` : 'Rename...', 'pencil', async () => {
     if (multi) { toast('Rename applies to a single item - select one.', 'info'); return; }
@@ -1409,7 +1446,10 @@ function openSftpFileMenu(x, y, tabId, entry) {
       try {
         await sftpCall('sftp_rename', { sessionId: tab.sessionId, from: fullPath, to: sftpJoin(tab.sftpPath, newName) });
         sftpLog(tabId, `rename ${entry.name} → ${newName}`);
-        await refreshSftpPanel(tabId);
+        // forceFresh (Task 6): same-directory rename, so the current dir's
+        // cache entry must not be served stale - see sftpRenamePrompt (F2),
+        // which this menu item duplicates for click access.
+        await refreshSftpPanel(tabId, { forceFresh: true });
       } catch (e) { toast(e.message || String(e), 'err'); }
     });
   });
@@ -1439,7 +1479,10 @@ function openSftpFileMenu(x, y, tabId, entry) {
       sftpLog(tabId, `delete ${ok} item(s)${fail ? `, ${fail} failed` : ''}`);
       if (fail) toast(`${ok} deleted, ${fail} failed.${lastErr ? ' ' + lastErr : ''}`, 'err');
       else if (ok) toast(paths.length === 1 ? `Deleted "${firstName}".` : `Deleted ${ok} items.`, 'ok');
-      await refreshSftpPanel(tabId);
+      // forceFresh (Task 6): a stale listing after a delete is worse than a
+      // slow one - never let this fall through to a cache hit that still
+      // shows the just-deleted item(s).
+      await refreshSftpPanel(tabId, { forceFresh: true });
     });
   });
   mk('Copy path', 'copy', () => copyText(fullPath).then(ok => ok && toast('Path copied.', 'ok')));
@@ -1575,7 +1618,9 @@ function openChmodDialog(tabId, paths, entry) {
     sftpLog(tabId, `chmod ${toOctal()} on ${paths.length} path(s) - ${changed} changed${fail ? `, ${fail} failed` : ''}`);
     toast(fail ? `${changed} updated, ${fail} failed.` : `Permissions set (${toOctal()}).`, fail ? 'err' : 'ok');
     close();
-    refreshSftpPanel(tabId);
+    // forceFresh (Task 6): the Permissions column of a cached listing would
+    // otherwise show the pre-chmod mode until the TTL expires.
+    refreshSftpPanel(tabId, { forceFresh: true });
   };
 
   modal.hidden = false;
@@ -2676,7 +2721,13 @@ function wireSftpPaneDnd(tabId) {
         try {
           await sftpCall('sftp_rename', { sessionId: tab.sessionId, from, to });
           sftpLog(tabId, `move ${payload.data.name} → ${to}`);
-          await refreshSftpPanel(tabId);
+          // Task 6: this rename crosses directories - the CURRENT dir (source
+          // parent) is covered by forceFresh below, but the drop target
+          // (new parent) isn't the directory being refreshed, so its cache
+          // entry needs an explicit invalidate or a later visit would show
+          // it without the item that just moved in.
+          sftpCacheInvalidate(tab, sftpJoin(tab.sftpPath, overDir));
+          await refreshSftpPanel(tabId, { forceFresh: true });
         } catch (e) { toast(e.message || String(e), 'err'); }
       }
     });
