@@ -17,12 +17,20 @@ inactivity (locking also disconnects every live SSH session and stops every tran
 
 All sensitive logic - crypto, vault, database, SSH, SFTP - runs in a compiled **Rust** core.
 The UI is vanilla HTML/CSS/JS in your OS webview: no Electron, no bundled Chromium, no Node
-runtime. The Windows installer is ~9 MB. Everything runs locally: no cloud, no telemetry, and
-no network access unless you enable Bitwarden sync, which talks only to the server you
-configure.
+runtime. The Windows installer is ~9 MB. Everything runs locally: no cloud, no telemetry.
+The only network traffic is the update check against GitHub (on by default, disableable in
+Settings) and, if you enable it, Bitwarden sync — which talks only to the server you
+configure. Auto-updates are minisign-signature-verified and fail closed.
 
 ## What's new
 
+- **v1.7.2** - Signed auto-updates (minisign-verified installers, fail-closed), consent-based
+  host-key trust with strict refusals, private-key export straight to a file (never through
+  the UI process), brute-force backoff, hardened staging and paths, plus the SFTP
+  FileZilla-parity set: resumable transfers, conflict dialogs, directory comparison with
+  synchronized browsing, drag & drop, and timestamp preservation.
+- **v1.7.1** - Security patch: real PBES2 PKCS#8 export, SSRF and data-loss fixes, a verified
+  auto-update path, and an XSS fix.
 - **v1.7.0** - PuTTY-style terminal utilities: right-click terminal/tab context menu, copy
   all, paste confirmation, duplicate/restart sessions, configurable scrollback, bell
   behavior, keyboard compatibility settings, SSH keepalive, and normal remote Tab
@@ -99,8 +107,9 @@ A quick tour of the desktop UI:
   Copy All, paste with optional multi-line confirmation, Ctrl+Shift+C/V, duplicate and
   restart sessions, clear/reset terminal, visual or sound bell, keyboard compatibility
   settings, and optional SSH keepalive.
-- **Host-key pinning (TOFU)** - first connection stores the server's fingerprint; any change
-  is refused with a clear warning.
+- **Host-key pinning** - the first connection to a host asks for explicit confirmation;
+  the backend refuses unpinned hosts without it (a `StrictHostKeyChecking=yes` equivalent).
+  Any later fingerprint change is refused and recorded in the audit log.
 - **Right-click any key -> "Use this key to connect..."** - pick a saved server (its username
   + your clicked key) or create a new server pre-filled with that key.
 - **Vault-gated**: locking the vault immediately disconnects every live session.
@@ -110,11 +119,16 @@ A quick tour of the desktop UI:
 Runs over the same live SSH connection as the terminal - no second login, no extra port:
 - **Background transfer queue** - uploads and downloads run on dedicated SFTP channels, so
   browsing stays responsive while transfers stream progress, speed, cancel/retry, and
-  Queued/Failed/Done tabs. Directories expand recursively in both directions; two transfers
+  Queued/Failed/Done tabs. Directories expand recursively in both directions; four transfers
   run in parallel by default (1-4 configurable).
 - **Dual-pane mode** - optional local pane with a draggable splitter; drag or double-click a
   local file to upload, double-click folders to navigate, drop files from your OS onto the
   remote pane.
+- **Resumable transfers** - interrupted uploads and downloads continue from verified partials
+  (atomic `.part` staging, so a crash never leaves a corrupt "complete" file); per-transfer
+  conflict handling with Ask/Overwrite/Skip/Rename/Resume and persistable defaults.
+- **Compare & synchronized browsing** - diff the local and remote panes and keep them in step;
+  file timestamps can be preserved across transfers.
 - **File permissions** - chmod dialog with an owner/group/other read/write/execute grid,
   live octal sync, recursion, and files/directories/all targeting.
 - **Recursive remote search** - case-insensitive search across the current directory tree
@@ -134,29 +148,31 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
 - **Bitwarden / Vaultwarden sync (optional)** - mirror keys to SSH-key items in your own
   vault, two-way, deletions never propagated; works with getbitwarden.com and self-hosted
   Vaultwarden (SSRF-hardened server URL validation).
-- **Deploy to SSH** - writes selected keys to `~/.sshspan/keys/<id>` (owner-only
-  permissions) and manages reversible `Host` blocks between marker comments in
-  `~/.ssh/config`.
+- **Deploy to SSH** - writes selected keys to `~/.ssh/sshspan_<name>` (owner-only permissions
+  from the moment of creation) and manages reversible `Host` blocks in SSHSpan's managed
+  SSH config.
 - **Backup and restore** - full vault backups (keys, servers, both category trees) to a
   single encrypted file, restorable only with the master password current at backup time.
 
 ### Trust & ops
 - **Audit log** - append-only local record of every sensitive action (key lifecycle, vault
   lock/unlock, connects, server changes, backups).
-- **DevTools available in release builds** (F12) - the UI layer holds no secrets by design.
+- **Signed auto-updates** - installers are downloaded only from this repository over HTTPS,
+  verified against a SHA-256 digest *and* a minisign signature whose public key is embedded
+  in the app; a missing or invalid signature refuses the update.
 - **Small & fast** - ~9 MB Windows installer, ~16 MB Linux packages; no Chromium, no Node
-  runtime.
+  runtime. DevTools are compiled out of release builds.
 
 ## Installation
 
 ### From a release (recommended)
 Grab the latest installer from [Releases](https://github.com/AGSQ11/SSHSpan/releases) -
-current release is **v1.7.0**:
+current release is **v1.7.2**:
 
 | Platform | Files |
 | --- | --- |
-| Windows | `SSHSpan_1.7.0_x64-setup.exe` (NSIS, per-user) · `SSHSpan_1.7.0_x64_en-US.msi` (system-wide) |
-| Linux | `SSHSpan_1.7.0_amd64.deb` · `SSHSpan-1.7.0-1.x86_64.rpm` |
+| Windows | `SSHSpan_1.7.2_x64-setup.exe` (NSIS, per-user) · `SSHSpan_1.7.2_x64_en-US.msi` (system-wide) |
+| Linux | `SSHSpan_1.7.2_amd64.deb` · `SSHSpan-1.7.2-1.x86_64.rpm` |
 
 ### Build from source
 Prerequisites: [Rust](https://rustup.rs) (stable), Node.js >= 18 (for the Tauri CLI), and on
@@ -175,12 +191,13 @@ Rust tests: `cargo test --manifest-path src-tauri/Cargo.toml`.
 ## Architecture (in one paragraph)
 
 A **Tauri v2** app: a Rust binary (`src-tauri/`) owns the SQLite vault (sqlx), all
-cryptography (`ssh-key`, `aes-gcm`, `bcrypt-pbkdf`, `chacha20poly1305`, `ring`), the
-Bitwarden client, the SSH deploy service, and the russh session + SFTP engines; the webview
-UI (`src/renderer/`) is plain HTML/CSS/JS that talks to Rust through typed IPC commands.
-Private key material is decrypted only inside Rust processes and never crosses the IPC
-boundary. The full Node.js -> Rust migration story, per-version changelog, and engineering
-notes live in [`docs/REWRITE-ROADMAP.md`](docs/REWRITE-ROADMAP.md); the process/module layout
+cryptography (`ssh-key`, `argon2`, `aes-gcm`, `minisign-verify`, the `russh` SSH + SFTP
+engines), the Bitwarden client, and the updater; the webview UI (`src/renderer/`) is plain
+HTML/CSS/JS that talks to Rust through typed IPC commands. Decrypted private key material
+stays inside Rust processes — even exports are written to disk by the backend — and never
+crosses the IPC boundary into the UI. The full Node.js -> Rust migration story,
+per-version changelog, and engineering notes live in
+[`docs/REWRITE-ROADMAP.md`](docs/REWRITE-ROADMAP.md); the process/module layout
 is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Security
