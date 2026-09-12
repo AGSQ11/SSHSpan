@@ -113,6 +113,62 @@ impl VaultPasswordStore {
     }
 }
 
+/// In-process throttle for master-password verification. After 5 consecutive
+/// failures every further attempt is delayed (30 s, doubling per additional
+/// failure, capped at 15 min), so IPC-driven password guessing is slowed to
+/// Argon2id-plus-backoff speed even for a local caller. This is defense in
+/// depth, not the primary control: the at-rest Argon2id hash resists offline
+/// guessing regardless, and an attacker able to restart the app clears this
+/// in-memory state — but also loses nothing, since there is nothing to gain
+/// from the IPC path that the DB file does not offer offline.
+pub struct UnlockThrottle {
+    state: std::sync::Mutex<ThrottleState>,
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    consecutive_failures: u32,
+    locked_until: Option<std::time::Instant>,
+}
+
+impl UnlockThrottle {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ThrottleState::default()),
+        }
+    }
+
+    /// Err while the throttle is cooling down after repeated failures.
+    fn check(&self) -> Result<(), String> {
+        let s = self.state.lock().unwrap();
+        if let Some(until) = s.locked_until {
+            let now = std::time::Instant::now();
+            if now < until {
+                let secs = (until - now).as_secs() + 1;
+                return Err(format!(
+                    "Too many failed attempts. Try again in {secs} second(s)."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_failure(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+        if s.consecutive_failures >= 5 {
+            // 5th failure: 30 s; each further failure doubles it, capped at 15 min.
+            let extra = (s.consecutive_failures - 5).min(5) as u32;
+            let delay = std::time::Duration::from_secs((30u64 << extra).min(900));
+            s.locked_until = Some(std::time::Instant::now() + delay);
+        }
+    }
+
+    fn record_success(&self) {
+        *self.state.lock().unwrap() = ThrottleState::default();
+    }
+}
+
 // ─── Master password hashing (Argon2id) ─────────────────────────────────────
 
 const MASTER_HASH_KEY: &str = "master.hash";
@@ -214,8 +270,11 @@ pub fn vault_create(app: AppHandle, password: String) -> CmdResult<serde_json::V
 
 /// Unlock an existing vault by verifying the password against the stored
 /// Argon2id hash (or upgrading a legacy plaintext verifier in place).
+/// Consecutive failures engage the [`UnlockThrottle`] backoff.
 #[tauri::command]
 pub fn vault_unlock(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
+    let throttle = app.state::<UnlockThrottle>();
+    throttle.check().map_err(CmdError::from)?;
     let stored = app
         .state::<AppState>()
         .db
@@ -227,12 +286,14 @@ pub fn vault_unlock(app: AppHandle, password: String) -> CmdResult<serde_json::V
     let ok = verify_master_password(&app.state::<AppState>().db, &password)
         .map_err(|e| e.to_string())?;
     if !ok {
+        throttle.record_failure();
         app.state::<AppState>()
             .db
             .add_audit("vault.unlock_failed", None, "Failed attempt")
             .map_err(|e| e.to_string())?;
         return Err("Incorrect master password.".into());
     }
+    throttle.record_success();
     app.state::<AppState>()
         .db
         .add_audit("vault.unlock", None, "")
@@ -267,6 +328,10 @@ pub fn vault_change_password(
     if new_password.len() < 8 {
         return Err("New master password must be at least 8 characters.".into());
     }
+    // The current-password check is a password guess too — throttle it with
+    // the same counter as unlock attempts.
+    let throttle = app.state::<UnlockThrottle>();
+    throttle.check().map_err(CmdError::from)?;
     let stored = app
         .state::<AppState>()
         .db
@@ -278,8 +343,10 @@ pub fn vault_change_password(
     let ok = verify_master_password(&app.state::<AppState>().db, &current_password)
         .map_err(|e| e.to_string())?;
     if !ok {
+        throttle.record_failure();
         return Err("Current master password is incorrect.".into());
     }
+    throttle.record_success();
 
     let db = &app.state::<AppState>().db;
     let keys = db.list_keys().map_err(|e| e.to_string())?;
@@ -523,6 +590,27 @@ mod tests {
             result.is_err(),
             "must not treat encrypted column as plaintext"
         );
+    }
+
+    /// Throttle: 4 failures keep the gate open; the 5th engages a cooldown;
+    /// a success resets it.
+    #[test]
+    fn unlock_throttle_backoff_progression() {
+        let t = UnlockThrottle::new();
+        for _ in 0..4 {
+            t.record_failure();
+        }
+        assert!(
+            t.check().is_ok(),
+            "4 consecutive failures must not engage the cooldown"
+        );
+        t.record_failure();
+        assert!(
+            t.check().is_err(),
+            "5 consecutive failures must engage the cooldown"
+        );
+        t.record_success();
+        assert!(t.check().is_ok(), "a success must reset the throttle");
     }
 
     /// Relative paths are rejected for backup export.
@@ -1248,6 +1336,11 @@ pub fn key_import(
     Ok(serde_json::json!({ "ok": true, "id": key_record.id }))
 }
 
+/// Export a key's PUBLIC material to the renderer. PRIVATE formats are
+/// deliberately refused here: decrypted private-key text must not pass
+/// through the WebView (it would live in renderer memory and any renderer
+/// compromise could read it). Use [`key_export_to_file`], which serializes
+/// straight to a user-chosen file without the data ever entering IPC.
 #[tauri::command]
 pub fn key_export(
     app: AppHandle,
@@ -1267,23 +1360,153 @@ pub fn key_export(
         .map_err(|e| e.to_string())?;
     let key = key.ok_or_else(|| "Key not found.".to_string())?;
 
-    if format == "public" || format == "authorized_keys" {
-        return Ok(serde_json::json!({ "data": key.public_key }));
+    // Public formats take no passphrase; the parameter is kept so the
+    // renderer's export payload shape is unchanged across formats.
+    let _ = passphrase;
+
+    if format != "public" && format != "authorized_keys" && format != "public-pem" {
+        let _ = app.state::<AppState>().db.add_audit(
+            "keys.export_refused",
+            Some(&id),
+            &format!("private format {format} requested via renderer export IPC"),
+        );
+        return Err(CmdError(
+            "Private-key export must be saved directly to a file \
+             (use the export dialog) so key material stays out of the UI process."
+                .into(),
+        ));
     }
+
+    let data = match format.as_str() {
+        "public" | "authorized_keys" => key.public_key.clone(),
+        "public-pem" => {
+            let key_data = load_private_key_data(&app, &key, &pw)?;
+            keys::export_public_key(&key_data, KeyFormat::Pkcs8).map_err(|e| e.to_string())?
+        }
+        _ => unreachable!("format restricted above"),
+    };
+
+    let _ = app.state::<AppState>().db.add_audit(
+        "keys.exported",
+        Some(&id),
+        &format!("public material, format {format}"),
+    );
+
+    Ok(serde_json::json!({ "data": data }))
+}
+
+/// Private-key export extensions, mirroring the renderer's map.
+fn private_export_extension(format: &str) -> &'static str {
+    match format {
+        "ppk" => ".ppk",
+        "pkcs8" | "pkcs8-encrypted" => ".pem",
+        _ => "", // openssh-private: no extension, matching ssh-keygen convention
+    }
+}
+
+/// Export a PRIVATE key straight to a user-chosen file. The PEM text is
+/// serialized in the backend and written to the path the user picks in the
+/// native save dialog — the key material never crosses the IPC boundary into
+/// the renderer. The file is written 0600 from the first byte on Unix; on
+/// Windows the current-user-only ACL is attempted and a failure is logged
+/// (exports may legitimately target volumes that cannot store ACLs, unlike
+/// the deploy destination, where a restriction failure is fatal).
+#[tauri::command]
+pub fn key_export_to_file(
+    app: AppHandle,
+    id: String,
+    format: String,
+    passphrase: Option<String>,
+) -> CmdResult<serde_json::Value> {
+    let pw = vault_password(&app)?;
+    if pw.is_empty() {
+        return Err("Vault is locked.".into());
+    }
+    match format.as_str() {
+        "openssh-private" | "ppk" | "pkcs8" | "pkcs8-encrypted" => {}
+        other => {
+            return Err(CmdError(format!(
+                "Format \"{other}\" is public material; use the regular export path."
+            )))
+        }
+    }
+
+    let key = app
+        .state::<AppState>()
+        .db
+        .get_key(&id)
+        .map_err(|e| e.to_string())?;
+    let key = key.ok_or_else(|| "Key not found.".to_string())?;
 
     let key_data = load_private_key_data(&app, &key, &pw)?;
     let pass = passphrase.as_deref().filter(|p| !p.is_empty());
-
     let data = match format.as_str() {
         "openssh-private" => keys::export_private_key(&key_data, KeyFormat::OpenSsh, pass),
         "pkcs8" | "pkcs8-encrypted" => keys::export_private_key(&key_data, KeyFormat::Pkcs8, pass),
         "ppk" => keys::export_private_key(&key_data, KeyFormat::Putty, pass),
-        "public-pem" => keys::export_public_key(&key_data, KeyFormat::Pkcs8),
-        _ => return Err(CmdError(format!("Unknown export format: {}", format)).into()),
+        _ => unreachable!("format restricted above"),
     }
     .map_err(|e| e.to_string())?;
 
-    Ok(serde_json::json!({ "data": data }))
+    use tauri_plugin_dialog::DialogExt;
+    let default_name = format!("{}{}", key.name, private_export_extension(&format));
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Export private key")
+        .set_file_name(&default_name)
+        .blocking_save_file();
+    let Some(path) = picked else {
+        return Ok(serde_json::json!({ "canceled": true }));
+    };
+    let path_str = path.to_string();
+    // The dialog choice is the user's approval; keep the absolute/app-data/
+    // system checks as a backstop (a dialog path is always absolute, but the
+    // app-data guard also protects the vault DB from being overwritten).
+    validate_export_path(&path_str)?;
+
+    use std::io::Write as _;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&path_str)
+        .map_err(|e| CmdError(format!("Could not create export file: {e}")))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        // mode() only applies at creation; reassert for a pre-existing file.
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path_str)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path_str, perms)?;
+    }
+    #[cfg(windows)]
+    {
+        if let Err(e) = crate::ssh::restrict_windows_file(&std::path::PathBuf::from(&path_str)) {
+            log::warn!(
+                "[sshspan-keys] could not restrict ACLs on export {}: {e} \
+                 (the destination may be a filesystem without ACL support)",
+                path_str
+            );
+        }
+    }
+
+    let _ = app.state::<AppState>().db.add_audit(
+        "keys.exported",
+        Some(&id),
+        &format!("private material, format {format} -> {path_str}"),
+    );
+
+    Ok(serde_json::json!({ "ok": true, "canceled": false, "path": path_str }))
 }
 
 #[tauri::command]

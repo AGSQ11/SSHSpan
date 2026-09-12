@@ -135,8 +135,17 @@ pub fn known_host_key(host: &str, port: u16) -> String {
     format!("{}:{}", host, port)
 }
 
-/// The russh client handler. Its only job is host-key verification (TOFU);
-/// the interactive I/O runs on the channel side in the spawned task.
+/// The russh client handler. Its only job is host-key verification; the
+/// interactive I/O runs on the channel side in the spawned task.
+///
+/// Host-key policy:
+/// - a pinned `host:port` must match exactly, else the connection is refused;
+/// - an UNPINNED host is accepted only when `allow_tofu` is set — i.e. the
+///   renderer has to have obtained explicit user consent first (the
+///   `known_hosts_check` → confirm flow). Without consent the unknown key is
+///   REFUSED (the StrictHostKeyChecking=yes equivalent): a silently-trusting
+///   first connect is no longer the default behavior, and a compromised
+///   renderer cannot silently grow the trusted set either.
 pub struct TerminalHandler {
     /// host used as the key in the known_hosts table
     pub host: String,
@@ -144,6 +153,9 @@ pub struct TerminalHandler {
     pub port: u16,
     /// database handle for host-key lookups
     pub db: Database,
+    /// Whether an unpinned host may be trusted on first use. Only set when
+    /// the user explicitly consented to trusting this host in the renderer.
+    pub allow_tofu: bool,
 }
 
 impl client::Handler for TerminalHandler {
@@ -186,9 +198,23 @@ impl client::Handler for TerminalHandler {
                 Ok(accepted)
             }
             Ok(None) => {
-                // First sight: TOFU-accept and store. The user never gets a
-                // prompt here, so at minimum record what was trusted and
-                // let the connect path surface a notice in the terminal.
+                if !self.allow_tofu {
+                    // Strict mode: no consent to trust a new host was given.
+                    // Refuse without storing anything, but record the attempt.
+                    let _ = self.db.add_audit(
+                        "known_hosts.unknown_refused",
+                        None,
+                        &format!(
+                            "{} (presented SHA256:{})",
+                            &host_key,
+                            fingerprint_of_blob(&presented_b64).unwrap_or_default()
+                        ),
+                    );
+                    return Ok(false);
+                }
+                // First sight WITH user consent: store and record what was
+                // trusted, and let the connect path surface a notice in the
+                // terminal.
                 let fp = fingerprint_of_blob(&presented_b64).unwrap_or_default();
                 let _ = self.db.add_known_host(&host_key, &presented_b64, &fp);
                 let _ = self.db.add_audit(
@@ -287,8 +313,19 @@ pub async fn authenticate(
                 .ok_or_else(|| anyhow::anyhow!("No private key selected for this session"))?;
             let key_pair = decode_secret_key(pem, None)
                 .map_err(|e| anyhow::anyhow!("Could not decode the selected private key: {e}"))?;
+            // RSA keys: pin the signature hash to SHA-256 (rsa-sha2-256)
+            // instead of letting the algorithm negotiation fall back to the
+            // legacy ssh-rsa (SHA-1) signature format. Non-RSA keys have a
+            // single fixed hash — pass None.
+            let hash_alg = match key_pair.algorithm() {
+                russh::keys::Algorithm::Rsa { .. } => Some(russh::keys::HashAlg::Sha256),
+                _ => None,
+            };
             let auth = session
-                .authenticate_publickey(&user, PrivateKeyWithHashAlg::new(Arc::new(key_pair), None))
+                .authenticate_publickey(
+                    &user,
+                    PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg),
+                )
                 .await?;
             if !auth.success() {
                 return Err(anyhow::anyhow!("Public-key authentication failed: the server rejected the key for user \"{user}\"."));
@@ -381,16 +418,18 @@ pub async fn start_interactive(
     db: Database,
     registry: Arc<SessionRegistry>,
     on_data: Channel<String>,
+    allow_tofu: bool,
 ) -> anyhow::Result<String> {
     let target_host = params.server.host.clone();
     let target_port = params.server.port;
     let known_host_lookup = known_host_key(&target_host, target_port);
 
     // Pre-check made BEFORE connecting: if the host has no known_hosts entry,
-    // the TOFU handler below will store a new key during the handshake. The
-    // lookup result drives the informational first-trust notice; the small
-    // race with the handler's own lookup is benign (a notice is advisory,
-    // the audit entry is authoritative).
+    // the handler below will only store a new key when `allow_tofu` consent
+    // was given (see TerminalHandler). The lookup result drives the
+    // informational first-trust notice; the small race with the handler's own
+    // lookup is benign (a notice is advisory, the audit entry is
+    // authoritative).
     let pre_connect_known_host = db.get_known_host(&known_host_lookup).ok().flatten();
 
     let config = Arc::new(base_client_config());
@@ -398,6 +437,7 @@ pub async fn start_interactive(
         host: target_host.clone(),
         port: target_port,
         db: db.clone(),
+        allow_tofu,
     };
 
     let t0 = std::time::Instant::now();

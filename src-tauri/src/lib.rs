@@ -62,6 +62,8 @@ pub fn run() {
             app.manage(VaultPasswordStore::new());
             // Save-dialog-approved write targets (system_write_text_file gate)
             app.manage(commands::DialogPathStore::new());
+            // Master-password guess backoff (unlock / change-password)
+            app.manage(commands::UnlockThrottle::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -93,6 +95,7 @@ pub fn run() {
             key_generate,
             key_import,
             key_export,
+            key_export_to_file,
             key_delete,
             key_list,
             key_get,
@@ -125,6 +128,7 @@ pub fn run() {
             terminal_list,
             server_test,
             known_hosts_list,
+            known_hosts_check,
             known_hosts_forget,
             sftp_open,
             sftp_list_dir,

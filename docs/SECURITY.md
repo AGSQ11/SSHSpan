@@ -29,6 +29,11 @@ While the vault is unlocked, the master password exists only in memory inside a
 locked the store is cleared and every live SSH/SFTP session is killed. There is no
 persistent copy of the password anywhere on disk.
 
+Password verification attempts are rate-limited: after 5 consecutive failures, further
+attempts are delayed with an exponential backoff (30 s doubling per failure, capped at
+15 minutes). This slows IPC-driven guessing; the primary offline defense remains the
+at-rest Argon2id hash, which does not depend on this in-process counter.
+
 ### Private key encryption
 
 Each private key is sealed independently as an `EncryptedVault` envelope
@@ -85,7 +90,9 @@ profile directory (Windows) / user-owned permissions (Unix).
 6. **Exports are under user control.** Exports require an unlocked vault and can be
    passphrase-protected: OpenSSH format (aes256-ctr + bcrypt KDF), PKCS#8 PBES2
    (PBKDF2-HMAC-SHA256, 100 000 iterations, AES-256-CBC), or PuTTY PPK v3. The export
-   passphrase is independent of the vault password and is not stored.
+   passphrase is independent of the vault password and is not stored. Private-key exports
+   are serialized by the backend directly into a user-chosen file — the decrypted key never
+   crosses the IPC boundary into the renderer process — and every export is audited.
 7. **The network surface is small, explicit, and user-controlled.** Exactly two destinations
    exist: the GitHub update check (default on, disableable; downloads pinned to
    `github.com/AGSQ11/SSHSpan/releases/`, HTTPS, redirect-validated, size-capped, verified
@@ -94,11 +101,14 @@ profile directory (Windows) / user-owned permissions (Unix).
 
 ## SSH client, SFTP, and host keys
 
-- **Host keys are pinned.** The first connection to a `host:port` stores the presented key
-  (TOFU), shows the fingerprint in the terminal, and records the trust in the audit log.
-  Every later connection must present the exact same key; a mismatch is a hard failure and
-  is recorded in the audit log. Pins are scoped to `host:port` so the same hostname on
-  different ports cannot share pins.
+- **Host keys are pinned, and first trust is a user decision.** Before connecting to a
+  `host:port` with no stored pin, the app asks the user to confirm; the backend REFUSES an
+  unpinned host unless that consent was given (the `StrictHostKeyChecking=yes` equivalent),
+  and records a refused attempt in the audit log. When the user accepts, the presented key
+  is stored (TOFU), the fingerprint is shown in the terminal, and the trust is recorded in
+  the audit log. Every later connection must present the exact same key; a mismatch is a
+  hard failure and is recorded in the audit log. Pins are scoped to `host:port` so the same
+  hostname on different ports cannot share pins.
 - **A malicious SSH/SFTP server is an in-scope attacker.** Remote file names are sanitized
   before they can become local paths: separators, `..` segments, drive letters, UNC paths,
   Windows reserved device names, and control characters are rejected or neutralized, and
@@ -206,6 +216,16 @@ SSHSpan is designed to defend against a specific, realistic class of attacker:
 ## Limitations
 
 These are deliberate, documented trade-offs, not bugs:
+
+- **Known third-party dependency advisories.** The `rsa` crate (transitive via the russh
+  SSH stack, versions 0.9.x and 0.10.0-rc) carries RUSTSEC-2023-0071 ("Marvin", a timing
+  side channel against RSA *decryption*). There is no patched upstream release. Exposure in
+  SSHSpan is limited: the app never RSA-decrypts attacker-controlled ciphertext (the
+  attack's requirement) — RSA appears only in signature verification (host keys) and
+  client-authentication signing, and RSA auth signatures are pinned to `rsa-sha2-256`
+  rather than legacy SHA-1. The risk is accepted and the dependency is monitored for an
+  upstream fix. Several other transitive crates (`instant`, `proc-macro-error`, `unic-*`,
+  `glib` on Linux) are flagged unmaintained-class with no known exploitable issue.
 
 - **The database file is not encrypted.** Only the private-key column, saved server
   passwords, and the verifier are protected. Public key material, fingerprints, tags,

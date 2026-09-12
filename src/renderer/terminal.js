@@ -381,6 +381,32 @@ function terminalConnectInTab(tabId, server, opts) {
       promptPassword: opts && opts.promptPassword,
     };
 
+    // Host-key consent (StrictHostKeyChecking semantics): the backend refuses
+    // an UNPINNED host unless allowTofu was granted, and it is granted only
+    // here — after the user explicitly accepts the first-trust prompt.
+    try {
+      const known = await tcore.invoke('known_hosts_check', {
+        host: server.host,
+        port: server.port || 22,
+      });
+      if (known && known.known === false) {
+        const okTrust = window.confirm(
+          '“' + server.host + ':' + (server.port || 22) + '” is not in Known Hosts yet.\n\n' +
+          'Trust this host on first connection (TOFU)?\n' +
+          'The fingerprint will be shown in the terminal and recorded in the audit log.'
+        );
+        if (!okTrust) {
+          trace(tabId, '[sshspan] connection cancelled — host not trusted');
+          return reject(new Error('Connection cancelled — host is not trusted yet.'));
+        }
+        args.allowTofu = true;
+      }
+    } catch (e) {
+      if (e && String((e && e.message) || e).indexOf('not trusted') !== -1) return reject(e);
+      // known_hosts_check itself failed: proceed WITHOUT consent — the
+      // backend stays strict and refuses an unknown host on its own.
+    }
+
     const encoder = new TextEncoder();
     const dataSub = t.onData(async (data) => {
       if (!rec.sessionId) return;

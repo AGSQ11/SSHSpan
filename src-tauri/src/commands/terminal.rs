@@ -143,6 +143,11 @@ pub async fn terminal_connect(
     override_username: Option<String>,
     override_key_id: Option<String>,
     prompt_password: Option<String>,
+    // True only when the user explicitly consented (renderer confirm dialog,
+    // after `known_hosts_check` reported the host as unpinned) to trusting a
+    // NEW host key on first use. Absent/false = strict: an unpinned host is
+    // refused instead of silently trusted.
+    allow_tofu: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
     if vault_pw.is_empty() {
@@ -182,12 +187,15 @@ pub async fn terminal_connect(
         db.clone(),
         registry.clone(),
         on_data,
+        allow_tofu.unwrap_or(false),
     ).await.map_err(|e| {
         let msg = e.to_string();
         let friendly = if msg.contains("Key exchange failed") || msg.contains("key exchange") {
             "The host rejected the connection during key exchange. If this host's fingerprint changed, forget it in the known_hosts list and retry.".to_string()
         } else if msg.to_lowercase().contains("host key") {
             "Host key mismatch. The server presented a different key than the one stored for this host — possible MITM, or the host was rebuilt. Forget it in known_hosts and retry.".to_string()
+        } else if msg.to_lowercase().contains("unknown key") {
+            "This host is not trusted yet and no consent to trust it was given. Reconnect and accept the host-key prompt, or add it via Known Hosts.".to_string()
         } else {
             msg
         };
@@ -291,11 +299,14 @@ pub fn terminal_list(app: AppHandle) -> CmdResult<serde_json::Value> {
 
 /// Quick connectivity check: open + authenticate + immediately close.
 /// Reports latency and any error verbatim so the renderer can surface it.
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn server_test(
     app: AppHandle,
     server_id: String,
     prompt_password: Option<String>,
+    // Same consent semantics as terminal_connect: trust a NEW host only when
+    // the user approved it in the renderer prompt.
+    allow_tofu: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
     if vault_pw.is_empty() {
@@ -326,6 +337,7 @@ pub async fn server_test(
             host: host_for_handler,
             db: db_for_handler,
             port: resolved.server.port,
+            allow_tofu: allow_tofu.unwrap_or(false),
         };
         let mut session = russh::client::connect(
             config,
@@ -366,6 +378,8 @@ pub async fn server_test(
             let raw = e.to_string();
             let friendly = if raw.to_lowercase().contains("host key") {
                 "Host key mismatch. Forget it in known_hosts and retry.".to_string()
+            } else if raw.to_lowercase().contains("unknown key") {
+                "This host is not trusted yet and no consent to trust it was given. Retry and accept the host-key prompt.".to_string()
             } else if raw.contains("Key exchange") || raw.contains("key exchange") {
                 "Key exchange failed.".to_string()
             } else if raw.starts_with("Connect failed: ") {
@@ -398,6 +412,25 @@ pub fn known_hosts_list(app: AppHandle) -> CmdResult<serde_json::Value> {
         })
         .collect();
     Ok(serde_json::json!({ "hosts": arr }))
+}
+
+/// Pre-connect host-key lookup for the renderer's consent flow: is there a
+/// stored pin for `host:port`, and if so what fingerprint? The renderer calls
+/// this BEFORE `terminal_connect`/`server_test` and shows the trust prompt
+/// only for unpinned hosts; the connect commands refuse unpinned hosts unless
+/// the prompt was accepted (`allow_tofu: true`).
+#[tauri::command(rename_all = "camelCase")]
+pub fn known_hosts_check(app: AppHandle, host: String, port: u16) -> CmdResult<serde_json::Value> {
+    let key = crate::ssh_client::known_host_key(&host, port);
+    match app.state::<AppState>().db.get_known_host(&key) {
+        Ok(Some(known)) => Ok(serde_json::json!({
+            "known": true,
+            "fingerprintSha256": known.fingerprint_sha256,
+            "firstSeen": known.first_seen.to_rfc3339(),
+        })),
+        Ok(None) => Ok(serde_json::json!({ "known": false })),
+        Err(e) => Err(CmdError(e.to_string())),
+    }
 }
 
 #[tauri::command]

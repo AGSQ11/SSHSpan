@@ -1338,12 +1338,23 @@ const EXPORT_EXT = {
   'authorized_keys': '.authorized_keys'
 };
 
+// Formats whose output is PRIVATE key material. These are exported through
+// `key_export_to_file` — the backend serializes straight into a user-chosen
+// file so the decrypted key never crosses the IPC boundary into the WebView.
+const PRIVATE_EXPORT_FORMATS = ['openssh-private', 'ppk', 'pkcs8', 'pkcs8-encrypted'];
+
 async function exportSelected() {
   if (!state.selectedId) return;
   const format = el('detailExportFormat').value;
   const passphrase = el('detailExportPass').value;
   const k = state.keys.find(x => x.id === state.selectedId);
   try {
+    if (PRIVATE_EXPORT_FORMATS.indexOf(format) !== -1) {
+      const r = await call('key_export_to_file', { id: state.selectedId, format, passphrase });
+      if (r.canceled) { toast('Export cancelled.', 'info'); return; }
+      toast('Exported ' + format + ' to ' + r.path, 'ok');
+      return;
+    }
     const out = await call('key_export', { id: state.selectedId, format, passphrase });
     const base = safeFileName(k ? k.name : state.selectedId);
     const ext = EXPORT_EXT[format] !== undefined ? EXPORT_EXT[format] : '.txt';
@@ -2741,7 +2752,24 @@ async function testSelectedServer(srv) {
   if (!srv) return;
   terminalSetStatus(`Testing ${srv.host}:${srv.port || 22}…`);
   try {
-    const result = await call('server_test', { serverId: srv.id });
+    // Host-key consent: the backend refuses an unpinned host unless the user
+    // accepted the first-trust prompt (same contract as terminal_connect).
+    let allowTofu;
+    const known = await call('known_hosts_check', { host: srv.host, port: srv.port || 22 });
+    if (known && known.known === false) {
+      const okTrust = window.confirm(
+        '“' + srv.host + ':' + (srv.port || 22) + '” is not in Known Hosts yet.\n\n' +
+        'Trust this host on first connection (TOFU)?\n' +
+        'The fingerprint will be recorded in the audit log.'
+      );
+      if (!okTrust) {
+        terminalSetStatus('Connection test cancelled.');
+        toast('Test cancelled — host is not trusted yet.', 'err');
+        return;
+      }
+      allowTofu = true;
+    }
+    const result = await call('server_test', { serverId: srv.id, allowTofu });
     if (result && result.ok === false) throw new Error(result.error || 'Connection test failed.');
     const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
     terminalSetStatus(`Connection OK${ms}`);

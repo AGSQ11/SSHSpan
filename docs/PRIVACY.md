@@ -101,8 +101,10 @@ The user controls the following privacy-relevant behaviour:
   contacts a remote host only when the user explicitly connects (terminal/SFTP/Connect) or
   tests a server.
 - **Whether to export private keys at all.** Exports require an unlocked vault and are
-  logged to the audit log. Exported files can be encrypted with an independent passphrase
-  (OpenSSH, PKCS#8/PBES2, or PuTTY PPK formats).
+  logged to the audit log. Private keys are serialized by the backend straight into the
+  file you choose in the save dialog — they never pass through the app's UI process.
+  Exported files can be encrypted with an independent passphrase (OpenSSH, PKCS#8/PBES2,
+  or PuTTY PPK formats).
 - **Clipboard.** The app's key views copy public key material. Private key material is
   never placed on the clipboard by SSHSpan (a user-selected region in the terminal is, of
   course, whatever the user selected).

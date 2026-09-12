@@ -265,7 +265,7 @@ fn get_ssh_dir() -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn restrict_windows_file(path: &PathBuf) -> Result<()> {
+pub(crate) fn restrict_windows_file(path: &PathBuf) -> Result<()> {
     use std::process::Command;
 
     // Get current user SID
