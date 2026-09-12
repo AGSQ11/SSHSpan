@@ -146,13 +146,36 @@ pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_js
     Ok(serde_json::json!({ "ok": true, "cwd": cwd }))
 }
 
+/// A listed entry, remote or local (the local pane in dual-pane mode shares
+/// this shape so the renderer can reuse one table renderer for both).
+///
+/// `is_link`, `permissions`, `uid` and `gid` all come for free off the same
+/// listing response (SFTP's SSH_FXP_READDIR — like OpenSSH's local
+/// `readdir(3)` — reports `lstat`-derived attributes for every entry, so a
+/// symlink's own type bit and the owning ids are already in hand). None of
+/// them costs an extra round trip; do not be tempted to "confirm" `is_link`
+/// with a follow-up stat inside a listing loop — see [`sftp_resolve_link`]
+/// for why that stays a separate, lazy, on-demand call instead.
+///
+/// `permissions` is the raw POSIX mode (type bits included, same encoding as
+/// `st_mode`) — this file never formats `drwxr-xr-x` in Rust, the renderer
+/// does. `user`/`group` symbolic names are deliberately absent: russh-sftp's
+/// wire format for SFTPv3 attributes carries only numeric uid/gid (the
+/// `FileAttributes.user`/`.group` fields exist on the struct but the crate's
+/// READDIR/STAT deserializer always leaves them `None` — there is no wire
+/// representation for them to come from), so exposing those fields here
+/// would just be two more always-`null` keys in every entry.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SftpEntry {
     pub name: String,
     pub is_dir: bool,
+    pub is_link: bool,
     pub size: u64,
     pub modified_ms: Option<i64>,
+    pub permissions: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
 }
 
 #[tauri::command]
@@ -175,9 +198,16 @@ pub async fn sftp_list_dir(
         let md = entry.metadata();
         entries.push(SftpEntry {
             name,
+            // lstat-derived, per the struct doc: a symlink to a directory
+            // reports is_dir == false here, is_link == true. The renderer
+            // resolves what it actually points at lazily, on demand.
             is_dir: md.is_dir(),
+            is_link: md.is_symlink(),
             size: md.size.unwrap_or(0),
             modified_ms: md.mtime.map(|s| (s as i64) * 1000),
+            permissions: md.permissions,
+            uid: md.uid,
+            gid: md.gid,
         });
     }
     // Dirs first, then files, each alphabetical (case-insensitive).
@@ -187,6 +217,46 @@ pub async fn sftp_list_dir(
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(serde_json::json!({ "ok": true, "entries": entries, "path": path }))
+}
+
+/// Resolve what a symlink reported by [`sftp_list_dir`] actually points at.
+/// Deliberately a separate, on-demand call rather than folded into the
+/// listing: a directory with hundreds of symlinks would otherwise cost
+/// hundreds of extra round trips just to draw icons.
+///
+/// A dangling symlink is a normal, expected outcome of browsing a remote
+/// filesystem (not a bug in this app, not a transport failure) so it is
+/// reported as `{ok: true, broken: true}`, never as a command `Err` — the
+/// renderer should render a "broken link" state, not an error toast.
+#[tauri::command]
+pub async fn sftp_resolve_link(
+    app: AppHandle,
+    session_id: String,
+    path: String,
+) -> CmdResult<serde_json::Value> {
+    let sftp = sftp_from_session(&app, &session_id)?;
+    // Best-effort display target: REALPATH resolution, not a local path
+    // component — never fed to `Path::join` or similar, only shown to the
+    // user. Attempted even for a link that turns out broken (many servers
+    // can still resolve the textual target even when the final component
+    // doesn't exist), but its absence never blocks the isDir/broken answer.
+    let target = sftp.canonicalize(&path).await.ok();
+    // `metadata` (SSH_FXP_STAT) follows the link, unlike the `symlink_metadata`
+    // (SSH_FXP_LSTAT) used elsewhere in this file to classify the link itself.
+    match sftp.metadata(&path).await {
+        Ok(md) => Ok(serde_json::json!({
+            "ok": true,
+            "isDir": md.is_dir(),
+            "target": target,
+            "broken": false,
+        })),
+        Err(_) => Ok(serde_json::json!({
+            "ok": true,
+            "isDir": false,
+            "target": target,
+            "broken": true,
+        })),
+    }
 }
 
 #[tauri::command]
@@ -1488,6 +1558,22 @@ pub fn sftp_bookmarks_save(
 
 // ─── local pane listing (dual-pane mode) ───────────────────────────────────
 
+/// Raw mode bits + owning uid/gid for a local file, mirroring what
+/// [`sftp_list_dir`] gets for free from the remote server. Unix-only by
+/// nature (Windows ACLs don't map onto a POSIX mode/uid/gid triple); on
+/// other platforms the renderer just sees `null` for these three fields,
+/// same as it would for an SFTP server that omitted them.
+#[cfg(unix)]
+fn local_owner_bits(md: &std::fs::Metadata) -> (Option<u32>, Option<u32>, Option<u32>) {
+    use std::os::unix::fs::MetadataExt;
+    (Some(md.mode()), Some(md.uid()), Some(md.gid()))
+}
+
+#[cfg(not(unix))]
+fn local_owner_bits(_md: &std::fs::Metadata) -> (Option<u32>, Option<u32>, Option<u32>) {
+    (None, None, None)
+}
+
 /// List a local directory for the dual-pane local view. Uses the same entry
 /// shape as the remote listing so the renderer can share its table renderer.
 #[tauri::command]
@@ -1506,17 +1592,24 @@ pub fn sftp_local_list(path: String) -> CmdResult<serde_json::Value> {
         Err(e) => return Err(CmdError(format!("read_dir failed: {e}")).into()),
     };
     for e in rd.flatten() {
+        // `DirEntry::metadata` does not traverse a symlink on Unix (mirrors
+        // `lstat`), matching the remote listing's semantics above.
         let Ok(md) = e.metadata() else { continue };
         let modified_ms = md
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
+        let (permissions, uid, gid) = local_owner_bits(&md);
         entries.push(SftpEntry {
             name: e.file_name().to_string_lossy().to_string(),
             is_dir: md.is_dir(),
+            is_link: md.is_symlink(),
             size: if md.is_dir() { 0 } else { md.len() },
             modified_ms,
+            permissions,
+            uid,
+            gid,
         });
     }
     entries.sort_by(|a, b| {
@@ -1685,6 +1778,182 @@ pub async fn sftp_fs_info(
         Ok(None) => Ok(serde_json::json!({ "ok": true, "supported": false })),
         Err(e) => Err(CmdError(format!("statvfs failed: {e}"))),
     }
+}
+
+// ─── on-demand directory size ─────────────────────────────────────────────
+
+/// Hard cap on entries scanned by [`sftp_dir_size`], shared with the
+/// wall-clock cap below — whichever is hit first stops the walk. Sized the
+/// same order of magnitude as [`expand_server_copy`]'s scan cap: an
+/// interactive "get size" click should give an answer (even if `truncated`)
+/// rather than hang the UI on a pathological tree.
+const DIR_SIZE_MAX_ENTRIES: u64 = 50_000;
+/// Wall-clock cap for [`sftp_dir_size`]'s walk.
+const DIR_SIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Pure cap check for [`sftp_dir_size`]'s walk, pulled out of the async loop
+/// so the truncation condition can be unit-tested without a live session.
+fn dir_size_capped(scanned: u64, elapsed: std::time::Duration) -> bool {
+    elapsed >= DIR_SIZE_TIMEOUT || scanned >= DIR_SIZE_MAX_ENTRIES
+}
+
+/// Recursively total the size of a remote directory tree, on demand (the
+/// renderer calls this only when the user asks for a folder's size — it is
+/// never part of [`sftp_list_dir`], which would otherwise pay for a walk on
+/// every navigation).
+///
+/// Classification is read straight off each `read_dir` entry's own
+/// attributes rather than an extra per-entry stat round trip — SFTP's
+/// SSH_FXP_READDIR already reports `lstat`-derived attributes (see the
+/// [`SftpEntry`] doc comment), so this already satisfies "lstat only, never
+/// follow a symlinked directory" for free: a symlink is counted as a leaf by
+/// its own dirent size and never pushed onto the walk stack, so
+/// `ln -s .. up` cannot recurse the walk into an ancestor.
+///
+/// Walked iteratively with an explicit queue (never unbounded recursion), a
+/// path-visited set as an explicit cycle guard, and the entry/time caps
+/// above; an unreadable subdirectory is skipped (already counted as a dir
+/// from its parent's listing) rather than failing the whole call.
+#[tauri::command]
+pub async fn sftp_dir_size(
+    app: AppHandle,
+    session_id: String,
+    path: String,
+) -> CmdResult<serde_json::Value> {
+    let sftp = sftp_from_session(&app, &session_id)?;
+    let started = std::time::Instant::now();
+
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    queue.push_back(path);
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut bytes: u64 = 0;
+    let mut files: u64 = 0;
+    let mut dirs: u64 = 0;
+    let mut scanned: u64 = 0;
+    let mut truncated = false;
+
+    'walk: while let Some(dir) = queue.pop_front() {
+        if !visited.insert(dir.clone()) {
+            // Cycle guard: this exact path was already walked. Structurally
+            // shouldn't happen (symlinked dirs are never enqueued below), but
+            // stays as an explicit belt-and-braces check per entry point.
+            continue;
+        }
+        let mut entries = match sftp.read_dir(&dir).await {
+            Ok(e) => e,
+            // Unreadable subdirectory (permission denied, vanished mid-walk,
+            // …): skip it, don't fail the whole size for one bad branch.
+            Err(_) => continue,
+        };
+        while let Some(entry) = entries.next() {
+            if dir_size_capped(scanned, started.elapsed()) {
+                truncated = true;
+                break 'walk;
+            }
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            scanned += 1;
+            let md = entry.metadata();
+            if md.is_symlink() {
+                // A symlink is a leaf for sizing purposes — its own dirent
+                // size — and is never traversed even when it points at a
+                // directory.
+                files += 1;
+                bytes += md.size.unwrap_or(0);
+            } else if md.is_dir() {
+                dirs += 1;
+                queue.push_back(format!("{}/{}", dir.trim_end_matches('/'), name));
+            } else {
+                files += 1;
+                bytes += md.size.unwrap_or(0);
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "bytes": bytes,
+        "files": files,
+        "dirs": dirs,
+        "truncated": truncated,
+    }))
+}
+
+// ─── remote SHA-256 ────────────────────────────────────────────────────────
+
+/// Stream a remote file through SHA-256 without ever holding it whole in
+/// memory, so a job can verify a large transfer without ballooning RSS.
+/// Shared by the on-demand [`sftp_file_sha256`] command below and by the
+/// transfer queue's opt-in post-transfer verification (which hashes both the
+/// source and destination legs on their own channels).
+///
+/// Reads are clamped to the file's stated size in 256 KiB chunks — the same
+/// clamp [`download_to`] uses — so the final read never crosses EOF (some
+/// SFTP servers answer an over-read with SSH_FX_FAILURE instead of a short
+/// read, which would otherwise fail a hash on the very last chunk).
+/// `cancel`, when given, is polled between chunks so a cancelled queue job
+/// stops hashing promptly instead of running to completion first.
+pub(crate) async fn remote_sha256(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<String, CmdError> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let size = sftp
+        .metadata(path)
+        .await
+        .map_err(|e| describe_sftp_error("stat", e))?
+        .size
+        .unwrap_or(0);
+
+    let mut remote_file = sftp
+        .open(path)
+        .await
+        .map_err(|e| describe_sftp_error("open", e))?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut done: u64 = 0;
+    while done < size {
+        if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+            return Err(CmdError("hash cancelled".into()));
+        }
+        let want = ((size - done) as usize).min(buf.len());
+        let n = remote_file
+            .read(&mut buf[..want])
+            .await
+            .map_err(describe_download_read_error)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        done += n as u64;
+    }
+    // Same tolerant-close reasoning as `download_to`: the hash is already
+    // computed from the bytes actually read, so a CLOSE failure on an
+    // otherwise-complete read is a warning, not a failure.
+    if let Err(e) = remote_file.close().await {
+        log::warn!("[sshspan-sftp] close after hashing {path}: {e}");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// On-demand single-file SHA-256, for the renderer's "verify" action outside
+/// the transfer queue's own opt-in post-transfer verification.
+#[tauri::command]
+pub async fn sftp_file_sha256(
+    app: AppHandle,
+    session_id: String,
+    path: String,
+) -> CmdResult<serde_json::Value> {
+    let sftp = sftp_from_session(&app, &session_id)?;
+    let hex = remote_sha256(&sftp, &path, None).await?;
+    Ok(serde_json::json!({ "ok": true, "sha256": hex }))
 }
 
 // ─── keep-alive ────────────────────────────────────────────────────────────
@@ -1964,5 +2233,100 @@ mod tests {
             Some(deep.join("ok.txt"))
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ─── SftpEntry shape (renderer-facing JSON keys) ──────────────────────
+
+    #[test]
+    fn sftp_entry_serializes_with_expected_camel_case_keys() {
+        let entry = SftpEntry {
+            name: "file.txt".to_string(),
+            is_dir: false,
+            is_link: true,
+            size: 42,
+            modified_ms: Some(1_700_000_000_000),
+            permissions: Some(0o100644),
+            uid: Some(1000),
+            gid: Some(1000),
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in [
+            "name",
+            "isDir",
+            "isLink",
+            "size",
+            "modifiedMs",
+            "permissions",
+            "uid",
+            "gid",
+        ] {
+            assert!(obj.contains_key(key), "missing renderer-facing key {key}");
+        }
+        assert_eq!(obj.len(), 8, "unexpected extra/missing field: {obj:?}");
+        assert_eq!(v["isLink"], serde_json::json!(true));
+        assert_eq!(v["permissions"], serde_json::json!(0o100644));
+    }
+
+    // ─── directory-size cap/truncation (sftp_dir_size) ────────────────────
+
+    #[test]
+    fn dir_size_capped_by_entry_count() {
+        assert!(!dir_size_capped(
+            DIR_SIZE_MAX_ENTRIES - 1,
+            std::time::Duration::from_secs(0)
+        ));
+        assert!(dir_size_capped(
+            DIR_SIZE_MAX_ENTRIES,
+            std::time::Duration::from_secs(0)
+        ));
+        assert!(dir_size_capped(
+            DIR_SIZE_MAX_ENTRIES + 1,
+            std::time::Duration::from_secs(0)
+        ));
+    }
+
+    #[test]
+    fn dir_size_capped_by_wall_clock() {
+        assert!(!dir_size_capped(
+            0,
+            DIR_SIZE_TIMEOUT - std::time::Duration::from_secs(1)
+        ));
+        assert!(dir_size_capped(0, DIR_SIZE_TIMEOUT));
+        assert!(dir_size_capped(
+            0,
+            DIR_SIZE_TIMEOUT + std::time::Duration::from_secs(1)
+        ));
+    }
+
+    // ─── local owner bits (dual-pane local listing) ───────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn local_owner_bits_reads_real_unix_metadata() {
+        let dir = std::env::temp_dir().join("sshspan-test-owner-bits");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let md = std::fs::metadata(&file).unwrap();
+        let (permissions, uid, gid) = local_owner_bits(&md);
+        // A regular file's mode always carries the S_IFREG type bit
+        // (0o100000), on top of whatever permission bits the umask left.
+        assert_eq!(permissions.unwrap() & 0o170000, 0o100000);
+        assert!(uid.is_some());
+        assert!(gid.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn local_owner_bits_none_off_unix() {
+        let dir = std::env::temp_dir().join("sshspan-test-owner-bits-nonunix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let md = std::fs::metadata(&file).unwrap();
+        assert_eq!(local_owner_bits(&md), (None, None, None));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
