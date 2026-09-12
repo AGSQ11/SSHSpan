@@ -60,6 +60,8 @@ pub fn run() {
 
             // Vault password lives in memory only; cleared on lock / quit
             app.manage(VaultPasswordStore::new());
+            // Save-dialog-approved write targets (system_write_text_file gate)
+            app.manage(commands::DialogPathStore::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -163,6 +165,7 @@ pub fn run() {
             audit_list,
             // System commands
             system_open_external,
+            system_open_url,
             system_show_item_in_folder,
             system_select_file,
             system_pick_save_path,

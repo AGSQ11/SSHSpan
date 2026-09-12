@@ -73,11 +73,15 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn vault_password(app: &AppHandle) -> CmdResult<String> {
+/// In-memory vault password accessor. Returns the password wrapped in
+/// `Zeroizing` so every per-command copy is wiped on drop, matching the
+/// store's own hygiene (the store holds the canonical `Zeroizing` copy; each
+/// command previously cloned a plain `String` that lived until free).
+fn vault_password(app: &AppHandle) -> CmdResult<zeroize::Zeroizing<String>> {
     Ok(app
         .state::<VaultPasswordStore>()
         .get()
-        .map(|s| s.to_string())
+        .map(zeroize::Zeroizing::new)
         .unwrap_or_default())
 }
 
@@ -747,37 +751,72 @@ pub fn vault_backup_restore(
         .map_err(|_| "Backup payload is corrupted.".to_string())?;
 
     // If the backup came from a different (older) password, re-seal key
-    // material and saved server passwords with the current one.
+    // material and saved server passwords with the current one. A blob that
+    // cannot be decrypted with the backup password NOR the current one is
+    // deliberately EXCLUDED (keys) or BLANKED (server passwords) instead of
+    // being imported: importing it would strand it — unopenable once the old
+    // backup password is discarded. Every exclusion is counted and surfaced
+    // in the result and the audit log.
+    let mut reseal_failures: u32 = 0;
     if reused_backup_password {
         let bp = backup_password.as_deref().unwrap_or_default().to_string();
         if let Some(arr) = data.get_mut("keys").and_then(|v| v.as_array_mut()) {
-            for k in arr.iter_mut() {
-                if let Some(blob) = k
+            let mut keep: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
+            for k in arr.drain(..) {
+                let Some(blob) = k
                     .get("private_key_encrypted")
                     .and_then(|v| v.as_str())
                     .map(String::from)
-                {
-                    if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
-                        if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
+                else {
+                    keep.push(k);
+                    continue;
+                };
+                if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
+                    match crate::crypto::vault::seal(&pw, &plain) {
+                        Ok(resealed) => {
+                            let mut k = k;
                             k["private_key_encrypted"] = serde_json::json!(resealed);
+                            keep.push(k);
                         }
+                        // Sealing failed: the blob is readable under the old
+                        // password only, which is being discarded — excluded.
+                        Err(_) => reseal_failures += 1,
                     }
+                } else if crate::crypto::vault::unseal(&pw, &blob).is_ok() {
+                    // Already usable with the current password (mixed-era
+                    // backup): keep as-is.
+                    keep.push(k);
+                } else {
+                    // Readable under neither password: a stranded blob.
+                    reseal_failures += 1;
                 }
             }
+            *arr = keep;
         }
         if let Some(arr) = data.get_mut("servers").and_then(|v| v.as_array_mut()) {
             for sv in arr.iter_mut() {
-                if let Some(blob) = sv
+                let Some(blob) = sv
                     .get("saved_password")
                     .and_then(|v| v.as_str())
                     .map(String::from)
-                {
-                    if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
-                        if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
-                            sv["saved_password"] = serde_json::json!(resealed);
-                        }
+                else {
+                    continue;
+                };
+                if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
+                    if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
+                        sv["saved_password"] = serde_json::json!(resealed);
+                        continue;
                     }
                 }
+                if crate::crypto::vault::unseal(&pw, &blob).is_ok() {
+                    // Already usable with the current password: keep as-is.
+                    continue;
+                }
+                // Unreadable under either password: drop the saved password
+                // (the server record itself is kept) rather than importing a
+                // stranded blob.
+                sv["saved_password"] = serde_json::Value::Null;
+                reseal_failures += 1;
             }
         }
     }
@@ -811,14 +850,28 @@ pub fn vault_backup_restore(
             ),
         );
     }
-    Ok(
-        serde_json::json!({ "ok": true, "counts": counts, "passwordReLinked": reused_backup_password }),
-    )
+    if reseal_failures > 0 {
+        let _ = app.state::<AppState>().db.add_audit(
+            "vault.restore_reseal_skipped",
+            None,
+            &format!(
+                "{reseal_failures} entrie(s) unreadable under the backup password were skipped (keys excluded, saved passwords blanked)"
+            ),
+        );
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "counts": counts,
+        "passwordReLinked": reused_backup_password,
+        "resealFailures": reseal_failures,
+    }))
 }
 
 // ─── File save helpers (backup export / generic) ───────────────────────────
 
-/// Native save-file dialog; returns the chosen path (or canceled).
+/// Native save-file dialog; returns the chosen path (or canceled). The chosen
+/// path is registered in the `DialogPathStore` so that `system_write_text_file`
+/// only ever writes where the user explicitly picked in a native dialog.
 #[tauri::command]
 pub fn system_pick_save_path(
     app: AppHandle,
@@ -833,15 +886,50 @@ pub fn system_pick_save_path(
         .set_file_name(default_name.as_deref().unwrap_or("file.txt"))
         .blocking_save_file();
     match result {
-        Some(path) => Ok(serde_json::json!({ "canceled": false, "path": path.to_string() })),
+        Some(path) => {
+            let path_str = path.to_string();
+            app.state::<DialogPathStore>().allow(&path_str);
+            Ok(serde_json::json!({ "canceled": false, "path": path_str }))
+        }
         None => Ok(serde_json::json!({ "canceled": true })),
     }
 }
 
-/// Write UTF-8 text to an absolute path (used for vault backup export).
+/// Paths the user explicitly picked in a native save dialog during this
+/// session. `system_write_text_file` requires membership, so a compromised
+/// renderer cannot use the write command against arbitrary user-writable
+/// locations (Startup folders, shell rc files, …) — only paths a human
+/// approved in the OS dialog.
+pub struct DialogPathStore(std::sync::Mutex<std::collections::HashSet<String>>);
+
+impl DialogPathStore {
+    pub fn new() -> Self {
+        Self(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+    fn allow(&self, path: &str) {
+        self.0.lock().unwrap().insert(path.to_string());
+    }
+    fn is_allowed(&self, path: &str) -> bool {
+        self.0.lock().unwrap().contains(path)
+    }
+}
+
+/// Write UTF-8 text to an absolute path (used for vault backup export). The
+/// path must have been returned by `system_pick_save_path` in this session
+/// AND must pass the absolute/app-data/system checks — both gates, so the
+/// write target is always a human-approved dialog choice.
 #[tauri::command]
-pub fn system_write_text_file(path: String, contents: String) -> CmdResult<serde_json::Value> {
+pub fn system_write_text_file(
+    app: AppHandle,
+    path: String,
+    contents: String,
+) -> CmdResult<serde_json::Value> {
     validate_export_path(&path)?;
+    if !app.state::<DialogPathStore>().is_allowed(&path) {
+        return Err(
+            "Write target must be a path chosen in a save dialog this session.".into(),
+        );
+    }
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -877,7 +965,7 @@ fn validate_export_path(path: &str) -> CmdResult<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn is_system_path(p: &std::path::Path) -> bool {
+pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
     if let Some(s) = p.as_os_str().to_str() {
         let lower = s.to_lowercase();
         if lower.starts_with("C:\\windows") || lower.starts_with("C:\\program files") {
@@ -898,7 +986,7 @@ fn is_system_path(p: &std::path::Path) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn is_system_path(p: &std::path::Path) -> bool {
+pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
     if let Ok(canonical) = p.canonicalize() {
         let system_dirs = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/etc", "/lib", "/lib64", "/usr/lib", "/usr/lib64"];
         for dir in &system_dirs {
@@ -1871,12 +1959,14 @@ pub fn settings_set(app: AppHandle, key: String, value: String) -> CmdResult<ser
 //  SYSTEM commands
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Contract: `system_open_external` accepts only an existing, absolute local
-/// filesystem path. URIs (`https:`, `file:`, `ms-settings:`, …) are rejected —
-/// the renderer's only call site passes the staged temp-file path returned by
-/// `sftp_open_for_edit`, and unrestricted `opener::open` would otherwise hand
-/// arbitrary schemes to the OS shell. A single-letter drive prefix (`C:\…` or
-/// `C:/…` on Windows) is a path, not a URI scheme.
+/// Contract: `system_open_external` accepts ONLY a staged temp file under the
+/// app's own `sshspan-edit` staging directory — the exact contract the
+/// renderer's single call site uses (the local path returned by
+/// `sftp_open_for_edit` / Send-to staging). URIs (`https:`, `file:`,
+/// `ms-settings:`, …) are rejected, and so is every path outside the staging
+/// dir: unrestricted `opener::open` would otherwise hand arbitrary schemes —
+/// or ShellExecute any on-disk executable — to the OS shell. A single-letter
+/// drive prefix (`C:\…` or `C:/…` on Windows) is a path, not a URI scheme.
 #[tauri::command]
 pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
     let p = std::path::Path::new(&url);
@@ -1895,10 +1985,26 @@ pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
             return Err("system_open_external does not accept URLs, only local file paths.".into());
         }
     }
-    if !p.is_file() {
-        return Err("system_open_external: path does not exist.".into());
+    // Staging-dir containment: canonicalize both sides so `..` segments and
+    // temp-dir aliases (8.3 names, subst drives) cannot smuggle a path past
+    // the prefix check. The staged file always exists before the renderer is
+    // handed its path, so a failed canonicalize here is a refusal.
+    let staging = crate::sftp::edit_temp_dir();
+    let staging_canon = staging
+        .canonicalize()
+        .map_err(|e| CmdError(format!("Staging directory unavailable: {e}")))?;
+    let resolved = p
+        .canonicalize()
+        .map_err(|_| CmdError("system_open_external: path does not exist.".into()))?;
+    if !resolved.starts_with(&staging_canon) {
+        return Err(
+            "system_open_external only opens files staged by SSHSpan.".into(),
+        );
     }
-    opener::open(p).map_err(|e| e.to_string())?;
+    if !resolved.is_file() {
+        return Err("system_open_external: path is not a regular file.".into());
+    }
+    opener::open(&resolved).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -1907,6 +2013,20 @@ pub fn system_show_item_in_folder(path: String) -> CmdResult<serde_json::Value> 
     let p = std::path::Path::new(&path);
     let dir = p.parent().unwrap_or(p);
     opener::open(dir).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Open an http(s) URL from the terminal in the system browser. The xterm
+/// web-links addon only linkifies http(s) URLs; this backend check enforces
+/// the same scheme allowlist so no other scheme can ever reach the OS shell
+/// from a terminal click, even if a future renderer change linkifies more.
+#[tauri::command]
+pub fn system_open_url(url: String) -> CmdResult<serde_json::Value> {
+    let parsed = url::Url::parse(url.trim()).map_err(|_| CmdError("Not a valid URL.".into()))?;
+    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        return Err(CmdError("Only http(s) URLs can be opened.".into()));
+    }
+    opener::open(parsed.as_str()).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
 

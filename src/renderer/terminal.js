@@ -213,7 +213,16 @@ function createTabTerminal(tabId) {
     try { term.loadAddon(fitAddon); } catch (e) { fitAddon = null; }
   }
   if (WebLinksCtor) {
-    try { term.loadAddon(new WebLinksCtor()); } catch (e) {}
+    try {
+      // Route clicks through the backend allowlist (system_open_url accepts
+      // http/https only) instead of the addon's default window.open, so a
+      // terminal link can never hand a non-web scheme to the OS shell. The
+      // addon regex itself only linkifies http(s), this is defense in depth.
+      term.loadAddon(new WebLinksCtor((_event, uri) => {
+        tcore.invoke('system_open_url', { url: uri })
+          .catch((e) => console.warn('[sshspan-terminal] link open refused:', e));
+      }));
+    } catch (e) {}
   }
 
   term.__sshspanTabId = tabId;

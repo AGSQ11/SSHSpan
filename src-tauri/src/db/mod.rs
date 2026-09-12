@@ -1573,8 +1573,12 @@ fn short_hash(s: &str) -> u32 {
 }
 
 fn get_db_path(_app: &AppHandle) -> Result<PathBuf> {
-    // Test override: SSHSPAN_DB=<path> isolates a dev instance from the
-    // real vault (used by the local e2e rig).
+    // Dev/test override: SSHSPAN_DB=<path> isolates a dev instance from the
+    // real vault (used by the local e2e rig). Compiled only into debug
+    // builds: in a release build, any process that can set this variable at
+    // launch could otherwise silently redirect the whole vault to a database
+    // it controls (a master-password phishing setup).
+    #[cfg(debug_assertions)]
     if let Ok(p) = std::env::var("SSHSPAN_DB") {
         if !p.trim().is_empty() {
             return Ok(PathBuf::from(p));

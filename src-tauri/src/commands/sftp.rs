@@ -24,8 +24,10 @@ use super::{CmdError, CmdResult};
 use directories::ProjectDirs;
 
 /// Reject non-absolute `local` paths and paths whose canonicalized parent
-/// would fall inside the app data directory. Mirrors the denylist used by
-/// `system_write_text_file`.
+/// would fall inside the app data directory or a system directory. The app
+/// data rule mirrors `system_write_text_file`; the system-dir rule reuses the
+/// same denylist, so a (hypothetically compromised) renderer cannot aim SFTP
+/// downloads at `C:\Windows`, `/etc`, or friends either.
 fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
     let p = std::path::Path::new(path);
     if !p.is_absolute() {
@@ -44,6 +46,10 @@ fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
         if normalized.starts_with(app_data_dir) {
             return Err("Writing into the application data directory is not allowed.".into());
         }
+    }
+
+    if super::is_system_path(&normalized) {
+        return Err("Writing into a system directory is not allowed.".into());
     }
 
     Ok(())
@@ -652,6 +658,12 @@ fn resolve_resume_mode(app: &AppHandle, resume: Option<&str>) -> ResumeMode {
 }
 
 /// Expand a local directory into upload jobs (recursive); a file becomes one.
+///
+/// Symlink-aware and cycle-breaking: recursion only ever enters REAL
+/// directories. A symlinked directory is never followed (following one can
+/// loop — `ln -s .. up` — and recurse until the stack overflows); a symlinked
+/// FILE is uploaded by following the link exactly one level (File::open
+/// resolves it; there is no recursion, hence no cycle).
 fn expand_upload(
     local: PathBuf,
     remote: String,
@@ -661,10 +673,35 @@ fn expand_upload(
     preserve_ts: bool,
     out: &mut Vec<QueuedItem>,
 ) {
-    let md = match std::fs::metadata(&local) {
+    // symlink_metadata (lstat): classifies the entry itself, never follows.
+    let md = match std::fs::symlink_metadata(&local) {
         Ok(m) => m,
         Err(_) => return,
     };
+    if md.is_symlink() {
+        match std::fs::metadata(&local) {
+            Ok(target) if target.is_file() => {
+                out.push(QueuedItem {
+                    kind: JobKind::Upload,
+                    session_id: session_id.clone(),
+                    server_name: server_name.clone(),
+                    local_path: local.display().to_string(),
+                    remote_path: remote,
+                    size: target.len(),
+                    target: None,
+                    resume: Some(resume),
+                    preserve_ts: Some(preserve_ts),
+                });
+            }
+            _ => {
+                log::warn!(
+                    "[sshspan-sftp] upload: skipping symlinked directory {} (symlink cycles are not followed)",
+                    local.display()
+                );
+            }
+        }
+        return;
+    }
     if md.is_file() {
         out.push(QueuedItem {
             kind: JobKind::Upload,

@@ -37,3 +37,9 @@ src-tauri/target/
 
 # Local security-audit scratch (Semgrep rules + findings — never commit)
 .semgrep*
+
+# Rust build output (repo root — src-tauri/target/ is covered separately)
+/target/
+
+# Codegraph index (never commit; contains a local SQLite index)
+.codegraph/

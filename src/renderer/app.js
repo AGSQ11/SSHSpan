@@ -1989,7 +1989,10 @@ function finishRestore(r) {
   loadKeys();
   loadServers();
   const conflicts = c.knownHostsConflicts || 0;
-  if (conflicts > 0) {
+  const skipped = r.resealFailures || 0;
+  if (skipped > 0) {
+    toast(`Backup restored, but ${skipped} entrie(s) could not be decrypted with the backup password and were SKIPPED (keys not imported, saved passwords cleared). Re-sync or re-add them manually.`, 'err');
+  } else if (conflicts > 0) {
     toast(`Backup restored, but ${conflicts} host-key pin(s) were NOT overwritten (conflicting keys kept). Check Known Hosts.`, 'err');
   } else {
     toast('Backup restored.', 'ok');

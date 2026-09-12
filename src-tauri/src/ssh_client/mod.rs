@@ -326,6 +326,18 @@ pub async fn authenticate(
                         ));
                     }
                     client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                        // The saved password is answered for ONE round of
+                        // prompts only. A hostile server can otherwise issue
+                        // unlimited extra InfoRequests ("Enter OTP:", "Enter
+                        // pet name:", …) and harvest the saved password from
+                        // every reply. A legitimate server re-prompts only
+                        // after a Failure — which is rejected above.
+                        if attempts > 1 {
+                            return Err(anyhow::anyhow!(
+                                "The server requested additional interactive authentication \
+                                 beyond the saved password; not supported."
+                            ));
+                        }
                         let password = params.password.as_deref().map(|s| s.as_str()).unwrap_or("");
                         let mut responses: Vec<Zeroizing<String>> = Vec::new();
                         for _prompt in &prompts {
