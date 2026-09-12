@@ -64,7 +64,7 @@
         <div class="toolbar">
           <div class="search-wrap">
             <span class="search-ico" data-ico="search"></span>
-            <input type="search" id="searchInput" placeholder="Search keys by name, comment, fingerprint…" />
+            <input type="search" id="searchInput" placeholder="Search keys by name, comment, fingerprint..." />
           </div>
           <select id="typeFilter">
             <option value="">All types</option>
@@ -92,15 +92,15 @@
           <section class="detail-pane" id="detailPane" hidden>
             <div class="detail-head">
               <span class="key-avatar" id="detailAvatar"></span>
-              <h2 id="detailName">—</h2>
-              <span class="badge" id="detailType">—</span>
+              <h2 id="detailName">-</h2>
+              <span class="badge" id="detailType">-</span>
             </div>
             <dl class="detail-meta" id="detailMeta"></dl>
             <label class="detail-label">Categories</label>
             <div class="cat-chips" id="detailCategories"></div>
-            <button id="detailBrowseCategoriesBtn" class="ghost-btn cat-browse-btn" disabled><span data-ico="folder-plus"></span>Browse categories…</button>
+            <button id="detailBrowseCategoriesBtn" class="ghost-btn cat-browse-btn" disabled><span data-ico="folder-plus"></span>Browse categories...</button>
             <label class="detail-label">Fingerprint</label>
-            <code class="mono block" id="detailFingerprint">—</code>
+            <code class="mono block" id="detailFingerprint">-</code>
             <label class="detail-label">Public key (authorized_keys)</label>
             <textarea class="mono" id="detailAuthorized" rows="4" readonly spellcheck="false"></textarea>
             <div class="detail-actions">
@@ -132,7 +132,7 @@
             <div class="server-list-head">
               <div class="search-wrap">
                 <span class="search-ico" data-ico="search"></span>
-                <input type="search" id="serverSearch" placeholder="Search servers…" />
+                <input type="search" id="serverSearch" placeholder="Search servers..." />
               </div>
               <button id="serverImportBtn" class="ghost-btn" title="Import a Host block from ~/.ssh/config"><span data-ico="file-text"></span>Config</button>
               <button id="serverNewBtn" class="primary-btn" title="New server"><span data-ico="plus"></span>New</button>
@@ -141,7 +141,7 @@
             <div class="empty-state small" id="serverEmpty" hidden>
               <div class="empty-ico" data-ico="monitor-smartphone"></div>
               <p>No saved servers yet.</p>
-              <p class="hint">Create one with <strong>New</strong>, or right-click a key and choose <em>Use this key to connect…</em>.</p>
+              <p class="hint">Create one with <strong>New</strong>, or right-click a key and choose <em>Use this key to connect...</em>.</p>
             </div>
           </aside>
           <section class="terminal-col">
@@ -158,7 +158,7 @@
               </div>
             </div>
             <div class="term-tabs" id="termTabs">
-              <div class="term-tab-add" id="termTabAdd" title="New connection — pick a server from the list"><span data-ico="plus"></span></div>
+              <div class="term-tab-add" id="termTabAdd" title="New connection - pick a server from the list"><span data-ico="plus"></span></div>
             </div>
             <div class="terminal-body" id="terminalBody"></div>
             <div class="sftp-body" id="sftpBody"></div>
@@ -223,21 +223,21 @@
                 <tbody id="knownHostsBody"></tbody>
               </table>
             </div>
-            <p class="hint" id="knownHostsEmpty" hidden>No hosts pinned yet — they appear after the first Connect session.</p>
+            <p class="hint" id="knownHostsEmpty" hidden>No hosts pinned yet - they appear after the first Connect session.</p>
           </div>
 
           <div class="card">
             <div class="card-head">
               <div>
                 <h2>Backup &amp; Restore</h2>
-                <p class="card-sub">Exports your entire vault — keys (still encrypted), categories, saved servers, known hosts, and settings — as a single sealed file. Restoring requires the master password that was current when the backup was taken.</p>
+                <p class="card-sub">Exports your entire vault - keys (still encrypted), categories, saved servers, known hosts, and settings - as a single sealed file. Restoring requires the master password that was current when the backup was taken.</p>
               </div>
             </div>
             <div class="bw-actions">
-              <button id="backupExportBtn" class="primary-btn"><span data-ico="download"></span>Create backup…</button>
-              <button id="backupImportBtn" class="ghost-btn"><span data-ico="file-up"></span>Restore from backup…</button>
+              <button id="backupExportBtn" class="primary-btn"><span data-ico="download"></span>Create backup...</button>
+              <button id="backupImportBtn" class="ghost-btn"><span data-ico="file-up"></span>Restore from backup...</button>
             </div>
-            <div class="status-strip" id="backupStatus">Backups are sealed with your master password — treat the file as a secret.</div>
+            <div class="status-strip" id="backupStatus">Backups are sealed with your master password - treat the file as a secret.</div>
           </div>
 
           <div class="card">
@@ -328,13 +328,13 @@
           <div class="cat-field">
             <span class="cat-field-label">Categories</span>
             <div class="cat-chips" id="genCategories"></div>
-            <button type="button" id="genBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories…</button>
+            <button type="button" id="genBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories...</button>
           </div>
         </div>
         <div class="tab-panel" id="tab-import" hidden>
           <label>Name <input type="text" id="importName" placeholder="work-server" /></label>
           <div class="import-source">
-            <button type="button" id="importBrowseBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse for key file…</button>
+            <button type="button" id="importBrowseBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse for key file...</button>
             <span class="hint" id="importFileHint">or paste the key material below</span>
           </div>
           <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, PuTTY .ppk v3, SPKI public PEM, or authorized_keys line)
@@ -344,7 +344,7 @@
           <div class="cat-field">
             <span class="cat-field-label">Categories</span>
             <div class="cat-chips" id="importCategories"></div>
-            <button type="button" id="importBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories…</button>
+            <button type="button" id="importBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories...</button>
           </div>
         </div>
       </div>
@@ -413,7 +413,7 @@
       <div class="modal-body picker-body">
         <div class="search-wrap picker-search">
           <span class="search-ico" data-ico="search"></span>
-          <input type="search" id="pickerSearch" role="combobox" aria-expanded="true" aria-controls="pickerTree" aria-autocomplete="list" placeholder="Filter categories…" />
+          <input type="search" id="pickerSearch" role="combobox" aria-expanded="true" aria-controls="pickerTree" aria-autocomplete="list" placeholder="Filter categories..." />
         </div>
         <div class="picker-selection" id="pickerSelection" aria-live="polite"></div>
         <div class="picker-tree" id="pickerTree" role="listbox" aria-multiselectable="true" tabindex="-1"></div>
@@ -451,11 +451,11 @@
           <div class="span-2 key-row" id="srvKeyRow">
             <label>Vault key
               <select id="srvKeyId">
-                <option value="">— select a key —</option>
+                <option value="">- select a key -</option>
               </select>
             </label>
             <div class="pem-row">
-              <input type="text" id="srvPemPath" placeholder="…or pick a .pem file on disk" />
+              <input type="text" id="srvPemPath" placeholder="...or pick a .pem file on disk" />
               <button type="button" id="srvBrowsePemBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse</button>
             </div>
           </div>
@@ -468,7 +468,7 @@
           <div class="span-2 cat-field">
             <span class="cat-field-label">Category</span>
             <div class="cat-chips" id="srvCategory"></div>
-            <button type="button" id="srvBrowseCategoryBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories…</button>
+            <button type="button" id="srvBrowseCategoryBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories...</button>
           </div>
         </div>
         <p class="hint">Keys are unsealed only inside the Rust process; the renderer never sees private key bytes.</p>
@@ -496,6 +496,29 @@
       <footer class="modal-footer">
         <button id="promptCancelBtn" class="ghost-btn">Cancel</button>
         <button id="promptOkBtn" class="primary-btn">OK</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal: SFTP delete confirmation -->
+  <div class="modal-backdrop" id="deleteModal" hidden>
+    <div class="modal modal-sm">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="trash-2"></span>
+          <h2 id="deleteTitle">Delete</h2>
+        </div>
+      </header>
+      <div class="modal-body">
+        <p id="deleteMessage" class="hint"></p>
+        <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;">
+          <input type="checkbox" id="deleteSkipSession" />
+          <span>Don't prompt me for this session anymore.</span>
+        </label>
+      </div>
+      <footer class="modal-footer">
+        <button id="deleteCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="deleteYesBtn" class="danger-btn">Yes, delete</button>
       </footer>
     </div>
   </div>
@@ -578,7 +601,7 @@
   <script src="app.js"></script>
   <!-- vendor/xterm.js, addon-fit.js, addon-web-links.js and terminal.js are
        loaded BY app.js (dynamic <script> injection with explicit onerror
-       reporting) — a static <script src> that 404s fails silently and was
+       reporting) - a static <script src> that 404s fails silently and was
        indistinguishable from "works but broken". -->
 </body>
 </html>
