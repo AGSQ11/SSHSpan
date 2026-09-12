@@ -280,7 +280,10 @@ mod tests {
 
     fn host_with(host: &str, hostname: &str, identity: &str) -> SshConfig {
         let mut extra = std::collections::HashMap::new();
-        extra.insert("ProxyCommand".to_string(), "ssh -W %h:%p jumphost".to_string());
+        extra.insert(
+            "ProxyCommand".to_string(),
+            "ssh -W %h:%p jumphost".to_string(),
+        );
         SshConfig {
             hosts: vec![SshHostConfig {
                 host: host.to_string(),
@@ -320,7 +323,10 @@ mod tests {
             );
         }
         // No injected directive can survive: the payload's newlines are gone.
-        assert!(!out.contains("\nHost *\n"), "injected Host stanza must not survive");
+        assert!(
+            !out.contains("\nHost *\n"),
+            "injected Host stanza must not survive"
+        );
         assert!(
             !out.contains("\nProxyCommand evil"),
             "injected ProxyCommand must not survive"
@@ -332,7 +338,11 @@ mod tests {
 
     #[test]
     fn to_config_string_clean_values_pass_through_unchanged() {
-        let config = host_with("deploy-key-1", "github.com", "/home/u/.ssh/sshspan_deploy-key-1");
+        let config = host_with(
+            "deploy-key-1",
+            "github.com",
+            "/home/u/.ssh/sshspan_deploy-key-1",
+        );
         let out = config.to_config_string();
         assert!(out.contains("Host deploy-key-1\n"));
         assert!(out.contains("    HostName github.com\n"));

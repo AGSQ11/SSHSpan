@@ -29,6 +29,7 @@ jobs:
             artifacts: |
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.platform }}
     steps:
@@ -49,7 +50,14 @@ jobs:
         run: npm ci
 
       - name: Set up Rust
+        # The version INPUT pins the Rust toolchain (and therefore rustfmt)
+        # deterministically on every runner; the SHA pin holds the action
+        # code. A rust-toolchain.toml was tried first and had to go: a bare
+        # channel there resolves against rustup's install-time host triple,
+        # which breaks msvc-target builds on gnu-host machines.
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.98.0
 
       - name: Rust cache
         uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
@@ -106,7 +114,7 @@ jobs:
         if: runner.os == 'Windows'
 
       - name: Build installers (Tauri)
-        run: npm run dist:linux -- --bundles deb,rpm
+        run: npm run dist:linux -- --bundles deb,rpm,appimage
         if: runner.os == 'Linux'
 
       - name: Extract release notes from CHANGELOG
@@ -176,7 +184,11 @@ jobs:
               echo "::error::Unsupported runner OS for the pinned minisign download."; exit 1 ;;
           esac
           curl -fsSL -o "$RUNNER_TEMP/minisign-dl" "$url"
-          actual="$(sha256sum "$RUNNER_TEMP/minisign-dl" | cut -d' ' -f1)"
+          # Hash a bare filename from inside RUNNER_TEMP: on Windows the
+          # absolute path contains backslashes, and GNU coreutils escapes an
+          # output line with a leading '\' when the filename does — which
+          # broke the string comparison below ("got \37b6003…" ≠ expected).
+          actual="$(cd "$RUNNER_TEMP" && sha256sum minisign-dl | cut -d' ' -f1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error::minisign download checksum mismatch (expected $expected, got $actual); refusing to sign with it."
             exit 1
@@ -205,7 +217,7 @@ jobs:
               -t "SSHSpan release ${GITHUB_REF_NAME}"
             signed=$((signed + 1))
           done < <(find src-tauri/target -type f \
-            \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' \) \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
             -path '*/release/bundle/*' -print0)
           if [ "$signed" -eq 0 ]; then
             echo "::error::No installer artifacts found to sign."; exit 1
@@ -234,3 +246,4 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi.minisig
             src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb.minisig
             src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm.minisig
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.minisig

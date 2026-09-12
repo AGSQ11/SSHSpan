@@ -39,7 +39,9 @@ fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
         None => return Err("Local path has no parent directory.".into()),
     };
 
-    let normalized = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let normalized = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
 
     if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
         let app_data_dir = app_data.data_dir();
@@ -305,7 +307,9 @@ pub async fn sftp_set_mtime(
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
     if mtime_ms < 0 {
-        return Err(CmdError("mtime must be a Unix timestamp in milliseconds.".into()));
+        return Err(CmdError(
+            "mtime must be a Unix timestamp in milliseconds.".into(),
+        ));
     }
     let secs = (mtime_ms / 1000) as u32;
     let mut attrs = russh_sftp::protocol::FileAttributes::default();
@@ -726,7 +730,15 @@ fn expand_upload(
             remote.trim_end_matches('/'),
             e.file_name().to_string_lossy()
         );
-        expand_upload(child, rname, session_id.clone(), server_name.clone(), resume, preserve_ts, out);
+        expand_upload(
+            child,
+            rname,
+            session_id.clone(),
+            server_name.clone(),
+            resume,
+            preserve_ts,
+            out,
+        );
     }
 }
 
@@ -956,8 +968,8 @@ pub async fn sftp_queue_add(
     direction: String,             // "upload" | "download"
     items: Vec<serde_json::Value>, // [{local, remote}] — remote for downloads may be a dir
     dest_dir: Option<String>,      // local dir for downloads
-    resume: Option<String>,        // "overwrite" | "resume" | "ask" (default: setting.sftpResumeDefault)
-    preserve_ts: Option<bool>,     // preserve source mtime on upload legs
+    resume: Option<String>, // "overwrite" | "resume" | "ask" (default: setting.sftpResumeDefault)
+    preserve_ts: Option<bool>, // preserve source mtime on upload legs
 ) -> CmdResult<serde_json::Value> {
     let kind = if direction == "upload" {
         JobKind::Upload
@@ -1168,7 +1180,9 @@ pub async fn sftp_server_copy(
         }
         let n = scanned.load(std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
-            return Err(CmdError("Nothing to send (empty or unreadable folder).".into()));
+            return Err(CmdError(
+                "Nothing to send (empty or unreadable folder).".into(),
+            ));
         }
         return Ok(serde_json::json!({ "ok": true, "target": base_target, "count": n }));
     }
@@ -1227,7 +1241,7 @@ fn expand_server_copy<'a>(
     Box::pin(async move {
         const MAX_EXPANDED: usize = 10_000;
         const FLUSH_EVERY: usize = 64; // enqueue this many files at a time
-        // Cycle guard: don't re-enter a directory we've already walked.
+                                       // Cycle guard: don't re-enter a directory we've already walked.
         {
             let mut seen = visited.lock().unwrap();
             if !seen.insert(remote_dir.clone()) {

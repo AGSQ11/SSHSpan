@@ -121,9 +121,7 @@ fn part_alignment(part_len: u64, total: u64) -> Result<u64, String> {
         return Ok(0);
     }
     if total == u64::MAX {
-        return Err(
-            "source size unknown; cannot verify .part alignment — starting over".into(),
-        );
+        return Err("source size unknown; cannot verify .part alignment — starting over".into());
     }
     if part_len >= total {
         return Err(format!(
@@ -465,8 +463,20 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     for (id, session_id, kind, local, remote, size, target, resume, preserve_ts) in to_start {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            run_job(app, gen, id, session_id, kind, local, remote, size, target, resume, preserve_ts)
-                .await;
+            run_job(
+                app,
+                gen,
+                id,
+                session_id,
+                kind,
+                local,
+                remote,
+                size,
+                target,
+                resume,
+                preserve_ts,
+            )
+            .await;
         });
     }
 }
@@ -710,9 +720,10 @@ async fn read_via_session<RT: tauri::Runtime>(
     size: u64,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let mut rf = sftp.open(source_remote).await.map_err(|e| {
-        crate::commands::sftp::sftp_error_detail(e)
-    })?;
+    let mut rf = sftp
+        .open(source_remote)
+        .await
+        .map_err(|e| crate::commands::sftp::sftp_error_detail(e))?;
     // Truncate the staging file (the failed fresh-channel attempt may have
     // left a partial write) before re-reading into it.
     let mut lf = tokio::fs::File::create(stage)
@@ -758,10 +769,12 @@ async fn run_server_copy<RT: tauri::Runtime>(
 
     // Stat first (same order as download_to): the size clamp below relies on
     // it, and a readable error here beats a failed first read.
-    let sftp = open_transfer_channel(app, source_session).await.map_err(|e| {
-        log::error!("[sshspan-sftp] sendto leg1 channel open: {e}");
-        format!("source channel: {e}")
-    })?;
+    let sftp = open_transfer_channel(app, source_session)
+        .await
+        .map_err(|e| {
+            log::error!("[sshspan-sftp] sendto leg1 channel open: {e}");
+            format!("source channel: {e}")
+        })?;
     let size = sftp
         .metadata(source_remote)
         .await
@@ -816,19 +829,25 @@ async fn run_server_copy<RT: tauri::Runtime>(
         drop(lf);
         // 2. Close the failed fresh remote read handle.
         if let Err(e) = rf.close().await {
-            log::warn!(
-                "[sshspan-sftp] close of failed fresh handle for {source_remote}: {e}"
-            );
+            log::warn!("[sshspan-sftp] close of failed fresh handle for {source_remote}: {e}");
         }
         // 3. Drop the fresh channel's SFTP session entirely.
         drop(sftp);
 
-        let interactive = app
-            .state::<crate::sftp::SftpRegistry>()
-            .get(source_session);
+        let interactive = app.state::<crate::sftp::SftpRegistry>().get(source_session);
         match interactive {
             Some(isftp) => {
-                match read_via_session(app, job_id, &isftp, source_remote, &stage, size, cancel.clone()).await {
+                match read_via_session(
+                    app,
+                    job_id,
+                    &isftp,
+                    source_remote,
+                    &stage,
+                    size,
+                    cancel.clone(),
+                )
+                .await
+                {
                     Ok(()) => {
                         log::warn!(
                             "[sshspan-sftp] sendto leg1 succeeded via INTERACTIVE browse session \
@@ -858,9 +877,7 @@ async fn run_server_copy<RT: tauri::Runtime>(
         // Tolerant close, same as download_to: a FAILURE reply to CLOSE after a
         // fully-copied read handle means the data already landed.
         if let Err(e) = rf.close().await {
-            log::warn!(
-                "[sshspan-sftp] close after copy of {source_remote}: {e}"
-            );
+            log::warn!("[sshspan-sftp] close after copy of {source_remote}: {e}");
         }
         drop(sftp);
     }
@@ -908,20 +925,21 @@ async fn run_server_copy<RT: tauri::Runtime>(
     // not create missing parents on open — without this the copy of a nested
     // file fails at open with "No such file".
     ensure_remote_dir(&target_sftp, &target.remote_path).await;
-    let mut rf = target_sftp.open_with_flags(
-        &tpart,
-        if offset > 0 {
-            OpenFlags::WRITE | OpenFlags::APPEND
-        } else {
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
-        },
-    )
-    .await
-    .map_err(|e| {
-        let d = crate::commands::sftp::sftp_error_detail(e);
-        log::error!("[sshspan-sftp] sendto leg2 open {}: {d}", tpart);
-        format!("target open: {d}")
-    })?;
+    let mut rf = target_sftp
+        .open_with_flags(
+            &tpart,
+            if offset > 0 {
+                OpenFlags::WRITE | OpenFlags::APPEND
+            } else {
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
+            },
+        )
+        .await
+        .map_err(|e| {
+            let d = crate::commands::sftp::sftp_error_detail(e);
+            log::error!("[sshspan-sftp] sendto leg2 open {}: {d}", tpart);
+            format!("target open: {d}")
+        })?;
     // Progress = second half of the overall copy, reported absolutely
     // (leg 1 already covered 0..size; a resumed leg 2 starts at
     // size + already-uploaded prefix).
@@ -936,7 +954,10 @@ async fn run_server_copy<RT: tauri::Runtime>(
     )
     .await
     .map_err(|e| {
-        log::error!("[sshspan-sftp] sendto leg2 write {} (size {size}): {e}", tpart);
+        log::error!(
+            "[sshspan-sftp] sendto leg2 write {} (size {size}): {e}",
+            tpart
+        );
         format!("target write: {e}")
     })?;
     // Tolerant close: a FAILURE reply to CLOSE after a fully-written .part
@@ -959,7 +980,9 @@ async fn run_server_copy<RT: tauri::Runtime>(
                 ));
             }
             Err(se) => {
-                return Err(format!("target close failed ({e}); staged stat also failed: {se}"));
+                return Err(format!(
+                    "target close failed ({e}); staged stat also failed: {se}"
+                ));
             }
         }
     }
@@ -968,11 +991,17 @@ async fn run_server_copy<RT: tauri::Runtime>(
     if let Err(e) = target_sftp.rename(&tpart, &target.remote_path).await {
         let d = crate::commands::sftp::sftp_error_detail(e);
         if target_sftp.remove_file(&target.remote_path).await.is_ok()
-            && target_sftp.rename(&tpart, &target.remote_path).await.is_ok()
+            && target_sftp
+                .rename(&tpart, &target.remote_path)
+                .await
+                .is_ok()
         {
             return Ok(());
         }
-        log::error!("[sshspan-sftp] sendto leg2 rename {tpart} -> {}: {d}", target.remote_path);
+        log::error!(
+            "[sshspan-sftp] sendto leg2 rename {tpart} -> {}: {d}",
+            target.remote_path
+        );
         return Err(format!("final rename failed: {d}"));
     }
     // Preserve timestamps (after the rename finalizes the destination): stat
@@ -1012,8 +1041,17 @@ async fn run_job<RT: tauri::Runtime + 'static>(
 
     let result: Result<(), String> = match (kind, target) {
         (JobKind::ServerCopy, Some(target)) => {
-            run_server_copy(&app, job_id, &session_id, &remote, &target, cancel, resume, preserve_ts)
-                .await
+            run_server_copy(
+                &app,
+                job_id,
+                &session_id,
+                &remote,
+                &target,
+                cancel,
+                resume,
+                preserve_ts,
+            )
+            .await
         }
         (JobKind::ServerCopy, None) => Err("server copy job is missing its target".into()),
         (kind, _) => {
@@ -1347,7 +1385,10 @@ mod tests {
         let mut r = std::io::Cursor::new(data.clone());
         // Discarding the whole stream is fine (n bytes, then the caller
         // copies 0 more).
-        assert_eq!(discard_exact(&mut r, data.len() as u64).await.unwrap(), 100 * 1024);
+        assert_eq!(
+            discard_exact(&mut r, data.len() as u64).await.unwrap(),
+            100 * 1024
+        );
         // Discarding past EOF fails with the position in the message.
         let mut r2 = std::io::Cursor::new(vec![1u8; 10]);
         let err = discard_exact(&mut r2, 11).await.unwrap_err();
