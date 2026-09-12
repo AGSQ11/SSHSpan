@@ -204,7 +204,11 @@ fn verify_master_password(db: &db::Database, password: &str) -> Result<bool, Str
             .verify_password(password.as_bytes(), &parsed)
             .is_ok())
     } else {
-        let ok = stored == password;
+        // Legacy plaintext verifier (pre-Argon2id vaults): compare in constant
+        // time — a short-circuiting `==` on a password would leak the stored
+        // verifier byte-by-byte through timing. This path disappears on the
+        // first successful unlock, which upgrades it to Argon2id.
+        let ok = crate::crypto::utils::constant_time_eq(stored.as_bytes(), password.as_bytes());
         if ok {
             let hashed = hash_master_password(password)?;
             db.set_config(MASTER_HASH_KEY, &hashed)

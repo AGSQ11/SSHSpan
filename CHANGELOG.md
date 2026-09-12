@@ -10,40 +10,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **Updater installers are now verified with embedded-key minisign signatures
-  (not yet enforced — requires one-time maintainer key provisioning).** The
-  updater previously verified the downloaded installer against the SHA-256
-  digest from the GitHub releases API — but the digest travels in the same
-  API response as the download URL, so anyone able to alter the release
-  (repository compromise, token theft) could replace the installer *and* its
-  digest together. The release workflow now signs every installer with
+  (enforced since key provisioning on 2026-09-12).** The updater previously
+  verified the downloaded installer against the SHA-256 digest from the GitHub
+  releases API — but the digest travels in the same API response as the
+  download URL, so anyone able to alter the release (repository compromise,
+  token theft) could replace the installer *and* its digest together. The
+  release workflow signs every installer with
   [minisign](https://jedisct1.github.io/minisign/) and uploads the resulting
   `.minisig` files as release assets; `update_download_and_run` downloads the
   `.minisig` sibling through the same host-allowlist / redirect-revalidation /
   size-cap discipline as the installer and verifies it against a public key
-  embedded in the app. Until the key is provisioned (below) the app skips
-  signature verification with a logged warning and falls back to the existing
-  digest check; once provisioned it fails closed — a missing, unparseable, or
-  invalid signature deletes the downloaded installer and refuses to run it.
+  embedded in the app (key id `D67C45BA942239D8`, provisioned 2026-09-12).
+  Verification is fail-closed: a missing, unparseable, or invalid signature
+  deletes the downloaded installer and refuses to run it. Releases published
+  before provisioning carry no `.minisig` and cannot serve as auto-update
+  sources for provisioned builds.
 
-  **Maintainer provisioning checklist (one-time):**
+- **SFTP staged-file names now use an inert-extension allowlist.** Staged
+  copies (edit-in-place, Send-to) previously preserved any extension not on
+  an executable denylist; unknown extensions could still map to a
+  code-executing OS handler. Only known-inert text formats (txt, log, md,
+  conf, ini, json, yaml, xml, csv, pem, …) keep their extension now —
+  everything else, including every unknown extension, stages as `.txt`. The
+  staged name does not affect what is uploaded back; the original remote path
+  is untouched.
 
-  1. Install minisign (e.g. `winget install jedisct1.minisign` or from
-     [the releases](https://github.com/jedisct1/minisign/releases)).
-  2. Generate an unencrypted keypair: `minisign -G -W -p minisign.pub -s
-     minisign.key` (the `-W` is required — the release workflow signs
-     non-interactively). Keep `minisign.key` secret.
-  3. Repository Settings → Secrets and variables → Actions → new secret
-     `MINISIGN_SECRET_KEY` whose value is the **entire contents** of
-     `minisign.key` (both lines).
-  4. In `src-tauri/src/commands/updater.rs`, replace the
-     `MINISIGN_PUBLIC_KEY` placeholder const with the base64 body of
-     `minisign.pub` (the second line of that file, starting with `RW`).
-  5. Tag the next release as usual — the workflow signs automatically and the
-     first build carrying the new const enforces signatures from then on.
-
-  Until step 3, releases are published unsigned (the workflow logs a warning
-  and skips signing); until step 4, the updater logs a warning and relies on
-  the GitHub digest check, exactly as before.
+- **Legacy vault verifiers are compared in constant time.** Vaults created
+  before Argon2id stored a plaintext verifier, compared with a
+  short-circuiting string equality; the comparison is now constant-time
+  (the path itself disappears on the first successful unlock, which upgrades
+  the verifier to Argon2id).
 
 ## [1.7.1] - 2026-09-09
 
