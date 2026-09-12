@@ -133,11 +133,13 @@ fn pick_asset_for_os(assets: &[GhAsset]) -> Option<&GhAsset> {
                 .iter()
                 .find(|a| a.name.ends_with("_amd64.deb"))
                 .or_else(|| assets.iter().find(|a| a.name.ends_with(".rpm")))
+                .or_else(|| assets.iter().find(|a| a.name.ends_with(".AppImage")))
         } else {
             assets
                 .iter()
                 .find(|a| a.name.ends_with(".rpm"))
                 .or_else(|| assets.iter().find(|a| a.name.ends_with("_amd64.deb")))
+                .or_else(|| assets.iter().find(|a| a.name.ends_with(".AppImage")))
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -147,8 +149,24 @@ fn pick_asset_for_os(assets: &[GhAsset]) -> Option<&GhAsset> {
     }
 }
 
-fn is_newer(candidate_tag: &str, current: &str) -> bool {
-    let strip = |s: &str| s.trim().trim_start_matches('v').to_string();
+/// Derive the installer filename extension from the asset URL. `.AppImage`
+/// must be matched exactly (`.ends_with`) — a substring check could catch
+/// anything mentioning it.
+fn installer_ext(url: &str) -> &'static str {
+    if url.contains(".msi") {
+        ".msi"
+    } else if url.ends_with(".deb") {
+        ".deb"
+    } else if url.ends_with(".rpm") {
+        ".rpm"
+    } else if url.ends_with(".AppImage") {
+        ".AppImage"
+    } else {
+        ".exe"
+    }
+}
+
+fn is_newer(candidate_tag: &str, current: &str) -> bool {    let strip = |s: &str| s.trim().trim_start_matches('v').to_string();
     let (cand, cur) = (strip(candidate_tag), strip(current));
     if cand == cur {
         // Defensive short-circuit: never offer an "update" to the version we
@@ -392,24 +410,48 @@ pub async fn update_download_and_run(
     // not just the github.com host).
     let mut current_url = validate_initial_asset_url(&url)?;
 
-    let ext = if url.contains(".msi") {
-        ".msi"
-    } else if url.ends_with(".deb") {
-        ".deb"
-    } else if url.ends_with(".rpm") {
-        ".rpm"
+    let ext = installer_ext(&url);
+
+    // AppImage self-replace: when the running app IS an AppImage (the
+    // AppImage runtime exports `APPIMAGE` = absolute path of the running
+    // image), a downloaded `.AppImage` update must be swapped in place —
+    // opening it would just start a second instance. Stage the download in
+    // the SAME directory as the running image so the final rename is atomic
+    // on one filesystem, and refuse early if that path is unknown.
+    let appimage_target = if ext == ".AppImage" {
+        match std::env::var("APPIMAGE") {
+            Ok(p) if !p.trim().is_empty() && std::path::Path::new(p.trim()).is_file() => {
+                Some(std::path::PathBuf::from(p.trim()))
+            }
+            _ => {
+                return Err(CmdError(
+                    "A Linux AppImage update was offered, but this app was not started \
+                     from an AppImage, so it cannot self-replace. Install SSHSpan via \
+                     .deb/.rpm, or download the new AppImage manually from the releases \
+                     page."
+                        .into(),
+                ))
+            }
+        }
     } else {
-        ".exe"
+        None
     };
+
     // Exclusive-create temp path with a random suffix: a pre-planted file at
     // a predictable name can never be reused, and create_new() below fails
     // if the path somehow already exists. `version` comes from the renderer,
     // so it is filtered to filename-safe characters first — a hostile value
-    // must not be able to steer the temp path outside the temp directory.
+    // must not be able to steer the temp path outside the destination
+    // directory.
     let version = sanitize_version_for_filename(&version);
     let rand_suffix = uuid::Uuid::new_v4().simple().to_string();
+    let dest_dir = appimage_target
+        .as_ref()
+        .and_then(|t| t.parent())
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
     let dest =
-        std::env::temp_dir().join(format!("sshspan-{}-update-{}{}", version, rand_suffix, ext));
+        dest_dir.join(format!("sshspan-{}-update-{}{}", version, rand_suffix, ext));
 
     let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Download")
@@ -574,9 +616,33 @@ pub async fn update_download_and_run(
     }
     #[cfg(target_os = "linux")]
     {
-        // Open with the desktop's package-installer handler (GNOME Software /
-        // KDE Discover handle .deb/.rpm), which prompts for the root password.
-        opener::open(&dest).map_err(|e| CmdError(e.to_string()))?;
+        if ext == ".AppImage" {
+            // Self-replace the running AppImage: the new image was staged in
+            // the SAME directory (atomic same-filesystem rename), so make it
+            // executable and swap it over the running one. The old image's
+            // mount keeps its inode alive until this process exits, so the
+            // swap is safe mid-run; the user restarts into the new version.
+            use std::os::unix::fs::PermissionsExt;
+            let Some(target) = appimage_target.as_ref() else {
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err(CmdError(
+                    "AppImage update refused: the running image path is unknown.".into(),
+                ));
+            };
+            tokio::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                .await
+                .map_err(|e| CmdError(e.to_string()))?;
+            tokio::fs::rename(&dest, target).await.map_err(|e| {
+                CmdError(format!(
+                    "Could not replace the running AppImage ({}): {e}",
+                    target.display()
+                ))
+            })?;
+        } else {
+            // Open with the desktop's package-installer handler (GNOME Software /
+            // KDE Discover handle .deb/.rpm), which prompts for the root password.
+            opener::open(&dest).map_err(|e| CmdError(e.to_string()))?;
+        }
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
@@ -590,7 +656,15 @@ pub async fn update_download_and_run(
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         app_for_exit.exit(0);
     });
-    Ok(serde_json::json!({ "ok": true, "installer": dest.display().to_string() }))
+    let installed_path = if cfg!(target_os = "linux") && ext == ".AppImage" {
+        appimage_target
+            .as_ref()
+            .map(|t| t.display().to_string())
+            .unwrap_or_else(|| dest.display().to_string())
+    } else {
+        dest.display().to_string()
+    };
+    Ok(serde_json::json!({ "ok": true, "installer": installed_path }))
 }
 
 #[cfg(test)]
@@ -998,6 +1072,88 @@ SWYMI+zOPB2iL5kCX2udBtoWCA9aGT7AvUVmT4Xa1CDTDUadQKeArHOsgGjFxnV/3xtgKHY5t3aUFcma
         pubkey
             .verify(blob, &signature, false)
             .map_err(|e| e.to_string())
+    }
+
+    // ── Installer extension derivation ──────────────────────────────────────
+
+    #[test]
+    fn installer_ext_matches_asset_kinds() {
+        assert_eq!(
+            installer_ext(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/SSHSpan_1.7.2_x64_en-US.msi"
+            ),
+            ".msi"
+        );
+        assert_eq!(
+            installer_ext(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/SSHSpan_1.7.2_amd64.deb"
+            ),
+            ".deb"
+        );
+        assert_eq!(
+            installer_ext(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/SSHSpan-1.7.2-1.x86_64.rpm"
+            ),
+            ".rpm"
+        );
+        assert_eq!(
+            installer_ext(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/SSHSpan_1.7.2_amd64.AppImage"
+            ),
+            ".AppImage"
+        );
+        assert_eq!(
+            installer_ext(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/SSHSpan_1.7.2_x64-setup.exe"
+            ),
+            ".exe"
+        );
+        // The AppImage match is exact-suffix, not substring.
+        assert_eq!(
+            installer_ext(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/notanappimage.exe"
+            ),
+            ".exe"
+        );
+    }
+
+    // ── Linux asset picker: AppImage fallback ────────────────────────────────
+    // These run only on Linux CI (dpkg exists on the runner, so the deb
+    // branch is exercised); on other hosts the cfg compiles them out.
+
+    #[cfg(target_os = "linux")]
+    fn asset(name: &str) -> GhAsset {
+        GhAsset {
+            name: name.to_string(),
+            browser_download_url: format!(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.7.2/{name}"
+            ),
+            digest: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_picker_prefers_deb_and_falls_back_to_appimage() {
+        // Package-manager assets win when present.
+        let assets = vec![
+            asset("SSHSpan_1.7.2_amd64.AppImage"),
+            asset("SSHSpan_1.7.2_amd64.deb"),
+        ];
+        let picked = pick_asset_for_os(&assets).unwrap();
+        assert!(picked.name.ends_with(".deb"));
+
+        // No deb/rpm in the release (or dpkg-less system): the AppImage is
+        // the install format and must be selected rather than returning None.
+        let assets = vec![
+            asset("SSHSpan_1.7.2_x64-setup.exe"),
+            asset("SSHSpan_1.7.2_amd64.AppImage"),
+        ];
+        let picked = pick_asset_for_os(&assets).unwrap();
+        assert!(picked.name.ends_with(".AppImage"));
+
+        // Nothing usable → None, as before.
+        assert!(pick_asset_for_os(&[asset("SSHSpan_1.7.2_x64-setup.exe")]).is_none());
     }
 
     #[test]
