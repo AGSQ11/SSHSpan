@@ -222,6 +222,7 @@ fn remove_remote_tree<'a>(
     path: &'a str,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
+        let mut first_err: Option<String> = None;
         let mut entries = sftp
             .read_dir(path)
             .await
@@ -232,27 +233,40 @@ fn remove_remote_tree<'a>(
                 continue;
             }
             let child = format!("{}/{}", path.trim_end_matches('/'), name);
-            let md = sftp
-                .symlink_metadata(&child)
-                .await
-                .map_err(|e| format!("stat {child}: {e}"))?;
+            let md = match sftp.symlink_metadata(&child).await {
+                Ok(m) => m,
+                Err(e) => {
+                    // A child that vanishes mid-walk (or is unreadable) should
+                    // not abort the whole delete — record and keep going.
+                    if first_err.is_none() {
+                        first_err = Some(format!("stat {child}: {e}"));
+                    }
+                    continue;
+                }
+            };
             let ft = md.file_type();
-            if ft.is_symlink() {
-                // Unlink the link; never recurse through it.
+            let res = if ft.is_symlink() || !ft.is_dir() {
+                // Symlinks and plain files are unlinked; a symlink is never followed.
                 sftp.remove_file(&child)
                     .await
-                    .map_err(|e| format!("rm symlink {child}: {e}"))?;
-            } else if ft.is_dir() {
-                remove_remote_tree(sftp, &child).await?;
+                    .map_err(|e| format!("rm {child}: {e}"))
             } else {
-                sftp.remove_file(&child)
-                    .await
-                    .map_err(|e| format!("rm {child}: {e}"))?;
+                remove_remote_tree(sftp, &child).await
+            };
+            if let Err(e) = res {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
-        sftp.remove_dir(path)
-            .await
-            .map_err(|e| format!("rmdir {path}: {e}"))?;
+        // rmdir regardless, so a partially-emptied dir still goes away when it
+        // became empty; surface the first child error only if the dir remains.
+        if let Err(e) = sftp.remove_dir(path).await {
+            return Err(match first_err {
+                Some(fe) => format!("{fe} (rmdir {path}: {e})"),
+                None => format!("rmdir {path}: {e}"),
+            });
+        }
         Ok(())
     })
 }

@@ -833,10 +833,10 @@ function openSftpFileMenu(x, y, tabId, entry) {
       try {
         await sftpCall('sftp_remove', { sessionId: tab.sessionId, path: p, isDir });
         ok++;
-      } catch (e) { fail++; lastErr = e; }
+      } catch (e) { fail++; lastErr = (e && (e.message || e.error)) || String(e); }
     }
     sftpLog(tabId, `delete ${ok} item(s)${fail ? `, ${fail} failed` : ''}`);
-    if (fail) toast(`${ok} deleted, ${fail} failed.${lastErr ? ' ' + (lastErr.message || lastErr) : ''}`, 'err');
+    if (fail) toast(`${ok} deleted, ${fail} failed.${lastErr ? ' ' + lastErr : ''}`, 'err');
     await refreshSftpPanel(tabId);
   });
   mk('Copy path', 'copy', () => copyText(fullPath).then(ok => ok && toast('Path copied.', 'ok')));
