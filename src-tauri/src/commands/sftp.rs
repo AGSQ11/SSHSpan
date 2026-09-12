@@ -303,10 +303,10 @@ pub async fn download_to(
         .await
         .map_err(|e| CmdError(format!("local create failed: {e}")))?;
 
-    // 32 KiB chunks, each clamped to the remaining bytes. A short read (<
-    // requested) means EOF on well-behaved servers; the size clamp means we
-    // never ask past EOF on any server.
-    let mut buf = vec![0u8; 32 * 1024];
+    // 256 KiB chunks (matches russh-sftp's max_packet_len), each clamped to the
+    // remaining bytes. A short read (< requested) means EOF on well-behaved
+    // servers; the size clamp means we never ask past EOF on any server.
+    let mut buf = vec![0u8; 256 * 1024];
     let mut done: u64 = 0;
     while done < size {
         let want = ((size - done) as usize).min(buf.len());

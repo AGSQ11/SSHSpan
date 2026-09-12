@@ -165,7 +165,7 @@ async fn remote_part_offset(
     }
 }
 
-/// Read and drop exactly `n` bytes from `reader` (32 KiB chunks, the same
+/// Read and drop exactly `n` bytes from `reader` (256 KiB chunks, the same
 /// buffer size as `copy_with_progress`). russh-sftp's `File` exposes no
 /// offset-taking read, so skipping a prefix on the remote side means
 /// issuing reads and discarding the data locally. Returns the number of
@@ -175,7 +175,7 @@ async fn discard_exact<R: tokio::io::AsyncRead + Unpin>(
     n: u64,
 ) -> Result<u64, String> {
     use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; 32 * 1024];
+    let mut buf = vec![0u8; 256 * 1024];
     let mut done: u64 = 0;
     while done < n {
         let want = ((n - done) as usize).min(buf.len());
@@ -282,7 +282,9 @@ pub fn emit_queue<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let _ = app.emit("sftp-queue", serde_json::json!({ "jobs": jobs }));
 }
 
-/// Fetch the live SFTP channel-count setting (1..=4, default 2).
+/// Fetch the live SFTP channel-count setting (1..=4, default 4).
+/// Many small files in a folder copy are per-file round-trip bound, so a
+/// higher default parallelism matters more than a larger chunk size there.
 fn parallel_limit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> usize {
     app.state::<crate::AppState>()
         .db
@@ -291,7 +293,7 @@ fn parallel_limit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> usize {
         .flatten()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, 4))
-        .unwrap_or(2)
+        .unwrap_or(4)
 }
 
 /// One fully-expanded transfer to enqueue.
@@ -511,7 +513,7 @@ where
             .to_string();
         format!("{inner} (at offset {off}, len {len})")
     };
-    let mut buf = vec![0u8; 32 * 1024];
+    let mut buf = vec![0u8; 256 * 1024];
     let mut done: u64 = 0;
     let mut last_emit = std::time::Instant::now();
     let mut last_bytes: u64 = 0;
