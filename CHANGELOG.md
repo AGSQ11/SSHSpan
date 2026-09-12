@@ -5,7 +5,7 @@ All notable changes to SSHSpan are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.2] - 2026-09-12
 
 ### Security
 
@@ -24,22 +24,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Verification is fail-closed: a missing, unparseable, or invalid signature
   deletes the downloaded installer and refuses to run it. Releases published
   before provisioning carry no `.minisig` and cannot serve as auto-update
-  sources for provisioned builds.
+  sources for provisioned builds. **This is the first signed release.**
 
-- **SFTP staged-file names now use an inert-extension allowlist.** Staged
-  copies (edit-in-place, Send-to) previously preserved any extension not on
-  an executable denylist; unknown extensions could still map to a
-  code-executing OS handler. Only known-inert text formats (txt, log, md,
-  conf, ini, json, yaml, xml, csv, pem, …) keep their extension now —
-  everything else, including every unknown extension, stages as `.txt`. The
-  staged name does not affect what is uploaded back; the original remote path
-  is untouched.
+- **Updater URL pinning.** The initial installer URL is pinned to
+  `github.com/AGSQ11/SSHSpan/releases/download/…` — the previous host-only
+  allowlist admitted any public GitHub repository as an update source — and
+  the renderer-supplied version is sanitized before temp-filename
+  interpolation.
 
-- **Legacy vault verifiers are compared in constant time.** Vaults created
-  before Argon2id stored a plaintext verifier, compared with a
-  short-circuiting string equality; the comparison is now constant-time
-  (the path itself disappears on the first successful unlock, which upgrades
-  the verifier to Argon2id).
+- **Host-key trust is now a user decision.** Connecting to a host with no
+  stored pin asks for explicit confirmation; the backend refuses unpinned
+  hosts without it (StrictHostKeyChecking=yes equivalent) and records refused
+  attempts in the audit log. Pins are scoped to `host:port`.
+
+- **Private-key export no longer passes through the renderer.** Private
+  formats are serialized by the backend straight into a user-chosen file
+  (0600 from the first byte on Unix); `key_export` serves public material
+  only. All exports are audited.
+
+- **Post-XSS blast-radius reduction.** `system_write_text_file` only writes
+  paths approved in a native save dialog; `system_open_external` only opens
+  files from SSHSpan's staging dir; SFTP local paths also refuse system
+  directories; the `SSHSPAN_DB` override is debug-build-only; per-command
+  vault-password copies are zeroized.
+
+- **Brute-force backoff.** Master-password verification (unlock and
+  change-password) backs off after 5 consecutive failures (30 s doubling,
+  15 min cap); legacy plaintext verifiers are compared in constant time and
+  upgrade to Argon2id on first unlock.
+
+- **SFTP staging and transfer hardening.** Staged-file names use an
+  inert-extension allowlist (every unknown or binary extension stages as
+  `.txt`); the staging dir refuses symlink pre-plants (random fallback);
+  remote names are sanitized against traversal, drive letters, UNC and
+  Windows device names before any local join; queued downloads are anchored
+  under the canonical destination; the plain upload walk is symlink-cycle-safe.
+
+- **SSH auth hardening.** RSA client-auth signatures are pinned to
+  `rsa-sha2-256` (no legacy SHA-1 fallback); keyboard-interactive
+  authentication answers one round of server prompts only; SSH auth secrets
+  are zeroized in memory and the vault clears with sessions killed on exit.
+
+- **Deploy and restore integrity.** Deployed private keys are written 0600
+  from the first byte (Unix) and Windows ACL-restriction failures fail the
+  deploy; backup restore excludes blobs that cannot be re-encrypted under the
+  current password (no stranded keys) and surfaces known-host pin conflicts.
+
+- **Bitwarden hardening.** HTTPS-only server URLs (loopback exempt), KDF
+  floors (PBKDF2 ≥ 600k, Argon2id ≥ 16 MiB / t ≥ 2), confirm-first sync for
+  remote overwrites, no-redirect policy, connect-time DNS-rebind filtering,
+  and `known_hosts` restore protection.
+
+- **CI/supply chain.** Third-party GitHub Actions are pinned to commit SHAs;
+  unused Tauri plugin grants were removed; `PRIVACY.md`/`SECURITY.md` were
+  rewritten against the actual implementation.
+
+### Added
+
+- **SFTP FileZilla-parity feature set:** resumable transfers with atomic
+  `.part` staging; transfer-conflict dialog (Ask/Overwrite/Skip/Rename/Resume
+  per direction, persistable defaults); directory comparison and
+  synchronized browsing in dual-pane mode; two-pane drag & drop; timestamp
+  preservation via setstat; UI density pass (editable path bars, pane
+  headers, drop overlay, status bar, transfer queue table).
+
+### Fixed
+
+- **Send-to (server-to-server copy):** folders expand into per-file jobs with
+  target parent-directory creation; the folder walk no longer follows
+  symlinks, guards cycles, caps at 10k files and 120 s, and streams jobs so
+  transfers start during the scan; fully-written `.part` uploads tolerate
+  servers that fail CLOSE, with staged-size verification before the final
+  rename; 256 KiB chunks and higher default parallelism fix latency-bound
+  small-file throughput; recursive remote folder delete is resilient against
+  unreadable children.
+- **Transfer progress bar:** finished Send-to rows now fill to 100% (completed
+  bytes were normalized to half the two-leg total), and single-file Send-to
+  jobs get a real progress denominator.
 
 ## [1.7.1] - 2026-09-09
 
