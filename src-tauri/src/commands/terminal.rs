@@ -52,9 +52,8 @@ fn saved_pw_for_server(
         Some(sealed) => {
             let bytes = crate::crypto::vault::unseal(vault_pw, sealed)
                 .map_err(|_| "Failed to decrypt saved password.".to_string())?;
-            let pw = String::from_utf8(bytes).map_err(|_| {
-                "Saved password is not valid UTF-8.".to_string()
-            })?;
+            let pw = String::from_utf8(bytes)
+                .map_err(|_| "Saved password is not valid UTF-8.".to_string())?;
             Ok(Some(zeroize::Zeroizing::new(pw)))
         }
         None => Ok(None),
@@ -103,7 +102,7 @@ fn resolve_for_server(
             }
             let _ = db.add_audit("connect.pem_path_used", None, &p);
             key_pem = Some(zeroize::Zeroizing::new(
-                std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?
+                std::fs::read_to_string(&p).map_err(|e| format!("Failed to read {p}: {e}"))?,
             ));
         }
     } else if auth_method == "password" || auth_method == "keyboard-interactive" {

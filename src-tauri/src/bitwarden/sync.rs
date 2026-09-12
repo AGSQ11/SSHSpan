@@ -363,7 +363,9 @@ pub async fn run_sync(
                     }
                     pulled += 1;
                 } else {
-                    errors.push(serde_json::json!({"cipher_id": cipher.id, "error": "db insert failed"}));
+                    errors.push(
+                        serde_json::json!({"cipher_id": cipher.id, "error": "db insert failed"}),
+                    );
                 }
             }
         } else {
@@ -1148,6 +1150,8 @@ mod tests {
         // Valid names pass through verbatim.
         assert_eq!(sanitize_sync_name(&db, "deploy-key-1"), "deploy-key-1");
         // Every sanitized output must itself pass validation.
-        assert!(crate::crypto::keys::validate_key_name(&sanitize_sync_name(&db, "a\tb\nc")).is_ok());
+        assert!(
+            crate::crypto::keys::validate_key_name(&sanitize_sync_name(&db, "a\tb\nc")).is_ok()
+        );
     }
 }
