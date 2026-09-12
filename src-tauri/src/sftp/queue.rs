@@ -28,14 +28,57 @@ pub enum JobKind {
     ServerCopy,
 }
 
+impl JobKind {
+    /// Stable string form for the `transfer_queue.kind` column — matches the
+    /// enum's own `#[serde(rename_all = "camelCase")]` wire spelling so the
+    /// DB row and `emit_queue`'s JSON never disagree.
+    fn as_db_str(self) -> &'static str {
+        match self {
+            JobKind::Upload => "upload",
+            JobKind::Download => "download",
+            JobKind::ServerCopy => "serverCopy",
+        }
+    }
+
+    fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "upload" => Some(JobKind::Upload),
+            "download" => Some(JobKind::Download),
+            "serverCopy" => Some(JobKind::ServerCopy),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JobState {
     Queued,
     Active,
+    /// Suspended by the user (or restored from a previous run — see
+    /// `restore_pending`) with its position intact: an Active job's `.part`
+    /// is left exactly where it was, a Queued job (including one sitting out
+    /// an auto-retry backoff) is simply parked. Never started by `dispatch`;
+    /// only `resume_job`/`resume_all` move a job out of this state.
+    Paused,
     Done,
     Failed,
     Cancelled,
+}
+
+impl JobState {
+    /// Stable string form for the `transfer_queue.state` column — matches
+    /// the enum's own camelCase wire spelling.
+    fn as_db_str(self) -> &'static str {
+        match self {
+            JobState::Queued => "queued",
+            JobState::Active => "active",
+            JobState::Paused => "paused",
+            JobState::Done => "done",
+            JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// How a queued transfer treats an existing destination (or a leftover
@@ -61,12 +104,35 @@ impl ResumeMode {
             _ => ResumeMode::Overwrite,
         }
     }
+
+    /// Stable string form for the `transfer_queue.resume` column — round-
+    /// trips through [`ResumeMode::from_str_loose`].
+    fn as_db_str(self) -> &'static str {
+        match self {
+            ResumeMode::Overwrite => "overwrite",
+            ResumeMode::Resume => "resume",
+            ResumeMode::Ask => "ask",
+        }
+    }
 }
 
 /// Staging suffix for in-flight transfers. Transfers write `<dest>.part` and
 /// rename to `<dest>` only after a full flush, so a crash/cancel leaves a
 /// resumable partial instead of a corrupt "complete" file.
 pub const PART_SUFFIX: &str = ".part";
+
+/// Sentinel error strings `run_job` matches on to tell "the worker stopped
+/// itself because a flag was raised" apart from a genuine transfer failure.
+/// Every fallible copy step in this file returns a `String`, so a sentinel
+/// value (rather than a richer error type) is what keeps that distinction
+/// without a wider refactor of every `?`-using call site — see
+/// `classify_error`'s doc comment for the same tradeoff applied to
+/// retry/terminal classification.
+const CANCELLED_SENTINEL: &str = "cancelled";
+/// Distinct from `CANCELLED_SENTINEL`: a paused job's `.part` must survive
+/// and its position must be preserved (see `JobState::Paused`), so `run_job`
+/// must never treat the two the same way.
+const PAUSED_SENTINEL: &str = "paused";
 
 /// Derive the `.part` staging path for a destination. The staging file stays
 /// in the destination's own directory so the final rename is a same-directory
@@ -205,6 +271,14 @@ pub struct TransferJob {
     /// Cancel flag shared with the active worker.
     #[serde(skip)]
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Pause flag shared with the active worker — deliberately separate from
+    /// `cancel`: a cancelled job's `.part` is abandoned (cleanup is the
+    /// user's/`clear_finished`'s concern), while a paused job's `.part` is
+    /// the whole point of pausing, so the two must never share one flag.
+    /// `None` while Queued/Done/Failed/Cancelled; set by `dispatch` the
+    /// moment a job goes Active, mirroring `cancel`.
+    #[serde(skip)]
+    pub pause: Option<Arc<AtomicBool>>,
     pub started_at: Option<std::time::SystemTime>,
     /// ServerCopy only: target session (job's `session_id` is the SOURCE).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,6 +299,34 @@ pub struct TransferJob {
     /// so construction sites that don't care keep compiling (default false).
     #[serde(skip)]
     pub preserve_ts: Option<bool>,
+    /// Automatic-retry counter (distinct from a user clicking Retry, which
+    /// resets this to 0): incremented each time `handle_job_failure`
+    /// re-queues a retryable failure. Auto-retry stops once this reaches
+    /// `MAX_AUTO_RETRIES` and the job lands in `Failed` with the last error.
+    pub attempts: u32,
+    /// When set, the earliest instant `dispatch` may start this Queued job —
+    /// the backoff timer for an in-flight auto-retry. `None` means eligible
+    /// immediately (a freshly enqueued job, or one resumed by the user).
+    /// A `SystemTime` (not `Instant`) so it round-trips through
+    /// `emit_queue`'s JSON and survives a restore from `restore_pending`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<std::time::SystemTime>,
+    /// Opt-in post-transfer SHA-256 check (`setting.sftpVerifyTransfers`),
+    /// stamped from the setting at enqueue time so every job in a batch is
+    /// consistent even if the setting changes mid-batch. `None` behaves as
+    /// `Some(false)` (off) — kept optional so a restored job whose persisted
+    /// row predates this column still reconstructs cleanly via
+    /// `restore_pending`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<bool>,
+    /// Last time this job's `bytes_done` was written to the `transfer_queue`
+    /// table (see `update_progress`). Progress ticks arrive many times a
+    /// second; persisting every one would hammer the disk for no benefit; a
+    /// crash between two persisted points just re-downloads/re-uploads a
+    /// little more on the next resume, which is cheap. Not part of the wire
+    /// format — purely internal bookkeeping.
+    #[serde(skip)]
+    last_persist_at: Option<std::time::Instant>,
 }
 
 impl TransferJob {
@@ -259,17 +361,102 @@ impl TransferJob {
             "targetServerName": self.target_server_name,
             "targetRemotePath": self.target_remote_path,
             "resume": self.resume,
+            "attempts": self.attempts,
+            // Millis-since-epoch (or null) rather than SystemTime's default
+            // {secs_since_epoch, nanos_since_epoch} shape — a plain number is
+            // what a renderer countdown wants, and it can't go negative or
+            // fail to serialize the way a pre-epoch SystemTime subtraction
+            // could.
+            "retryAt": self.retry_at.and_then(system_time_to_millis),
+            "verify": self.verify.unwrap_or(false),
         })
+    }
+
+    /// Snapshot the persisted subset of this job as a `transfer_queue` row
+    /// (see `db::QueueJobRow`). `session_id`/`target_session_id` are stored
+    /// as-is even though they're only valid for the run that created them —
+    /// turning a stale one into a "needs reconnect" job is `restore_pending`'s
+    /// job on the NEXT startup, not this method's.
+    fn to_row(&self) -> crate::db::QueueJobRow {
+        crate::db::QueueJobRow {
+            id: self.id as i64,
+            kind: self.kind.as_db_str().to_string(),
+            session_id: self.session_id.clone(),
+            server_name: self.server_name.clone(),
+            local_path: self.local_path.clone(),
+            remote_path: self.remote_path.clone(),
+            size: self.size as i64,
+            bytes_done: self.bytes_done as i64,
+            state: self.state.as_db_str().to_string(),
+            error: self.error.clone(),
+            resume: self.resume.map(|r| r.as_db_str().to_string()),
+            preserve_ts: self.preserve_ts,
+            target_session_id: self.target_session_id.clone(),
+            target_server_name: self.target_server_name.clone(),
+            target_remote_path: self.target_remote_path.clone(),
+            attempts: self.attempts as i64,
+            verify: self.verify,
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch, or `None` for a `SystemTime` that
+/// somehow predates it (never happens in practice — `retry_at` is always
+/// `SystemTime::now() + a few seconds` — but `duration_since` is fallible and
+/// this file avoids `unwrap()` on anything not statically known-infallible).
+fn system_time_to_millis(t: std::time::SystemTime) -> Option<u64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// Token-bucket state backing the global bandwidth throttle (see
+/// [`TransferQueue::throttle_bandwidth`]). Kept as plain data so the pacing
+/// arithmetic ([`rate_bucket_step`]) is a pure function, testable without a
+/// clock or a tokio runtime.
+struct RateBucket {
+    /// Bytes currently available to spend without sleeping. Starts at 0
+    /// (not a full bucket) so a freshly lowered cap can't be blown through by
+    /// a burst credit nobody paced against; it fills in at the configured
+    /// rate as transfers run.
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl Default for RateBucket {
+    fn default() -> Self {
+        Self {
+            tokens: 0.0,
+            last_refill: std::time::Instant::now(),
+        }
     }
 }
 
 /// Global queue state (Tauri-managed).
-#[derive(Default)]
 pub struct TransferQueue {
     jobs: Mutex<Vec<TransferJob>>,
     next_id: AtomicU64,
     /// Generation counter — dispatcher restart when jobs are added.
     generation: AtomicU64,
+    /// Shared bytes/sec cap for every worker combined (0 = unlimited). Lives
+    /// here rather than as its own Tauri-managed state so lib.rs's existing
+    /// `app.manage(TransferQueue::new())` call needs no changes; read fresh
+    /// on every chunk so [`set_rate_limit`] takes effect on already-running
+    /// transfers, not just newly started ones.
+    rate_bps: AtomicU64,
+    rate_bucket: Mutex<RateBucket>,
+}
+
+impl Default for TransferQueue {
+    fn default() -> Self {
+        Self {
+            jobs: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            rate_bps: AtomicU64::new(0),
+            rate_bucket: Mutex::new(RateBucket::default()),
+        }
+    }
 }
 
 impl TransferQueue {
@@ -285,6 +472,65 @@ impl TransferQueue {
             .map(|j| j.snapshot(None))
             .collect()
     }
+
+    /// Pace one chunk against the shared cap, sleeping only when this call
+    /// pushed the bucket into deficit. The `rate_bucket` mutex is a plain
+    /// `std::sync::Mutex` and is held only for the synchronous arithmetic in
+    /// [`rate_bucket_step`] — never across the `.await` below — so a
+    /// concurrent [`set_rate_limit`] or another worker's chunk is never
+    /// blocked behind a sleeping one.
+    async fn throttle_bandwidth(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let cap = self.rate_bps.load(Ordering::SeqCst);
+        if cap == 0 {
+            return; // unlimited — the common case, skip the lock entirely
+        }
+        let wait = {
+            let mut bucket = self.rate_bucket.lock().unwrap();
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+            bucket.last_refill = now;
+            let (after, wait) = rate_bucket_step(bucket.tokens, elapsed, cap, bytes);
+            bucket.tokens = after;
+            wait
+        };
+        if let Some(d) = wait {
+            tokio::time::sleep(d).await;
+        }
+    }
+}
+
+/// Pure token-bucket arithmetic: given the tokens on hand, the time elapsed
+/// since the last refill, the bytes/sec cap, and the bytes about to be
+/// spent, returns the updated token balance and — if spending would drive it
+/// negative — how long to sleep to work the debt off at the current rate.
+/// `cap_bps == 0` (unlimited) always returns `(tokens, None)` unchanged.
+/// Refill is capped at one second's worth of tokens so a long idle gap (a
+/// paused job, a queue with nothing to send) can't bank an unbounded burst
+/// credit for later — the cap is a running average, not a once-a-while
+/// allowance.
+fn rate_bucket_step(
+    tokens: f64,
+    elapsed_secs: f64,
+    cap_bps: u64,
+    bytes: u64,
+) -> (f64, Option<std::time::Duration>) {
+    if cap_bps == 0 {
+        return (tokens, None);
+    }
+    let cap = cap_bps as f64;
+    let refilled = (tokens + elapsed_secs.max(0.0) * cap).min(cap);
+    let after = refilled - bytes as f64;
+    if after >= 0.0 {
+        (after, None)
+    } else {
+        (
+            after,
+            Some(std::time::Duration::from_secs_f64(-after / cap)),
+        )
+    }
 }
 
 /// Emit the full queue state to the renderer.
@@ -292,6 +538,36 @@ pub fn emit_queue<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let q = app.state::<TransferQueue>();
     let jobs = q.snapshot();
     let _ = app.emit("sftp-queue", serde_json::json!({ "jobs": jobs }));
+}
+
+// ─── queue persistence (`transfer_queue` table) ────────────────────────────
+//
+// Best-effort throughout: the in-memory `TransferQueue` is always the source
+// of truth for a running app, so a DB write failure here is logged and
+// swallowed exactly like the tolerant SETSTAT calls elsewhere in this file —
+// it must never fail (or roll back) the transfer it's shadowing. Persistence
+// only exists to survive a restart (see `restore_pending`).
+
+/// Upsert one job's persisted row. Called on every meaningful state
+/// transition (enqueue, dispatch → Active, pause/resume, cancel/retry,
+/// completion) and, throttled, on progress — never anywhere hotter than that.
+fn persist_job<R: tauri::Runtime>(app: &tauri::AppHandle<R>, row: crate::db::QueueJobRow) {
+    let id = row.id;
+    if let Err(e) = app.state::<crate::AppState>().db.upsert_queue_job(&row) {
+        log::warn!("[sshspan-sftp] queue persistence: upsert job {id} failed: {e}");
+    }
+}
+
+/// Mirror `clear_finished`'s in-memory retain: drop every persisted
+/// Done/Failed/Cancelled row.
+fn persist_clear_finished<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Err(e) = app
+        .state::<crate::AppState>()
+        .db
+        .delete_finished_queue_jobs()
+    {
+        log::warn!("[sshspan-sftp] queue persistence: clear finished failed: {e}");
+    }
 }
 
 /// Fetch the live SFTP channel-count setting (1..=4, default 4).
@@ -308,7 +584,65 @@ fn parallel_limit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> usize {
         .unwrap_or(4)
 }
 
+/// Fetch whether opt-in post-transfer SHA-256 verification is on
+/// (`setting.sftpVerifyTransfers`). Off unless the value is exactly "true"
+/// or "1" (case-insensitive) — verification re-reads every byte on both
+/// ends, so anything unrecognized must fail closed to "off", not "on".
+fn verify_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    app.state::<crate::AppState>()
+        .db
+        .get_config("setting.sftpVerifyTransfers")
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false)
+}
+
+/// Fetch the shared bandwidth cap in bytes/sec (`setting.sftpMaxBps`); 0 (or
+/// an absent/unparseable value) means unlimited. Same settings-read pattern
+/// as [`parallel_limit`]; the live value workers actually pace against lives
+/// on `TransferQueue::rate_bps` (see [`set_rate_limit`]), not re-read from
+/// the DB on every chunk.
+fn rate_limit_bps<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> u64 {
+    app.state::<crate::AppState>()
+        .db
+        .get_config("setting.sftpMaxBps")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Change the shared bandwidth cap live, without touching any in-flight
+/// transfer: every worker reads `rate_bps` fresh on every chunk (see
+/// [`TransferQueue::throttle_bandwidth`]), so a raise, a drop, or a change to
+/// 0 (unlimited) takes effect the very next chunk any of them copies — never
+/// a restart, and never a wait on anything that could deadlock. Also
+/// persists the choice as `setting.sftpMaxBps` so it survives a restart
+/// (read back into `rate_bps` by [`restore_pending`] at the next startup).
+pub fn set_rate_limit<R: tauri::Runtime>(app: &tauri::AppHandle<R>, bytes_per_sec: u64) {
+    app.state::<TransferQueue>()
+        .rate_bps
+        .store(bytes_per_sec, Ordering::SeqCst);
+    if let Err(e) = app
+        .state::<crate::AppState>()
+        .db
+        .set_config("setting.sftpMaxBps", &bytes_per_sec.to_string())
+    {
+        log::warn!("[sshspan-sftp] set_rate_limit: persisting setting failed: {e}");
+    }
+}
+
 /// One fully-expanded transfer to enqueue.
+///
+/// Deliberately does NOT carry a `verify` field: every construction site
+/// (`commands/sftp.rs`'s `expand_upload`/`expand_download`/
+/// `expand_server_copy`/`sftp_server_copy`) builds this struct with an
+/// exhaustive field list and no `..Default::default()`, so adding a required
+/// field here would be a breaking change to code outside this file. Instead
+/// [`enqueue`] stamps every job in a batch from the global
+/// `setting.sftpVerifyTransfers` setting directly (the same pattern
+/// `parallel_limit` uses for `sftpParallel`) — see `verify_enabled`.
 pub struct QueuedItem {
     pub kind: JobKind,
     pub session_id: String,
@@ -361,11 +695,13 @@ impl QueuedItem {
 /// (directories were expanded by the caller).
 pub fn enqueue<R: tauri::Runtime>(app: &tauri::AppHandle<R>, items: Vec<QueuedItem>) {
     let q = app.state::<TransferQueue>();
+    let verify = verify_enabled(app);
+    let mut new_rows = Vec::new();
     {
         let mut guard = q.jobs.lock().unwrap();
         for item in items {
             let id = q.next_id.fetch_add(1, Ordering::SeqCst);
-            guard.push(TransferJob {
+            let job = TransferJob {
                 id,
                 kind: item.kind,
                 session_id: item.session_id,
@@ -377,19 +713,40 @@ pub fn enqueue<R: tauri::Runtime>(app: &tauri::AppHandle<R>, items: Vec<QueuedIt
                 state: JobState::Queued,
                 error: None,
                 cancel: None,
+                pause: None,
                 started_at: None,
                 target_session_id: item.target.as_ref().map(|t| t.session_id.clone()),
                 target_server_name: item.target.as_ref().map(|t| t.server_name.clone()),
                 target_remote_path: item.target.as_ref().map(|t| t.remote_path.clone()),
                 resume: item.resume,
                 preserve_ts: item.preserve_ts,
-            });
+                attempts: 0,
+                retry_at: None,
+                verify: Some(verify),
+                last_persist_at: None,
+            };
+            new_rows.push(job.to_row());
+            guard.push(job);
         }
     }
     q.generation.fetch_add(1, Ordering::SeqCst);
     drop(q);
+    for row in new_rows {
+        persist_job(app, row);
+    }
     emit_queue(app);
     dispatch(app);
+}
+
+/// Whether `dispatch` may start this job right now: it must be Queued, and
+/// if it's mid-backoff from an auto-retry (`retry_at` set by
+/// `handle_job_failure`), that instant must have passed. Paused jobs never
+/// match — pulling this predicate out as a free function of plain data (no
+/// `TransferQueue`/`AppHandle`) makes "dispatch skips a paused job" and "a
+/// backoff still counting down is skipped too" unit-testable without a live
+/// Tauri app.
+fn is_dispatchable(job: &TransferJob, now: std::time::SystemTime) -> bool {
+    job.state == JobState::Queued && job.retry_at.is_none_or(|t| t <= now)
 }
 
 /// Spawn workers for queued jobs while fewer than the limit are active.
@@ -399,6 +756,7 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let q = app.state::<TransferQueue>();
     let limit = parallel_limit(app);
 
+    let mut persisted_rows = Vec::new();
     let to_start: Vec<(
         u64,
         String,
@@ -409,6 +767,7 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         Option<ServerCopyTarget>,
         Option<ResumeMode>,
         bool,
+        bool,
     )> = {
         let mut guard = q.jobs.lock().unwrap();
         let active = guard.iter().filter(|j| j.state == JobState::Active).count();
@@ -417,13 +776,15 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         if capacity == 0 {
             return;
         }
+        let now = std::time::SystemTime::now();
         for j in guard.iter_mut() {
             if capacity == 0 {
                 break;
             }
-            if j.state == JobState::Queued {
+            if is_dispatchable(j, now) {
                 j.state = JobState::Active;
                 j.cancel = Some(Arc::new(AtomicBool::new(false)));
+                j.pause = Some(Arc::new(AtomicBool::new(false)));
                 j.started_at = Some(std::time::SystemTime::now());
                 let target = match (
                     j.target_session_id.clone(),
@@ -447,7 +808,9 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                     target,
                     j.resume,
                     j.preserve_ts.unwrap_or(false),
+                    j.verify.unwrap_or(false),
                 ));
+                persisted_rows.push(j.to_row());
                 capacity -= 1;
             }
         }
@@ -460,7 +823,12 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let gen = q.generation.load(Ordering::SeqCst);
     drop(q);
 
-    for (id, session_id, kind, local, remote, size, target, resume, preserve_ts) in to_start {
+    for row in persisted_rows {
+        persist_job(app, row);
+    }
+
+    for (id, session_id, kind, local, remote, size, target, resume, preserve_ts, verify) in to_start
+    {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             run_job(
@@ -475,6 +843,7 @@ pub fn dispatch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                 target,
                 resume,
                 preserve_ts,
+                verify,
             )
             .await;
         });
@@ -509,12 +878,19 @@ pub(crate) async fn open_transfer_channel<R: tauri::Runtime>(
 /// `progress_offset` is added to the copied count when reporting job
 /// progress, so a multi-leg transfer can show its overall position (0 for
 /// plain uploads/downloads).
+///
+/// Also the single choke point for the global bandwidth throttle: every job
+/// kind's every leg calls this to move bytes, so pacing here (via
+/// `TransferQueue::throttle_bandwidth`) caps all of them without needing a
+/// separate check in each caller.
+#[allow(clippy::too_many_arguments)]
 async fn copy_with_progress<RT, R, W>(
     app: &tauri::AppHandle<RT>,
     job_id: u64,
     reader: &mut R,
     writer: &mut W,
     cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     max_read: Option<u64>,
     progress_offset: u64,
 ) -> Result<u64, String>
@@ -544,7 +920,13 @@ where
     let mut speed: f64 = 0.0;
     loop {
         if cancel.load(Ordering::SeqCst) {
-            return Err("cancelled".into());
+            return Err(CANCELLED_SENTINEL.into());
+        }
+        // Checked at the same chunk boundary as cancel, right before the
+        // next read: an Active job's `.part` (or partial ServerCopy leg) is
+        // left exactly where it stands, never truncated or rewound.
+        if pause.load(Ordering::SeqCst) {
+            return Err(PAUSED_SENTINEL.into());
         }
         if let Some(max) = max_read {
             if done >= max {
@@ -569,6 +951,11 @@ where
             .map_err(|e| e.to_string())?;
         done += n as u64;
 
+        // Global bandwidth pacing: a no-op (no lock taken) when unlimited.
+        app.state::<TransferQueue>()
+            .throttle_bandwidth(n as u64)
+            .await;
+
         let now = std::time::Instant::now();
         if last_emit.elapsed().as_millis() >= 200 {
             let dt = now.duration_since(last_emit).as_secs_f64();
@@ -590,6 +977,13 @@ where
     Ok(done)
 }
 
+/// How often a job's `bytes_done` is written to the `transfer_queue` table.
+/// Progress ticks fire every ~200ms (see `copy_with_progress`); persisting
+/// every one would be a DB write several times a second per active transfer
+/// for no real benefit — a crash between two persisted points just costs a
+/// few more seconds of re-transfer on the next resume.
+const PROGRESS_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn update_progress<RT: tauri::Runtime>(
     app: &tauri::AppHandle<RT>,
     job_id: u64,
@@ -597,22 +991,40 @@ fn update_progress<RT: tauri::Runtime>(
     speed: Option<f64>,
 ) {
     let q = app.state::<TransferQueue>();
-    let job_json = {
+    let (job_json, persist_row) = {
         let mut guard = q.jobs.lock().unwrap();
         match guard.iter_mut().find(|j| j.id == job_id) {
             Some(j) => {
                 j.bytes_done = bytes_done;
-                Some(j.snapshot(speed))
+                let now = std::time::Instant::now();
+                let due = j
+                    .last_persist_at
+                    .is_none_or(|t| now.duration_since(t) >= PROGRESS_PERSIST_INTERVAL);
+                let row = if due {
+                    j.last_persist_at = Some(now);
+                    Some(j.to_row())
+                } else {
+                    None
+                };
+                (Some(j.snapshot(speed)), row)
             }
-            None => None,
+            None => (None, None),
         }
     };
+    drop(q);
     if let Some(job) = job_json {
         let _ = app.emit("sftp-queue", serde_json::json!({ "jobs": [job] }));
     }
+    if let Some(row) = persist_row {
+        persist_job(app, row);
+    }
 }
 
-/// Set a job's terminal state and emit it.
+/// Set a job's resting state — a terminal one (Done/Failed/Cancelled) or the
+/// Paused suspension — and emit it. Also used for Paused because pausing
+/// frees the job's concurrency slot exactly like a terminal state does; the
+/// `state == Done` special case below is the only place the two are treated
+/// differently.
 fn finish_job<RT: tauri::Runtime>(
     app: &tauri::AppHandle<RT>,
     job_id: u64,
@@ -620,7 +1032,7 @@ fn finish_job<RT: tauri::Runtime>(
     error: Option<String>,
 ) {
     let q = app.state::<TransferQueue>();
-    let job_json = {
+    let (job_json, row) = {
         let mut guard = q.jobs.lock().unwrap();
         match guard.iter_mut().find(|j| j.id == job_id) {
             Some(j) => {
@@ -633,16 +1045,19 @@ fn finish_job<RT: tauri::Runtime>(
                     // row at a half-filled bar.
                     j.bytes_done = j.progress_total();
                 }
-                Some(j.snapshot(None))
+                (Some(j.snapshot(None)), Some(j.to_row()))
             }
-            None => None,
+            None => (None, None),
         }
     };
     if let Some(job) = job_json {
         let _ = app.emit("sftp-queue", serde_json::json!({ "jobs": [job] }));
     }
     drop(q);
-    // Something finished — try to start the next queued job.
+    if let Some(row) = row {
+        persist_job(app, row);
+    }
+    // Something finished (or paused) — try to start the next queued job.
     dispatch(app);
 }
 
@@ -711,6 +1126,7 @@ impl Drop for StageGuard {
 /// session (the interactive browse channel) instead of a fresh channel.
 /// Used by `run_server_copy` to distinguish "fresh channel read is refused"
 /// from "the read pattern itself fails on this server".
+#[allow(clippy::too_many_arguments)]
 async fn read_via_session<RT: tauri::Runtime>(
     app: &tauri::AppHandle<RT>,
     job_id: u64,
@@ -719,6 +1135,7 @@ async fn read_via_session<RT: tauri::Runtime>(
     stage: &std::path::Path,
     size: u64,
     cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut rf = sftp
         .open(source_remote)
@@ -729,7 +1146,7 @@ async fn read_via_session<RT: tauri::Runtime>(
     let mut lf = tokio::fs::File::create(stage)
         .await
         .map_err(|e| format!("local recreate failed: {e}"))?;
-    copy_with_progress(app, job_id, &mut rf, &mut lf, cancel, Some(size), 0).await?;
+    copy_with_progress(app, job_id, &mut rf, &mut lf, cancel, pause, Some(size), 0).await?;
     lf.flush()
         .await
         .map_err(|e| format!("local flush failed: {e}"))?;
@@ -747,6 +1164,7 @@ async fn read_via_session<RT: tauri::Runtime>(
 /// plain queue downloads/uploads (that is what makes this path work on
 /// servers whose interactive channel fails reads with SSH_FX_FAILURE).
 /// The target leg stages into `<target>.part` and renames on success.
+#[allow(clippy::too_many_arguments)]
 async fn run_server_copy<RT: tauri::Runtime>(
     app: &tauri::AppHandle<RT>,
     job_id: u64,
@@ -754,8 +1172,10 @@ async fn run_server_copy<RT: tauri::Runtime>(
     source_remote: &str,
     target: &ServerCopyTarget,
     cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     resume: Option<ResumeMode>,
     preserve_ts: bool,
+    verify: bool,
 ) -> Result<(), String> {
     let file_name = source_remote.rsplit('/').next().unwrap_or("file");
     // Staged copy lives in the same 0700 temp dir + unpredictable-name
@@ -811,9 +1231,34 @@ async fn run_server_copy<RT: tauri::Runtime>(
         .await
         .map_err(|e| format!("local create failed: {e}"))?;
     // Size-clamped reads (EOF-crossing read defense), progress = first half.
-    let fresh_result =
-        copy_with_progress(app, job_id, &mut rf, &mut lf, cancel.clone(), Some(size), 0).await;
+    let fresh_result = copy_with_progress(
+        app,
+        job_id,
+        &mut rf,
+        &mut lf,
+        cancel.clone(),
+        pause.clone(),
+        Some(size),
+        0,
+    )
+    .await;
     if let Err(fresh_err) = fresh_result {
+        // A user-requested stop, not a genuine read failure: clean up and
+        // return the bare sentinel so `run_job` recognizes it. The
+        // diagnostic/fallback path below exists to tell "this server
+        // read-blocks fresh channels" apart from "the read pattern itself is
+        // broken" — it must never fire just because the user paused or
+        // cancelled mid-read (retrying via the interactive session at that
+        // point would ignore the request and keep transferring).
+        if fresh_err == CANCELLED_SENTINEL || fresh_err == PAUSED_SENTINEL {
+            let _ = lf.flush().await;
+            drop(lf);
+            if let Err(e) = rf.close().await {
+                log::debug!("[sshspan-sftp] sendto leg1 close after {fresh_err}: {e}");
+            }
+            drop(sftp);
+            return Err(fresh_err);
+        }
         // DIAGNOSTIC + FALLBACK: the fresh transfer channel failed the read.
         // Retry the identical clamped read on the interactive browse session —
         // but only after releasing every resource from the failed attempt, so
@@ -845,6 +1290,7 @@ async fn run_server_copy<RT: tauri::Runtime>(
                     &stage,
                     size,
                     cancel.clone(),
+                    pause.clone(),
                 )
                 .await
                 {
@@ -854,6 +1300,9 @@ async fn run_server_copy<RT: tauri::Runtime>(
                              (fresh channel is read-blocked on this server)"
                         );
                         // Fall through to leg 2 with the staged file in place.
+                    }
+                    Err(ie) if ie == CANCELLED_SENTINEL || ie == PAUSED_SENTINEL => {
+                        return Err(ie);
                     }
                     Err(ie) => {
                         return Err(format!(
@@ -949,11 +1398,19 @@ async fn run_server_copy<RT: tauri::Runtime>(
         &mut lf,
         &mut rf,
         cancel.clone(),
+        pause.clone(),
         Some(size.saturating_sub(offset)),
         size + offset,
     )
     .await
     .map_err(|e| {
+        // A user-requested stop must reach `run_job` as the bare sentinel
+        // (see the matching leg-1 guard above) — wrapping it into a
+        // "target write: …" message would hide the pause/cancel from the
+        // state-transition match and land the job in Failed instead.
+        if e == CANCELLED_SENTINEL || e == PAUSED_SENTINEL {
+            return e;
+        }
         log::error!(
             "[sshspan-sftp] sendto leg2 write {} (size {size}): {e}",
             tpart
@@ -1004,6 +1461,49 @@ async fn run_server_copy<RT: tauri::Runtime>(
         );
         return Err(format!("final rename failed: {d}"));
     }
+    // Opt-in verification (`setting.sftpVerifyTransfers`): hash both remote
+    // ends and compare before trusting the copy. The source channel was
+    // already closed after leg 1, so this reopens a fresh one purely for the
+    // hash — cheap next to re-reading the whole file, which is what a
+    // mismatch would otherwise cost the user in a silent later discovery.
+    // A mismatch removes the target file: the copy must not sit there
+    // looking successful when it isn't.
+    if verify {
+        let source_hash = match open_transfer_channel(app, source_session).await {
+            Ok(verify_sftp) => {
+                crate::commands::sftp::remote_sha256(
+                    &verify_sftp,
+                    source_remote,
+                    Some(cancel.as_ref()),
+                )
+                .await
+            }
+            Err(e) => Err(crate::commands::CmdError(format!(
+                "reopening source for verification: {e}"
+            ))),
+        };
+        let target_hash = crate::commands::sftp::remote_sha256(
+            &target_sftp,
+            &target.remote_path,
+            Some(cancel.as_ref()),
+        )
+        .await;
+        match (source_hash, target_hash) {
+            (Ok(sh), Ok(th)) if sh == th => {}
+            (Ok(sh), Ok(th)) => {
+                let _ = target_sftp.remove_file(&target.remote_path).await;
+                return Err(format!(
+                    "checksum mismatch: source {sh} != target {th} (copy removed)"
+                ));
+            }
+            (Err(e), _) => {
+                return Err(format!("checksum mismatch: could not hash source: {e}"));
+            }
+            (_, Err(e)) => {
+                return Err(format!("checksum mismatch: could not hash target: {e}"));
+            }
+        }
+    }
     // Preserve timestamps (after the rename finalizes the destination): stat
     // the STAGED file (its data equals the remote source) and push its mtime
     // onto the target. Best-effort setstat.
@@ -1013,6 +1513,7 @@ async fn run_server_copy<RT: tauri::Runtime>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_job<RT: tauri::Runtime + 'static>(
     app: tauri::AppHandle<RT>,
     _gen: u64,
@@ -1025,16 +1526,17 @@ async fn run_job<RT: tauri::Runtime + 'static>(
     target: Option<ServerCopyTarget>,
     resume: Option<ResumeMode>,
     preserve_ts: bool,
+    verify: bool,
 ) {
-    let cancel = {
+    let (cancel, pause) = {
         let q = app.state::<TransferQueue>();
         let guard = q.jobs.lock().unwrap();
-        guard
-            .iter()
-            .find(|j| j.id == job_id)
-            .and_then(|j| j.cancel.clone())
+        match guard.iter().find(|j| j.id == job_id) {
+            Some(j) => (j.cancel.clone(), j.pause.clone()),
+            None => (None, None),
+        }
     };
-    let Some(cancel) = cancel else {
+    let (Some(cancel), Some(pause)) = (cancel, pause) else {
         finish_job(&app, job_id, JobState::Failed, Some("job vanished".into()));
         return;
     };
@@ -1048,8 +1550,10 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                 &remote,
                 &target,
                 cancel,
+                pause,
                 resume,
                 preserve_ts,
+                verify,
             )
             .await
         }
@@ -1117,6 +1621,7 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                             &mut lf,
                             &mut rf,
                             cancel.clone(),
+                            pause.clone(),
                             Some(lsize.saturating_sub(offset)),
                             offset,
                         )
@@ -1153,6 +1658,39 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                                 return Ok(());
                             }
                             return Err(format!("final rename failed: {d}"));
+                        }
+                        // Opt-in verification: hash the local source and the
+                        // now-renamed remote destination and compare. A
+                        // mismatch removes the remote file rather than
+                        // leaving a corrupt upload that looks complete.
+                        if verify {
+                            let local_hash =
+                                local_sha256(std::path::Path::new(&local), cancel.clone()).await;
+                            let remote_hash = crate::commands::sftp::remote_sha256(
+                                &sftp,
+                                &remote,
+                                Some(cancel.as_ref()),
+                            )
+                            .await;
+                            match (local_hash, remote_hash) {
+                                (Ok(lh), Ok(rh)) if lh == rh => {}
+                                (Ok(lh), Ok(rh)) => {
+                                    let _ = sftp.remove_file(&remote).await;
+                                    return Err(format!(
+                                        "checksum mismatch: local {lh} != remote {rh} (upload removed)"
+                                    ));
+                                }
+                                (Err(e), _) => {
+                                    return Err(format!(
+                                        "checksum mismatch: could not hash local file: {e}"
+                                    ));
+                                }
+                                (_, Err(e)) => {
+                                    return Err(format!(
+                                        "checksum mismatch: could not hash remote file: {e}"
+                                    ));
+                                }
+                            }
                         }
                         // Preserve timestamps (after the rename finalizes the
                         // destination): stat the local source mtime and setstat
@@ -1225,6 +1763,7 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                             &mut rf,
                             &mut lf,
                             cancel.clone(),
+                            pause.clone(),
                             Some(size.saturating_sub(offset)),
                             offset,
                         )
@@ -1239,6 +1778,39 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         tokio::fs::rename(&lpart, &local)
                             .await
                             .map_err(|e| format!("final rename failed: {e}"))?;
+                        // Opt-in verification: hash the now-renamed local
+                        // file and the remote source and compare. A mismatch
+                        // removes the local file rather than leaving a
+                        // corrupt download that looks complete.
+                        if verify {
+                            let local_hash =
+                                local_sha256(std::path::Path::new(&local), cancel.clone()).await;
+                            let remote_hash = crate::commands::sftp::remote_sha256(
+                                &sftp,
+                                &remote,
+                                Some(cancel.as_ref()),
+                            )
+                            .await;
+                            match (remote_hash, local_hash) {
+                                (Ok(rh), Ok(lh)) if rh == lh => {}
+                                (Ok(rh), Ok(lh)) => {
+                                    let _ = tokio::fs::remove_file(&local).await;
+                                    return Err(format!(
+                                        "checksum mismatch: remote {rh} != local {lh} (download removed)"
+                                    ));
+                                }
+                                (Err(e), _) => {
+                                    return Err(format!(
+                                        "checksum mismatch: could not hash remote file: {e}"
+                                    ));
+                                }
+                                (_, Err(e)) => {
+                                    return Err(format!(
+                                        "checksum mismatch: could not hash local file: {e}"
+                                    ));
+                                }
+                            }
+                        }
                         // Preserve-timestamps on DOWNLOADS is NOT applied here:
                         // the remote mtime would have to be written onto the
                         // LOCAL file, and std has no portable mtime setter
@@ -1257,36 +1829,220 @@ async fn run_job<RT: tauri::Runtime + 'static>(
 
     match result {
         Ok(()) => finish_job(&app, job_id, JobState::Done, None),
-        Err(e) if e == "cancelled" => finish_job(&app, job_id, JobState::Cancelled, None),
-        Err(e) => finish_job(&app, job_id, JobState::Failed, Some(e)),
+        Err(e) if e == CANCELLED_SENTINEL => finish_job(&app, job_id, JobState::Cancelled, None),
+        Err(e) if e == PAUSED_SENTINEL => finish_job(&app, job_id, JobState::Paused, None),
+        Err(e) => handle_job_failure(&app, job_id, e),
     }
     let _ = size;
+}
+
+/// Stream a local file through SHA-256 in the same 256 KiB chunk size as
+/// `copy_with_progress`, so verifying even a very large transfer never holds
+/// more than one chunk in memory. Checked against `cancel` between chunks so
+/// a cancel raised mid-verification doesn't hang shutdown behind hashing a
+/// huge file.
+async fn local_sha256(path: &std::path::Path, cancel: Arc<AtomicBool>) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open for hashing failed: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED_SENTINEL.into());
+        }
+        let n = f
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read for hashing failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Classification of a transfer failure for the auto-retry policy (see
+/// [`handle_job_failure`]): whether the exact same operation stands a
+/// reasonable chance of succeeding on a fresh attempt (a network blip, a
+/// closed pipe, a timeout) versus a structural problem that retrying cannot
+/// fix (permission denied, a missing file, a full disk, an unsupported
+/// operation). Conservative by design: an error this function doesn't
+/// recognize is `Terminal`, so auto-retry can never turn an actionable
+/// failure into a silent multi-minute stall in an unattended batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorClass {
+    Retryable,
+    Terminal,
+}
+
+/// Classify a failure by its already-rendered message. Every fallible step
+/// in this file reaches its caller as a `String` (the
+/// `.map_err(|e| format!(...))` convention used throughout `run_job` /
+/// `run_server_copy`), and that rendered text already carries the
+/// OS-level/SFTP-protocol wording — `std::io::Error`'s `Display` and
+/// `sftp_error_detail`'s output both surface it in the message itself — so
+/// matching on the final string here recognizes the same failures a
+/// typed-error classification would, without a wider refactor of every
+/// fallible call site's return type. Case-insensitive; a message containing
+/// both a terminal and a retryable phrase is treated as terminal (the
+/// stronger signal to trust when the two disagree).
+fn classify_error(msg: &str) -> ErrorClass {
+    let m = msg.to_ascii_lowercase();
+    const TERMINAL: &[&str] = &[
+        "permission denied",
+        "access denied",
+        "no such file",
+        "not found",
+        "quota",
+        "disk full",
+        "no space left",
+        "invalid handle",
+        "unsupported",
+        "not supported",
+        "already exists",
+        "not a directory",
+        "is a directory",
+        "checksum mismatch",
+    ];
+    const RETRYABLE: &[&str] = &[
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "temporary failure",
+        "unexpected eof",
+        "eof at",
+    ];
+    if TERMINAL.iter().any(|k| m.contains(k)) {
+        return ErrorClass::Terminal;
+    }
+    if RETRYABLE.iter().any(|k| m.contains(k)) {
+        return ErrorClass::Retryable;
+    }
+    ErrorClass::Terminal
+}
+
+/// Auto-retry ceiling: after this many automatic attempts a retryable
+/// failure still gives up and lands the job in `Failed` — an unattended
+/// batch must eventually surface a real, persistent problem instead of
+/// retrying forever.
+const MAX_AUTO_RETRIES: u32 = 3;
+
+/// Exponential backoff schedule for auto-retry: the Nth retry (1-based, i.e.
+/// the value `attempts` holds right after incrementing) waits `2^N` seconds
+/// — 2s, 4s, 8s for N = 1, 2, 3.
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2u64.saturating_pow(attempt))
+}
+
+/// Handle a job failure that is neither a pause nor a cancel: classify it
+/// and either schedule an automatic retry with exponential backoff or land
+/// the job in `Failed` with the real error, exactly as before auto-retry
+/// existed. Mirrors `finish_job`'s lock-compute-then-emit discipline.
+///
+/// Guards against a race between this failure and a pause/cancel request
+/// that arrived while the attempt was in flight: the worker may hit a real
+/// I/O error before it next checks the flag, so the CURRENT flag state (not
+/// just the sentinel this attempt happened to return) decides whether the
+/// job is actually cancelled/paused rather than genuinely failed — auto-retry
+/// must never resurrect a job the user just stopped.
+fn handle_job_failure<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64, error: String) {
+    let q = app.state::<TransferQueue>();
+    let row = {
+        let mut guard = q.jobs.lock().unwrap();
+        let Some(j) = guard.iter_mut().find(|j| j.id == job_id) else {
+            return;
+        };
+        let cancelled = j.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst));
+        let paused = j.pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst));
+        if cancelled {
+            j.state = JobState::Cancelled;
+        } else if paused {
+            j.state = JobState::Paused;
+        } else {
+            let retryable =
+                classify_error(&error) == ErrorClass::Retryable && j.attempts < MAX_AUTO_RETRIES;
+            if retryable {
+                j.attempts += 1;
+                let delay = backoff_delay(j.attempts);
+                j.state = JobState::Queued;
+                j.retry_at = Some(std::time::SystemTime::now() + delay);
+                j.error = Some(format!(
+                    "{error} — retrying ({}/{MAX_AUTO_RETRIES})",
+                    j.attempts
+                ));
+                j.cancel = None;
+                j.pause = None;
+                // Nudge the dispatcher once the backoff elapses so an
+                // otherwise-idle queue doesn't wait on some unrelated event
+                // to notice the job is due. `retry_at` (checked by
+                // `is_dispatchable`) remains the actual source of truth, so a
+                // missed or early wakeup here can't start the job too soon —
+                // worst case it waits for the next incidental `dispatch`
+                // call, which a busy queue has plenty of anyway.
+                let app2 = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    dispatch(&app2);
+                });
+            } else {
+                j.state = JobState::Failed;
+                j.error = Some(error);
+            }
+        }
+        j.to_row()
+    };
+    drop(q);
+    persist_job(app, row);
+    emit_queue(app);
+    // A retry frees no slot (the job stays Queued/counted-not-Active only
+    // once dispatched again), but Failed/Cancelled/Paused all do — cheap to
+    // call unconditionally, same as `finish_job`.
+    dispatch(app);
 }
 
 /// Cancel one job (active jobs abort at their next chunk; queued flip state).
 pub fn cancel_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
     let q = app.state::<TransferQueue>();
-    let mut guard = q.jobs.lock().unwrap();
-    if let Some(j) = guard.iter_mut().find(|j| j.id == job_id) {
-        if let Some(c) = &j.cancel {
-            c.store(true, Ordering::SeqCst);
+    let row = {
+        let mut guard = q.jobs.lock().unwrap();
+        match guard.iter_mut().find(|j| j.id == job_id) {
+            Some(j) => {
+                if let Some(c) = &j.cancel {
+                    c.store(true, Ordering::SeqCst);
+                }
+                if j.state == JobState::Queued {
+                    j.state = JobState::Cancelled;
+                }
+                Some(j.to_row())
+            }
+            None => None,
         }
-        if j.state == JobState::Queued {
-            j.state = JobState::Cancelled;
-        }
-    }
-    drop(guard);
+    };
     drop(q);
+    if let Some(row) = row {
+        persist_job(app, row);
+    }
     emit_queue(app);
 }
 
-/// Re-queue a failed/cancelled job.
+/// Re-queue a failed/cancelled job. A user-initiated retry is a fresh start
+/// for the auto-retry counter too: `attempts` resets to 0 and any pending
+/// backoff (`retry_at`) is cleared, distinguishing this from
+/// `handle_job_failure`'s automatic re-queue.
 pub fn retry_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
     let q = app.state::<TransferQueue>();
-    {
+    let row = {
         let mut guard = q.jobs.lock().unwrap();
-        if let Some(j) = guard.iter_mut().find(|j| j.id == job_id) {
-            if matches!(j.state, JobState::Failed | JobState::Cancelled) {
+        match guard.iter_mut().find(|j| j.id == job_id) {
+            Some(j) if matches!(j.state, JobState::Failed | JobState::Cancelled) => {
                 j.state = JobState::Queued;
                 j.error = None;
                 // bytes_done resets, but a leftover `.part` is deliberately
@@ -1295,15 +2051,24 @@ pub fn retry_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
                 // clear_finished's concern, not retry's.
                 j.bytes_done = 0;
                 j.cancel = None;
+                j.pause = None;
+                j.attempts = 0;
+                j.retry_at = None;
+                Some(j.to_row())
             }
+            _ => None,
         }
-    }
+    };
     drop(q);
+    if let Some(row) = row {
+        persist_job(app, row);
+    }
     emit_queue(app);
     dispatch(app);
 }
 
-/// Remove Done/Failed/Cancelled jobs from the list.
+/// Remove Done/Failed/Cancelled jobs from the list (and their persisted
+/// rows, so a restart's `restore_pending` doesn't resurrect them).
 pub fn clear_finished<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
     let q = app.state::<TransferQueue>();
     q.jobs.lock().unwrap().retain(|j| {
@@ -1313,6 +2078,7 @@ pub fn clear_finished<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
         )
     });
     drop(q);
+    persist_clear_finished(app);
     emit_queue(app);
 }
 
@@ -1320,6 +2086,7 @@ pub fn clear_finished<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
 /// ServerCopy job belongs to BOTH its source and target sessions.
 pub fn cancel_for_session<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, session_id: &str) {
     let q = app.state::<TransferQueue>();
+    let mut rows = Vec::new();
     {
         let mut guard = q.jobs.lock().unwrap();
         for j in guard.iter_mut() {
@@ -1332,11 +2099,224 @@ pub fn cancel_for_session<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, sessio
                 if j.state == JobState::Queued {
                     j.state = JobState::Cancelled;
                 }
+                rows.push(j.to_row());
             }
         }
     }
     drop(q);
+    for row in rows {
+        persist_job(app, row);
+    }
     emit_queue(app);
+}
+
+/// Pause one job. An Active job winds down at its next chunk boundary — only
+/// the flag is raised here; `copy_with_progress` observes it and `run_job`
+/// finalizes the state to `Paused` once the worker actually exits, leaving
+/// its `.part` (or partial ServerCopy leg) exactly where it stood. A Queued
+/// job (including one sitting out an auto-retry backoff) has no worker to
+/// observe a flag, so it is paused immediately. Any other state
+/// (Done/Failed/Cancelled/already Paused) is left untouched.
+pub fn pause_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
+    let q = app.state::<TransferQueue>();
+    let row = {
+        let mut guard = q.jobs.lock().unwrap();
+        let Some(j) = guard.iter_mut().find(|j| j.id == job_id) else {
+            return;
+        };
+        match j.state {
+            JobState::Active => {
+                if let Some(p) = &j.pause {
+                    p.store(true, Ordering::SeqCst);
+                }
+                None
+            }
+            JobState::Queued => {
+                j.state = JobState::Paused;
+                j.retry_at = None;
+                Some(j.to_row())
+            }
+            _ => return,
+        }
+    };
+    drop(q);
+    if let Some(row) = row {
+        persist_job(app, row);
+    }
+    emit_queue(app);
+}
+
+/// Resume one paused job: `Paused` → `Queued`, then kick the dispatcher.
+/// Forces `ResumeMode::Resume` regardless of how the job was originally
+/// queued — the whole point of pausing is that its `.part` survives, so the
+/// resumed attempt must continue from it rather than restart from
+/// `Overwrite`/`Ask` semantics. Any state other than `Paused` is a no-op.
+pub fn resume_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
+    let q = app.state::<TransferQueue>();
+    let row = {
+        let mut guard = q.jobs.lock().unwrap();
+        match guard.iter_mut().find(|j| j.id == job_id) {
+            Some(j) if j.state == JobState::Paused => {
+                j.state = JobState::Queued;
+                j.error = None;
+                j.retry_at = None;
+                j.resume = Some(ResumeMode::Resume);
+                Some(j.to_row())
+            }
+            _ => None,
+        }
+    };
+    drop(q);
+    if let Some(row) = row {
+        persist_job(app, row);
+    }
+    emit_queue(app);
+    dispatch(app);
+}
+
+/// Pause every Active/Queued job — see [`pause_job`] for the per-state
+/// behavior applied to each.
+pub fn pause_all<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
+    let q = app.state::<TransferQueue>();
+    let mut rows = Vec::new();
+    {
+        let mut guard = q.jobs.lock().unwrap();
+        for j in guard.iter_mut() {
+            match j.state {
+                JobState::Active => {
+                    if let Some(p) = &j.pause {
+                        p.store(true, Ordering::SeqCst);
+                    }
+                }
+                JobState::Queued => {
+                    j.state = JobState::Paused;
+                    j.retry_at = None;
+                    rows.push(j.to_row());
+                }
+                _ => {}
+            }
+        }
+    }
+    drop(q);
+    for row in rows {
+        persist_job(app, row);
+    }
+    emit_queue(app);
+}
+
+/// Resume every Paused job — see [`resume_job`] for the forced-`Resume`
+/// rationale applied to each.
+pub fn resume_all<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
+    let q = app.state::<TransferQueue>();
+    let mut rows = Vec::new();
+    {
+        let mut guard = q.jobs.lock().unwrap();
+        for j in guard.iter_mut() {
+            if j.state == JobState::Paused {
+                j.state = JobState::Queued;
+                j.error = None;
+                j.retry_at = None;
+                j.resume = Some(ResumeMode::Resume);
+                rows.push(j.to_row());
+            }
+        }
+    }
+    drop(q);
+    for row in rows {
+        persist_job(app, row);
+    }
+    emit_queue(app);
+    dispatch(app);
+}
+
+/// Reload jobs left `Queued`/`Active`/`Paused` from a previous run and bring
+/// them back as `Paused` — never auto-started. The previous run's SSH
+/// sessions no longer exist (a new run has fresh, differently-numbered
+/// ones), so silently reconnecting and resuming writes at startup would
+/// surprise a user who never asked for it; surfacing the job as Paused with
+/// an explicit "needs reconnect" error lets them resume it deliberately
+/// (`resume_job`) once they've reopened the right connection. Returns the
+/// number of jobs restored.
+///
+/// Must be called once at startup, AFTER both `AppState` (the DB) and
+/// `TransferQueue` are managed — see lib.rs's `setup()`. Also seeds the
+/// shared bandwidth cap from `setting.sftpMaxBps`: `TransferQueue::new()`
+/// runs before the DB exists, so this is the first opportunity to read it.
+pub fn restore_pending<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> usize {
+    app.state::<TransferQueue>()
+        .rate_bps
+        .store(rate_limit_bps(app), Ordering::SeqCst);
+
+    let rows = match app.state::<crate::AppState>().db.list_pending_queue_jobs() {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("[sshspan-sftp] queue restore: list failed: {e}");
+            return 0;
+        }
+    };
+    if rows.is_empty() {
+        return 0;
+    }
+
+    let q = app.state::<TransferQueue>();
+    let mut restored_rows = Vec::new();
+    {
+        let mut guard = q.jobs.lock().unwrap();
+        let mut max_id = q.next_id.load(Ordering::SeqCst);
+        for row in rows {
+            let id = row.id.max(0) as u64;
+            max_id = max_id.max(id + 1);
+            let Some(kind) = JobKind::from_db_str(&row.kind) else {
+                log::warn!(
+                    "[sshspan-sftp] queue restore: job {id} has unknown kind {:?}, skipping",
+                    row.kind
+                );
+                continue;
+            };
+            let job = TransferJob {
+                id,
+                kind,
+                session_id: row.session_id,
+                server_name: row.server_name.clone(),
+                local_path: row.local_path,
+                remote_path: row.remote_path,
+                size: row.size.max(0) as u64,
+                bytes_done: row.bytes_done.max(0) as u64,
+                state: JobState::Paused,
+                error: Some(format!(
+                    "Session closed before restart — reconnect to \"{}\" and resume.",
+                    row.server_name
+                )),
+                cancel: None,
+                pause: None,
+                started_at: None,
+                target_session_id: row.target_session_id,
+                target_server_name: row.target_server_name,
+                target_remote_path: row.target_remote_path,
+                resume: row.resume.as_deref().map(ResumeMode::from_str_loose),
+                preserve_ts: row.preserve_ts,
+                attempts: row.attempts.max(0) as u32,
+                retry_at: None,
+                verify: row.verify,
+                last_persist_at: None,
+            };
+            restored_rows.push(job.to_row());
+            guard.push(job);
+        }
+        q.next_id.store(max_id, Ordering::SeqCst);
+    }
+    drop(q);
+
+    let n = restored_rows.len();
+    for row in restored_rows {
+        // Normalize the persisted rows to the restored Paused state/error so
+        // a second restart doesn't need to re-derive it.
+        persist_job(app, row);
+    }
+    if n > 0 {
+        emit_queue(app);
+    }
+    n
 }
 
 /// True when the session has active or queued jobs (as source OR as the
@@ -1393,5 +2373,164 @@ mod tests {
         let mut r2 = std::io::Cursor::new(vec![1u8; 10]);
         let err = discard_exact(&mut r2, 11).await.unwrap_err();
         assert!(err.contains("EOF at 10 of 11"), "unexpected message: {err}");
+    }
+
+    /// Minimal `TransferJob` for tests that only care about a couple of
+    /// fields (state/retry_at) — every field still needs a value since this
+    /// struct is never constructed outside `sftp::queue` (see `QueuedItem`'s
+    /// doc comment), so there's no `Default` impl to lean on elsewhere.
+    fn test_job(id: u64, state: JobState) -> TransferJob {
+        TransferJob {
+            id,
+            kind: JobKind::Upload,
+            session_id: "s1".into(),
+            server_name: "srv".into(),
+            local_path: "/local/a".into(),
+            remote_path: "/remote/a".into(),
+            size: 100,
+            bytes_done: 0,
+            state,
+            error: None,
+            cancel: None,
+            pause: None,
+            started_at: None,
+            target_session_id: None,
+            target_server_name: None,
+            target_remote_path: None,
+            resume: None,
+            preserve_ts: None,
+            attempts: 0,
+            retry_at: None,
+            verify: None,
+            last_persist_at: None,
+        }
+    }
+
+    #[test]
+    fn classify_error_recognizes_retryable_phrases() {
+        // The task's own examples, plus the shapes std::io::Error /
+        // sftp_error_detail actually render for them.
+        for msg in [
+            "Connection reset by peer (os error 104)",
+            "connection closed",
+            "Broken pipe (os error 32)",
+            "Operation timed out (os error 110)",
+            "read for hashing failed: timeout",
+            "temporary failure in name resolution",
+            "unexpected EOF at 10 of 11 skipped bytes",
+        ] {
+            assert_eq!(
+                classify_error(msg),
+                ErrorClass::Retryable,
+                "expected retryable: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_error_recognizes_terminal_phrases() {
+        for msg in [
+            "Permission denied (code 3)",
+            "SFTP server returned no such file",
+            "disk full",
+            "quota exceeded",
+            "invalid handle",
+            "unsupported operation",
+            "checksum mismatch: local abc != remote def (upload removed)",
+        ] {
+            assert_eq!(
+                classify_error(msg),
+                ErrorClass::Terminal,
+                "expected terminal: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_error_defaults_unrecognized_to_terminal() {
+        // Conservative by design: an error this function has never seen
+        // before must not be auto-retried.
+        assert_eq!(
+            classify_error("some brand new SFTP extension error nobody has seen"),
+            ErrorClass::Terminal
+        );
+    }
+
+    #[test]
+    fn classify_error_terminal_wins_when_both_match() {
+        assert_eq!(
+            classify_error("no such file (connection reset while retrying)"),
+            ErrorClass::Terminal
+        );
+    }
+
+    #[test]
+    fn backoff_schedule_is_2_4_8_seconds() {
+        assert_eq!(backoff_delay(1), std::time::Duration::from_secs(2));
+        assert_eq!(backoff_delay(2), std::time::Duration::from_secs(4));
+        assert_eq!(backoff_delay(3), std::time::Duration::from_secs(8));
+    }
+
+    #[test]
+    fn rate_bucket_step_unlimited_never_waits() {
+        let (after, wait) = rate_bucket_step(0.0, 10.0, 0, 10_000_000);
+        assert_eq!(after, 0.0);
+        assert!(wait.is_none());
+    }
+
+    #[test]
+    fn rate_bucket_step_empty_bucket_waits_proportionally() {
+        // 256 KiB at a 1,000,000 B/s cap from a freshly-created (empty)
+        // bucket: no time has elapsed to refill, so the whole chunk is debt.
+        let bytes = 256 * 1024u64;
+        let (after, wait) = rate_bucket_step(0.0, 0.0, 1_000_000, bytes);
+        assert!(after < 0.0);
+        let wait = wait.expect("an empty bucket must wait for a nonzero chunk");
+        let expected = bytes as f64 / 1_000_000.0;
+        assert!(
+            (wait.as_secs_f64() - expected).abs() < 1e-9,
+            "expected ~{expected}s, got {:?}",
+            wait
+        );
+    }
+
+    #[test]
+    fn rate_bucket_step_refill_lets_a_small_chunk_through_free() {
+        // A full bucket (tokens == cap) can absorb a chunk smaller than the
+        // cap with no wait at all.
+        let (after, wait) = rate_bucket_step(1_000_000.0, 0.0, 1_000_000, 1_000);
+        assert_eq!(after, 999_000.0);
+        assert!(wait.is_none());
+    }
+
+    #[test]
+    fn rate_bucket_step_refill_caps_at_one_second() {
+        // A long idle gap (e.g. a paused job) must not bank an unbounded
+        // burst credit — refill never exceeds one second's worth of the cap.
+        let (after, wait) = rate_bucket_step(0.0, 1000.0, 1_000_000, 0);
+        assert_eq!(after, 1_000_000.0);
+        assert!(wait.is_none());
+    }
+
+    #[test]
+    fn dispatch_skips_paused_and_pending_backoff_jobs() {
+        let now = std::time::SystemTime::now();
+        assert!(!is_dispatchable(&test_job(1, JobState::Paused), now));
+        assert!(!is_dispatchable(&test_job(2, JobState::Active), now));
+        assert!(!is_dispatchable(&test_job(3, JobState::Done), now));
+        assert!(!is_dispatchable(&test_job(4, JobState::Failed), now));
+        assert!(!is_dispatchable(&test_job(5, JobState::Cancelled), now));
+
+        // A freshly enqueued Queued job (no retry_at) is eligible right away.
+        assert!(is_dispatchable(&test_job(6, JobState::Queued), now));
+
+        // A Queued job mid-backoff is skipped until its retry_at passes.
+        let mut retrying = test_job(7, JobState::Queued);
+        retrying.retry_at = Some(now + std::time::Duration::from_secs(2));
+        assert!(!is_dispatchable(&retrying, now));
+        assert!(is_dispatchable(
+            &retrying,
+            now + std::time::Duration::from_secs(3)
+        ));
     }
 }

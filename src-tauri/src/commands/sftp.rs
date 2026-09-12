@@ -1153,6 +1153,45 @@ pub fn sftp_queue_retry(app: AppHandle, job_id: u64) -> CmdResult<serde_json::Va
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Suspend one transfer without losing its place: an active job winds down at
+/// the next chunk boundary and its `.part` is left where it stands, so
+/// resuming continues rather than restarting. Distinct from cancel, which
+/// abandons the partial.
+#[tauri::command]
+pub fn sftp_queue_pause(app: AppHandle, job_id: u64) -> CmdResult<serde_json::Value> {
+    tfq::pause_job(&app, job_id);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+#[tauri::command]
+pub fn sftp_queue_resume(app: AppHandle, job_id: u64) -> CmdResult<serde_json::Value> {
+    tfq::resume_job(&app, job_id);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+#[tauri::command]
+pub fn sftp_queue_pause_all(app: AppHandle) -> CmdResult<serde_json::Value> {
+    tfq::pause_all(&app);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+#[tauri::command]
+pub fn sftp_queue_resume_all(app: AppHandle) -> CmdResult<serde_json::Value> {
+    tfq::resume_all(&app);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Cap total transfer throughput across every worker. 0 means unlimited.
+/// Takes effect on in-flight transfers, not just newly started ones.
+#[tauri::command]
+pub fn sftp_queue_set_rate_limit(
+    app: AppHandle,
+    bytes_per_sec: u64,
+) -> CmdResult<serde_json::Value> {
+    tfq::set_rate_limit(&app, bytes_per_sec);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
 #[tauri::command]
 pub fn sftp_queue_clear_finished(app: AppHandle) -> CmdResult<serde_json::Value> {
     q_clear(&app);

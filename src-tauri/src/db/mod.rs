@@ -97,6 +97,35 @@ pub struct KnownHost {
     pub first_seen: DateTime<Utc>,
 }
 
+/// One persisted `sftp::queue::TransferJob` row (the `transfer_queue`
+/// table). Deliberately decoupled from `sftp::queue`'s `JobKind`/`JobState`/
+/// `ResumeMode` enums — this module has no dependency on `sftp`, and the
+/// conversion (stable lowercase/camelCase strings both sides already agree
+/// on for `emit_queue`'s wire format) lives in `TransferJob::to_row` and
+/// `restore_pending` instead. `id` mirrors `TransferJob.id` (a `u64`, cast to
+/// `i64` for SQLite's INTEGER PRIMARY KEY — queue ids never get remotely
+/// close to overflowing that).
+#[derive(Debug, Clone)]
+pub struct QueueJobRow {
+    pub id: i64,
+    pub kind: String,
+    pub session_id: String,
+    pub server_name: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub size: i64,
+    pub bytes_done: i64,
+    pub state: String,
+    pub error: Option<String>,
+    pub resume: Option<String>,
+    pub preserve_ts: Option<bool>,
+    pub target_session_id: Option<String>,
+    pub target_server_name: Option<String>,
+    pub target_remote_path: Option<String>,
+    pub attempts: i64,
+    pub verify: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BitwardenConfig {
     pub server_url: Option<String>,
@@ -399,6 +428,44 @@ impl Database {
             )
             .execute(&self.pool)
             .await;
+
+            // Transfer queue: survives a restart/crash so a 5,000-file batch
+            // isn't silently lost mid-way and its `.part` files left orphaned.
+            // `session_id`/`target_session_id` are per-run and stale the
+            // moment the app restarts — `sftp::queue::restore_pending` is what
+            // turns a restored row into a "needs reconnect" Paused job, not
+            // this table's schema.
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS transfer_queue (
+                    id                  INTEGER PRIMARY KEY,
+                    kind                TEXT NOT NULL,
+                    session_id          TEXT NOT NULL,
+                    server_name         TEXT NOT NULL,
+                    local_path          TEXT NOT NULL,
+                    remote_path         TEXT NOT NULL,
+                    size                INTEGER NOT NULL,
+                    bytes_done          INTEGER NOT NULL,
+                    state               TEXT NOT NULL,
+                    error               TEXT,
+                    resume              TEXT,
+                    preserve_ts         INTEGER,
+                    target_session_id   TEXT,
+                    target_server_name  TEXT,
+                    target_remote_path  TEXT,
+                    attempts            INTEGER NOT NULL DEFAULT 0,
+                    verify              INTEGER,
+                    updated_at          TEXT NOT NULL
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_transfer_queue_state ON transfer_queue(state)",
+            )
+            .execute(&self.pool)
+            .await?;
 
             Ok::<_, anyhow::Error>(())
         })
@@ -1247,6 +1314,128 @@ impl Database {
         })
     }
 
+    // ── Transfer queue persistence ─────────────────────────────────────────
+    // See `sftp::queue` for the in-memory `TransferJob` these rows mirror.
+    // Best-effort throughout by convention at the call site (queue.rs logs
+    // and swallows a failure here rather than letting it affect a live
+    // transfer) — this table is a resiliency feature, not the source of
+    // truth for a running app.
+
+    /// Insert or fully overwrite one job's persisted row.
+    pub fn upsert_queue_job(&self, row: &QueueJobRow) -> Result<()> {
+        block(async {
+            sqlx::query(
+                r#"
+                INSERT INTO transfer_queue (
+                    id, kind, session_id, server_name, local_path, remote_path,
+                    size, bytes_done, state, error, resume, preserve_ts,
+                    target_session_id, target_server_name, target_remote_path,
+                    attempts, verify, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    session_id = excluded.session_id,
+                    server_name = excluded.server_name,
+                    local_path = excluded.local_path,
+                    remote_path = excluded.remote_path,
+                    size = excluded.size,
+                    bytes_done = excluded.bytes_done,
+                    state = excluded.state,
+                    error = excluded.error,
+                    resume = excluded.resume,
+                    preserve_ts = excluded.preserve_ts,
+                    target_session_id = excluded.target_session_id,
+                    target_server_name = excluded.target_server_name,
+                    target_remote_path = excluded.target_remote_path,
+                    attempts = excluded.attempts,
+                    verify = excluded.verify,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(row.id)
+            .bind(&row.kind)
+            .bind(&row.session_id)
+            .bind(&row.server_name)
+            .bind(&row.local_path)
+            .bind(&row.remote_path)
+            .bind(row.size)
+            .bind(row.bytes_done)
+            .bind(&row.state)
+            .bind(&row.error)
+            .bind(&row.resume)
+            .bind(row.preserve_ts.map(|b| b as i64))
+            .bind(&row.target_session_id)
+            .bind(&row.target_server_name)
+            .bind(&row.target_remote_path)
+            .bind(row.attempts)
+            .bind(row.verify.map(|b| b as i64))
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// Delete one job's persisted row.
+    pub fn delete_queue_job(&self, id: i64) -> Result<()> {
+        block(async {
+            sqlx::query("DELETE FROM transfer_queue WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Delete every Done/Failed/Cancelled row (mirrors `clear_finished`'s
+    /// in-memory retain).
+    pub fn delete_finished_queue_jobs(&self) -> Result<()> {
+        block(async {
+            sqlx::query(
+                "DELETE FROM transfer_queue WHERE state IN ('done', 'failed', 'cancelled')",
+            )
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// Jobs left `Queued`/`Active`/`Paused` by a previous run — what
+    /// `sftp::queue::restore_pending` reloads at startup.
+    pub fn list_pending_queue_jobs(&self) -> Result<Vec<QueueJobRow>> {
+        block(async {
+            let rows = sqlx::query(
+                "SELECT * FROM transfer_queue WHERE state IN ('queued', 'active', 'paused') \
+                 ORDER BY id ASC",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(rows.into_iter().map(Self::row_to_queue_job).collect())
+        })
+    }
+
+    fn row_to_queue_job(row: SqliteRow) -> QueueJobRow {
+        QueueJobRow {
+            id: row.get("id"),
+            kind: row.get("kind"),
+            session_id: row.get("session_id"),
+            server_name: row.get("server_name"),
+            local_path: row.get("local_path"),
+            remote_path: row.get("remote_path"),
+            size: row.get("size"),
+            bytes_done: row.get("bytes_done"),
+            state: row.get("state"),
+            error: row.get("error"),
+            resume: row.get("resume"),
+            preserve_ts: row.get::<Option<i64>, _>("preserve_ts").map(|v| v != 0),
+            target_session_id: row.get("target_session_id"),
+            target_server_name: row.get("target_server_name"),
+            target_remote_path: row.get("target_remote_path"),
+            attempts: row.get("attempts"),
+            verify: row.get::<Option<i64>, _>("verify").map(|v| v != 0),
+        }
+    }
+
     // ── Backup / restore ───────────────────────────────────────────────────
 
     /// Upsert every entity from an (already unsealed) backup payload in one
@@ -1560,6 +1749,135 @@ mod tests {
         let hosts = db.list_known_hosts().expect("list known hosts");
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].host, "example.com:2222");
+    }
+
+    fn test_db() -> Database {
+        let db_path = std::env::temp_dir().join(format!(
+            "sshspan-transfer-queue-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        Database::open_at(db_path).expect("open test db")
+    }
+
+    fn sample_row(id: i64, state: &str) -> QueueJobRow {
+        QueueJobRow {
+            id,
+            kind: "upload".to_string(),
+            session_id: "sess-1".to_string(),
+            server_name: "my-server".to_string(),
+            local_path: "/local/a".to_string(),
+            remote_path: "/remote/a".to_string(),
+            size: 1000,
+            bytes_done: 200,
+            state: state.to_string(),
+            error: None,
+            resume: Some("resume".to_string()),
+            preserve_ts: Some(true),
+            target_session_id: None,
+            target_server_name: None,
+            target_remote_path: None,
+            attempts: 1,
+            verify: Some(false),
+        }
+    }
+
+    /// `upsert_queue_job` must both insert a new row and, on a repeat call
+    /// with the same id, overwrite it in place rather than duplicating it —
+    /// `sftp::queue` relies on this for its throttled progress persistence
+    /// (many upserts of the same job over its lifetime).
+    #[test]
+    fn upsert_queue_job_inserts_then_overwrites_by_id() {
+        let db = test_db();
+        db.upsert_queue_job(&sample_row(1, "active"))
+            .expect("insert");
+        let mut updated = sample_row(1, "done");
+        updated.bytes_done = 1000;
+        db.upsert_queue_job(&updated).expect("overwrite");
+
+        let pending = db.list_pending_queue_jobs().expect("list pending");
+        // "done" is not a pending state, so the row shouldn't show up here —
+        // proves the second upsert changed the SAME row's state rather than
+        // inserting a second one next to it.
+        assert!(pending.is_empty());
+    }
+
+    /// `list_pending_queue_jobs` returns exactly the Queued/Active/Paused
+    /// rows — the set `restore_pending` reloads at startup — and none of the
+    /// terminal ones.
+    #[test]
+    fn list_pending_queue_jobs_filters_by_state() {
+        let db = test_db();
+        for (id, state) in [
+            (1, "queued"),
+            (2, "active"),
+            (3, "paused"),
+            (4, "done"),
+            (5, "failed"),
+            (6, "cancelled"),
+        ] {
+            db.upsert_queue_job(&sample_row(id, state)).unwrap();
+        }
+        let mut pending_ids: Vec<i64> = db
+            .list_pending_queue_jobs()
+            .expect("list pending")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        pending_ids.sort();
+        assert_eq!(pending_ids, vec![1, 2, 3]);
+    }
+
+    /// `delete_finished_queue_jobs` removes only Done/Failed/Cancelled rows —
+    /// what `clear_finished` calls so a restart's `restore_pending` never
+    /// resurrects a job the user already cleared.
+    #[test]
+    fn delete_finished_queue_jobs_only_removes_terminal_states() {
+        let db = test_db();
+        for (id, state) in [(1, "queued"), (2, "done"), (3, "failed"), (4, "cancelled")] {
+            db.upsert_queue_job(&sample_row(id, state)).unwrap();
+        }
+        db.delete_finished_queue_jobs().expect("delete finished");
+
+        let remaining_ids: Vec<i64> = db
+            .list_pending_queue_jobs()
+            .expect("list pending")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(remaining_ids, vec![1]);
+    }
+
+    /// A round trip through the DB must preserve every field a restored job
+    /// needs to reconstruct — including nullable ones (`resume`,
+    /// `preserve_ts`, `verify`, the ServerCopy `target_*` triple).
+    #[test]
+    fn queue_job_round_trip_preserves_all_fields() {
+        let db = test_db();
+        let mut row = sample_row(42, "paused");
+        row.target_session_id = Some("target-sess".to_string());
+        row.target_server_name = Some("target-server".to_string());
+        row.target_remote_path = Some("/remote/dest".to_string());
+        db.upsert_queue_job(&row).expect("insert");
+
+        let pending = db.list_pending_queue_jobs().expect("list pending");
+        assert_eq!(pending.len(), 1);
+        let got = &pending[0];
+        assert_eq!(got.id, 42);
+        assert_eq!(got.kind, "upload");
+        assert_eq!(got.session_id, "sess-1");
+        assert_eq!(got.server_name, "my-server");
+        assert_eq!(got.local_path, "/local/a");
+        assert_eq!(got.remote_path, "/remote/a");
+        assert_eq!(got.size, 1000);
+        assert_eq!(got.bytes_done, 200);
+        assert_eq!(got.state, "paused");
+        assert_eq!(got.resume.as_deref(), Some("resume"));
+        assert_eq!(got.preserve_ts, Some(true));
+        assert_eq!(got.target_session_id.as_deref(), Some("target-sess"));
+        assert_eq!(got.target_server_name.as_deref(), Some("target-server"));
+        assert_eq!(got.target_remote_path.as_deref(), Some("/remote/dest"));
+        assert_eq!(got.attempts, 1);
+        assert_eq!(got.verify, Some(false));
     }
 }
 
