@@ -50,7 +50,14 @@ jobs:
         run: npm ci
 
       - name: Set up Rust
+        # The version INPUT pins the Rust toolchain (and therefore rustfmt)
+        # deterministically on every runner; the SHA pin holds the action
+        # code. A rust-toolchain.toml was tried first and had to go: a bare
+        # channel there resolves against rustup's install-time host triple,
+        # which breaks msvc-target builds on gnu-host machines.
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.98.0
 
       - name: Rust cache
         uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
