@@ -230,6 +230,20 @@ pub struct TransferJob {
 }
 
 impl TransferJob {
+    /// Cumulative byte total the workers report against, i.e. what
+    /// `bytes_done` reaches when the job completes. A ServerCopy moves the
+    /// data TWICE (leg 1: source → local staging, leg 2: staging → target),
+    /// and its progress is reported cumulatively across both legs, so its
+    /// total is 2× the source size; plain transfers total the source size.
+    /// The renderer maps `bytesDone / progressTotal` onto the bar (for
+    /// serverCopy it computes 2×size itself, sftp.js "totalUnits").
+    fn progress_total(&self) -> u64 {
+        match self.kind {
+            JobKind::ServerCopy => self.size.saturating_mul(2),
+            _ => self.size,
+        }
+    }
+
     fn snapshot(&self, speed: Option<f64>) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
@@ -603,7 +617,11 @@ fn finish_job<RT: tauri::Runtime>(
                 j.state = state;
                 j.error = error;
                 if state == JobState::Done {
-                    j.bytes_done = j.size;
+                    // Completed bytes = the job's full progress total. For a
+                    // ServerCopy that is 2× the source size (both legs done) —
+                    // normalizing to `size` here left every finished Send-to
+                    // row at a half-filled bar.
+                    j.bytes_done = j.progress_total();
                 }
                 Some(j.snapshot(None))
             }
@@ -753,6 +771,20 @@ async fn run_server_copy<RT: tauri::Runtime>(
             format!("source stat: {d}")
         })?
         .size;
+    // Single-file Send-to jobs are enqueued with size 0 ("stat'd by the
+    // worker") — write the stat'd size back into the job record so the queue
+    // row gets a real progress denominator (the worker's own clamp below
+    // needs it too).
+    if let Some(real) = size {
+        let q = app.state::<TransferQueue>();
+        let mut guard = q.jobs.lock().unwrap();
+        if let Some(j) = guard.iter_mut().find(|j| j.id == job_id) {
+            if j.size == 0 {
+                j.size = real;
+            }
+        }
+        drop(guard);
+    }
     // Unknown remote size must never mean "0-byte file": clamp to an
     // effectively unbounded stream so the copy reads until a real short read
     // (the EOF signal on well-behaved servers).
