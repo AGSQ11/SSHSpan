@@ -1,5 +1,5 @@
 /**
- * sftp.js — SFTP file-browser panel for Connect tabs (FileZilla-parity pass).
+ * sftp.js - SFTP file-browser panel for Connect tabs (FileZilla-parity pass).
  * ---------------------------------------------------------------------------
  * Per-tab panel: remote listing with sortable columns, multi-select,
  * hidden-file toggle, per-server bookmarks, recursive search, chmod dialog,
@@ -69,7 +69,7 @@ async function toggleSshSftpMode() {
   const tab = sftpTab(state.activeTabId);
   if (!tab) return;
   if (!window.tabSessionLive(tab.tabId)) {
-    toast('Connect first — SFTP runs over the live session.', 'err');
+    toast('Connect first - SFTP runs over the live session.', 'err');
     return;
   }
   if (tab.mode === 'sftp') {
@@ -214,7 +214,7 @@ function buildSftpPanel(tabId) {
   searchBar.hidden = true;
   const searchInput = document.createElement('input');
   searchInput.type = 'text';
-  searchInput.placeholder = 'Find in this directory tree…';
+  searchInput.placeholder = 'Find in this directory tree...';
   searchInput.id = 'sftpSearchInput-' + tabId;
   const searchResults = document.createElement('div');
   searchResults.className = 'sftp-searchresults';
@@ -246,7 +246,7 @@ function buildSftpPanel(tabId) {
   const pathBox = document.createElement('input');
   pathBox.className = 'sftp-path';
   pathBox.id = 'sftpPath-' + tabId;
-  pathBox.placeholder = '/remote/path — Enter to navigate';
+  pathBox.placeholder = '/remote/path - Enter to navigate';
   pathBox.spellcheck = false;
   pathBox.autocomplete = 'off';
   pathBox.addEventListener('keydown', (ev) => {
@@ -311,7 +311,7 @@ function buildSftpPanel(tabId) {
   const localPath = document.createElement('input');
   localPath.className = 'sftp-path';
   localPath.id = 'sftpLocalPath-' + tabId;
-  localPath.placeholder = 'Local path — Enter to navigate';
+  localPath.placeholder = 'Local path - Enter to navigate';
   localPath.spellcheck = false;
   localPath.autocomplete = 'off';
   localPath.addEventListener('keydown', (ev) => {
@@ -370,7 +370,7 @@ function buildSftpPanel(tabId) {
 
   // ── drop overlay ──
   // Hidden by default; appears only while a drag hovers the panel (wireSftpDrop
-  // toggles the .dragover class). No permanent strip — the panes keep full height.
+  // toggles the .dragover class). No permanent strip - the panes keep full height.
   const panesWrap = document.createElement('div');
   panesWrap.className = 'sftp-paneswrap';
   const hint = document.createElement('div');
@@ -408,7 +408,7 @@ function buildSftpPanel(tabId) {
 // transferred files") ────────────────────────────────────────────────────────
 
 /// Idempotent: append the toggle next to the hidden-files button if absent
-/// (never restructure the toolbar — G owns that block; this appends only).
+/// (never restructure the toolbar - G owns that block; this appends only).
 function ensureSftpPreserveTsToggle(tabId) {
   const panel = document.getElementById('sftpPanel-' + tabId);
   if (!panel || document.getElementById('sftpPreserveTsBtn-' + tabId)) return;
@@ -617,13 +617,13 @@ function renderEntries(tabId) {
     if (entry.isDir) {
       // Directory size: muted placeholder, not missing metadata.
       tdSize.className = 'sftp-dirsize';
-      tdSize.textContent = '—';
+      tdSize.textContent = '-';
       tdSize.title = 'Directory';
     } else {
       tdSize.textContent = formatSftpSize(entry.size);
     }
     const tdMod = document.createElement('td');
-    tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
+    tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '-';
     tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
 
     tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
@@ -783,6 +783,30 @@ async function updateFsInfo(tabId) {
 
 // ─── context menu ───────────────────────────────────────────────────────────
 
+// Session-scoped delete-confirmation state (classic scripts share the global
+// lexical scope, so the names are sftp-prefixed on purpose).
+let sftpDeleteConfirmSuppressed = false;
+let sftpDeleteInFlight = false;
+
+/// In-app delete confirmation: names the item(s), Yes / Cancel, and a
+/// session-scoped "don't ask again" checkbox (never persisted - a restart
+/// restores the safety prompt). Runs onYes only on Yes.
+function sftpConfirmDelete(message, onYes) {
+  if (sftpDeleteConfirmSuppressed) { onYes(); return; }
+  el('deleteTitle').textContent = 'Delete';
+  el('deleteMessage').textContent = message;
+  el('deleteSkipSession').checked = false;
+  el('deleteModal').hidden = false;
+  const finish = (yes) => {
+    el('deleteModal').hidden = true;
+    if (el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed = true;
+    if (yes) onYes();
+  };
+  el('deleteYesBtn').onclick = () => finish(true);
+  el('deleteCancelBtn').onclick = () => finish(false);
+  setTimeout(() => el('deleteYesBtn').focus(), 0);
+}
+
 /// Right-click menu for a remote file/dir (selection-aware).
 function openSftpFileMenu(x, y, tabId, entry) {
   closeKeyConnectMenu();
@@ -808,12 +832,12 @@ function openSftpFileMenu(x, y, tabId, entry) {
   mk(multi ? `Download ${selected.length} items` : 'Download', 'download', () =>
     queueDownloads(tabId, selectedPaths.length ? selectedPaths : [fullPath]));
   if (!multi && !entry.isDir) {
-    mk('Download as…', 'download', () => sftpDownloadTo(tabId, fullPath, entry.name));
+    mk('Download as...', 'download', () => sftpDownloadTo(tabId, fullPath, entry.name));
     mk('Open with system app', 'pencil', () => sftpOpenForEdit(tabId, fullPath, entry.name));
   }
-  mk('File permissions…', 'settings', () => openChmodDialog(tabId, multi ? selectedPaths : [fullPath], entry));
-  mk(multi ? `Rename… (${selected[0]} +${selected.length - 1})` : 'Rename…', 'pencil', async () => {
-    if (multi) { toast('Rename applies to a single item — select one.', 'info'); return; }
+  mk('File permissions...', 'settings', () => openChmodDialog(tabId, multi ? selectedPaths : [fullPath], entry));
+  mk(multi ? `Rename... (${selected[0]} +${selected.length - 1})` : 'Rename...', 'pencil', async () => {
+    if (multi) { toast('Rename applies to a single item - select one.', 'info'); return; }
     promptModal('Rename', 'New name:', entry.name, async (newName) => {
       if (!newName || newName === entry.name) return;
       try {
@@ -825,19 +849,32 @@ function openSftpFileMenu(x, y, tabId, entry) {
   });
   mk(multi ? `Delete ${selected.length} items` : 'Delete', 'trash-2', async () => {
     const paths = selectedPaths.length ? selectedPaths : [fullPath];
-    if (!confirm(`Delete ${paths.length === 1 ? `"${paths[0]}"` : paths.length + ' items'}?`)) return;
-    let ok = 0, fail = 0, lastErr = null;
-    for (const p of paths) {
-      const name = p.split('/').filter(Boolean).pop();
-      const isDir = (tab._entries || []).find(e => e.name === name)?.isDir ?? false;
-      try {
-        await sftpCall('sftp_remove', { sessionId: tab.sessionId, path: p, isDir });
-        ok++;
-      } catch (e) { fail++; lastErr = (e && (e.message || e.error)) || String(e); }
-    }
-    sftpLog(tabId, `delete ${ok} item(s)${fail ? `, ${fail} failed` : ''}`);
-    if (fail) toast(`${ok} deleted, ${fail} failed.${lastErr ? ' ' + lastErr : ''}`, 'err');
-    await refreshSftpPanel(tabId);
+    const firstName = paths[0].split('/').filter(Boolean).pop();
+    const firstIsDir = (tab._entries || []).find(e => e.name === firstName)?.isDir ?? false;
+    const message = paths.length === 1
+      ? (firstIsDir
+        ? `Are you sure you want to delete the folder "${firstName}" and everything inside it?`
+        : `Are you sure you want to delete "${firstName}"?`)
+      : `Are you sure you want to delete these ${paths.length} items?`;
+    sftpConfirmDelete(message, async () => {
+      if (sftpDeleteInFlight) { toast('A delete is already in progress - one moment.', 'info'); return; }
+      sftpDeleteInFlight = true;
+      toast(paths.length === 1 ? `Deleting "${firstName}"...` : `Deleting ${paths.length} items...`, 'info');
+      let ok = 0, fail = 0, lastErr = null;
+      for (const p of paths) {
+        const name = p.split('/').filter(Boolean).pop();
+        const isDir = (tab._entries || []).find(e => e.name === name)?.isDir ?? false;
+        try {
+          await sftpCall('sftp_remove', { sessionId: tab.sessionId, path: p, isDir });
+          ok++;
+        } catch (e) { fail++; lastErr = (e && (e.message || e.error)) || String(e); }
+      }
+      sftpDeleteInFlight = false;
+      sftpLog(tabId, `delete ${ok} item(s)${fail ? `, ${fail} failed` : ''}`);
+      if (fail) toast(`${ok} deleted, ${fail} failed.${lastErr ? ' ' + lastErr : ''}`, 'err');
+      else if (ok) toast(paths.length === 1 ? `Deleted "${firstName}".` : `Deleted ${ok} items.`, 'ok');
+      await refreshSftpPanel(tabId);
+    });
   });
   mk('Copy path', 'copy', () => copyText(fullPath).then(ok => ok && toast('Path copied.', 'ok')));
   mk('Copy URL (sftp://)', 'copy', () => {
@@ -865,7 +902,7 @@ function openSftpFileMenu(x, y, tabId, entry) {
     sendLabel.className = 'ctx-item';
     sendLabel.style.cursor = 'default';
     sendLabel.style.opacity = '0.6';
-    sendLabel.innerHTML = `${ico('send')}<span>Send to…</span>`;
+    sendLabel.innerHTML = `${ico('send')}<span>Send to...</span>`;
     menu.appendChild(sendLabel);
     for (const other of others) {
       const b = document.createElement('button');
@@ -899,8 +936,8 @@ function openChmodDialog(tabId, paths, entry) {
   if (!modal) { toast('chmod dialog missing from page.', 'err'); return; }
   const title = document.getElementById('chmodTitle');
   title.textContent = paths.length === 1
-    ? `Permissions — ${paths[0].split('/').filter(Boolean).pop()}`
-    : `Permissions — ${paths.length} items`;
+    ? `Permissions - ${paths[0].split('/').filter(Boolean).pop()}`
+    : `Permissions - ${paths.length} items`;
 
   const boxes = {}; // rwx × owner/group/other
   for (const who of ['owner', 'group', 'other']) {
@@ -969,7 +1006,7 @@ function openChmodDialog(tabId, paths, entry) {
         changed += r.changed || 1;
       } catch { fail++; }
     }
-    sftpLog(tabId, `chmod ${toOctal()} on ${paths.length} path(s) — ${changed} changed${fail ? `, ${fail} failed` : ''}`);
+    sftpLog(tabId, `chmod ${toOctal()} on ${paths.length} path(s) - ${changed} changed${fail ? `, ${fail} failed` : ''}`);
     toast(fail ? `${changed} updated, ${fail} failed.` : `Permissions set (${toOctal()}).`, fail ? 'err' : 'ok');
     close();
     refreshSftpPanel(tabId);
@@ -998,7 +1035,7 @@ async function runSearch(tabId, query) {
   const status = document.getElementById('sftpSearchStatus-' + tabId);
   if (!results || !status) return;
   results.innerHTML = '';
-  status.textContent = 'Searching…';
+  status.textContent = 'Searching...';
   sftpLog(tabId, `search "${query}" under ${tab.sftpPath}`);
   let count = 0;
 
@@ -1079,7 +1116,7 @@ async function openBookmarkMenu(ev, tabId) {
   menu.appendChild(sep);
   const addBtn = document.createElement('button');
   addBtn.className = 'ctx-item';
-  addBtn.innerHTML = `${ico('plus')}<span>Bookmark this directory…</span>`;
+  addBtn.innerHTML = `${ico('plus')}<span>Bookmark this directory...</span>`;
   addBtn.addEventListener('click', () => {
     closeKeyConnectMenu();
     promptModal('Bookmark', `Name for ${tab.sftpPath}:`, tab.sftpPath.split('/').filter(Boolean).pop() || 'root', async (name) => {
@@ -1156,13 +1193,13 @@ async function sftpUiLocalLoad(tabId) {
     const tdSize = document.createElement('td');
     if (entry.isDir) {
       tdSize.className = 'sftp-dirsize';
-      tdSize.textContent = '—';
+      tdSize.textContent = '-';
       tdSize.title = 'Directory';
     } else {
       tdSize.textContent = formatSftpSize(entry.size);
     }
     const tdMod = document.createElement('td');
-    tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '—';
+    tdMod.textContent = entry.modifiedMs ? fmtTime(new Date(entry.modifiedMs).toISOString()) : '-';
     tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
     tr.addEventListener('dblclick', () => {
       if (entry.isDir) {
@@ -1251,17 +1288,17 @@ async function queueDownloads(tabId, remotePaths) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   // Plain "Download" lands in the local pane's current directory. If the
-  // local pane isn't open, open it so the destination is always visible —
-  // never a hidden temp folder. Explicit placement stays on "Download as…".
+  // local pane isn't open, open it so the destination is always visible -
+  // never a hidden temp folder. Explicit placement stays on "Download as...".
   sftpTabState(tab);
   if (!tab.dualPane) toggleDualPane(tabId);
   if (!tab.localPath) {
-    // Local listing hasn't loaded yet (toggle just opened it) — wait briefly.
+    // Local listing hasn't loaded yet (toggle just opened it) - wait briefly.
     await new Promise(r => setTimeout(r, 600));
   }
   const dir = tab.localPath || null;
   if (!dir) {
-    toast('Local pane is still loading — try again in a moment.', 'err');
+    toast('Local pane is still loading - try again in a moment.', 'err');
     return;
   }
   try {
@@ -1327,7 +1364,7 @@ async function queueUploads(tabId, pairs) {
         const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: dir });
         remoteEntries.set(dir, new Map((r.entries || []).map(e => [e.name, e])));
       } catch (e) {
-        // Destination dir unreadable/missing — no conflict possible; the
+        // Destination dir unreadable/missing - no conflict possible; the
         // backend will surface the real error if the upload can't proceed.
         continue;
       }
@@ -1346,7 +1383,7 @@ async function queueUploads(tabId, pairs) {
         if (d.action === 'skip') continue;
         // NOTE: resume:'resume' is honored by the backend once the
         // resume/.part update lands (Agent B); today the backend treats it
-        // as a plain overwrite — acceptable interim fallback.
+        // as a plain overwrite - acceptable interim fallback.
         items.push({ local: pair.local, remote: d.action === 'rename' ? d.renameRemote : pair.remote, resume: d.action });
       } else {
         items.push({ local: pair.local, remote: pair.remote, resume: 'overwrite' });
@@ -1387,7 +1424,7 @@ function sftpConflictDefault(direction) {
   const key = direction === 'upload' ? 'sftpConflictUpload' : 'sftpConflictDownload';
   let v = (state.settings && state.settings[key]) || sftpConflictDefaults[key] || 'ask';
   // Download rename needs the backend `localName` field (remote-basename
-  // derivation can't be redirected today) — asking beats silently
+  // derivation can't be redirected today) - asking beats silently
   // overwriting when the user asked for a rename.
   if (direction === 'download' && v === 'rename') v = 'ask';
   return CONFLICT_ACTIONS.includes(v) && v !== 'ask' ? v : 'ask';
@@ -1400,7 +1437,7 @@ function splitExt(name) {
 }
 
 /// First name of the form "name (n).ext" (n starting at 1) that is NOT
-/// taken in `taken` — the FileZilla auto-rename scheme. The original name
+/// taken in `taken` - the FileZilla auto-rename scheme. The original name
 /// is already taken (that's why we're renaming).
 function sftpFreeName(name, taken) {
   const [base, ext] = splitExt(name);
@@ -1418,15 +1455,15 @@ function sftpConflictMtimeNote(srcMs, dstMs) {
 }
 
 function fmtSftpTime(ms) {
-  if (!ms) return '—';
+  if (!ms) return '-';
   const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  return Number.isNaN(d.getTime()) ? '-' : d.toLocaleString();
 }
 
 /// Decide the action for every conflict in a batch. Returns an array of
 /// { ..., action, renameRemote?/localName? } for the conflicted items only,
 /// or null when the user cancels the whole batch. Non-conflicting items are
-/// never blocked — they enqueue as overwrite.
+/// never blocked - they enqueue as overwrite.
 async function resolveBatchConflicts(tabId, direction, conflicts) {
   if (!conflicts.length) return [];
   const tab = sftpTab(tabId);
@@ -1465,13 +1502,13 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
 
     // Source side info (for size/mtime comparison). Uploads: stat the local
     // files via the local pane's dir; downloads: stat remote via list_dir of
-    // the parent (already fetched by the caller when possible — refetch here
+    // the parent (already fetched by the caller when possible - refetch here
     // to keep this self-contained).
     listEl.innerHTML = '';
     const rows = [];
     let srcEntryPromise;
     if (isUp) {
-      // Local source stats — group by source dir.
+      // Local source stats - group by source dir.
       srcEntryPromise = (async () => {
         const dirs = new Map();
         for (const c of conflicts) {
@@ -1500,7 +1537,7 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
       cmp.className = 'conflict-cmp';
       const srcCell = document.createElement('span');
       const dstCell = document.createElement('span');
-      srcCell.textContent = '…'; dstCell.textContent = '…';
+      srcCell.textContent = '...'; dstCell.textContent = '...';
       cmp.appendChild(srcCell); cmp.appendChild(dstCell);
       row.appendChild(cmp);
       // Fill in source stats asynchronously.
@@ -1648,18 +1685,18 @@ async function sftpOpenForEdit(tabId, fullPath, name) {
     const r = await sftpCall('sftp_open_for_edit', { sessionId: tab.sessionId, remote: fullPath });
     await call('system_open_external', { url: r.localPath });
     sftpLog(tabId, `editing ${name} (auto-sync on save)`);
-    toast(`Editing ${name} — saves upload automatically.`, 'info');
+    toast(`Editing ${name} - saves upload automatically.`, 'info');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
 // Server-to-server "Send to": enqueues a queue job that downloads from the
 // source and uploads to the target on fresh SFTP channels (the interactive
-// browse sessions are never used — some servers fail reads on the
+// browse sessions are never used - some servers fail reads on the
 // long-lived channel). Progress shows in the transfer queue panel.
 async function sftpSendTo(fromTabId, fullPath, targetTab) {
   try {
     const name = fullPath.split('/').filter(Boolean).pop() || 'file';
-    terminalSetStatus(`Sending ${name} to ${targetTab.serverName}…`);
+    terminalSetStatus(`Sending ${name} to ${targetTab.serverName}...`);
     await sftpCall('sftp_server_copy', {
       fromSessionId: state.sessions.get(fromTabId)?.sessionId,
       remote: fullPath,
@@ -1667,7 +1704,7 @@ async function sftpSendTo(fromTabId, fullPath, targetTab) {
       targetDir: targetTab.sftpPath || '/',
     });
     terminalSetStatus(`Sent ${name} to ${targetTab.serverName}.`);
-    toast(`Sending ${name} to ${targetTab.serverName} — see Transfers.`, 'ok');
+    toast(`Sending ${name} to ${targetTab.serverName} - see Transfers.`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
@@ -1687,23 +1724,23 @@ function wireQueueEvents() {
       if (j.state === 'failed' && !j._logged) {
         j._logged = true;
         const tab = [...state.sessions.values()].find(t => t.sessionId === j.sessionId);
-        if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath || j.localPath} — ${j.error || 'error'}`);
+        if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath || j.localPath} - ${j.error || 'error'}`);
       }
     }
     renderQueuePanel();
   }).then(un => { queueUnlisten = un; });
 }
 
-/// ETA from remaining bytes / speed. '—' when speed is 0/unknown or all done.
+/// ETA from remaining bytes / speed. '-' when speed is 0/unknown or all done.
 /// serverCopy progress counts both halves, so remaining uses 2×size (matching
 /// the progress bar's totalUnits).
 function sftpUiQueueEta(j, shownDone) {
-  if (j.state === 'done') return '—';
+  if (j.state === 'done') return '-';
   const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
   const done = j.kind === 'serverCopy' ? (j.bytesDone || 0) : (shownDone || 0);
   const remaining = totalUnits > 0 ? Math.max(0, totalUnits - done) : 0;
   const speed = j.speed || 0;
-  if (speed <= 0 || remaining <= 0) return '—';
+  if (speed <= 0 || remaining <= 0) return '-';
   const secs = Math.ceil(remaining / speed);
   if (secs < 60) return secs + 's';
   if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
@@ -1736,7 +1773,7 @@ function buildQueuePanel() {
   document.addEventListener('mouseup', () => { qDrag = null; });
 
   // Head: title / summary / tabs / actions. Extra action buttons (pause,
-  // priority, …) append to .sftp-queueactions-head without layout changes.
+  // priority, ...) append to .sftp-queueactions-head without layout changes.
   const head = document.createElement('div');
   head.className = 'sftp-queuehead';
   const title = document.createElement('span');
@@ -1854,7 +1891,7 @@ function renderQueuePanel() {
     const progress = j.size
       ? `${formatSftpSize(shownDone || 0)} / ${formatSftpSize(j.size)}`
       : formatSftpSize(shownDone || 0);
-    const speed = j.speed ? (j.speed / 1024).toFixed(1) + ' KB/s' : '—';
+    const speed = j.speed ? (j.speed / 1024).toFixed(1) + ' KB/s' : '-';
     const eta = sftpUiQueueEta(j, shownDone);
 
     row.innerHTML = `
@@ -1977,7 +2014,7 @@ function sftpDndPayload(ev) {
         if (!raw) return null;
         const data = JSON.parse(raw);
         return { type, data };
-      } catch { return null; } // malformed payload — ignore the gesture
+      } catch { return null; } // malformed payload - ignore the gesture
     }
   }
   return null;
@@ -2102,7 +2139,7 @@ document.addEventListener('drop', (ev) => {
   if (row && row.dataset.isdir === '1') return;
   if (payload.type === 'text/sftp-local') {
     // Local → remote pane cwd (upload). If the drop was over the LOCAL pane,
-    // a local→local move is not supported — treat as no-op.
+    // a local→local move is not supported - treat as no-op.
     if (ev.target.closest && ev.target.closest('.sftp-local')) return;
     queueUploads(tab.tabId, [{ local: payload.data.path, remote: sftpJoin(tab.sftpPath, payload.data.name) }]);
   } else if (payload.type === 'text/sftp-remote') {
@@ -2128,11 +2165,11 @@ document.addEventListener('dragleave', (ev) => {
 //
 // FileZilla-parity directory comparison: tint rows in both panes to show which
 // files exist on only one side (yellow) or differ between sides (red), in two
-// modes — by file size or by modification time. Self-contained section; hooks
+// modes - by file size or by modification time. Self-contained section; hooks
 // in refreshSftpPanel / refreshLocalPane / renderEntries call sftpCmpAfterRefresh
 // guarded with typeof checks, so merging with parallel work stays clean.
 
-// mtime comparison tolerance in ms — two files whose mtimes differ by less
+// mtime comparison tolerance in ms - two files whose mtimes differ by less
 // than this are considered identical (clock skew + FAT-style 2s granularity).
 const sftpCmpMtimeToleranceMs = 60 * 1000;
 
@@ -2194,7 +2231,7 @@ function sftpCmpAfterRefresh(tabId) {
 }
 
 /// Compute the comparison between tab._localEntries and tab._entries and
-/// tint rows in both panes. Files only — directories stay neutral.
+/// tint rows in both panes. Files only - directories stay neutral.
 function sftpCmpRun(tabId) {
   const tab = sftpTab(tabId);
   if (!tab || !tab.dualPane) return;
@@ -2288,7 +2325,7 @@ function sftpCmpUpdateButton(tabId) {
   const span = btn.querySelector('span');
   if (span) span.textContent = mode === 'size' ? 'Cmp·size' : mode === 'mtime' ? 'Cmp·mtime' : 'Compare';
   btn.title = mode
-    ? `Comparing by ${mode === 'size' ? 'file size' : 'modified time'} — click or Ctrl+Y to change`
+    ? `Comparing by ${mode === 'size' ? 'file size' : 'modified time'} - click or Ctrl+Y to change`
     : 'Compare directories (Ctrl+Y): off → by size → by mtime';
 }
 
@@ -2307,7 +2344,7 @@ document.addEventListener('keydown', (ev) => {
 //
 // FileZilla-parity synchronized browsing: when enabled with the dual pane
 // open, navigating into a directory (or up) on one side mirrors the other.
-// The anchor is the local↔remote path pair at the moment sync is enabled —
+// The anchor is the local↔remote path pair at the moment sync is enabled -
 // mirroring is structural (same subdir name / one level up), not an absolute
 // path mapping. If the mirrored directory doesn't exist, sync is suspended
 // with a toast until the two sides realign at a shared level.
@@ -2345,7 +2382,7 @@ function sftpSyncUpdateButton(tabId) {
   if (!btn) return;
   btn.classList.toggle('active', sftpSyncTabs.has(tabId));
   btn.title = sftpSyncTabs.has(tabId)
-    ? 'Synchronized browsing is ON — click or Ctrl+Shift+B to turn off'
+    ? 'Synchronized browsing is ON - click or Ctrl+Shift+B to turn off'
     : 'Synchronized browsing (Ctrl+Shift+B): mirror navigation in both panes';
 }
 
@@ -2359,7 +2396,7 @@ function sftpSyncActive(tabId) {
 /// Suspend sync for this tab and explain why (missing mirror directory).
 function sftpSyncSuspend(tabId, side, name) {
   if (!sftpSyncTabs.delete(tabId)) return;
-  toast(`${side} ${name} doesn't exist — sync paused for this level`, 'warn');
+  toast(`${side} ${name} doesn't exist - sync paused for this level`, 'warn');
   sftpLog(tabId, `synchronized browsing suspended: ${side} "${name}" has no mirror`);
   sftpSyncUpdateButton(tabId);
 }
