@@ -34,6 +34,7 @@
   --ok:            #34d399;
   --ok-rgb:        52, 211, 153;
   --warn:          #f5b544;
+  --warn-rgb:      245, 181, 68;
   --danger:        #f4717d;
   --danger-rgb:    244, 113, 125;
 
@@ -743,31 +744,55 @@ label:focus-within { color: var(--text); }
    Toast
    ========================================================================== */
 
+/* Toast stack. #toast is the container; each message is a .toast-item, so a
+   batch reporting several failures shows all of them instead of the last one
+   overwriting the rest.
+
+   The kind classes are err/warn/ok/info, matching what toast() is actually
+   called with. The previous rule styled `.error`, which no call site ever
+   passed — all 108 error toasts rendered in neutral styling with no red. */
 #toast {
   position: fixed; bottom: 22px; left: 50%;
-  transform: translateX(-50%) translateY(8px);
+  transform: translateX(-50%);
+  z-index: 99;
+  display: flex; flex-direction: column-reverse; align-items: center; gap: 8px;
+  pointer-events: none;               /* the page stays clickable between toasts */
+  max-width: min(560px, calc(100vw - 32px));
+}
+.toast-item {
+  pointer-events: auto;               /* but each toast is dismissible */
   background: #1a2130;
   border: 1px solid var(--line-strong);
   color: var(--text);
-  padding: 10px 18px;
+  padding: 10px 10px 10px 18px;
   border-radius: 10px;
   font-size: 13px;
   box-shadow: 0 12px 34px rgba(0,0,0,0.5);
-  opacity: 0; pointer-events: none;
-  transition: opacity 0.18s ease, transform 0.18s ease;
-  z-index: 99;
-  max-width: 560px;
   display: flex; align-items: center; gap: 9px;
+  max-width: 100%;
+  animation: toastIn 0.18s ease;
 }
-#toast::before {
+@keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.toast-item.leaving { opacity: 0; transition: opacity 0.18s ease; }
+.toast-item::before {
   content: ""; width: 7px; height: 7px; flex: none; border-radius: 50%;
   background: var(--accent);
 }
-#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-#toast.error { border-color: rgba(var(--danger-rgb), 0.5); color: #fecaca; }
-#toast.error::before { background: var(--danger); }
-#toast.ok { border-color: rgba(var(--ok-rgb), 0.4); }
-#toast.ok::before { background: var(--ok); }
+/* Long server-supplied error text wraps rather than stretching the toast off
+   screen; the container is already capped to the viewport above. */
+.toast-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast-dismiss {
+  flex: none; background: none; border: 0; cursor: pointer;
+  color: var(--text-faint); font-size: 16px; line-height: 1;
+  padding: 2px 4px; border-radius: 5px;
+}
+.toast-dismiss:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+.toast-item.err  { border-color: rgba(var(--danger-rgb), 0.5); color: #fecaca; }
+.toast-item.err::before  { background: var(--danger); }
+.toast-item.warn { border-color: rgba(var(--warn-rgb), 0.45); }
+.toast-item.warn::before { background: var(--warn); }
+.toast-item.ok   { border-color: rgba(var(--ok-rgb), 0.4); }
+.toast-item.ok::before   { background: var(--ok); }
 
 /* ==========================================================================
    Scrollbars
@@ -1730,10 +1755,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 /* ─── directory comparison tints (agent-e) ─────────────────────────────
    FileZilla-style: yellow = only on this side, red = differs between
    sides, green = identical. Subtle background tint + thin left border,
-   consistent with .sftp-entry.selected. --warn-rgb is not defined in the
-   token block, so warn tints use the literal #f5b544 components. */
+   consistent with .sftp-entry.selected. */
 .sftp-entry.sftp-cmp-only {
-  background: rgba(245, 181, 68, 0.10);
+  background: rgba(var(--warn-rgb), 0.10);
   box-shadow: inset 3px 0 var(--warn);
 }
 .sftp-entry.sftp-cmp-only td:first-child { color: var(--warn); }

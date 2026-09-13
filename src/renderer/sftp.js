@@ -1368,12 +1368,34 @@ function sftpConfirmDelete(message, onYes) {
   el('deleteModal').hidden = false;
   const finish = (yes) => {
     el('deleteModal').hidden = true;
-    if (el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed = true;
+    // Only a confirmed delete may disarm the prompt. Reading the checkbox on
+    // every exit meant ticking it and then backing out via Cancel still
+    // switched the safety prompt off for the session, so the NEXT delete —
+    // one the user never agreed to skip confirming — went through silently.
+    if (yes && el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed = true;
+    document.removeEventListener('keydown', onKey, true);
+    el('deleteModal').removeEventListener('click', onBackdrop);
     if (yes) onYes();
   };
+  function onKey(ev) {
+    if (ev.key !== 'Escape') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    finish(false);
+  }
+  function onBackdrop(ev) {
+    if (ev.target === el('deleteModal')) finish(false);
+  }
   el('deleteYesBtn').onclick = () => finish(true);
   el('deleteCancelBtn').onclick = () => finish(false);
-  setTimeout(() => el('deleteYesBtn').focus(), 0);
+  // Escape and a backdrop click both mean "no" — abandoning a destructive
+  // prompt must never be harder than confirming it, and both exits are the
+  // safe answer. Capture phase so the dialog wins over any handler behind it.
+  document.addEventListener('keydown', onKey, true);
+  el('deleteModal').addEventListener('click', onBackdrop);
+  // Focus Cancel, not Yes: a reflexive Enter or Space on a delete prompt must
+  // not be the thing that deletes.
+  setTimeout(() => el('deleteCancelBtn').focus(), 0);
 }
 
 /// Rename flow shared by the context menu's "Rename..." item and the F2
@@ -1622,7 +1644,20 @@ function openChmodDialog(tabId, paths, entry) {
     } catch { fromOctal(0o644); }
   })();
 
-  const close = () => { modal.hidden = true; };
+  const close = () => {
+    modal.hidden = true;
+    document.removeEventListener('keydown', onKey, true);
+  };
+  // Escape closes without applying, matching the backdrop click below. Capture
+  // phase and stopPropagation so the keystroke cannot also reach a handler for
+  // whatever is open behind this dialog.
+  function onKey(ev) {
+    if (ev.key !== 'Escape') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    close();
+  }
+  document.addEventListener('keydown', onKey, true);
   cancelBtn.onclick = close;
   modal.onclick = (ev) => { if (ev.target === modal) close(); };
 
@@ -2256,7 +2291,19 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
     const close = () => {
       modal.hidden = true;
       applyBtn.onclick = null; cancelBtn.onclick = null; closeBtn.onclick = null; modal.onclick = null;
+      document.removeEventListener('keydown', onKey, true);
     };
+    // Escape means "cancel the whole batch", the same as the X and Cancel
+    // buttons — it must resolve(null) too, or the transfer awaiting this
+    // promise would hang forever with the dialog gone.
+    function onKey(ev) {
+      if (ev.key !== 'Escape') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      close();
+      resolve(null);
+    }
+    document.addEventListener('keydown', onKey, true);
     const finish = () => {
       const out = [];
       for (const { c, actions } of rows) {
