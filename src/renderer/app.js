@@ -406,6 +406,15 @@ function keysInCategoryRecursive(catId) {
   return state.keys.filter(k => ids.has(k.id));
 }
 
+/// The key list the UI renders: the active CATEGORY narrows the pool first,
+/// then the search box and the type filter narrow it further.
+///
+/// There used to be a second `function filteredKeys()` further down this file
+/// that applied only the search and type filters. Function declarations hoist,
+/// so the later one silently replaced this one for the single caller
+/// (renderKeyList) — and the category filter did nothing at all. Selecting a
+/// category in the sidebar rendered every key in the vault, which also made
+/// "All categories" and a specific category look identical.
 function filteredKeys() {
   const q = el('searchInput').value.trim().toLowerCase();
   const type = el('typeFilter').value;
@@ -1194,20 +1203,6 @@ function updateSelectionHint() {
       ? (n === 1 ? '1 key staged for deploy' : n + ' keys staged for deploy')
       : (state.keys.length === 1 ? '1 key in vault' : state.keys.length + ' keys in vault');
   }
-}
-
-function filteredKeys() {
-  const q = el('searchInput').value.trim().toLowerCase();
-  const type = el('typeFilter').value;
-  return state.keys.filter(k => {
-    if (type && k.key_type !== type) {
-      // "ecdsa" filter matches any ecdsa-p256/p384/p521 variant
-      if (type !== 'ecdsa' || !k.key_type.startsWith('ecdsa')) return false;
-    }
-    if (!q) return true;
-    const hay = [k.name, k.comment, k.fingerprint_sha256].filter(Boolean).join(' ').toLowerCase();
-    return hay.includes(q);
-  });
 }
 
 function renderKeyList() {

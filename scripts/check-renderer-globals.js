@@ -32,9 +32,14 @@ const FILES = ['src/renderer/app.js', 'src/renderer/sftp.js', 'src/renderer/term
 const OWNED = /^(sftp|terminal|vault|key|category|server|queue|render|refresh|build|show|open|close|update|toast|el|call|ico|escapeHtml|fmt|format|join|state|system|bw)[A-Za-z0-9_]*$/;
 
 const sources = new Map();
+const rawSources = new Map();
 for (const rel of FILES) {
   const abs = path.join(ROOT, rel);
-  if (fs.existsSync(abs)) sources.set(rel, fs.readFileSync(abs, 'utf8'));
+  if (fs.existsSync(abs)) {
+    const text = fs.readFileSync(abs, 'utf8');
+    sources.set(rel, text);
+    rawSources.set(rel, text);
+  }
 }
 
 /** Strip comments and string/template literals so they cannot produce hits. */
@@ -135,13 +140,25 @@ const problems = [];
 //   * markTerminalBell called `window.markTerminalBell(...)`, which after the
 //     replacement was itself — infinite recursion on every background-tab bell.
 for (const [name, sites] of topLevel) {
+  if (sites.length < 2) continue;
   const files = new Set(sites.map((s2) => s2.file));
-  if (files.size < 2) continue;
   const where = sites.map((s2) => `${s2.file}:${s2.line}`).join(', ');
-  problems.push(
-    `'${name}' is declared at top level in more than one renderer script: ${where}\n` +
-    `        They share one global scope, so the last one loaded silently replaces the others.`
-  );
+  if (files.size > 1) {
+    problems.push(
+      `'${name}' is declared at top level in more than one renderer script: ${where}\n` +
+      `        They share one global scope, so the last one loaded silently replaces the others.`
+    );
+  } else {
+    // Same file, declared twice. Function declarations hoist, so the LAST one
+    // wins for every caller — including callers written against the first.
+    // app.js carried two `filteredKeys`: the first applied the active category
+    // filter, the second only search and type. The second won, so selecting a
+    // category never filtered the key list.
+    problems.push(
+      `'${name}' is declared ${sites.length} times at top level in one file: ${where}\n` +
+      `        The last declaration wins for every caller; the earlier ones are dead.`
+    );
+  }
 }
 
 for (const [rel, s] of scrubbed) {
@@ -157,6 +174,53 @@ for (const [rel, s] of scrubbed) {
       problems.push(`${rel}:${idx + 1}  calls '${name}(...)', which is never defined in any renderer script`);
     }
   });
+}
+
+// ---- Element ids looked up but never created ------------------------------
+// `el('x')` and `getElementById('x')` return null for an id that does not
+// exist, and the very next `.value` / `.textContent` / `.addEventListener`
+// throws. Collect every id the page declares statically plus every id the
+// renderer assigns at runtime, then flag lookups that can never match.
+{
+  const htmlPath = path.join(ROOT, 'src/renderer/index.html');
+  if (fs.existsSync(htmlPath)) {
+    const html = fs.readFileSync(htmlPath, 'utf8');
+    const staticIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
+    const exactIds = new Set();
+    const prefixes = new Set();
+    for (const [, raw] of rawSources) {
+      for (const m of raw.matchAll(/\.id\s*=\s*'([^']+)'\s*\+/g)) prefixes.add(m[1]);
+      for (const m of raw.matchAll(/\.id\s*=\s*`([^`$]*)\$\{/g)) prefixes.add(m[1]);
+      for (const m of raw.matchAll(/\bid="([^"$]*)\$\{/g)) prefixes.add(m[1]);
+      for (const m of raw.matchAll(/\.id\s*=\s*'([^']+)'\s*;/g)) exactIds.add(m[1]);
+      for (const m of raw.matchAll(/\.id\s*=\s*`([^`$]+)`/g)) exactIds.add(m[1]);
+      for (const m of raw.matchAll(/\bid="([^"$]+)"/g)) exactIds.add(m[1]);
+    }
+    const known = (id) =>
+      staticIds.has(id) ||
+      exactIds.has(id) ||
+      [...prefixes].some((p2) => id.startsWith(p2));
+    const knownPrefix = (pfx) =>
+      prefixes.has(pfx) ||
+      [...staticIds].some((x) => x.startsWith(pfx)) ||
+      [...exactIds].some((x) => x.startsWith(pfx));
+
+    for (const [rel, raw] of rawSources) {
+      raw.split('\n').forEach((line, idx) => {
+        if (/^\s*(\/\/|\*)/.test(line)) return;
+        for (const m of line.matchAll(/(?:\bel|getElementById)\(\s*'([^']+)'\s*\)/g)) {
+          if (!known(m[1])) {
+            problems.push(`${rel}:${idx + 1}  looks up element id '${m[1]}', which is never created`);
+          }
+        }
+        for (const m of line.matchAll(/(?:\bel|getElementById)\(\s*'([^']*)'\s*\+/g)) {
+          if (!knownPrefix(m[1])) {
+            problems.push(`${rel}:${idx + 1}  looks up ids starting '${m[1]}', but nothing creates one`);
+          }
+        }
+      });
+    }
+  }
 }
 
 console.log(`Checked ${scrubbed.size} renderer scripts; ${defined.size} names in scope.`);
