@@ -119,7 +119,7 @@ impl VaultPasswordStore {
 /// Argon2id-plus-backoff speed even for a local caller. This is defense in
 /// depth, not the primary control: the at-rest Argon2id hash resists offline
 /// guessing regardless, and an attacker able to restart the app clears this
-/// in-memory state — but also loses nothing, since there is nothing to gain
+/// in-memory state - but also loses nothing, since there is nothing to gain
 /// from the IPC path that the DB file does not offer offline.
 pub struct UnlockThrottle {
     state: std::sync::Mutex<ThrottleState>,
@@ -205,7 +205,7 @@ fn verify_master_password(db: &db::Database, password: &str) -> Result<bool, Str
             .is_ok())
     } else {
         // Legacy plaintext verifier (pre-Argon2id vaults): compare in constant
-        // time — a short-circuiting `==` on a password would leak the stored
+        // time - a short-circuiting `==` on a password would leak the stored
         // verifier byte-by-byte through timing. This path disappears on the
         // first successful unlock, which upgrades it to Argon2id.
         let ok = crate::crypto::utils::constant_time_eq(stored.as_bytes(), password.as_bytes());
@@ -308,19 +308,82 @@ pub fn vault_unlock(app: AppHandle, password: String) -> CmdResult<serde_json::V
 
 #[tauri::command]
 pub fn vault_lock(app: AppHandle) -> CmdResult<serde_json::Value> {
-    // Kill every live interactive SSH session BEFORE clearing the master
-    // password; sessions that survive into a locked vault would otherwise be
-    // using unsealed key material with no way to re-derive it.
+    lock_vault_internal(&app);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Shared teardown for manual lock and the backend idle watchdog: kill every
+/// live interactive SSH session BEFORE clearing the master password; sessions
+/// that survive into a locked vault would otherwise be using unsealed key
+/// material with no way to re-derive it.
+pub(crate) fn lock_vault_internal(app: &AppHandle) {
     app.state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
         .kill_all();
     app.state::<crate::sftp::EditRegistry>().stop_all();
     app.state::<crate::sftp::KeepaliveRegistry>().stop_all();
     app.state::<VaultPasswordStore>().clear();
-    app.state::<AppState>()
-        .db
-        .add_audit("vault.lock", None, "")
-        .map_err(|e| e.to_string())?;
+    let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
+}
+
+/// Last time the renderer signalled it is alive (`heartbeat` IPC). The
+/// backend idle watchdog uses it to enforce `autoLockMinutes` even when the
+/// renderer cannot - a hung or crashed webview stops heartbeating, and the
+/// vault locks on the Rust side instead of staying unsealed forever.
+pub struct ActivityTracker(std::sync::Mutex<std::time::Instant>);
+
+impl ActivityTracker {
+    pub fn new() -> Self {
+        Self(std::sync::Mutex::new(std::time::Instant::now()))
+    }
+    pub fn touch(&self) {
+        *self.0.lock().unwrap() = std::time::Instant::now();
+    }
+    pub fn elapsed(&self) -> std::time::Duration {
+        std::time::Instant::now().duration_since(*self.0.lock().unwrap())
+    }
+}
+
+#[tauri::command]
+pub fn heartbeat(app: AppHandle) -> CmdResult<serde_json::Value> {
+    app.state::<ActivityTracker>().touch();
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Background task enforcing the auto-lock setting on the Rust side. The
+/// renderer's own timer remains the primary UX path; this watchdog covers
+/// the case where the renderer can no longer act (hung/crashed webview,
+/// closed window with a tray-resident process). Locks only when the vault is
+/// currently unlocked; `autoLockMinutes` of 0/absent disables it, matching
+/// the renderer's semantics.
+pub(crate) fn spawn_auto_lock_watchdog(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mins: i64 = app
+                .state::<AppState>()
+                .db
+                .get_config("setting.autoLockMinutes")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15);
+            if mins <= 0 {
+                continue;
+            }
+            let unlocked = app.state::<VaultPasswordStore>().get().is_some();
+            if !unlocked {
+                continue;
+            }
+            if app.state::<ActivityTracker>().elapsed()
+                >= std::time::Duration::from_secs((mins as u64).saturating_mul(60))
+            {
+                log::info!("[sshspan-vault] backend idle watchdog locked the vault after {mins} min without renderer activity");
+                lock_vault_internal(&app);
+                // Best effort: tell the renderer so its UI reflects the lock.
+                let _ = tauri::Emitter::emit(&app, "vault-locked-by-watchdog", ());
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -332,7 +395,7 @@ pub fn vault_change_password(
     if new_password.len() < 8 {
         return Err("New master password must be at least 8 characters.".into());
     }
-    // The current-password check is a password guess too — throttle it with
+    // The current-password check is a password guess too - throttle it with
     // the same counter as unlock attempts.
     let throttle = app.state::<UnlockThrottle>();
     throttle.check().map_err(CmdError::from)?;
@@ -413,7 +476,7 @@ fn migrate_vault_records(
     }
 
     // Saved server passwords are sealed with the same vault password, so they
-    // must be re-sealed too — otherwise every stored server password becomes
+    // must be re-sealed too - otherwise every stored server password becomes
     // unrecoverable after the change.
     let mut migrated_servers = Vec::with_capacity(servers.len());
     for mut server in servers {
@@ -552,7 +615,7 @@ mod tests {
         assert_eq!(key_plain, b"fake-private-key");
     }
 
-    /// A corrupted/unopenable sealed value must abort the whole migration —
+    /// A corrupted/unopenable sealed value must abort the whole migration -
     /// no silent plaintext fallback, no partial re-encryption.
     #[test]
     fn change_password_aborts_on_unsealable_blob() {
@@ -573,7 +636,7 @@ mod tests {
             err.0
         );
 
-        // Nothing was persisted — the stored blob still fails with the old pw.
+        // Nothing was persisted - the stored blob still fails with the old pw.
         let stored = db.get_server("srv-bad").unwrap().unwrap();
         assert!(crate::crypto::vault::unseal(
             "old-master-pw",
@@ -635,11 +698,84 @@ mod tests {
         assert!(validate_export_path(&target.display().to_string()).is_err());
     }
 
-    /// An absolute path outside the app data / system dirs is accepted.
+    /// Regression for the Windows verbatim-prefix guard bypass: a file that
+    /// ALREADY EXISTS inside the app data dir canonicalizes to a
+    /// `\\?\`-prefixed path under std::fs::canonicalize, which never matched
+    /// the plain app-data prefix - the guard fired only for not-yet-existing
+    /// paths. The anchor must hold for existing targets too (this is the
+    /// vault-overwrite case). Writes a throwaway file inside the app data
+    /// dir and removes it again.
+    #[test]
+    fn validate_export_path_rejects_existing_app_data_file() {
+        use directories::ProjectDirs;
+        let dir = ProjectDirs::from("org", "sshspan", "SSHSpan")
+            .expect("project dirs")
+            .data_dir()
+            .to_path_buf();
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("sshspan-guard-test.json");
+        std::fs::write(&target, b"").expect("create guard-test file");
+        let result = validate_export_path(&target.display().to_string());
+        let _ = std::fs::remove_file(&target);
+        assert!(
+            result.is_err(),
+            "an existing file inside the app data dir must be rejected"
+        );
+    }
+
+    /// The app data dir itself is not a legal write target.
+    #[test]
+    fn validate_export_path_rejects_app_data_dir_itself() {
+        use directories::ProjectDirs;
+        let app_data = ProjectDirs::from("org", "sshspan", "SSHSpan")
+            .expect("project dirs")
+            .data_dir()
+            .to_path_buf();
+        assert!(validate_export_path(&app_data.display().to_string()).is_err());
+    }
+
+    /// System-directory protection must also cover paths that do not exist
+    /// yet: the old Unix branch skipped the check entirely when
+    /// canonicalize() failed on the not-yet-created path.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn is_system_path_covers_nonexistent_paths() {
+        assert!(is_system_path(std::path::Path::new("/etc/sshspan-new")));
+        assert!(is_system_path(std::path::Path::new(
+            "/etc/does-not-exist/nested/file"
+        )));
+        assert!(!is_system_path(std::path::Path::new(
+            "/etc-backup/sshspan-new"
+        )));
+    }
+
+    /// Windows: the literal branches still match, and a non-existent path
+    /// under the Windows directory is protected by the literal fallback.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn is_system_path_covers_nonexistent_paths() {
+        assert!(is_system_path(std::path::Path::new(
+            "C:\\Windows\\sshspan-new"
+        )));
+        assert!(is_system_path(std::path::Path::new(
+            "C:\\Windows\\System32\\x.dll"
+        )));
+        assert!(is_system_path(std::path::Path::new("C:\\Program Files\\x")));
+        assert!(!is_system_path(std::path::Path::new(
+            "C:\\Windows-backup\\x"
+        )));
+    }
+
+    /// An absolute path outside the app data / system dirs is accepted. The
+    /// fixture is anchored at the current directory rather than temp_dir:
+    /// on some machines %TEMP% itself lives under the Windows directory,
+    /// which the (correct) system-dir guard rejects.
     #[test]
     fn validate_export_path_accepts_good_path() {
-        let tmp = std::env::temp_dir().join("sshspan-export-test.txt");
-        assert!(validate_export_path(&tmp.display().to_string()).is_ok());
+        let good = std::env::current_dir()
+            .expect("cwd")
+            .join("sshspan-export-test.txt");
+        assert!(validate_export_path(&good.display().to_string()).is_ok());
     }
 }
 
@@ -669,7 +805,7 @@ pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<s
     let _pw = vault_password(&app)?;
     let mut imported = 0;
     for item in &keys {
-        // Imported names become Host aliases in ~/.ssh/config — a name that
+        // Imported names become Host aliases in ~/.ssh/config - a name that
         // can't be a single Host token is sanitized instead of rejecting the
         // whole import (same mapping the Bitwarden sync uses).
         let raw_name = item
@@ -846,7 +982,7 @@ pub fn vault_backup_restore(
     // material and saved server passwords with the current one. A blob that
     // cannot be decrypted with the backup password NOR the current one is
     // deliberately EXCLUDED (keys) or BLANKED (server passwords) instead of
-    // being imported: importing it would strand it — unopenable once the old
+    // being imported: importing it would strand it - unopenable once the old
     // backup password is discarded. Every exclusion is counted and surfaced
     // in the result and the audit log.
     let mut reseal_failures: u32 = 0;
@@ -871,7 +1007,7 @@ pub fn vault_backup_restore(
                             keep.push(k);
                         }
                         // Sealing failed: the blob is readable under the old
-                        // password only, which is being discarded — excluded.
+                        // password only, which is being discarded - excluded.
                         Err(_) => reseal_failures += 1,
                     }
                 } else if crate::crypto::vault::unseal(&pw, &blob).is_ok() {
@@ -922,26 +1058,6 @@ pub fn vault_backup_restore(
         app.state::<AppState>()
             .db
             .add_audit("vault.backup_restored", None, &counts.to_string());
-    // A restore can silently swap stored host keys for hosts the user already
-    // trusts; that deserves its own visible audit entry.
-    if counts
-        .get("knownHostsReplaced")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        > 0
-    {
-        let _ = app.state::<AppState>().db.add_audit(
-            "known_hosts.restored_replaced",
-            None,
-            &format!(
-                "{} host key(s) replaced by restore",
-                counts
-                    .get("knownHostsReplaced")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
-            ),
-        );
-    }
     if reseal_failures > 0 {
         let _ = app.state::<AppState>().db.add_audit(
             "vault.restore_reseal_skipped",
@@ -996,25 +1112,38 @@ pub async fn system_pick_save_path(
 /// Paths the user explicitly picked in a native save dialog during this
 /// session. `system_write_text_file` requires membership, so a compromised
 /// renderer cannot use the write command against arbitrary user-writable
-/// locations (Startup folders, shell rc files, …) — only paths a human
+/// locations (Startup folders, shell rc files, ...) - only paths a human
 /// approved in the OS dialog.
-pub struct DialogPathStore(std::sync::Mutex<std::collections::HashSet<String>>);
+pub struct DialogPathStore(std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>);
+
+/// How long a dialog-approved path stays writable. The backup-export flow
+/// uses the path within seconds of picking it, so a generous window covers
+/// retries without leaving the grant alive for the whole session.
+const DIALOG_PATH_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 impl DialogPathStore {
     pub fn new() -> Self {
-        Self(std::sync::Mutex::new(std::collections::HashSet::new()))
+        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
     }
     fn allow(&self, path: &str) {
-        self.0.lock().unwrap().insert(path.to_string());
+        let mut guard = self.0.lock().unwrap();
+        let now = std::time::Instant::now();
+        // Prune expired entries so the map cannot grow unboundedly.
+        guard.retain(|_, granted| now.duration_since(*granted) < DIALOG_PATH_TTL);
+        guard.insert(path.to_string(), now);
     }
     fn is_allowed(&self, path: &str) -> bool {
-        self.0.lock().unwrap().contains(path)
+        let guard = self.0.lock().unwrap();
+        match guard.get(path) {
+            Some(granted) => std::time::Instant::now().duration_since(*granted) < DIALOG_PATH_TTL,
+            None => false,
+        }
     }
 }
 
 /// Write UTF-8 text to an absolute path (used for vault backup export). The
 /// path must have been returned by `system_pick_save_path` in this session
-/// AND must pass the absolute/app-data/system checks — both gates, so the
+/// AND must pass the absolute/app-data/system checks - both gates, so the
 /// write target is always a human-approved dialog choice.
 #[tauri::command]
 pub fn system_write_text_file(
@@ -1033,6 +1162,28 @@ pub fn system_write_text_file(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Component-wise, path-aware prefix test used by every local-target guard.
+/// On Windows the comparison is CASE-INSENSITIVE (NTFS/ReFS preserve case
+/// but ignore it, so `c:\users\...` and `C:\Users\...` are the same
+/// directory - a case-sensitive `starts_with` would let a hostile renderer
+/// bypass the app-data guard by merely changing case). On Unix it is
+/// `Path::starts_with` verbatim.
+#[cfg(target_os = "windows")]
+pub(crate) fn path_starts_with(p: &std::path::Path, base: &std::path::Path) -> bool {
+    let lower_components = |path: &std::path::Path| -> Vec<String> {
+        path.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let (pc, bc) = (lower_components(p), lower_components(base));
+    pc.len() >= bc.len() && pc[..bc.len()] == bc[..]
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn path_starts_with(p: &std::path::Path, base: &std::path::Path) -> bool {
+    p.starts_with(base)
+}
+
 /// Reject paths that are not absolute or that would write into the app data
 /// directory / system directories. Used by the limited number of commands that
 /// accept a renderer-supplied local filesystem target.
@@ -1042,11 +1193,23 @@ fn validate_export_path(path: &str) -> CmdResult<()> {
         return Err("Path must be absolute.".into());
     }
 
-    let normalized = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    // dunce::canonicalize (not std::fs::canonicalize): on Windows std returns
+    // a `\\?\`-prefixed path, and `Path::starts_with` compares prefix
+    // components exactly, so a verbatim path NEVER matches the plain
+    // `C:\Users\...` app-data dir - the guard would only fire for paths that
+    // do not exist yet. dunce returns the plain form for existing paths, so
+    // both the exists and not-exists cases compare against the same shape.
+    let normalized = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
 
     if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
         let app_data_dir = app_data.data_dir();
-        if normalized.starts_with(app_data_dir) {
+        // Normalize the anchor the same way so a junctioned/symlinked app-data
+        // dir still matches.
+        let app_data_norm =
+            dunce::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
+        if path_starts_with(&normalized, &app_data_norm)
+            || path_starts_with(&normalized, app_data_dir)
+        {
             return Err("Writing into the application data directory is not allowed.".into());
         }
     }
@@ -1060,46 +1223,58 @@ fn validate_export_path(path: &str) -> CmdResult<()> {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
-    if let Some(s) = p.as_os_str().to_str() {
-        let lower = s.to_lowercase();
-        if lower.starts_with("C:\\windows") || lower.starts_with("C:\\program files") {
-            return true;
-        }
-        if let Ok(windir) = std::env::var("WINDIR") {
-            let windir_norm = std::path::Path::new(&windir)
-                .canonicalize()
-                .unwrap_or_else(|_| std::path::Path::new(&windir).to_path_buf());
-            if let Ok(canonical) = p.canonicalize() {
-                if canonical.starts_with(windir_norm) {
-                    return true;
-                }
+    // Same normalization rule as validate_export_path: canonicalize when the
+    // path exists, keep the literal form when it does not, never carry the
+    // `\\?\` verbatim prefix into the comparison. Comparisons are
+    // component-wise (`Path::starts_with`) so e.g. "C:\Program Filesx" cannot
+    // prefix-match "C:\Program Files".
+    let normalized = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+
+    let mut protected: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("C:\\Windows"),
+        std::path::PathBuf::from("C:\\Program Files"),
+        std::path::PathBuf::from("C:\\Program Files (x86)"),
+    ];
+    for var in [
+        "WINDIR",
+        "ProgramFiles",
+        "ProgramW6432",
+        "ProgramFiles(x86)",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                protected.push(std::path::PathBuf::from(v));
             }
         }
     }
-    false
+    protected
+        .iter()
+        .map(|d| dunce::canonicalize(d).unwrap_or_else(|_| d.clone()))
+        .any(|d| path_starts_with(&normalized, &d))
 }
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
-    if let Ok(canonical) = p.canonicalize() {
-        let system_dirs = [
-            "/bin",
-            "/sbin",
-            "/usr/bin",
-            "/usr/sbin",
-            "/etc",
-            "/lib",
-            "/lib64",
-            "/usr/lib",
-            "/usr/lib64",
-        ];
-        for dir in &system_dirs {
-            if canonical.starts_with(dir) {
-                return true;
-            }
-        }
-    }
-    false
+    // dunce::canonicalize on Unix is std::fs::canonicalize, but keeping the
+    // same fall-through shape as the Windows branch: a path that does not
+    // exist (yet) is checked in its literal form instead of skipping the
+    // check entirely.
+    let normalized = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let system_dirs = [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+    ];
+    system_dirs
+        .iter()
+        .map(std::path::Path::new)
+        .any(|d| normalized.starts_with(d))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1225,7 +1400,7 @@ pub fn key_generate(
     let comment_str = comment.clone().unwrap_or_default();
     let name_str =
         name.unwrap_or_else(|| format!("{}-{}", key_type, &Uuid::new_v4().to_string()[..8]));
-    // Names become Host aliases in ~/.ssh/config — reject anything that could
+    // Names become Host aliases in ~/.ssh/config - reject anything that could
     // break out of a single Host token before it ever reaches the vault.
     keys::validate_key_name(&name_str)?;
 
@@ -1313,7 +1488,7 @@ pub fn key_import(
     }
 
     let name_str = name.unwrap_or_else(|| format!("imported-{}", &Uuid::new_v4().to_string()[..8]));
-    // Names become Host aliases in ~/.ssh/config — reject anything that could
+    // Names become Host aliases in ~/.ssh/config - reject anything that could
     // break out of a single Host token before it ever reaches the vault.
     keys::validate_key_name(&name_str)?;
     let sealed_private =
@@ -1422,7 +1597,7 @@ fn private_export_extension(format: &str) -> &'static str {
 
 /// Export a PRIVATE key straight to a user-chosen file. The PEM text is
 /// serialized in the backend and written to the path the user picks in the
-/// native save dialog — the key material never crosses the IPC boundary into
+/// native save dialog - the key material never crosses the IPC boundary into
 /// the renderer. The file is written 0600 from the first byte on Unix; on
 /// Windows the current-user-only ACL is attempted and a failure is logged
 /// (exports may legitimately target volumes that cannot store ACLs, unlike
@@ -1512,12 +1687,22 @@ pub async fn key_export_to_file(
     }
     #[cfg(windows)]
     {
+        // Private key material must not ship with inherited (broad) ACLs. A
+        // failed restriction is fail-closed: delete what we just wrote and
+        // refuse the export rather than leaving a world-readable key behind.
         if let Err(e) = crate::ssh::restrict_windows_file(&std::path::PathBuf::from(&path_str)) {
+            let removed = fs::remove_file(&path_str);
             log::warn!(
                 "[sshspan-keys] could not restrict ACLs on export {}: {e} \
-                 (the destination may be a filesystem without ACL support)",
-                path_str
+                 (file removed: {:?}); export refused",
+                path_str,
+                removed.is_ok()
             );
+            return Err(CmdError(format!(
+                "Could not restrict permissions on the export file, so it was deleted \
+                 instead of leaving the private key broadly readable ({e}). Export to a \
+                 location that supports Windows ACLs (e.g. an NTFS drive)."
+            )));
         }
     }
 
@@ -1875,7 +2060,7 @@ pub fn key_create_with_categories(
     let comment_str = comment.clone().unwrap_or_default();
     let name_str =
         name.unwrap_or_else(|| format!("{}-{}", key_type, &Uuid::new_v4().to_string()[..8]));
-    // Names become Host aliases in ~/.ssh/config — reject anything that could
+    // Names become Host aliases in ~/.ssh/config - reject anything that could
     // break out of a single Host token before it ever reaches the vault.
     keys::validate_key_name(&name_str)?;
 
@@ -2259,13 +2444,13 @@ pub fn settings_set(app: AppHandle, key: String, value: String) -> CmdResult<ser
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Contract: `system_open_external` accepts ONLY a staged temp file under the
-/// app's own `sshspan-edit` staging directory — the exact contract the
+/// app's own `sshspan-edit` staging directory - the exact contract the
 /// renderer's single call site uses (the local path returned by
 /// `sftp_open_for_edit` / Send-to staging). URIs (`https:`, `file:`,
-/// `ms-settings:`, …) are rejected, and so is every path outside the staging
-/// dir: unrestricted `opener::open` would otherwise hand arbitrary schemes —
-/// or ShellExecute any on-disk executable — to the OS shell. A single-letter
-/// drive prefix (`C:\…` or `C:/…` on Windows) is a path, not a URI scheme.
+/// `ms-settings:`, ...) are rejected, and so is every path outside the staging
+/// dir: unrestricted `opener::open` would otherwise hand arbitrary schemes -
+/// or ShellExecute any on-disk executable - to the OS shell. A single-letter
+/// drive prefix (`C:\...` or `C:/...` on Windows) is a path, not a URI scheme.
 #[tauri::command]
 pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
     let p = std::path::Path::new(&url);

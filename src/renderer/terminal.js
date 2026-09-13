@@ -1,5 +1,5 @@
 /**
- * terminal.js — per-tab xterm.js sessions for the Connect view.
+ * terminal.js - per-tab xterm.js sessions for the Connect view.
  * ---------------------------------------------------------------------------
  * Every session lives in its own tab: its own xterm instance, host <div>,
  * IPC channel, keystroke subscription, and close-detection poll. Inactive
@@ -24,7 +24,7 @@
 window.__SSHPAN_TERMINAL_JS__ = 'loaded-v14-tabs';
 
 // app.js already declares top-level `const invoke` in the shared classic-
-// script global scope — re-declaring it here is a SyntaxError that kills the
+// script global scope - re-declaring it here is a SyntaxError that kills the
 // whole file. Namespace everything.
 const tcore = window.__TAURI__.core;
 const tclip = (window.__TAURI__ && window.__TAURI__.clipboardManager) || null;
@@ -60,12 +60,9 @@ function terminalAppKeypad() {
   return terminalSetting('terminalAppKeypad', 'default');
 }
 
-
-function terminalKeepaliveSeconds() {
-  const value = parseInt(terminalSetting('terminalKeepaliveSeconds', '0'), 10);
-  if (!Number.isFinite(value) || value <= 0) return 0;
-  return Math.max(15, Math.min(3600, value));
-}
+// (terminalKeepaliveSeconds removed: keepalives are SSH-protocol-level now -
+// see startTabKeepalive. The terminalKeepaliveSeconds setting remains stored
+// but has no effect.)
 
 function sendTerminalBytes(rec, data) {
   if (!rec || !rec.sessionId) return Promise.resolve(false);
@@ -305,15 +302,15 @@ function setTabSession(tabId, sessionId) {
   if (rec) rec.sessionId = sessionId;
 }
 
+// Keepalives are handled at the SSH protocol level (russh sends
+// keepalive@openssh.com global requests every 30 s). This used to write a
+// NUL byte into the PTY - interactive programs received it as Ctrl-@ - so
+// the renderer no longer pings the data channel at all.
 function startTabKeepalive(rec) {
-  if (!rec || !rec.sessionId) return;
-  if (rec.keepaliveHandle) clearInterval(rec.keepaliveHandle);
-  const seconds = terminalKeepaliveSeconds();
-  if (!seconds) return;
-  rec.keepaliveHandle = setInterval(() => {
-    if (!rec.sessionId || rec.sessionEnded) return;
-    tcore.invoke('terminal_keepalive', { sessionId: rec.sessionId }).catch(() => {});
-  }, seconds * 1000);
+  if (rec && rec.keepaliveHandle) {
+    clearInterval(rec.keepaliveHandle);
+    rec.keepaliveHandle = null;
+  }
 }
 
 function fitActiveTerminal() {
@@ -358,7 +355,7 @@ function terminalConnectInTab(tabId, server, opts) {
     rec.sessionId = null;
 
     try { t.reset(); } catch (e) {}
-    trace(tabId, `[sshspan] xterm ready (${t.cols}x${t.rows}) — connecting to ${server.host}:${server.port} (auth=${server.authMethod || 'publickey'})`);
+    trace(tabId, `[sshspan] xterm ready (${t.cols}x${t.rows}) - connecting to ${server.host}:${server.port} (auth=${server.authMethod || 'publickey'})`);
     setTimeout(() => { try { t.focus(); } catch (e) {} }, 50);
 
     const onData = new tcore.Channel();
@@ -366,7 +363,7 @@ function terminalConnectInTab(tabId, server, opts) {
       if (typeof text !== 'string' || text.length === 0) return;
       if (!rec.gotFirstData) {
         rec.gotFirstData = true;
-        if (tabId === activeTabId) terminalSetStatus(`Connected to ${server.host}:${server.port} — streaming`);
+        if (tabId === activeTabId) terminalSetStatus(`Connected to ${server.host}:${server.port} - streaming`);
       }
       try { t.write(text); } catch (e) {}
     };
@@ -381,31 +378,11 @@ function terminalConnectInTab(tabId, server, opts) {
       promptPassword: opts && opts.promptPassword,
     };
 
-    // Host-key consent (StrictHostKeyChecking semantics): the backend refuses
-    // an UNPINNED host unless allowTofu was granted, and it is granted only
-    // here — after the user explicitly accepts the first-trust prompt.
-    try {
-      const known = await tcore.invoke('known_hosts_check', {
-        host: server.host,
-        port: server.port || 22,
-      });
-      if (known && known.known === false) {
-        const okTrust = window.confirm(
-          '“' + server.host + ':' + (server.port || 22) + '” is not in Known Hosts yet.\n\n' +
-          'Trust this host on first connection (TOFU)?\n' +
-          'The fingerprint will be shown in the terminal and recorded in the audit log.'
-        );
-        if (!okTrust) {
-          trace(tabId, '[sshspan] connection cancelled — host not trusted');
-          return reject(new Error('Connection cancelled — host is not trusted yet.'));
-        }
-        args.allowTofu = true;
-      }
-    } catch (e) {
-      if (e && String((e && e.message) || e).indexOf('not trusted') !== -1) return reject(e);
-      // known_hosts_check itself failed: proceed WITHOUT consent — the
-      // backend stays strict and refuses an unknown host on its own.
-    }
+    // Host-key consent (StrictHostKeyChecking semantics) is owned by the
+    // backend: when the host is unpinned - or a backup-imported pin has not
+    // been confirmed yet - the Rust handler raises a NATIVE dialog showing
+    // the fingerprint before the decision. The renderer deliberately has no
+    // consent flag to pass: a compromised page cannot mint trust.
 
     const encoder = new TextEncoder();
     const dataSub = t.onData(async (data) => {
@@ -415,7 +392,7 @@ function terminalConnectInTab(tabId, server, opts) {
           sessionId: rec.sessionId,
           bytes: Array.from(encoder.encode(data)),
         });
-      } catch (e) { /* closed channel — close-detection handles teardown */ }
+      } catch (e) { /* closed channel - close-detection handles teardown */ }
     });
 
     const teardown = (sid) => {
@@ -438,7 +415,7 @@ function terminalConnectInTab(tabId, server, opts) {
       rec.sessionId = sessionId;
       rec.tabId = tabId;
       startTabKeepalive(rec);
-      trace(tabId, `[sshspan] session established (id=${sessionId.slice(0, 8)}…) — waiting for remote output`);
+      trace(tabId, `[sshspan] session established (id=${sessionId.slice(0, 8)}...) - waiting for remote output`);
       if (!rec.gotFirstData) {
         trace(tabId, '[sshspan] NOTE: no channel data yet. If this is the last line you see, the IPC Channel is not delivering.');
       }

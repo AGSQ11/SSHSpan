@@ -63,7 +63,7 @@ fn saved_pw_for_server(
 /// Build a `ResolvedConnection` for a saved server id.
 ///
 /// `override_username` / `override_key_id` come from the renderer's "Use this
-/// key to connect…" right-click flow — when the user picks a key right on a key
+/// key to connect..." right-click flow - when the user picks a key right on a key
 /// row, we want to keep the server's saved username but swap the key.
 ///
 /// The `key_pem` and `password` fields are wrapped in `zeroize::Zeroizing`
@@ -94,7 +94,7 @@ fn resolve_for_server(
         if let Some(kid) = override_key_id.or_else(|| server.key_id.clone()) {
             key_pem = Some(key_pem_for_id(app, db, vault_pw, &kid)?);
         } else if let Some(p) = server.pem_path.clone() {
-            // Read PEM from disk — leaves the file untouched, treats it as a public key on the SSH server side.
+            // Read PEM from disk - leaves the file untouched, treats it as a public key on the SSH server side.
             // This is a stored setting set by the user via the UI; validate it exists and is a regular file.
             let path = std::path::Path::new(&p);
             if !path.is_file() {
@@ -142,11 +142,6 @@ pub async fn terminal_connect(
     override_username: Option<String>,
     override_key_id: Option<String>,
     prompt_password: Option<String>,
-    // True only when the user explicitly consented (renderer confirm dialog,
-    // after `known_hosts_check` reported the host as unpinned) to trusting a
-    // NEW host key on first use. Absent/false = strict: an unpinned host is
-    // refused instead of silently trusted.
-    allow_tofu: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
     if vault_pw.is_empty() {
@@ -168,12 +163,17 @@ pub async fn terminal_connect(
 
     // Welcome banner so the user sees something even before the first
     // shell prompt arrives. If the channel to the webview is broken, FAIL
-    // LOUDLY — a silent failure here looks exactly like a connected-but-blank
-    // terminal, which cost us a debugging cycle already.
+    // LOUDLY - a silent failure here looks exactly like a connected-but-blank
+    // terminal, which cost us a debugging cycle already. Host/username/auth
+    // are server-derived strings: control characters are stripped so this
+    // app-composed line can never carry an injected escape sequence.
     on_data
         .send(format!(
             "\r\n\x1b[1;36mConnecting to {}:{} as {} (auth={})\x1b[0m\r\n",
-            resolved.server.host, resolved.server.port, resolved.username, resolved.auth_method
+            ssh_client::sanitize_terminal_text(&resolved.server.host),
+            resolved.server.port,
+            ssh_client::sanitize_terminal_text(&resolved.username),
+            ssh_client::sanitize_terminal_text(&resolved.auth_method)
         ))
         .map_err(|e| {
             CmdError(format!(
@@ -181,20 +181,23 @@ pub async fn terminal_connect(
             ))
         })?;
 
+    // Host-key consent is backend-owned: when the host is unpinned (or a
+    // backup-imported pin is unconfirmed), the russh handler raises a native
+    // dialog with the fingerprint. The renderer has no consent flag to forge.
     let session_id = ssh_client::start_interactive(
+        app.clone(),
         resolved.clone(),
         db.clone(),
         registry.clone(),
         on_data,
-        allow_tofu.unwrap_or(false),
     ).await.map_err(|e| {
         let msg = e.to_string();
         let friendly = if msg.contains("Key exchange failed") || msg.contains("key exchange") {
             "The host rejected the connection during key exchange. If this host's fingerprint changed, forget it in the known_hosts list and retry.".to_string()
         } else if msg.to_lowercase().contains("host key") {
-            "Host key mismatch. The server presented a different key than the one stored for this host — possible MITM, or the host was rebuilt. Forget it in known_hosts and retry.".to_string()
-        } else if msg.to_lowercase().contains("unknown key") {
-            "This host is not trusted yet and no consent to trust it was given. Reconnect and accept the host-key prompt, or add it via Known Hosts.".to_string()
+            "Host key mismatch. The server presented a different key than the one stored for this host - possible MITM, or the host was rebuilt. Forget it in known_hosts and retry.".to_string()
+        } else if msg.to_lowercase().contains("unknown key") || msg.to_lowercase().contains("not trusted") {
+            "This host is not trusted yet and the trust prompt was not accepted. Reconnect and accept the host-key prompt, or add it via Known Hosts.".to_string()
         } else {
             msg
         };
@@ -252,13 +255,6 @@ pub fn terminal_resize(
 }
 
 #[tauri::command]
-pub fn terminal_keepalive(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
-    let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
-    ssh_client::session_send(&registry, &session_id, b"\x00".to_vec()).map_err(anyhow_cmd)?;
-    Ok(serde_json::json!({ "ok": true }))
-}
-
-#[tauri::command]
 pub fn terminal_disconnect(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
     let server_name = registry
@@ -303,9 +299,6 @@ pub async fn server_test(
     app: AppHandle,
     server_id: String,
     prompt_password: Option<String>,
-    // Same consent semantics as terminal_connect: trust a NEW host only when
-    // the user approved it in the renderer prompt.
-    allow_tofu: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let vault_pw = super::vault_password(&app)?;
     if vault_pw.is_empty() {
@@ -327,7 +320,8 @@ pub async fn server_test(
     let started = std::time::Instant::now();
     // Open + authenticate using the same russh glue as start_interactive,
     // then drop the channel immediately. We don't want this to land in the
-    // SessionRegistry or persist.
+    // SessionRegistry or persist. Host-key trust behaves identically to a
+    // real connect: the native first-trust dialog comes from the handler.
     let db_for_handler = db.clone();
     let host_for_handler = resolved.server.host.clone();
     let result: anyhow::Result<()> = async {
@@ -336,7 +330,7 @@ pub async fn server_test(
             host: host_for_handler,
             db: db_for_handler,
             port: resolved.server.port,
-            allow_tofu: allow_tofu.unwrap_or(false),
+            app: app.clone(),
         };
         let mut session = russh::client::connect(
             config,
@@ -377,8 +371,10 @@ pub async fn server_test(
             let raw = e.to_string();
             let friendly = if raw.to_lowercase().contains("host key") {
                 "Host key mismatch. Forget it in known_hosts and retry.".to_string()
-            } else if raw.to_lowercase().contains("unknown key") {
-                "This host is not trusted yet and no consent to trust it was given. Retry and accept the host-key prompt.".to_string()
+            } else if raw.to_lowercase().contains("unknown key")
+                || raw.to_lowercase().contains("not trusted")
+            {
+                "This host is not trusted yet and the trust prompt was not accepted. Retry and accept the host-key prompt.".to_string()
             } else if raw.contains("Key exchange") || raw.contains("key exchange") {
                 "Key exchange failed.".to_string()
             } else if raw.starts_with("Connect failed: ") {
@@ -413,23 +409,20 @@ pub fn known_hosts_list(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "hosts": arr }))
 }
 
-/// Pre-connect host-key lookup for the renderer's consent flow: is there a
-/// stored pin for `host:port`, and if so what fingerprint? The renderer calls
-/// this BEFORE `terminal_connect`/`server_test` and shows the trust prompt
-/// only for unpinned hosts; the connect commands refuse unpinned hosts unless
-/// the prompt was accepted (`allow_tofu: true`).
-#[tauri::command(rename_all = "camelCase")]
-pub fn known_hosts_check(app: AppHandle, host: String, port: u16) -> CmdResult<serde_json::Value> {
-    let key = crate::ssh_client::known_host_key(&host, port);
-    match app.state::<AppState>().db.get_known_host(&key) {
-        Ok(Some(known)) => Ok(serde_json::json!({
-            "known": true,
-            "fingerprintSha256": known.fingerprint_sha256,
-            "firstSeen": known.first_seen.to_rfc3339(),
-        })),
-        Ok(None) => Ok(serde_json::json!({ "known": false })),
-        Err(e) => Err(CmdError(e.to_string())),
+/// Kept as a no-op for IPC compatibility: keepalives are handled at the SSH
+/// protocol level (russh sends `keepalive@openssh.com` global requests every
+/// 30 s via `base_client_config().keepalive_interval`). This command used to
+/// write a NUL byte into the PTY data stream, which interactive programs
+/// received as Ctrl-@ - it must never do that again. The renderer's
+/// `terminalKeepaliveSeconds` setting is retained but has no effect.
+#[tauri::command]
+pub fn terminal_keepalive(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
+    // Verify the session still exists so the call stays honest.
+    let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
+    if registry.get_input_tx(&session_id).is_none() {
+        return Err(CmdError("Session not found.".into()));
     }
+    Ok(serde_json::json!({ "ok": true }))
 }
 
 #[tauri::command]

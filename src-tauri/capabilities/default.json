@@ -21,25 +21,8 @@
     "dialog:allow-save",
     "dialog:allow-message",
 
-    "process:default",
-    "process:allow-exit",
-    "process:allow-restart",
-
-    "os:default",
-    "os:allow-platform",
-    "os:allow-family",
-    "os:allow-arch",
-    "os:allow-hostname",
-
-    "notification:default",
-    "notification:allow-notify",
-
-    "opener:allow-reveal-item-in-dir",
-
     "clipboard-manager:default",
     "clipboard-manager:allow-write-text",
-    "clipboard-manager:allow-read-text",
-
-    "updater:default"
+    "clipboard-manager:allow-read-text"
   ]
 }

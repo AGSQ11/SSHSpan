@@ -95,15 +95,25 @@ pub struct KnownHost {
     pub host_key: String,
     pub fingerprint_sha256: String,
     pub first_seen: DateTime<Utc>,
+    /// Where this pin came from: "connection" (the user confirmed a live
+    /// first-use handshake) or "imported" (planted by a backup restore and
+    /// not yet confirmed against a real connection - untrusted until the
+    /// user re-confirms the fingerprint on first use).
+    #[serde(default = "default_known_host_source")]
+    pub source: String,
+}
+
+fn default_known_host_source() -> String {
+    "connection".to_string()
 }
 
 /// One persisted `sftp::queue::TransferJob` row (the `transfer_queue`
 /// table). Deliberately decoupled from `sftp::queue`'s `JobKind`/`JobState`/
-/// `ResumeMode` enums — this module has no dependency on `sftp`, and the
+/// `ResumeMode` enums - this module has no dependency on `sftp`, and the
 /// conversion (stable lowercase/camelCase strings both sides already agree
 /// on for `emit_queue`'s wire format) lives in `TransferJob::to_row` and
 /// `restore_pending` instead. `id` mirrors `TransferJob.id` (a `u64`, cast to
-/// `i64` for SQLite's INTEGER PRIMARY KEY — queue ids never get remotely
+/// `i64` for SQLite's INTEGER PRIMARY KEY - queue ids never get remotely
 /// close to overflowing that).
 #[derive(Debug, Clone)]
 pub struct QueueJobRow {
@@ -359,7 +369,7 @@ impl Database {
             .await?;
 
             // Connect: saved SSH servers (PuTTY-style sessions) + trusted host keys.
-            // key_id references keys.id; the private key itself is never copied —
+            // key_id references keys.id; the private key itself is never copied -
             // the reference is resolved + unsealed in-process at connect time.
             // saved_password holds an AES-GCM blob sealed with the vault password,
             // only present when the user opts to store a password.
@@ -387,7 +397,7 @@ impl Database {
             .await?;
 
             // Migration: server sync metadata (Bitwarden two-way server sync).
-            // Must run after the servers table above exists — on a fresh DB an
+            // Must run after the servers table above exists - on a fresh DB an
             // ALTER TABLE against a not-yet-created table fails silently and
             // the columns never get added.
             let _ = sqlx::query("ALTER TABLE servers ADD COLUMN bitwarden_id TEXT")
@@ -429,10 +439,31 @@ impl Database {
             .execute(&self.pool)
             .await;
 
+            // Migration: track where each known_hosts pin came from. Rows
+            // that predate this column were all learned from real
+            // connections, so they default to 'connection'. Pins inserted by
+            // a backup restore from now on use 'imported' and require the
+            // user to re-confirm the fingerprint on first use (see
+            // `confirm_imported_known_host`), so a crafted backup cannot
+            // silently pre-seed trust for a host the user never contacted.
+            let has_source: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('known_hosts') WHERE name = 'source'",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
+            if has_source == 0 {
+                sqlx::query(
+                    "ALTER TABLE known_hosts ADD COLUMN source TEXT NOT NULL DEFAULT 'connection'",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+
             // Transfer queue: survives a restart/crash so a 5,000-file batch
             // isn't silently lost mid-way and its `.part` files left orphaned.
             // `session_id`/`target_session_id` are per-run and stale the
-            // moment the app restarts — `sftp::queue::restore_pending` is what
+            // moment the app restarts - `sftp::queue::restore_pending` is what
             // turns a restored row into a "needs reconnect" Paused job, not
             // this table's schema.
             sqlx::query(
@@ -1287,6 +1318,9 @@ impl Database {
                 .ok()
                 .map(|d| d.with_timezone(&Utc))
                 .unwrap_or_else(|| Utc::now()),
+            source: row
+                .try_get::<String, _>("source")
+                .unwrap_or_else(|_| "connection".to_string()),
         }
     }
 
@@ -1304,13 +1338,31 @@ impl Database {
                 Some(_) => Ok(false),
                 None => {
                     sqlx::query(
-                        "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) VALUES (?, ?, ?, ?)"
+                        "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen, source) VALUES (?, ?, ?, ?, 'connection')"
                     )
                     .bind(host).bind(host_key).bind(fingerprint).bind(chrono::Utc::now().to_rfc3339())
                     .execute(&self.pool).await?;
                     Ok(true)
                 }
             }
+        })
+    }
+
+    /// Upgrade a pin that was imported from a backup to a confirmed
+    /// first-use pin. Only succeeds for rows still marked `imported` whose
+    /// stored key equals the presented one - a differing key is a mismatch
+    /// the caller must hard-fail on, never upgrade.
+    pub fn confirm_imported_known_host(&self, host: &str, presented_key: &str) -> Result<bool> {
+        block(async {
+            let result = sqlx::query(
+                "UPDATE known_hosts SET source = 'connection' \
+                 WHERE host = ? AND source = 'imported' AND host_key = ?",
+            )
+            .bind(host)
+            .bind(presented_key)
+            .execute(&self.pool)
+            .await?;
+            Ok(result.rows_affected() > 0)
         })
     }
 
@@ -1351,7 +1403,7 @@ impl Database {
     // See `sftp::queue` for the in-memory `TransferJob` these rows mirror.
     // Best-effort throughout by convention at the call site (queue.rs logs
     // and swallows a failure here rather than letting it affect a live
-    // transfer) — this table is a resiliency feature, not the source of
+    // transfer) - this table is a resiliency feature, not the source of
     // truth for a running app.
 
     /// Insert or fully overwrite one job's persisted row.
@@ -1433,7 +1485,7 @@ impl Database {
         })
     }
 
-    /// Jobs left `Queued`/`Active`/`Paused` by a previous run — what
+    /// Jobs left `Queued`/`Active`/`Paused` by a previous run - what
     /// `sftp::queue::restore_pending` reloads at startup.
     pub fn list_pending_queue_jobs(&self) -> Result<Vec<QueueJobRow>> {
         block(async {
@@ -1472,7 +1524,7 @@ impl Database {
     // ── Backup / restore ───────────────────────────────────────────────────
 
     /// Upsert every entity from an (already unsealed) backup payload in one
-    /// transaction. Existing rows with the same id/host are overwritten —
+    /// transaction. Existing rows with the same id/host are overwritten -
     /// re-running a restore is safe. Returns per-entity row counts.
     pub fn restore_backup(&self, data: &serde_json::Value) -> Result<serde_json::Value> {
         block(async {
@@ -1522,7 +1574,7 @@ impl Database {
                         continue;
                     };
                     let s = |f: &str| k.get(f).and_then(|v| v.as_str());
-                    // Names become Host aliases in ~/.ssh/config — restore
+                    // Names become Host aliases in ~/.ssh/config - restore
                     // payloads (possibly from older vaults or other sources)
                     // are sanitized rather than rejecting the whole restore.
                     let raw_name = s("name").unwrap_or("imported");
@@ -1648,6 +1700,7 @@ impl Database {
             }
 
             let mut known_hosts_conflicts = 0u32;
+            let mut known_hosts_imported = 0u32;
             if let Some(arr) = data.get("known_hosts").and_then(|v| v.as_array()) {
                 for h in arr {
                     let Some(host) = h
@@ -1663,29 +1716,40 @@ impl Database {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let seen = h.get("first_seen").and_then(|v| v.as_str()).unwrap_or("");
-                    // Security: never overwrite an existing host-key pin from a
-                    // backup, because a malicious backup could pin an attacker-
-                    // controlled key. New hosts are still added. Conflicts are
-                    // counted so the caller can surface them.
+                    // Security: a backup is untrusted input. A differing pin
+                    // for a known host is never overwritten (a malicious
+                    // backup could pin an attacker-controlled key) and is
+                    // surfaced as a conflict. A pin for an ABSENT host is
+                    // inserted marked 'imported' - the trust anchor is only
+                    // used after the user re-confirms the fingerprint on
+                    // first use (see `confirm_imported_known_host`), so a
+                    // crafted backup cannot silently pre-seed trust.
                     let existing_key = sqlx::query_scalar::<_, String>(
                         "SELECT host_key FROM known_hosts WHERE host = ?",
                     )
                     .bind(host)
                     .fetch_optional(&mut *tx)
                     .await?;
-                    if existing_key.is_some_and(|k| k != host_key) {
-                        known_hosts_conflicts += 1;
-                        continue;
+                    match existing_key {
+                        Some(current) if current != host_key => {
+                            known_hosts_conflicts += 1;
+                        }
+                        Some(_) => {
+                            // Already pinned with the same key: keep the
+                            // existing row (and its source) untouched.
+                            hosts_n += 1;
+                        }
+                        None => {
+                            sqlx::query(
+                                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen, source) \
+                                 VALUES (?, ?, ?, ?, 'imported')",
+                            )
+                            .bind(host).bind(host_key).bind(fp).bind(seen)
+                            .execute(&mut *tx).await?;
+                            hosts_n += 1;
+                            known_hosts_imported += 1;
+                        }
                     }
-                    sqlx::query(
-                        "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
-                         VALUES (?, ?, ?, ?) \
-                         ON CONFLICT(host) DO UPDATE SET host_key=excluded.host_key, \
-                           fingerprint_sha256=excluded.fingerprint_sha256, first_seen=excluded.first_seen",
-                    )
-                    .bind(host).bind(host_key).bind(fp).bind(seen)
-                    .execute(&mut *tx).await?;
-                    hosts_n += 1;
                 }
             }
 
@@ -1708,7 +1772,7 @@ impl Database {
             Ok(serde_json::json!({
                 "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
                 "servers": servers_n, "knownHosts": hosts_n,
-                "knownHostsReplaced": 0u32,
+                "knownHostsImported": known_hosts_imported,
                 "knownHostsConflicts": known_hosts_conflicts, "settings": settings_n,
             }))
         })
@@ -1815,7 +1879,7 @@ mod tests {
     }
 
     /// `upsert_queue_job` must both insert a new row and, on a repeat call
-    /// with the same id, overwrite it in place rather than duplicating it —
+    /// with the same id, overwrite it in place rather than duplicating it -
     /// `sftp::queue` relies on this for its throttled progress persistence
     /// (many upserts of the same job over its lifetime).
     #[test]
@@ -1828,14 +1892,14 @@ mod tests {
         db.upsert_queue_job(&updated).expect("overwrite");
 
         let pending = db.list_pending_queue_jobs().expect("list pending");
-        // "done" is not a pending state, so the row shouldn't show up here —
+        // "done" is not a pending state, so the row shouldn't show up here -
         // proves the second upsert changed the SAME row's state rather than
         // inserting a second one next to it.
         assert!(pending.is_empty());
     }
 
     /// `list_pending_queue_jobs` returns exactly the Queued/Active/Paused
-    /// rows — the set `restore_pending` reloads at startup — and none of the
+    /// rows - the set `restore_pending` reloads at startup - and none of the
     /// terminal ones.
     #[test]
     fn list_pending_queue_jobs_filters_by_state() {
@@ -1860,7 +1924,7 @@ mod tests {
         assert_eq!(pending_ids, vec![1, 2, 3]);
     }
 
-    /// `delete_finished_queue_jobs` removes only Done/Failed/Cancelled rows —
+    /// `delete_finished_queue_jobs` removes only Done/Failed/Cancelled rows -
     /// what `clear_finished` calls so a restart's `restore_pending` never
     /// resurrects a job the user already cleared.
     #[test]
@@ -1881,7 +1945,7 @@ mod tests {
     }
 
     /// A round trip through the DB must preserve every field a restored job
-    /// needs to reconstruct — including nullable ones (`resume`,
+    /// needs to reconstruct - including nullable ones (`resume`,
     /// `preserve_ts`, `verify`, the ServerCopy `target_*` triple).
     #[test]
     fn queue_job_round_trip_preserves_all_fields() {

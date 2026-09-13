@@ -10,14 +10,14 @@ use super::{CmdError, CmdResult};
 
 const RELEASES_API: &str = "https://api.github.com/repos/AGSQ11/SSHSpan/releases/latest";
 
-/// Hard cap for the release-manifest JSON read by `update_check` (10 MiB —
+/// Hard cap for the release-manifest JSON read by `update_check` (10 MiB -
 /// the real payload is a few KiB; anything larger is a broken or hostile
 /// response and must never be buffered whole).
 const MAX_MANIFEST_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Hard cap for the streamed installer download (512 MiB). Installers are
 /// streamed to disk chunk-by-chunk, so this is a sanity bound, not the
-/// amount of RAM used — but an "installer" larger than this is refused
+/// amount of RAM used - but an "installer" larger than this is refused
 /// instead of filling the disk.
 const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -28,11 +28,11 @@ const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 
 /// minisign public key (base64 body of `minisign.pub`, i.e. the SECOND line
-/// of the key file — algorithm bytes + key id + Ed25519 key, base64-encoded).
+/// of the key file - algorithm bytes + key id + Ed25519 key, base64-encoded).
 ///
 /// The SHA-256 asset digest returned by the GitHub API comes from the same
 /// release that serves the installer, so it only proves the download matches
-/// the release — not that the release itself is trusted. This embedded key
+/// the release - not that the release itself is trusted. This embedded key
 /// closes that gap: the release workflow signs every installer with the
 /// minisign SECRET key (GitHub secret `MINISIGN_SECRET_KEY`) and uploads the
 /// `.minisig` files as release assets; `update_download_and_run` refuses to
@@ -41,7 +41,7 @@ const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 /// the release.
 ///
 /// Key provisioned 2026-09-12 (key id D67C45BA942239D8). The secret key is
-/// NOT in the repository — it lives in the `MINISIGN_SECRET_KEY` Actions
+/// NOT in the repository - it lives in the `MINISIGN_SECRET_KEY` Actions
 /// secret and in the maintainer's offline backup. From this build on,
 /// signature verification is FAIL-CLOSED: a missing, invalid, or unsigned
 /// `.minisig` refuses the update. Releases older than the first signed one
@@ -56,7 +56,7 @@ const MINISIGN_PUBLIC_KEY_PLACEHOLDER: &str = "PLACEHOLDER-REPLACE-WITH-BASE64-P
 
 /// True when the minisign public key has been provisioned (i.e. is not the
 /// build-time placeholder). When false, signature verification is skipped
-/// with a warning and the GitHub digest check alone decides — matching the
+/// with a warning and the GitHub digest check alone decides - matching the
 /// pre-signing behavior so releases keep working while the keypair is
 /// being set up. Parameterized over the key so tests can exercise both
 /// states regardless of whether the shipped const is still the placeholder.
@@ -149,11 +149,11 @@ fn pick_asset_for_os(assets: &[GhAsset]) -> Option<&GhAsset> {
     }
 }
 
-/// Derive the installer filename extension from the asset URL. `.AppImage`
-/// must be matched exactly (`.ends_with`) — a substring check could catch
-/// anything mentioning it.
+/// Derive the installer filename extension from the asset URL. Every known
+/// kind is matched by exact suffix - a substring check could catch anything
+/// mentioning it.
 fn installer_ext(url: &str) -> &'static str {
-    if url.contains(".msi") {
+    if url.ends_with(".msi") {
         ".msi"
     } else if url.ends_with(".deb") {
         ".deb"
@@ -165,6 +165,19 @@ fn installer_ext(url: &str) -> &'static str {
         ".exe"
     }
 }
+
+/// How far ahead of the running version a candidate may claim to be. The
+/// release metadata (GitHub API response) is not itself signed - only the
+/// installer bytes are - so an on-path attacker can serve arbitrary version
+/// NUMBERS. Without a plausibility bound they can fast-forward-freeze the
+/// app: claim v9.9.9 while pointing at a real old signed asset; the user
+/// "updates" to the old build and every genuine future release then parses
+/// as a downgrade and is refused. The bounds below sit well above any
+/// realistic release cadence; raise them if the project ever jumps multiple
+/// majors in one update. The freeze variant (replaying the CURRENT version
+/// forever) cannot be fixed client-side and is accepted risk.
+const MAX_MAJOR_JUMP: u64 = 1;
+const MAX_MINOR_JUMP: u64 = 12;
 
 fn is_newer(candidate_tag: &str, current: &str) -> bool {
     let strip = |s: &str| s.trim().trim_start_matches('v').to_string();
@@ -178,8 +191,16 @@ fn is_newer(candidate_tag: &str, current: &str) -> bool {
         semver::Version::parse(&cand),
         semver::Version::parse(cur.as_str()),
     ) {
-        (Ok(a), Ok(b)) => a > b, // strictly newer only — never a downgrade
-        _ => false,              // unparsable tag: never nag the user over an unknown format
+        (Ok(a), Ok(b)) => {
+            if a <= b {
+                return false; // strictly newer only - never a downgrade
+            }
+            // Fast-forward plausibility bound (see the constants above).
+            let major_ok = a.major <= b.major + MAX_MAJOR_JUMP;
+            let minor_ok = a.major < b.major || a.minor <= b.minor + MAX_MINOR_JUMP;
+            major_ok && minor_ok
+        }
+        _ => false, // unparsable tag: never nag the user over an unknown format
     }
 }
 
@@ -253,7 +274,7 @@ fn validate_asset_url(raw: &str) -> CmdResult<url::Url> {
 /// validated against the host allowlist only, because GitHub redirects
 /// release downloads to `objects.githubusercontent.com` /
 /// `release-assets.githubusercontent.com` paths that do not carry the
-/// owner/repo prefix — the pin applies to the renderer-supplied URL, which is
+/// owner/repo prefix - the pin applies to the renderer-supplied URL, which is
 /// the only hop an attacker controls directly.
 const RELEASE_REPO_PREFIX: &str = "/AGSQ11/SSHSpan/releases/download/";
 
@@ -290,7 +311,7 @@ fn sanitize_version_for_filename(version: &str) -> String {
 }
 
 /// Check GitHub for the latest release and, if newer, report the asset URL for
-/// this OS. Never installs anything — the renderer asks the user first.
+/// this OS. Never installs anything - the renderer asks the user first.
 #[tauri::command]
 pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
     let current = current_version(&app);
@@ -336,8 +357,8 @@ pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// Download the `<installer-url>.minisig` sibling of the (post-redirect)
 /// installer URL through the same validate-allowlist + manual-redirect +
 /// revalidation + size-cap discipline as the installer itself, returning
-/// the body as a string. ANY failure — including a 404 for an unsigned
-/// asset, a network error, or an oversized body — returns Err; the caller
+/// the body as a string. ANY failure - including a 404 for an unsigned
+/// asset, a network error, or an oversized body - returns Err; the caller
 /// decides (fail-closed) what to do with it.
 async fn download_minisig(
     client: &reqwest::Client,
@@ -415,7 +436,7 @@ pub async fn update_download_and_run(
 
     // AppImage self-replace: when the running app IS an AppImage (the
     // AppImage runtime exports `APPIMAGE` = absolute path of the running
-    // image), a downloaded `.AppImage` update must be swapped in place —
+    // image), a downloaded `.AppImage` update must be swapped in place -
     // opening it would just start a second instance. Stage the download in
     // the SAME directory as the running image so the final rename is atomic
     // on one filesystem, and refuse early if that path is unknown.
@@ -441,7 +462,7 @@ pub async fn update_download_and_run(
     // Exclusive-create temp path with a random suffix: a pre-planted file at
     // a predictable name can never be reused, and create_new() below fails
     // if the path somehow already exists. `version` comes from the renderer,
-    // so it is filtered to filename-safe characters first — a hostile value
+    // so it is filtered to filename-safe characters first - a hostile value
     // must not be able to steer the temp path outside the destination
     // directory.
     let version = sanitize_version_for_filename(&version);
@@ -553,22 +574,22 @@ pub async fn update_download_and_run(
         // Backward tolerance: an older renderer did not thread the digest
         // through. We still execute only a non-empty, allowlisted,
         // size-capped HTTPS download from GitHub, but this path loses the
-        // tamper guarantee — the renderer in this repo always sends the
+        // tamper guarantee - the renderer in this repo always sends the
         // digest, so in practice this arm is unreachable for shipped builds.
         None => { /* no digest provided: non-empty size verified above */ }
     }
 
     // Signature verification: the digest above proves the download matches
     // the release, but both the binary and its digest come from the same
-    // GitHub API response — whoever can alter one can alter the other. The
+    // GitHub API response - whoever can alter one can alter the other. The
     // minisign signature closes that gap by binding the installer to a key
     // embedded in this binary. With the key provisioned this is fail-closed
     // (missing/invalid signature = delete the installer and refuse to run);
     // until then it is skipped with a warning (digest check only), so
     // pre-provisioning builds keep updating.
     if minisign_key_provisioned(MINISIGN_PUBLIC_KEY) {
-        // ANY signature problem — 404 (unsigned asset), network failure,
-        // oversized body, unparseable or invalid signature — deletes the
+        // ANY signature problem - 404 (unsigned asset), network failure,
+        // oversized body, unparseable or invalid signature - deletes the
         // installer and refuses to run it. There is deliberately no
         // "unsigned release, carry on" path once the key is provisioned.
         let sig = match download_minisig(&client, &current_url).await {
@@ -672,7 +693,7 @@ mod tests {
     use super::*;
 
     /// Build a synthetic reqwest Response with the given status, headers and
-    /// body — no network needed. reqwest 0.12 implements
+    /// body - no network needed. reqwest 0.12 implements
     /// `From<http::Response<T>> for Response`, so unit tests can exercise
     /// the download helpers directly (same approach as the Bitwarden
     /// HTTP-hardening tests).
@@ -871,7 +892,7 @@ mod tests {
         // A tiny cap makes a small body "oversized" without allocating much.
         // A synthetic reqwest Response built from a Full body reports its
         // exact size, so either the content_length() pre-check ("too large")
-        // or the streaming accumulation check ("exceeded") fires — both
+        // or the streaming accumulation check ("exceeded") fires - both
         // reject, which is what matters.
         let resp = make_response(200, &[], b"xxxxx".to_vec());
         let err = read_body_capped(resp, 4, "release manifest")
@@ -1000,6 +1021,23 @@ mod tests {
         assert!(is_newer("1.7.1", "1.7.0"));
     }
 
+    // ── Fast-forward plausibility bound (freeze defence) ─────────────────────
+    // The release metadata is unsigned; a MITM can claim any version number
+    // while pointing at a real old signed asset. Absurd version claims must
+    // be refused so they cannot freeze future genuine updates out.
+    #[test]
+    fn implausible_fast_forward_is_refused() {
+        // From 1.7.2: a claim of v9.9.9 (old asset, absurd number) is refused.
+        assert!(!is_newer("v9.9.9", "1.7.2"));
+        assert!(!is_newer("v100.0.0", "1.7.2"));
+        // Same-major minor jump beyond the bound is refused too.
+        assert!(!is_newer("v1.99.0", "1.7.2"));
+        // ...but a plausible next release still passes.
+        assert!(is_newer("v1.8.0", "1.7.2"));
+        assert!(is_newer("v1.19.0", "1.7.2"));
+        assert!(is_newer("v2.0.0", "1.7.2"));
+    }
+
     // ── Newer running, older remote: never offer a downgrade ────────────────
     #[test]
     fn older_remote_is_not_newer() {
@@ -1025,7 +1063,7 @@ mod tests {
     #[test]
     fn regression_self_reported_stale_version_not_newer() {
         // The exact user-visible failure: tag v1.7.0 vs running "1.4.0" is a
-        // real difference and WOULD be newer — this asserts it is detected
+        // real difference and WOULD be newer - this asserts it is detected
         // (true), which is why the version *source* had to be fixed. With the
         // fix, the running version is 1.7.0 and the equal-version short-
         // circuit keeps the banner away.
@@ -1054,7 +1092,7 @@ RURZlujGKpcBldENeLIUcGNlFb9xFwGX+iU02JbswtWWQcwT/WyI+zphVZmp33Z68qq7K87GPIrQ5pq8
 trusted comment: sshspan-updater-test
 Zo4gaiQqoL1Jfr9KXg5zhLPR2W1kR6V9kt/NEr/E06UHQiCABaoXZC2Y8FZgL6TjOS3mB2J7N8PLYKufka2IAg==";
 
-    /// Valid minisign signature over DIFFERENT content (b"tampered bytes") —
+    /// Valid minisign signature over DIFFERENT content (b"tampered bytes") -
     /// a well-formed signature that must still fail against TEST_BLOB.
     const TEST_SIG_OTHER_BLOB: &str = "untrusted comment: signature from minisign secret key
 RURZlujGKpcBlV9Y3Of2Aq8JpnTqJciEKaKsGZN1PEnSLAvM32YiLeMCo5j0nqtZFXxi79QXGTljTGHWm2+nVcfC4PFn+TTfsAM=
@@ -1203,7 +1241,7 @@ SWYMI+zOPB2iL5kCX2udBtoWCA9aGT7AvUVmT4Xa1CDTDUadQKeArHOsgGjFxnV/3xtgKHY5t3aUFcma
     #[test]
     fn minisign_signature_of_other_content_is_rejected() {
         // Even a perfectly valid signature (over different bytes) must not
-        // verify against TEST_BLOB — this is the release-asset substitution
+        // verify against TEST_BLOB - this is the release-asset substitution
         // case: attacker uploads their own installer + its own valid sig.
         let err = verify_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, TEST_SIG_OTHER_BLOB)
             .expect_err("a signature over different content must be rejected");
@@ -1218,7 +1256,7 @@ SWYMI+zOPB2iL5kCX2udBtoWCA9aGT7AvUVmT4Xa1CDTDUadQKeArHOsgGjFxnV/3xtgKHY5t3aUFcma
         // A different (valid-format) Ed25519 key: the signature's key id
         // does not match, so verification fails before any crypto runs.
         // Second half of the test pubkey with the first bytes of the real
-        // one kept — valid format, different key id/key.
+        // one kept - valid format, different key id/key.
         let wrong_key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
         let err = verify_with_key(wrong_key, TEST_BLOB, TEST_SIG_GOOD)
             .expect_err("a signature from a different key must be rejected");

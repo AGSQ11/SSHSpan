@@ -1,4 +1,4 @@
-//! Bitwarden cryptographic operations — 1:1 port of bitwardenCrypto.js
+//! Bitwarden cryptographic operations - 1:1 port of bitwardenCrypto.js
 //!
 //! Implements the minimal subset of Bitwarden's client-side crypto stack:
 //!   1. Master key derivation (PBKDF2-SHA256 or Argon2id per server prelogin)
@@ -7,7 +7,7 @@
 //!   4. EncString type 2: AES-256-CBC + HMAC-SHA256 ("2.<iv>|<ct>|<mac>")
 //!
 //! Only HMAC-verified decryptions succeed; every cipher field we send is
-//! encrypted locally — the server only ever sees ciphertext.
+//! encrypted locally - the server only ever sees ciphertext.
 
 use aes::Aes256;
 use base64ct::{Base64, Encoding};
@@ -54,7 +54,54 @@ pub(crate) const ARGON2_MIN_MEMORY_KIB: u32 = 16 * 1024;
 pub(crate) const ARGON2_MIN_ITERATIONS: u32 = 2;
 pub(crate) const ARGON2_MIN_PARALLELISM: u32 = 1;
 
+// Ceilings on the server-supplied work factors. Floors alone are not enough:
+// a hostile vault server can send kdfIterations: 2_000_000_000 or
+// kdfMemory: 16 GiB and turn a sync into an unbounded local CPU/RAM burn -
+// the cost is paid during derivation, which no HTTP timeout covers. The
+// ceilings sit far above anything a real Bitwarden/Vaultwarden account can
+// configure (PBKDF2 max 2M iterations, Argon2 max 1024 MiB per the official
+// clients) while still bounding the worst case.
+pub(crate) const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
+pub(crate) const ARGON2_MAX_ITERATIONS: u32 = 16;
+pub(crate) const ARGON2_MAX_MEMORY_KIB: u32 = 1024 * 1024; // 1 GiB
+pub(crate) const ARGON2_MAX_PARALLELISM: u32 = 16;
+
+/// Clamp server-supplied KDF parameters to safe bounds, selected by KDF
+/// type - the same field names mean very different magnitudes per algorithm
+/// (PBKDF2 iterations are hundreds of thousands; Argon2 passes are single
+/// digits), so a shared clamp would be wrong in both directions. Unknown KDF
+/// types are refused outright rather than derived with guessed parameters.
+pub(crate) fn clamp_kdf_params(
+    kdf_type: u32,
+    iterations: u32,
+    memory: u32,
+    parallelism: u32,
+) -> anyhow::Result<KdfParams> {
+    let params = match kdf_type {
+        0 => KdfParams {
+            kdf_type,
+            iterations: iterations.clamp(PBKDF2_MIN_ITERATIONS, PBKDF2_MAX_ITERATIONS),
+            // Memory/parallelism are meaningless for PBKDF2; do not let a
+            // hostile server smuggle Argon2-magnitude values into them.
+            memory: 0,
+            parallelism: 0,
+        },
+        1 => KdfParams {
+            kdf_type,
+            iterations: iterations.clamp(ARGON2_MIN_ITERATIONS, ARGON2_MAX_ITERATIONS),
+            memory: memory.clamp(ARGON2_MIN_MEMORY_KIB, ARGON2_MAX_MEMORY_KIB),
+            parallelism: parallelism.clamp(ARGON2_MIN_PARALLELISM, ARGON2_MAX_PARALLELISM),
+        },
+        other => anyhow::bail!("Unsupported Bitwarden KDF type: {other}"),
+    };
+    Ok(params)
+}
+
 pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow::Result<[u8; 32]> {
+    // Defense in depth: clamp again at the crypto boundary, so a caller that
+    // bypassed the prelogin clamp (a future import path, a test) still
+    // cannot drive unbounded work factors.
+    let kdf = &clamp_kdf_params(kdf.kdf_type, kdf.iterations, kdf.memory, kdf.parallelism)?;
     let pw = password.as_bytes();
     let salt = email.trim().to_lowercase();
     let salt_bytes = salt.as_bytes();
@@ -95,7 +142,7 @@ pub fn master_password_hash(master_key: &[u8; 32], password: &str) -> String {
 
 /// HKDF-Expand only (RFC 5869, SHA-256). Bitwarden expands the master key
 /// directly without the Extract step.
-/// HKDF-Expand only (RFC 5869) — Bitwarden expands the master key directly
+/// HKDF-Expand only (RFC 5869) - Bitwarden expands the master key directly
 /// without the Extract step, exactly like the Electron original:
 /// T(1) = HMAC(PRK, info || 0x01), T(i) = HMAC(PRK, T(i-1) || info || i)
 fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Vec<u8> {
@@ -252,7 +299,7 @@ pub fn decrypt_to_bytes(enc_string: &str, key64: &[u8; 64]) -> anyhow::Result<Ve
     }
 
     // Decrypt. decrypt_padded_mut returns a slice of `buf` with the PKCS7
-    // padding already removed, but it does NOT resize the buffer — returning
+    // padding already removed, but it does NOT resize the buffer - returning
     // `buf` wholesale would leak the trailing pad block (e.g. a 64-byte user
     // key whose ciphertext ends in a full 0x10x16 pad block would come back
     // as 80 bytes). Return the unpadded slice instead.
@@ -280,6 +327,31 @@ fn generate_iv() -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Server-supplied KDF parameters are clamped at BOTH ends, per type.
+    #[test]
+    fn kdf_params_clamped_both_ends_per_type() {
+        // PBKDF2: floor and ceiling, and no memory/parallelism smuggling.
+        let p = clamp_kdf_params(0, 1, u32::MAX, u32::MAX).unwrap();
+        assert_eq!(p.iterations, PBKDF2_MIN_ITERATIONS);
+        assert_eq!((p.memory, p.parallelism), (0, 0));
+        let p = clamp_kdf_params(0, 2_000_000_000, 0, 0).unwrap();
+        assert_eq!(p.iterations, PBKDF2_MAX_ITERATIONS);
+
+        // Argon2id: independent floors/ceilings for passes, memory, lanes.
+        let p = clamp_kdf_params(1, 0, 0, 0).unwrap();
+        assert_eq!(p.iterations, ARGON2_MIN_ITERATIONS);
+        assert_eq!(p.memory, ARGON2_MIN_MEMORY_KIB);
+        assert_eq!(p.parallelism, ARGON2_MIN_PARALLELISM);
+        let p = clamp_kdf_params(1, u32::MAX, u32::MAX, u32::MAX).unwrap();
+        assert_eq!(p.iterations, ARGON2_MAX_ITERATIONS);
+        assert_eq!(p.memory, ARGON2_MAX_MEMORY_KIB);
+        assert_eq!(p.parallelism, ARGON2_MAX_PARALLELISM);
+
+        // Unknown KDF types are refused, not guessed.
+        assert!(clamp_kdf_params(7, 600_000, 0, 0).is_err());
+        assert!(clamp_kdf_params(u32::MAX, 600_000, 0, 0).is_err());
+    }
 
     #[test]
     fn stretch_master_key_matches_electron_hkdf_expand() {
