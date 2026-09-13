@@ -191,7 +191,6 @@ pub fn run() {
             // System commands
             system_open_external,
             system_open_url,
-            system_show_item_in_folder,
             system_select_file,
             system_pick_save_path,
             system_write_text_file,

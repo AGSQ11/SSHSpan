@@ -89,7 +89,7 @@ framework-free (plain DOM + `window.__TAURI__.core.invoke`) so the CSP can remai
 | **Servers (new)** | `server_list`, `server_save`, `server_delete`, `server_test` |
 | **Terminal (new)** | `terminal_connect`, `terminal_send`, `terminal_resize`, `terminal_disconnect`, `terminal_list`, `known_hosts_list`, `known_hosts_forget` |
 | Bitwarden | `bitwarden_get_config`, `bitwarden_save_config`, `bitwarden_test_connection`, `bitwarden_sync` |
-| Ops | `settings_get`, `settings_set`, `audit_list`, `system_open_external`, `system_show_item_in_folder`, `system_select_file` |
+| Ops | `settings_get`, `settings_set`, `audit_list`, `system_open_external`, `system_select_file` |
 
 ### 2.4 Renderer
 

@@ -429,15 +429,25 @@ impl Database {
 
             // Migration: port-qualify legacy bare-host known_hosts pins.
             // Existing rows stored the host as a bare hostname; all new rows
-            // use "host:port". Appending ":22" matches the historical default
-            // port and keeps pins for the same hostname on different ports
-            // independent. IPv6 addresses that were stored bare also receive
-            // ":22" because they were saved without bracket/port decoration.
-            let _ = sqlx::query(
-                "UPDATE known_hosts SET host = host || ':22' WHERE host NOT LIKE '%:%'",
-            )
-            .execute(&self.pool)
-            .await;
+            // use "host:port" (see `ssh_client::known_host_key`).
+            //
+            // SECURITY: a pin that does not migrate is not a benign leftover.
+            // The lookup key becomes "host:22", the orphaned row never matches,
+            // and the next connection to that host takes the *unpinned* branch
+            // — turning what should have been a hard mismatch failure into a
+            // routine first-trust prompt, which is exactly the downgrade a
+            // machine-in-the-middle wants. So this migration is explicit,
+            // per-row, and its failures are propagated rather than discarded.
+            //
+            // Two shapes the old blanket `UPDATE … WHERE host NOT LIKE '%:%'`
+            // got wrong, both regression-tested below:
+            //   * an IPv6 literal always contains ':', so it never matched the
+            //     predicate and was left orphaned forever;
+            //   * if a qualified row for the same host already existed (a
+            //     backup restore inserts "host:port" directly) the UPDATE hit
+            //     the PRIMARY KEY, SQLite rolled the WHOLE statement back, and
+            //     `let _ =` swallowed it — losing every legacy pin at once.
+            self.migrate_known_hosts_port_qualify().await?;
 
             // Migration: track where each known_hosts pin came from. Rows
             // that predate this column were all learned from real
@@ -1324,6 +1334,54 @@ impl Database {
         }
     }
 
+    /// Port-qualify legacy bare-host `known_hosts` rows to "host:22".
+    ///
+    /// Runs inside `migrate()`. Explicit and per-row so that one bad row
+    /// cannot silently take the rest of the pins with it — see the call site
+    /// for why a lost pin is a security downgrade rather than cosmetic.
+    ///
+    /// Rules:
+    /// * A row already carrying an explicit ":port" suffix is left alone.
+    /// * A bare IPv6 literal is bracketed as well as port-qualified, so it
+    ///   becomes "[2001:db8::1]:22" — distinguishable from a bare hostname and
+    ///   stable under a second run.
+    /// * If the destination key is already taken, the legacy row is dropped
+    ///   rather than colliding: the existing qualified row is the newer, more
+    ///   specific pin, and keeping the orphan would only confuse a later run.
+    /// * Idempotent: a second call finds nothing left to do.
+    async fn migrate_known_hosts_port_qualify(&self) -> Result<()> {
+        let rows: Vec<String> = sqlx::query_scalar::<_, String>("SELECT host FROM known_hosts")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut tx = self.pool.begin().await?;
+        for old in rows {
+            let Some(new) = qualify_legacy_known_host(&old) else {
+                continue; // already qualified
+            };
+            let taken =
+                sqlx::query_scalar::<_, String>("SELECT host FROM known_hosts WHERE host = ?")
+                    .bind(&new)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .is_some();
+            if taken {
+                sqlx::query("DELETE FROM known_hosts WHERE host = ?")
+                    .bind(&old)
+                    .execute(&mut *tx)
+                    .await?;
+                continue;
+            }
+            sqlx::query("UPDATE known_hosts SET host = ? WHERE host = ?")
+                .bind(&new)
+                .bind(&old)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Insert a newly-seen host key. Returns false if the host already exists
     /// with a DIFFERENT key (the caller should treat that as a mismatch).
     pub fn add_known_host(&self, host: &str, host_key: &str, fingerprint: &str) -> Result<bool> {
@@ -1779,73 +1837,172 @@ impl Database {
     }
 }
 
+/// Decide how a legacy `known_hosts.host` value must be rewritten to the
+/// "host:port" form every current lookup uses, or `None` when it already is.
+///
+/// A bare IPv6 literal is the case the old `WHERE host NOT LIKE '%:%'`
+/// predicate could never match, because an IPv6 address is *made of* colons.
+/// Detect it by shape (two or more colons and no bracket) and bracket it, so
+/// the result is unambiguous and a second pass leaves it alone.
+pub(crate) fn qualify_legacy_known_host(host: &str) -> Option<String> {
+    if host.is_empty() {
+        return None;
+    }
+    // Already qualified: "[v6]:port", or "name:port" with a numeric port.
+    if let Some(rest) = host.strip_prefix('[') {
+        return if rest.contains("]:") {
+            None
+        } else {
+            Some(format!("{host}:22"))
+        };
+    }
+    let colons = host.matches(':').count();
+    match colons {
+        0 => Some(format!("{host}:22")),
+        // Exactly one colon: "name:port" if the tail parses as a port, else it
+        // is something odd — qualify it rather than leave it unreachable.
+        1 => {
+            let tail = host.rsplit(':').next().unwrap_or("");
+            if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+                None
+            } else {
+                Some(format!("{host}:22"))
+            }
+        }
+        // Two or more colons and no bracket: a bare IPv6 literal.
+        _ => Some(format!("[{host}]:22")),
+    }
+}
+
 /// FNV-1a 32-bit hash of the string, formatted as 8 lowercase hex chars.
 /// Used to derive a short deterministic id from a category path.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The port-qualifying migration must rewrite legacy bare-host pins to
-    /// "host:22" and leave already-qualified pins untouched.
-    #[test]
-    fn known_hosts_migration_port_qualifies_bare_host() {
-        let db_path = std::env::temp_dir().join(format!(
-            "sshspan-known-hosts-test-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let db = Database::open_at(db_path).expect("open test db");
-
-        // Simulate a pre-migration row (bare hostname).
+    /// Helper: seed a row straight into known_hosts, bypassing add_known_host,
+    /// to simulate a pre-migration database.
+    fn seed_pin(db: &Database, host: &str, key: &str) {
         block(async {
             sqlx::query(
                 "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) VALUES (?, ?, ?, ?)",
             )
-            .bind("example.com")
-            .bind("fake-key-blob")
+            .bind(host)
+            .bind(key)
             .bind("aa:bb:cc")
             .bind(chrono::Utc::now().to_rfc3339())
             .execute(&db.pool)
             .await
             .unwrap();
         });
-
-        // Running migrate() again should qualify the bare host.
-        db.migrate().expect("migrate should succeed");
-
-        let hosts = db.list_known_hosts().expect("list known hosts");
-        assert_eq!(hosts.len(), 1);
-        assert_eq!(hosts[0].host, "example.com:22");
     }
 
-    /// Already-qualified pins (e.g., from a backup restore) must not accumulate
-    /// extra ":22" suffixes on each migration.
-    #[test]
-    fn known_hosts_migration_idempotent_for_qualified_host() {
+    fn migration_db(name: &str) -> Database {
         let db_path = std::env::temp_dir().join(format!(
-            "sshspan-known-hosts-qualified-test-{}.db",
+            "sshspan-known-hosts-{name}-{}.db",
             uuid::Uuid::new_v4()
         ));
-        let db = Database::open_at(db_path).expect("open test db");
+        Database::open_at(db_path).expect("open test db")
+    }
 
-        block(async {
-            sqlx::query(
-                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) VALUES (?, ?, ?, ?)",
-            )
-            .bind("example.com:2222")
-            .bind("fake-key-blob")
-            .bind("aa:bb:cc")
-            .bind(chrono::Utc::now().to_rfc3339())
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        });
+    fn pins(db: &Database) -> Vec<String> {
+        let mut v: Vec<String> = db
+            .list_known_hosts()
+            .expect("list known hosts")
+            .into_iter()
+            .map(|h| h.host)
+            .collect();
+        v.sort();
+        v
+    }
 
+    /// The migration must rewrite legacy bare-host pins to "host:22".
+    #[test]
+    fn known_hosts_migration_port_qualifies_bare_host() {
+        let db = migration_db("bare");
+        seed_pin(&db, "example.com", "fake-key-blob");
+        db.migrate().expect("migrate should succeed");
+        assert_eq!(pins(&db), vec!["example.com:22"]);
+    }
+
+    /// Already-qualified pins must not accumulate extra ":22" suffixes.
+    #[test]
+    fn known_hosts_migration_idempotent_for_qualified_host() {
+        let db = migration_db("qualified");
+        seed_pin(&db, "example.com:2222", "fake-key-blob");
         db.migrate().expect("migrate should succeed");
         db.migrate().expect("second migrate should be idempotent");
+        assert_eq!(pins(&db), vec!["example.com:2222"]);
+    }
 
-        let hosts = db.list_known_hosts().expect("list known hosts");
-        assert_eq!(hosts.len(), 1);
-        assert_eq!(hosts[0].host, "example.com:2222");
+    /// REGRESSION: a bare IPv6 literal is made of colons, so the old
+    /// `WHERE host NOT LIKE '%:%'` predicate never matched it and the pin was
+    /// orphaned — every later connection to that host took the unpinned
+    /// branch and got a first-trust prompt instead of a mismatch failure.
+    #[test]
+    fn known_hosts_migration_qualifies_bare_ipv6() {
+        let db = migration_db("ipv6");
+        seed_pin(&db, "2001:db8::1", "fake-key-blob");
+        db.migrate().expect("migrate should succeed");
+        assert_eq!(pins(&db), vec!["[2001:db8::1]:22"]);
+        // The migrated key must be exactly what a lookup will ask for.
+        assert_eq!(
+            crate::ssh_client::known_host_key("2001:db8::1", 22),
+            "[2001:db8::1]:22"
+        );
+        assert!(db
+            .get_known_host(&crate::ssh_client::known_host_key("2001:db8::1", 22))
+            .expect("lookup")
+            .is_some());
+        db.migrate().expect("second migrate should be idempotent");
+        assert_eq!(pins(&db), vec!["[2001:db8::1]:22"]);
+    }
+
+    /// REGRESSION: with both "example.com" and "example.com:22" present, the
+    /// old blanket UPDATE hit the PRIMARY KEY, SQLite rolled the whole
+    /// statement back, and `let _ =` swallowed the error — so EVERY legacy pin
+    /// stayed bare and unreachable. The per-row migration must survive the
+    /// collision and still migrate the unrelated rows.
+    #[test]
+    fn known_hosts_migration_survives_key_collision() {
+        let db = migration_db("collision");
+        seed_pin(&db, "example.com", "legacy-blob");
+        seed_pin(&db, "example.com:22", "current-blob");
+        seed_pin(&db, "other.example", "other-blob");
+        db.migrate().expect("migrate must not fail on a collision");
+        assert_eq!(pins(&db), vec!["example.com:22", "other.example:22"]);
+        // The existing qualified pin wins; the legacy orphan is dropped.
+        let kept = db
+            .get_known_host("example.com:22")
+            .expect("lookup")
+            .expect("pin present");
+        assert_eq!(kept.host_key, "current-blob");
+    }
+
+    #[test]
+    fn qualify_legacy_known_host_shapes() {
+        // Bare hostname / IPv4 -> ":22".
+        assert_eq!(
+            qualify_legacy_known_host("example.com").as_deref(),
+            Some("example.com:22")
+        );
+        assert_eq!(
+            qualify_legacy_known_host("192.0.2.1").as_deref(),
+            Some("192.0.2.1:22")
+        );
+        // Bare IPv6 -> bracketed and qualified.
+        assert_eq!(
+            qualify_legacy_known_host("::1").as_deref(),
+            Some("[::1]:22")
+        );
+        // Already qualified -> untouched.
+        assert_eq!(qualify_legacy_known_host("example.com:2222"), None);
+        assert_eq!(qualify_legacy_known_host("[2001:db8::1]:22"), None);
+        // Bracketed but portless -> qualified.
+        assert_eq!(
+            qualify_legacy_known_host("[2001:db8::1]").as_deref(),
+            Some("[2001:db8::1]:22")
+        );
     }
 
     fn test_db() -> Database {
