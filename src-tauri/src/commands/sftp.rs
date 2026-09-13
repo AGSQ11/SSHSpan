@@ -1076,15 +1076,29 @@ pub async fn sftp_queue_add(
     preserve_ts: Option<bool>, // preserve source mtime on upload legs
 ) -> CmdResult<serde_json::Value> {
     require_unlocked(&app)?;
-    let kind = if direction == "upload" {
-        JobKind::Upload
-    } else {
-        JobKind::Download
+    // Parse explicitly and reject anything else.
+    //
+    // This used to be `if direction == "upload" { Upload } else { Download }`,
+    // with an `if !matches!(kind, Upload | Download)` guard after it. That
+    // guard could never fire — `kind` was only ever one of those two — so the
+    // "unsupported direction" error was dead code, and every unrecognised
+    // value (a typo, a renamed constant, anything a compromised renderer
+    // sends) silently became a DOWNLOAD instead of an error.
+    //
+    // It granted no capability the renderer did not already have by simply
+    // sending "download", so this is fail-open in shape rather than a
+    // privilege issue. It is still the wrong default for an untrusted input:
+    // unrecognised should mean refused. ServerCopy is enqueued via
+    // `sftp_server_copy`, never here, so it is not accepted either.
+    let kind = match direction.as_str() {
+        "upload" => JobKind::Upload,
+        "download" => JobKind::Download,
+        other => {
+            return Err(CmdError(format!(
+                "unsupported transfer direction {other:?}; expected \"upload\" or \"download\"."
+            )))
+        }
     };
-    // ServerCopy jobs are enqueued via `sftp_server_copy`, never here.
-    if !matches!(kind, JobKind::Upload | JobKind::Download) {
-        return Err(CmdError("unsupported direction.".into()));
-    }
     // Ask/Overwrite/Resume - resolved once here, threaded into every
     // expanded job.
     let resume = resolve_resume_mode(&app, resume.as_deref());
@@ -2318,6 +2332,49 @@ mod tests {
             Some("résumé v2.txt".to_string())
         );
         assert_eq!(sanitize_remote_name("a..b"), Some("a..b".to_string()));
+    }
+
+    /// REGRESSION: `sftp_queue_add` mapped every direction that was not
+    /// exactly "upload" onto Download, and the `!matches!(kind, ...)` guard
+    /// meant to catch bad input could never fire because `kind` was already
+    /// one of the two variants. A typo or any unrecognised value silently
+    /// started a download. Unrecognised input from the renderer must be
+    /// refused, not defaulted.
+    ///
+    /// The command itself needs an AppHandle, so this pins the parsing rule
+    /// the command applies rather than invoking it.
+    #[test]
+    fn queue_direction_accepts_only_the_two_known_values() {
+        fn parse(direction: &str) -> Result<JobKind, String> {
+            match direction {
+                "upload" => Ok(JobKind::Upload),
+                "download" => Ok(JobKind::Download),
+                other => Err(format!(
+                    "unsupported transfer direction {other:?}; expected \"upload\" or \"download\"."
+                )),
+            }
+        }
+
+        assert!(matches!(parse("upload"), Ok(JobKind::Upload)));
+        assert!(matches!(parse("download"), Ok(JobKind::Download)));
+
+        // Everything else is refused — previously every one of these became a
+        // silent Download.
+        for bad in [
+            "",
+            "Upload",
+            "DOWNLOAD",
+            "upl0ad",
+            "serverCopy",
+            "../",
+            "sync",
+        ] {
+            let err = parse(bad).expect_err("must refuse unrecognised direction");
+            assert!(
+                err.contains("unsupported transfer direction"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
     }
 
     #[test]
