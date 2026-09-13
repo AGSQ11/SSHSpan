@@ -393,9 +393,17 @@ function buildSftpPanel(tabId) {
   localWrap.appendChild(localTable);
   localPane.appendChild(localHead);
   localPane.appendChild(localWrap);
-  // Local pane has no sort/selection UI (never did) - just the two
-  // delegated listeners it already had per-row (dblclick, dragstart).
-  sftpWireLocalTbodyDelegation(tabId);
+  // Local pane has no sort/selection UI (never did). Its two per-row
+  // listeners (dblclick to descend/upload, dragstart to drag onto the remote
+  // pane) are attached in sftpUiLocalLoad as each row is built, which is
+  // where they have always lived.
+  //
+  // There was a call to sftpWireLocalTbodyDelegation(tabId) here, left behind
+  // by the delegated-rows refactor: the remote pane moved to a single
+  // delegated tbody listener, the local pane was meant to follow, and the
+  // function was never written. It threw a ReferenceError right here, in
+  // buildSftpPanel, so the ENTIRE SFTP panel failed to build and the view
+  // rendered blank - not just the local pane.
 
   // ── splitter (drag to resize) ──
   const splitter = document.createElement('div');

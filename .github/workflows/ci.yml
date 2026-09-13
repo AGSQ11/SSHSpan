@@ -94,6 +94,13 @@ jobs:
             node --check "$f"
           done
 
+      # node --check only parses. A call to a function that was never written
+      # is valid syntax and passes it, then throws a ReferenceError at runtime
+      # - which is how a leftover sftpWireLocalTbodyDelegation() call sat in
+      # buildSftpPanel and blanked the entire SFTP view.
+      - name: Undefined project functions
+        run: node scripts/check-renderer-globals.js
+
   ipc-arg-names:
     name: IPC argument names
     runs-on: ubuntu-latest
