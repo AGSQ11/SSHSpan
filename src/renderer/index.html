@@ -72,7 +72,10 @@
             <option value="ed25519">Ed25519</option>
             <option value="ecdsa">ECDSA</option>
           </select>
-          <button id="catFilterBtn" class="ghost-btn cat-filter-btn" title="Filter by category" disabled>
+          <!-- Not disabled by default: updateCatFilterButton() enables it, but
+               until that first runs the control looked permanently inert, so
+               "show every key regardless of category" read as missing. -->
+          <button id="catFilterBtn" class="ghost-btn cat-filter-btn" title="Filter by category — currently showing every key">
             <span data-ico="folder"></span><span id="catFilterLabel">All categories</span>
           </button>
           <span class="spacer"></span>
@@ -104,6 +107,7 @@
             <label class="detail-label">Public key (authorized_keys)</label>
             <textarea class="mono" id="detailAuthorized" rows="4" readonly spellcheck="false"></textarea>
             <div class="detail-actions">
+              <button id="detailRenameBtn" class="ghost-btn"><span data-ico="pencil"></span>Rename</button>
               <button id="detailCopyPublicBtn" class="ghost-btn"><span data-ico="copy"></span>Copy public key</button>
               <button id="detailDeleteBtn" class="danger-btn"><span data-ico="trash-2"></span>Delete</button>
             </div>

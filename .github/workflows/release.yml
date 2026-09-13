@@ -117,6 +117,41 @@ jobs:
         run: npm run dist:linux -- --bundles deb,rpm,appimage
         if: runner.os == 'Linux'
 
+      # The AppImage ships its own libwayland-client.so.0. On a Wayland host
+      # that library has to be the compositor's, not ours: when they disagree
+      # the app fails to start at all, and the only way in was
+      #   LD_PRELOAD=/usr/lib64/libwayland-client.so.0 ./SSHSpan.AppImage
+      # libwayland-client is on the official AppImage excludelist for exactly
+      # this reason, but Tauri's bundler does not apply it, so strip the
+      # library back out and repack. Runs before the signing step below so the
+      # signature covers the repacked file, and the filename is preserved so
+      # the artifact glob still matches.
+      - name: Unbundle host-owned Wayland libs from the AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(src-tauri/target/*/release/bundle/appimage/*.AppImage)
+          if [ ${#appimages[@]} -eq 0 ]; then
+            echo "::error::No AppImage produced — nothing to repack."; exit 1
+          fi
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+          for img in "${appimages[@]}"; do
+            work="$(mktemp -d)"
+            ( cd "$work" && "$OLDPWD/$img" --appimage-extract >/dev/null )
+            removed=0
+            for lib in "$work"/squashfs-root/usr/lib/libwayland-client.so*; do
+              rm -f "$lib"; removed=$((removed + 1))
+            done
+            echo "Removed $removed bundled libwayland-client file(s) from $(basename "$img")"
+            rm -f "$img"
+            ARCH=x86_64 /tmp/appimagetool --no-appstream "$work/squashfs-root" "$img"
+            rm -rf "$work"
+          done
+
       - name: Extract release notes from CHANGELOG
         shell: bash
         run: |

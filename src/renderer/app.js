@@ -36,6 +36,43 @@ function toast(msg, kind) {
   toastTimer = setTimeout(() => { t.className = ''; }, 3800);
 }
 
+// \u2500\u2500\u2500 interface scale \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// The default 13px base is too small on a lot of 1080p displays and the
+// stylesheet has no relative sizing to lean on, so scaling is done with the
+// webview's own zoom \u2014 the same mechanism as Ctrl+= \u2014 which scales layout and
+// text together. Stored as a percentage under the `uiScale` setting.
+
+const UI_SCALE_MIN = 75;
+const UI_SCALE_MAX = 200;
+
+function clampUiScale(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return 100;
+  return Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, n));
+}
+
+function currentUiScale() {
+  return clampUiScale(state.settings && state.settings.uiScale ? state.settings.uiScale : 100);
+}
+
+/// Apply a scale percentage to the live window. Best-effort: if the webview
+/// zoom API is unavailable the UI simply stays at 100% rather than throwing
+/// during boot.
+function applyUiScale(pct) {
+  const factor = clampUiScale(pct) / 100;
+  try {
+    const wv = window.__TAURI__ && window.__TAURI__.webviewWindow;
+    const win = wv && wv.getCurrentWebviewWindow && wv.getCurrentWebviewWindow();
+    if (win && typeof win.setZoom === 'function') {
+      const r = win.setZoom(factor);
+      if (r && typeof r.catch === 'function') r.catch(() => {});
+    }
+  } catch {
+    /* zoom unavailable \u2014 keep the default scale */
+  }
+}
+
 function fmtTime(iso) {
   if (!iso) return '\u2014';
   const d = new Date(iso);
@@ -59,7 +96,25 @@ function download(filename, text) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
+// Copy via Tauri's clipboard plugin first, the browser API second.
+//
+// Under WebKitGTK (every Linux build, and the AppImage in particular)
+// navigator.clipboard.writeText rejects even when the text reaches the
+// clipboard, so the old browser-only path reported "Clipboard unavailable"
+// on copies that had in fact worked. tauri_plugin_clipboard_manager is
+// already registered (src-tauri/src/lib.rs) and terminal.js already uses it;
+// this path simply never did.
+const clipboardPlugin = (window.__TAURI__ && window.__TAURI__.clipboardManager) || null;
+
 async function copyText(text) {
+  if (clipboardPlugin && typeof clipboardPlugin.writeText === 'function') {
+    try {
+      await clipboardPlugin.writeText(text);
+      return true;
+    } catch {
+      // fall through to the browser API
+    }
+  }
   try {
     await navigator.clipboard.writeText(text);
     return true;
@@ -773,6 +828,14 @@ const state = window.state = {
 // ─── vault gate ────────────────────────────────────────────────────────────
 
 function showVaultModal(mode) {
+  const backdrop = el('vaultModal');
+  // refreshVaultStatus() runs on a 10s interval and calls straight back in
+  // here while the dialog is already up. Clearing unconditionally therefore
+  // wiped the master password every 10 seconds as the user typed it, which
+  // made the vault impossible to create with anything longer than a short
+  // password (and impossible to paste from a password manager). Only reset
+  // the fields when the dialog is actually being opened, or switching mode.
+  const reopening = backdrop.hidden || state.vaultMode !== mode;
   state.vaultMode = mode;
   const title = el('vaultModalTitle');
   const text = el('vaultModalText');
@@ -780,7 +843,7 @@ function showVaultModal(mode) {
   const confirm = el('vaultPasswordConfirm');
   const current = el('vaultPasswordCurrent');
   const primary = el('vaultPrimary');
-  pw.value = ''; confirm.value = ''; current.value = '';
+  if (reopening) { pw.value = ''; confirm.value = ''; current.value = ''; }
   pw.hidden = false;
   confirm.hidden = mode !== 'create' && mode !== 'change';
   // The current password is re-typed instead of being cached in state, so the
@@ -799,8 +862,11 @@ function showVaultModal(mode) {
     text.textContent = 'Enter your master password to decrypt your keys for this session.';
     primary.textContent = 'Unlock';
   }
-  el('vaultModal').hidden = false;
-  pw.focus();
+  backdrop.hidden = false;
+  // Same reason as the field reset above: focusing on every poll would yank
+  // the caret out of the confirm field back into the password field every
+  // 10 seconds while the user is still filling the form in.
+  if (reopening) pw.focus();
 }
 
 function hideVaultModal() { el('vaultModal').hidden = true; }
@@ -1753,6 +1819,30 @@ async function loadSettings() {
   });
   mkRow('Auto-lock after (minutes)', autoLock);
 
+  // Interface scale. The stylesheet is written in px throughout, so a root
+  // font-size would only resize text and leave every control the same size.
+  // The webview's own zoom scales the whole layout the way Ctrl+= does in a
+  // browser, and survives as a stored setting.
+  const uiScale = document.createElement('select');
+  for (const pct of [90, 100, 110, 125, 150, 175, 200]) {
+    const o = document.createElement('option');
+    o.value = String(pct);
+    o.textContent = pct + '%';
+    uiScale.appendChild(o);
+  }
+  uiScale.value = String(currentUiScale());
+  uiScale.addEventListener('change', async () => {
+    const pct = clampUiScale(uiScale.value);
+    uiScale.value = String(pct);
+    applyUiScale(pct);
+    try {
+      await call('settings_set', { key: 'uiScale', value: String(pct) });
+      state.settings.uiScale = String(pct);
+      toast('Interface scale set to ' + pct + '%.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Interface scale', uiScale);
+
   const confirmDelete = document.createElement('input');
   confirmDelete.type = 'checkbox';
   confirmDelete.checked = state.settings.confirmDelete !== false;
@@ -2274,6 +2364,21 @@ function wire() {
   });
   el('catAddRootBtn').addEventListener('click', () => addCategoryPrompt(null));
   el('catFilterBtn').setAttribute('aria-label', 'Filter current view by category');
+  el('detailRenameBtn').addEventListener('click', () => {
+    if (!state.selectedId) return;
+    const k = state.keys.find(x => x.id === state.selectedId);
+    if (!k) return;
+    promptModal('Rename key', 'New name (no spaces — it is used as the Host alias in your SSH config):', k.name, async (name) => {
+      const next = (name || '').trim();
+      if (!next || next === k.name) return;
+      try {
+        await call('key_rename', { id: k.id, name: next });
+        await loadKeys();
+        selectKey(k.id);
+        toast('Key renamed.', 'ok');
+      } catch (e) { toast(e.message || String(e), 'err'); }
+    });
+  });
   el('detailCopyPublicBtn').addEventListener('click', copyPublic);
   el('detailDeleteBtn').addEventListener('click', deleteSelected);
   el('detailExportBtn').addEventListener('click', exportSelected);
@@ -3202,6 +3307,7 @@ function escapeHtml(s) {
   // when the Settings view is opened).
   try { state.settings = await call('settings_get'); } catch (e) { state.settings = {}; }
   state.sftpDualPane = state.settings.sftpDualPane === '1';
+  applyUiScale(currentUiScale());
 
   // Auto-lock idle timer: user activity resets it; expiry calls lockNow().
   for (const ev of ['keydown', 'mousedown', 'wheel', 'touchstart']) {
