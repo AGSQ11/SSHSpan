@@ -72,10 +72,28 @@ fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
     Ok(())
 }
 
+/// Refuse anything that touches a remote filesystem while the vault is locked.
+///
+/// SECURITY: `terminal_connect` and `server_test` both check this; no `sftp_*`
+/// command did. Locking is the app's answer to an unattended machine, and it
+/// promises to end remote access - but an SFTP channel lives on its own russh
+/// channel, so it survived the shell teardown and every listing, download,
+/// upload and delete kept working against a "locked" vault.
+fn require_unlocked(app: &AppHandle) -> CmdResult<()> {
+    if super::vault_password(app)?.is_empty() {
+        return Err(CmdError("Vault is locked.".into()));
+    }
+    Ok(())
+}
+
 fn sftp_from_session(
     app: &AppHandle,
     session_id: &str,
 ) -> Result<Arc<russh_sftp::client::SftpSession>, CmdError> {
+    // Single choke point: every command that reaches the remote filesystem
+    // resolves its session here, so the gate belongs here rather than in ~40
+    // command bodies where one would eventually be missed.
+    require_unlocked(app)?;
     app.state::<SftpRegistry>()
         .get(session_id)
         .ok_or_else(|| CmdError("SFTP is not open for this session - switch to SFTP first.".into()))
@@ -139,6 +157,7 @@ pub(crate) fn describe_download_read_error(e: std::io::Error) -> CmdError {
 /// Open the SFTP subsystem on a live session (lazily, on first SFTP switch).
 #[tauri::command]
 pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
+    require_unlocked(&app)?;
     let sftp_tx = app
         .state::<StdArc<SessionRegistry>>()
         .get_sftp_tx(&session_id)
@@ -1056,6 +1075,7 @@ pub async fn sftp_queue_add(
     resume: Option<String>, // "overwrite" | "resume" | "ask" (default: setting.sftpResumeDefault)
     preserve_ts: Option<bool>, // preserve source mtime on upload legs
 ) -> CmdResult<serde_json::Value> {
+    require_unlocked(&app)?;
     let kind = if direction == "upload" {
         JobKind::Upload
     } else {
@@ -1174,6 +1194,7 @@ pub fn sftp_queue_cancel(app: AppHandle, job_id: u64) -> CmdResult<serde_json::V
 
 #[tauri::command]
 pub fn sftp_queue_retry(app: AppHandle, job_id: u64) -> CmdResult<serde_json::Value> {
+    require_unlocked(&app)?;
     q_retry(&app, job_id);
     Ok(serde_json::json!({ "ok": true }))
 }
@@ -1190,6 +1211,7 @@ pub fn sftp_queue_pause(app: AppHandle, job_id: u64) -> CmdResult<serde_json::Va
 
 #[tauri::command]
 pub fn sftp_queue_resume(app: AppHandle, job_id: u64) -> CmdResult<serde_json::Value> {
+    require_unlocked(&app)?;
     tfq::resume_job(&app, job_id);
     Ok(serde_json::json!({ "ok": true }))
 }
@@ -1202,6 +1224,7 @@ pub fn sftp_queue_pause_all(app: AppHandle) -> CmdResult<serde_json::Value> {
 
 #[tauri::command]
 pub fn sftp_queue_resume_all(app: AppHandle) -> CmdResult<serde_json::Value> {
+    require_unlocked(&app)?;
     tfq::resume_all(&app);
     Ok(serde_json::json!({ "ok": true }))
 }
@@ -1245,6 +1268,7 @@ pub async fn sftp_server_copy(
     target_session_id: String,
     target_dir: String,
 ) -> CmdResult<serde_json::Value> {
+    require_unlocked(&app)?;
     if from_session_id == target_session_id {
         return Err(CmdError(
             "Source and target are the same connection.".into(),

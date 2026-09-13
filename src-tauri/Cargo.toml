@@ -117,6 +117,12 @@ russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa
 log = "0.4"                        # surfaces russh-sftp's internal warn!() (dev tooling)
 env_logger = "0.11"                # used by examples/dev-sshd.rs + examples/sftp-smoke.rs (dev tooling only)
 
+# Unix only: geteuid(), so the shared /tmp staging directory can verify it is
+# actually OURS before reusing it. Already in the tree transitively (0.2.x);
+# named here because we call it directly.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Unit-test support for the Bitwarden HTTP hardening: building synthetic
 # reqwest Response values from http::Response (version already in the

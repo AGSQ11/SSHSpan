@@ -30,6 +30,13 @@ impl SftpRegistry {
     pub fn remove(&self, id: &str) -> Option<Arc<SftpSession>> {
         self.sessions.lock().unwrap().remove(id)
     }
+    /// Drop every open SFTP session. Called when the vault locks: the shell
+    /// sessions are torn down there too, but an SFTP channel is opened on its
+    /// OWN russh channel, so clearing the shell registry alone left these
+    /// handles live and every `sftp_*` command still working against them.
+    pub fn clear(&self) {
+        self.sessions.lock().unwrap().clear();
+    }
 }
 
 /// One "open with system editor" watch: when the local temp file is written,
@@ -139,14 +146,7 @@ pub fn edit_temp_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("sshspan-edit");
     let usable = match std::fs::create_dir(&dir) {
         Ok(()) => true, // we just created it — it cannot be a symlink
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            match std::fs::symlink_metadata(&dir) {
-                // symlink_metadata().is_dir() is true only for a real
-                // directory; a symlink reports is_symlink() (is_dir() false).
-                Ok(md) if md.is_dir() => true,
-                _ => false,
-            }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => reuse_is_safe(&dir),
         Err(_) => false,
     };
     let dir = if usable {
@@ -155,28 +155,91 @@ pub fn edit_temp_dir() -> std::path::PathBuf {
         let fallback =
             std::env::temp_dir().join(format!("sshspan-edit-{}", uuid::Uuid::new_v4().simple()));
         log::warn!(
-            "[sshspan-sftp] {} is missing, not a directory, or a symlink (possible tampering); using fallback {}",
+            "[sshspan-sftp] {} is missing, not a directory, a symlink, or not owned by us (possible tampering); using fallback {}",
             dir.display(),
             fallback.display()
         );
         let _ = std::fs::create_dir_all(&fallback);
-        fallback
+        let _ = restrict_dir(&fallback);
+        return fallback;
     };
+    // A chmod failure on the SHARED name is not survivable: it means the
+    // directory is not ours to restrict, so anything staged in it is readable
+    // by whoever does own it. Fall back to a fresh unguessable directory
+    // instead of logging and carrying on.
+    if restrict_dir(&dir).is_err() {
+        let fallback =
+            std::env::temp_dir().join(format!("sshspan-edit-{}", uuid::Uuid::new_v4().simple()));
+        log::warn!(
+            "[sshspan-sftp] could not restrict permissions on {}; using fallback {}",
+            dir.display(),
+            fallback.display()
+        );
+        let _ = std::fs::create_dir_all(&fallback);
+        let _ = restrict_dir(&fallback);
+        return fallback;
+    }
+    dir
+}
+
+/// Is an EXISTING `/tmp/sshspan-edit` safe for us to reuse?
+///
+/// SECURITY: `symlink_metadata().is_dir()` alone is necessary but not
+/// sufficient. On a shared machine another local user can win the race and
+/// create a REAL directory at this predictable name: lstat then reports a
+/// directory, the check passes, our 0700 chmod fails with EPERM because we do
+/// not own it, and every file staged for "open in system editor" lands in
+/// their directory — readable, and replaceable before the watcher re-uploads
+/// it to the user's server. So ownership and mode are part of the test.
+fn reuse_is_safe(dir: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    // lstat: a symlink reports is_symlink(), never is_dir().
+    if !md.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Must be ours. Root owning it is not "close enough" — we could not
+        // restrict it either.
+        if md.uid() != effective_uid() {
+            return false;
+        }
+        // Group- or world-accessible means someone else may already be able to
+        // read what we stage, even if we can chmod it now.
+        if md.mode() & 0o077 != 0 {
+            // Recoverable: we own it, so tighten it and re-check below.
+            if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The process's effective uid.
+///
+/// The only `unsafe` in this file. `geteuid(2)` cannot fail, takes no
+/// arguments and touches no memory, so there is no invariant to uphold beyond
+/// calling it — std simply does not re-export it.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// Apply owner-only permissions to a staging directory. Unix only; on Windows
+/// the per-user temp directory already carries a user-scoped ACL.
+fn restrict_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // create_dir leaves the mode at umask default (typically 0755), and an
-        // existing dir may predate this hardening — reassert 0700. Best-effort:
-        // a failure to chmod is ignored like the create above, but is logged
-        // so a misconfigured environment is visible.
-        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
-            log::warn!(
-                "[sshspan-sftp] could not restrict permissions on {}: {e}",
-                dir.display()
-            );
-        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    dir
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Sanitize a remote file name for use as a local staged-file base name:
@@ -404,6 +467,91 @@ mod tests {
             0o700,
             "sshspan-edit must not be readable by other users (mode {mode:o})"
         );
+    }
+
+    /// REGRESSION: `symlink_metadata().is_dir()` alone accepted a real
+    /// directory another local user had pre-created at the predictable
+    /// `/tmp/sshspan-edit`. The 0700 chmod then failed with EPERM and was only
+    /// logged, so staged remote files landed in their directory, readable and
+    /// replaceable before the watcher re-uploaded them. Ownership is now part
+    /// of the test.
+    #[cfg(unix)]
+    #[test]
+    fn reuse_rejects_a_directory_we_do_not_own() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sshspan-reuse-foreign-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build the hostile shape directly when we can (running as root, as CI
+        // containers often do): a REAL directory owned by another uid. That is
+        // precisely what the old is_dir()-only check waved through.
+        let made_foreign = if effective_uid() == 0 {
+            let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+            // uid 65534 = nobody on every distro we ship for.
+            unsafe { libc::chown(c.as_ptr(), 65534, 65534) == 0 }
+        } else {
+            false
+        };
+
+        if made_foreign {
+            assert_ne!(
+                std::fs::symlink_metadata(&dir).unwrap().uid(),
+                effective_uid(),
+                "fixture must be owned by someone else"
+            );
+            assert!(
+                !reuse_is_safe(&dir),
+                "a directory owned by another user must never be reused for staging"
+            );
+        } else {
+            // Unprivileged fallback: /tmp is a real, world-writable directory
+            // we do not own on any normal system.
+            let shared = std::path::Path::new("/tmp");
+            if shared.is_dir()
+                && std::fs::symlink_metadata(shared).unwrap().uid() != effective_uid()
+            {
+                assert!(!reuse_is_safe(shared));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory we own and can restrict is fine to reuse.
+    #[cfg(unix)]
+    #[test]
+    fn reuse_accepts_our_own_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "sshspan-reuse-ok-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(reuse_is_safe(&dir));
+        // ...and reuse_is_safe tightened it on the way through.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected 0700, got {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink at the staging name is refused (lstat never follows it).
+    #[cfg(unix)]
+    #[test]
+    fn reuse_rejects_a_symlink() {
+        let base = std::env::temp_dir().join(format!(
+            "sshspan-reuse-link-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!reuse_is_safe(&link));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

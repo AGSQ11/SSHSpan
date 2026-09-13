@@ -321,6 +321,12 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) {
         .kill_all();
     app.state::<crate::sftp::EditRegistry>().stop_all();
     app.state::<crate::sftp::KeepaliveRegistry>().stop_all();
+    // SFTP runs on its own channel per session, so killing the shell registry
+    // does not close it. Without this the registry kept live handles and every
+    // sftp_* command carried on working against a "locked" vault - and the
+    // transfer queue carried on writing files.
+    app.state::<crate::sftp::SftpRegistry>().clear();
+    crate::sftp::queue::pause_all(app);
     app.state::<VaultPasswordStore>().clear();
     let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
 }
