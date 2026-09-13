@@ -27,13 +27,146 @@ async function call(cmd, args) {
 
 function el(id) { return document.getElementById(id); }
 
-let toastTimer = null;
+// Toasts stack instead of overwriting one another. A batch operation that
+// reports several failures used to show only the last one, because a single
+// #toast element had its text replaced each time.
+//
+// SECURITY: toast text routinely carries remote-controlled strings — SFTP
+// error messages, server names, filenames from a listing. It is built with
+// textContent and never innerHTML, so markup in any of them can never render.
+const TOAST_TTL_MS = { err: 9000, warn: 6000, ok: 3800, info: 3800 };
+const TOAST_MAX = 4;
+
 function toast(msg, kind) {
-  const t = el('toast');
-  t.textContent = msg;
-  t.className = 'show ' + (kind || 'info');
-  if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.className = ''; }, 3800);
+  const host = el('toast');
+  if (!host) return;
+  kind = kind || 'info';
+  const item = document.createElement('div');
+  item.className = 'toast-item ' + kind;
+  // role=alert for errors so a screen reader interrupts; status for the rest.
+  item.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+
+  const text = document.createElement('span');
+  text.className = 'toast-text';
+  text.textContent = msg;           // never innerHTML — see SECURITY above
+  item.appendChild(text);
+
+  const dismiss = document.createElement('button');
+  dismiss.className = 'toast-dismiss';
+  dismiss.type = 'button';
+  dismiss.title = 'Dismiss';
+  dismiss.setAttribute('aria-label', 'Dismiss notification');
+  dismiss.textContent = '×';
+  item.appendChild(dismiss);
+
+  const remove = () => {
+    if (item._done) return;
+    item._done = true;
+    clearTimeout(item._timer);
+    item.classList.add('leaving');
+    setTimeout(() => item.remove(), 180);
+  };
+  dismiss.addEventListener('click', remove);
+  // Errors linger longer than confirmations — they are the ones worth reading.
+  item._timer = setTimeout(remove, TOAST_TTL_MS[kind] || TOAST_TTL_MS.info);
+
+  host.appendChild(item);
+  // Cap the stack so a failing batch cannot bury the whole window; the oldest
+  // goes first, since the newest message is the one being reacted to.
+  while (host.children.length > TOAST_MAX) host.firstElementChild.remove();
+}
+
+// \u2500\u2500\u2500 modal focus management \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// Every modal is a .modal-backdrop toggled by setting .hidden from ~15 call
+// sites across app.js and sftp.js. Rather than touch each one (and rely on
+// every future modal remembering to opt in), a MutationObserver watches the
+// `hidden` attribute and applies the behaviour centrally:
+//
+//   - focus moves into the dialog when it opens, and returns to whatever
+//     opened it when it closes;
+//   - Tab and Shift+Tab cycle within the topmost dialog instead of walking
+//     out into the page behind it, which they previously did after ~13 tabs.
+//
+// The stack is keyed on open order, so a dialog opened on top of another (the
+// category picker over the host form) traps first and hands control back when
+// it closes.
+
+const modalStack = [];
+
+const FOCUSABLE = [
+  'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])', 'textarea:not([disabled])', '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+function modalFocusable(root) {
+  return [...root.querySelectorAll(FOCUSABLE)].filter((n) => {
+    if (n.closest('[hidden]') !== null && n.closest('[hidden]') !== root) return false;
+    // offsetParent is null for display:none subtrees; position:fixed elements
+    // report null too, so fall back to a rect check for those.
+    return n.offsetParent !== null || n.getBoundingClientRect().width > 0;
+  });
+}
+
+function onModalTabKey(ev) {
+  if (ev.key !== 'Tab' || !modalStack.length) return;
+  const top = modalStack[modalStack.length - 1];
+  const items = modalFocusable(top.node);
+  if (!items.length) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  const active = document.activeElement;
+  // Focus outside the dialog (or on the backdrop itself) means the previous
+  // Tab already escaped \u2014 pull it back to the appropriate edge.
+  if (!top.node.contains(active)) {
+    ev.preventDefault();
+    (ev.shiftKey ? last : first).focus();
+    return;
+  }
+  if (ev.shiftKey && active === first) { ev.preventDefault(); last.focus(); }
+  else if (!ev.shiftKey && active === last) { ev.preventDefault(); first.focus(); }
+}
+
+function modalDidOpen(node) {
+  if (modalStack.some((m) => m.node === node)) return;
+  const opener = document.activeElement;
+  modalStack.push({ node, opener: opener && opener !== document.body ? opener : null });
+  // Only take focus if the dialog's own open path has not already placed it
+  // somewhere deliberate (the picker focuses its search box, the delete
+  // prompt focuses Cancel) \u2014 a rAF lets those run first.
+  requestAnimationFrame(() => {
+    if (node.hidden || node.contains(document.activeElement)) return;
+    const items = modalFocusable(node);
+    if (items.length) items[0].focus();
+  });
+}
+
+function modalDidClose(node) {
+  const i = modalStack.findIndex((m) => m.node === node);
+  if (i === -1) return;
+  const [entry] = modalStack.splice(i, 1);
+  // Restore focus to the control that opened the dialog, so keyboard users
+  // are not dropped at the top of the document. Skipped when something else
+  // has already claimed focus inside a dialog still on the stack.
+  const top = modalStack[modalStack.length - 1];
+  if (top && top.node.contains(document.activeElement)) return;
+  if (entry.opener && document.contains(entry.opener)) entry.opener.focus();
+}
+
+function initModalFocusManagement() {
+  document.addEventListener('keydown', onModalTabKey, true);
+  const obs = new MutationObserver((records) => {
+    for (const r of records) {
+      const node = r.target;
+      if (!node.classList || !node.classList.contains('modal-backdrop')) continue;
+      if (node.hidden) modalDidClose(node);
+      else modalDidOpen(node);
+    }
+  });
+  for (const m of document.querySelectorAll('.modal-backdrop')) {
+    obs.observe(m, { attributes: true, attributeFilter: ['hidden'] });
+    if (!m.hidden) modalDidOpen(m);
+  }
 }
 
 function fmtTime(iso) {
@@ -2466,6 +2599,17 @@ function wire() {
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   el('srvSaveBtn').addEventListener('click', submitServerModal);
+  // Enter submits from any single-line field in the host form, the way a real
+  // <form> would — this dialog is filled in dozens of times and previously
+  // required reaching for the mouse. Textareas and the segmented auth buttons
+  // are excluded so Enter keeps its normal meaning there.
+  el('serverModal').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.isComposing) return;
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement) || t.type === 'checkbox') return;
+    e.preventDefault();
+    submitServerModal();
+  });
   el('srvBrowseCategoryBtn').addEventListener('click', () => {
     openCategoryPicker({
       title: 'Server category',
@@ -2790,6 +2934,13 @@ async function submitServerModal() {
     categoryId: state._pendingServerCategory,
     color: null,
   };
+  // Re-entrancy guard: Save was not disabled while the save was in flight, so
+  // a double-click (or Enter held down, now that Enter submits) fired
+  // server_save twice and created two rows for the same new host.
+  if (submitServerModal._busy) return;
+  submitServerModal._busy = true;
+  const saveBtn = el('srvSaveBtn');
+  saveBtn.disabled = true;
   try {
     const r = await call('server_save', args);
     closeServerModal();
@@ -2797,6 +2948,10 @@ async function submitServerModal() {
     if (r && r.id) selectServer(r.id);
     toast('Server saved.', 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
+  finally {
+    submitServerModal._busy = false;
+    saveBtn.disabled = false;
+  }
 }
 
 // Pick an existing saved server and connect immediately using the chosen key.
@@ -3156,6 +3311,9 @@ function escapeHtml(s) {
   document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();
+  // Before wire(): the observer must be watching every .modal-backdrop before
+  // anything can open one.
+  initModalFocusManagement();
   try {
     wire();
   } catch (e) {

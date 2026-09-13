@@ -66,7 +66,7 @@
             <span class="search-ico" data-ico="search"></span>
             <input type="search" id="searchInput" placeholder="Search keys by name, comment, fingerprint..." />
           </div>
-          <select id="typeFilter">
+          <select id="typeFilter" aria-label="Filter keys by type">
             <option value="">All types</option>
             <option value="rsa">RSA</option>
             <option value="ed25519">Ed25519</option>
@@ -102,7 +102,7 @@
             <label class="detail-label">Fingerprint</label>
             <code class="mono block" id="detailFingerprint">-</code>
             <label class="detail-label">Public key (authorized_keys)</label>
-            <textarea class="mono" id="detailAuthorized" rows="4" readonly spellcheck="false"></textarea>
+            <textarea class="mono" id="detailAuthorized" rows="4" readonly spellcheck="false" aria-label="authorized_keys line for this key"></textarea>
             <div class="detail-actions">
               <button id="detailCopyPublicBtn" class="ghost-btn"><span data-ico="copy"></span>Copy public key</button>
               <button id="detailDeleteBtn" class="danger-btn"><span data-ico="trash-2"></span>Delete</button>
@@ -110,7 +110,7 @@
             <hr class="sep" />
             <label class="detail-label">Export private key</label>
             <div class="export-row">
-              <select id="detailExportFormat">
+              <select id="detailExportFormat" aria-label="Export format">
                 <option value="openssh-private">OpenSSH private (new format)</option>
                 <option value="ppk">PuTTY private (.ppk v3)</option>
                 <option value="pkcs8">PKCS#8 PEM (unencrypted)</option>
@@ -288,7 +288,7 @@
 
   <!-- Modal: New / Import Key -->
   <div class="modal-backdrop" id="modalBackdrop" hidden>
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="key-square"></span>
@@ -357,7 +357,7 @@
 
   <!-- Modal: Vault (create / unlock / change password) -->
   <div class="modal-backdrop" id="vaultModal" hidden>
-    <div class="modal modal-sm">
+    <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="vaultModalTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="lock"></span>
@@ -379,7 +379,7 @@
 
   <!-- Modal: Connect password prompt -->
   <div class="modal-backdrop" id="connectPwModal" hidden>
-    <div class="modal modal-sm">
+    <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="connectPwTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="key-round"></span>
@@ -402,7 +402,7 @@
 
   <!-- Multi-select category picker (used from sidebar filter, new-key modal, detail pane, move-to) -->
   <div class="modal-backdrop" id="pickerModal" hidden>
-    <div class="modal picker-modal">
+    <div class="modal picker-modal" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="folder"></span>
@@ -427,7 +427,7 @@
 
   <!-- Modal: New / Edit SSH server -->
   <div class="modal-backdrop" id="serverModal" hidden>
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="serverModalTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="server"></span>
@@ -482,7 +482,7 @@
 
   <!-- Inline rename prompt modal -->
   <div class="modal-backdrop" id="promptModal" hidden>
-    <div class="modal modal-sm">
+    <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="promptTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="pencil"></span>
@@ -491,7 +491,7 @@
       </header>
       <div class="modal-body">
         <p id="promptMessage" class="hint"></p>
-        <input type="text" id="promptInput" />
+        <input type="text" id="promptInput" aria-labelledby="promptMessage" />
       </div>
       <footer class="modal-footer">
         <button id="promptCancelBtn" class="ghost-btn">Cancel</button>
@@ -502,7 +502,7 @@
 
   <!-- Modal: SFTP delete confirmation -->
   <div class="modal-backdrop" id="deleteModal" hidden>
-    <div class="modal modal-sm">
+    <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="deleteTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="trash-2"></span>
@@ -525,7 +525,7 @@
 
   <!-- SFTP chmod modal -->
   <div class="modal-backdrop" id="chmodModal" hidden>
-    <div class="modal modal-sm">
+    <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="chmodTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="settings"></span>
@@ -540,17 +540,17 @@
           </thead>
           <tbody>
             <tr><th>Owner</th>
-              <td><input type="checkbox" id="chmod-owner-r" /></td>
-              <td><input type="checkbox" id="chmod-owner-w" /></td>
-              <td><input type="checkbox" id="chmod-owner-x" /></td></tr>
+              <td><input type="checkbox" id="chmod-owner-r" aria-label="Owner read" /></td>
+              <td><input type="checkbox" id="chmod-owner-w" aria-label="Owner write" /></td>
+              <td><input type="checkbox" id="chmod-owner-x" aria-label="Owner execute" /></td></tr>
             <tr><th>Group</th>
-              <td><input type="checkbox" id="chmod-group-r" /></td>
-              <td><input type="checkbox" id="chmod-group-w" /></td>
-              <td><input type="checkbox" id="chmod-group-x" /></td></tr>
+              <td><input type="checkbox" id="chmod-group-r" aria-label="Group read" /></td>
+              <td><input type="checkbox" id="chmod-group-w" aria-label="Group write" /></td>
+              <td><input type="checkbox" id="chmod-group-x" aria-label="Group execute" /></td></tr>
             <tr><th>Other</th>
-              <td><input type="checkbox" id="chmod-other-r" /></td>
-              <td><input type="checkbox" id="chmod-other-w" /></td>
-              <td><input type="checkbox" id="chmod-other-x" /></td></tr>
+              <td><input type="checkbox" id="chmod-other-r" aria-label="Other read" /></td>
+              <td><input type="checkbox" id="chmod-other-w" aria-label="Other write" /></td>
+              <td><input type="checkbox" id="chmod-other-x" aria-label="Other execute" /></td></tr>
           </tbody>
         </table>
         <label>Numeric value <input type="text" id="chmodOctal" maxlength="3" placeholder="644" /></label>
@@ -572,7 +572,7 @@
 
   <!-- SFTP transfer overwrite-conflict modal (FileZilla "file already exists") -->
   <div class="modal-backdrop" id="conflictModal" hidden>
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="conflictTitle">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="file-text"></span>
