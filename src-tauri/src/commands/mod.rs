@@ -321,6 +321,12 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) {
         .kill_all();
     app.state::<crate::sftp::EditRegistry>().stop_all();
     app.state::<crate::sftp::KeepaliveRegistry>().stop_all();
+    // SFTP runs on its own channel per session, so killing the shell registry
+    // does not close it. Without this the registry kept live handles and every
+    // sftp_* command carried on working against a "locked" vault - and the
+    // transfer queue carried on writing files.
+    app.state::<crate::sftp::SftpRegistry>().clear();
+    crate::sftp::queue::pause_all(app);
     app.state::<VaultPasswordStore>().clear();
     let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
 }
@@ -779,6 +785,14 @@ mod tests {
     }
 }
 
+/// NOT REGISTERED in `generate_handler!`, deliberately.
+///
+/// It returns every key's `private_key_encrypted` blob to the webview. The
+/// blobs are sealed with the master password, so this is not plaintext key
+/// material - but it hands a compromised renderer the entire keystore to
+/// attack offline, and nothing in the shipped UI ever called it. Registering
+/// it again needs a reason and a review; `vault_backup_create` is the
+/// supported export path and keeps the material in the backend.
 #[tauri::command]
 pub fn vault_export(app: AppHandle) -> CmdResult<serde_json::Value> {
     let _pw = vault_password(&app)?;
@@ -800,6 +814,10 @@ pub fn vault_export(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "keys": exported }))
 }
 
+/// NOT REGISTERED in `generate_handler!`, deliberately - the counterpart to
+/// `vault_export`, and likewise never called by the shipped UI. It writes
+/// caller-supplied key records straight into the vault; `vault_backup_restore`
+/// is the reviewed import path.
 #[tauri::command]
 pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<serde_json::Value> {
     let _pw = vault_password(&app)?;
@@ -1132,10 +1150,17 @@ impl DialogPathStore {
         guard.retain(|_, granted| now.duration_since(*granted) < DIALOG_PATH_TTL);
         guard.insert(path.to_string(), now);
     }
-    fn is_allowed(&self, path: &str) -> bool {
-        let guard = self.0.lock().unwrap();
-        match guard.get(path) {
-            Some(granted) => std::time::Instant::now().duration_since(*granted) < DIALOG_PATH_TTL,
+    /// Consume a grant: a dialog pick authorises exactly ONE write.
+    ///
+    /// SECURITY: checking without consuming meant a path approved for a
+    /// legitimate backup export stayed writable for the rest of the grant
+    /// window, so a compromised renderer could wait for a real export and then
+    /// rewrite that file with contents of its own. The grant is removed
+    /// whether or not it had expired, so a stale entry cannot be retried.
+    fn consume(&self, path: &str) -> bool {
+        let mut guard = self.0.lock().unwrap();
+        match guard.remove(path) {
+            Some(granted) => std::time::Instant::now().duration_since(granted) < DIALOG_PATH_TTL,
             None => false,
         }
     }
@@ -1152,7 +1177,7 @@ pub fn system_write_text_file(
     contents: String,
 ) -> CmdResult<serde_json::Value> {
     validate_export_path(&path)?;
-    if !app.state::<DialogPathStore>().is_allowed(&path) {
+    if !app.state::<DialogPathStore>().consume(&path) {
         return Err("Write target must be a path chosen in a save dialog this session.".into());
     }
     if let Some(parent) = std::path::Path::new(&path).parent() {
@@ -1662,49 +1687,12 @@ pub async fn key_export_to_file(
     // app-data guard also protects the vault DB from being overwritten).
     validate_export_path(&path_str)?;
 
-    use std::io::Write as _;
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts
-        .open(&path_str)
-        .map_err(|e| CmdError(format!("Could not create export file: {e}")))?;
-    file.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    file.flush().map_err(|e| e.to_string())?;
-    drop(file);
-
-    #[cfg(unix)]
-    {
-        // mode() only applies at creation; reassert for a pre-existing file.
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&path_str)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&path_str, perms)?;
-    }
-    #[cfg(windows)]
-    {
-        // Private key material must not ship with inherited (broad) ACLs. A
-        // failed restriction is fail-closed: delete what we just wrote and
-        // refuse the export rather than leaving a world-readable key behind.
-        if let Err(e) = crate::ssh::restrict_windows_file(&std::path::PathBuf::from(&path_str)) {
-            let removed = fs::remove_file(&path_str);
-            log::warn!(
-                "[sshspan-keys] could not restrict ACLs on export {}: {e} \
-                 (file removed: {:?}); export refused",
-                path_str,
-                removed.is_ok()
-            );
-            return Err(CmdError(format!(
-                "Could not restrict permissions on the export file, so it was deleted \
-                 instead of leaving the private key broadly readable ({e}). Export to a \
-                 location that supports Windows ACLs (e.g. an NTFS drive)."
-            )));
-        }
-    }
+    // One helper for every secret we write to disk (export + deploy), so the
+    // "mode() only applies at creation" trap cannot be reintroduced in one
+    // place and not the other. It replaces any existing file and create_new's
+    // it at 0600, and on Windows fails closed if the ACL cannot be tightened.
+    crate::ssh::write_secret_file(std::path::Path::new(&path_str), data.as_bytes())
+        .map_err(|e| CmdError(e.to_string()))?;
 
     let _ = app.state::<AppState>().db.add_audit(
         "keys.exported",
@@ -2123,6 +2111,13 @@ pub fn ssh_config_read() -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "hosts": config.hosts }))
 }
 
+/// NOT REGISTERED in `generate_handler!`, deliberately.
+///
+/// `SshConfig::parse` round-trips unknown directives through `extra`, so this
+/// let a caller write ANY ssh_config directive - ProxyCommand, IdentityFile,
+/// StrictHostKeyChecking no - into the managed config, with no vault gate at
+/// all. The UI writes that file only through `key_deploy`, which validates
+/// what it interpolates.
 #[tauri::command]
 pub fn ssh_config_write(content: String) -> CmdResult<serde_json::Value> {
     let config = crate::config::SshConfig::parse(&content);
@@ -2368,39 +2363,69 @@ pub fn audit_list(app: AppHandle, limit: Option<i64>) -> CmdResult<serde_json::V
 /// the two can never disagree about what the family is called.
 const SFTP_LOCAL_DIR_PREFIX: &str = "sftpLocalDir:";
 
+/// Every setting key the app reads. `settings_get` returns these (plus the
+/// `sftpLocalDir:` family) and `settings_set` accepts only these, so the two
+/// cannot drift and the renderer cannot write keys nothing will ever read.
+const SETTINGS_KEYS: &[&str] = &[
+    "autoLockMinutes",
+    "sshKeysDir",
+    "sshConfigPath",
+    "theme",
+    "confirmDelete",
+    "autoUpdateCheck",
+    "sftpParallel",
+    "sftpShowHidden",
+    "sftpDualPane",
+    // FileZilla-parity transfer behavior (renderer mirror only works
+    // in-session unless these load at startup).
+    "sftpConflictUpload",
+    "sftpConflictDownload",
+    "sftpPreserveTs",
+    "sftpCmpMode",
+    "sftpResumeDefault",
+    "sftpMaxBps",
+    "sftpVerifyTransfers",
+    "uiScale",
+    "terminalScrollback",
+    "terminalBackspace",
+    "terminalHomeEnd",
+    "terminalAppCursorKeys",
+    "terminalAppKeypad",
+    "terminalBell",
+    "terminalKeepaliveSeconds",
+    "confirmMultiLinePaste",
+];
+
+/// The real on-disk locations, so the UI can state them instead of guessing.
+///
+/// The Settings pane and the deploy confirmation used to hard-code three
+/// paths, and all three were wrong: the database was named as
+/// `~/.sshspan/sshspan.db` (actually the platform data dir), deployed keys as
+/// `~/.sshspan/keys/<id>` (actually `~/.ssh/sshspan_<name>`), and the managed
+/// SSH config as `~/.ssh/config` (actually the app config dir). Users make
+/// security decisions on those strings - what StrictHostKeyChecking applies
+/// to, what to back up, what to wipe - so a wrong one is a real defect, not a
+/// typo. Deriving them here means they cannot drift again.
+#[tauri::command]
+pub fn system_paths(app: AppHandle) -> CmdResult<serde_json::Value> {
+    let db = app.state::<AppState>().db.db_path.display().to_string();
+    let ssh_config = crate::config::ssh_config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let deploy_dir = crate::config::get_ssh_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    Ok(serde_json::json!({
+        "database": db,
+        "sshConfig": ssh_config,
+        "deployDir": deploy_dir,
+    }))
+}
+
 #[tauri::command]
 pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
-    let keys = [
-        "autoLockMinutes",
-        "sshKeysDir",
-        "sshConfigPath",
-        "theme",
-        "confirmDelete",
-        "autoUpdateCheck",
-        "sftpParallel",
-        "sftpShowHidden",
-        "sftpDualPane",
-        // FileZilla-parity transfer behavior (renderer mirror only works
-        // in-session unless these load at startup).
-        "sftpConflictUpload",
-        "sftpConflictDownload",
-        "sftpPreserveTs",
-        "sftpCmpMode",
-        "sftpResumeDefault",
-        "sftpMaxBps",
-        "sftpVerifyTransfers",
-        "uiScale",
-        "terminalScrollback",
-        "terminalBackspace",
-        "terminalHomeEnd",
-        "terminalAppCursorKeys",
-        "terminalAppKeypad",
-        "terminalBell",
-        "terminalKeepaliveSeconds",
-        "confirmMultiLinePaste",
-    ];
     let mut settings = serde_json::Map::new();
-    for key in &keys {
+    for key in SETTINGS_KEYS {
         if let Some(val) = app
             .state::<AppState>()
             .db
@@ -2431,6 +2456,16 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
 pub fn settings_set(app: AppHandle, key: String, value: String) -> CmdResult<serde_json::Value> {
     if key.starts_with("bwSync.") {
         return Err("Bitwarden sync settings must be changed via the sync settings dialog.".into());
+    }
+    // Allowlist, not a denylist: `settings_get` only ever reads the keys in
+    // SETTINGS_KEYS plus the sftpLocalDir: family, so anything else written
+    // here is unreadable clutter at best. Accepting arbitrary keys let a
+    // compromised renderer write unbounded rows into the same `config` table
+    // that holds the Bitwarden secrets, which is worth refusing outright.
+    let known = SETTINGS_KEYS.contains(&key.as_str())
+        || (key.starts_with(SFTP_LOCAL_DIR_PREFIX) && key.len() > SFTP_LOCAL_DIR_PREFIX.len());
+    if !known {
+        return Err(format!("Unknown setting: {key}").into());
     }
     app.state::<AppState>()
         .db
@@ -2484,14 +2519,6 @@ pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
         return Err("system_open_external: path is not a regular file.".into());
     }
     opener::open(&resolved).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
-}
-
-#[tauri::command]
-pub fn system_show_item_in_folder(path: String) -> CmdResult<serde_json::Value> {
-    let p = std::path::Path::new(&path);
-    let dir = p.parent().unwrap_or(p);
-    opener::open(dir).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
 

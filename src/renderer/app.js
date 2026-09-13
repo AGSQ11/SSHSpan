@@ -1690,7 +1690,15 @@ async function previewConfig() {
 async function deployConfig() {
   const ids = [...state.deploySelected];
   if (ids.length === 0) { toast('Select at least one key in the Keys view.', 'err'); return; }
-  const sure = window.confirm('Deploy ' + ids.length + ' key(s) to ~/.ssh/ and update ~/.ssh/config?');
+  // Real paths, from the backend. This prompt used to say it updated
+  // ~/.ssh/config; it does not - the managed config lives in the app config
+  // dir, while the private key really does land in ~/.ssh. Someone ticking
+  // "strict host key checking" here was told their system SSH was being
+  // configured when it was not.
+  const paths = await systemPaths();
+  const sure = window.confirm(
+    'Deploy ' + ids.length + ' key(s) to ' + paths.deployDir + '/ and update ' + paths.sshConfig + '?'
+  );
   if (!sure) return;
   try {
     const passphraseEnabled = el('keyPassphraseToggle')?.checked === true;
@@ -1749,7 +1757,7 @@ async function importFromSshConfig(anchorEl) {
   try {
     const res = await call('ssh_config_list_hosts');
     const hosts = res.hosts || [];
-    if (hosts.length === 0) { toast('No Host blocks found in ~/.ssh/config.', 'info'); return; }
+    if (hosts.length === 0) { toast('No Host blocks found in ' + (await systemPaths()).sshConfig + '.', 'info'); return; }
     closeKeyConnectMenu();
     const menu = document.createElement('div');
     menu.className = 'ctx-menu';
@@ -1884,7 +1892,12 @@ async function bwSyncNow(allowRemoteOverwrite) {
   btn.disabled = true;
   setBwStatus('Syncing\u2026', 'syncing');
   try {
-    const s = await call('bitwarden_sync', { allow_remote_overwrite: allowRemoteOverwrite === true });
+    // camelCase: Tauri v2 converts a command's snake_case parameter to
+    // camelCase by default, so `allow_remote_overwrite` never matched
+    // `allowRemoteOverwrite`, deserialized to None, and unwrap_or(false)
+    // applied. The "Apply them now?" approval was silently discarded and the
+    // UI still reported "Sync complete."
+    const s = await call('bitwarden_sync', { allowRemoteOverwrite: allowRemoteOverwrite === true });
     const skipped = (s.skippedOverwrites || 0) + (s.skippedNew || 0);
     if (skipped > 0 && !allowRemoteOverwrite) {
       const msg = [
@@ -1917,7 +1930,18 @@ async function bwSyncNow(allowRemoteOverwrite) {
 
 // ─── settings view ─────────────────────────────────────────────────────────
 
+// Fill the three path hints from the backend. They were hard-coded and all
+// three named a location the app does not actually use.
+async function fillPathHints() {
+  const p = await systemPaths();
+  const set = (id, val) => { const n = el(id); if (n) n.textContent = val; };
+  set('dataDirHint', p.database);
+  set('sshConfigHint', p.sshConfig);
+  set('deployDirHint', p.deployDir + '/sshspan_<name>');
+}
+
 async function loadSettings() {
+  fillPathHints();
   try {
     state.settings = await call('settings_get');
   } catch (e) {
@@ -3385,10 +3409,31 @@ window.onSessionClosed = onSessionClosed;
 window.activateSessionSurface = activateSessionSurface;
 
 // ─── tiny escaper used by context menus// ─── tiny escaper used by context menus ────────────────────────────────────
+// Escapes for both text and attribute context. The apostrophe is included
+// even though every interpolated attribute in this codebase currently uses
+// double quotes: that is a property nothing enforces, and the first
+// single-quoted attribute added later would silently become an injection
+// point. Cheap here, invisible to catch there.
+// Real on-disk locations, fetched once. Three UI strings used to hard-code
+// these and all three were wrong; deriving them from the backend is what stops
+// them drifting again. Falls back to honest placeholders rather than to a
+// plausible-looking guess.
+let _systemPaths = null;
+async function systemPaths() {
+  if (_systemPaths) return _systemPaths;
+  try {
+    _systemPaths = await call('system_paths');
+  } catch (e) {
+    _systemPaths = { database: '(unknown)', sshConfig: '(unknown)', deployDir: '(unknown)' };
+  }
+  return _systemPaths;
+}
+
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // ─── boot ──────────────────────────────────────────────────────────────────

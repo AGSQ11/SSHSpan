@@ -245,18 +245,24 @@ pub fn resolve_safe_server_url(server_url: &str) -> anyhow::Result<String> {
     }
 
     // Plain HTTP is forbidden for vault traffic: it would send master-password
-    // hashes, Bearer tokens, and vault ciphertext across the network
-    // unencrypted. Allow it only for loopback targets where self-hosters test
-    // Vaultwarden locally (127.0.0.0/8 and ::1). The loopback check reuses the
-    // same restricted-address helpers already applied below, so IPv6 literals
-    // and IPv4-mapped loopback are handled consistently.
-    let is_loopback = host == "localhost"
-        || (host.contains(':') && is_restricted_ipv6(&host))
-        || v4_to_int(&host).is_some_and(|n| in_cidr4(n, 0x7F000000, 8));
-    if scheme == "http" && !is_loopback {
-        anyhow::bail!(
-            "Server URL must use https://. Plain http:// is only allowed for loopback hosts."
-        );
+    // hashes, Bearer tokens and vault ciphertext across the network in the
+    // clear.
+    //
+    // There used to be a loopback exception here for self-hosters testing
+    // Vaultwarden locally. It was unreachable: every address it admitted -
+    // 127.0.0.0/8, ::1, "localhost" - is rejected a few lines below by the
+    // reserved-address and local-hostname guards, so the branch could only
+    // ever change WHICH error came back, never allow a connection. The test
+    // that "covered" it only asserted the error was not the https-only
+    // message, so it passed either way and never caught this.
+    //
+    // Removed rather than made to work: the SSRF guard exists because a
+    // compromised renderer can call bitwarden_save_config with any URL, and
+    // an http://127.0.0.1:<port> destination would turn the sync client into
+    // a localhost port prober. Self-hosters reach their vault by its public
+    // hostname over HTTPS.
+    if scheme == "http" {
+        anyhow::bail!("Server URL must use https://.");
     }
 
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
@@ -452,27 +458,27 @@ mod resolver_tests {
     }
 
     #[test]
-    fn resolver_allows_plain_http_for_loopback() {
-        for ok in [
+    fn plain_http_is_always_refused() {
+        // The old test here asserted only that the error was NOT the
+        // https-only message, so it passed whether or not the loopback
+        // exception worked - and it did not: every one of these was rejected
+        // a few lines later by the reserved-address guard. Assert the real
+        // contract instead: no plain HTTP destination is ever accepted.
+        for url in [
             "http://127.0.0.1:8080",
             "http://127.0.0.100",
             "http://[::1]:8080",
+            "http://localhost:8080",
+            "http://vault.example.com",
         ] {
-            // These will fail DNS resolution in CI, but the scheme/host
-            // validation itself should not be the blocker. The error, if
-            // any, must NOT be the https-only message.
-            match resolve_safe_server_url(ok) {
-                Err(e) => {
-                    assert!(
-                        !e.to_string().contains("must use https://"),
-                        "{ok} should not fail with https-only error: {e}"
-                    );
-                }
-                Ok(base) => {
-                    assert!(base.starts_with("http://"), "{ok} normalized to {base}");
-                }
-            }
+            let err = resolve_safe_server_url(url)
+                .expect_err("plain http must be refused")
+                .to_string();
+            assert!(!err.is_empty(), "{url} must fail with a reason");
         }
+        // ...and the reserved-address guard still stands on its own for https.
+        assert!(resolve_safe_server_url("https://127.0.0.1:8080").is_err());
+        assert!(resolve_safe_server_url("https://localhost:8080").is_err());
     }
 
     #[test]

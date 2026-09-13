@@ -133,7 +133,16 @@ impl SessionRegistry {
 /// to `host:port` so the same hostname on different ports cannot share or
 /// clobber each other.
 pub fn known_host_key(host: &str, port: u16) -> String {
-    format!("{}:{}", host, port)
+    // An IPv6 literal is made of colons, so "{host}:{port}" would produce
+    // "2001:db8::1:22" — ambiguous, and impossible to tell from a hostname
+    // that happens to contain colons. Bracket it, matching the URL-authority
+    // convention and the form `db::qualify_legacy_known_host` migrates old
+    // rows into, so a pin written by either path is found by the other.
+    if host.starts_with('[') || host.matches(':').count() < 2 {
+        format!("{}:{}", host, port)
+    } else {
+        format!("[{}]:{}", host, port)
+    }
 }
 
 /// The russh client handler. Its only job is host-key verification; the

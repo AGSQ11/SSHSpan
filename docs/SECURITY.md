@@ -120,7 +120,12 @@ profile directory (Windows) / user-owned permissions (Unix).
   in `Zeroizing` on the auth path and never logged. Keyboard-interactive authentication
   answers one round of prompts with the saved password and refuses further rounds, so a
   hostile server cannot harvest it via repeated prompts.
-- **Deployed keys are protected by filesystem permissions only**: 0600 from creation on
+- **Deployed keys are protected by filesystem permissions only**: the file is
+  created at 0600 *before* any content is written (a previous version opened an
+  existing file with `mode(0o600)`, which applies at creation only, so a
+  re-deploy wrote the key under the old mode and chmod'd afterwards), and on
+  Windows a failure to apply the current-user-only ACL deletes the file and
+  fails the operation.
   Unix; on Windows NTFS inheritance is stripped and only the current user is granted access
   (`icacls /inheritance:r /grant:r <SID>:F`, verified as a deploy failure if it cannot be
   applied).

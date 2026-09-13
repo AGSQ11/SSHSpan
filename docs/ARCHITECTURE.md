@@ -61,7 +61,7 @@ ordered, high-throughput delivery.
 | Servers | `server_list`, `server_save`, `server_delete`, `server_test` |
 | Terminal | `terminal_connect`, `terminal_send`, `terminal_resize`, `terminal_disconnect`, `terminal_list`, `known_hosts_list`, `known_hosts_forget` |
 | Bitwarden | `bitwarden_get_config`, `bitwarden_save_config`, `bitwarden_test_connection`, `bitwarden_sync` |
-| Ops | `settings_get`, `settings_set`, `audit_list`, `system_open_external`, `system_show_item_in_folder`, `system_select_file` |
+| Ops | `settings_get`, `settings_set`, `audit_list`, `system_open_external`, `system_select_file` |
 
 ## Module walkthrough (src-tauri/src)
 

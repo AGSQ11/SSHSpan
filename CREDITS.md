@@ -47,4 +47,29 @@ Usability and Linux packaging issues reported by **alice** (LowEndTalk), fixed i
 - Font too small on 1080p, with no interface-scale setting
 - Long category names overflowed the sidebar across the key list at small window sizes
 
+Additional security issues reported by **itzsenu** (LowEndTalk), fixed in #59 and #60:
+
+- Queued SFTP transfers skipped the local-path validator the single-file paths use, so a compromised renderer plus a hostile server could overwrite the vault database — or upload it
+- Trust-on-first-use consent was enforced only in the renderer, and the prompt asked the user to trust a host key whose fingerprint it had not shown them
+- Bitwarden KDF parameters had lower bounds but no upper bounds, so a hostile vault server could force an unbounded CPU/RAM burn during key derivation
+- The SFTP staging directory could be pre-created by another local user; the 0700 restriction failure was only logged, and staged files inherited the umask
+- `DialogPathStore` kept every approved path for the whole session, with no expiry and no single-use consumption
+- `is_system_path` skipped the check entirely for paths that did not exist yet, and its Windows branch could never match
+- Key export wrote the private key before fixing permissions on a pre-existing file, and Windows ACL failures only logged a warning
+- A crafted backup could plant host-key pins for hosts the user had never contacted
+- `terminal_keepalive` wrote a NUL byte into the PTY, which interactive programs receive as Ctrl-@
+- The Bitwarden master password crossed the IPC boundary, and was held after decryption, in a plain `String`
+- The managed SSH config was written under the app config directory while the UI named `~/.ssh/config`
+- `terminal_connect` interpolated host and username into the xterm stream without stripping control characters
+- Registered but unused Tauri plugins and capability grants, and a loopback HTTP allowance that later checks made unreachable
+
+Found while acting on that report, fixed in #60:
+
+- The `known_hosts` port-qualifying migration orphaned every IPv6 pin and, on a single primary-key collision, silently discarded every legacy pin — turning a host-key mismatch failure into a routine first-trust prompt
+- `system_show_item_in_folder` passed an unvalidated renderer path to the OS shell, the unguarded sibling of the hardened `system_open_external`
+- The Bitwarden "apply remote changes?" approval was sent under a snake_case argument name that Tauri drops, so it never applied and the UI still reported success
+- SFTP was not gated on the vault being unlocked, and locking never closed open SFTP channels or paused the transfer queue
+- The updater treated the installer digest as optional and had no downgrade check on the install path
+- CI fetched `appimagetool` from a mutable tag with no verification, into the job holding the release signing key
+
 Rust + Tauri migration suggested by **Herdie** (LowEndTalk Discord Server).

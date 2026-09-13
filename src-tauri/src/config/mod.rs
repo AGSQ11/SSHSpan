@@ -195,7 +195,7 @@ pub struct SshConfigService {
 
 impl SshConfigService {
     pub fn new() -> Result<Self> {
-        let config_path = get_ssh_config_path()?;
+        let config_path = ssh_config_path()?;
         Ok(Self { config_path })
     }
 
@@ -256,7 +256,7 @@ impl SshConfigService {
     }
 }
 
-fn get_ssh_config_path() -> Result<PathBuf> {
+pub fn ssh_config_path() -> Result<PathBuf> {
     if let Some(dirs) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
         Ok(dirs.config_dir().join("ssh").join("config"))
     } else if let Some(home) = dirs::home_dir() {

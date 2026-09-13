@@ -418,9 +418,11 @@ async fn download_minisig(
 /// The renderer must only call this after the user explicitly approved.
 ///
 /// `expected_sha256` is the GitHub-computed digest ("sha256:<hex>") threaded
-/// through from `update_check`'s response; it is `Option` for backward
-/// tolerance with older renderers. When present the downloaded file is
-/// verified against it and execution is REFUSED on mismatch.
+/// through from `update_check`'s response. It is REQUIRED: the parameter stays
+/// `Option` only so a missing value produces our own clear error instead of a
+/// deserialisation failure. Omitting it used to skip the integrity check
+/// entirely, which is a check a compromised renderer could switch off simply
+/// by not passing the argument.
 #[tauri::command]
 pub async fn update_download_and_run(
     app: AppHandle,
@@ -431,6 +433,18 @@ pub async fn update_download_and_run(
     // Only accept installer URLs from OUR GitHub releases (owner/repo pinned,
     // not just the github.com host).
     let mut current_url = validate_initial_asset_url(&url)?;
+
+    // Rollback guard. `update_check` compares versions, but this command takes
+    // `url` and `version` straight from the renderer, so on its own it would
+    // happily install an OLDER release of this repo - genuinely signed, so
+    // every downstream check passes - pinning the user to a known-vulnerable
+    // build. Re-derive the comparison here, where the decision is made.
+    let running = current_version(&app);
+    if !is_newer(&version, &running) {
+        return Err(CmdError(format!(
+            "Refusing to install {version}: it is not newer than the running version {running}."
+        )));
+    }
 
     let ext = installer_ext(&url);
 
@@ -571,12 +585,18 @@ pub async fn update_download_and_run(
                  refusing to run a possibly tampered download."
             )));
         }
-        // Backward tolerance: an older renderer did not thread the digest
-        // through. We still execute only a non-empty, allowlisted,
-        // size-capped HTTPS download from GitHub, but this path loses the
-        // tamper guarantee - the renderer in this repo always sends the
-        // digest, so in practice this arm is unreachable for shipped builds.
-        None => { /* no digest provided: non-empty size verified above */ }
+        // Absent digest = refuse. This was previously a "carry on" arm for
+        // older renderers; but the renderer is the untrusted side of the IPC
+        // boundary, so an optional integrity check is one an attacker just
+        // declines to supply. `update_check` always returns the digest.
+        None => {
+            let _ = tokio::fs::remove_file(&dest).await;
+            return Err(CmdError(
+                "Installer integrity check skipped: no expected digest was supplied. \
+                 Re-run the update check and try again."
+                    .into(),
+            ));
+        }
     }
 
     // Signature verification: the digest above proves the download matches

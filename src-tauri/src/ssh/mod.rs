@@ -4,9 +4,70 @@
 use crate::config::{SshConfigService, SshHostConfig};
 use anyhow::Result;
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+/// Write secret bytes to `path` so the content is NEVER on disk under
+/// permissions broader than 0600.
+///
+/// SECURITY: `OpenOptions::mode()` applies at CREATION ONLY. Opening an
+/// existing file with `.create(true).truncate(true).mode(0o600)` keeps that
+/// file's old mode, so the key is written under it and the chmod that follows
+/// closes the door after the horse has gone. Reproduced: a pre-existing 0644
+/// file stays 0644 for the whole write and only becomes 0600 afterwards.
+///
+/// The fix is to remove any existing file first and `create_new`, so the very
+/// first byte lands in a file this process created at 0600. `create_new` also
+/// means we never write through a symlink an attacker planted at the target.
+///
+/// On Windows the current-user-only ACL is applied after creation (there is no
+/// create-time equivalent) and a failure is fatal: the partially written file
+/// is removed and the error propagated, rather than leaving readable key
+/// material behind.
+pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    // Replace rather than truncate: truncating an existing file inherits its
+    // mode and its inode (and follows a symlink), which is the whole bug.
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("Could not replace {}: {e}", path.display())),
+    }
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Could not create {}: {e}", path.display()))?;
+
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.flush())
+        .map_err(|e| anyhow::anyhow!("Could not write {}: {e}", path.display()));
+    drop(file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+
+    #[cfg(windows)]
+    {
+        if let Err(e) = restrict_windows_file(&path.to_path_buf()) {
+            let _ = fs::remove_file(path);
+            return Err(anyhow::anyhow!(
+                "Could not restrict permissions on {}: {e}",
+                path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 pub struct SshService;
 
@@ -30,46 +91,17 @@ impl SshService {
         let private_path = ssh_dir.join(&key_filename);
         let public_path = ssh_dir.join(format!("{}.pub", key_filename));
 
-        // Write the private key with restrictive permissions from the FIRST
-        // byte on disk: creating it via fs::write (umask default, typically
-        // 0644) and chmodding afterwards leaves a window where the key is
-        // world-readable to anything watching ~/.ssh. mode(0o600) applies at
-        // create time on Unix; the explicit chmod below stays as a reassert
-        // for pre-existing files (re-deploy over an older key).
-        use std::io::Write as _;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut private_file = opts.open(&private_path)?;
-        private_file.write_all(private_key_pem.as_bytes())?;
-        private_file.flush()?;
-        drop(private_file);
-
-        // Set permissions: 600 on Unix, handle Windows ACL
-        #[cfg(unix)]
-        {
-            let mut perms = fs::metadata(&private_path)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&private_path, perms)?;
-        }
-
-        #[cfg(windows)]
-        {
-            // Use icacls to restrict to current user. A FAILED restriction is
-            // not survivable for a private key: fail the deploy and remove
-            // the file rather than leave readable key material behind.
-            if let Err(e) = restrict_windows_file(&private_path) {
-                let _ = fs::remove_file(&private_path);
-                let _ = fs::remove_file(&public_path);
-                return Err(anyhow::anyhow!(
-                    "Could not restrict private-key file permissions: {e}"
-                ));
-            }
-        }
+        // Private key: written through the shared helper so the very first
+        // byte lands in a file created at 0600. The previous code opened with
+        // .create(true).truncate(true).mode(0o600), which on a RE-DEPLOY over
+        // an existing key kept that file's old mode for the whole write and
+        // only chmod'd afterwards - the comment claimed "0600 from the FIRST
+        // byte on disk", and it was not. On Windows the helper fails closed if
+        // the current-user-only ACL cannot be applied.
+        write_secret_file(&private_path, private_key_pem.as_bytes()).map_err(|e| {
+            let _ = fs::remove_file(&public_path);
+            e
+        })?;
 
         // Write public key
         fs::write(&public_path, public_key)?;
@@ -323,4 +355,79 @@ pub(crate) fn restrict_windows_file(path: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod secret_write_tests {
+    use super::*;
+
+    /// REGRESSION: the old sequence was
+    ///   OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+    ///   -> write -> chmod 0600
+    /// `mode()` applies at CREATION only, so overwriting an existing 0644 file
+    /// wrote the private key under 0644 and only tightened it afterwards. Both
+    /// the export and deploy paths carried this, with comments claiming "0600
+    /// from the first byte".
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_is_0600_even_over_a_permissive_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "sshspan-secret-{}.pem",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        // A pre-existing, world-readable file at the target - the "replace?"
+        // case in a save dialog, or a re-deploy over an older key.
+        fs::write(&path, b"stale").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_secret_file(&path, b"-----BEGIN OPENSSH PRIVATE KEY-----").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret file must be 0600, got {mode:o}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"-----BEGIN OPENSSH PRIVATE KEY-----"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_creates_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "sshspan-secret-new-{}.pem",
+            uuid::Uuid::new_v4().simple()
+        ));
+        write_secret_file(&path, b"key").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "new secret file must be 0600, got {mode:o}");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A symlink planted at the destination must not be written through:
+    /// create_new fails rather than following it to the target.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_does_not_follow_a_planted_symlink() {
+        let dir =
+            std::env::temp_dir().join(format!("sshspan-symlink-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        fs::write(&victim, b"original").unwrap();
+        let link = dir.join("key.pem");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        // remove_file unlinks the symlink itself, then create_new makes a real
+        // file - the victim must be untouched.
+        write_secret_file(&link, b"secret").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert!(!fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
