@@ -89,7 +89,17 @@ function terminalBufferText(rec) {
   }
 }
 
-function markTerminalBell(tabId) {
+/// Flag a bell on a BACKGROUND tab so the tab strip can show it.
+///
+/// Deliberately not named `markTerminalBell`. app.js defines a global of that
+/// name and assigns it to `window.markTerminalBell`; every renderer script is
+/// a classic <script> sharing one global scope, and terminal.js loads AFTER
+/// app.js, so a same-named function declaration here replaced the global —
+/// making the `window.markTerminalBell(tabId)` call below call THIS function,
+/// recursively, until the stack blew:
+///   RangeError: Maximum call stack size exceeded
+/// on every bell in a non-active tab.
+function notifyBackgroundTabBell(tabId) {
   if (tabId === activeTabId) return;
   if (typeof window.markTerminalBell === 'function') window.markTerminalBell(tabId);
 }
@@ -110,11 +120,21 @@ function playTerminalBell() {
 }
 
 
-function copyText(text) {
-  if (!text) return;
-  if (tclip) { tclip.writeText(text).catch(() => {}); return; }
-  if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
-}
+// copyText lives in app.js and is shared. It used to be duplicated here, and
+// because terminal.js loads after app.js in the same global scope, THIS
+// version won — a fire-and-forget function returning undefined.
+//
+// Two consequences, both live until now:
+//   * sftp.js does `copyText(x).then(...)` in three places (Copy path, Copy
+//     URL). `.then` of undefined threw a TypeError and the menu item did
+//     nothing visible.
+//   * app.js does `const ok = await copyText(x)`. The clipboard write DID
+//     succeed, but `ok` was undefined, so both call sites reported
+//     "Clipboard unavailable." on a copy that had worked — the exact symptom
+//     reported against 1.7.2 and thought fixed.
+//
+// app.js's version is the one to keep: it tries the Tauri plugin, falls back
+// to the browser API, and returns a boolean the callers actually read.
 
 async function readClipboard() {
   if (tclip) { try { return await tclip.readText(); } catch (e) {} }
@@ -231,7 +251,7 @@ function createTabTerminal(tabId) {
   term.onBell(() => {
     const mode = terminalBellMode();
     if (mode === 'silent') return;
-    markTerminalBell(tabId);
+    notifyBackgroundTabBell(tabId);
     if (mode === 'sound') playTerminalBell();
   });
 

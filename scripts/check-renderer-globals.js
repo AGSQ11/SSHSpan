@@ -64,10 +64,26 @@ function scrub(src) {
 
 // Every name bound at any scope: declarations, assignments, params, imports.
 const defined = new Set();
+// name -> [{file, line}] for TOP-LEVEL declarations only. Used for the
+// duplicate-global check below; nested/param names are not collected here.
+const topLevel = new Map();
 const scrubbed = new Map();
 for (const [rel, src] of sources) {
   const s = scrub(src);
   scrubbed.set(rel, s);
+  // Top-level declarations: column 0 only, so nested helpers are excluded.
+  for (const re of [
+    /^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm,
+    /^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/gm,
+    /^class\s+([A-Za-z_$][\w$]*)/gm,
+  ]) {
+    let m;
+    while ((m = re.exec(s))) {
+      const line = s.slice(0, m.index).split('\n').length;
+      if (!topLevel.has(m[1])) topLevel.set(m[1], []);
+      topLevel.get(m[1]).push({ file: rel, line });
+    }
+  }
   for (const re of [
     /\bfunction\s+([A-Za-z_$][\w$]*)/g,
     /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g,
@@ -104,6 +120,30 @@ for (const [rel, src] of sources) {
 }
 
 const problems = [];
+
+// ---- Duplicate top-level names across files -------------------------------
+// The renderer's scripts are classic <script> tags sharing ONE global scope,
+// loaded app.js -> terminal.js -> sftp.js. Two files declaring the same
+// top-level name is not a shadow, it is a REPLACEMENT: the later one wins for
+// every caller in every file, silently.
+//
+// This is not hypothetical. terminal.js had its own `copyText` and its own
+// `markTerminalBell`, both of which replaced app.js's:
+//   * copyText returned undefined, so sftp.js's `copyText(x).then(...)` threw
+//     and app.js's `const ok = await copyText(x)` reported "Clipboard
+//     unavailable." on copies that had actually succeeded;
+//   * markTerminalBell called `window.markTerminalBell(...)`, which after the
+//     replacement was itself — infinite recursion on every background-tab bell.
+for (const [name, sites] of topLevel) {
+  const files = new Set(sites.map((s2) => s2.file));
+  if (files.size < 2) continue;
+  const where = sites.map((s2) => `${s2.file}:${s2.line}`).join(', ');
+  problems.push(
+    `'${name}' is declared at top level in more than one renderer script: ${where}\n` +
+    `        They share one global scope, so the last one loaded silently replaces the others.`
+  );
+}
+
 for (const [rel, s] of scrubbed) {
   const lines = s.split('\n');
   lines.forEach((line, idx) => {
@@ -121,9 +161,13 @@ for (const [rel, s] of scrubbed) {
 
 console.log(`Checked ${scrubbed.size} renderer scripts; ${defined.size} names in scope.`);
 if (problems.length) {
-  console.error(`\n${problems.length} undefined call(s):\n`);
+  console.error(`\n${problems.length} problem(s):\n`);
   for (const p of [...new Set(problems)]) console.error('  ' + p);
-  console.error('\nThese are valid syntax, so `node --check` passes; they throw a\nReferenceError at runtime and can take a whole view down with them.\n');
+  console.error(
+    '\nAll of these are valid syntax, so `node --check` passes. They fail at\n' +
+    'runtime: an undefined call throws a ReferenceError, and a duplicated\n' +
+    'global silently replaces the version every other file is calling.\n'
+  );
   process.exit(1);
 }
-console.log('No calls to undefined project functions.');
+console.log('No undefined calls and no duplicated globals.');
