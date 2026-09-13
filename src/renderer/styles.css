@@ -579,6 +579,12 @@ label:focus-within { color: var(--text); }
   margin: 2px 0 10px 2px;
 }
 .settings-grid { display: flex; flex-direction: column; gap: 10px; margin-bottom: 8px; }
+/* multi-control settings row (bandwidth throttle: Unlimited + number + unit) */
+.settings-combo { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settings-combo input[type="number"] { width: 90px; }
+.settings-combo select { width: auto; min-width: 90px; }
+.settings-combo input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
+.settings-combo-tag { font-size: 12px; color: var(--text-dim); cursor: pointer; user-select: none; }
 
 .setting-row {
   display: flex; align-items: center; justify-content: space-between; gap: 16px;
@@ -1600,6 +1606,15 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .sftp-queueactions-head { display: flex; align-items: center; gap: 6px; }
 .sftp-queueactions-head .ghost-btn { padding: 3px 10px; font-size: 11px; }
 
+/* restored-transfer banner (Task 5) - hidden unless a paused job's session
+   died with the previous run */
+.sftp-queuebanner {
+  flex: none; font-size: 11px; color: var(--warn);
+  background: rgba(var(--accent-rgb), 0.08);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: 5px 10px;
+}
+
 /* column grid shared by the header row and job rows */
 .sftp-queuecols, .sftp-queueitem {
   display: grid;
@@ -1626,6 +1641,8 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .q-cell.q-prog { display: flex; align-items: center; gap: 8px; }
 .q-progtext { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
 .q-cell.q-err { color: var(--danger); font-size: 11px; }
+.q-cell.q-err.retrying { color: var(--warn); } /* auto-retry backoff - expected, not a failure */
+.q-cell.q-err.info { color: var(--text-dim); } /* restored/paused note - informational */
 .q-cell.q-act { display: flex; justify-content: flex-end; }
 .sftp-queuebar {
   flex: none; width: 70px; height: 6px; border-radius: 3px;
@@ -1634,7 +1651,16 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .sftp-queuefill { display: block; height: 100%; background: var(--accent); transition: width .2s; }
 .sftp-queuefill.done { background: var(--ok); }
 .sftp-queuefill.failed { background: var(--danger); }
+/* Deliberately suspended, not stalled - a muted neutral tone rather than the
+   in-progress accent, done green, or failed red. */
+.sftp-queuefill.paused { background: var(--text-faint); }
+.sftp-queueitem.q-state-paused { opacity: 0.85; }
 .sftp-queueactions { display: flex; gap: 4px; justify-content: flex-end; }
+.icon-btn.disabled, .icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.icon-btn.disabled:hover, .icon-btn:disabled:hover { background: transparent; color: var(--text-faint); }
+/* verify badge (Task 4) - small marker on rows running SHA-256 verification */
+.q-verify { display: inline-flex; vertical-align: -2px; margin-right: 4px; color: var(--ok); }
+.q-verify svg { width: 12px; height: 12px; }
 
 /* chmod dialog grid */
 .chmod-grid { width: 100%; border-collapse: collapse; }

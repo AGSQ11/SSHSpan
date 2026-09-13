@@ -72,6 +72,16 @@ pub fn run() {
             app.manage(KeepaliveRegistry::new());
             app.manage(crate::sftp::queue::TransferQueue::new());
 
+            // Bring back transfers a previous run left unfinished. They come
+            // back Paused, never running: the SSH sessions they were bound to
+            // died with that run, and silently reconnecting to write files at
+            // startup is not something the user asked for. Must run after both
+            // the DB state and the queue are managed.
+            let restored = crate::sftp::queue::restore_pending(app.handle());
+            if restored > 0 {
+                log::info!("[sshspan-sftp] restored {restored} unfinished transfer(s) as paused");
+            }
+
             create_tray(app.handle())?;
 
             if let Some(window) = app.get_webview_window("main") {
@@ -132,6 +142,9 @@ pub fn run() {
             known_hosts_forget,
             sftp_open,
             sftp_list_dir,
+            sftp_resolve_link,
+            sftp_dir_size,
+            sftp_file_sha256,
             sftp_mkdir,
             sftp_remove,
             sftp_rename,
@@ -149,6 +162,11 @@ pub fn run() {
             sftp_queue_list,
             sftp_queue_cancel,
             sftp_queue_retry,
+            sftp_queue_pause,
+            sftp_queue_resume,
+            sftp_queue_pause_all,
+            sftp_queue_resume_all,
+            sftp_queue_set_rate_limit,
             sftp_queue_clear_finished,
             sftp_server_copy,
             sftp_search,
