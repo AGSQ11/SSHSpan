@@ -1,5 +1,5 @@
 /**
- * app.js — SSHSpan renderer controller (Tauri v2).
+ * app.js - SSHSpan renderer controller (Tauri v2).
  * ---------------------------------------------------------------------------
  * Plain DOM + Tauri's invoke(). No Node, no require, no framework.
  * Every IPC call goes through invoke() which returns the Rust Result<T, String>.
@@ -31,7 +31,7 @@ function el(id) { return document.getElementById(id); }
 // reports several failures used to show only the last one, because a single
 // #toast element had its text replaced each time.
 //
-// SECURITY: toast text routinely carries remote-controlled strings — SFTP
+// SECURITY: toast text routinely carries remote-controlled strings - SFTP
 // error messages, server names, filenames from a listing. It is built with
 // textContent and never innerHTML, so markup in any of them can never render.
 const TOAST_TTL_MS = { err: 9000, warn: 6000, ok: 3800, info: 3800 };
@@ -48,7 +48,7 @@ function toast(msg, kind) {
 
   const text = document.createElement('span');
   text.className = 'toast-text';
-  text.textContent = msg;           // never innerHTML — see SECURITY above
+  text.textContent = msg;           // never innerHTML - see SECURITY above
   item.appendChild(text);
 
   const dismiss = document.createElement('button');
@@ -67,7 +67,7 @@ function toast(msg, kind) {
     setTimeout(() => item.remove(), 180);
   };
   dismiss.addEventListener('click', remove);
-  // Errors linger longer than confirmations — they are the ones worth reading.
+  // Errors linger longer than confirmations - they are the ones worth reading.
   item._timer = setTimeout(remove, TOAST_TTL_MS[kind] || TOAST_TTL_MS.info);
 
   host.appendChild(item);
@@ -239,7 +239,7 @@ function ico(name) {
   return ICONS[name] || '';
 }
 
-/** 32–36px rounded key-type tile used by key rows and the detail pane. */
+/** 32-36px rounded key-type tile used by key rows and the detail pane. */
 function keyAvatar(kind) {
   const map = { ed25519: 'ed25519', 'ed25519-sk': 'ed25519', rsa: 'rsa', ecdsa: 'ecdsa' };
   const k = map[kind] || '';
@@ -261,7 +261,7 @@ function typeBadge(kind) {
   return t;
 }
 
-/** <a data-vault-state=…> pill for the sidebar vault indicator. */
+/** <a data-vault-state=...> pill for the sidebar vault indicator. */
 function vaultStatusHTML(unlocked, hasVault) {
   const s = unlocked ? 'unlocked' : (hasVault ? 'locked' : 'novault');
   return {
@@ -517,7 +517,7 @@ async function renameCategory(id) {
 async function moveCategoryPrompt(id) {
   // opens the picker in single-select mode for choosing a new parent
   openCategoryPicker({
-    title: 'Move to…',
+    title: 'Move to...',
     scope: state.categoryScope,
     initial: [],
     single: true,
@@ -554,7 +554,7 @@ function openCatMenu(cat, anchor) {
   m.innerHTML =
     `<button data-act="rename"><span data-ico="pencil"></span>Rename</button>` +
     `<button data-act="addChild"><span data-ico="folder-plus"></span>New subcategory</button>` +
-    `<button data-act="move"><span data-ico="move"></span>Move to…</button>` +
+    `<button data-act="move"><span data-ico="move"></span>Move to...</button>` +
     `<button data-act="delete" class="danger"><span data-ico="x"></span>Delete</button>`;
   // position absolutely under the anchor; the sidebar isn't a positioning ancestor, so use fixed.
   const r = anchor.getBoundingClientRect();
@@ -1202,7 +1202,7 @@ function renderKeyList() {
     const cats = state.keyCategories[k.id] || [];
     if (!cats.length) placeKey(k);
   }
-  // Dedupe keys within each group (since placeKey runs multiple times in the loop above for the same key across multiple cats — we want each key once per top-level ancestor it appears in)
+  // Dedupe keys within each group (since placeKey runs multiple times in the loop above for the same key across multiple cats - we want each key once per top-level ancestor it appears in)
   for (const g of groups) g.keys = dedupeById(g.keys);
 
   for (const g of groups) {
@@ -1277,7 +1277,7 @@ function keyRowEl(k, groupKeys) {
   }
   const cats = state.keyCategories[k.id] || [];
   if (cats.length > 1) {
-    // "in N categories" badge — only show if this key appears in more than one category.
+    // "in N categories" badge - only show if this key appears in more than one category.
     // We only know the count locally; "appears in more than one group" depends on group structure.
     const distinctTop = new Set();
     for (const cid of cats) { let t = cid; while (true) { const c = catById(t); if (!c) break; if (!c.parent_id) { distinctTop.add(c.id); break; } t = c.parent_id; } }
@@ -1306,7 +1306,7 @@ function keyRowEl(k, groupKeys) {
   return row;
 }
 
-// Tiny right-click menu: "Use this key to connect…".
+// Tiny right-click menu: "Use this key to connect...".
 function openKeyConnectMenu(x, y, key) {
   closeKeyConnectMenu();
   const menu = document.createElement('div');
@@ -1314,7 +1314,7 @@ function openKeyConnectMenu(x, y, key) {
   menu.id = 'keyConnectMenu';
   const btn = document.createElement('button');
   btn.className = 'ctx-item';
-  btn.innerHTML = `${ico('plug-zap')}<span>Use this key to connect…</span>`;
+  btn.innerHTML = `${ico('plug-zap')}<span>Use this key to connect...</span>`;
   btn.addEventListener('click', async () => {
     closeKeyConnectMenu();
     if (!state.unlocked) {
@@ -1322,7 +1322,7 @@ function openKeyConnectMenu(x, y, key) {
       return;
     }
     if (state.servers.length === 0) {
-      // No saved servers yet — open the server modal with this key preselected.
+      // No saved servers yet - open the server modal with this key preselected.
       openServerModal({ keyId: key.id });
     } else {
       // Pick one of the existing servers; the chosen server's saved username
@@ -1472,7 +1472,7 @@ const EXPORT_EXT = {
 };
 
 // Formats whose output is PRIVATE key material. These are exported through
-// `key_export_to_file` — the backend serializes straight into a user-chosen
+// `key_export_to_file` - the backend serializes straight into a user-chosen
 // file so the decrypted key never crosses the IPC boundary into the WebView.
 const PRIVATE_EXPORT_FORMATS = ['openssh-private', 'ppk', 'pkcs8', 'pkcs8-encrypted'];
 
@@ -1751,7 +1751,7 @@ async function loadBitwardenConfig() {
   try {
     config = await call('bitwarden_get_config');
   } catch {
-    // first launch — no config yet
+    // first launch - no config yet
   }
 
   for (const f of BW_FIELDS) {
@@ -1941,7 +1941,7 @@ async function loadSettings() {
       toast('Parallel transfers updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('SFTP parallel transfers (1–4)', sftpParallel);
+  mkRow('SFTP parallel transfers (1-4)', sftpParallel);
 
   const sftpHidden = document.createElement('input');
   sftpHidden.type = 'checkbox';
@@ -2149,22 +2149,13 @@ async function loadSettings() {
   });
   mkRow('Application keypad', termAppKeypad);
 
-  const termKeepalive = document.createElement('input');
-  termKeepalive.type = 'number';
-  termKeepalive.min = '0';
-  termKeepalive.max = '3600';
-  termKeepalive.step = '15';
-  termKeepalive.value = state.settings.terminalKeepaliveSeconds || 0;
-  termKeepalive.addEventListener('change', async () => {
-    const v = Math.max(0, Math.min(3600, parseInt(termKeepalive.value, 10) || 0));
-    termKeepalive.value = v;
-    try {
-      await call('settings_set', { key: 'terminalKeepaliveSeconds', value: String(v) });
-      state.settings.terminalKeepaliveSeconds = String(v);
-      toast('SSH keepalive updated; it applies to new connections.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
-  mkRow('SSH keepalive interval (seconds, 0=off)', termKeepalive);
+  // Keepalives moved to the SSH protocol layer (russh keepalive@openssh.com
+  // every 30 s); the old per-second data-channel ping sent NUL bytes the
+  // remote shell saw as Ctrl-@. Shown as read-only info, no setting.
+  const keepaliveInfo = document.createElement('span');
+  keepaliveInfo.className = 'hint';
+  keepaliveInfo.textContent = 'Automatic - protocol-level, every 30 s';
+  mkRow('SSH keepalive', keepaliveInfo);
 
   loadKnownHosts();
 }
@@ -2202,7 +2193,7 @@ async function backupRestore() {
     } catch (e) {
       const msg = e.message || String(e);
       if (!msg.includes('different master password')) throw e;
-      // The backup was created under a different master password — ask for it.
+      // The backup was created under a different master password - ask for it.
       promptModal('Backup password',
         'This backup was created with a different master password. Enter the one that was active when the backup was taken:',
         '', async (pw) => {
@@ -2223,6 +2214,7 @@ function finishRestore(r) {
   loadKeys();
   loadServers();
   const conflicts = c.knownHostsConflicts || 0;
+  const imported = c.knownHostsImported || 0;
   const skipped = r.resealFailures || 0;
   if (skipped > 0) {
     toast(`Backup restored, but ${skipped} entrie(s) could not be decrypted with the backup password and were SKIPPED (keys not imported, saved passwords cleared). Re-sync or re-add them manually.`, 'err');
@@ -2230,6 +2222,11 @@ function finishRestore(r) {
     toast(`Backup restored, but ${conflicts} host-key pin(s) were NOT overwritten (conflicting keys kept). Check Known Hosts.`, 'err');
   } else {
     toast('Backup restored.', 'ok');
+  }
+  if (imported > 0) {
+    // Planted-trust defence: pins that arrived with the backup are marked
+    // unconfirmed; the user re-confirms the fingerprint on first connection.
+    toast(`${imported} host-key pin(s) came from the backup and are marked unconfirmed - you will be asked to confirm each fingerprint on its first connection.`, 'info');
   }
 }
 async function loadKnownHosts() {
@@ -2248,7 +2245,7 @@ async function loadKnownHosts() {
       const tdFp = document.createElement('td');
       const code = document.createElement('code');
       code.className = 'mono';
-      code.textContent = h.fingerprintSha256 || '—';
+      code.textContent = h.fingerprintSha256 || '-';
       tdFp.appendChild(code);
       const tdSeen = document.createElement('td');
       tdSeen.textContent = fmtTime(h.firstSeen);
@@ -2530,7 +2527,7 @@ function wire() {
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
       // Topmost first. The picker opens OVER the key/host modal, and its own
-      // handlers only cover the search box and the tree — with focus on Save
+      // handlers only cover the search box and the tree - with focus on Save
       // or Cancel the keystroke arrives here instead, and closing the modal
       // underneath would discard the form the user is still filling in.
       if (!el('pickerModal').hidden) closeCategoryPicker();
@@ -2577,7 +2574,7 @@ function wire() {
   const termModeBtn = el('termModeBtn');
   if (termModeBtn) termModeBtn.addEventListener('click', () => {
     if (typeof window.toggleSshSftpMode === 'function') window.toggleSshSftpMode();
-    else toast('SFTP is still loading — try again in a moment.', 'err');
+    else toast('SFTP is still loading - try again in a moment.', 'err');
   });
   el('keyPassphraseToggle')?.addEventListener('change', (ev) => {
     const input = el('keyPassphraseInput');
@@ -2600,7 +2597,7 @@ function wire() {
   });
   el('srvSaveBtn').addEventListener('click', submitServerModal);
   // Enter submits from any single-line field in the host form, the way a real
-  // <form> would — this dialog is filled in dozens of times and previously
+  // <form> would - this dialog is filled in dozens of times and previously
   // required reaching for the mouse. Textareas and the segmented auth buttons
   // are excluded so Enter keeps its normal meaning there.
   el('serverModal').addEventListener('keydown', (e) => {
@@ -2664,6 +2661,17 @@ function resetAutoLockTimer() {
   }, mins * 60 * 1000);
 }
 
+// Renderer liveness heartbeat: the backend runs its own idle auto-lock
+// watchdog that locks the vault when no heartbeat has arrived for
+// autoLockMinutes. This covers a hung or crashed webview, where the
+// renderer-side timer above can never fire. 0/absent still disables
+// auto-lock (the backend reads the same setting).
+setInterval(() => {
+  if (window.__TAURI__ && window.__TAURI__.core) {
+    window.__TAURI__.core.invoke('heartbeat').catch(() => {});
+  }
+}, 30000);
+
 // ─── Update check (GitHub releases; manual + auto per setting) ─────────────
 
 async function manualUpdateCheck() {
@@ -2675,7 +2683,7 @@ async function manualUpdateCheck() {
         `${r.notes ? r.notes.slice(0, 800) + '\n\n' : ''}` +
         `Download and run the installer for this OS?`);
       if (install) {
-        toast('Downloading installer…', 'info');
+        toast('Downloading installer...', 'info');
         await call('update_download_and_run', { url: r.assetUrl, version: r.version, expectedSha256: r.assetDigest });
         // The app exits itself right after spawning the installer.
       }
@@ -2692,14 +2700,14 @@ async function autoUpdateCheckOnBoot() {
   try {
     const r = await call('update_check');
     if (r.available) {
-      toast(`Update available: ${r.version} — Settings → "Check now" to install.`, 'info');
+      toast(`Update available: ${r.version} - Settings → "Check now" to install.`, 'info');
     }
   } catch (e) { /* offline or rate-limited: silently ignore on boot */ }
 }
 
 // ─── Connect: saved servers + SSH sessions ─────────────────────────────────
 
-// Password prompt for connect — uses a custom modal instead of native prompt()
+// Password prompt for connect - uses a custom modal instead of native prompt()
 // which silently fails in Tauri's WebView.
 function askConnectPassword(server, callback) {
   const modal = document.getElementById('connectPwModal');
@@ -2858,7 +2866,7 @@ function openServerModal({ id, keyId, prefill } = {}) {
   el('serverModalTitle').textContent = id ? 'Edit Server' : 'New Server';
   // Populate key dropdown from cached state.keys
   const sel = el('srvKeyId');
-  sel.innerHTML = '<option value="">— select a key —</option>';
+  sel.innerHTML = '<option value="">- select a key -</option>';
   for (const k of state.keys) {
     if (!k.has_private) continue;
     const opt = document.createElement('option');
@@ -2982,7 +2990,7 @@ function openServerPickerForKey(key) {
   menu.appendChild(div);
   const newBtn = document.createElement('button');
   newBtn.className = 'ctx-item';
-  newBtn.innerHTML = `${ico('plus')}<span>New server with this key…</span>`;
+  newBtn.innerHTML = `${ico('plus')}<span>New server with this key...</span>`;
   newBtn.addEventListener('click', () => {
     closeKeyConnectMenu();
     openServerModal({ keyId: key.id });
@@ -3003,26 +3011,12 @@ function openServerPickerForKey(key) {
 
 async function testSelectedServer(srv) {
   if (!srv) return;
-  terminalSetStatus(`Testing ${srv.host}:${srv.port || 22}…`);
+  terminalSetStatus(`Testing ${srv.host}:${srv.port || 22}...`);
   try {
-    // Host-key consent: the backend refuses an unpinned host unless the user
-    // accepted the first-trust prompt (same contract as terminal_connect).
-    let allowTofu;
-    const known = await call('known_hosts_check', { host: srv.host, port: srv.port || 22 });
-    if (known && known.known === false) {
-      const okTrust = window.confirm(
-        '“' + srv.host + ':' + (srv.port || 22) + '” is not in Known Hosts yet.\n\n' +
-        'Trust this host on first connection (TOFU)?\n' +
-        'The fingerprint will be recorded in the audit log.'
-      );
-      if (!okTrust) {
-        terminalSetStatus('Connection test cancelled.');
-        toast('Test cancelled — host is not trusted yet.', 'err');
-        return;
-      }
-      allowTofu = true;
-    }
-    const result = await call('server_test', { serverId: srv.id, allowTofu });
+    // Host-key consent is backend-owned: if the host is unpinned, the native
+    // trust dialog (with the fingerprint) is raised by the Rust handler
+    // during the handshake. The renderer deliberately passes no consent flag.
+    const result = await call('server_test', { serverId: srv.id });
     if (result && result.ok === false) throw new Error(result.error || 'Connection test failed.');
     const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
     terminalSetStatus(`Connection OK${ms}`);
@@ -3037,10 +3031,10 @@ function newTabId() {
   return 'tab-' + Date.now().toString(36) + Math.floor(Math.random() * 1e4);
 }
 
-/// Open a NEW session tab for a server (always a new tab — never replaces).
+/// Open a NEW session tab for a server (always a new tab - never replaces).
 async function openSessionTab(srv, opts = {}) {
   if (typeof window.terminalConnectInTab !== 'function') {
-    toast('terminal.js is missing — Connect cannot run.', 'err');
+    toast('terminal.js is missing - Connect cannot run.', 'err');
     return;
   }
   switchView('connect');
@@ -3062,7 +3056,7 @@ async function openSessionTab(srv, opts = {}) {
   activateSessionSurface(tabId);
   el('termDisconnectBtn').hidden = true;
   el('termReconnectBtn').hidden = true;
-  terminalSetStatus(`Connecting to ${srv.host}:${srv.port}…`);
+  terminalSetStatus(`Connecting to ${srv.host}:${srv.port}...`);
 
   let pw = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
@@ -3079,7 +3073,7 @@ async function openSessionTab(srv, opts = {}) {
     tab.sessionId = sessionId;
     renderTermTabs();
     updateTerminalHead();
-    terminalSetStatus(`Connected to ${srv.host}:${srv.port} — streaming`);
+    terminalSetStatus(`Connected to ${srv.host}:${srv.port} - streaming`);
   } catch (e) {
     tab.ended = true;
     renderTermTabs();
@@ -3108,7 +3102,7 @@ function toggleTermMax() {
   btn.innerHTML = ico(max ? 'minimize-2' : 'maximize-2');
   btn.title = max ? 'Restore terminal size (<>)' : 'Expand terminal to full window';
   if (typeof terminalSetStatus === 'function') {
-    terminalSetStatus(max ? 'Terminal maximized — press Esc or <> to restore.' : 'Restored.');
+    terminalSetStatus(max ? 'Terminal maximized - press Esc or <> to restore.' : 'Restored.');
   }
   // Let the layout settle, then refit + push the new PTY size.
   setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 80);
@@ -3126,7 +3120,7 @@ async function reconnectActiveTab() {
     pw = await new Promise(resolve => askConnectPassword(srv, resolve));
     if (pw === null || pw === undefined) return;
   }
-  terminalSetStatus(`Reconnecting to ${srv.host}:${srv.port}…`);
+  terminalSetStatus(`Reconnecting to ${srv.host}:${srv.port}...`);
   el('termDisconnectBtn').hidden = true;
   el('termReconnectBtn').hidden = true;
   try {
@@ -3135,7 +3129,7 @@ async function reconnectActiveTab() {
     tab.ended = false;
     renderTermTabs();
     updateTerminalHead();
-    terminalSetStatus(`Connected to ${srv.host}:${srv.port} — streaming`);
+    terminalSetStatus(`Connected to ${srv.host}:${srv.port} - streaming`);
   } catch (e) {
     renderTermTabs();
     updateTerminalHead();
@@ -3295,7 +3289,7 @@ function escapeHtml(s) {
 // ─── boot ──────────────────────────────────────────────────────────────────
 
 (async function main() {
-  // Persistent boot-error log — readable via CDP even after the toast fades.
+  // Persistent boot-error log - readable via CDP even after the toast fades.
   window.__bootErrors = window.__bootErrors || [];
   window.addEventListener('error', (ev) => {
     const msg = 'JS error: ' + (ev.message || 'unknown');
@@ -3327,7 +3321,7 @@ function escapeHtml(s) {
   loadBrandIcon();
 
   // Load the terminal stack explicitly, in order, with loud per-file errors.
-  // A statically-failed <script src> fires no window.onerror — it fails
+  // A statically-failed <script src> fires no window.onerror - it fails
   // silently, which cost us days of "blank terminal" debugging.
   const loadScript = (src) => new Promise((resolve) => {
     const s = document.createElement('script');
@@ -3340,7 +3334,7 @@ function escapeHtml(s) {
   for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js', 'sftp.js']) {
     const r = await loadScript(src);
     results.push(r);
-    if (!r.ok) toast('Failed to load ' + src + ' — Connect will not work.', 'err');
+    if (!r.ok) toast('Failed to load ' + src + ' - Connect will not work.', 'err');
   }
 
   // Build marker: visible in the sidebar brand on every screen (the window
@@ -3349,9 +3343,9 @@ function escapeHtml(s) {
   if (brandSub) brandSub.textContent = 'KEY MANAGER · ' + window.__SSHPAN_BUILD__;
 
   if (!window.__SSHPAN_TERMINAL_JS__) {
-    toast('terminal.js loaded but did not initialize — Connect view will not work.', 'err');
+    toast('terminal.js loaded but did not initialize - Connect view will not work.', 'err');
   } else if (!window.Terminal) {
-    toast('xterm.js did not expose window.Terminal — terminal rendering unavailable.', 'err');
+    toast('xterm.js did not expose window.Terminal - terminal rendering unavailable.', 'err');
   }
 
   await refreshVaultStatus();

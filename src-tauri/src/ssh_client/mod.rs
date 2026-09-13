@@ -18,6 +18,7 @@ use russh::keys::*;
 use russh::Pty;
 use russh::*;
 use tauri::ipc::Channel;
+use tauri::AppHandle;
 use zeroize::Zeroizing;
 
 use crate::db::{Database, ServerRecord};
@@ -139,13 +140,17 @@ pub fn known_host_key(host: &str, port: u16) -> String {
 /// interactive I/O runs on the channel side in the spawned task.
 ///
 /// Host-key policy:
-/// - a pinned `host:port` must match exactly, else the connection is refused;
-/// - an UNPINNED host is accepted only when `allow_tofu` is set — i.e. the
-///   renderer has to have obtained explicit user consent first (the
-///   `known_hosts_check` → confirm flow). Without consent the unknown key is
-///   REFUSED (the StrictHostKeyChecking=yes equivalent): a silently-trusting
-///   first connect is no longer the default behavior, and a compromised
-///   renderer cannot silently grow the trusted set either.
+/// - a pinned `host:port` learned from a real connection must match exactly,
+///   else the connection is refused;
+/// - an UNPINNED host is accepted only after the user accepts a NATIVE
+///   backend dialog raised here, at the moment the key arrives, showing the
+///   fingerprint BEFORE the decision. Consent never travels through the
+///   renderer: a compromised webview cannot mint it, suppress it, or fake
+///   it - the worst it can do is relay the same OS dialog the user sees;
+/// - a pin imported from a backup restore is marked `imported` and is NOT
+///   silently trusted even when the presented key matches: the same native
+///   dialog re-confirms the fingerprint on first use, then the pin is
+///   upgraded to `connection` (see `confirm_imported_known_host`).
 pub struct TerminalHandler {
     /// host used as the key in the known_hosts table
     pub host: String,
@@ -153,9 +158,8 @@ pub struct TerminalHandler {
     pub port: u16,
     /// database handle for host-key lookups
     pub db: Database,
-    /// Whether an unpinned host may be trusted on first use. Only set when
-    /// the user explicitly consented to trusting this host in the renderer.
-    pub allow_tofu: bool,
+    /// App handle used only to raise the native host-key trust dialog.
+    pub app: AppHandle,
 }
 
 impl client::Handler for TerminalHandler {
@@ -167,24 +171,26 @@ impl client::Handler for TerminalHandler {
     ) -> Result<bool, Self::Error> {
         let presented_b64: String = match server_public_key {
             PublicKeyOrCertificate::PublicKey { key, .. } => {
-                let bytes = key.to_bytes().map_err(|e| russh::Error::from(e))?;
+                let bytes = key.to_bytes().map_err(russh::Error::from)?;
                 base64ct::Base64::encode_string(&bytes)
             }
             PublicKeyOrCertificate::Certificate(cert) => {
-                let bytes = cert.to_bytes().map_err(|e| russh::Error::from(e))?;
+                let bytes = cert.to_bytes().map_err(russh::Error::from)?;
                 base64ct::Base64::encode_string(&bytes)
             }
         };
 
         let host_key = known_host_key(&self.host, self.port);
+        let presented_fp = fingerprint_of_blob(&presented_b64).unwrap_or_default();
 
         match self.db.get_known_host(&host_key) {
             Ok(Some(known)) => {
-                // Known host: accept only if the presented key matches what we stored.
-                let accepted = known.host_key == presented_b64;
-                if !accepted {
-                    // Mismatch is hard-failed; leave an audit trail so a
-                    // silent MITM attempt is visible after the fact.
+                if known.host_key != presented_b64 {
+                    // Mismatch is hard-failed - for a confirmed pin AND for
+                    // an imported one (a key that differs from any stored
+                    // anchor is an attack signal, never an upgrade). Leave
+                    // an audit trail so a silent MITM attempt is visible
+                    // after the fact.
                     let _ = self.db.add_audit(
                         "known_hosts.mismatch_rejected",
                         None,
@@ -194,33 +200,83 @@ impl client::Handler for TerminalHandler {
                             hostkey_fingerprint_display(&known.host_key)
                         ),
                     );
+                    return Ok(false);
+                }
+                if known.source == "connection" {
+                    return Ok(true);
+                }
+                // Exact match against an IMPORTED pin (backup restore, never
+                // used against a live connection): not silently trusted. The
+                // user confirms the fingerprint once in the native dialog;
+                // the pin is then upgraded to 'connection'. If the confirm
+                // fails (row gone, already upgraded) refuse rather than
+                // trust something unrecorded.
+                let accepted = ask_host_trust_native(
+                    &self.app,
+                    &self.host,
+                    self.port,
+                    &format!("SHA256:{presented_fp}"),
+                    true,
+                );
+                if accepted {
+                    match self
+                        .db
+                        .confirm_imported_known_host(&host_key, &presented_b64)
+                    {
+                        Ok(true) => {
+                            let _ = self.db.add_audit(
+                                "known_hosts.imported_confirmed",
+                                None,
+                                &format!("{} (SHA256:{})", &host_key, presented_fp),
+                            );
+                        }
+                        _ => {
+                            let _ = self.db.add_audit(
+                                "known_hosts.imported_confirm_failed",
+                                None,
+                                &format!("{} (SHA256:{})", &host_key, presented_fp),
+                            );
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    let _ = self.db.add_audit(
+                        "known_hosts.imported_refused",
+                        None,
+                        &format!("{} (SHA256:{})", &host_key, presented_fp),
+                    );
                 }
                 Ok(accepted)
             }
             Ok(None) => {
-                if !self.allow_tofu {
-                    // Strict mode: no consent to trust a new host was given.
+                // First sight: the trust decision is the native dialog below,
+                // with the fingerprint shown before it. Without the user's
+                // click the key is refused and nothing is stored.
+                if !ask_host_trust_native(
+                    &self.app,
+                    &self.host,
+                    self.port,
+                    &format!("SHA256:{presented_fp}"),
+                    false,
+                ) {
                     // Refuse without storing anything, but record the attempt.
                     let _ = self.db.add_audit(
                         "known_hosts.unknown_refused",
                         None,
-                        &format!(
-                            "{} (presented SHA256:{})",
-                            &host_key,
-                            fingerprint_of_blob(&presented_b64).unwrap_or_default()
-                        ),
+                        &format!("{} (presented SHA256:{})", &host_key, presented_fp),
                     );
                     return Ok(false);
                 }
                 // First sight WITH user consent: store and record what was
                 // trusted, and let the connect path surface a notice in the
                 // terminal.
-                let fp = fingerprint_of_blob(&presented_b64).unwrap_or_default();
-                let _ = self.db.add_known_host(&host_key, &presented_b64, &fp);
+                let _ = self
+                    .db
+                    .add_known_host(&host_key, &presented_b64, &presented_fp);
                 let _ = self.db.add_audit(
                     "known_hosts.trust_on_first_use",
                     None,
-                    &format!("{} (SHA256:{})", &host_key, fp),
+                    &format!("{} (SHA256:{})", &host_key, presented_fp),
                 );
                 Ok(true)
             }
@@ -229,7 +285,56 @@ impl client::Handler for TerminalHandler {
     }
 }
 
-/// Base64(SHA-256(wire-format blob)) — the "SHA256:<this>" part of a
+/// Native host-key trust prompt, raised from the backend at the moment the
+/// key arrives - with the fingerprint displayed BEFORE the decision (the
+/// property that makes TOFU honest). Returns true only when the user
+/// accepted in the OS dialog; the webview cannot forge that click.
+fn ask_host_trust_native(
+    app: &AppHandle,
+    host: &str,
+    port: u16,
+    fingerprint_display: &str,
+    imported: bool,
+) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let shown_host = sanitize_terminal_text(host);
+    let message = if imported {
+        format!(
+            "A host key for {shown_host}:{port} came from a vault backup, \
+             but this is its first real connection.\n\n\
+             Presented fingerprint:\n{fingerprint_display}\n\n\
+             Trust this key and connect?"
+        )
+    } else {
+        format!(
+            "The authenticity of host {shown_host}:{port} can't be established.\n\n\
+             Presented fingerprint:\n{fingerprint_display}\n\n\
+             Trust this host key and connect? \
+             Compare the fingerprint out-of-band if you can."
+        )
+    };
+    app.dialog()
+        .message(message)
+        .title("SSHSpan - Host key verification")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Trust && connect".to_string(),
+            "Refuse".to_string(),
+        ))
+        .blocking_show()
+}
+
+/// Strip control characters (C0, DEL, C1) from app-composed text that is
+/// written into the terminal stream. App-composed strings interpolate
+/// server-derived substrings (hostnames, usernames, server names); without
+/// stripping, those become an ANSI injection channel where the APP is the
+/// origin of escape sequences it never intended. Untrusted terminal output
+/// itself is rendered by xterm.js by design and is not handled here.
+pub(crate) fn sanitize_terminal_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Base64(SHA-256(wire-format blob)) - the "SHA256:<this>" part of a
 /// `ssh-keygen -lf` fingerprint, without the label.
 pub fn fingerprint_of_blob(blob_b64: &str) -> Option<String> {
     use sha2::Digest;
@@ -239,7 +344,7 @@ pub fn fingerprint_of_blob(blob_b64: &str) -> Option<String> {
     )))
 }
 
-/// `ssh-keygen`-style display form: "SHA256:…".
+/// `ssh-keygen`-style display form: "SHA256:...".
 pub fn hostkey_fingerprint_display(blob_b64: &str) -> String {
     fingerprint_of_blob(blob_b64)
         .map(|f| format!("SHA256:{f}"))
@@ -249,7 +354,7 @@ pub fn hostkey_fingerprint_display(blob_b64: &str) -> String {
 /// Decide whether a first-trust notice should be shown for a connection:
 /// the host had no known_hosts entry before connecting, so TOFU stored a new
 /// key during the handshake. `pre_connect_known_host` is the lookup made
-/// BEFORE `client::connect` (the race between the two is benign — the notice
+/// BEFORE `client::connect` (the race between the two is benign - the notice
 /// is informational, and the authoritative record is the
 /// `known_hosts.trust_on_first_use` audit entry).
 pub fn first_trust_notice(
@@ -261,7 +366,8 @@ pub fn first_trust_notice(
         return None;
     }
     Some(format!(
-        "\r\n\x1b[1;33mTrusted new host key for {host} ({fingerprint_display}) — manage in Known Hosts.\x1b[0m\r\n"
+        "\r\n\x1b[1;33mTrusted new host key for {} ({fingerprint_display}) - manage in Known Hosts.\x1b[0m\r\n",
+        sanitize_terminal_text(host)
     ))
 }
 
@@ -284,7 +390,7 @@ fn base_client_config() -> client::Config {
     client::Config {
         // None disables the inactivity timer so an interactive shell can sit
         // idle indefinitely while the user thinks. Some(Duration::from_secs(0))
-        // would mean "fire after 0 seconds" — russh would tear down the
+        // would mean "fire after 0 seconds" - russh would tear down the
         // session the moment the channel went quiet between commands.
         inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -316,7 +422,7 @@ pub async fn authenticate(
             // RSA keys: pin the signature hash to SHA-256 (rsa-sha2-256)
             // instead of letting the algorithm negotiation fall back to the
             // legacy ssh-rsa (SHA-1) signature format. Non-RSA keys have a
-            // single fixed hash — pass None.
+            // single fixed hash - pass None.
             let hash_alg = match key_pair.algorithm() {
                 russh::keys::Algorithm::Rsa { .. } => Some(russh::keys::HashAlg::Sha256),
                 _ => None,
@@ -366,9 +472,9 @@ pub async fn authenticate(
                         // The saved password is answered for ONE round of
                         // prompts only. A hostile server can otherwise issue
                         // unlimited extra InfoRequests ("Enter OTP:", "Enter
-                        // pet name:", …) and harvest the saved password from
+                        // pet name:", ...) and harvest the saved password from
                         // every reply. A legitimate server re-prompts only
-                        // after a Failure — which is rejected above.
+                        // after a Failure - which is rejected above.
                         if attempts > 1 {
                             return Err(anyhow::anyhow!(
                                 "The server requested additional interactive authentication \
@@ -414,19 +520,19 @@ pub struct ResolvedConnection {
 /// remote output to `on_data` until the channel closes or `disconnect` is called.
 /// Returns the new session id.
 pub async fn start_interactive(
+    app: AppHandle,
     params: ResolvedConnection,
     db: Database,
     registry: Arc<SessionRegistry>,
     on_data: Channel<String>,
-    allow_tofu: bool,
 ) -> anyhow::Result<String> {
     let target_host = params.server.host.clone();
     let target_port = params.server.port;
     let known_host_lookup = known_host_key(&target_host, target_port);
 
     // Pre-check made BEFORE connecting: if the host has no known_hosts entry,
-    // the handler below will only store a new key when `allow_tofu` consent
-    // was given (see TerminalHandler). The lookup result drives the
+    // the handler will raise the native first-trust dialog during the
+    // handshake (see TerminalHandler). The lookup result drives the
     // informational first-trust notice; the small race with the handler's own
     // lookup is benign (a notice is advisory, the audit entry is
     // authoritative).
@@ -437,7 +543,7 @@ pub async fn start_interactive(
         host: target_host.clone(),
         port: target_port,
         db: db.clone(),
-        allow_tofu,
+        app,
     };
 
     let t0 = std::time::Instant::now();
@@ -464,7 +570,7 @@ pub async fn start_interactive(
 
     // Terminal dimensions start at 80x24; the renderer sends the real size right
     // after it learns the session id. The terminal_modes list must include
-    // at least Pty::ECHO — many sshd implementations REJECT a PTY request with
+    // at least Pty::ECHO - many sshd implementations REJECT a PTY request with
     // no modes at all (silent PTY rejection = no input echo, no prompt).
     let mut channel = session.channel_open_session().await?;
     channel
@@ -499,7 +605,7 @@ pub async fn start_interactive(
         .await
         .map_err(|e| anyhow::anyhow!("Shell request failed: {e}"))?;
     eprintln!(
-        "[sshspan-terminal] pty+shell in {}ms — streaming",
+        "[sshspan-terminal] pty+shell in {}ms - streaming",
         t0.elapsed().as_millis()
     );
 
@@ -524,16 +630,21 @@ pub async fn start_interactive(
     let server_name = params.server.name.clone();
     let reg_session_id = session_id.clone();
     let registry2 = registry.clone();
+    // App-composed text interpolates server-derived values (host, username,
+    // server name) - strip control characters so the app never becomes the
+    // origin of an escape sequence a server smuggled into its own identity.
     let banner = format!(
-        "\r\n\x1b[1;32mConnected to {target_host}:{target_port} as {} ({server_name})\x1b[0m\r\n",
-        params.username
+        "\r\n\x1b[1;32mConnected to {}:{target_port} as {} ({})\x1b[0m\r\n",
+        sanitize_terminal_text(&target_host),
+        sanitize_terminal_text(&params.username),
+        sanitize_terminal_text(&server_name)
     );
     if let Err(e) = on_data.send(banner) {
         eprintln!("[sshspan-terminal] channel send failed right after connect: {e}");
     }
 
     // First-time trust: the TOFU handler stored a new host key during this
-    // handshake — tell the user what fingerprint they now trust.
+    // handshake - tell the user what fingerprint they now trust.
     if let Some(notice) = db
         .get_known_host(&known_host_lookup)
         .ok()
@@ -563,7 +674,7 @@ pub async fn start_interactive(
                         Some(ChannelMsg::Data { data }) => {
                             let text = String::from_utf8_lossy(&data);
                             if let Err(e) = on_data.send(text.to_string()) {
-                                // Renderer channel died — tear the session down,
+                                // Renderer channel died - tear the session down,
                                 // but leave a stderr trail so it is diagnosable.
                                 eprintln!("[sshspan-terminal] data send failed, closing session {reg_session_id}: {e}");
                                 break;
@@ -680,6 +791,7 @@ mod tests {
             host_key: "AAAAblob".into(),
             fingerprint_sha256: "abc123".into(),
             first_seen: chrono::Utc::now(),
+            source: "connection".into(),
         }
     }
 

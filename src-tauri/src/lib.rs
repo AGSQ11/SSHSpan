@@ -42,17 +42,12 @@ impl AppState {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_sql::Builder::default().build())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
         }))
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let state = AppState::new(app.handle())?;
@@ -64,6 +59,8 @@ pub fn run() {
             app.manage(commands::DialogPathStore::new());
             // Master-password guess backoff (unlock / change-password)
             app.manage(commands::UnlockThrottle::new());
+            // Renderer liveness signal for the backend idle auto-lock
+            app.manage(commands::ActivityTracker::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -81,6 +78,10 @@ pub fn run() {
             if restored > 0 {
                 log::info!("[sshspan-sftp] restored {restored} unfinished transfer(s) as paused");
             }
+
+            // Backend-enforced idle auto-lock: covers the case where the
+            // renderer cannot lock the vault itself (hung/crashed webview).
+            commands::spawn_auto_lock_watchdog(app.handle().clone());
 
             create_tray(app.handle())?;
 
@@ -138,8 +139,9 @@ pub fn run() {
             terminal_list,
             server_test,
             known_hosts_list,
-            known_hosts_check,
             known_hosts_forget,
+            // Renderer liveness heartbeat (backend idle auto-lock input)
+            heartbeat,
             sftp_open,
             sftp_list_dir,
             sftp_resolve_link,

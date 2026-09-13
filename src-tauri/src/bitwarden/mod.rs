@@ -1,4 +1,4 @@
-//! Bitwarden client — 1:1 port of bitwardenClient.js
+//! Bitwarden client - 1:1 port of bitwardenClient.js
 //!
 //! Password-based auth via the standard Bitwarden API:
 //!   POST /identity/accounts/prelogin  → KDF parameters
@@ -148,7 +148,7 @@ impl BitwardenClient {
         // SSRF hardening: never follow redirects. resolve_safe_server_url()
         // validates the initial URL (scheme, no userinfo, DNS resolution,
         // no private/link-local/loopback targets), but reqwest's default
-        // policy silently follows up to 20 redirects — a malicious or
+        // policy silently follows up to 20 redirects - a malicious or
         // compromised vault server could 302 to http://169.254.169.254/
         // or http://127.0.0.1/ and the client would follow it, leaking the
         // Bearer token and request body to an internal target. The official
@@ -227,23 +227,21 @@ impl BitwardenClient {
         if !resp.status().is_success() {
             anyhow::bail!("Server prelogin failed (HTTP {}).", resp.status());
         }
-        // Read the body tolerantly and pick only the fields we need — PBKDF2
+        // Read the body tolerantly and pick only the fields we need - PBKDF2
         // accounts send kdfMemory/kdfParallelism as explicit null.
         let data: serde_json::Value = read_body_capped_json(resp).await?;
         let num = |k: &str| data.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        // Enforce Bitwarden's server-side KDF minimums. A malicious or
-        // misconfigured server cannot claim a low iteration count to speed
-        // up offline cracking. Argon2id floors: m >= 16 MiB, t >= 2, p >= 1.
-        let iterations = num("kdfIterations").max(crate::crypto::bitwarden::PBKDF2_MIN_ITERATIONS);
-        let memory = num("kdfMemory").max(crate::crypto::bitwarden::ARGON2_MIN_MEMORY_KIB);
-        let parallelism =
-            num("kdfParallelism").max(crate::crypto::bitwarden::ARGON2_MIN_PARALLELISM);
-        Ok(KdfParams {
-            kdf_type: num("kdf"),
-            iterations,
-            memory,
-            parallelism,
-        })
+        // Clamp the server-supplied KDF parameters at BOTH ends, selected by
+        // KDF type: floors stop a malicious server from weakening the
+        // derivation, ceilings stop it from turning a sync into an unbounded
+        // local CPU/RAM burn (the cost is paid during derivation, which no
+        // HTTP timeout covers).
+        crate::crypto::bitwarden::clamp_kdf_params(
+            num("kdf"),
+            num("kdfIterations"),
+            num("kdfMemory"),
+            num("kdfParallelism"),
+        )
     }
 
     async fn token_request(&mut self, body: &[(&str, &str)]) -> Result<()> {
@@ -258,7 +256,7 @@ impl BitwardenClient {
 
         reject_redirect(resp.status())?;
 
-        // Read the body tolerantly first — a failed login returns a JSON
+        // Read the body tolerantly first - a failed login returns a JSON
         // error page that must not crash decoding. Non-JSON bodies are fine.
         let status = resp.status();
         let text = read_body_capped_text(resp).await.unwrap_or_default();
@@ -440,7 +438,7 @@ impl BitwardenClient {
                     self.user_key = Some(zeroize::Zeroizing::new(uk));
                 }
                 other => {
-                    // Diagnostics must NOT include the key material itself —
+                    // Diagnostics must NOT include the key material itself -
                     // report only the length and a short non-reversible digest.
                     use sha2::{Digest, Sha256};
                     let digest = Sha256::digest(&user_key_bytes);
@@ -647,7 +645,7 @@ fn reject_redirect(status: reqwest::StatusCode) -> Result<()> {
     if status.is_redirection() {
         anyhow::bail!(
             "Vault server returned a redirect (HTTP {}), which is not allowed. \
-             Check the server URL — the vault server must serve the Bitwarden \
+             Check the server URL - the vault server must serve the Bitwarden \
              API directly without redirects.",
             status
         );
@@ -658,7 +656,7 @@ fn reject_redirect(status: reqwest::StatusCode) -> Result<()> {
 /// Read a response body into a byte buffer, enforcing [`MAX_RESPONSE_BYTES`].
 /// The cap is checked against `Content-Length` up front (fast rejection) and
 /// against the accumulated bytes during streaming, so an oversized body stops
-/// the read instead of exhausting memory — even when the server lies about
+/// the read instead of exhausting memory - even when the server lies about
 /// (or omits) `Content-Length`.
 async fn read_body_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
     if let Some(len) = resp.content_length() {
@@ -706,7 +704,7 @@ mod tests {
     use super::*;
 
     /// Build a synthetic reqwest Response with the given status, headers and
-    /// body — no network needed. reqwest 0.12 implements
+    /// body - no network needed. reqwest 0.12 implements
     /// `From<http::Response<T>> for Response`, so unit tests can exercise
     /// the hardening helpers directly.
     fn make_response(status: u16, headers: &[(&str, &str)], body: Vec<u8>) -> reqwest::Response {

@@ -23,37 +23,52 @@ use crate::AppState;
 use super::{CmdError, CmdResult};
 use directories::ProjectDirs;
 
-/// Reject non-absolute `local` paths and paths whose canonicalized parent
-/// would fall inside the app data directory or a system directory. The app
-/// data rule mirrors `system_write_text_file`; the system-dir rule reuses the
-/// same denylist, so a (hypothetically compromised) renderer cannot aim SFTP
-/// downloads at `C:\Windows`, `/etc`, or friends either.
+/// Guard every renderer-supplied local filesystem target against the app
+/// data directory and system directories. Runs for BOTH directions: a
+/// download must not write there, and an upload must not read the vault (or
+/// other app-private files) out to a server. The app data rule mirrors
+/// `validate_export_path`; the system-dir rule reuses the same denylist, so
+/// a (hypothetically compromised) renderer cannot aim SFTP transfers at
+/// `C:\Windows`, `/etc`, or friends either.
+///
+/// dunce::canonicalize (not std::fs::canonicalize): on Windows std returns a
+/// `\\?\`-prefixed path, and `Path::starts_with` compares prefix components
+/// exactly, so a verbatim path NEVER matched the plain `C:\Users\...`
+/// app-data dir - the guard fired only for paths that did not exist yet,
+/// i.e. it was inverted exactly where a write could succeed. dunce keeps
+/// existing paths in the plain form so both shapes compare. Both the target
+/// itself and its parent are probed: the parent may not exist yet (the queue
+/// path creates it later) and the target may already exist.
 fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
     let p = std::path::Path::new(path);
     if !p.is_absolute() {
         return Err("Local path must be absolute.".into());
     }
 
-    let parent = match p.parent() {
-        Some(parent) => parent,
-        None => return Err("Local path has no parent directory.".into()),
+    let check = |probe: &std::path::Path| -> CmdResult<()> {
+        let normalized = dunce::canonicalize(probe).unwrap_or_else(|_| probe.to_path_buf());
+        if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
+            let app_data_dir = app_data.data_dir();
+            let app_data_norm =
+                dunce::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
+            if super::path_starts_with(&normalized, &app_data_norm)
+                || super::path_starts_with(&normalized, app_data_dir)
+            {
+                return Err(
+                    "The application data directory is off-limits for SFTP transfers.".into(),
+                );
+            }
+        }
+        if super::is_system_path(&normalized) {
+            return Err("System directories are off-limits for SFTP transfers.".into());
+        }
+        Ok(())
     };
 
-    let normalized = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
-
-    if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
-        let app_data_dir = app_data.data_dir();
-        if normalized.starts_with(app_data_dir) {
-            return Err("Writing into the application data directory is not allowed.".into());
-        }
+    if let Some(parent) = p.parent() {
+        check(parent)?;
     }
-
-    if super::is_system_path(&normalized) {
-        return Err("Writing into a system directory is not allowed.".into());
-    }
-
+    check(p)?;
     Ok(())
 }
 
@@ -63,7 +78,7 @@ fn sftp_from_session(
 ) -> Result<Arc<russh_sftp::client::SftpSession>, CmdError> {
     app.state::<SftpRegistry>()
         .get(session_id)
-        .ok_or_else(|| CmdError("SFTP is not open for this session — switch to SFTP first.".into()))
+        .ok_or_else(|| CmdError("SFTP is not open for this session - switch to SFTP first.".into()))
 }
 
 /// Render a russh-sftp error as a clean, single-layer message.
@@ -71,7 +86,7 @@ fn sftp_from_session(
 /// russh-sftp's `Status` Display is "{status_code}: {error_message}", which
 /// for a bare SSH_FXP_FAILURE with no message becomes "Failure: " (or
 /// "Failure: Failure" when the server echoes the code name as the message).
-/// Re-wrapping that in "download failed: …" produced the user-facing
+/// Re-wrapping that in "download failed: ..." produced the user-facing
 /// "download failed: Failure: Failure" toast that hid the real cause.
 /// This helper surfaces the status code meaningfully instead.
 pub(crate) fn sftp_error_detail(e: russh_sftp::client::error::Error) -> String {
@@ -150,19 +165,19 @@ pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_js
 /// this shape so the renderer can reuse one table renderer for both).
 ///
 /// `is_link`, `permissions`, `uid` and `gid` all come for free off the same
-/// listing response (SFTP's SSH_FXP_READDIR — like OpenSSH's local
-/// `readdir(3)` — reports `lstat`-derived attributes for every entry, so a
+/// listing response (SFTP's SSH_FXP_READDIR - like OpenSSH's local
+/// `readdir(3)` - reports `lstat`-derived attributes for every entry, so a
 /// symlink's own type bit and the owning ids are already in hand). None of
 /// them costs an extra round trip; do not be tempted to "confirm" `is_link`
-/// with a follow-up stat inside a listing loop — see [`sftp_resolve_link`]
+/// with a follow-up stat inside a listing loop - see [`sftp_resolve_link`]
 /// for why that stays a separate, lazy, on-demand call instead.
 ///
 /// `permissions` is the raw POSIX mode (type bits included, same encoding as
-/// `st_mode`) — this file never formats `drwxr-xr-x` in Rust, the renderer
+/// `st_mode`) - this file never formats `drwxr-xr-x` in Rust, the renderer
 /// does. `user`/`group` symbolic names are deliberately absent: russh-sftp's
 /// wire format for SFTPv3 attributes carries only numeric uid/gid (the
 /// `FileAttributes.user`/`.group` fields exist on the struct but the crate's
-/// READDIR/STAT deserializer always leaves them `None` — there is no wire
+/// READDIR/STAT deserializer always leaves them `None` - there is no wire
 /// representation for them to come from), so exposing those fields here
 /// would just be two more always-`null` keys in every entry.
 #[derive(serde::Serialize)]
@@ -226,7 +241,7 @@ pub async fn sftp_list_dir(
 ///
 /// A dangling symlink is a normal, expected outcome of browsing a remote
 /// filesystem (not a bug in this app, not a transport failure) so it is
-/// reported as `{ok: true, broken: true}`, never as a command `Err` — the
+/// reported as `{ok: true, broken: true}`, never as a command `Err` - the
 /// renderer should render a "broken link" state, not an error toast.
 #[tauri::command]
 pub async fn sftp_resolve_link(
@@ -236,7 +251,7 @@ pub async fn sftp_resolve_link(
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
     // Best-effort display target: REALPATH resolution, not a local path
-    // component — never fed to `Path::join` or similar, only shown to the
+    // component - never fed to `Path::join` or similar, only shown to the
     // user. Attempted even for a link that turns out broken (many servers
     // can still resolve the textual target even when the final component
     // doesn't exist), but its absence never blocks the isDir/broken answer.
@@ -294,7 +309,7 @@ pub async fn sftp_remove(
 
 /// Depth-first recursive delete of a remote directory tree. Children are
 /// removed before their parent (rmdir requires an empty dir). Symlinks are
-/// unlinked, never followed — `symlink_metadata` classifies the link itself.
+/// unlinked, never followed - `symlink_metadata` classifies the link itself.
 fn remove_remote_tree<'a>(
     sftp: &'a russh_sftp::client::SftpSession,
     path: &'a str,
@@ -315,7 +330,7 @@ fn remove_remote_tree<'a>(
                 Ok(m) => m,
                 Err(e) => {
                     // A child that vanishes mid-walk (or is unreadable) should
-                    // not abort the whole delete — record and keep going.
+                    // not abort the whole delete - record and keep going.
                     if first_err.is_none() {
                         first_err = Some(format!("stat {child}: {e}"));
                     }
@@ -363,7 +378,7 @@ pub async fn sftp_rename(
     Ok(serde_json::json!({ "ok": true }))
 }
 
-/// Set a remote file's mtime (and atime) via SFTP setstat — the remote half
+/// Set a remote file's mtime (and atime) via SFTP setstat - the remote half
 /// of "preserve timestamps of transferred files". Exposed so the renderer can
 /// apply timestamps for non-queue flows; the queue applies it automatically
 /// on upload legs when `preserveTs` was passed to `sftp_queue_add`.
@@ -407,14 +422,14 @@ pub async fn sftp_download(
 /// Download `remote` into local path `local`, robust against SFTP servers
 /// that answer a read crossing EOF with SSH_FX_FAILURE instead of a short
 /// read (seen in the wild on some sftp-server bridges/gateways; reproduced
-/// against the dev-sshd fixture in EOF-FAILURE mode — the exact
+/// against the dev-sshd fixture in EOF-FAILURE mode - the exact
 /// "download failed: Failure: Failure" report).
 ///
 /// Two defenses:
 /// 1. Size-clamped reads: stat the file first and never request bytes past
 ///    EOF. `tokio::io::copy` always asks for a full 8 KiB buffer, so its
 ///    final read crosses EOF on any file whose size is not a multiple of
-///    8 KiB — fatal against such servers.
+///    8 KiB - fatal against such servers.
 /// 2. Tolerant close: if the server answers the CLOSE of a fully-copied
 ///    read handle with SSH_FX_FAILURE, the data has already landed locally,
 ///    so the transfer is treated as complete (logged, not failed).
@@ -655,7 +670,7 @@ pub async fn sftp_open_for_edit(
                     // edit session: the watcher only uploads-on-change, it
                     // never re-downloads, and deleting a path a third-party
                     // editor may hold open makes editors recreate an
-                    // empty/stale buffer on the next save — clobbering the
+                    // empty/stale buffer on the next save - clobbering the
                     // remote file. Cleanup happens on session close, vault
                     // lock/teardown (EditRegistry::stop*), explicit
                     // sftp_close_edit, or the 24h stale prune.
@@ -716,7 +731,7 @@ use crate::sftp::queue::{
 
 /// Resolve the resume mode for a queue-add call: explicit argument wins,
 /// otherwise the stored default (`setting.sftpResumeDefault`, itself
-/// defaulting to "ask" — the UI layer resolves Ask before enqueue).
+/// defaulting to "ask" - the UI layer resolves Ask before enqueue).
 fn resolve_resume_mode(app: &AppHandle, resume: Option<&str>) -> ResumeMode {
     let raw = match resume.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(s) => s.to_string(),
@@ -735,7 +750,7 @@ fn resolve_resume_mode(app: &AppHandle, resume: Option<&str>) -> ResumeMode {
 ///
 /// Symlink-aware and cycle-breaking: recursion only ever enters REAL
 /// directories. A symlinked directory is never followed (following one can
-/// loop — `ln -s .. up` — and recurse until the stack overflows); a symlinked
+/// loop - `ln -s .. up` - and recurse until the stack overflows); a symlinked
 /// FILE is uploaded by following the link exactly one level (File::open
 /// resolves it; there is no recursion, hence no cycle).
 fn expand_upload(
@@ -839,7 +854,7 @@ fn sanitized_len_utf16(s: &str) -> usize {
 /// - Drive-letter prefixes (`C:`, `C:\evil`, `c:relative`) → reject: on
 ///   Windows `join` with such a name discards the base directory entirely.
 /// - Absolute-path prefixes (`/etc`, `\\server\share`) → reject.
-/// - Windows reserved device names — CON, PRN, AUX, NUL, COM1-9, LPT1-9,
+/// - Windows reserved device names - CON, PRN, AUX, NUL, COM1-9, LPT1-9,
 ///   case-insensitive, with or without extension (`CON.exe`, `NUL.txt`) →
 ///   reject: creating them redirects to a device or fails unpredictably.
 /// - Empty / whitespace-only → reject.
@@ -908,7 +923,7 @@ fn sanitize_remote_name(name: &str) -> Option<String> {
 
 /// Join a sanitized remote name under `dir` and verify the result stays under
 /// the canonical destination `root`. Returns `None` (caller skips the entry)
-/// when the join would escape — the belt-and-braces check behind
+/// when the join would escape - the belt-and-braces check behind
 /// [`sanitize_remote_name`], so even a missed sanitization case cannot queue
 /// an out-of-root write.
 fn safe_join_under(root: &std::path::Path, dir: &std::path::Path, name: &str) -> Option<PathBuf> {
@@ -957,7 +972,7 @@ fn expand_download(
             .map_err(|e| format!("stat {remote}: {e}"))?;
         if !md.is_dir() {
             // Single file: its name comes from the user-picked remote path
-            // (not a ReadDir entry), but sanitize anyway — the path string
+            // (not a ReadDir entry), but sanitize anyway - the path string
             // still originates from the server's view of the filesystem.
             let raw = remote.rsplit('/').next().unwrap_or("file");
             let Some(local) = safe_join_under(&root, &local_dir, raw) else {
@@ -1036,7 +1051,7 @@ pub async fn sftp_queue_add(
     app: AppHandle,
     session_id: String,
     direction: String,             // "upload" | "download"
-    items: Vec<serde_json::Value>, // [{local, remote}] — remote for downloads may be a dir
+    items: Vec<serde_json::Value>, // [{local, remote}] - remote for downloads may be a dir
     dest_dir: Option<String>,      // local dir for downloads
     resume: Option<String>, // "overwrite" | "resume" | "ask" (default: setting.sftpResumeDefault)
     preserve_ts: Option<bool>, // preserve source mtime on upload legs
@@ -1050,7 +1065,7 @@ pub async fn sftp_queue_add(
     if !matches!(kind, JobKind::Upload | JobKind::Download) {
         return Err(CmdError("unsupported direction.".into()));
     }
-    // Ask/Overwrite/Resume — resolved once here, threaded into every
+    // Ask/Overwrite/Resume - resolved once here, threaded into every
     // expanded job.
     let resume = resolve_resume_mode(&app, resume.as_deref());
     let preserve_ts = preserve_ts.unwrap_or(false);
@@ -1077,6 +1092,11 @@ pub async fn sftp_queue_add(
                 if local.is_empty() || remote.is_empty() {
                     continue;
                 }
+                // Same gate the single-file sftp_upload applies: the local
+                // upload source must not be the app data dir (the vault) or a
+                // system directory. This is the boundary the queue path must
+                // not skip.
+                validate_sftp_local_path(local)?;
                 expand_upload(
                     PathBuf::from(local),
                     remote.to_string(),
@@ -1093,6 +1113,11 @@ pub async fn sftp_queue_add(
             let dest = dest_dir
                 .map(PathBuf::from)
                 .unwrap_or_else(crate::sftp::edit_temp_dir);
+            // Renderer-supplied destination: run the same app-data/system
+            // gate the single-file download uses, BEFORE any directory is
+            // created - dest_dir must not be able to aim the batch at the
+            // vault directory.
+            validate_sftp_local_path(&dest.to_string_lossy())?;
             let _ = tokio::fs::create_dir_all(&dest).await;
             // Anchor every queued local path at the canonical destination:
             // the walk below joins remote-supplied names onto this root and
@@ -1201,12 +1226,12 @@ pub fn sftp_queue_clear_finished(app: AppHandle) -> CmdResult<serde_json::Value>
 /// Server-to-server copy ("Send to <server>"): enqueue one ServerCopy job
 /// that downloads from the source session and uploads to the target session,
 /// each on its own FRESH SFTP channel (the interactive browse sessions are
-/// never used — some servers fail reads on the long-lived channel with
+/// never used - some servers fail reads on the long-lived channel with
 /// SSH_FX_FAILURE). The transfer queue panel shows progress; a temp staging
 /// file is created by the worker and always removed on completion.
 ///
 /// Directories are expanded recursively into per-file jobs (a directory
-/// cannot be read as a file — reading one fails at offset 0). Each child file
+/// cannot be read as a file - reading one fails at offset 0). Each child file
 /// keeps the folder structure under `<target_dir>/<dir-name>/...`. Directory
 /// names come from the source server's listing, so every remote path segment
 /// is passed through `sanitize_remote_name` before it is joined into the
@@ -1278,7 +1303,7 @@ pub async fn sftp_server_copy(
             scanned.clone(),
         );
         // Bounded so a stalled/pathological source surfaces an error instead of
-        // leaving "Sending…" frozen forever.
+        // leaving "Sending..." frozen forever.
         if tokio::time::timeout(std::time::Duration::from_secs(120), walk)
             .await
             .is_err()
@@ -1321,12 +1346,12 @@ pub async fn sftp_server_copy(
 /// Recursively expand a remote directory into per-file ServerCopy jobs,
 /// ENQUEUING them in batches as the walk proceeds so transfers start
 /// immediately and overlap the scan (a full scan-then-enqueue of a huge tree
-/// reads as a frozen "Sending…" on a slow link). Returns the count scanned.
+/// reads as a frozen "Sending..." on a slow link). Returns the count scanned.
 ///
 /// Child names come from the source server's directory listing
 /// (attacker-influenceable on a hostile source), so each segment is sanitized
 /// before joining into the target path. Entry type/size come from the
-/// listing's own attributes — no per-file round-trip stat.
+/// listing's own attributes - no per-file round-trip stat.
 ///
 /// Robustness guards (a naive walk freezes on real-world trees):
 /// - Symlinks are classified from the listing and skipped, never followed (a
@@ -1764,7 +1789,7 @@ pub async fn sftp_chmod(
 
 // ─── new empty file ────────────────────────────────────────────────────────
 
-/// Create an empty remote file (fails if it already exists is NOT enforced —
+/// Create an empty remote file (fails if it already exists is NOT enforced -
 /// opening with TRUNCATE on an existing path would wipe it, so we stat first).
 #[tauri::command]
 pub async fn sftp_touch(
@@ -1822,7 +1847,7 @@ pub async fn sftp_fs_info(
 // ─── on-demand directory size ─────────────────────────────────────────────
 
 /// Hard cap on entries scanned by [`sftp_dir_size`], shared with the
-/// wall-clock cap below — whichever is hit first stops the walk. Sized the
+/// wall-clock cap below - whichever is hit first stops the walk. Sized the
 /// same order of magnitude as [`expand_server_copy`]'s scan cap: an
 /// interactive "get size" click should give an answer (even if `truncated`)
 /// rather than hang the UI on a pathological tree.
@@ -1837,12 +1862,12 @@ fn dir_size_capped(scanned: u64, elapsed: std::time::Duration) -> bool {
 }
 
 /// Recursively total the size of a remote directory tree, on demand (the
-/// renderer calls this only when the user asks for a folder's size — it is
+/// renderer calls this only when the user asks for a folder's size - it is
 /// never part of [`sftp_list_dir`], which would otherwise pay for a walk on
 /// every navigation).
 ///
 /// Classification is read straight off each `read_dir` entry's own
-/// attributes rather than an extra per-entry stat round trip — SFTP's
+/// attributes rather than an extra per-entry stat round trip - SFTP's
 /// SSH_FXP_READDIR already reports `lstat`-derived attributes (see the
 /// [`SftpEntry`] doc comment), so this already satisfies "lstat only, never
 /// follow a symlinked directory" for free: a symlink is counted as a leaf by
@@ -1882,7 +1907,7 @@ pub async fn sftp_dir_size(
         let mut entries = match sftp.read_dir(&dir).await {
             Ok(e) => e,
             // Unreadable subdirectory (permission denied, vanished mid-walk,
-            // …): skip it, don't fail the whole size for one bad branch.
+            // ...): skip it, don't fail the whole size for one bad branch.
             Err(_) => continue,
         };
         while let Some(entry) = entries.next() {
@@ -1897,8 +1922,8 @@ pub async fn sftp_dir_size(
             scanned += 1;
             let md = entry.metadata();
             if md.is_symlink() {
-                // A symlink is a leaf for sizing purposes — its own dirent
-                // size — and is never traversed even when it points at a
+                // A symlink is a leaf for sizing purposes - its own dirent
+                // size - and is never traversed even when it points at a
                 // directory.
                 files += 1;
                 bytes += md.size.unwrap_or(0);
@@ -1929,8 +1954,8 @@ pub async fn sftp_dir_size(
 /// transfer queue's opt-in post-transfer verification (which hashes both the
 /// source and destination legs on their own channels).
 ///
-/// Reads are clamped to the file's stated size in 256 KiB chunks — the same
-/// clamp [`download_to`] uses — so the final read never crosses EOF (some
+/// Reads are clamped to the file's stated size in 256 KiB chunks - the same
+/// clamp [`download_to`] uses - so the final read never crosses EOF (some
 /// SFTP servers answer an over-read with SSH_FX_FAILURE instead of a short
 /// read, which would otherwise fail a hash on the very last chunk).
 /// `cancel`, when given, is polled between chunks so a cancelled queue job
@@ -2005,7 +2030,7 @@ pub async fn sftp_keepalive_start(
     app: AppHandle,
     session_id: String,
 ) -> CmdResult<serde_json::Value> {
-    // Registry already holds a live session — verify it exists.
+    // Registry already holds a live session - verify it exists.
     let sftp = sftp_from_session(&app, &session_id)?;
     let app_for_loop = app.clone();
     let sid = session_id.clone();
@@ -2047,6 +2072,57 @@ pub fn sftp_stage_path(name: String) -> CmdResult<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the Windows verbatim-prefix guard bypass: a download
+    /// target inside the app data dir - with an EXISTING parent directory -
+    /// canonicalized under std to a `\\?\` path that never matched the plain
+    /// app-data prefix, so the guard passed exactly where a write would
+    /// succeed (vault overwrite). Both the existing-parent and
+    /// not-yet-existing shapes must be rejected.
+    #[test]
+    fn sftp_local_path_rejects_app_data_targets() {
+        use directories::ProjectDirs;
+        let dir = ProjectDirs::from("org", "sshspan", "SSHSpan")
+            .expect("project dirs")
+            .data_dir()
+            .to_path_buf();
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Existing parent (the vault dir itself), non-existing file: this is
+        // the exact shape that used to slip through on Windows.
+        assert!(
+            validate_sftp_local_path(dir.join("sshspan.db").display().to_string().as_str())
+                .is_err()
+        );
+        // Nested non-existing subtree under the vault dir.
+        assert!(validate_sftp_local_path(
+            dir.join("new").join("f.txt").display().to_string().as_str()
+        )
+        .is_err());
+        // The dir itself as the destination root (queue download shape).
+        assert!(validate_sftp_local_path(dir.display().to_string().as_str()).is_err());
+        // An existing file inside the vault dir (covers dunce on existing
+        // targets).
+        let probe = dir.join("sshspan-guard-test.tmp");
+        std::fs::write(&probe, b"").expect("guard-test file");
+        let res = validate_sftp_local_path(probe.display().to_string().as_str());
+        let _ = std::fs::remove_file(&probe);
+        assert!(res.is_err());
+    }
+
+    /// System directories stay off-limits for paths that do not exist yet.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn sftp_local_path_rejects_nonexistent_system_paths() {
+        assert!(validate_sftp_local_path("/etc/sshspan-new/f.txt").is_err());
+        assert!(validate_sftp_local_path("/home/sshspan-ok/f.txt").is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sftp_local_path_rejects_nonexistent_system_paths() {
+        assert!(validate_sftp_local_path("C:\\Windows\\new\\f.txt").is_err());
+    }
 
     fn status_err(
         code: russh_sftp::protocol::StatusCode,
@@ -2193,7 +2269,7 @@ mod tests {
 
     #[test]
     fn sanitize_flattens_weird_but_safe_names() {
-        // Windows-invalid characters become underscores — the file lands
+        // Windows-invalid characters become underscores - the file lands
         // under the destination, just with a locally-legal name. (A colon
         // in position 2 would be a drive letter; "back:up" is not one.)
         assert_eq!(
@@ -2243,7 +2319,7 @@ mod tests {
 
     #[test]
     fn safe_join_under_skips_hostile_names_at_any_depth() {
-        // The hostile names the walk can meet in a ReadDir — at the root or
+        // The hostile names the walk can meet in a ReadDir - at the root or
         // deep inside recursion (the invariant only holds if every level
         // re-checks, since each level's `dir` is a fresh descendant).
         let root = std::env::temp_dir().join("sshspan-test-join-hostile");

@@ -17,15 +17,14 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 
 # ─── Tauri plugins ──────────────────────────────────────────────────────────
+# Only plugins with a live consumer are registered: dialog (native file pick
+# + backend host-key trust prompt), single-instance, clipboard-manager
+# (terminal paste fallback). The process/os/sql/notification/opener/updater
+# plugins were registered but never called from the renderer or Rust - dead
+# IPC surface - and were removed.
 tauri-plugin-dialog = "2"
-tauri-plugin-process = "2"
-tauri-plugin-os = "2"
-tauri-plugin-sql = { version = "2", features = ["sqlite"] }
-tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
-tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
-tauri-plugin-updater = "2"
 
 # ─── Crypto: password hashing / KDF ─────────────────────────────────────────
 argon2 = "0.5"                    # Argon2id (PPK v3, vault KDF)
@@ -109,6 +108,7 @@ thiserror = "1.0"
 generic-array = "0.14"
 # ─── Utilities ─────────────────────────────────────────────────────────────
 opener = "0.7"                    # Open URLs / reveal files in OS default app
+dunce = "1"                       # canonicalize() without the Windows verbatim-path prefix
 urlencoding = "2"                 # URL-encode cipher IDs for Bitwarden API
 russh-sftp = "2"                  # SFTP client subsystem over russh channels
 notify = "7"                       # file watching (SFTP open-with-editor sync-back)

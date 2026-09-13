@@ -5,6 +5,92 @@ All notable changes to SSHSpan are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Fixed a Windows path-guard bypass that allowed writing into (or reading
+  from) the application data directory.** `std::fs::canonicalize` returns
+  `\\?\`-prefixed paths on Windows, and `Path::starts_with` compares prefix
+  components exactly, so a canonicalized target NEVER matched the plain
+  `C:\Users\...\SSHSpan` app-data prefix - the guard fired only for paths that
+  did not exist yet and passed exactly the targets whose parent directory
+  existed (i.e. the cases where a write succeeds). A crafted SFTP download
+  could overwrite the vault database, and an upload could read it. All
+  local-target guards (`validate_sftp_local_path`, `validate_export_path`,
+  `is_system_path`) now normalize with `dunce::canonicalize` (no verbatim
+  prefix), compare case-insensitively (NTFS ignores case), and probe both
+  the target and its parent. Regression tests cover the existing-file and
+  lowercase-variant shapes.
+
+- **Queued SFTP transfers now apply the same path gate as single-file
+  transfers.** `sftp_queue_add` validated neither the renderer-supplied
+  `dest_dir` (downloads) nor the upload sources - the single-file
+  `sftp_download`/`sftp_upload` commands validated, the batch path skipped
+  the check. Both now run `validate_sftp_local_path` before any filesystem
+  work.
+
+- **Host-key trust is now decided by the backend, not the renderer.** The
+  `allow_tofu` boolean previously traveled over IPC: a compromised renderer
+  could mint consent for an unpinned host. The trust prompt is now a native
+  OS dialog raised inside the SSH handshake handler, showing the fingerprint
+  BEFORE the decision; the renderer has no consent flag to forge. The
+  `known_hosts_check` command was removed (dead surface).
+
+- **Host-key pins imported from backups are untrusted until re-confirmed.**
+  A crafted backup could previously plant pins for hosts the user never
+  contacted, silently matching a MITM on first connect. Restored pins for
+  previously-unknown hosts are now marked `imported` and require the user to
+  confirm the fingerprint once on first use (then upgraded to a confirmed
+  pin); a differing key for any stored anchor still hard-fails. The restore
+  result reports `knownHostsImported`, and the dead `knownHostsReplaced`
+  audit path was removed.
+
+- **Bitwarden KDF parameters are clamped at both ends, per algorithm.**
+  Server-supplied `kdfIterations`/`kdfMemory`/`kdfParallelism` previously
+  had floors only; a hostile vault server could request an absurd work
+  factor and burn CPU/RAM locally (the cost is paid during derivation,
+  which no HTTP timeout covers). PBKDF2 iterations are clamped to
+  [600k, 10M]; Argon2id to [2, 16] passes, [16 MiB, 1 GiB] memory,
+  [1, 16] lanes; unknown KDF types are refused instead of guessed. The same
+  clamps are re-applied at the crypto boundary.
+
+- **Backend-enforced idle auto-lock.** `autoLockMinutes` was previously
+  honored only by a renderer timer; a hung or crashed webview could leave
+  the vault unsealed indefinitely. The renderer now heartbeats
+  (`heartbeat` IPC) and a backend watchdog locks the vault - killing
+  sessions, SFTP edits, and keepalives - when no heartbeat arrives for the
+  configured interval.
+
+- **Private-key export on Windows fails closed on ACL restriction failure.**
+  The export previously warned and left the key with inherited (broad)
+  permissions; it now deletes the written file and returns an error.
+
+- **Updater fast-forward bound.** Release metadata is unsigned (only the
+  installer bytes are), so version *numbers* are attacker-malleable on the
+  network. `is_newer` now refuses implausibly large version jumps
+  (> 1 major or > 12 minors ahead), defeating freeze attacks that replay an
+  old signed asset under a huge version number. The `installer_ext`
+  helper also matches `.msi` by exact suffix now.
+
+- **Terminal hygiene.** The SFTP/terminal keepalive no longer writes a NUL
+  byte into the PTY data channel (interactive programs received it as
+  Ctrl-@); keepalives are SSH-protocol-level (russh, every 30 s) and the
+  per-second renderer ping was removed. App-composed terminal banners now
+  strip control characters from server-derived hostnames/usernames/server
+  names so the app can never originate an injected ANSI escape sequence.
+
+- **DialogPathStore grants expire.** A path approved in a save dialog is
+  writable via `system_write_text_file` for 15 minutes instead of for the
+  rest of the session.
+
+### Removed
+
+- Registered-but-unused Tauri plugins `sql`, `os`, `process`, `notification`,
+  `opener`, and `updater` (and their capability grants) - dead IPC surface.
+  The app uses the standalone `opener` crate for shell integration and its
+  own minisign updater.
+
 ## [1.7.2] - 2026-09-12
 
 ### Security
