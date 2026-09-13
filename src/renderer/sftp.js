@@ -605,7 +605,12 @@ function sftpUpdateStatusBar(tabId) {
     const sizeStr = unknown && size ? `${formatSftpSize(size)}+` : formatSftpSize(size);
     text = `${total} item${total === 1 ? '' : 's'} · ${sel.length} selected · ${sizeStr}`;
   } else {
+    // Multi-select has always worked (ctrl/cmd-click, shift-click for a range,
+    // Ctrl+A for all) but nothing on screen said so, and users reported it as
+    // missing outright. Spell it out while nothing is selected; the hint is
+    // replaced by the live count as soon as it is being used.
     text = `${total} item${total === 1 ? '' : 's'}`;
+    if (total) text += '  ·  Ctrl+click to select · Shift+click for a range · Ctrl+A for all';
   }
   if (tab.dualPane) {
     // _localEntries is the cached local-entry ARRAY (see sftpUiLocalLoad).

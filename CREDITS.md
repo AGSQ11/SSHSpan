@@ -34,4 +34,17 @@ Additional issues found in the September 2026 code audit, fixed in v1.7.2 (#41):
 
 Remaining items tracked under the `security` label.
 
+Usability and Linux packaging issues reported by **alice** (LowEndTalk), fixed in #57:
+
+- AppImage would not start under Wayland at all without `LD_PRELOAD`-ing the host `libwayland-client.so.0`
+- "Create Backup" froze the whole program, and the file picker never appeared (`GStreamer element appsink not found`)
+- The create-vault password field cleared itself every ten seconds, making the vault impossible to set up with a password of any length
+- Copying a public key reported "Clipboard unavailable" on a copy that had in fact worked
+- Bitwarden Server URL and Email rendered as unthemed white boxes
+- No way to rename a key after creation
+- No obvious way to list every key across all categories
+- SFTP multi-select appeared to be unsupported
+- Font too small on 1080p, with no interface-scale setting
+- Long category names overflowed the sidebar across the key list at small window sizes
+
 Rust + Tauri migration suggested by **Herdie** (LowEndTalk Discord Server).
