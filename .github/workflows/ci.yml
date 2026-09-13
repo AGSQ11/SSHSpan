@@ -1,0 +1,116 @@
+name: CI
+
+# Until now nothing ran until a `v*` tag: `cargo test`, `cargo fmt --check`
+# and clippy first executed at RELEASE time, so a change could merge with a
+# failing test suite and the breakage surfaced only when cutting a version.
+# This runs the same checks the release job enforces, on every pull request
+# and every push to main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A second push to the same PR cancels the first: no point spending runners on
+# a commit nobody will merge.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions pinned to full commit SHAs, same rule as the
+      # release workflow: a mutable tag that moves would run attacker code.
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          # Same pin as the release job, so "passes CI" and "builds a release"
+          # cannot diverge over a toolchain difference.
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux system dependencies (Tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev
+
+      - name: Formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      # Deny the CORRECTNESS group (lints for code that is outright wrong)
+      # rather than -D warnings. The tree carries ~40 pre-existing style lints
+      # - map_or simplifications, redundant closures - and gating on all of
+      # them would mean a CI that fails on its first run, which teaches people
+      # to ignore it. Correctness is clean today, so this gate bites only on a
+      # genuine regression. Style lints still print.
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D clippy::correctness
+
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  renderer:
+    name: Renderer (syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      # The renderer has no build step and no test runner, so a syntax error
+      # would otherwise reach a release. `node --check` is cheap and catches
+      # the class of mistake that leaves the whole UI unwired at boot.
+      - name: Syntax check
+        run: |
+          set -euo pipefail
+          for f in src/renderer/*.js; do
+            echo "checking $f"
+            node --check "$f"
+          done
+
+  ipc-arg-names:
+    name: IPC argument names
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      # Tauri v2 converts a command's snake_case parameters to camelCase, and
+      # an argument the renderer spells differently is SILENTLY DROPPED - an
+      # Option<T> parameter just becomes None. That is how the Bitwarden
+      # "apply remote changes?" approval came to be discarded while the UI
+      # still reported success. Nothing else catches it: it compiles, it runs,
+      # and it fails quietly.
+      - name: Cross-check renderer invoke() args against Rust signatures
+        run: node scripts/check-ipc-args.js

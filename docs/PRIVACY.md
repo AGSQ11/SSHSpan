@@ -38,8 +38,8 @@ Everything is stored on the local machine, in the user's profile:
 
 | Path | Contents | Protected by |
 | --- | --- | --- |
-| Windows `%APPDATA%\SSHSpan\sshspan.db` / Linux `~/.local/share/SSHSpan/sshspan.db` / macOS `~/Library/Application Support/SSHSpan/sshspan.db` | SQLite database: keys, saved servers, known-host pins, settings, audit log | User-profile ACLs; private-key column and saved server passwords encrypted with the master password |
-| `~/.ssh/sshspan_<key-name>` (+ `.pub`) | Deployed SSH private/public keys | 0600 permissions from creation (POSIX) / current-user-only ACL via `icacls` (Windows) |
+| Windows `%APPDATA%\SSHSpan\sshspan.db` / Linux `~/.local/share/sshspan/sshspan.db` / macOS `~/Library/Application Support/SSHSpan/sshspan.db` | SQLite database: keys, saved servers, known-host pins, settings, audit log | User-profile ACLs; private-key column and saved server passwords encrypted with the master password. The exact path for your install is shown in Settings, read from the backend rather than hard-coded |
+| `~/.ssh/sshspan_<key-name>` (+ `.pub`) | Deployed SSH private/public keys | Created at 0600 before any content is written (POSIX) / current-user-only ACL via `icacls` (Windows), and the write fails rather than leaving a readable key if that cannot be applied |
 | App config dir `ssh/config` (e.g. `%APPDATA%\SSHSpan\ssh\config`) | SSHSpan's managed SSH config (Host aliases for deployed keys) | User-profile ACLs |
 
 No data is stored in the cloud and no third party receives any of it, unless the user
@@ -67,7 +67,9 @@ user's own Bitwarden-compatible vault:
   disk and only usable while the vault is unlocked.
 - **What is never done.** No automatic deletion on either side, no sharing to
   organizations, no third-party endpoints, no analytics about sync usage. Remote
-  overwrites and new imports are confirmed with the user before they happen.
+  overwrites and new imports are confirmed with the user before they happen, and
+  that confirmation is verified end to end by a CI check on the IPC argument
+  names (an earlier mismatch made the approval a silent no-op).
 
 The feature is off unless configured, and every sync action is recorded in the local audit
 log.

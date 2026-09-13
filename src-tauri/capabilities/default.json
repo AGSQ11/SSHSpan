@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default permissions for SSHSpan",
+  "description": "Default permissions for SSHSpan. Capabilities gate what the WEBVIEW may call over IPC; they do not gate the Rust side. Every entry here is something the shipped renderer actually uses - the dialog grants were removed because every file picker in this app is opened from Rust (app.dialog()), which does not consult the ACL, so granting them only widened what an injected script could do.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -16,12 +16,6 @@
     "core:path:default",
     "core:menu:default",
 
-    "dialog:default",
-    "dialog:allow-open",
-    "dialog:allow-save",
-    "dialog:allow-message",
-
-    "clipboard-manager:default",
     "clipboard-manager:allow-write-text",
     "clipboard-manager:allow-read-text"
   ]

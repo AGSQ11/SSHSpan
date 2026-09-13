@@ -785,6 +785,14 @@ mod tests {
     }
 }
 
+/// NOT REGISTERED in `generate_handler!`, deliberately.
+///
+/// It returns every key's `private_key_encrypted` blob to the webview. The
+/// blobs are sealed with the master password, so this is not plaintext key
+/// material - but it hands a compromised renderer the entire keystore to
+/// attack offline, and nothing in the shipped UI ever called it. Registering
+/// it again needs a reason and a review; `vault_backup_create` is the
+/// supported export path and keeps the material in the backend.
 #[tauri::command]
 pub fn vault_export(app: AppHandle) -> CmdResult<serde_json::Value> {
     let _pw = vault_password(&app)?;
@@ -806,6 +814,10 @@ pub fn vault_export(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "keys": exported }))
 }
 
+/// NOT REGISTERED in `generate_handler!`, deliberately - the counterpart to
+/// `vault_export`, and likewise never called by the shipped UI. It writes
+/// caller-supplied key records straight into the vault; `vault_backup_restore`
+/// is the reviewed import path.
 #[tauri::command]
 pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<serde_json::Value> {
     let _pw = vault_password(&app)?;
@@ -2099,6 +2111,13 @@ pub fn ssh_config_read() -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "hosts": config.hosts }))
 }
 
+/// NOT REGISTERED in `generate_handler!`, deliberately.
+///
+/// `SshConfig::parse` round-trips unknown directives through `extra`, so this
+/// let a caller write ANY ssh_config directive - ProxyCommand, IdentityFile,
+/// StrictHostKeyChecking no - into the managed config, with no vault gate at
+/// all. The UI writes that file only through `key_deploy`, which validates
+/// what it interpolates.
 #[tauri::command]
 pub fn ssh_config_write(content: String) -> CmdResult<serde_json::Value> {
     let config = crate::config::SshConfig::parse(&content);
@@ -2376,6 +2395,32 @@ const SETTINGS_KEYS: &[&str] = &[
     "terminalKeepaliveSeconds",
     "confirmMultiLinePaste",
 ];
+
+/// The real on-disk locations, so the UI can state them instead of guessing.
+///
+/// The Settings pane and the deploy confirmation used to hard-code three
+/// paths, and all three were wrong: the database was named as
+/// `~/.sshspan/sshspan.db` (actually the platform data dir), deployed keys as
+/// `~/.sshspan/keys/<id>` (actually `~/.ssh/sshspan_<name>`), and the managed
+/// SSH config as `~/.ssh/config` (actually the app config dir). Users make
+/// security decisions on those strings - what StrictHostKeyChecking applies
+/// to, what to back up, what to wipe - so a wrong one is a real defect, not a
+/// typo. Deriving them here means they cannot drift again.
+#[tauri::command]
+pub fn system_paths(app: AppHandle) -> CmdResult<serde_json::Value> {
+    let db = app.state::<AppState>().db.db_path.display().to_string();
+    let ssh_config = crate::config::ssh_config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let deploy_dir = crate::config::get_ssh_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    Ok(serde_json::json!({
+        "database": db,
+        "sshConfig": ssh_config,
+        "deployDir": deploy_dir,
+    }))
+}
 
 #[tauri::command]
 pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {

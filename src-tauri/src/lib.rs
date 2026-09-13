@@ -98,8 +98,6 @@ pub fn run() {
             vault_lock,
             vault_change_password,
             vault_status,
-            vault_export,
-            vault_import,
             vault_backup_create,
             vault_backup_restore,
             // Key commands
@@ -125,7 +123,6 @@ pub fn run() {
             key_create_with_categories,
             // SSH Config commands
             ssh_config_read,
-            ssh_config_write,
             ssh_config_list_hosts,
             // Saved server CRUD
             server_list,
@@ -185,6 +182,7 @@ pub fn run() {
             bitwarden_sync,
             // Settings commands
             settings_get,
+            system_paths,
             settings_set,
             // Audit log commands
             audit_list,

@@ -136,8 +136,19 @@ jobs:
           if [ ${#appimages[@]} -eq 0 ]; then
             echo "::error::No AppImage produced — nothing to repack."; exit 1
           fi
+          # Pinned by tag AND verified by SHA-256, exactly as the minisign
+          # step below does. This previously fetched the mutable "continuous"
+          # tag with no verification, and then ran the result inside the
+          # release job - the same job that holds contents:write and, a few
+          # steps later, MINISIGN_SECRET_KEY. It was the one unpinned binary
+          # in the pipeline, and it rewrites the artifact being signed.
+          # To bump: change the tag, run sha256sum on the downloaded file.
+          APPIMAGETOOL_TAG='1.9.0'
+          APPIMAGETOOL_SHA256='46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1'
           curl -fsSL -o /tmp/appimagetool \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_TAG}/appimagetool-x86_64.AppImage"
+          echo "${APPIMAGETOOL_SHA256}  /tmp/appimagetool" | sha256sum -c - \
+            || { echo "::error::appimagetool SHA-256 mismatch - refusing to run it."; exit 1; }
           chmod +x /tmp/appimagetool
           for img in "${appimages[@]}"; do
             work="$(mktemp -d)"
