@@ -108,6 +108,7 @@ pub fn run() {
             key_export,
             key_export_to_file,
             key_delete,
+            key_rename,
             key_list,
             key_get,
             key_fingerprint,

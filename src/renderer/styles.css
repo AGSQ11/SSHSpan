@@ -250,8 +250,12 @@ img.logo {
 
 /* ---- form controls ------------------------------------------------------ */
 
+/* type=url and type=email were missing here, so the two Bitwarden fields
+   (Server URL, Email) fell back to the browser default and rendered as
+   white boxes in an otherwise dark UI. */
 input[type="text"], input[type="search"], input[type="password"],
-input[type="number"], select, textarea {
+input[type="number"], input[type="url"], input[type="email"],
+select, textarea {
   background: var(--bg-elev);
   border: 1px solid var(--line-strong);
   color: var(--text);
@@ -824,6 +828,13 @@ label:focus-within { color: var(--text); }
   #newKeyBtn::before { content: '+'; font-size: 17px; }
   .keys-layout { flex-direction: column; }
   .detail-pane, .key-list-col { flex: 1 1 auto; width: 100%; }
+  /* The sidebar drops to 66px here and every other label is hidden with it,
+     but the category tree was left rendering full-width rows — long category
+     names then spilled out of the sidebar across the key list. The Keys page
+     keeps its own "All categories" filter button, so the tree is redundant at
+     this width rather than lost. Note the window minimum is 880px, so this
+     breakpoint is always active at the smallest allowed size. */
+  .cat-panel { display: none !important; }
 }
 
 @media (max-width: 620px) {

@@ -1081,7 +1081,13 @@ pub fn vault_backup_restore(
 /// path is registered in the `DialogPathStore` so that `system_write_text_file`
 /// only ever writes where the user explicitly picked in a native dialog.
 #[tauri::command]
-pub fn system_pick_save_path(
+/// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
+/// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
+/// called from there — the window stops responding and never repaints, which
+/// is what "Create Backup freezes the whole program" was. An async command
+/// runs on the async runtime instead, where blocking for the user's answer is
+/// safe.
+pub async fn system_pick_save_path(
     app: AppHandle,
     title: Option<String>,
     default_name: Option<String>,
@@ -1597,7 +1603,13 @@ fn private_export_extension(format: &str) -> &'static str {
 /// (exports may legitimately target volumes that cannot store ACLs, unlike
 /// the deploy destination, where a restriction failure is fatal).
 #[tauri::command]
-pub fn key_export_to_file(
+/// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
+/// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
+/// called from there — the window stops responding and never repaints, which
+/// is what "Create Backup freezes the whole program" was. An async command
+/// runs on the async runtime instead, where blocking for the user's answer is
+/// safe.
+pub async fn key_export_to_file(
     app: AppHandle,
     id: String,
     format: String,
@@ -1713,6 +1725,39 @@ pub fn key_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
         .db
         .add_audit("keys.deleted", Some(&id), "")?;
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Rename a stored key. There was previously no way to change a key's name
+/// after creation at all.
+///
+/// SECURITY: the name is used verbatim as a `Host` alias when the SSH config
+/// is written, so it goes through the same `validate_key_name` gate as
+/// creation and import — a rename must not be a way to smuggle in whitespace
+/// or newlines and inject config directives. Nothing else about the key is
+/// touched; the private material is not decrypted or re-encrypted to rename.
+#[tauri::command]
+pub fn key_rename(app: AppHandle, id: String, name: String) -> CmdResult<serde_json::Value> {
+    let name = name.trim().to_string();
+    crate::crypto::keys::validate_key_name(&name).map_err(CmdError)?;
+
+    let state = app.state::<AppState>();
+    let mut key = state
+        .db
+        .get_key(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Key not found.".to_string())?;
+
+    if key.name == name {
+        return Ok(serde_json::json!({ "ok": true, "name": name }));
+    }
+    let previous = key.name.clone();
+    key.name = name.clone();
+    key.updated_at = chrono::Utc::now();
+    state.db.update_key(&key).map_err(|e| e.to_string())?;
+    state
+        .db
+        .add_audit("keys.renamed", Some(&id), &format!("{previous} -> {name}"))?;
+    Ok(serde_json::json!({ "ok": true, "name": name }))
 }
 
 #[tauri::command]
@@ -2344,6 +2389,7 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
         "sftpResumeDefault",
         "sftpMaxBps",
         "sftpVerifyTransfers",
+        "uiScale",
         "terminalScrollback",
         "terminalBackspace",
         "terminalHomeEnd",
@@ -2464,7 +2510,16 @@ pub fn system_open_url(url: String) -> CmdResult<serde_json::Value> {
 }
 
 #[tauri::command]
-pub fn system_select_file(app: AppHandle, title: Option<String>) -> CmdResult<serde_json::Value> {
+/// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
+/// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
+/// called from there — the window stops responding and never repaints, which
+/// is what "Create Backup freezes the whole program" was. An async command
+/// runs on the async runtime instead, where blocking for the user's answer is
+/// safe.
+pub async fn system_select_file(
+    app: AppHandle,
+    title: Option<String>,
+) -> CmdResult<serde_json::Value> {
     use tauri_plugin_dialog::DialogExt;
     let result = app
         .dialog()
