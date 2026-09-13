@@ -2352,7 +2352,10 @@ function wire() {
   });
   el('pickerSearch').addEventListener('keydown', (e) => {
     const rows = [...el('pickerTree').querySelectorAll('.picker-row[role="option"]')];
-    if (e.key === 'Escape') { e.preventDefault(); closeCategoryPicker(); return; }
+    // stopPropagation: the picker can sit on top of the host/key modal, and the
+    // document-level Escape handler would otherwise go on to close THAT modal
+    // too, throwing away a half-filled form behind the picker.
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeCategoryPicker(); return; }
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
       if (!rows.length) return;
@@ -2368,7 +2371,7 @@ function wire() {
     }
   });
   el('pickerTree').addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); closeCategoryPicker(); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeCategoryPicker(); }
   });
   el('pickerModal').addEventListener('click', (e) => {
     if (e.target === el('pickerModal')) closeCategoryPicker();
@@ -2393,7 +2396,12 @@ function wire() {
   // keyboard: Escape closes modals; Ctrl/Cmd shortcuts
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
-      if (!el('modalBackdrop').hidden) closeKeyModal();
+      // Topmost first. The picker opens OVER the key/host modal, and its own
+      // handlers only cover the search box and the tree — with focus on Save
+      // or Cancel the keystroke arrives here instead, and closing the modal
+      // underneath would discard the form the user is still filling in.
+      if (!el('pickerModal').hidden) closeCategoryPicker();
+      else if (!el('modalBackdrop').hidden) closeKeyModal();
       else if (!el('serverModal').hidden) closeServerModal();
       else if (el('app').classList.contains('term-max')) toggleTermMax();
       else if (!el('vaultModal').hidden && state.vaultMode === 'change') hideVaultModal();

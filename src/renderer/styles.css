@@ -666,6 +666,15 @@ label:focus-within { color: var(--text); }
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
+/* The category picker is a SECONDARY modal: it opens on top of the host and
+   key modals, which are .modal-backdrop too. Equal z-index means DOM order
+   decides what paints on top, and #serverModal is declared after #pickerModal,
+   so the picker rendered behind the host form — invisible and unclickable,
+   which made it impossible to assign a category while adding a server. Give it
+   its own layer above every other backdrop (and above .cat-menu at 60), but
+   below the toast layer at 99 so errors stay readable over it. */
+#pickerModal { z-index: 70; }
+
 .modal {
   width: 560px; max-width: calc(100vw - 40px);
   max-height: calc(100vh - 60px);
