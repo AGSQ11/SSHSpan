@@ -101,6 +101,14 @@ jobs:
       - name: Undefined project functions
         run: node scripts/check-renderer-globals.js
 
+      # xterm.js and its addons are committed, not installed, so nothing else
+      # records what they are - npm audit and Dependabot see nothing. This
+      # checks them against the versions and hashes in
+      # src/renderer/vendor/VENDOR.md, and fails on a vendored file that has
+      # no row, so a new one cannot arrive unrecorded.
+      - name: Vendored library provenance
+        run: node scripts/check-vendor.js
+
       # Static checks only find shapes we have already been burned by. They
       # cannot tell an empty key list from a broken one: reading .parent_id
       # off a category *id* is valid JavaScript that silently dropped every
@@ -115,6 +123,33 @@ jobs:
           npm install --no-save --no-audit --no-fund playwright@1.56.1
           npx playwright install --with-deps chromium
           npm run test:ui
+
+  cargo-audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # RUSTSEC-2023-0071 (Marvin attack) is ignored DELIBERATELY, and this is
+      # the reasoning so nobody has to re-derive it:
+      #
+      #   `rsa` appears twice in the tree - 0.9.10 under our own ssh-key 0.6.7,
+      #   and 0.10.0-rc.18 under russh's ssh-key 0.7.0-rc.11. Neither has a
+      #   patched release; upstream has none to offer. The advisory is a timing
+      #   sidechannel in PKCS#1 v1.5 *decryption*. SSH public-key auth uses
+      #   RSASSA-PKCS1-v1_5 *signing*, so the attack does not map onto how this
+      #   app uses the crate.
+      #
+      # Without the ignore this job is permanently red, which teaches people to
+      # ignore it - the same reasoning as scoping clippy to `correctness`. Every
+      # OTHER advisory, including a future one on rsa itself, still fails here.
+      # Revisit when rsa 0.10 ships a stable release.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit --file src-tauri/Cargo.lock --ignore RUSTSEC-2023-0071
 
   ipc-arg-names:
     name: IPC argument names

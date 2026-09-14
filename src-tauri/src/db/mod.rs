@@ -201,16 +201,46 @@ impl Database {
         let db_path = get_db_path(app)?;
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Owner-only on the DIRECTORY too, not just the file below.
+            // create_dir_all leaves 0755 under a normal umask, so anything
+            // the app drops beside the DB at default permissions is readable
+            // by every local account - including SQLite's transient
+            // `-journal`, which carries page images of sealed material while
+            // a write is in flight.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                {
+                    log::warn!(
+                        "[sshspan-db] could not restrict {} to 0700: {e}",
+                        parent.display()
+                    );
+                }
+            }
         }
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
         let pool = block(async { SqlitePool::connect(&db_url).await })?;
         // Owner-only permissions on the vault file (Unix). The DB holds the
         // Argon2id verifier and sealed key material; default umasks can leave
         // it world-readable depending on the system.
+        //
+        // Propagated, not swallowed: this used to be `let _ = ...`, so a
+        // failure left the vault at default permissions with no error and no
+        // log line - a security property applied best-effort and never
+        // verified is one you cannot claim.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "Could not restrict permissions on the vault database {}: {e}",
+                        db_path.display()
+                    )
+                },
+            )?;
         }
         let db = Self { pool, db_path };
         db.migrate()?;

@@ -61,6 +61,12 @@ impl VaultKey {
     }
 }
 
+/// AES-256-GCM nonce length, in bytes. `Nonce::from_slice` panics on any
+/// other length, so every decrypt path checks against this first.
+const NONCE_LEN: usize = 12;
+/// AES-256-GCM authentication tag length, in bytes.
+const TAG_LEN: usize = 16;
+
 /// Encrypted vault data structure
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedVault {
@@ -85,7 +91,7 @@ impl EncryptedVault {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // AES-GCM returns ciphertext || auth_tag combined
-        let (ciphertext, auth_tag) = ciphertext.split_at(ciphertext.len() - 16);
+        let (ciphertext, auth_tag) = ciphertext.split_at(ciphertext.len() - TAG_LEN);
 
         Ok(Self {
             version: 1,
@@ -102,6 +108,31 @@ impl EncryptedVault {
         let nonce = Base64::decode_vec(&self.nonce)?;
         let ciphertext = Base64::decode_vec(&self.ciphertext)?;
         let auth_tag = Base64::decode_vec(&self.auth_tag)?;
+
+        // Validate the fixed-size fields BEFORE handing them to the cipher.
+        // `Nonce::from_slice` PANICS on anything that is not exactly 12
+        // bytes, and this blob can come from a file: vault_backup_restore
+        // unseals whatever string a chosen backup carries, so a crafted (or
+        // merely corrupted) file crashed the command instead of reporting a
+        // bad backup. The Bitwarden parser next door validates every length
+        // of a far less trusted input; the app's own format validated none.
+        if nonce.len() != NONCE_LEN {
+            anyhow::bail!(
+                "Malformed vault blob: nonce is {} bytes, expected {NONCE_LEN}",
+                nonce.len()
+            );
+        }
+        if salt.is_empty() {
+            anyhow::bail!("Malformed vault blob: empty salt");
+        }
+        // GCM needs at least its tag; a shorter combined buffer would be
+        // rejected by the cipher anyway, but say so plainly.
+        if auth_tag.len() != TAG_LEN {
+            anyhow::bail!(
+                "Malformed vault blob: auth tag is {} bytes, expected {TAG_LEN}",
+                auth_tag.len()
+            );
+        }
 
         // Combine ciphertext and auth_tag for AES-GCM
         let mut combined = ciphertext;
@@ -142,4 +173,52 @@ pub fn unseal(password: &str, sealed: &str) -> anyhow::Result<Vec<u8>> {
     let enc: EncryptedVault =
         serde_json::from_str(sealed).map_err(|e| anyhow::anyhow!("Corrupted vault entry: {e}"))?;
     enc.decrypt(password)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A blob whose fixed-size fields are the wrong length must come back as
+    /// an error, not a panic. `vault_backup_restore` unseals whatever a
+    /// user-chosen backup file contains, so this is reachable from outside.
+    #[test]
+    fn malformed_blob_lengths_are_rejected_not_panicked_on() {
+        let blob = |nonce_len: usize, tag_len: usize, salt_len: usize| {
+            serde_json::json!({
+                "version": 1,
+                "salt": Base64::encode_string(&vec![0u8; salt_len]),
+                "nonce": Base64::encode_string(&vec![0u8; nonce_len]),
+                "ciphertext": Base64::encode_string(&[0u8; 8]),
+                "auth_tag": Base64::encode_string(&vec![0u8; tag_len]),
+            })
+            .to_string()
+        };
+        for (n, t, s, what) in [
+            (4, TAG_LEN, 32, "short nonce"),
+            (0, TAG_LEN, 32, "empty nonce"),
+            (32, TAG_LEN, 32, "long nonce"),
+            (NONCE_LEN, 4, 32, "short auth tag"),
+            (NONCE_LEN, TAG_LEN, 0, "empty salt"),
+        ] {
+            let err =
+                unseal("pw", &blob(n, t, s)).expect_err(&format!("{what} should be rejected"));
+            assert!(
+                err.to_string().contains("Malformed vault blob"),
+                "{what}: unexpected error {err}"
+            );
+        }
+    }
+
+    /// The happy path still round-trips, so the new checks are not rejecting
+    /// blobs this code writes itself.
+    #[test]
+    fn seal_unseal_round_trips() {
+        let sealed = seal("correct horse", b"-----BEGIN OPENSSH PRIVATE KEY-----").unwrap();
+        assert_eq!(
+            unseal("correct horse", &sealed).unwrap(),
+            b"-----BEGIN OPENSSH PRIVATE KEY-----"
+        );
+        assert!(unseal("wrong", &sealed).is_err());
+    }
 }

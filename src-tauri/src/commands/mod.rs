@@ -1170,6 +1170,16 @@ impl DialogPathStore {
 /// path must have been returned by `system_pick_save_path` in this session
 /// AND must pass the absolute/app-data/system checks - both gates, so the
 /// write target is always a human-approved dialog choice.
+///
+/// The write goes through `write_secret_file` (0600 at create time, replace
+/// rather than truncate, fail-closed Windows ACL). Its only caller exports
+/// the vault backup, which carries every private key and saved server
+/// password sealed under the master password plus plaintext structure -
+/// server names, hosts, usernames. `fs::write` used to leave that at
+/// `0666 & ~umask`, i.e. 0644 on a normal desktop and 0664 (group-WRITABLE)
+/// under umask 002, so any other local account could copy it and attack the
+/// Argon2id blob offline. The helper for exactly this already existed and
+/// this path simply was not using it.
 #[tauri::command]
 pub fn system_write_text_file(
     app: AppHandle,
@@ -1183,7 +1193,8 @@ pub fn system_write_text_file(
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::write(&path, contents).map_err(|e| e.to_string())?;
+    crate::ssh::write_secret_file(std::path::Path::new(&path), contents.as_bytes())
+        .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
 

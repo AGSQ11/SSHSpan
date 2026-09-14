@@ -163,6 +163,11 @@ impl BitwardenClient {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
             .dns_resolver(ssrf::guarded_resolver())
+            // Explicit rather than implied: Cargo.toml already removes the
+            // native-tls backend, and this makes a re-added `default-tls`
+            // feature a compile error here instead of a silent switch back
+            // to OpenSSL.
+            .use_rustls_tls()
             .build()?;
 
         Ok(Self {
@@ -621,6 +626,7 @@ pub async fn probe_server_version(base_url: &str) -> Option<String> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
         .dns_resolver(ssrf::guarded_resolver())
+        .use_rustls_tls()
         .build()
         .ok()?;
     let url = format!("{}/api/config", base_url);
