@@ -264,12 +264,132 @@ async function checkConnectPicker(browser, server) {
   await page.close();
 }
 
+// ─── SFTP local pane: selection, context menu, column toggle ───────────────
+
+async function checkSftpLocalPane(browser, server) {
+  console.log('sftp local pane');
+  const { page, errors } = await openPage(browser, server, {
+    vault_status: { hasVault: true, unlocked: true },
+    key_list: { keys: [KEY('k1', 'a-key', [])] },
+    category_list: { categories: [], allKeyCategories: {}, orphans: false, hostOrphans: false },
+    server_list: { servers: [] },
+    settings_get: {},
+    sftp_local_list: {
+      path: 'C:\\Users\\Andrei', home: 'C:\\Users\\Andrei',
+      entries: [
+        { name: '.anaconda', isDir: true, size: null, modifiedMs: 1756075901000 },
+        { name: '.bun', isDir: true, size: null, modifiedMs: 1777576926000 },
+        { name: 'notes.txt', isDir: false, size: 1234, modifiedMs: 1777576926000 },
+      ],
+    },
+    sftp_list_dir: { entries: [] },
+    sftp_bookmarks_list: { bookmarks: [] },
+    sftp_queue_list: { jobs: [] },
+  });
+
+  const built = await page.evaluate(async () => {
+    const tabId = 't1';
+    state.sessions.set(tabId, {
+      tabId, sessionId: 'sess', serverId: 'srv', serverName: 'host',
+      host: '10.0.0.1', port: 22, mode: 'sftp', sftpReady: true, sftpPath: '/', ended: false,
+    });
+    const panel = buildSftpPanel(tabId);
+    document.getElementById('sftpBody').appendChild(panel);
+    panel.style.display = 'flex';
+    document.getElementById('sftpBody').classList.add('visible');
+    toggleDualPane(tabId);                       // open the local pane
+    await new Promise(r => setTimeout(r, 300));
+    const tbody = document.getElementById('sftpLocalTbody-' + tabId);
+    return tbody ? tbody.querySelectorAll('tr.sftp-entry').length : 0;
+  });
+  check('the local pane lists its entries', built, 3);
+
+  // A right-click that nothing handles falls through to the webview's own
+  // Back/Reload/Save-as menu, which is what users saw here.
+  const ctx = await page.evaluate(async () => {
+    const rows = document.querySelectorAll('#sftpLocalTbody-t1 tr.sftp-entry');
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 300 });
+    rows[0].dispatchEvent(ev);
+    await new Promise(r => setTimeout(r, 60));
+    const menu = document.getElementById('keyConnectMenu');
+    return {
+      prevented: ev.defaultPrevented,
+      items: menu ? Array.from(menu.querySelectorAll('.ctx-item')).map(b => b.textContent.trim()) : [],
+      selected: document.querySelectorAll('#sftpLocalTbody-t1 tr.selected').length,
+    };
+  });
+  check('a right-click on a local row suppresses the webview menu', ctx.prevented, true);
+  check('it opens the app menu for a folder', ctx.items, ['Open', 'Upload folder', 'Copy path', 'Refresh']);
+  check('and retargets the selection to the row under the pointer', ctx.selected, 1);
+
+  const empty = await page.evaluate(async () => {
+    closeKeyConnectMenu();
+    const wrap = document.querySelector('#sftpLocalPane-t1 .sftp-tablewrap');
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 700 });
+    wrap.dispatchEvent(ev);
+    await new Promise(r => setTimeout(r, 60));
+    const menu = document.getElementById('keyConnectMenu');
+    return {
+      prevented: ev.defaultPrevented,
+      items: menu ? Array.from(menu.querySelectorAll('.ctx-item')).map(b => b.textContent.trim()) : [],
+    };
+  });
+  check('the empty space below the rows is covered too', empty.prevented, true);
+  check('with a directory-level menu', empty.items,
+    ['Parent directory', 'Copy current path', 'Set as default local directory', 'Refresh']);
+
+  const sel = await page.evaluate(async () => {
+    closeKeyConnectMenu();
+    const rows = document.querySelectorAll('#sftpLocalTbody-t1 tr.sftp-entry');
+    rows[0].click();
+    const after1 = document.querySelectorAll('#sftpLocalTbody-t1 tr.selected').length;
+    rows[2].dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    const afterShift = document.querySelectorAll('#sftpLocalTbody-t1 tr.selected').length;
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 300 });
+    rows[2].dispatchEvent(ev);
+    await new Promise(r => setTimeout(r, 60));
+    const menu = document.getElementById('keyConnectMenu');
+    return {
+      after1, afterShift,
+      items: menu ? Array.from(menu.querySelectorAll('.ctx-item')).map(b => b.textContent.trim()) : [],
+      status: (document.getElementById('sftpStatusLeft-t1') || {}).textContent || '',
+    };
+  });
+  check('a plain click selects one row', sel.after1, 1);
+  check('shift-click extends the range', sel.afterShift, 3);
+  check('the menu acts on the whole selection', sel.items,
+    ['Upload 3 items', 'Copy 3 paths', 'Refresh']);
+  check('the status bar counts the local selection', /local: 3 items, 3 selected/.test(sel.status), true);
+
+  // The Columns button flips .show-owner-cols on the panel; nothing read it.
+  const cols = await page.evaluate(async () => {
+    closeKeyConnectMenu();
+    const panel = document.getElementById('sftpPanel-t1');
+    const btn = Array.from(panel.querySelectorAll('.sftp-toolbar .ghost-btn'))
+      .find(b => b.textContent.trim() === 'Columns');
+    const cell = panel.querySelector('.col-extra');
+    const before = getComputedStyle(cell).display;
+    btn.click();
+    await new Promise(r => setTimeout(r, 40));
+    const off = getComputedStyle(cell).display;
+    btn.click();
+    await new Promise(r => setTimeout(r, 40));
+    return { before, off, on: getComputedStyle(cell).display };
+  });
+  check('permissions/owner columns start visible', cols.before, 'table-cell');
+  check('the Columns button actually hides them', cols.off, 'none');
+  check('and brings them back', cols.on, 'table-cell');
+  check('no page errors', errors, []);
+  await page.close();
+}
+
 (async () => {
   const server = await serve();
   const browser = await chromium.launch();
   try {
     await checkKeyListGrouping(browser, server);
     await checkConnectPicker(browser, server);
+    await checkSftpLocalPane(browser, server);
   } finally {
     await browser.close();
     server.close();

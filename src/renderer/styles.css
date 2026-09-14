@@ -1575,6 +1575,14 @@ label:focus-within { color: var(--text); }
   cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel);
 }
 .sftp-table th.sorted { color: var(--accent); }
+
+/* Permissions/Owner columns, toggled by the toolbar's Columns button. The
+   button flips .show-owner-cols on the panel and has done since it was
+   written, but nothing ever read the class, so pressing it only restyled the
+   button itself. Both panes tag those cells .col-extra, so one pair of rules
+   covers the remote listing and the local one. */
+.sftp-panel .col-extra { display: none; }
+.sftp-panel.show-owner-cols .col-extra { display: table-cell; }
 .sftp-table th.sorted::after { content: ' ↑'; }
 .sftp-table th.sorted.desc::after { content: ' ↓'; }
 .sftp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); }

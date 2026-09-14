@@ -70,6 +70,8 @@ function sftpTabState(tab) {
   // (they widen the table noticeably, so narrow windows may prefer them off -
   // the table wrapper also scrolls horizontally regardless, see styles.css).
   if (tab.showOwnerCols === undefined) tab.showOwnerCols = state.settings?.sftpShowOwnerCols !== '0';
+  // Local-pane selection, mirroring sftpSelected on the remote side.
+  if (!tab.localSelected) tab.localSelected = new Set();
   return tab;
 }
 
@@ -393,17 +395,20 @@ function buildSftpPanel(tabId) {
   localWrap.appendChild(localTable);
   localPane.appendChild(localHead);
   localPane.appendChild(localWrap);
-  // Local pane has no sort/selection UI (never did). Its two per-row
-  // listeners (dblclick to descend/upload, dragstart to drag onto the remote
-  // pane) are attached in sftpUiLocalLoad as each row is built, which is
-  // where they have always lived.
+  // Selection and the right-click menu are delegated on the wrapper, so a
+  // refresh does not have to re-attach them. The per-row listeners that
+  // predate this (dblclick to descend/upload, dragstart to drag onto the
+  // remote pane) still live in sftpUiLocalLoad, where they have always been.
   //
-  // There was a call to sftpWireLocalTbodyDelegation(tabId) here, left behind
-  // by the delegated-rows refactor: the remote pane moved to a single
-  // delegated tbody listener, the local pane was meant to follow, and the
-  // function was never written. It threw a ReferenceError right here, in
-  // buildSftpPanel, so the ENTIRE SFTP panel failed to build and the view
-  // rendered blank - not just the local pane.
+  // The call that used to stand here was left behind by the delegated-rows
+  // refactor - the remote pane moved to a delegated tbody listener, the local
+  // pane was meant to follow, and the function was never written, so it threw
+  // a ReferenceError in buildSftpPanel and the whole SFTP view rendered
+  // blank. Removing the call unblocked the view but left the local pane with
+  // no selection and no context menu at all, so a right-click there fell
+  // through to the webview's own Back/Reload/Save-as menu. This is the
+  // function it was always calling for.
+  sftpWireLocalTbodyDelegation(tabId, localWrap);
 
   // ── splitter (drag to resize) ──
   const splitter = document.createElement('div');
@@ -623,7 +628,13 @@ function sftpUpdateStatusBar(tabId) {
   if (tab.dualPane) {
     // _localEntries is the cached local-entry ARRAY (see sftpUiLocalLoad).
     const localTotal = (tab._localEntries || []).length;
-    if (localTotal) text += ` · local: ${localTotal} item${localTotal === 1 ? '' : 's'}`;
+    if (localTotal) {
+      text += ` · local: ${localTotal} item${localTotal === 1 ? '' : 's'}`;
+      // Without this the only "N selected" on the line is the remote pane's,
+      // which reads as though a local selection had not registered.
+      const localSel = tab.localSelected ? tab.localSelected.size : 0;
+      if (localSel) text += `, ${localSel} selected`;
+    }
   }
   el.textContent = text;
 }
@@ -1851,7 +1862,7 @@ function toggleDualPane(tabId) {
 /// Core local-pane refresh: lists, renders rows, updates path + status bar.
 /// Throws on failure (callers decide whether to toast/revert).
 async function sftpUiLocalLoad(tabId) {
-  const tab = sftpTab(tabId);
+  const tab = sftpTabState(sftpTab(tabId));
   if (!tab) return;
   const tbody = document.getElementById('sftpLocalTbody-' + tabId);
   const pathEl = document.getElementById('sftpLocalPath-' + tabId);
@@ -1905,6 +1916,11 @@ async function sftpUiLocalLoad(tabId) {
     });
     tbody.appendChild(tr);
   }
+  // Carry the selection across the re-render, dropping whatever is no longer
+  // on disk so a stale name cannot be uploaded from the menu.
+  const present = new Set((r.entries || []).map(e => e.name));
+  for (const n of [...tab.localSelected]) if (!present.has(n)) tab.localSelected.delete(n);
+  sftpRefreshLocalSelectionClasses(tabId);
   sftpUpdateStatusBar(tabId);
   // Re-run directory comparison with the fresh local entries (no-op when the
   // pane is closed or comparison is off).
@@ -1912,6 +1928,153 @@ async function sftpUiLocalLoad(tabId) {
 }
 
 /// Public local-pane refresh: swallows errors with a toast (existing callers).
+/// Paint the local pane's selection classes, the way
+/// sftpRefreshSelectionClasses does for the remote one.
+function sftpRefreshLocalSelectionClasses(tabId) {
+  const tab = sftpTab(tabId);
+  const tbody = document.getElementById('sftpLocalTbody-' + tabId);
+  if (!tab || !tbody || !tab.localSelected) return;
+  for (const row of tbody.querySelectorAll('tr.sftp-entry')) {
+    toggleRowSelected(row, tab.localSelected.has(row.dataset.name));
+  }
+}
+
+/// Local-pane row interaction: click to select, right-click for the menu.
+/// Delegated on the table wrapper rather than the tbody so that a right-click
+/// in the empty space below the last row is caught too - otherwise that one
+/// spot still raised the webview's own menu.
+function sftpWireLocalTbodyDelegation(tabId, wrap) {
+  const host = wrap || document.getElementById('sftpLocalTbody-' + tabId);
+  if (!host || host._sftpLocalWired) return;
+  host._sftpLocalWired = true;
+
+  const rowNames = () => Array.from(
+    document.querySelectorAll('#sftpLocalTbody-' + tabId + ' tr.sftp-entry')
+  ).map(r => r.dataset.name);
+
+  host.addEventListener('click', (ev) => {
+    const tab = sftpTabState(sftpTab(tabId));
+    if (!tab) return;
+    const tr = ev.target.closest('tr.sftp-entry');
+    if (!tr) {
+      // Click on empty space clears, as the remote pane does.
+      tab.localSelected.clear();
+      sftpRefreshLocalSelectionClasses(tabId);
+      sftpUpdateStatusBar(tabId);
+      return;
+    }
+    const name = tr.dataset.name;
+    if (ev.ctrlKey || ev.metaKey) {
+      if (tab.localSelected.has(name)) tab.localSelected.delete(name);
+      else tab.localSelected.add(name);
+      tab._localLastClicked = name;
+    } else if (ev.shiftKey && tab._localLastClicked) {
+      const names = rowNames();
+      const i0 = names.indexOf(tab._localLastClicked), i1 = names.indexOf(name);
+      if (i0 >= 0 && i1 >= 0) {
+        for (let i = Math.min(i0, i1); i <= Math.max(i0, i1); i++) tab.localSelected.add(names[i]);
+      }
+    } else {
+      tab.localSelected.clear();
+      tab.localSelected.add(name);
+      tab._localLastClicked = name;
+    }
+    sftpRefreshLocalSelectionClasses(tabId);
+    sftpUpdateStatusBar(tabId);
+  });
+
+  host.addEventListener('contextmenu', (ev) => {
+    const tab = sftpTabState(sftpTab(tabId));
+    if (!tab) return;
+    ev.preventDefault(); // suppress the webview menu for the whole listing
+    const tr = ev.target.closest('tr.sftp-entry');
+    if (!tr) { openSftpLocalMenu(ev.clientX, ev.clientY, tabId, null); return; }
+    const entry = (tab._localEntries || []).find(e => e.name === tr.dataset.name);
+    if (!entry) { openSftpLocalMenu(ev.clientX, ev.clientY, tabId, null); return; }
+    // Right-clicking outside the current selection retargets it, so the menu
+    // always acts on what the pointer is over - same rule as the remote pane.
+    if (!tab.localSelected.has(entry.name)) {
+      tab.localSelected.clear();
+      tab.localSelected.add(entry.name);
+      tab._localLastClicked = entry.name;
+      sftpRefreshLocalSelectionClasses(tabId);
+      sftpUpdateStatusBar(tabId);
+    }
+    openSftpLocalMenu(ev.clientX, ev.clientY, tabId, entry);
+  });
+}
+
+/// Right-click menu for the local pane (selection-aware). Deliberately
+/// shorter than the remote one: the backend exposes only sftp_local_list on
+/// this side - there is no local rename, delete or mkdir command to call - and
+/// a menu entry that cannot work is worse than one that is absent. Passing a
+/// null entry builds the empty-space menu.
+function openSftpLocalMenu(x, y, tabId, entry) {
+  closeKeyConnectMenu();
+  const tab = sftpTabState(sftpTab(tabId));
+  if (!tab) return;
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.id = 'keyConnectMenu';
+  const mk = (label, icon, fn) => {
+    const b = document.createElement('button');
+    b.className = 'ctx-item';
+    b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
+    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
+    menu.appendChild(b);
+  };
+  const sep = () => {
+    const d = document.createElement('div');
+    d.className = 'ctx-sep';
+    menu.appendChild(d);
+  };
+
+  if (entry) {
+    const names = tab.localSelected.size ? [...tab.localSelected] : [entry.name];
+    const multi = names.length > 1;
+    if (!multi && entry.isDir) {
+      mk('Open', 'folder-open', () => {
+        if (typeof sftpSyncLocalNav === 'function' && sftpSyncLocalNav(tabId, entry.name)) return;
+        tab.localPath = joinLocal(tab.localPath, entry.name);
+        refreshLocalPane(tabId);
+      });
+    }
+    // sftp_upload walks a directory itself (upload_directory), so this is the
+    // same entry for files and folders rather than two that differ only in
+    // wording.
+    mk(multi ? `Upload ${names.length} items` : (entry.isDir ? 'Upload folder' : 'Upload'), 'upload-cloud', () => {
+      if (tab.mode !== 'sftp' || !tab.sessionId) { toast('Not connected.', 'err'); return; }
+      queueUploads(tabId, names.map(n => ({
+        local: joinLocal(tab.localPath, n),
+        remote: sftpJoin(tab.sftpPath, n),
+      })));
+    });
+    sep();
+    mk(multi ? `Copy ${names.length} paths` : 'Copy path', 'copy', () => {
+      const text = names.map(n => joinLocal(tab.localPath, n)).join('\n');
+      copyText(text).then(ok => toast(ok ? 'Path copied.' : 'Clipboard unavailable.', ok ? 'ok' : 'err'));
+    });
+  } else {
+    mk('Parent directory', 'arrow-up', () => localNavigateUp(tabId));
+    mk('Copy current path', 'copy', () => {
+      if (!tab.localPath) { toast('Local pane has no path yet.', 'info'); return; }
+      copyText(tab.localPath).then(ok => toast(ok ? 'Path copied.' : 'Clipboard unavailable.', ok ? 'ok' : 'err'));
+    });
+    mk('Set as default local directory', 'star', () => sftpSetLocalDirDefault(tabId));
+    sep();
+  }
+  mk('Refresh', 'refresh-cw', () => refreshLocalPane(tabId));
+
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  document.body.appendChild(menu);
+  const onAway = (ev) => {
+    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
+    closeKeyConnectMenu();
+  };
+  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+}
+
 async function refreshLocalPane(tabId) {
   try {
     await sftpUiLocalLoad(tabId);
