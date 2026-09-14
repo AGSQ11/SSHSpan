@@ -274,8 +274,10 @@ async function checkSftpLocalPane(browser, server) {
     category_list: { categories: [], allKeyCategories: {}, orphans: false, hostOrphans: false },
     server_list: { servers: [] },
     settings_get: {},
+    // Stub reply for the fake sftp_local_list IPC - a Windows-shaped path so
+    // the separator handling gets exercised, with no real user in it.
     sftp_local_list: {
-      path: 'C:\\Users\\Andrei', home: 'C:\\Users\\Andrei',
+      path: 'C:\\Users\\example', home: 'C:\\Users\\example',
       entries: [
         { name: '.anaconda', isDir: true, size: null, modifiedMs: 1756075901000 },
         { name: '.bun', isDir: true, size: null, modifiedMs: 1777576926000 },
