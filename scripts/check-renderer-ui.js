@@ -385,6 +385,110 @@ async function checkSftpLocalPane(browser, server) {
   await page.close();
 }
 
+// ─── transfer queue: grouped by server, then by remote directory ───────────
+
+async function checkQueueGrouping(browser, server) {
+  console.log('transfer queue grouping');
+  const { page, errors } = await openPage(browser, server, {
+    vault_status: { hasVault: true, unlocked: true },
+    key_list: { keys: [KEY('k1', 'a-key', [])] },
+    category_list: { categories: [], allKeyCategories: {}, orphans: false, hostOrphans: false },
+    server_list: { servers: [] },
+    settings_get: {},
+    sftp_queue_list: { jobs: [] },
+  });
+
+  // Oldest first, the order queueJobs itself holds.
+  const JOB = (id, server, remotePath, state, extra) => Object.assign({
+    id, kind: 'upload', serverName: server, remotePath,
+    localPath: '/tmp/' + id, size: 1000, bytesDone: 0, state,
+  }, extra || {});
+  const jobs = [
+    JOB('1', 'us-slc', '/root/dump.sql', 'done', { kind: 'download', bytesDone: 1000 }),
+    JOB('2', 'eu-da-mx', '/var/www/html/index.php', 'queued'),
+    JOB('3', 'eu-da-mx', '/var/www/html/app.js', 'active', { bytesDone: 500 }),
+    JOB('4', 'eu-da-mx', '/var/www/html/css/site.css', 'queued'),
+    JOB('5', 'eu-da-mx', '/var/www/html/css/img/logo.png', 'queued'),
+    JOB('6', 'eu-da-mx', '/var/www/README.md', 'queued'),
+    JOB('7', 'eu-da-mx', '/top-level.txt', 'queued'),
+  ];
+
+  const draw = () => page.evaluate(() =>
+    Array.from(document.getElementById('sftpQueueList').children).map((el) => {
+      const depth = Number(getComputedStyle(el).getPropertyValue('--q-depth')) || 0;
+      if (el.classList.contains('sftp-queuegroup')) {
+        return { depth, kind: el.classList.contains('q-group-server') ? 'server' : 'dir',
+                 label: el.querySelector('.q-grouplabel').textContent,
+                 count: Number(el.querySelector('.q-groupcount').textContent),
+                 collapsed: el.classList.contains('collapsed') };
+      }
+      return { depth, kind: 'job', label: el.querySelector('.q-name').textContent.trim() };
+    }));
+
+  await page.evaluate((jobs) => {
+    queueJobs.clear();
+    for (const j of jobs) queueJobs.set(j.id, j);
+    const panel = buildQueuePanel();
+    document.getElementById('sftpBody').appendChild(panel);
+    panel.style.display = 'flex';
+    document.getElementById('sftpBody').classList.add('visible');
+    queueTab = 'queued';
+    renderQueuePanel();
+  }, jobs);
+
+  check('the queue nests server > folder > file', await draw(), [
+    { depth: 0, kind: 'server', label: 'eu-da-mx', count: 6, collapsed: false },
+    // A run of folders holding nothing but one subfolder collapses to one row.
+    { depth: 1, kind: 'dir', label: 'var/www', count: 5, collapsed: false },
+    { depth: 2, kind: 'dir', label: 'html', count: 4, collapsed: false },
+    { depth: 3, kind: 'dir', label: 'css', count: 2, collapsed: false },
+    { depth: 4, kind: 'dir', label: 'img', count: 1, collapsed: false },
+    { depth: 5, kind: 'job', label: 'logo.png' },
+    // Files sit beside the subfolders at their own level, not after all of them.
+    { depth: 4, kind: 'job', label: 'site.css' },
+    { depth: 3, kind: 'job', label: 'app.js' },
+    { depth: 3, kind: 'job', label: 'index.php' },
+    { depth: 2, kind: 'job', label: 'README.md' },
+    { depth: 1, kind: 'job', label: 'top-level.txt' },
+  ]);
+
+  // Only the filename indents; the progress columns stay in one line.
+  check('indentation does not move the progress column', await page.evaluate(() => {
+    const lefts = Array.from(document.querySelectorAll('#sftpQueueList .sftp-queueitem .q-prog'))
+      .map(c => Math.round(c.getBoundingClientRect().left));
+    return new Set(lefts).size;
+  }), 1);
+
+  const collapsed = await page.evaluate(async () => {
+    Array.from(document.querySelectorAll('.sftp-queuegroup'))
+      .find(r => r.querySelector('.q-grouplabel').textContent === 'css').click();
+    await new Promise(r => setTimeout(r, 40));
+    return Array.from(document.getElementById('sftpQueueList').children).length;
+  });
+  check('collapsing a folder hides its whole branch', collapsed, 8); // 11 - css's 3 rows
+
+  check('the collapse survives a progress redraw', await page.evaluate(async () => {
+    renderQueuePanel();
+    await new Promise(r => setTimeout(r, 40));
+    return Array.from(document.querySelectorAll('.sftp-queuegroup.collapsed'))
+      .map(r => r.querySelector('.q-grouplabel').textContent);
+  }), ['css']);
+
+  // The Done tab is a different job set; the same grouping has to apply.
+  check('the other tabs group too', await page.evaluate(async () => {
+    queueTab = 'done';
+    renderQueuePanel();
+    await new Promise(r => setTimeout(r, 40));
+    return Array.from(document.getElementById('sftpQueueList').children).map(el =>
+      el.classList.contains('sftp-queuegroup')
+        ? el.querySelector('.q-grouplabel').textContent
+        : el.querySelector('.q-name').textContent.trim());
+  }), ['us-slc', 'root', 'dump.sql']);
+
+  check('no page errors', errors, []);
+  await page.close();
+}
+
 (async () => {
   const server = await serve();
   const browser = await chromium.launch();
@@ -392,6 +496,7 @@ async function checkSftpLocalPane(browser, server) {
     await checkKeyListGrouping(browser, server);
     await checkConnectPicker(browser, server);
     await checkSftpLocalPane(browser, server);
+    await checkQueueGrouping(browser, server);
   } finally {
     await browser.close();
     server.close();

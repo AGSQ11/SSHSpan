@@ -2811,6 +2811,235 @@ async function sftpQueueResumeAllResumable() {
   if (skipped) toast(`Resumed ${resumable.length} - ${skipped} more need a reconnect first.`, 'info');
 }
 
+// ─── transfer queue: grouping ───────────────────────────────────────────────
+
+/// Group headers the user has collapsed, keyed by server + directory path.
+/// renderQueuePanel redraws the whole list once a second while anything is
+/// moving, so this cannot live in the DOM.
+const sftpQueueCollapsed = new Set();
+
+function sftpQueueGroupKey(server, dirPath) { return server + '\u0000' + dirPath; }
+
+/// Build server → directory → files out of a flat job list.
+///
+/// The remote path is what every kind of job has in common (an upload's
+/// destination, a download's source, a server-copy's source), and it is the
+/// path that belongs to the server the group is named after, so it is what
+/// the tree is built from.
+///
+/// `jobs` arrives oldest-first, so a job's index doubles as its recency.
+/// Servers are ordered most-recent-first, which keeps whatever is being
+/// transferred right now at the top; everything below sorts by name, because
+/// a tree whose rows reshuffle as bytes arrive cannot be read.
+function sftpQueueTree(jobs) {
+  const mkNode = (name) => ({ name, dirs: new Map(), jobs: [] });
+  const servers = new Map();
+  jobs.forEach((j, i) => {
+    const server = j.serverName || 'Unknown server';
+    if (!servers.has(server)) servers.set(server, { name: server, recency: -1, total: 0, root: mkNode('') });
+    const s = servers.get(server);
+    s.recency = Math.max(s.recency, i);
+    s.total++;
+    const segs = (j.remotePath || '').split('/').filter(Boolean);
+    segs.pop(); // the last segment is the file itself, not a directory
+    let node = s.root;
+    for (const seg of segs) {
+      if (!node.dirs.has(seg)) node.dirs.set(seg, mkNode(seg));
+      node = node.dirs.get(seg);
+    }
+    node.jobs.push(j);
+  });
+  return [...servers.values()].sort((a, b) => b.recency - a.recency);
+}
+
+/// A run of directories that each hold nothing but one subdirectory carries no
+/// information spread over several rows, so it collapses into one
+/// "var/www/html" row. Returns the deepest node reached and the joined name.
+function sftpQueueFlattenChain(node) {
+  let name = node.name;
+  let cur = node;
+  while (cur.jobs.length === 0 && cur.dirs.size === 1) {
+    const only = [...cur.dirs.values()][0];
+    name = name ? name + '/' + only.name : only.name;
+    cur = only;
+  }
+  return { node: cur, name };
+}
+
+function sftpQueueCountJobs(node) {
+  let n = node.jobs.length;
+  for (const child of node.dirs.values()) n += sftpQueueCountJobs(child);
+  return n;
+}
+
+/// One header row. Clicking it collapses or expands the branch beneath.
+function sftpQueueGroupEl(kind, label, key, depth, count) {
+  const row = document.createElement('button');
+  const collapsed = sftpQueueCollapsed.has(key);
+  row.className = 'sftp-queuegroup q-group-' + kind + (collapsed ? ' collapsed' : '');
+  row.style.setProperty('--q-depth', String(depth));
+  row.innerHTML = `<span class="q-twisty">${ico('chevron-right')}</span>`
+    + `<span class="q-groupicon">${ico(kind === 'server' ? 'server' : 'folder')}</span>`
+    + `<span class="q-grouplabel">${escapeHtml(label)}</span>`
+    + `<span class="q-groupcount">${count}</span>`;
+  row.addEventListener('click', () => {
+    if (sftpQueueCollapsed.has(key)) sftpQueueCollapsed.delete(key);
+    else sftpQueueCollapsed.add(key);
+    renderQueuePanel();
+  });
+  return row;
+}
+
+function sftpQueueRenderGroups(list, jobs) {
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  const renderNode = (server, node, dirPath, depth) => {
+    for (const child of [...node.dirs.values()].sort(byName)) {
+      const flat = sftpQueueFlattenChain(child);
+      const path = dirPath + '/' + flat.name;
+      const key = sftpQueueGroupKey(server, path);
+      list.appendChild(sftpQueueGroupEl('dir', flat.name, key, depth, sftpQueueCountJobs(flat.node)));
+      if (!sftpQueueCollapsed.has(key)) renderNode(server, flat.node, path, depth + 1);
+    }
+    // Files sit alongside the subfolders at their own level, not after all of
+    // them, which is what "maybe a file here" in a directory listing means.
+    for (const j of node.jobs.slice().sort((a, b) =>
+      sftpQueueJobName(a).localeCompare(sftpQueueJobName(b)))) {
+      list.appendChild(sftpQueueRowEl(j, depth));
+    }
+  };
+  for (const s of sftpQueueTree(jobs)) {
+    const key = sftpQueueGroupKey(s.name, '');
+    list.appendChild(sftpQueueGroupEl('server', s.name, key, 0, s.total));
+    if (!sftpQueueCollapsed.has(key)) renderNode(s.name, s.root, '', 1);
+  }
+}
+
+function sftpQueueJobName(j) {
+  return (j.remotePath || '').split('/').filter(Boolean).pop() || '?';
+}
+
+/// One transfer row, indented to `depth` so it lines up under its directory.
+function sftpQueueRowEl(j, depth) {
+  const row = document.createElement('div');
+  row.className = 'sftp-queueitem q-state-' + j.state;
+  const name = sftpQueueJobName(j);
+  const dirIcon = j.kind === 'upload'
+    ? `<span class="q-dirarrow up" title="Upload">${ico('file-up')}</span>`
+    : j.kind === 'serverCopy'
+      ? `<span class="q-dirarrow copy" title="Server to server">${ico('send')}</span>`
+      : `<span class="q-dirarrow down" title="Download">${ico('download')}</span>`;
+  // serverCopy: bytesDone is overall (download half + upload half), so the
+  // progress bar maps 0..2×size onto 0..100%.
+  const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
+  // Paused/queued jobs keep whatever bytesDone the backend last reported
+  // (the .part on disk is untouched by pausing), so this naturally holds
+  // the bar's position instead of zeroing it - nothing extra needed here.
+  const pct = totalUnits > 0
+    ? Math.min(100, (j.bytesDone / totalUnits) * 100)
+    : (j.state === 'done' ? 100 : 0);
+  const shownDone = j.kind === 'serverCopy'
+    ? Math.min(j.bytesDone || 0, j.size || 0)
+    : (j.bytesDone || 0);
+
+  const route = j.kind === 'serverCopy' && j.targetServerName
+    ? `${escapeHtml(j.serverName || '')} → ${escapeHtml(j.targetServerName)}`
+    : escapeHtml(j.serverName || '');
+  const progress = j.size
+    ? `${formatSftpSize(shownDone || 0)} / ${formatSftpSize(j.size)}`
+    : formatSftpSize(shownDone || 0);
+  const speed = j.speed ? (j.speed / 1024).toFixed(1) + ' KB/s' : '-';
+  const eta = sftpUiQueueEta(j, shownDone);
+  // Verify badge (Task 4): a small marker on jobs that ran (or will run)
+  // with post-transfer SHA-256 verification, so the extra traffic/time
+  // it costs isn't a silent surprise when watching the queue.
+  const verifyBadge = j.verify
+    ? `<span class="q-verify" title="Verifying with SHA-256 after transfer">${ico('shield-check')}</span>`
+    : '';
+  // Auto-retry countdown (Task 2): a backoff-queued job carries
+  // attempts > 0 and a future retryAt, plus a human error like
+  // "connection reset — retrying (2/3)". Pull just the "(2/3)" back out
+  // of that string rather than hardcoding the retry cap here, so the two
+  // stay in sync automatically; the full backend message is still the
+  // tooltip. A single shared ticker (see setInterval above) redraws this
+  // once a second - no per-row timer to leak.
+  const retrySecs = (j.state === 'queued' && j.retryAt)
+    ? Math.max(0, Math.ceil((j.retryAt - Date.now()) / 1000))
+    : null;
+  let errDisplay = j.error || '';
+  let errClass = '';
+  if (retrySecs !== null) {
+    const m = errDisplay.match(/\((\d+\/\d+)\)\s*$/);
+    errDisplay = `retrying in ${retrySecs}s${m ? ' (' + m[1] + ')' : ''}`;
+    errClass = ' retrying';
+  } else if (j.state === 'paused' && j.error) {
+    errClass = ' info'; // restored/paused note, not a failure - don't paint it red
+  }
+
+  row.innerHTML = `
+    <span class="q-cell q-dir">${dirIcon}</span>
+    <span class="q-cell q-name" title="${escapeHtml(name || '')}">${verifyBadge}${escapeHtml(name || '?')}</span>
+    <span class="q-cell q-route" title="${route}">${route}</span>
+    <span class="q-cell q-prog">
+      <span class="sftp-queuebar"><span class="sftp-queuefill${j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : j.state === 'paused' ? ' paused' : ''}" style="width:${pct}%"></span></span>
+      <span class="q-progtext">${progress}</span>
+    </span>
+    <span class="q-cell q-speed">${speed}</span>
+    <span class="q-cell q-eta">${eta}</span>
+    <span class="q-cell q-err${errClass}" title="${escapeHtml(j.error || '')}">${escapeHtml(errDisplay)}</span>`;
+
+  const actions = document.createElement('span');
+  actions.className = 'q-cell q-act sftp-queueactions';
+  if (j.state === 'active' || j.state === 'queued') {
+    const pause = document.createElement('button');
+    pause.className = 'icon-btn';
+    pause.title = 'Pause';
+    pause.innerHTML = Q_ICON_PAUSE;
+    pause.addEventListener('click', () => call('sftp_queue_pause', { jobId: j.id }));
+    actions.appendChild(pause);
+    const cancel = document.createElement('button');
+    cancel.className = 'icon-btn';
+    cancel.title = 'Cancel';
+    cancel.innerHTML = ico('x');
+    cancel.addEventListener('click', () => call('sftp_queue_cancel', { jobId: j.id }));
+    actions.appendChild(cancel);
+  } else if (j.state === 'paused') {
+    const resumable = sftpQueueJobResumable(j);
+    const resume = document.createElement('button');
+    resume.className = resumable ? 'icon-btn' : 'icon-btn disabled';
+    resume.innerHTML = Q_ICON_RESUME;
+    if (resumable) {
+      resume.title = 'Resume';
+      resume.addEventListener('click', () => call('sftp_queue_resume', { jobId: j.id }));
+    } else {
+      // Session from the previous run (or a since-closed tab) is gone -
+      // resume_job would just fail the job. Disabled, not wired.
+      resume.title = `Reconnect to "${j.serverName || 'the server'}" to resume`;
+      resume.disabled = true;
+    }
+    actions.appendChild(resume);
+    // Cancel is the way off a paused row that can never resume — a job
+    // restored from a previous run whose session is gone. cancel_job
+    // transitions Paused as well as Queued, so this is not a no-op.
+    const cancel = document.createElement('button');
+    cancel.className = 'icon-btn';
+    cancel.title = 'Cancel';
+    cancel.innerHTML = ico('x');
+    cancel.addEventListener('click', () => call('sftp_queue_cancel', { jobId: j.id }));
+    actions.appendChild(cancel);
+  }
+  if (j.state === 'failed' || j.state === 'cancelled') {
+    const retry = document.createElement('button');
+    retry.className = 'icon-btn';
+    retry.title = 'Retry';
+    retry.innerHTML = ico('refresh-cw');
+    retry.addEventListener('click', () => call('sftp_queue_retry', { jobId: j.id }));
+    actions.appendChild(retry);
+  }
+  row.appendChild(actions);
+  row.style.setProperty('--q-depth', String(depth));
+  return row;
+}
+
 function renderQueuePanel() {
   const list = document.getElementById('sftpQueueList');
   const summary = document.getElementById('sftpQueueSummary');
@@ -2853,127 +3082,9 @@ function renderQueuePanel() {
     : queueTab === 'failed' ? failed : done;
 
   list.innerHTML = '';
-  for (const j of shown.slice(-100).reverse()) {
-    const row = document.createElement('div');
-    row.className = 'sftp-queueitem q-state-' + j.state;
-    const name = j.kind === 'upload'
-      ? (j.remotePath || '').split('/').filter(Boolean).pop()
-      : (j.remotePath || '').split('/').filter(Boolean).pop();
-    const dirIcon = j.kind === 'upload'
-      ? `<span class="q-dirarrow up" title="Upload">${ico('file-up')}</span>`
-      : j.kind === 'serverCopy'
-        ? `<span class="q-dirarrow copy" title="Server to server">${ico('send')}</span>`
-        : `<span class="q-dirarrow down" title="Download">${ico('download')}</span>`;
-    // serverCopy: bytesDone is overall (download half + upload half), so the
-    // progress bar maps 0..2×size onto 0..100%.
-    const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
-    // Paused/queued jobs keep whatever bytesDone the backend last reported
-    // (the .part on disk is untouched by pausing), so this naturally holds
-    // the bar's position instead of zeroing it - nothing extra needed here.
-    const pct = totalUnits > 0
-      ? Math.min(100, (j.bytesDone / totalUnits) * 100)
-      : (j.state === 'done' ? 100 : 0);
-    const shownDone = j.kind === 'serverCopy'
-      ? Math.min(j.bytesDone || 0, j.size || 0)
-      : (j.bytesDone || 0);
-
-    const route = j.kind === 'serverCopy' && j.targetServerName
-      ? `${escapeHtml(j.serverName || '')} → ${escapeHtml(j.targetServerName)}`
-      : escapeHtml(j.serverName || '');
-    const progress = j.size
-      ? `${formatSftpSize(shownDone || 0)} / ${formatSftpSize(j.size)}`
-      : formatSftpSize(shownDone || 0);
-    const speed = j.speed ? (j.speed / 1024).toFixed(1) + ' KB/s' : '-';
-    const eta = sftpUiQueueEta(j, shownDone);
-    // Verify badge (Task 4): a small marker on jobs that ran (or will run)
-    // with post-transfer SHA-256 verification, so the extra traffic/time
-    // it costs isn't a silent surprise when watching the queue.
-    const verifyBadge = j.verify
-      ? `<span class="q-verify" title="Verifying with SHA-256 after transfer">${ico('shield-check')}</span>`
-      : '';
-    // Auto-retry countdown (Task 2): a backoff-queued job carries
-    // attempts > 0 and a future retryAt, plus a human error like
-    // "connection reset — retrying (2/3)". Pull just the "(2/3)" back out
-    // of that string rather than hardcoding the retry cap here, so the two
-    // stay in sync automatically; the full backend message is still the
-    // tooltip. A single shared ticker (see setInterval above) redraws this
-    // once a second - no per-row timer to leak.
-    const retrySecs = (j.state === 'queued' && j.retryAt)
-      ? Math.max(0, Math.ceil((j.retryAt - Date.now()) / 1000))
-      : null;
-    let errDisplay = j.error || '';
-    let errClass = '';
-    if (retrySecs !== null) {
-      const m = errDisplay.match(/\((\d+\/\d+)\)\s*$/);
-      errDisplay = `retrying in ${retrySecs}s${m ? ' (' + m[1] + ')' : ''}`;
-      errClass = ' retrying';
-    } else if (j.state === 'paused' && j.error) {
-      errClass = ' info'; // restored/paused note, not a failure - don't paint it red
-    }
-
-    row.innerHTML = `
-      <span class="q-cell q-dir">${dirIcon}</span>
-      <span class="q-cell q-name" title="${escapeHtml(name || '')}">${verifyBadge}${escapeHtml(name || '?')}</span>
-      <span class="q-cell q-route" title="${route}">${route}</span>
-      <span class="q-cell q-prog">
-        <span class="sftp-queuebar"><span class="sftp-queuefill${j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : j.state === 'paused' ? ' paused' : ''}" style="width:${pct}%"></span></span>
-        <span class="q-progtext">${progress}</span>
-      </span>
-      <span class="q-cell q-speed">${speed}</span>
-      <span class="q-cell q-eta">${eta}</span>
-      <span class="q-cell q-err${errClass}" title="${escapeHtml(j.error || '')}">${escapeHtml(errDisplay)}</span>`;
-
-    const actions = document.createElement('span');
-    actions.className = 'q-cell q-act sftp-queueactions';
-    if (j.state === 'active' || j.state === 'queued') {
-      const pause = document.createElement('button');
-      pause.className = 'icon-btn';
-      pause.title = 'Pause';
-      pause.innerHTML = Q_ICON_PAUSE;
-      pause.addEventListener('click', () => call('sftp_queue_pause', { jobId: j.id }));
-      actions.appendChild(pause);
-      const cancel = document.createElement('button');
-      cancel.className = 'icon-btn';
-      cancel.title = 'Cancel';
-      cancel.innerHTML = ico('x');
-      cancel.addEventListener('click', () => call('sftp_queue_cancel', { jobId: j.id }));
-      actions.appendChild(cancel);
-    } else if (j.state === 'paused') {
-      const resumable = sftpQueueJobResumable(j);
-      const resume = document.createElement('button');
-      resume.className = resumable ? 'icon-btn' : 'icon-btn disabled';
-      resume.innerHTML = Q_ICON_RESUME;
-      if (resumable) {
-        resume.title = 'Resume';
-        resume.addEventListener('click', () => call('sftp_queue_resume', { jobId: j.id }));
-      } else {
-        // Session from the previous run (or a since-closed tab) is gone -
-        // resume_job would just fail the job. Disabled, not wired.
-        resume.title = `Reconnect to "${j.serverName || 'the server'}" to resume`;
-        resume.disabled = true;
-      }
-      actions.appendChild(resume);
-      // Cancel is the way off a paused row that can never resume — a job
-      // restored from a previous run whose session is gone. cancel_job
-      // transitions Paused as well as Queued, so this is not a no-op.
-      const cancel = document.createElement('button');
-      cancel.className = 'icon-btn';
-      cancel.title = 'Cancel';
-      cancel.innerHTML = ico('x');
-      cancel.addEventListener('click', () => call('sftp_queue_cancel', { jobId: j.id }));
-      actions.appendChild(cancel);
-    }
-    if (j.state === 'failed' || j.state === 'cancelled') {
-      const retry = document.createElement('button');
-      retry.className = 'icon-btn';
-      retry.title = 'Retry';
-      retry.innerHTML = ico('refresh-cw');
-      retry.addEventListener('click', () => call('sftp_queue_retry', { jobId: j.id }));
-      actions.appendChild(retry);
-    }
-    row.appendChild(actions);
-    list.appendChild(row);
-  }
+  // Grouped rather than flat: server, then the remote directory tree the
+  // transfers land in. See sftpQueueTree for why the ordering is what it is.
+  sftpQueueRenderGroups(list, shown.slice(-100));
   // Ask backend for authoritative state on first render.
   if (!queueJobs.size) call('sftp_queue_list').catch(() => {});
 }
