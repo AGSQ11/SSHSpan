@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-14
+
+A UX pass over the whole renderer, plus the Send-to scan fix and the rustls
+advisory bump that landed after 1.7.3 was tagged.
+
 ### Changed
 
 - **Navigation is two objects plus Settings.** Keys and Servers are the
@@ -77,11 +82,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had an all-or-nothing effect through the `rows.length === 0` bail. Typing a
   term that matched one key still listed the whole vault.
 
+- **The Send-to folder scan no longer fails on a large, slow tree.** The
+  server-to-server scan wrapped its whole recursive walk in a flat 120s
+  timeout, so a big tree on a slow-but-advancing source blew the ceiling and
+  returned "Folder scan timed out" - while the transfers it had already
+  streamed into the queue kept running, making the error both fatal-looking
+  and wrong. The bound is now progress-aware: the scan continues as long as
+  new files keep being enqueued, and only a genuine stall (no progress for
+  60s) aborts it, with an error that says so. (#73)
+
 - **The deploy preview printed a literal `\n`.** `previewConfig` joined its
   lines on `'\\n'` - an escaped backslash - so the generated config rendered as
   one unreadable line. `deployConfig`, a few lines below, always used a real
   newline. The preview is also live now; it used to stay empty until you pressed
   a Preview button, making the first answer to "what will this write?" nothing.
+
+### Security
+
+- **rustls 0.23.43 -> 0.23.45 (RUSTSEC-2026-0285).** TLS 1.3 handshake messages
+  were incorrectly accepted across encryption-level boundaries (medium).
+  Upgraded to the patched release. (#73)
 
 ## [1.7.3] - 2026-09-14
 
