@@ -92,7 +92,29 @@ directories = "5"
 dirs = "5"
 
 # ─── HTTP client ────────────────────────────────────────────────────────────
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
+# TLS: rustls only. `features = [...]` alone does NOT disable reqwest's
+# defaults, and its default `default-tls` feature pulls in native-tls ->
+# openssl -> openssl-sys AND wins as the default connector, so every HTTPS
+# request (Bitwarden, updater) was going over system OpenSSL despite the
+# `rustls-tls` above. default-features = false is what actually removes it;
+# `cargo tree -i openssl` must stay empty.
+#
+# `rustls-tls-native-roots` rather than plain `rustls-tls` (= webpki roots):
+# it keeps the OS trust store, which is what a self-hosted Vaultwarden behind
+# a private CA depends on. Switching to bundled roots would have quietly
+# broken those users.
+#
+# `http2`, `charset` and `system-proxy` are re-listed because they were in
+# reqwest's default set and dropping them would change behaviour (HTTP/2 to
+# the GitHub API, non-UTF-8 response bodies, and HTTP(S)_PROXY support).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "blocking",
+    "rustls-tls-native-roots",
+    "http2",
+    "charset",
+    "system-proxy",
+] }
 url = "2"                          # URL parsing (SSRF guard, Bitwarden client)
 
 # ─── SQL ────────────────────────────────────────────────────────────────────

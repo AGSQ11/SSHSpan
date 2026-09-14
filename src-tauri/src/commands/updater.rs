@@ -318,6 +318,11 @@ pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
     let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Check")
         .timeout(std::time::Duration::from_secs(15))
+        // Explicit rather than implied: Cargo.toml already removes the
+        // native-tls backend, and this makes a re-added `default-tls`
+        // feature a compile error here instead of a silent switch back to
+        // OpenSSL for the update channel.
+        .use_rustls_tls()
         .build()
         .map_err(|e| CmdError(e.to_string()))?;
     let resp = client
@@ -495,6 +500,7 @@ pub async fn update_download_and_run(
         // against the same host allowlist; the default policy would happily
         // follow a 3xx to an arbitrary host after the initial URL passed.
         .redirect(reqwest::redirect::Policy::none())
+        .use_rustls_tls()
         .build()
         .map_err(|e| CmdError(e.to_string()))?;
 

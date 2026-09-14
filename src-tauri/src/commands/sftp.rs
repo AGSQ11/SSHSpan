@@ -470,7 +470,8 @@ pub async fn download_to(
         .open(remote)
         .await
         .map_err(|e| describe_sftp_error("open", e))?;
-    let mut local_file = tokio::fs::File::create(local)
+    // Replace-without-following, not File::create: see create_transfer_file.
+    let mut local_file = crate::sftp::create_transfer_file(std::path::Path::new(local))
         .await
         .map_err(|e| CmdError(format!("local create failed: {e}")))?;
 
@@ -1505,8 +1506,32 @@ fn expand_server_copy<'a>(
 
 // ─── recursive remote search ───────────────────────────────────────────────
 
+/// Result cap for [`sftp_search`] - the UI cannot usefully show more.
+const SEARCH_MAX_MATCHES: usize = 500;
+/// Entry cap for [`sftp_search`]'s walk. The match cap alone does not bound
+/// anything: the server chooses the tree and the `is_dir` flag on every entry
+/// it reports, so a tree full of NON-matching names (or one where every entry
+/// claims to be a directory) never reaches 500 matches and the walk runs until
+/// the session dies. `sftp_dir_size` has had an entry ceiling and a deadline
+/// since it was written; search had neither.
+const SEARCH_MAX_ENTRIES: usize = 200_000;
+/// Wall-clock cap for [`sftp_search`]'s walk.
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Ceiling on the renderer-supplied `max_depth`. The UI never offers more
+/// than a few levels, and an unclamped `u32` from the untrusted side of the
+/// IPC boundary is just another way to ask for an unbounded walk.
+const SEARCH_MAX_DEPTH: u32 = 32;
+
+/// Pure cap check for [`sftp_search`]'s walk, pulled out of the async loop so
+/// the stop condition can be unit-tested without a live session. Mirrors
+/// [`dir_size_capped`].
+fn search_capped(matched: usize, scanned: usize, elapsed: std::time::Duration) -> bool {
+    matched > SEARCH_MAX_MATCHES || scanned >= SEARCH_MAX_ENTRIES || elapsed >= SEARCH_TIMEOUT
+}
+
 /// Recursive walker emitting per-result `sftp-search` events with the
-/// session id. Caps at 500 results to avoid runaway walks.
+/// session id. Bounded by [`search_capped`]: results, entries scanned and
+/// wall-clock time, whichever is hit first.
 fn walk_search(
     sftp: Arc<russh_sftp::client::SftpSession>,
     app: AppHandle,
@@ -1517,6 +1542,7 @@ fn walk_search(
     matched: Arc<std::sync::atomic::AtomicUsize>,
     scanned: Arc<std::sync::atomic::AtomicUsize>,
     capped: Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
     sid: String,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     use std::sync::atomic::Ordering as AtomOrd;
@@ -1537,13 +1563,19 @@ fn walk_search(
             if name == "." || name == ".." {
                 continue;
             }
-            scanned.fetch_add(1, AtomOrd::SeqCst);
+            // Budget check per ENTRY. Previously this only fired on a match,
+            // so a tree of non-matching names walked forever.
+            let seen = scanned.fetch_add(1, AtomOrd::SeqCst) + 1;
+            if search_capped(matched.load(AtomOrd::SeqCst), seen, started.elapsed()) {
+                capped.store(true, AtomOrd::SeqCst);
+                return;
+            }
             let full = format!("{}/{}", dir.trim_end_matches('/'), name);
             let md = entry.metadata();
             let is_dir = md.is_dir();
             if name.to_lowercase().contains(&needle) {
                 let m = matched.fetch_add(1, AtomOrd::SeqCst) + 1;
-                if m > 500 {
+                if m > SEARCH_MAX_MATCHES {
                     capped.store(true, AtomOrd::SeqCst);
                     return;
                 }
@@ -1568,6 +1600,7 @@ fn walk_search(
                     matched.clone(),
                     scanned.clone(),
                     capped.clone(),
+                    started,
                     sid.clone(),
                 )
                 .await;
@@ -1591,7 +1624,7 @@ pub async fn sftp_search(
     use tauri::Emitter;
     let sftp = sftp_from_session(&app, &session_id)?;
     let needle = query.to_lowercase();
-    let max_depth = max_depth.unwrap_or(10);
+    let max_depth = max_depth.unwrap_or(10).min(SEARCH_MAX_DEPTH);
 
     let sid = session_id.clone();
     let root = root_path.clone();
@@ -1600,6 +1633,7 @@ pub async fn sftp_search(
         let matched = Arc::new(AtomicUsize::new(0));
         let scanned = Arc::new(AtomicUsize::new(0));
         let capped = Arc::new(AtomicBool::new(false));
+        let started = std::time::Instant::now();
         walk_search(
             sftp,
             app2.clone(),
@@ -1610,6 +1644,7 @@ pub async fn sftp_search(
             matched.clone(),
             scanned.clone(),
             capped.clone(),
+            started,
             sid.clone(),
         )
         .await;
@@ -1617,7 +1652,7 @@ pub async fn sftp_search(
             "sftp-search",
             serde_json::json!({
                 "sessionId": sid, "done": true,
-                "matched": matched.load(AtomOrd::SeqCst).min(500),
+                "matched": matched.load(AtomOrd::SeqCst).min(SEARCH_MAX_MATCHES),
                 "scanned": scanned.load(AtomOrd::SeqCst),
                 "capped": capped.load(AtomOrd::SeqCst),
             }),
@@ -2378,6 +2413,36 @@ mod tests {
     }
 
     #[test]
+    /// The search walk must stop on entries scanned and on the clock, not
+    /// only on matches. A hostile server controls the tree and the `is_dir`
+    /// flag on every entry, so a tree of NON-matching names used to walk
+    /// forever - the 500-match cap never fired.
+    #[test]
+    fn search_stops_on_entries_and_time_not_only_on_matches() {
+        let none = std::time::Duration::from_secs(0);
+        // Nothing matched, nothing near the caps: keep going.
+        assert!(!search_capped(0, 10, none));
+        assert!(!search_capped(
+            SEARCH_MAX_MATCHES,
+            SEARCH_MAX_ENTRIES - 1,
+            none
+        ));
+        // Each bound stops it on its own.
+        assert!(search_capped(SEARCH_MAX_MATCHES + 1, 0, none));
+        assert!(search_capped(0, SEARCH_MAX_ENTRIES, none));
+        assert!(search_capped(0, 0, SEARCH_TIMEOUT));
+        // The case the fix is about: no matches at all, entries exhausted.
+        assert!(search_capped(0, SEARCH_MAX_ENTRIES + 1, none));
+    }
+
+    /// `max_depth` arrives from the renderer, which is the untrusted side of
+    /// the IPC boundary; an unclamped u32 is just another unbounded walk.
+    #[test]
+    fn search_depth_is_clamped() {
+        assert_eq!(u32::MAX.min(SEARCH_MAX_DEPTH), SEARCH_MAX_DEPTH);
+        assert_eq!(3u32.min(SEARCH_MAX_DEPTH), 3);
+    }
+
     fn safe_join_under_keeps_normal_names_in_root() {
         let root = std::env::temp_dir().join("sshspan-test-join");
         std::fs::create_dir_all(&root).unwrap();

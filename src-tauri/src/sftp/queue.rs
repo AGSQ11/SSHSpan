@@ -1143,7 +1143,7 @@ async fn read_via_session<RT: tauri::Runtime>(
         .map_err(|e| crate::commands::sftp::sftp_error_detail(e))?;
     // Truncate the staging file (the failed fresh-channel attempt may have
     // left a partial write) before re-reading into it.
-    let mut lf = tokio::fs::File::create(stage)
+    let mut lf = crate::sftp::create_transfer_file(std::path::Path::new(stage))
         .await
         .map_err(|e| format!("local recreate failed: {e}"))?;
     copy_with_progress(app, job_id, &mut rf, &mut lf, cancel, pause, Some(size), 0).await?;
@@ -1753,7 +1753,7 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         } else {
                             // Fresh start: replaces a leftover .part (the
                             // Overwrite mode's "delete/ignore the .part").
-                            tokio::fs::File::create(&lpart)
+                            crate::sftp::create_transfer_file(std::path::Path::new(&lpart))
                                 .await
                                 .map_err(|e| format!("local create failed: {e}"))?
                         };

@@ -435,8 +435,76 @@ impl KeepaliveRegistry {
     }
 }
 
+/// Create a local file for a transfer to write into, replacing whatever is
+/// there WITHOUT following a symlink.
+///
+/// `File::create` truncates through an existing symlink, so anything able to
+/// pre-create one at the destination - a world-writable download directory, a
+/// hostile process running as the same user - had the transfer overwrite the
+/// link target instead. `<dest>.part` is the easier target of the two, since
+/// its name follows from the destination.
+///
+/// Same shape as [`crate::ssh::write_secret_file`]: unlink first so a planted
+/// symlink is removed rather than traversed, then `create_new` so a symlink
+/// re-planted in the gap fails the open instead of being followed. On Unix
+/// `O_NOFOLLOW` closes that race directly as well.
+///
+/// The mode is deliberately left at the process default: these are the user's
+/// downloaded files, not secrets, and forcing 0600 would surprise anyone
+/// fetching something they then expect other tools to read.
+pub async fn create_transfer_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // tokio's OpenOptions carries custom_flags inherently on Unix - no
+    // std OpenOptionsExt import needed.
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.open(path).await
+}
+
 #[cfg(test)]
 mod tests {
+    /// A transfer must not write through a symlink planted at its
+    /// destination. `File::create` truncates the link TARGET; the helper
+    /// unlinks first and opens with create_new + O_NOFOLLOW, so the planted
+    /// link is removed rather than followed and the victim is untouched.
+    #[test]
+    fn create_transfer_file_does_not_follow_a_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("sshspan-nofollow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"do not clobber me").unwrap();
+        let planted = dir.join("download.part");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let file = rt.block_on(create_transfer_file(&planted));
+        assert!(
+            file.is_ok(),
+            "the transfer file itself should still be created"
+        );
+        drop(file);
+        // The victim keeps its contents, and the destination is now a real
+        // file rather than a link.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not clobber me");
+        assert!(!std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]
