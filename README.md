@@ -19,11 +19,20 @@ All sensitive logic - crypto, vault, database, SSH, SFTP - runs in a compiled **
 The UI is vanilla HTML/CSS/JS in your OS webview: no Electron, no bundled Chromium, no Node
 runtime. The Windows installer is ~9 MB. Everything runs locally: no cloud, no telemetry.
 The only network traffic is the update check against GitHub (on by default, disableable in
-Settings) and, if you enable it, Bitwarden sync — which talks only to the server you
+Settings) and, if you enable it, Bitwarden sync - which talks only to the server you
 configure. Auto-updates are minisign-signature-verified and fail closed.
 
 ## What's new
 
+- **v1.7.3** - Security release resolving a full source audit: the renderer-to-native
+  executable-staging chain is closed, a vault lock now revokes in-progress connects/exports/
+  syncs (not just live sessions), master-password rotation is atomic and covers the
+  Bitwarden credential, download resume can no longer follow a planted `.part` symlink,
+  recursive uploads re-check every descendant, backups no longer import local deletion
+  paths, the updater resolves the signature from the right URL and binds the version to the
+  asset, and Bitwarden Argon2id now matches the official client. Plus the SFTP queue's
+  pause/resume, auto-retry, throttle, persistence, and integrity verification, richer remote
+  listings, and a round of renderer/UI fixes.
 - **v1.7.2** - Signed auto-updates (minisign-verified installers, fail-closed), consent-based
   host-key trust with strict refusals, private-key export straight to a file (never through
   the UI process), brute-force backoff, hardened staging and paths, plus the SFTP
@@ -167,12 +176,12 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
 
 ### From a release (recommended)
 Grab the latest installer from [Releases](https://github.com/AGSQ11/SSHSpan/releases) -
-current release is **v1.7.2**:
+current release is **v1.7.3**:
 
 | Platform | Files |
 | --- | --- |
-| Windows | `SSHSpan_1.7.2_x64-setup.exe` (NSIS, per-user) · `SSHSpan_1.7.2_x64_en-US.msi` (system-wide) |
-| Linux | `SSHSpan_1.7.2_amd64.deb` · `SSHSpan-1.7.2-1.x86_64.rpm` |
+| Windows | `SSHSpan_1.7.3_x64-setup.exe` (NSIS, per-user) · `SSHSpan_1.7.3_x64_en-US.msi` (system-wide) |
+| Linux | `SSHSpan_1.7.3_amd64.deb` · `SSHSpan-1.7.3-1.x86_64.rpm` |
 
 ### Build from source
 Prerequisites: [Rust](https://rustup.rs) (stable), Node.js >= 18 (for the Tauri CLI), and on
@@ -194,7 +203,7 @@ A **Tauri v2** app: a Rust binary (`src-tauri/`) owns the SQLite vault (sqlx), a
 cryptography (`ssh-key`, `argon2`, `aes-gcm`, `minisign-verify`, the `russh` SSH + SFTP
 engines), the Bitwarden client, and the updater; the webview UI (`src/renderer/`) is plain
 HTML/CSS/JS that talks to Rust through typed IPC commands. Decrypted private key material
-stays inside Rust processes — even exports are written to disk by the backend — and never
+stays inside Rust processes - even exports are written to disk by the backend - and never
 crosses the IPC boundary into the UI. The full Node.js -> Rust migration story,
 per-version changelog, and engineering notes live in
 [`docs/REWRITE-ROADMAP.md`](docs/REWRITE-ROADMAP.md); the process/module layout

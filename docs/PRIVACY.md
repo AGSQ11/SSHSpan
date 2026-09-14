@@ -9,20 +9,26 @@ Rust/Tauri implementation (v1.7.x); every claim here is a property of the code, 
 SSHSpan collects **no telemetry and no usage data**. There is no analytics SDK and no crash
 reporter. The app does not profile user behaviour and cannot be contacted by any server.
 
-There are exactly **two kinds of outbound network requests** the app can make, nothing else:
+There are exactly **three kinds of outbound network connections** the app can make, nothing
+else:
 
 1. **Update check (on by default, can be turned off).** When the app starts it asks GitHub's
    releases API (`api.github.com/repos/AGSQ11/SSHSpan/releases/latest`) whether a newer
    version exists. The request carries a generic User-Agent (`SSHSpan-Update-Check`) and no
    account identifiers; GitHub sees the request's source IP and that header. Nothing beyond
-   that is sent. If — and only if — a new version exists **and the user explicitly approves
+   that is sent. If - and only if - a new version exists **and the user explicitly approves
    the update in the app's dialog**, the installer is downloaded from
-   `github.com/AGSQ11/SSHSpan/releases/download/…` (pinned to this repository), verified
+   `github.com/AGSQ11/SSHSpan/releases/download/...` (pinned to this repository), verified
    against a SHA-256 digest and a minisign release signature, and the OS installer is
    launched. The setting is `autoUpdateCheck` in Settings.
 2. **Bitwarden/Vaultwarden sync (off until configured).** Described below. The user must
    explicitly configure a server URL, account email, and password before any connection is
    made.
+3. **SSH/SFTP connections and transfers the user initiates.** Connect, the SFTP file
+   manager, and cross-server Send-to open SSH sessions to the hosts the user configured and
+   carry the credentials and file data the user chose to send to those hosts. These are the
+   app's core function, are always user-initiated, and connect only to user-entered
+   destinations - they are listed here so the "what leaves the machine" picture is complete.
 
 The only data the app processes is data the user explicitly brings into it:
 
@@ -55,14 +61,14 @@ user's own Bitwarden-compatible vault:
   except for loopback targets (self-hosted testing); everything else must be HTTPS. The app
   refuses to connect to localhost, LAN, or otherwise private/reserved addresses (IPv4 and
   IPv6, including IPv4-mapped forms), and re-filters DNS answers at connection time to
-  defeat DNS rebinding — so the destination is a user-controlled public server.
+  defeat DNS rebinding - so the destination is a user-controlled public server.
 - **What is sent.** SSH key vault items whose sensitive fields (private key, public key,
   fingerprint, name) are encrypted client-side with the Bitwarden protocol before they
   leave the machine; the server only ever receives ciphertext. No telemetry, identifiers,
   or metadata beyond the protocol's own account authentication are transmitted. Redirects
   are never followed.
 - **What is stored locally in addition.** The sync configuration (server URL, account
-  email, folder name) and the Bitwarden master password — the latter only in a form
+  email, folder name) and the Bitwarden master password - the latter only in a form
   AES-256-GCM-encrypted with the SSHSpan vault master password, so it is unreadable on
   disk and only usable while the vault is unlocked.
 - **What is never done.** No automatic deletion on either side, no sharing to
@@ -104,7 +110,7 @@ The user controls the following privacy-relevant behaviour:
   tests a server.
 - **Whether to export private keys at all.** Exports require an unlocked vault and are
   logged to the audit log. Private keys are serialized by the backend straight into the
-  file you choose in the save dialog — they never pass through the app's UI process.
+  file you choose in the save dialog - they never pass through the app's UI process.
   Exported files can be encrypted with an independent passphrase (OpenSSH, PKCS#8/PBES2,
   or PuTTY PPK formats).
 - **Clipboard.** The app's key views copy public key material. Private key material is
@@ -130,8 +136,9 @@ advertising, and no marketing.
 
 ## Changes to this policy
 
-SSHSpan stores everything locally and the two network exceptions above are visible in
-Settings. This privacy model is a property of the code, not a policy that can change without
+SSHSpan stores everything locally and the optional network exceptions above are visible in
+Settings (the SSH/SFTP sessions are always user-initiated). This privacy model is a property
+of the code, not a policy that can change without
 a new release. Any change that introduces data collection, additional network access, or
 telemetry would require an explicit, visible change to the app and a revision of this
 document.
