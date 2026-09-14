@@ -109,7 +109,11 @@ pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow
         0 => {
             // PBKDF2 uses the normalized email bytes directly as the salt.
             let iterations = kdf.iterations.max(PBKDF2_MIN_ITERATIONS);
-            Ok(pbkdf2_hmac_array::<Sha256, 32>(pw, salt.as_bytes(), iterations))
+            Ok(pbkdf2_hmac_array::<Sha256, 32>(
+                pw,
+                salt.as_bytes(),
+                iterations,
+            ))
         }
         1 => {
             use argon2::{Algorithm, Argon2, Params, Version};
@@ -123,9 +127,7 @@ pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow
             // same credentials, so an Argon2-configured account could never
             // authenticate or decrypt. Hash the email here to match.
             use sha2::Digest;
-            let salt_sha = sha2::Sha256::new()
-                .chain_update(salt.as_bytes())
-                .finalize();
+            let salt_sha = sha2::Sha256::new().chain_update(salt.as_bytes()).finalize();
             let memory = kdf.memory.max(ARGON2_MIN_MEMORY_KIB);
             let iterations = kdf.iterations.max(ARGON2_MIN_ITERATIONS);
             let parallelism = kdf.parallelism.max(ARGON2_MIN_PARALLELISM);

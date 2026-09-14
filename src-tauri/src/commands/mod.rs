@@ -133,7 +133,10 @@ pub fn capture_vault_generation(app: &AppHandle) -> CmdResult<u64> {
 /// export, apply a sync) after one or more awaits.
 pub fn require_generation_current(app: &AppHandle, captured: u64) -> CmdResult<()> {
     let unlocked = !vault_password(app)?.is_empty();
-    if !app.state::<VaultGeneration>().is_current(captured, unlocked) {
+    if !app
+        .state::<VaultGeneration>()
+        .is_current(captured, unlocked)
+    {
         return Err(CmdError(
             "Vault was locked while the operation was in progress.".into(),
         ));

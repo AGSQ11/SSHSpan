@@ -678,8 +678,8 @@ mod tests {
             assert!(path_has_inert_extension(Path::new(ok)), "should open: {ok}");
         }
         for bad in [
-            "x.exe", "x.scr", "x.bat", "x.cmd", "x.com", "x.msi", "x.ps1",
-            "x.vbs", "x.js", "x.jar", "x.sh", "x.dll", "x.bin", "x.7z", "x",
+            "x.exe", "x.scr", "x.bat", "x.cmd", "x.com", "x.msi", "x.ps1", "x.vbs", "x.js",
+            "x.jar", "x.sh", "x.dll", "x.bin", "x.7z", "x",
         ] {
             assert!(
                 !path_has_inert_extension(Path::new(bad)),

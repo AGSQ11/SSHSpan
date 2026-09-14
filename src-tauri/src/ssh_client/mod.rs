@@ -627,8 +627,7 @@ pub async fn start_interactive(
     // F2). Aborting here drops `session`, closing the just-established
     // connection rather than registering it.
     if let Some(gen) = vault_generation {
-        crate::commands::require_generation_current(&app, gen)
-            .map_err(|e| anyhow::anyhow!(e.0))?;
+        crate::commands::require_generation_current(&app, gen).map_err(|e| anyhow::anyhow!(e.0))?;
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
