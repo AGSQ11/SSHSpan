@@ -1394,6 +1394,9 @@ label:focus-within { color: var(--text); }
   display: flex;
   flex-direction: column;
   color: var(--text);
+  /* A vault with many hosts in one category would otherwise run off screen. */
+  max-height: min(70vh, 460px);
+  overflow-y: auto;
 }
 .ctx-item {
   display: flex;
@@ -1408,11 +1411,18 @@ label:focus-within { color: var(--text); }
   cursor: pointer;
   font-size: 13px;
   width: 100%;
+  flex: none; /* a scrolling menu must not squash its own rows */
 }
 .ctx-item:hover { background: var(--hover); }
 .ctx-item svg { width: 14px; height: 14px; flex: none; }
 .ctx-item small { color: var(--text-dim); font-size: 11px; }
-.ctx-sep { height: 1px; background: var(--line); margin: 4px 6px; }
+.ctx-sep { height: 1px; background: var(--line); margin: 4px 6px; flex: none; }
+
+/* Host picker: a category row opens a flyout with its subcategories and hosts. */
+.ctx-item.has-sub { padding-right: 6px; }
+.ctx-item.has-sub > span { flex: 1; }
+.ctx-item.has-sub .ctx-count { color: var(--text-dim); font-size: 11px; }
+.ctx-item.has-sub > svg:last-child { opacity: 0.55; }
 
 /* ─── Nav: locked-variant for vault-gated buttons ─────────────────────── */
 

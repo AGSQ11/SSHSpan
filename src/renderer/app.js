@@ -348,6 +348,16 @@ function childrenOf(parentId) {
   return state.childrenOf.get(parentId || '') || [];
 }
 
+/// Children of a category in an explicitly named scope. The index that
+/// childrenOf() reads is rebuilt for whichever scope the sidebar is currently
+/// showing, so anything that has to walk the *other* scope's tree - the host
+/// picker, which opens from the Keys view - reads state.categories directly.
+function childrenOfScoped(parentId, scope) {
+  return state.categories
+    .filter(c => c.scope === scope && (c.parent_id || '') === (parentId || ''))
+    .sort((a, b) => a.sort_index - b.sort_index || a.name.localeCompare(b.name));
+}
+
 function catPath(id) {
   const out = [];
   let cur = catById(id);
@@ -1382,15 +1392,13 @@ function openKeyConnectMenu(x, y, key) {
       toast('Unlock the vault to connect.', 'err');
       return;
     }
-    if (state.servers.length === 0) {
-      // No saved servers yet - open the server modal with this key preselected.
-      openServerModal({ keyId: key.id });
-    } else {
-      // Pick one of the existing servers; the chosen server's saved username
-      // is overridden by the server's row username (kept) but its key is
-      // overridden with this one at connect time.
-      openServerPickerForKey(key);
-    }
+    // Pick one of the existing servers; the chosen server's saved username is
+    // kept but its key is overridden with this one at connect time. The picker
+    // loads the server list if the Connect view has never been opened, and
+    // falls back to the new-server modal when there genuinely are none - the
+    // emptiness check cannot happen out here, because state.servers is only
+    // populated by switchView('connect').
+    await openServerPickerForKey(key, x, y);
   });
   menu.appendChild(btn);
   menu.style.left = x + 'px';
@@ -1405,6 +1413,16 @@ function openKeyConnectMenu(x, y, key) {
 function closeKeyConnectMenu() {
   const m = document.getElementById('keyConnectMenu');
   if (m && m.parentNode) m.parentNode.removeChild(m);
+  // Host-picker flyouts are body-level elements rather than children of the
+  // row that opened them, so removing the root menu alone would leave them
+  // floating over the page.
+  for (const sub of document.querySelectorAll('.ctx-submenu')) sub.remove();
+  hostPickerCancelClose();
+  if (hostPickerAwayHandler) {
+    document.removeEventListener('mousedown', hostPickerAwayHandler);
+    document.removeEventListener('keydown', hostPickerAwayHandler);
+    hostPickerAwayHandler = null;
+  }
 }
 
 async function loadKeys() {
@@ -3086,49 +3104,208 @@ async function submitServerModal() {
   }
 }
 
-// Pick an existing saved server and connect immediately using the chosen key.
-function openServerPickerForKey(key) {
-  closeKeyConnectMenu();
-  switchView('connect');
-  if (!state.servers.length) {
-    openServerModal({ keyId: key.id });
-    return;
+// ─── cascading host picker (key -> category -> ... -> host) ────────────────
+//
+// Opened by right-clicking a key, so it has to leave the user where they are.
+// The flat version switched to Connect before drawing anything, purely because
+// it anchored itself to that view's "New" button - an element with no layout
+// box while its view is hidden, so without the switch the menu landed at 0,0.
+// It now anchors at the cursor and lets openSessionTab() do the switching,
+// once a host has actually been chosen.
+//
+// The menu mirrors the host category tree rather than listing every server in
+// the vault flat, so a deep tree reads as category > subcategory > host.
+
+let hostPickerCloseTimer = null;
+let hostPickerAwayHandler = null;
+
+function hostPickerCancelClose() {
+  if (hostPickerCloseTimer !== null) {
+    clearTimeout(hostPickerCloseTimer);
+    hostPickerCloseTimer = null;
   }
-  const menu = document.createElement('div');
-  menu.className = 'ctx-menu';
-  menu.id = 'keyConnectMenu';
+}
+
+/// Drop every flyout at `depth` or deeper. Depth 1 is the first flyout; the
+/// root menu is depth 0 and is never removed here, so closing one branch to
+/// open another does not close the menu itself.
+function hostPickerCloseFrom(depth) {
+  for (const sub of document.querySelectorAll('.ctx-submenu')) {
+    if (Number(sub.dataset.depth) >= depth) sub.remove();
+  }
+}
+
+/// Moving from a category row towards its flyout usually clips a sibling row
+/// on the way. Closing the instant that happens would put the flyout out of
+/// reach, so give the pointer a moment to land inside it first.
+function hostPickerScheduleClose(depth) {
+  hostPickerCancelClose();
+  hostPickerCloseTimer = setTimeout(() => {
+    hostPickerCloseTimer = null;
+    hostPickerCloseFrom(depth);
+  }, 180);
+}
+
+/// Keep a menu fully on screen: at the requested point where there is room,
+/// pushed back inside the viewport where there is not.
+function positionCtxMenuAt(menu, x, y) {
+  const pad = 6;
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(pad, Math.min(x, window.innerWidth - r.width - pad)) + 'px';
+  menu.style.top = Math.max(pad, Math.min(y, window.innerHeight - r.height - pad)) + 'px';
+}
+
+/// A flyout sits against the right edge of the row that owns it, overlapping
+/// by a couple of pixels so the pointer never crosses a gap, and flips to the
+/// left when the right would run off screen.
+function positionCtxFlyout(menu, anchorEl) {
+  const pad = 6;
+  const a = anchorEl.getBoundingClientRect();
+  const r = menu.getBoundingClientRect();
+  let left = a.right - 2;
+  if (left + r.width > window.innerWidth - pad) left = a.left - r.width + 2;
+  menu.style.left = Math.max(pad, Math.min(left, window.innerWidth - r.width - pad)) + 'px';
+  menu.style.top = Math.max(pad, Math.min(a.top - 4, window.innerHeight - r.height - pad)) + 'px';
+}
+
+/// The host category tree, pruned to branches that actually contain a server.
+/// Anything the walk does not reach - a server with no category, one pointing
+/// at a deleted or key-scope category, one orphaned by a reparent cycle - is
+/// returned in `loose` and shown at the top level, so no host is unreachable
+/// through the picker no matter what the category table looks like.
+function hostPickerTree() {
+  const byCat = new Map();
   for (const s of state.servers) {
+    if (!s.categoryId) continue;
+    if (!byCat.has(s.categoryId)) byCat.set(s.categoryId, []);
+    byCat.get(s.categoryId).push(s);
+  }
+  const byLabel = (a, b) => (a.name || a.host || '').localeCompare(b.name || b.host || '');
+  const seen = new Set(); // a cycle in a restored vault must not hang the UI
+  const build = (cat) => {
+    if (seen.has(cat.id)) return null;
+    seen.add(cat.id);
+    const hosts = (byCat.get(cat.id) || []).slice().sort(byLabel);
+    const children = [];
+    for (const child of childrenOfScoped(cat.id, 'host')) {
+      const node = build(child);
+      if (node && node.total > 0) children.push(node);
+    }
+    return { cat, hosts, children, total: hosts.length + children.reduce((n, c) => n + c.total, 0) };
+  };
+  const roots = [];
+  for (const cat of childrenOfScoped(null, 'host')) {
+    const node = build(cat);
+    if (node && node.total > 0) roots.push(node);
+  }
+  const placed = new Set();
+  (function walk(nodes) {
+    for (const n of nodes) {
+      for (const h of n.hosts) placed.add(h.id);
+      walk(n.children);
+    }
+  })(roots);
+  return { roots, loose: state.servers.filter(s => !placed.has(s.id)).sort(byLabel) };
+}
+
+/// Render one level of the picker into `menu`: a row per category that opens
+/// the next level, then a row per host that connects with `key` overriding
+/// whatever key that server has saved - the point of this entry point.
+function buildHostPickerLevel(menu, depth, nodes, hosts, key) {
+  for (const node of nodes) {
+    const b = document.createElement('button');
+    b.className = 'ctx-item has-sub';
+    b.innerHTML = `${ico('folder')}<span>${escapeHtml(node.cat.name)}</span>`
+      + `<small class="ctx-count">${node.total}</small>${ico('chevron-right')}`;
+    const openSub = () => {
+      hostPickerCancelClose();
+      const open = document.querySelector('.ctx-submenu[data-depth="' + (depth + 1) + '"]');
+      if (open && open.dataset.owner === node.cat.id) return; // already showing
+      hostPickerCloseFrom(depth + 1);
+      const sub = document.createElement('div');
+      sub.className = 'ctx-menu ctx-submenu';
+      sub.dataset.depth = String(depth + 1);
+      sub.dataset.owner = node.cat.id;
+      buildHostPickerLevel(sub, depth + 1, node.children, node.hosts, key);
+      sub.addEventListener('mouseenter', hostPickerCancelClose);
+      document.body.appendChild(sub);
+      positionCtxFlyout(sub, b);
+    };
+    b.addEventListener('mouseenter', openSub);
+    b.addEventListener('click', openSub);
+    menu.appendChild(b);
+  }
+  if (nodes.length && hosts.length) {
+    const sep = document.createElement('div');
+    sep.className = 'ctx-sep';
+    menu.appendChild(sep);
+  }
+  for (const s of hosts) {
     const b = document.createElement('button');
     b.className = 'ctx-item';
-    b.innerHTML = `${ico('server')}<span>${escapeHtml(s.name)} <small>(${escapeHtml(s.username)}@${escapeHtml(s.host)})</small></span>`;
+    b.innerHTML = `${ico('server')}<span>${escapeHtml(s.name || s.host)} `
+      + `<small>(${escapeHtml(s.username)}@${escapeHtml(s.host)})</small></span>`;
+    b.addEventListener('mouseenter', () => hostPickerScheduleClose(depth + 1));
     b.addEventListener('click', () => {
       closeKeyConnectMenu();
       state._pendingConnectKey = key.id;
-      selectServer(s.id);
+      // Set the selection directly rather than through selectServer(): the
+      // server list is still rendering under the Keys view's category scope
+      // here, and switchView('connect') inside openSessionTab re-renders it
+      // against the host scope a moment later anyway.
+      state.connectSelectedId = s.id;
       openSessionTab(s, { overrideKeyId: key.id });
     });
     menu.appendChild(b);
   }
-  const div = document.createElement('div');
-  div.className = 'ctx-sep';
-  menu.appendChild(div);
+}
+
+// Pick an existing saved server and connect immediately using the chosen key.
+async function openServerPickerForKey(key, x, y) {
+  closeKeyConnectMenu();
+  // Nothing but the Connect view loads the server list, so a user who has not
+  // opened it yet this session would otherwise be told they have no servers.
+  if (!state.servers.length) await loadServers();
+  if (!state.servers.length) {
+    openServerModal({ keyId: key.id });
+    return;
+  }
+  const { roots, loose } = hostPickerTree();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.id = 'keyConnectMenu';
+  buildHostPickerLevel(menu, 0, roots, loose, key);
+  const sep = document.createElement('div');
+  sep.className = 'ctx-sep';
+  menu.appendChild(sep);
   const newBtn = document.createElement('button');
   newBtn.className = 'ctx-item';
   newBtn.innerHTML = `${ico('plus')}<span>New server with this key...</span>`;
+  newBtn.addEventListener('mouseenter', () => hostPickerScheduleClose(1));
   newBtn.addEventListener('click', () => {
     closeKeyConnectMenu();
     openServerModal({ keyId: key.id });
   });
   menu.appendChild(newBtn);
-  const rect = el('serverNewBtn').getBoundingClientRect();
-  menu.style.left = rect.left + 'px';
-  menu.style.top = (rect.bottom + 4) + 'px';
   document.body.appendChild(menu);
-  const onAway = (ev) => {
-    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
+  positionCtxMenuAt(menu, x, y);
+  // One handler for the whole chain: a click inside any menu in it - opening a
+  // flyout, say - must not dismiss the menu, which the old per-menu {once:true}
+  // listener got wrong (it was spent by the first click, inside or out).
+  const away = (ev) => {
+    if (ev.type === 'keydown') {
+      if (ev.key === 'Escape') closeKeyConnectMenu();
+      return;
+    }
+    if (ev.target.closest && ev.target.closest('.ctx-menu')) return;
     closeKeyConnectMenu();
   };
-  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  hostPickerAwayHandler = away;
+  setTimeout(() => {
+    if (hostPickerAwayHandler !== away) return; // superseded before we armed
+    document.addEventListener('mousedown', away);
+    document.addEventListener('keydown', away);
+  }, 0);
 }
 
 // ─── Connect / disconnect / test ───────────────────────────────────────────
