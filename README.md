@@ -24,7 +24,7 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
 
 ## What's new
 
-- **Unreleased** - UX pass over the whole renderer. The navigation is two objects (Keys,
+- **v1.8.0** - UX pass over the whole renderer. The navigation is two objects (Keys,
   Servers) plus Settings: Deploy is now an action on the keys you have selected rather than
   a destination you visit afterwards, and the audit log is a Settings section. A Ctrl+K
   command palette searches keys, servers and categories and runs actions. The key list
@@ -34,6 +34,8 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
   path is a clickable breadcrumb, and Settings is sectioned with one toggle component
   throughout. Two bugs fixed along the way: the search box did nothing in the default
   grouped key view, and the deploy preview joined its lines on a literal `\n`.
+  Also in this release: the Send-to folder scan is bounded by progress rather
+  than a flat 120s cap, and rustls is bumped to 0.23.45 for RUSTSEC-2026-0285.
 - **v1.7.3** - Security release resolving a full source audit: the renderer-to-native
   executable-staging chain is closed, a vault lock now revokes in-progress connects/exports/
   syncs (not just live sessions), master-password rotation is atomic and covers the
