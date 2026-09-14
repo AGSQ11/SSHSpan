@@ -489,6 +489,235 @@ async function checkQueueGrouping(browser, server) {
   await page.close();
 }
 
+// ─── UX refactor: nav shape, palette, selection/deploy, export, settings ───
+//
+// These cover the surfaces the 2026 UX pass introduced. They exist for the
+// same reason as everything above: each one is a path that can break while
+// still rendering a page that merely looks fine.
+
+const UX_KEY = (id, name, extra) => Object.assign({
+  id, name, key_type: 'ed25519', has_private: true, public_key: 'ssh-ed25519 AAAA' + id,
+  fingerprint_sha256: 'SHA256:' + id, comment: name + '@host',
+  created_at: '2026-09-01T10:00:00Z', deployed: false, bitwarden_sync: false, category_ids: [],
+}, extra || {});
+
+async function checkUxRefactor(browser, server) {
+  console.log('ux: nav, palette, selection, export, settings');
+  const keys = [
+    UX_KEY('a', 'prod-deploy', { deployed: true, deploy_path: '~/.sshspan/keys/a' }),
+    UX_KEY('b', 'staging'),
+    UX_KEY('c', 'laptop'),
+  ];
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  await page.addInitScript(({ r }) => {
+    window.__TAURI__ = {
+      core: {
+        invoke: async (cmd, args) => {
+          if (cmd === 'key_get') return r.key_list.keys.find(k => k.id === args.id);
+          return r[cmd] ?? {};
+        },
+      },
+      event: { listen: async () => () => {} },
+    };
+  }, { r: {
+    vault_status: { hasVault: true, unlocked: true },
+    key_list: { keys },
+    category_list: {
+      categories: [{ id: 'p', name: 'Prod', parent_id: null, scope: 'key', sort_index: 0, color: null }],
+      allKeyCategories: {}, orphans: true, hostOrphans: false,
+    },
+    server_list: { servers: [SRV('s1', 'web-1', '10.0.0.1', null), SRV('s2', 'db-1', '10.0.0.2', null)] },
+    settings_get: { autoLockMinutes: 15, confirmDelete: true },
+    known_hosts_list: { hosts: [] },
+    audit_list: { entries: [] },
+    system_paths: { deployDir: '~/.sshspan/keys', sshConfig: '~/.ssh/config', dataDir: '~/.sshspan/sshspan.db' },
+  } });
+  const errors = [];
+  page.on('pageerror', e => errors.push(String(e.message || e)));
+  await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
+  await page.waitForSelector('#keyList .key-row', { timeout: 15000 });
+
+  // Deploy and Audit are no longer destinations; both are still reachable.
+  check('nav is two objects plus Settings',
+    await page.$$eval('.nav-item', ns => ns.map(n => n.dataset.view)), ['keys', 'connect', 'settings']);
+  check('the vault control shows the auto-lock countdown',
+    /locks in \d+:\d\d/.test(await page.textContent('#vaultSub')), true);
+
+  // The row's sub-line used to be the full fingerprint, which nobody scans by.
+  check('a key row leads with its comment',
+    await page.textContent('#keyList .key-row .key-row-sub'), 'prod-deploy@host');
+
+  // The grouped view used to walk state.keys, so the search box did nothing
+  // unless it matched zero keys.
+  await page.fill('#searchInput', 'staging');
+  check('the search box filters the grouped view',
+    await page.$$eval('#keyList .key-row', rs => rs.map(r => r.dataset.id)), ['b']);
+  await page.fill('#searchInput', '');
+
+  // Export: its own tab, and a passphrase field only for the format using one.
+  await page.click('#keyList .key-row');
+  await page.waitForTimeout(80);
+  check('the detail pane opens on Overview', await page.isVisible('#detailPanel-overview'), true);
+  await page.click('.detail-tab[data-detail-tab="export"]');
+  check('the passphrase field is hidden for an unencrypted format',
+    await page.isHidden('#detailExportPass'), true);
+  await page.click('.format-row[data-format="pkcs8-encrypted"]');
+  check('and appears for the encrypted one', await page.isVisible('#detailExportPass'), true);
+  check('every format is marked with what it hands you',
+    await page.$$eval('.risk-chip', cs => cs.map(c => c.textContent)),
+    ['Secret', 'Secret', 'Sealed', 'Secret', 'Public', 'Public']);
+  await page.fill('#detailExportPass', 'unused');
+  await page.click('.detail-tab[data-detail-tab="overview"]');
+  check('leaving the Export tab clears a typed passphrase',
+    await page.inputValue('#detailExportPass'), '');
+
+  // Deploy is an action on the selection, with a preview that is live.
+  check('the selection bar is hidden with nothing selected',
+    await page.isHidden('#selectionBar'), true);
+  await page.locator('#keyList .key-row .deploy-check').nth(0).click();
+  await page.locator('#keyList .key-row .deploy-check').nth(1).click();
+  check('it appears and counts the selection',
+    await page.textContent('#selectionHint'), '2 keys selected');
+  await page.click('#selDeployBtn');
+  await page.waitForTimeout(120);
+  check('Deploy opens a sheet carrying the selection',
+    await page.$$eval('#deployKeyChips .cat-chip', cs => cs.map(c => c.textContent)),
+    ['prod-deploy', 'staging']);
+  const preview = await page.inputValue('#configPreview');
+  check('the preview is populated before any button is pressed', preview.length > 0, true);
+  // join('\\n') here rendered the two characters \n and put the whole config
+  // on one line; deployConfig() a few lines away always used a real newline.
+  check('the preview breaks lines instead of printing a literal backslash-n',
+    preview.includes('\\n'), false);
+  await page.fill('#cfgHost', 'prod-web-1');
+  await page.waitForTimeout(80);
+  check('and follows the form as you type',
+    (await page.inputValue('#configPreview')).includes('Host prod-web-1'), true);
+  await page.keyboard.press('Escape');
+  check('Escape closes the sheet', await page.isHidden('#deployModal'), true);
+
+  // One search across everything, where there used to be three boxes.
+  await page.keyboard.press('Control+k');
+  await page.waitForTimeout(150);
+  check('the palette spans every kind of thing',
+    await page.$$eval('.palette-group', gs => gs.map(g => g.textContent)),
+    ['Servers', 'Keys', 'Categories', 'Actions']);
+  await page.fill('#paletteInput', 'web-1');
+  await page.waitForTimeout(80);
+  check('a server is reachable from it',
+    await page.$$eval('.palette-name', ns => ns.map(n => n.textContent)), ['web-1']);
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(80);
+  check('Escape closes the palette', await page.isHidden('#paletteModal'), true);
+
+  // Server rows carry their own live state and a way to act on it.
+  await page.click('.nav-item[data-view="connect"]');
+  await page.waitForTimeout(200);
+  check('the view is called Servers', await page.textContent('#viewTitle'), 'Servers');
+  check('each row shows connection state and a Connect button',
+    await page.$$eval('.server-row', rs => rs.map(r => !!r.querySelector('.server-dot') && !!r.querySelector('.server-go'))),
+    [true, true]);
+  check('the surface control names all three surfaces',
+    await page.$$eval('#termModeSeg .seg-btn', bs => bs.map(b => b.dataset.mode)), ['ssh', 'sftp', 'split']);
+
+  // Settings is one page with a rail, and the audit log lives in it.
+  await page.click('.nav-item[data-view="settings"]');
+  await page.waitForTimeout(250);
+  check('settings has a section rail including the audit log',
+    await page.$$eval('.settings-nav-item', ns => ns.map(n => n.dataset.section)),
+    ['general', 'vault', 'hosts', 'backup', 'sync', 'audit']);
+  check('only one section shows at a time',
+    await page.$$eval('.settings-section', ss => ss.filter(s => !s.hidden).length), 1);
+  // Settings used to render bare browser checkboxes while the deploy options
+  // one screen away used the styled toggle.
+  check('no bare checkbox is left visible in settings',
+    await page.$$eval('#settingsRows input[type=checkbox]',
+      is => is.filter(i => getComputedStyle(i).opacity !== '0' && !i.classList.contains('toggle-input')).length), 0);
+  check('every settings row states what it costs you',
+    await page.$$eval('#settingsRows .settings-row',
+      rs => rs.every(r => r.querySelector('.settings-row-title') && r.querySelector('.settings-row-sub'))), true);
+
+  check('no page errors', errors, []);
+  await page.close();
+}
+
+// ─── session surface: split view and the remote path breadcrumb ────────────
+
+async function checkSessionSurface(browser, server) {
+  console.log('session surface');
+  const { page, errors } = await openPage(browser, server, {
+    vault_status: { hasVault: true, unlocked: true },
+    key_list: { keys: [UX_KEY('k1', 'a-key')] },
+    category_list: { categories: [], allKeyCategories: {}, orphans: false, hostOrphans: false },
+    server_list: { servers: [] },
+    settings_get: {},
+    sftp_list_dir: { entries: [], path: '/srv/api/releases' },
+    sftp_bookmarks_list: { bookmarks: [] },
+    sftp_queue_list: { jobs: [] },
+    sftp_local_list: { path: '/home/u', home: '/home/u', entries: [] },
+  });
+
+  const built = await page.evaluate(async () => {
+    state.sessions.set('t1', {
+      tabId: 't1', sessionId: 'sess', serverId: 'srv', serverName: 'host',
+      host: '10.0.0.1', port: 22, mode: 'sftp', sftpReady: true,
+      sftpPath: '/srv/api/releases', ended: false,
+    });
+    state.activeTabId = 't1';
+    const panel = buildSftpPanel('t1');
+    document.getElementById('sftpBody').appendChild(panel);
+    panel.style.display = 'flex';
+    document.getElementById('sftpBody').classList.add('visible');
+    renderRemoteCrumbs('t1');
+    await new Promise(r => setTimeout(r, 120));
+    return Array.from(document.querySelectorAll('#sftpCrumbs-t1 .sftp-crumb')).map(b => b.textContent);
+  });
+  // The path was a text field: going up two levels meant editing a string.
+  check('the remote path renders as clickable segments', built, ['/', 'srv', 'api', 'releases']);
+  check('the deepest segment is marked as where you are', await page.evaluate(() =>
+    document.querySelector('#sftpCrumbs-t1 .sftp-crumb.current').textContent), 'releases');
+
+  const edit = await page.evaluate(async () => {
+    editRemotePath('t1');
+    await new Promise(r => setTimeout(r, 40));
+    const typing = { box: !document.getElementById('sftpPath-t1').hidden, crumbs: document.getElementById('sftpCrumbs-t1').hidden };
+    showRemoteCrumbs('t1');
+    await new Promise(r => setTimeout(r, 40));
+    return { typing, back: { box: document.getElementById('sftpPath-t1').hidden, crumbs: !document.getElementById('sftpCrumbs-t1').hidden } };
+  });
+  check('clicking the path hands you the editable field', edit.typing, { box: true, crumbs: true });
+  check('and it returns to the breadcrumb afterwards', edit.back, { box: true, crumbs: true });
+
+  // Split is the point of the surface control: both at once, not either/or.
+  const split = await page.evaluate(async () => {
+    window.showSplitForTab('t1');
+    await new Promise(r => setTimeout(r, 60));
+    const surface = document.getElementById('sessionSurface');
+    return {
+      split: surface.classList.contains('split'),
+      row: getComputedStyle(surface).flexDirection,
+      termVisible: getComputedStyle(document.getElementById('terminalBody')).display !== 'none',
+      filesVisible: document.getElementById('sftpBody').classList.contains('visible'),
+      splitter: !document.getElementById('surfaceSplitter').hidden,
+    };
+  });
+  check('split shows the shell and the file browser together', split,
+    { split: true, row: 'row', termVisible: true, filesVisible: true, splitter: true });
+
+  const back = await page.evaluate(async () => {
+    window.showSshForTab('t1');
+    await new Promise(r => setTimeout(r, 60));
+    return {
+      split: document.getElementById('sessionSurface').classList.contains('split'),
+      filesVisible: document.getElementById('sftpBody').classList.contains('visible'),
+    };
+  });
+  check('leaving split restores the single surface', back, { split: false, filesVisible: false });
+
+  check('no page errors', errors, []);
+  await page.close();
+}
+
 (async () => {
   const server = await serve();
   const browser = await chromium.launch();
@@ -497,6 +726,8 @@ async function checkQueueGrouping(browser, server) {
     await checkConnectPicker(browser, server);
     await checkSftpLocalPane(browser, server);
     await checkQueueGrouping(browser, server);
+    await checkUxRefactor(browser, server);
+    await checkSessionSurface(browser, server);
   } finally {
     await browser.close();
     server.close();

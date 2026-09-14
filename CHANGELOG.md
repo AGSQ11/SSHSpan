@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Navigation is two objects plus Settings.** Keys and Servers are the
+  destinations. Deploy was a fifth nav item whose own copy read "Select keys to
+  deploy using the checkboxes in the Keys view" - an instruction to go and
+  operate a different view, which is what a task split at the wrong seam looks
+  like. Selecting keys now raises an action bar in the list, and Deploy opens a
+  sheet over it with that selection already loaded. The audit log moved into
+  Settings. `switchView` no longer takes `config` or `audit`; Ctrl+3 is
+  Settings and Ctrl+4/Ctrl+5 are gone.
+
+- **The vault control absorbed the two topbar buttons.** "Change password" and
+  "Lock" occupied the top-right of every view, including the audit log. Both
+  now hang off the vault chip at the bottom of the sidebar, which also shows the
+  auto-lock countdown - auto-lock was a setting with no feedback at all, so the
+  vault could seal mid-task with no warning it was coming. The freed topbar
+  space holds the Ctrl+K entry point.
+
+- **One category filter surface.** The sidebar tree, an "All categories"
+  toolbar button and a modal picker all filtered or assigned the same thing. The
+  tree filters (and now hides itself outside Keys and Servers); chips assign,
+  via a "+ Add" chip where the old "Browse categories..." button used to sit
+  below them.
+
+- **Key rows lead with the comment.** The row's second line was the full
+  SHA-256 fingerprint - 50-odd undifferentiated base64 characters, on every row,
+  in the one position a list is scanned by. The fingerprint moved to the detail
+  pane, which is where it gets compared. Rows gained a Deployed chip and a
+  Connect button; connecting with a key was previously reachable only by
+  right-clicking, with nothing on screen saying so.
+
+- **Export has its own tab.** It sat at the same visual weight as "Copy public
+  key", with a passphrase box permanently on screen including for the four
+  formats that ignore it and the two that carry no private key. Each format is
+  now marked Secret, Sealed or Public, the passphrase field appears only for the
+  format that uses one, and leaving the tab clears anything typed into it.
+
+- **Sessions show Shell, Files or Split.** The old control was a single button
+  labelled with the mode you would switch to, so it read "SFTP" while you were
+  looking at the shell. It is a three-way control labelled with the surface you
+  are on, and Split shows the terminal and the file browser at once.
+
+- **The remote path is a breadcrumb.** It was a bare text field, so going up two
+  directories meant editing a string. Segments are clickable; clicking the strip
+  hands back the editable field.
+
+- **Server rows carry their own state.** A live-session dot and a Connect button
+  (Enter works too). Connecting used to be a double-click with no affordance,
+  and whether a host already had a session open was visible only in the tab
+  strip.
+
+- **Settings is sectioned.** A section rail replaces one 760px-wide scroll,
+  rows are two-column with a line saying what each setting costs you, and every
+  toggle is the same component - Settings rendered raw browser checkboxes while
+  the deploy options one screen away used the styled toggle.
+
+### Added
+
+- **Ctrl+K command palette.** One search across keys, servers and categories,
+  plus actions that previously had no keyboard path at all (deploy the
+  selection, open the audit log, lock, new key, new server). Enter opens,
+  Ctrl+Enter connects in a new tab.
+
+### Fixed
+
+- **The key search box did nothing in the default grouped view.** `renderKeyList`
+  filtered into `rows` and then walked `state.keys` anyway, so a query only ever
+  had an all-or-nothing effect through the `rows.length === 0` bail. Typing a
+  term that matched one key still listed the whole vault.
+
+- **The deploy preview printed a literal `\n`.** `previewConfig` joined its
+  lines on `'\\n'` - an escaped backslash - so the generated config rendered as
+  one unreadable line. `deployConfig`, a few lines below, always used a real
+  newline. The preview is also live now; it used to stay empty until you pressed
+  a Preview button, making the first answer to "what will this write?" nothing.
+
 ## [1.7.3] - 2026-09-14
 
 ### Security

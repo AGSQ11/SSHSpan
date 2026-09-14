@@ -91,20 +91,18 @@ function sftpLog(tabId, line) {
 
 // ─── mode switching ─────────────────────────────────────────────────────────
 
-async function toggleSshSftpMode() {
+/// Put the active session on one of the three surfaces. 'split' shows the shell
+/// and the file browser side by side, because editing a file and running a
+/// command against it is one task - the old single toggle made you give up one
+/// to see the other.
+async function setSessionMode(mode) {
   const tab = sftpTab(state.activeTabId);
   if (!tab) return;
   if (!window.tabSessionLive(tab.tabId)) {
-    toast('Connect first - SFTP runs over the live session.', 'err');
+    toast('Connect first - the file browser runs over the live session.', 'err');
     return;
   }
-  if (tab.mode === 'sftp') {
-    tab.mode = 'ssh';
-    if (state.activeTabId === tab.tabId) {
-      if (typeof window.activateSessionSurface === 'function') window.activateSessionSurface(tab.tabId);
-      else showSshForTab(tab.tabId);
-    }
-  } else {
+  if (mode === 'sftp' || mode === 'split') {
     try {
       if (!tab.sftpReady) {
         const r = await sftpCall('sftp_open', { sessionId: tab.sessionId });
@@ -114,22 +112,58 @@ async function toggleSshSftpMode() {
         sftpCall('sftp_keepalive_start', { sessionId: tab.sessionId }).catch(() => {});
         wireQueueEvents();
       }
-      tab.mode = 'sftp';
-      if (state.activeTabId === tab.tabId) {
-        if (typeof window.activateSessionSurface === 'function') window.activateSessionSurface(tab.tabId);
-        else showSftpForTab(tab.tabId);
-      }
-      await refreshSftpPanel(tab.tabId);
     } catch (e) {
       toast(e.message || String(e), 'err');
+      return;
     }
   }
+  tab.mode = mode;
+  if (state.activeTabId === tab.tabId) {
+    if (typeof window.activateSessionSurface === 'function') window.activateSessionSurface(tab.tabId);
+  }
+  if (mode === 'sftp' || mode === 'split') await refreshSftpPanel(tab.tabId);
   updateTerminalHead();
+}
+
+/// Kept for the terminal context menu and anything else that just wants the
+/// other surface; it now cycles shell -> files -> split.
+async function toggleSshSftpMode() {
+  const tab = sftpTab(state.activeTabId);
+  if (!tab) return;
+  const next = tab.mode === 'ssh' ? 'sftp' : tab.mode === 'sftp' ? 'split' : 'ssh';
+  await setSessionMode(next);
+}
+
+/// Shell and file browser at once. The surfaces are siblings in a flex row, so
+/// showing both is a class on the wrapper plus leaving the terminal visible;
+/// xterm has to be re-fit afterwards or it keeps the old column count.
+function showSplitForTab(tabId) {
+  showSftpForTab(tabId);
+  const surface = document.getElementById('sessionSurface');
+  const body = document.getElementById('terminalBody');
+  const splitter = document.getElementById('surfaceSplitter');
+  const rec = window.tabRecord ? window.tabRecord(tabId) : null;
+  if (surface) surface.classList.add('split');
+  if (splitter) splitter.hidden = false;
+  if (body) body.style.display = 'flex';
+  if (rec && rec.hostEl) rec.hostEl.style.display = 'block';
+  if (typeof window.showTabTerminal === 'function') window.showTabTerminal(tabId);
+  requestAnimationFrame(() => {
+    if (typeof window.fitActiveTerminal === 'function') window.fitActiveTerminal();
+  });
+}
+
+function clearSplit() {
+  const surface = document.getElementById('sessionSurface');
+  const splitter = document.getElementById('surfaceSplitter');
+  if (surface) surface.classList.remove('split');
+  if (splitter) splitter.hidden = true;
 }
 
 function showSftpForTab(tabId) {
   const body = document.getElementById('terminalBody');
   const sbody = document.getElementById('sftpBody');
+  clearSplit();
   if (body) body.style.display = 'none';
   if (sbody) {
     sbody.classList.add('visible');
@@ -149,8 +183,6 @@ function showSftpForTab(tabId) {
     sbody.appendChild(queuePanel);
   }
   if (queuePanel) queuePanel.style.display = 'flex';
-  const label = document.getElementById('termModeLabel');
-  if (label) label.textContent = 'SSH';
   const rec = window.tabRecord ? window.tabRecord(tabId) : null;
   if (rec && rec.hostEl) rec.hostEl.style.display = 'none';
 }
@@ -158,6 +190,7 @@ function showSftpForTab(tabId) {
 function showSshForTab(tabId) {
   const rec = window.tabRecord ? window.tabRecord(tabId) : null;
   const sbody = document.getElementById('sftpBody');
+  clearSplit();
   if (sbody) {
     sbody.classList.remove('visible');
     for (const child of sbody.children) child.style.display = 'none';
@@ -166,8 +199,9 @@ function showSshForTab(tabId) {
   if (body) body.style.display = 'flex';
   if (rec && rec.hostEl) rec.hostEl.style.display = 'block';
   if (typeof window.showTabTerminal === 'function') window.showTabTerminal(tabId);
-  const label = document.getElementById('termModeLabel');
-  if (label) label.textContent = 'SFTP';
+  requestAnimationFrame(() => {
+    if (typeof window.fitActiveTerminal === 'function') window.fitActiveTerminal();
+  });
 }
 
 // ─── panel construction ─────────────────────────────────────────────────────
@@ -291,13 +325,29 @@ function buildSftpPanel(tabId) {
   pathBox.placeholder = '/remote/path - Enter to navigate';
   pathBox.spellcheck = false;
   pathBox.autocomplete = 'off';
+  pathBox.hidden = true;   // the breadcrumb below is the default face
   pathBox.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter') { ev.preventDefault(); sftpUiNavigateRemote(tabId, pathBox.value.trim()); }
-    else if (ev.key === 'Escape') { pathBox.value = sftpTab(tabId)?.sftpPath || ''; pathBox.blur(); }
+    else if (ev.key === 'Escape') { pathBox.value = sftpTab(tabId)?.sftpPath || ''; showRemoteCrumbs(tabId); }
   });
   pathBox.addEventListener('focus', () => pathBox.select());
+  pathBox.addEventListener('blur', () => showRemoteCrumbs(tabId));
+
+  /// The path was a bare text field: to go up two directories you edited a
+  /// string. Each segment is now a button, and clicking the empty space (or the
+  /// pencil) hands you back the field you are reading this in.
+  const crumbs = document.createElement('div');
+  crumbs.className = 'sftp-crumbs';
+  crumbs.id = 'sftpCrumbs-' + tabId;
+  crumbs.title = 'Click a folder to jump to it, or click here to type a path';
+  crumbs.addEventListener('click', (ev) => {
+    if (ev.target.closest('.sftp-crumb')) return;   // a segment handles its own click
+    editRemotePath(tabId);
+  });
+
   const remoteCopy = mkPathCopy(() => sftpTab(tabId)?.sftpPath || '');
   remoteHead.appendChild(remoteTitle);
+  remoteHead.appendChild(crumbs);
   remoteHead.appendChild(pathBox);
   remoteHead.appendChild(remoteCopy);
 
@@ -534,6 +584,63 @@ function sftpUiNormalizeRemotePath(input) {
 }
 
 /// Enter in the remote path box: navigate; on failure toast and revert.
+/// Draw the current remote path as clickable segments.
+function renderRemoteCrumbs(tabId) {
+  const crumbs = document.getElementById('sftpCrumbs-' + tabId);
+  if (!crumbs) return;
+  const full = (sftpTab(tabId) || {}).sftpPath || '/';
+  crumbs.innerHTML = '';
+
+  const mk = (label, target, isLast) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sftp-crumb' + (isLast ? ' current' : '');
+    b.textContent = label;
+    b.title = target;
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (!isLast) sftpUiNavigateRemote(tabId, target);
+    });
+    crumbs.appendChild(b);
+  };
+  const sep = () => {
+    const s = document.createElement('span');
+    s.className = 'sftp-crumb-sep';
+    s.textContent = '›';
+    crumbs.appendChild(s);
+  };
+
+  const parts = full.split('/').filter(Boolean);
+  mk('/', '/', parts.length === 0);
+  let acc = '';
+  parts.forEach((p, i) => {
+    acc += '/' + p;
+    sep();
+    mk(p, acc, i === parts.length - 1);
+  });
+}
+
+/// Swap the breadcrumb for the editable field - the same input that used to be
+/// the only way to see where you were.
+function editRemotePath(tabId) {
+  const crumbs = document.getElementById('sftpCrumbs-' + tabId);
+  const pathBox = document.getElementById('sftpPath-' + tabId);
+  if (!crumbs || !pathBox) return;
+  pathBox.value = (sftpTab(tabId) || {}).sftpPath || '';
+  crumbs.hidden = true;
+  pathBox.hidden = false;
+  pathBox.focus();
+}
+
+function showRemoteCrumbs(tabId) {
+  const crumbs = document.getElementById('sftpCrumbs-' + tabId);
+  const pathBox = document.getElementById('sftpPath-' + tabId);
+  if (!crumbs || !pathBox) return;
+  pathBox.hidden = true;
+  crumbs.hidden = false;
+  renderRemoteCrumbs(tabId);
+}
+
 async function sftpUiNavigateRemote(tabId, input) {
   const tab = sftpTab(tabId);
   const box = document.getElementById('sftpPath-' + tabId);
@@ -544,6 +651,9 @@ async function sftpUiNavigateRemote(tabId, input) {
     box.value = tab.sftpPath || '/';
     return;
   }
+  // Whether you typed a path or clicked a crumb, you end up back on the
+  // breadcrumb - the field is a detour, not the resting state.
+  showRemoteCrumbs(tabId);
   if (norm.path === tab.sftpPath) { box.value = tab.sftpPath; return; }
   const prev = tab.sftpPath;
   tab.sftpPath = norm.path;
@@ -777,6 +887,7 @@ async function refreshSftpPanel(tabId, opts = {}) {
     tab._quickFind = ''; // a fresh listing drops an in-progress quick-find
     const pathBox = document.getElementById('sftpPath-' + tabId);
     if (pathBox && document.activeElement !== pathBox) pathBox.value = tab.sftpPath;
+    renderRemoteCrumbs(tabId);
     renderEntries(tabId);
     if (tab.dualPane) refreshLocalPane(tabId);
     if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
@@ -3664,6 +3775,8 @@ window.toggleSshSftpMode = toggleSshSftpMode;
 window.refreshSftpPanel = refreshSftpPanel;
 window.showSshForTab = showSshForTab;
 window.showSftpForTab = showSftpForTab;
+window.showSplitForTab = showSplitForTab;
+window.setSessionMode = setSessionMode;
 window.sftpQueueDownloads = queueDownloads;
 window.sftpConflictDefaults = sftpConflictDefaults;
 window.sftpCmpToggle = sftpCmpToggle;
