@@ -72,7 +72,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
   renderer:
-    name: Renderer (syntax)
+    name: Renderer (syntax, behaviour)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -100,6 +100,21 @@ jobs:
       # buildSftpPanel and blanked the entire SFTP view.
       - name: Undefined project functions
         run: node scripts/check-renderer-globals.js
+
+      # Static checks only find shapes we have already been burned by. They
+      # cannot tell an empty key list from a broken one: reading .parent_id
+      # off a category *id* is valid JavaScript that silently dropped every
+      # categorized key out of the default view. This drives the real page in
+      # headless Chromium and asserts what the user should see.
+      # Pinned exactly: the package and the browser revision it downloads have
+      # to match, and only playwright is installed rather than the whole
+      # devDependency tree, which this job has no use for.
+      - name: Renderer UI behaviour
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-audit --no-fund playwright@1.56.1
+          npx playwright install --with-deps chromium
+          npm run test:ui
 
   ipc-arg-names:
     name: IPC argument names
