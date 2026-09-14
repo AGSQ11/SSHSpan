@@ -1243,38 +1243,56 @@ function renderKeyList() {
 
   // Grouped: by category (or uncategorized if no cats).
   // First, build the group order: roots in sort_index order; for each, walk sub-tree.
-  const groups = []; // { id|null (uncategorized) | categoryId, name, keys[] }
+  const groups = []; // { id: 'cat:<rootId>' | 'uncategorized', name, keys[] }
   const seen = new Set();
-  const placeKey = (k) => {
-    const cats = state.keyCategories[k.id] || [];
-    if (!cats.length) { groups.push({ id: 'uncategorized', name: 'Uncategorized', keys: [k] }); return; }
-    for (const c of cats) {
-      // Each category the key belongs to: walk the chain to find the *root ancestor* so the key
-      // appears once per root path. This is the natural "EU DC1" vs "Asia DC1" grouping.
-      let top = c;
-      while (top.parent_id) top = catById(top.parent_id);
-      const key = 'cat:' + top.id;
-      if (seen.has(key + ':' + k.id)) continue;
-      seen.add(key + ':' + k.id);
-      let g = groups.find(g => g.id === key);
-      if (!g) { g = { id: key, name: catPathString(top.id) + ' / ' + c.name, _topId: top.id, _leafId: c.id, keys: [] }; groups.push(g); }
-      g.keys.push(k);
+  /// state.keyCategories maps a key id to category *ids*, not to category
+  /// objects. Resolving them is what makes the walk to the root ancestor work
+  /// at all - reading .parent_id straight off a string yields undefined, which
+  /// is how every categorized key used to end up in no group and so render
+  /// nowhere in this view.
+  const catsOf = (k) => (state.keyCategories[k.id] || []).map(catById).filter(Boolean);
+  /// The root ancestor of a category, tolerating a parent chain that a
+  /// restored or hand-edited vault left dangling or circular.
+  const rootOf = (cat) => {
+    let top = cat;
+    const chain = new Set([top.id]);
+    while (top.parent_id) {
+      const parent = catById(top.parent_id);
+      if (!parent || chain.has(parent.id)) break;
+      chain.add(parent.id);
+      top = parent;
     }
+    return top;
   };
-  // Render groups in a stable order: roots in sort_index order; uncategorized last.
-  const rootIds = state.categories.filter(c => !c.parent_id).map(c => c.id);
-  for (const rootId of rootIds) {
+  const groupFor = (id, name) => {
+    let g = groups.find(g => g.id === id);
+    if (!g) { g = { id, name, keys: [] }; groups.push(g); }
+    return g;
+  };
+  // Render groups in a stable order: roots in sort_index order; uncategorized
+  // last. A category whose parent no longer exists is a root too, or the keys
+  // filed under it would belong to no group and so render nowhere.
+  const rootCats = state.categories
+    .filter(c => c.scope === 'key' && (!c.parent_id || !catById(c.parent_id)))
+    .sort((a, b) => a.sort_index - b.sort_index || a.name.localeCompare(b.name));
+  for (const root of rootCats) {
+    // A key appears once per root ancestor it has a category under - the
+    // natural "EU DC1" vs "Asia DC1" grouping - and only once per root even
+    // when several of its categories share one. The group is named for that
+    // root, since naming it after one descendant would misdescribe what it
+    // collects. Walking roots outer and keys inner is what keeps both the
+    // group order and the order within each group stable.
     for (const k of state.keys) {
-      const cats = state.keyCategories[k.id] || [];
-      if (cats.some(c => { let t = c; while (t.parent_id) t = catById(t.parent_id); return t.id === rootId; })) placeKey(k);
+      if (!catsOf(k).some(c => rootOf(c).id === root.id)) continue;
+      const id = 'cat:' + root.id;
+      if (seen.has(id + ':' + k.id)) continue;
+      seen.add(id + ':' + k.id);
+      groupFor(id, catPathString(root.id)).keys.push(k);
     }
   }
   for (const k of state.keys) {
-    const cats = state.keyCategories[k.id] || [];
-    if (!cats.length) placeKey(k);
+    if (!catsOf(k).length) groupFor('uncategorized', 'Uncategorized').keys.push(k);
   }
-  // Dedupe keys within each group (since placeKey runs multiple times in the loop above for the same key across multiple cats - we want each key once per top-level ancestor it appears in)
-  for (const g of groups) g.keys = dedupeById(g.keys);
 
   for (const g of groups) {
     const grp = document.createElement('div');
@@ -1308,12 +1326,6 @@ function renderKeyList() {
     for (const k of g.keys) grp.appendChild(keyRowEl(k, g.keys));
     list.appendChild(grp);
   }
-}
-
-function dedupeById(arr) {
-  const seen = new Set(); const out = [];
-  for (const k of arr) { if (!seen.has(k.id)) { seen.add(k.id); out.push(k); } }
-  return out;
 }
 
 function keyRowEl(k, groupKeys) {
