@@ -1,4 +1,4 @@
-//! Two-way sync between the SSHSpan vault and Bitwarden vault —
+//! Two-way sync between the SSHSpan vault and Bitwarden vault -
 //! 1:1 port of bitwardenSyncService.js
 //!
 //! Sync model (per row, newest side wins):
@@ -14,6 +14,12 @@ use crate::db::{Database, KeyRecord};
 use anyhow::Result;
 
 /// Run a full two-way sync. Returns a JSON summary.
+///
+/// `cancelled` is polled before every remote/local mutation; when it reports
+/// true (the vault was locked mid-sync) the sync aborts with an error instead
+/// of spending more secrets or writing into the locked vault. This is the
+/// lock-cancellation the audit's F2 requires: a sync started before a lock
+/// must not keep pushing/pulling after it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sync(
     server_url: &str,
@@ -25,7 +31,16 @@ pub async fn run_sync(
     db: &Database,
     vault_password: &str,
     allow_remote_overwrite: bool,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<serde_json::Value> {
+    // Abort helper: evaluated at each mutation boundary below.
+    let check = || -> Result<()> {
+        if cancelled() {
+            anyhow::bail!("Vault was locked; sync aborted.")
+        }
+        Ok(())
+    };
+    check()?;
     let mut client = BitwardenClient::new(server_url, email, master_password, device_id)?;
     client.connect().await?;
 
@@ -128,6 +143,7 @@ pub async fn run_sync(
 
     // ─── Pass 1: local → remote ──────────────────────────────────────────
     for row in &local_keys {
+        check()?; // abort promptly if the vault was locked mid-sync
         if row.private_key_encrypted.is_empty() {
             continue; // public-only
         }
@@ -218,6 +234,7 @@ pub async fn run_sync(
 
     // ─── Pass 2: remote → local (unmatched items) ────────────────────────
     for cipher in &remote_ssh {
+        check()?;
         if matched_remote.contains(&cipher.id) {
             continue;
         }
@@ -254,7 +271,7 @@ pub async fn run_sync(
             .and_then(|n| client.decrypt_field(n).ok())
             .unwrap_or_else(|| "imported key".to_string());
         // Remote cipher names are arbitrary text but become Host aliases in
-        // ~/.ssh/config on deploy — sanitize rather than skipping the item,
+        // ~/.ssh/config on deploy - sanitize rather than skipping the item,
         // and leave an audit trail of the mapping.
         let name = sanitize_sync_name(db, &name);
 
@@ -400,6 +417,7 @@ pub async fn run_sync(
     let (mut servers_pulled, mut servers_updated_local) = (0usize, 0usize);
 
     for sv in &local_servers {
+        check()?;
         let cipher = sv
             .bitwarden_id
             .as_ref()
@@ -464,6 +482,7 @@ pub async fn run_sync(
     }
 
     for cipher in &remote_logins {
+        check()?;
         if server_matched.contains(&cipher.id) {
             continue;
         }
@@ -506,7 +525,7 @@ async fn push_local_key(
     db: &Database,
     vault_password: &str,
 ) -> Result<()> {
-    // Decrypt the private key. A failed unseal must abort the push — the
+    // Decrypt the private key. A failed unseal must abort the push - the
     // sealed ciphertext is never valid key material.
     let private_bytes = unseal_private_key(vault_password, &row.private_key_encrypted)?;
 
@@ -624,7 +643,7 @@ async fn pull_remote_item(
         .and_then(|n| client.decrypt_field(n).ok())
         .unwrap_or_else(|| row.name.clone());
     // Remote cipher names are arbitrary text but become Host aliases in
-    // ~/.ssh/config on deploy — sanitize rather than failing the item.
+    // ~/.ssh/config on deploy - sanitize rather than failing the item.
     let name = sanitize_sync_name(db, &name);
 
     let key_data = if priv_pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
@@ -1097,12 +1116,12 @@ mod tests {
         assert_eq!(unsealed, key);
     }
 
-    // NOTE: seal_private_key has no unit-testable failure path here — the
+    // NOTE: seal_private_key has no unit-testable failure path here - the
     // underlying crypto::vault::seal is deterministic-success for any
     // password (Argon2 accepts even empty passwords), and adding a failure
     // injection point would mean changing the crypto, which is out of scope.
-    // Its contract — error propagation instead of an empty-ciphertext
-    // substitute — is enforced by the type system (Result return, no
+    // Its contract - error propagation instead of an empty-ciphertext
+    // substitute - is enforced by the type system (Result return, no
     // unwrap_or_default at call sites) and verified by inspection.
 
     #[test]

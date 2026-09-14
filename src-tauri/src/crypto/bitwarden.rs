@@ -104,15 +104,28 @@ pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow
     let kdf = &clamp_kdf_params(kdf.kdf_type, kdf.iterations, kdf.memory, kdf.parallelism)?;
     let pw = password.as_bytes();
     let salt = email.trim().to_lowercase();
-    let salt_bytes = salt.as_bytes();
 
     match kdf.kdf_type {
         0 => {
+            // PBKDF2 uses the normalized email bytes directly as the salt.
             let iterations = kdf.iterations.max(PBKDF2_MIN_ITERATIONS);
-            Ok(pbkdf2_hmac_array::<Sha256, 32>(pw, salt_bytes, iterations))
+            Ok(pbkdf2_hmac_array::<Sha256, 32>(pw, salt.as_bytes(), iterations))
         }
         1 => {
             use argon2::{Algorithm, Argon2, Params, Version};
+            // SECURITY (interoperability): the official Bitwarden client does
+            // NOT feed the raw email into Argon2 - it first hashes the
+            // normalized email with SHA-256 and uses THAT 32-byte digest as
+            // the Argon2 salt (sdk-internal crates/bitwarden-crypto kdf.rs:
+            // `let salt_sha = sha2::Sha256::new().chain_update(salt).finalize();`
+            // then `argon.hash_password_into(secret, &salt_sha, ...)`).
+            // Using the raw email produces a different master key for the
+            // same credentials, so an Argon2-configured account could never
+            // authenticate or decrypt. Hash the email here to match.
+            use sha2::Digest;
+            let salt_sha = sha2::Sha256::new()
+                .chain_update(salt.as_bytes())
+                .finalize();
             let memory = kdf.memory.max(ARGON2_MIN_MEMORY_KIB);
             let iterations = kdf.iterations.max(ARGON2_MIN_ITERATIONS);
             let parallelism = kdf.parallelism.max(ARGON2_MIN_PARALLELISM);
@@ -121,7 +134,7 @@ pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow
             let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
             let mut key = [0u8; 32];
             argon2
-                .hash_password_into(pw, salt_bytes, &mut key)
+                .hash_password_into(pw, &salt_sha, &mut key)
                 .map_err(|e| anyhow::anyhow!("Argon2 derivation failed: {e}"))?;
             Ok(key)
         }
@@ -392,6 +405,29 @@ mod tests {
         };
         let key_floor = derive_master_key("password", "user@example.com", &kdf_floor).unwrap();
         assert_eq!(key_low, key_floor);
+    }
+
+    /// Interop regression: the Argon2 salt must be SHA-256(normalized email),
+    /// not the raw email. Vector from the official Bitwarden SDK
+    /// (sdk-internal crates/bitwarden-crypto/src/keys/kdf.rs), reproduced
+    /// independently with argon2-cffi: Argon2id(password="67t9b5g67$%Dh89n",
+    /// salt=SHA256("test_key"), m=32 MiB, t=4, p=2, out=32) = cff0e1b1....
+    /// Before the fix this code derived f862b03e... (raw-salt), which can never
+    /// authenticate against a real Argon2-configured Bitwarden account.
+    #[test]
+    fn kdf_argon2_matches_official_sdk_vector() {
+        let kdf = KdfParams {
+            kdf_type: 1,
+            iterations: 4,
+            memory: 32 * 1024, // 32 MiB in KiB
+            parallelism: 2,
+        };
+        let key = derive_master_key("67t9b5g67$%Dh89n", "test_key", &kdf).unwrap();
+        assert_eq!(
+            hex(&key),
+            "cff0e1b1a213a34c626ab3afe00911f01493ed2ff6968db83ee183f23335e1f2",
+            "Argon2id master key must match the official Bitwarden SDK test vector"
+        );
     }
 
     #[test]

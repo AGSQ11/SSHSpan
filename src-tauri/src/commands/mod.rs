@@ -85,6 +85,62 @@ fn vault_password(app: &AppHandle) -> CmdResult<zeroize::Zeroizing<String>> {
         .unwrap_or_default())
 }
 
+/// Monotonic vault generation, bumped at the very start of every lock.
+///
+/// Long-running secret-consuming operations (SSH connect, SFTP open, key
+/// export, Bitwarden sync) capture the generation BEFORE their first network
+/// await and re-check it at every secret-consuming/committing boundary. A
+/// lock bumps the counter BEFORE tearing anything down, so an in-progress
+/// operation that crosses the lock observes a changed generation and aborts
+/// instead of registering a session or exporting a secret into the locked
+/// state. This closes the race the audit's F2 describes: clearing the
+/// password store alone does not revoke copies a pending task already holds.
+pub struct VaultGeneration(std::sync::atomic::AtomicU64);
+
+impl VaultGeneration {
+    pub fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+    /// Current generation value.
+    pub fn current(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Advance to a new generation (called on lock, before teardown).
+    pub fn bump(&self) -> u64 {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+    /// True when `captured` is still the current generation AND the vault is
+    /// unlocked. Both halves are required: a captured generation from a
+    /// previous unlock session must never authorize a later one.
+    pub fn is_current(&self, captured: u64, unlocked: bool) -> bool {
+        unlocked && self.current() == captured
+    }
+}
+
+/// Capture the current generation for a pending secret-consuming operation.
+/// Returns the generation only when the vault is unlocked; callers pair it
+/// with [`VaultGeneration::is_current`] / [`require_generation_current`].
+pub fn capture_vault_generation(app: &AppHandle) -> CmdResult<u64> {
+    if vault_password(app)?.is_empty() {
+        return Err(CmdError("Vault is locked.".into()));
+    }
+    Ok(app.state::<VaultGeneration>().current())
+}
+
+/// Abort a pending operation if the vault was locked (generation bumped) or
+/// is now locked since `captured` was taken. Called at the point a pending
+/// operation is about to commit a side effect (register a session, write an
+/// export, apply a sync) after one or more awaits.
+pub fn require_generation_current(app: &AppHandle, captured: u64) -> CmdResult<()> {
+    let unlocked = !vault_password(app)?.is_empty();
+    if !app.state::<VaultGeneration>().is_current(captured, unlocked) {
+        return Err(CmdError(
+            "Vault was locked while the operation was in progress.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// In-memory vault password (set on unlock, cleared on lock).
 /// Wrapped in `Zeroizing` so the password is wiped from memory when the
 /// store replaces or drops it, not just left as freed heap bytes.
@@ -317,6 +373,11 @@ pub fn vault_lock(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// that survive into a locked vault would otherwise be using unsealed key
 /// material with no way to re-derive it.
 pub(crate) fn lock_vault_internal(app: &AppHandle) {
+    // Bump the generation FIRST, before any teardown. An in-progress connect,
+    // SFTP open, export, or sync that captured the old generation observes the
+    // bump at its next commit boundary and aborts, so a pending operation can
+    // never register a session or spend a secret into the now-locked vault.
+    app.state::<VaultGeneration>().bump();
     app.state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
         .kill_all();
     app.state::<crate::sftp::EditRegistry>().stop_all();
@@ -426,17 +487,35 @@ pub fn vault_change_password(
     let servers = db.list_servers().map_err(|e| e.to_string())?;
     // Everything is re-encrypted in memory first; if any record fails to
     // unseal, the whole change is aborted and nothing is persisted.
-    let migration = migrate_vault_records(keys, servers, &current_password, &new_password)?;
+    let mut migration = migrate_vault_records(keys, servers, &current_password, &new_password)?;
+
+    // The stored Bitwarden master password is sealed with the SAME vault
+    // password, so it must be re-sealed too - otherwise sync silently strands
+    // on the old password after a rotation (F6). Re-seal it in memory here so
+    // it commits in the same transaction below. A missing/unconfigured
+    // credential is fine (None); an unsealable one aborts the whole change.
+    let bw_config = db.load_bitwarden_config().map_err(|e| e.to_string())?;
+    migration.bitwarden_master_password = match bw_config.master_password.as_ref() {
+        Some(sealed) => {
+            let plain = crate::crypto::vault::unseal(&current_password, sealed)
+                .map_err(|e| format!("Cannot re-encrypt the stored Bitwarden password: {e}"))?;
+            Some(crate::crypto::vault::seal(&new_password, &plain).map_err(CmdError::from)?)
+        }
+        None => None,
+    };
 
     let hashed = hash_master_password(&new_password).map_err(CmdError::from)?;
-    for key in &migration.keys {
-        db.update_key(key).map_err(|e| e.to_string())?;
-    }
-    for server in &migration.servers {
-        db.update_server(server).map_err(|e| e.to_string())?;
-    }
-    db.set_config(MASTER_HASH_KEY, &hashed)
-        .map_err(|e| e.to_string())?;
+    // Single transaction: every re-sealed record, the Bitwarden credential,
+    // and the verifier commit together or not at all (F3). A crash or I/O
+    // error part-way rolls back to the complete old state instead of leaving
+    // the vault split across two passwords.
+    db.apply_vault_rotation(
+        &migration.keys,
+        &migration.servers,
+        migration.bitwarden_master_password.as_deref(),
+        &hashed,
+    )
+    .map_err(|e| e.to_string())?;
     let reencrypted = migration.keys.len() as u32;
     db.add_audit(
         "vault.password_changed",
@@ -457,6 +536,9 @@ struct VaultMigration {
     keys: Vec<KeyRecord>,
     /// Only servers that actually had a saved password to re-seal.
     servers: Vec<db::ServerRecord>,
+    /// Re-sealed Bitwarden master password (None when sync is not configured).
+    /// Filled in by the caller after `migrate_vault_records` runs.
+    bitwarden_master_password: Option<String>,
 }
 
 /// Unseal every stored private key and saved server password with the current
@@ -507,6 +589,7 @@ fn migrate_vault_records(
     Ok(VaultMigration {
         keys: migrated_keys,
         servers: migrated_servers,
+        bitwarden_master_password: None,
     })
 }
 
@@ -1101,7 +1184,7 @@ pub fn vault_backup_restore(
 #[tauri::command]
 /// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
 /// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
-/// called from there — the window stops responding and never repaints, which
+/// called from there - the window stops responding and never repaints, which
 /// is what "Create Backup freezes the whole program" was. An async command
 /// runs on the async runtime instead, where blocking for the user's answer is
 /// safe.
@@ -1641,7 +1724,7 @@ fn private_export_extension(format: &str) -> &'static str {
 #[tauri::command]
 /// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
 /// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
-/// called from there — the window stops responding and never repaints, which
+/// called from there - the window stops responding and never repaints, which
 /// is what "Create Backup freezes the whole program" was. An async command
 /// runs on the async runtime instead, where blocking for the user's answer is
 /// safe.
@@ -1655,6 +1738,10 @@ pub async fn key_export_to_file(
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
+    // Capture the generation before the (decrypt → dialog → write) sequence:
+    // the save dialog blocks on user input for an unbounded time, during
+    // which the vault could be locked. Re-checked before the write below.
+    let generation = capture_vault_generation(&app)?;
     match format.as_str() {
         "openssh-private" | "ppk" | "pkcs8" | "pkcs8-encrypted" => {}
         other => {
@@ -1673,13 +1760,19 @@ pub async fn key_export_to_file(
 
     let key_data = load_private_key_data(&app, &key, &pw)?;
     let pass = passphrase.as_deref().filter(|p| !p.is_empty());
-    let data = match format.as_str() {
-        "openssh-private" => keys::export_private_key(&key_data, KeyFormat::OpenSsh, pass),
-        "pkcs8" | "pkcs8-encrypted" => keys::export_private_key(&key_data, KeyFormat::Pkcs8, pass),
-        "ppk" => keys::export_private_key(&key_data, KeyFormat::Putty, pass),
-        _ => unreachable!("format restricted above"),
-    }
-    .map_err(|e| e.to_string())?;
+    // Zeroizing: the serialized private key is wiped from this frame once
+    // written, not left as freed heap (secret-wiping hardening).
+    let data = zeroize::Zeroizing::new(
+        match format.as_str() {
+            "openssh-private" => keys::export_private_key(&key_data, KeyFormat::OpenSsh, pass),
+            "pkcs8" | "pkcs8-encrypted" => {
+                keys::export_private_key(&key_data, KeyFormat::Pkcs8, pass)
+            }
+            "ppk" => keys::export_private_key(&key_data, KeyFormat::Putty, pass),
+            _ => unreachable!("format restricted above"),
+        }
+        .map_err(|e| e.to_string())?,
+    );
 
     use tauri_plugin_dialog::DialogExt;
     let default_name = format!("{}{}", key.name, private_export_extension(&format));
@@ -1692,6 +1785,9 @@ pub async fn key_export_to_file(
     let Some(path) = picked else {
         return Ok(serde_json::json!({ "canceled": true }));
     };
+    // The dialog has closed; if the vault was locked while the user decided,
+    // do not write private material decrypted under the now-locked vault.
+    require_generation_current(&app, generation)?;
     let path_str = path.to_string();
     // The dialog choice is the user's approval; keep the absolute/app-data/
     // system checks as a backstop (a dialog path is always absolute, but the
@@ -1731,7 +1827,7 @@ pub fn key_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
 ///
 /// SECURITY: the name is used verbatim as a `Host` alias when the SSH config
 /// is written, so it goes through the same `validate_key_name` gate as
-/// creation and import — a rename must not be a way to smuggle in whitespace
+/// creation and import - a rename must not be a way to smuggle in whitespace
 /// or newlines and inject config directives. Nothing else about the key is
 /// touched; the private material is not decrypted or re-encrypted to rename.
 #[tauri::command]
@@ -1836,6 +1932,10 @@ pub fn key_deploy(
 
 #[tauri::command]
 pub fn key_remove_deployed(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
+    // Deleting local files is a privileged side effect; refuse while locked.
+    if vault_password(&app)?.is_empty() {
+        return Err("Vault is locked.".into());
+    }
     let key = app
         .state::<AppState>()
         .db
@@ -1844,8 +1944,38 @@ pub fn key_remove_deployed(app: AppHandle, id: String) -> CmdResult<serde_json::
     let key = key.ok_or_else(|| "Key not found.".to_string())?;
 
     if let Some(deploy_path) = &key.deploy_path {
-        let _ = fs::remove_file(deploy_path);
-        let _ = fs::remove_file(format!("{}.pub", deploy_path));
+        // Only ever delete inside the managed SSH directory (~/.ssh). The
+        // stored path is normally produced by deploy_key, but a pre-F9 backup
+        // restore (or direct DB tampering) could have written an arbitrary
+        // path here; authenticated encryption of a backup does not make its
+        // local deployment paths trustworthy. Canonicalize the parent so
+        // `..`/junction games cannot escape, then require containment before
+        // touching the filesystem.
+        let candidate = std::path::Path::new(deploy_path);
+        let managed = dirs::home_dir().map(|h| h.join(".ssh"));
+        let contained = match (&managed, candidate.parent()) {
+            (Some(m), Some(parent)) => {
+                let m_norm = dunce::canonicalize(m).unwrap_or_else(|_| m.clone());
+                let p_norm = dunce::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                p_norm.starts_with(&m_norm)
+            }
+            _ => false,
+        };
+        if contained {
+            let _ = fs::remove_file(deploy_path);
+            let _ = fs::remove_file(format!("{}.pub", deploy_path));
+        } else {
+            // Refuse to delete outside the managed directory; still clear the
+            // record so the UI no longer reports a phantom deployment.
+            log::warn!(
+                "[sshspan-keys] key_remove_deployed: refusing to delete {deploy_path} (outside managed ~/.ssh); clearing the deployment record only"
+            );
+            let _ = app.state::<AppState>().db.add_audit(
+                "keys.undeploy_refused",
+                Some(&id),
+                "stored deploy_path outside managed directory; record cleared, file untouched",
+            );
+        }
     }
     let mut updated = key;
     updated.deployed = false;
@@ -2193,6 +2323,10 @@ pub fn bitwarden_save_config(
     config.server_url = Some(validated_url);
     config.email = Some(email);
     if let Some(mp) = master_password.filter(|s| !s.is_empty()) {
+        // Wrap in Zeroizing immediately: the plaintext Bitwarden master
+        // password must be wiped from this frame once sealed, not left as
+        // freed heap (secret-wiping hardening).
+        let mp = zeroize::Zeroizing::new(mp);
         // Seal the Bitwarden master password with the SSHSpan vault password
         let sealed = crate::crypto::vault::seal(&pw, mp.as_bytes()).map_err(|e| e.to_string())?;
         config.master_password = Some(sealed);
@@ -2228,11 +2362,13 @@ pub async fn bitwarden_test_connection(app: AppHandle) -> CmdResult<serde_json::
         .ok_or_else(|| "No master password stored. Re-save the sync settings.".to_string())?;
 
     let pw = vault_password(&app)?;
-    let master_password =
+    // Zeroizing: the decrypted Bitwarden master password is wiped on drop.
+    let master_password = zeroize::Zeroizing::new(
         String::from_utf8(crate::crypto::vault::unseal(&pw, &mp_sealed).map_err(|_| {
             "Failed to decrypt stored Bitwarden password. Re-save the sync settings.".to_string()
         })?)
-        .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())?;
+        .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())?,
+    );
 
     let device_id = config
         .device_id
@@ -2301,16 +2437,35 @@ pub async fn bitwarden_sync(
         .unwrap_or_else(|| "SSHSpan_Servers".to_string());
 
     let pw = vault_password(&app)?;
-    let master_password = String::from_utf8(
-        crate::crypto::vault::unseal(&pw, &mp_sealed)
-            .map_err(|_| "Failed to decrypt stored Bitwarden password.".to_string())?,
-    )
-    .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())?;
+    // Zeroizing: the decrypted Bitwarden master password is wiped on drop.
+    let master_password = zeroize::Zeroizing::new(
+        String::from_utf8(
+            crate::crypto::vault::unseal(&pw, &mp_sealed)
+                .map_err(|_| "Failed to decrypt stored Bitwarden password.".to_string())?,
+        )
+        .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())?,
+    );
 
     let device_id = config
         .device_id
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let db = app.state::<AppState>().db.clone();
+
+    // Capture the vault generation so a lock mid-sync cancels the run at the
+    // next mutation boundary (sync pushes/pulls secrets; it must not continue
+    // after the vault that authorized it has locked).
+    let generation = capture_vault_generation(&app)?;
+    let app_for_cancel = app.clone();
+    let cancelled = move || {
+        let unlocked = !app_for_cancel
+            .state::<VaultPasswordStore>()
+            .get()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        !app_for_cancel
+            .state::<VaultGeneration>()
+            .is_current(generation, unlocked)
+    };
 
     // run_sync is async (network + DB). The DB layer internally hops onto a
     // blocking thread when called from within the async runtime, so awaiting
@@ -2325,6 +2480,7 @@ pub async fn bitwarden_sync(
         &db,
         &pw,
         allow_remote_overwrite.unwrap_or(false),
+        &cancelled,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -2529,6 +2685,21 @@ pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
     if !resolved.is_file() {
         return Err("system_open_external: path is not a regular file.".into());
     }
+    // Enforce the inert-extension policy AT THE OPENER, not just in the
+    // staging flow. The staging flow names files safely, but the renderer
+    // controls which staged path it passes here: without this check a
+    // compromised renderer could `sftp_stage_path` + `sftp_download` remote
+    // bytes into `<staging>/x.exe` and have the OS shell EXECUTE it via this
+    // command. Only extensions whose OS handler is an editor/viewer (the
+    // staging allowlist) may be handed to the shell; everything else is
+    // refused before any OS call. This is the backend-owned boundary the
+    // audit's executable-staging chain broke through.
+    if !crate::sftp::path_has_inert_extension(&resolved) {
+        return Err(
+            "system_open_external refuses to open non-text staged files (possible executable)."
+                .into(),
+        );
+    }
     opener::open(&resolved).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
@@ -2550,7 +2721,7 @@ pub fn system_open_url(url: String) -> CmdResult<serde_json::Value> {
 #[tauri::command]
 /// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
 /// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
-/// called from there — the window stops responding and never repaints, which
+/// called from there - the window stops responding and never repaints, which
 /// is what "Create Backup freezes the whole program" was. An async command
 /// runs on the async runtime instead, where blocking for the user's answer is
 /// safe.

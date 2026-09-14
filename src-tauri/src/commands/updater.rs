@@ -359,21 +359,27 @@ pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
     }))
 }
 
-/// Download the `<installer-url>.minisig` sibling of the (post-redirect)
-/// installer URL through the same validate-allowlist + manual-redirect +
-/// revalidation + size-cap discipline as the installer itself, returning
-/// the body as a string. ANY failure - including a 404 for an unsigned
-/// asset, a network error, or an oversized body - returns Err; the caller
-/// decides (fail-closed) what to do with it.
+/// Download the `<installer>.minisig` sibling asset through the same
+/// validate-allowlist + manual-redirect + revalidation + size-cap discipline
+/// as the installer itself, returning the body as a string. ANY failure -
+/// including a 404 for an unsigned asset, a network error, or an oversized
+/// body - returns Err; the caller decides (fail-closed) what to do with it.
+///
+/// `original_release_url` must be the repo-pinned
+/// `github.com/AGSQ11/SSHSpan/releases/download/...` URL, NOT the
+/// post-redirect CDN object URL. GitHub serves a release asset and its
+/// `.minisig` sibling as SEPARATE release assets, each 302-redirecting to its
+/// own signed `release-assets.githubusercontent.com` object; the CDN object
+/// URL carries a signed query, so appending `.minisig` to the FINAL URL both
+/// targets the wrong object and mangles the query (the suffix lands after
+/// `?...`, not on the path). Appending the suffix to the original release URL
+/// names the sibling asset, and its own redirect hop below is followed and
+/// re-validated independently.
 async fn download_minisig(
     client: &reqwest::Client,
-    final_installer_url: &url::Url,
+    original_release_url: &url::Url,
 ) -> CmdResult<String> {
-    // GitHub serves release assets and their .minisig siblings from the same
-    // host and path, so appending the suffix to the FINAL (post-redirect)
-    // URL lands on the right asset even after the release-download →
-    // objects/release-assets redirect hop.
-    let mut sig_url_str = final_installer_url.as_str().to_string();
+    let mut sig_url_str = original_release_url.as_str().to_string();
     sig_url_str.push_str(".minisig");
     let mut current_url = validate_asset_url(&sig_url_str)?;
 
@@ -438,6 +444,10 @@ pub async fn update_download_and_run(
     // Only accept installer URLs from OUR GitHub releases (owner/repo pinned,
     // not just the github.com host).
     let mut current_url = validate_initial_asset_url(&url)?;
+    // Preserve the repo-pinned release URL before the redirect loop mutates
+    // `current_url` into the CDN object URL: the `.minisig` sibling must be
+    // resolved from THIS release-asset URL, not the redirected one (F7).
+    let original_release_url = current_url.clone();
 
     // Rollback guard. `update_check` compares versions, but this command takes
     // `url` and `version` straight from the renderer, so on its own it would
@@ -449,6 +459,32 @@ pub async fn update_download_and_run(
         return Err(CmdError(format!(
             "Refusing to install {version}: it is not newer than the running version {running}."
         )));
+    }
+
+    // Bind the claimed version to the signed asset URL: the release-download
+    // path is `/AGSQ11/SSHSpan/releases/download/v<tag>/<asset>`, so the tag
+    // segment must equal the renderer-supplied `version`. Without this, a
+    // compromised renderer could claim a FUTURE version while pointing at an
+    // OLDER (still genuinely signed) asset URL - every signature check passes
+    // while the install is a silent downgrade. The metadata (version number)
+    // is not itself signed, so tie it to the URL that selects the signed
+    // bytes. This is checked at the same decision point as the rollback guard.
+    {
+        let tag_segment = original_release_url
+            .path_segments()
+            .and_then(|mut segs| {
+                // .../releases/download/<tag>/<asset>
+                segs.nth_back(1)
+            })
+            .unwrap_or("");
+        let claimed = version.trim().trim_start_matches('v');
+        let tag = tag_segment.trim_start_matches('v');
+        if tag.is_empty() || tag != claimed {
+            return Err(CmdError(format!(
+                "Refusing to install: the claimed version {version} does not match the \
+                 release tag in the asset URL ({tag_segment})."
+            )));
+        }
     }
 
     let ext = installer_ext(&url);
@@ -618,7 +654,7 @@ pub async fn update_download_and_run(
         // oversized body, unparseable or invalid signature - deletes the
         // installer and refuses to run it. There is deliberately no
         // "unsigned release, carry on" path once the key is provisioned.
-        let sig = match download_minisig(&client, &current_url).await {
+        let sig = match download_minisig(&client, &original_release_url).await {
             Ok(sig) => sig,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&dest).await;

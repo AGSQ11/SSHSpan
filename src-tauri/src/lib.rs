@@ -61,6 +61,8 @@ pub fn run() {
             app.manage(commands::UnlockThrottle::new());
             // Renderer liveness signal for the backend idle auto-lock
             app.manage(commands::ActivityTracker::new());
+            // Vault generation: bumped on lock so pending operations abort
+            app.manage(commands::VaultGeneration::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -238,6 +240,14 @@ fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
                     let _ = window.set_focus();
                 }
                 "lock" => {
+                    // Enforce the lock in the BACKEND, not by asking the
+                    // renderer: a hung or compromised webview could otherwise
+                    // ignore `vault-lock-requested` and leave the vault
+                    // unsealed. `lock_vault_internal` kills sessions, stops
+                    // watches, clears the in-memory password and bumps the
+                    // vault generation; the emit afterwards is only so a
+                    // healthy renderer updates its UI.
+                    crate::commands::lock_vault_internal(app);
                     let _ = window.emit("vault-lock-requested", "");
                 }
                 "quit" => {

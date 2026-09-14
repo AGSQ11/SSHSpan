@@ -147,6 +147,11 @@ pub async fn terminal_connect(
     if vault_pw.is_empty() {
         return Err(CmdError("Vault is locked.".into()));
     }
+    // Capture the vault generation BEFORE any network await. If the vault is
+    // locked while the handshake is in flight, `start_interactive` re-checks
+    // this generation at the point it would register the session and aborts,
+    // so a pending connect cannot complete into the locked state.
+    let generation = super::capture_vault_generation(&app)?;
     let db = app.state::<AppState>().db.clone();
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
 
@@ -190,6 +195,7 @@ pub async fn terminal_connect(
         db.clone(),
         registry.clone(),
         on_data,
+        Some(generation),
     ).await.map_err(|e| {
         let msg = e.to_string();
         let friendly = if msg.contains("Key exchange failed") || msg.contains("key exchange") {
@@ -237,6 +243,12 @@ pub fn terminal_send(
     session_id: String,
     bytes: Vec<u8>,
 ) -> CmdResult<serde_json::Value> {
+    // Sending input to a live session consumes the authenticated channel;
+    // refuse while the vault is locked so a stale renderer cannot drive a
+    // session the lock was supposed to end.
+    if super::vault_password(&app)?.is_empty() {
+        return Err(CmdError("Vault is locked.".into()));
+    }
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
     ssh_client::session_send(&registry, &session_id, bytes).map_err(anyhow_cmd)?;
     Ok(serde_json::json!({ "ok": true }))
