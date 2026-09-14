@@ -134,7 +134,7 @@ impl SessionRegistry {
 /// clobber each other.
 pub fn known_host_key(host: &str, port: u16) -> String {
     // An IPv6 literal is made of colons, so "{host}:{port}" would produce
-    // "2001:db8::1:22" — ambiguous, and impossible to tell from a hostname
+    // "2001:db8::1:22" - ambiguous, and impossible to tell from a hostname
     // that happens to contain colons. Bracket it, matching the URL-authority
     // convention and the form `db::qualify_legacy_known_host` migrates old
     // rows into, so a pin written by either path is found by the other.
@@ -534,6 +534,7 @@ pub async fn start_interactive(
     db: Database,
     registry: Arc<SessionRegistry>,
     on_data: Channel<String>,
+    vault_generation: Option<u64>,
 ) -> anyhow::Result<String> {
     let target_host = params.server.host.clone();
     let target_port = params.server.port;
@@ -552,7 +553,7 @@ pub async fn start_interactive(
         host: target_host.clone(),
         port: target_port,
         db: db.clone(),
-        app,
+        app: app.clone(),
     };
 
     let t0 = std::time::Instant::now();
@@ -617,6 +618,17 @@ pub async fn start_interactive(
         "[sshspan-terminal] pty+shell in {}ms - streaming",
         t0.elapsed().as_millis()
     );
+
+    // Lock-during-connect guard: re-check the captured vault generation at
+    // the last moment before the session is registered. The network handshake
+    // and authentication above are the long await during which a lock could
+    // have landed; without this check a connection started before the lock
+    // would register a live session into the now-locked vault (the audit's
+    // F2). Aborting here drops `session`, closing the just-established
+    // connection rather than registering it.
+    if let Some(gen) = vault_generation {
+        crate::commands::require_generation_current(&app, gen).map_err(|e| anyhow::anyhow!(e.0))?;
+    }
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();

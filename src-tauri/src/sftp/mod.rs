@@ -145,7 +145,7 @@ impl EditRegistry {
 pub fn edit_temp_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("sshspan-edit");
     let usable = match std::fs::create_dir(&dir) {
-        Ok(()) => true, // we just created it — it cannot be a symlink
+        Ok(()) => true, // we just created it - it cannot be a symlink
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => reuse_is_safe(&dir),
         Err(_) => false,
     };
@@ -189,7 +189,7 @@ pub fn edit_temp_dir() -> std::path::PathBuf {
 /// create a REAL directory at this predictable name: lstat then reports a
 /// directory, the check passes, our 0700 chmod fails with EPERM because we do
 /// not own it, and every file staged for "open in system editor" lands in
-/// their directory — readable, and replaceable before the watcher re-uploads
+/// their directory - readable, and replaceable before the watcher re-uploads
 /// it to the user's server. So ownership and mode are part of the test.
 fn reuse_is_safe(dir: &std::path::Path) -> bool {
     let Ok(md) = std::fs::symlink_metadata(dir) else {
@@ -202,7 +202,7 @@ fn reuse_is_safe(dir: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        // Must be ours. Root owning it is not "close enough" — we could not
+        // Must be ours. Root owning it is not "close enough" - we could not
         // restrict it either.
         if md.uid() != effective_uid() {
             return false;
@@ -223,7 +223,7 @@ fn reuse_is_safe(dir: &std::path::Path) -> bool {
 ///
 /// The only `unsafe` in this file. `geteuid(2)` cannot fail, takes no
 /// arguments and touches no memory, so there is no invariant to uphold beyond
-/// calling it — std simply does not re-export it.
+/// calling it - std simply does not re-export it.
 #[cfg(unix)]
 fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
@@ -287,13 +287,13 @@ fn is_windows_device_name(stem: &str) -> bool {
 
 /// Extensions that may be preserved on a staged edit file: plain-text/data
 /// formats whose OS handler opens an editor or viewer, never a program that
-/// executes its input. EVERYTHING ELSE — including every unknown extension —
+/// executes its input. EVERYTHING ELSE - including every unknown extension -
 /// is forced to `.txt`. This is an allowlist rather than the old executable
 /// denylist on purpose: a denylist ages badly (each new executable/packaged
 /// format is a gap until someone adds it), while the edit flow is text-editor
 /// based anyway, so an unknown extension has no honest handler to preserve.
-/// The staged name does not affect what is uploaded back — the original
-/// remote path is untouched — so collapsing names to `.txt` costs nothing
+/// The staged name does not affect what is uploaded back - the original
+/// remote path is untouched - so collapsing names to `.txt` costs nothing
 /// except a default-app association.
 const INERT_STAGE_EXTENSIONS: [&str; 25] = [
     "txt",
@@ -329,6 +329,21 @@ fn is_inert_stage_extension(ext: &str) -> bool {
         .any(|b| b.eq_ignore_ascii_case(ext))
 }
 
+/// Is `path`'s extension on the inert (safe-to-open-in-an-editor) allowlist?
+///
+/// The opener (`system_open_external`) re-checks this at the point of launch
+/// so the inert-extension policy is enforced by the BACKEND at the OS
+/// boundary, not only by the staging flow that happens to name the file.
+/// A staged file produced by [`staged_file_name`] always satisfies this; a
+/// file a compromised renderer downloads into the staging directory with an
+/// attacker-chosen `.exe`/`.scr`/unknown extension does not.
+pub fn path_has_inert_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(is_inert_stage_extension)
+        .unwrap_or(false)
+}
+
 /// Unpredictable staged-file name for a remote file: `{base}.{uuid}.{ext}`
 /// (no extension → `{base}-{uuid}`). The random component prevents another
 /// local user from pre-creating or guessing the path of a file that will
@@ -336,8 +351,8 @@ fn is_inert_stage_extension(ext: &str) -> bool {
 /// original extension are preserved so the editor association still works.
 ///
 /// If the remote extension is not on the inert allowlist (executable,
-/// packaged, binary, or simply unknown — e.g. `.scr`, `.exe`, `.7z`), it is
-/// NEVER preserved — the staged name is forced to end in `.txt` so the OS
+/// packaged, binary, or simply unknown - e.g. `.scr`, `.exe`, `.7z`), it is
+/// NEVER preserved - the staged name is forced to end in `.txt` so the OS
 /// shell opens it in an editor instead of handing it to whatever handler the
 /// extension maps to. A remote name that is only a non-inert extension
 /// (`.scr`) or empty stages as `file.{uuid}.txt`.
@@ -347,7 +362,7 @@ pub fn staged_file_name(remote_name: &str) -> String {
     let base = if base.is_empty() { "file" } else { &base };
     match base.rsplit_once('.') {
         // Preserve a non-empty extension, limiting it to a sane length so a
-        // dot-heavy name cannot produce a pathologically long tail — but only
+        // dot-heavy name cannot produce a pathologically long tail - but only
         // if the extension is on the inert allowlist; anything else stages as
         // `.txt`.
         Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 16 => {
@@ -371,7 +386,7 @@ pub fn staged_file_name(remote_name: &str) -> String {
 }
 
 /// Best-effort removal of files older than `max_age` inside the sshspan-edit
-/// temp dir. Only ever touches plain files directly inside that directory —
+/// temp dir. Only ever touches plain files directly inside that directory -
 /// never anything outside it, never subdirectories. Staged copies left behind
 /// by a crash or a killed session are otherwise never cleaned up.
 pub fn prune_stale_stage_files(dir: &std::path::Path, max_age: std::time::Duration) {
@@ -465,6 +480,51 @@ pub async fn create_transfer_file(path: &std::path::Path) -> std::io::Result<tok
     #[cfg(unix)]
     opts.custom_flags(libc::O_NOFOLLOW);
     opts.open(path).await
+}
+
+/// Open an EXISTING transfer file for append during a resume, without
+/// following a symlink planted at the final component.
+///
+/// `create_transfer_file` removes-then-recreates, which is correct for a
+/// fresh transfer but would delete the very `.part` a resume is supposed to
+/// continue. Appending with a plain `OpenOptions::append(true).open` follows
+/// a planted symlink, so an attacker who can drop `dest/name.part -> victim`
+/// into a writable download folder would have remote bytes appended to
+/// `victim` (the final rename then moves the LINK, leaving the modified
+/// victim behind). Guard the final component at both ends of the race:
+///
+/// 1. lstat the path first: if it is a symlink (or anything but a regular
+///    file), refuse. The caller's resume-offset logic already treats "not a
+///    trustworthy regular file" as "start over".
+/// 2. Open with O_NOFOLLOW (Unix) so a link swapped in between the check and
+///    the open fails with ELOOP instead of being followed. On Windows the
+///    FILE_FLAG_OPEN_REPARSE_POINT equivalent is not exposed through tokio's
+///    OpenOptions; the pre-check plus the staging-dir/destination model
+///    (queue downloads land in a user-chosen directory, and the
+///    authenticated-local-attacker scenario the symlink needs is already a
+///    reduced threat there) is the accepted residual, documented here.
+///
+/// Returns the metadata captured by the lstat so the caller can align its
+/// resume offset against the SAME object it is about to append to.
+pub async fn open_transfer_file_append(
+    path: &std::path::Path,
+) -> std::io::Result<(tokio::fs::File, std::fs::Metadata)> {
+    let md = tokio::fs::symlink_metadata(path).await?;
+    if md.file_type().is_symlink() || !md.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to resume into {}: not a regular file (possible planted link)",
+                path.display()
+            ),
+        ));
+    }
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.append(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    let file = opts.open(path).await?;
+    Ok((file, md))
 }
 
 #[cfg(test)]
@@ -605,6 +665,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The opener-side inert-extension gate (F1 regression): extensions whose
+    /// OS handler could execute the file must be refused; editor/viewer
+    /// extensions pass. This is the predicate `system_open_external` enforces
+    /// at launch time, independent of how the staged file was named.
+    #[test]
+    fn inert_extension_gate_blocks_executables() {
+        use std::path::Path;
+        for ok in [
+            "a.txt", "b.md", "c.json", "d.yaml", "e.pem", "f.log", "g.csv",
+        ] {
+            assert!(path_has_inert_extension(Path::new(ok)), "should open: {ok}");
+        }
+        for bad in [
+            "x.exe", "x.scr", "x.bat", "x.cmd", "x.com", "x.msi", "x.ps1", "x.vbs", "x.js",
+            "x.jar", "x.sh", "x.dll", "x.bin", "x.7z", "x",
+        ] {
+            assert!(
+                !path_has_inert_extension(Path::new(bad)),
+                "should refuse: {bad}"
+            );
+        }
+    }
+
     /// A symlink at the staging name is refused (lstat never follows it).
     #[cfg(unix)]
     #[test]
@@ -685,7 +768,7 @@ mod tests {
 
     #[test]
     fn staged_name_forces_txt_for_non_inert_extensions() {
-        // Known-executable names and — the point of the allowlist — every
+        // Known-executable names and - the point of the allowlist - every
         // UNKNOWN/binary extension stage as .txt; only inert text formats
         // keep their extension.
         for name in [
@@ -775,7 +858,7 @@ mod tests {
 
         // Device name with a (blocked) extension: the stem is the device
         // name, so the prefix applies AND the extension is forced to .txt.
-        // Policy: `CON.exe` → `_CON.{uuid}.txt` — never a device, never
+        // Policy: `CON.exe` → `_CON.{uuid}.txt` - never a device, never
         // executable.
         let a = staged_file_name("CON.exe");
         assert!(a.starts_with("_CON."), "device stem must be prefixed: {a}");

@@ -464,19 +464,19 @@ impl Database {
             // SECURITY: a pin that does not migrate is not a benign leftover.
             // The lookup key becomes "host:22", the orphaned row never matches,
             // and the next connection to that host takes the *unpinned* branch
-            // — turning what should have been a hard mismatch failure into a
+            // - turning what should have been a hard mismatch failure into a
             // routine first-trust prompt, which is exactly the downgrade a
             // machine-in-the-middle wants. So this migration is explicit,
             // per-row, and its failures are propagated rather than discarded.
             //
-            // Two shapes the old blanket `UPDATE … WHERE host NOT LIKE '%:%'`
+            // Two shapes the old blanket `UPDATE ... WHERE host NOT LIKE '%:%'`
             // got wrong, both regression-tested below:
             //   * an IPv6 literal always contains ':', so it never matched the
             //     predicate and was left orphaned forever;
             //   * if a qualified row for the same host already existed (a
             //     backup restore inserts "host:port" directly) the UPDATE hit
             //     the PRIMARY KEY, SQLite rolled the WHOLE statement back, and
-            //     `let _ =` swallowed it — losing every legacy pin at once.
+            //     `let _ =` swallowed it - losing every legacy pin at once.
             self.migrate_known_hosts_port_qualify().await?;
 
             // Migration: track where each known_hosts pin came from. Rows
@@ -1315,6 +1315,105 @@ impl Database {
         })
     }
 
+    /// Atomically persist a full vault password rotation.
+    ///
+    /// Re-encryption happens in memory in the caller; this writes the results.
+    /// The audit's F3/F6: previously each key/server UPDATE was its own
+    /// pool-backed statement and the master verifier was a third write, so an
+    /// I/O error or a crash part-way left some rows sealed under the new
+    /// password and the rest (plus the verifier) under the old - a vault that
+    /// unlocks but cannot decrypt half its contents. And the Bitwarden master
+    /// password was never re-sealed at all, stranding sync on the old
+    /// password. Here every re-sealed record AND the verifier commit inside a
+    /// single SQLite transaction: the database holds either the complete old
+    /// state or the complete new state, never a split.
+    pub fn apply_vault_rotation(
+        &self,
+        keys: &[KeyRecord],
+        servers: &[ServerRecord],
+        bitwarden_master_password: Option<&str>,
+        new_master_hash: &str,
+    ) -> Result<()> {
+        block(async {
+            let mut tx = self.pool.begin().await?;
+            for key in keys {
+                sqlx::query(
+                    r#"
+                    UPDATE keys SET
+                        name = ?, key_type = ?, public_key = ?, private_key_encrypted = ?,
+                        fingerprint_sha256 = ?, fingerprint_md5 = ?, comment = ?, updated_at = ?,
+                        deployed = ?, deploy_path = ?, bitwarden_id = ?, bitwarden_sync = ?,
+                        bitwarden_revision_ts = ?, bitwarden_updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(&key.name)
+                .bind(&key.key_type)
+                .bind(&key.public_key)
+                .bind(&key.private_key_encrypted)
+                .bind(&key.fingerprint_sha256)
+                .bind(&key.fingerprint_md5)
+                .bind(&key.comment)
+                .bind(key.updated_at.to_rfc3339())
+                .bind(key.deployed as i64)
+                .bind(&key.deploy_path)
+                .bind(&key.bitwarden_id)
+                .bind(key.bitwarden_sync as i64)
+                .bind(key.bitwarden_revision_ts.map(|v| v.to_string()))
+                .bind(key.bitwarden_updated_at.map(|v| v.to_string()))
+                .bind(&key.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for s in servers {
+                sqlx::query(
+                    r#"
+                    UPDATE servers SET name = ?, host = ?, port = ?, username = ?, key_id = ?, pem_path = ?,
+                        auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?,
+                        bitwarden_id = ?, bitwarden_revision_ts = ?, bitwarden_updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(&s.name).bind(&s.host).bind(s.port as i64).bind(&s.username)
+                .bind(&s.key_id).bind(&s.pem_path).bind(&s.auth_method).bind(&s.saved_password)
+                .bind(&s.category_id).bind(&s.color)
+                .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
+                .bind(s.updated_at.to_rfc3339())
+                .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
+                .bind(&s.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            // The Bitwarden master password is sealed with the SAME vault
+            // password; it must rotate in the same transaction or sync is
+            // stranded on the old password (F6).
+            if let Some(sealed) = bitwarden_master_password {
+                sqlx::query(
+                    "INSERT INTO bitwarden_config (key, value, updated_at) VALUES ('master_password', ?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                )
+                .bind(sealed)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            }
+            // The verifier rotates last, inside the same transaction: if any
+            // earlier statement failed, the whole rotation rolls back and the
+            // old password keeps working against untouched rows.
+            sqlx::query(
+                "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            )
+            .bind("master.hash")
+            .bind(new_master_hash)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
     pub fn get_server(&self, id: &str) -> Result<Option<ServerRecord>> {
         block(async {
             let row = sqlx::query("SELECT * FROM servers WHERE id = ?")
@@ -1367,13 +1466,13 @@ impl Database {
     /// Port-qualify legacy bare-host `known_hosts` rows to "host:22".
     ///
     /// Runs inside `migrate()`. Explicit and per-row so that one bad row
-    /// cannot silently take the rest of the pins with it — see the call site
+    /// cannot silently take the rest of the pins with it - see the call site
     /// for why a lost pin is a security downgrade rather than cosmetic.
     ///
     /// Rules:
     /// * A row already carrying an explicit ":port" suffix is left alone.
     /// * A bare IPv6 literal is bracketed as well as port-qualified, so it
-    ///   becomes "[2001:db8::1]:22" — distinguishable from a bare hostname and
+    ///   becomes "[2001:db8::1]:22" - distinguishable from a bare hostname and
     ///   stable under a second run.
     /// * If the destination key is already taken, the legacy row is dropped
     ///   rather than colliding: the existing qualified row is the newer, more
@@ -1686,8 +1785,8 @@ impl Database {
                          ON CONFLICT(id) DO UPDATE SET name=excluded.name, key_type=excluded.key_type, \
                            public_key=excluded.public_key, private_key_encrypted=excluded.private_key_encrypted, \
                            fingerprint_sha256=excluded.fingerprint_sha256, fingerprint_md5=excluded.fingerprint_md5, \
-                           comment=excluded.comment, updated_at=excluded.updated_at, deployed=excluded.deployed, \
-                           deploy_path=excluded.deploy_path, bitwarden_id=excluded.bitwarden_id, \
+                           comment=excluded.comment, updated_at=excluded.updated_at, \
+                           bitwarden_id=excluded.bitwarden_id, \
                            bitwarden_sync=excluded.bitwarden_sync, bitwarden_revision_ts=excluded.bitwarden_revision_ts, \
                            bitwarden_updated_at=excluded.bitwarden_updated_at",
                     )
@@ -1701,8 +1800,16 @@ impl Database {
                     .bind(s("comment").unwrap_or(""))
                     .bind(s("created_at").unwrap_or(""))
                     .bind(s("updated_at").unwrap_or(""))
-                    .bind(k.get("deployed").and_then(|v| v.as_bool()).unwrap_or(false) as i64)
-                    .bind(s("deploy_path"))
+                    // Machine-local deployment state is NEVER restored from a
+                    // backup (F9): `deployed`/`deploy_path` describe a
+                    // deployment performed on the machine that WROTE the
+                    // backup. Restoring them verbatim lets a crafted backup
+                    // point `deploy_path` at any user-writable file, after
+                    // which `key_remove_deployed` would delete it. The key
+                    // material itself is the portable part; deployment is
+                    // local and starts cleared.
+                    .bind(0i64)
+                    .bind(Option::<String>::None)
                     .bind(s("bitwarden_id"))
                     .bind(k.get("bitwarden_sync").and_then(|v| v.as_bool()).unwrap_or(false) as i64)
                     .bind(s("bitwarden_revision_ts"))
@@ -1890,7 +1997,7 @@ pub(crate) fn qualify_legacy_known_host(host: &str) -> Option<String> {
     match colons {
         0 => Some(format!("{host}:22")),
         // Exactly one colon: "name:port" if the tail parses as a port, else it
-        // is something odd — qualify it rather than leave it unreachable.
+        // is something odd - qualify it rather than leave it unreachable.
         1 => {
             let tail = host.rsplit(':').next().unwrap_or("");
             if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
@@ -1967,7 +2074,7 @@ mod tests {
 
     /// REGRESSION: a bare IPv6 literal is made of colons, so the old
     /// `WHERE host NOT LIKE '%:%'` predicate never matched it and the pin was
-    /// orphaned — every later connection to that host took the unpinned
+    /// orphaned - every later connection to that host took the unpinned
     /// branch and got a first-trust prompt instead of a mismatch failure.
     #[test]
     fn known_hosts_migration_qualifies_bare_ipv6() {
@@ -1990,7 +2097,7 @@ mod tests {
 
     /// REGRESSION: with both "example.com" and "example.com:22" present, the
     /// old blanket UPDATE hit the PRIMARY KEY, SQLite rolled the whole
-    /// statement back, and `let _ =` swallowed the error — so EVERY legacy pin
+    /// statement back, and `let _ =` swallowed the error - so EVERY legacy pin
     /// stayed bare and unreachable. The per-row migration must survive the
     /// collision and still migrate the unrelated rows.
     #[test]
@@ -2162,6 +2269,107 @@ mod tests {
         assert_eq!(got.target_remote_path.as_deref(), Some("/remote/dest"));
         assert_eq!(got.attempts, 1);
         assert_eq!(got.verify, Some(false));
+    }
+
+    // ── F3/F6: atomic vault rotation ─────────────────────────────────────────
+
+    fn rotation_key(id: &str, pw: &str) -> KeyRecord {
+        KeyRecord {
+            id: id.to_string(),
+            name: format!("key-{id}"),
+            key_type: "ed25519".into(),
+            public_key: "ssh-ed25519 AAAAfake".into(),
+            private_key_encrypted: crate::crypto::vault::seal(pw, b"priv").unwrap(),
+            fingerprint_sha256: "SHA256:f".into(),
+            fingerprint_md5: "MD5:f".into(),
+            comment: String::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deployed: false,
+            deploy_path: None,
+            bitwarden_id: None,
+            bitwarden_sync: false,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+            category_ids: Vec::new(),
+        }
+    }
+
+    /// F3/F6 regression: a full rotation (keys + the Bitwarden credential +
+    /// the verifier) commits in one transaction, so after `apply_vault_rotation`
+    /// every record unseals under the NEW password and the old password fails.
+    #[test]
+    fn apply_vault_rotation_reseals_keys_and_bitwarden_and_verifier() {
+        let db = test_db();
+        let old_pw = "old-master-pw";
+        let new_pw = "new-master-pw";
+        db.insert_key(&rotation_key("k1", old_pw)).unwrap();
+
+        // Seed a Bitwarden credential sealed under the OLD password.
+        let bw_old = crate::crypto::vault::seal(old_pw, b"bw-master-secret").unwrap();
+        let mut cfg = BitwardenConfig::default();
+        cfg.master_password = Some(bw_old);
+        db.save_bitwarden_config(&cfg).unwrap();
+        db.set_config("master.hash", "OLD-VERIFIER").unwrap();
+
+        // Rotate: re-seal key + BW cred in memory, commit atomically.
+        let mut key = db.get_key("k1").unwrap().unwrap();
+        let plain = crate::crypto::vault::unseal(old_pw, &key.private_key_encrypted).unwrap();
+        key.private_key_encrypted = crate::crypto::vault::seal(new_pw, &plain).unwrap();
+        let bw_new = crate::crypto::vault::seal(new_pw, b"bw-master-secret").unwrap();
+        db.apply_vault_rotation(&[key], &[], Some(&bw_new), "NEW-VERIFIER")
+            .unwrap();
+
+        // Key unseals under NEW, not OLD.
+        let stored = db.get_key("k1").unwrap().unwrap();
+        assert!(crate::crypto::vault::unseal(new_pw, &stored.private_key_encrypted).is_ok());
+        assert!(crate::crypto::vault::unseal(old_pw, &stored.private_key_encrypted).is_err());
+        // The Bitwarden credential rotated too (F6): NEW unseals, OLD fails.
+        let cfg2 = db.load_bitwarden_config().unwrap();
+        let mp = cfg2.master_password.unwrap();
+        assert_eq!(
+            crate::crypto::vault::unseal(new_pw, &mp).unwrap(),
+            b"bw-master-secret"
+        );
+        assert!(crate::crypto::vault::unseal(old_pw, &mp).is_err());
+        // Verifier rotated.
+        assert_eq!(
+            db.get_config("master.hash").unwrap().as_deref(),
+            Some("NEW-VERIFIER")
+        );
+    }
+
+    // ── F9: restore clears machine-local deployment state ───────────────────
+
+    /// F9 regression: a backup carrying `deployed`/`deploy_path` must NOT
+    /// restore them - deployment is machine-local and a crafted path would
+    /// otherwise steer `key_remove_deployed` into deleting an arbitrary file.
+    #[test]
+    fn restore_backup_discards_deployment_state() {
+        let db = test_db();
+        let payload = serde_json::json!({
+            "keys": [{
+                "id": "k-evil",
+                "name": "evil",
+                "key_type": "ed25519",
+                "public_key": "ssh-ed25519 AAAAfake",
+                "private_key_encrypted": "x",
+                "fingerprint_sha256": "SHA256:f",
+                "fingerprint_md5": "MD5:f",
+                "comment": "",
+                "created_at": "",
+                "updated_at": "",
+                "deployed": true,
+                "deploy_path": "C:\\Users\\victim\\important.txt"
+            }]
+        });
+        db.restore_backup(&payload).unwrap();
+        let key = db.get_key("k-evil").unwrap().unwrap();
+        assert!(!key.deployed, "restored key must not be marked deployed");
+        assert!(
+            key.deploy_path.is_none(),
+            "restored key must not carry a deployment path"
+        );
     }
 }
 

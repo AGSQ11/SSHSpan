@@ -1,9 +1,11 @@
 # SSHSpan security model
 
 SSHSpan is a local-first SSH key manager. It stores no data on any server and ships no
-telemetry. Its only network traffic is (1) an update check against GitHub, on by default and
-disableable in Settings, and (2) the optional **Bitwarden/Vaultwarden sync**, which talks
-only to the server the user explicitly configures. This document describes the cryptographic
+telemetry. Its network traffic is (1) an update check against GitHub, on by default and
+disableable in Settings, (2) the optional **Bitwarden/Vaultwarden sync**, which talks
+only to the server the user explicitly configures, and (3) the **SSH/SFTP connections and
+transfers the user initiates** via Connect/SFTP - by design these carry vault secrets to the
+target hosts the user chose. This document describes the cryptographic
 controls, the storage layout, and the threat model the app is designed to defend against, as
 well as the things it deliberately does not defend against. It describes the current
 Rust/Tauri implementation (v1.7.x).
@@ -40,15 +42,17 @@ Each private key is sealed independently as an `EncryptedVault` envelope
 (`{salt, nonce, ciphertext, auth_tag}`, base64, JSON):
 
 - a fresh 32-byte random **salt** is generated per seal, and the AES-256 key is derived with
-  **Argon2id** (64 MiB memory, 3 iterations, 4 lanes) from the master password — deliberately
+  **Argon2id** (64 MiB memory, 3 iterations, 4 lanes) from the master password - deliberately
   expensive, so this runs per single-key operation, never in a list loop;
 - a fresh 12-byte random **nonce** (OsRng) is used per encryption;
 - **AES-256-GCM** produces the ciphertext and the 16-byte authentication tag.
 
 Saved server passwords are sealed with the same scheme. Changing the master password
-re-derives and re-seals every key and saved server password **in memory first**; if any
-record fails to unseal, the whole change is aborted and nothing is persisted, so a failure
-can never leave a key stranded in an unrecoverable state.
+re-derives and re-seals every key, every saved server password, **and the stored Bitwarden
+sync credential** in memory first; if any record fails to unseal, the whole change is
+aborted and nothing is persisted. The re-sealed records and the master verifier are then
+committed in a **single SQLite transaction**, so a crash or I/O error part-way rolls back to
+the complete old state - the vault never ends up split across two passwords.
 
 Vault backups are sealed (same envelope) with the vault password; restoring a backup taken
 under a different password re-seals every readable blob with the current password, and
@@ -61,12 +65,12 @@ The database is a single SQLite file at the platform app-data directory
 (`%APPDATA%\SSHSpan\sshspan.db` on Windows, `~/.local/share/SSHSpan/sshspan.db` on Linux).
 The relevant columns are:
 
-- `keys.private_key_encrypted` — the sealed envelope described above;
-- `servers.saved_password` — sealed with the same scheme;
-- `known_hosts` — one row per trusted host, keyed by `host:port`, storing the exact
+- `keys.private_key_encrypted` - the sealed envelope described above;
+- `servers.saved_password` - sealed with the same scheme;
+- `known_hosts` - one row per trusted host, keyed by `host:port`, storing the exact
   wire-format host-key blob and its SHA-256 fingerprint;
-- `config` table row `master.hash` — the Argon2id verification material;
-- everything else — public key material, fingerprints, tags, settings, and the audit log —
+- `config` table row `master.hash` - the Argon2id verification material;
+- everything else - public key material, fingerprints, tags, settings, and the audit log -
   is stored in the clear.
 
 The database file itself is **not encrypted**. It inherits the restrictive ACLs of the user
@@ -91,13 +95,15 @@ profile directory (Windows) / user-owned permissions (Unix).
    passphrase-protected: OpenSSH format (aes256-ctr + bcrypt KDF), PKCS#8 PBES2
    (PBKDF2-HMAC-SHA256, 100 000 iterations, AES-256-CBC), or PuTTY PPK v3. The export
    passphrase is independent of the vault password and is not stored. Private-key exports
-   are serialized by the backend directly into a user-chosen file — the decrypted key never
-   crosses the IPC boundary into the renderer process — and every export is audited.
-7. **The network surface is small, explicit, and user-controlled.** Exactly two destinations
-   exist: the GitHub update check (default on, disableable; downloads pinned to
+   are serialized by the backend directly into a user-chosen file - the decrypted key never
+   crosses the IPC boundary into the renderer process - and every export is audited.
+7. **The network surface is small, explicit, and user-controlled.** Two management
+   destinations exist: the GitHub update check (default on, disableable; downloads pinned to
    `github.com/AGSQ11/SSHSpan/releases/`, HTTPS, redirect-validated, size-capped, verified
    against GitHub's asset digest and a minisign release signature) and the opt-in Bitwarden
-   sync (below). No other endpoint is contacted.
+   sync (below). The SSH/SFTP sessions and transfers the user initiates (Connect, SFTP,
+   Send-to) are the third, by-design network flow - they carry the vault secrets the user
+   chose to use to the target hosts the user chose to reach. No other endpoint is contacted.
 
 ## SSH client, SFTP, and host keys
 
@@ -183,12 +189,12 @@ the OS-matching installer. Downloading only happens after explicit user approval
 download path is hardened:
 
 - **Repo-pinned URL**: the initial URL must be
-  `https://github.com/AGSQ11/SSHSpan/releases/download/…` (not merely any github.com host),
+  `https://github.com/AGSQ11/SSHSpan/releases/download/...` (not merely any github.com host),
   so a compromised renderer cannot retarget the updater at another repository's asset.
 - **HTTPS + host allowlist on every redirect hop**, followed manually and re-validated.
 - **Size caps** on the manifest, the signature, and the installer.
 - **SHA-256 verification** against GitHub's computed asset digest before execution.
-- **minisign release signature** verified against a public key embedded in the binary —
+- **minisign release signature** verified against a public key embedded in the binary -
   which binds the installer to the source tree even if the GitHub repo/token is compromised.
   The key was provisioned on 2026-09-12 (key id `D67C45BA942239D8`; the secret lives in the
   `MINISIGN_SECRET_KEY` Actions secret and the maintainer's offline backup, never in the
@@ -214,11 +220,18 @@ SSHSpan is designed to defend against a specific, realistic class of attacker:
   server-controlled text through escaping/`textContent`. That said, the renderer exposes
   the application's IPC surface (`window.__TAURI__`): a full renderer compromise can invoke
   backend commands (e.g. export a key once the vault is unlocked, read files the user picks
-  in dialogs, connect to hosts). The high-value commands are narrowed accordingly — writes
+  in dialogs, connect to hosts). The high-value commands are narrowed accordingly - writes
   require a user-approved dialog path, `system_open_external` only opens SSHSpan-staged
-  files, and the updater is repo-pinned and signature-checked — but renderer compromise
+  files whose extension is on an inert editor/viewer allowlist, and the updater is
+  repo-pinned and signature-checked - but renderer compromise
   remains the highest-impact single failure, which is why the XSS defenses above are the
   app's most important attack surface.
+
+  One boundary is worth stating plainly: **exporting** a private key is backend-owned (the
+  decrypted key is written to a user-chosen file without crossing IPC), but **importing** a
+  private key from a file reads the file in the renderer (`system_select_file`) and passes
+  the text to `key_import` over IPC, so the plaintext transits renderer memory during an
+  import. This is why a compromised renderer is in the threat model at all.
 
 ## Limitations
 
@@ -228,7 +241,7 @@ These are deliberate, documented trade-offs, not bugs:
   SSH stack, versions 0.9.x and 0.10.0-rc) carries RUSTSEC-2023-0071 ("Marvin", a timing
   side channel against RSA *decryption*). There is no patched upstream release. Exposure in
   SSHSpan is limited: the app never RSA-decrypts attacker-controlled ciphertext (the
-  attack's requirement) — RSA appears only in signature verification (host keys) and
+  attack's requirement) - RSA appears only in signature verification (host keys) and
   client-authentication signing, and RSA auth signatures are pinned to `rsa-sha2-256`
   rather than legacy SHA-1. The risk is accepted and the dependency is monitored for an
   upstream fix. Several other transitive crates (`instant`, `proc-macro-error`, `unic-*`,
@@ -262,7 +275,7 @@ These are deliberate, documented trade-offs, not bugs:
 - **Sync widens the blast radius of a server compromise to key availability, not
   confidentiality.** If the configured Bitwarden/Vaultwarden server or the account password
   is compromised, an attacker obtains ciphertext that requires the account's master password
-  to decrypt — the same trust model as any Bitwarden client. A malicious server, however,
+  to decrypt - the same trust model as any Bitwarden client. A malicious server, however,
   could feed SSHSpan crafted items; they are parsed with the same hardened key parsers used
   for user imports, and unparseable items are reported per-item rather than aborting.
 

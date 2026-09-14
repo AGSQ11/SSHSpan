@@ -72,6 +72,32 @@ fn validate_sftp_local_path(path: &str) -> CmdResult<()> {
     Ok(())
 }
 
+/// Non-erroring form of the app-data/system rule for DESCENDANT filtering
+/// (F5): `validate_sftp_local_path` gates the user-selected ROOT of an
+/// upload, but a recursive walk enqueues descendants without re-checking, so
+/// an allowed ancestor that CONTAINS app data (or a symlink to a protected
+/// file) would upload the vault database. This predicate answers "is this
+/// exact path, or the canonical target it resolves to, protected?" so the
+/// recursive expander can skip (not fail) protected entries. Symlinked files
+/// are checked against their canonical target, closing the symlink-to-vault
+/// gap.
+fn is_protected_upload_source(path: &std::path::Path) -> bool {
+    // Canonicalize resolves the final symlink component too, so a symlink to
+    // the vault DB is recognized by its target.
+    let normalized = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
+        let app_data_dir = app_data.data_dir();
+        let app_data_norm =
+            dunce::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
+        if super::path_starts_with(&normalized, &app_data_norm)
+            || super::path_starts_with(&normalized, app_data_dir)
+        {
+            return true;
+        }
+    }
+    super::is_system_path(&normalized)
+}
+
 /// Refuse anything that touches a remote filesystem while the vault is locked.
 ///
 /// SECURITY: `terminal_connect` and `server_test` both check this; no `sftp_*`
@@ -593,6 +619,16 @@ fn upload_directory(
             {
                 count += upload_directory(sftp.clone(), local, remote).await?;
             } else {
+                // F5: descendants of a validated root re-pass the source
+                // authorization check, so a broad folder upload cannot lift
+                // the vault DB (or a symlink to it) out of app data.
+                if is_protected_upload_source(&local) {
+                    log::warn!(
+                        "[sshspan-sftp] upload: skipping protected source {}",
+                        local.display()
+                    );
+                    continue;
+                }
                 upload_one_file(sftp.clone(), local, remote).await?;
                 count += 1;
             }
@@ -790,6 +826,16 @@ fn expand_upload(
     if md.is_symlink() {
         match std::fs::metadata(&local) {
             Ok(target) if target.is_file() => {
+                // The link resolves to a file we follow one level; the TARGET
+                // must still pass the protected-source check, or a symlink to
+                // the vault DB inside an allowed tree would be uploaded (F5).
+                if is_protected_upload_source(&local) {
+                    log::warn!(
+                        "[sshspan-sftp] upload: skipping {} (symlink target is a protected path)",
+                        local.display()
+                    );
+                    return;
+                }
                 out.push(QueuedItem {
                     kind: JobKind::Upload,
                     session_id: session_id.clone(),
@@ -812,6 +858,16 @@ fn expand_upload(
         return;
     }
     if md.is_file() {
+        // F5: every expanded file re-passes the source authorization check -
+        // the root was validated by the caller, but descendants were not, so
+        // an allowed ancestor containing app data must not upload the vault.
+        if is_protected_upload_source(&local) {
+            log::warn!(
+                "[sshspan-sftp] upload: skipping protected source {}",
+                local.display()
+            );
+            return;
+        }
         out.push(QueuedItem {
             kind: JobKind::Upload,
             session_id: session_id.clone(),
@@ -1081,7 +1137,7 @@ pub async fn sftp_queue_add(
     //
     // This used to be `if direction == "upload" { Upload } else { Download }`,
     // with an `if !matches!(kind, Upload | Download)` guard after it. That
-    // guard could never fire — `kind` was only ever one of those two — so the
+    // guard could never fire - `kind` was only ever one of those two - so the
     // "unsupported direction" error was dead code, and every unrecognised
     // value (a typo, a renamed constant, anything a compromised renderer
     // sends) silently became a DOWNLOAD instead of an error.
@@ -2393,7 +2449,7 @@ mod tests {
         assert!(matches!(parse("upload"), Ok(JobKind::Upload)));
         assert!(matches!(parse("download"), Ok(JobKind::Download)));
 
-        // Everything else is refused — previously every one of these became a
+        // Everything else is refused - previously every one of these became a
         // silent Download.
         for bad in [
             "",
