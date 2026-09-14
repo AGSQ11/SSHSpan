@@ -24,6 +24,16 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
 
 ## What's new
 
+- **Unreleased** - UX pass over the whole renderer. The navigation is two objects (Keys,
+  Servers) plus Settings: Deploy is now an action on the keys you have selected rather than
+  a destination you visit afterwards, and the audit log is a Settings section. A Ctrl+K
+  command palette searches keys, servers and categories and runs actions. The key list
+  leads with each key's comment instead of its fingerprint, export moves to its own tab
+  with a per-format Secret/Sealed/Public marker and a passphrase field that appears only
+  when the format uses one, sessions gain a Shell/Files/Split surface control, the remote
+  path is a clickable breadcrumb, and Settings is sectioned with one toggle component
+  throughout. Two bugs fixed along the way: the search box did nothing in the default
+  grouped key view, and the deploy preview joined its lines on a literal `\n`.
 - **v1.7.3** - Security release resolving a full source audit: the renderer-to-native
   executable-staging chain is closed, a vault lock now revokes in-progress connects/exports/
   syncs (not just live sessions), master-password rotation is atomic and covers the
@@ -56,7 +66,9 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
 
 ## Screenshots
 
-A quick tour of the desktop UI:
+A quick tour of the desktop UI. These predate the UX pass described under *What's new* -
+Deploy is now a sheet over the key list and the audit log is a Settings section, so those
+two shots no longer match a view you can navigate to.
 
 <table>
   <tr>
@@ -107,7 +119,7 @@ A quick tour of the desktop UI:
   categories travel under a separate `Hosts-` namespace, so two SSHSpan installs (or a
   reinstall) converge on the same structure.
 
-### Connect - embedded SSH client
+### Servers - embedded SSH client
 - **Saved servers** with per-server username + SSH-key binding; optional password storage
   (sealed with your vault master, unsealed only in-process at connect time).
 - **Interactive terminal** (xterm.js + the `russh` Rust SSH library): full ANSI colors,
@@ -118,6 +130,9 @@ A quick tour of the desktop UI:
   settings, and optional SSH keepalive.
 - **Host-key pinning** - the first connection to a host asks for explicit confirmation;
   the backend refuses unpinned hosts without it (a `StrictHostKeyChecking=yes` equivalent).
+- **Shell, Files or Split** - a session shows the terminal, the file browser, or both side
+  by side; the control is labelled with the surface you are on, not the one you would
+  switch to.
   Any later fingerprint change is refused and recorded in the audit log.
 - **Right-click any key -> "Use this key to connect..."** - pick a saved server (its username
   + your clicked key) or create a new server pre-filled with that key.
@@ -157,15 +172,16 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
 - **Bitwarden / Vaultwarden sync (optional)** - mirror keys to SSH-key items in your own
   vault, two-way, deletions never propagated; works with getbitwarden.com and self-hosted
   Vaultwarden (SSRF-hardened server URL validation).
-- **Deploy to SSH** - writes selected keys to `~/.ssh/sshspan_<name>` (owner-only permissions
-  from the moment of creation) and manages reversible `Host` blocks in SSHSpan's managed
-  SSH config.
+- **Deploy to SSH** - select keys in the Keys view and a selection bar offers Deploy; the
+  sheet opens over the list with those keys already in it and a preview that updates as you
+  type. Writes to `~/.ssh/sshspan_<name>` (owner-only permissions from the moment of
+  creation) and manages reversible `Host` blocks in SSHSpan's managed SSH config.
 - **Backup and restore** - full vault backups (keys, servers, both category trees) to a
   single encrypted file, restorable only with the master password current at backup time.
 
 ### Trust & ops
 - **Audit log** - append-only local record of every sensitive action (key lifecycle, vault
-  lock/unlock, connects, server changes, backups).
+  lock/unlock, connects, server changes, backups). Lives under Settings.
 - **Signed auto-updates** - installers are downloaded only from this repository over HTTPS,
   verified against a SHA-256 digest *and* a minisign signature whose public key is embedded
   in the app; a missing or invalid signature refuses the update.

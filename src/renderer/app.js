@@ -510,7 +510,16 @@ function renderCategoryTree() {
   if (!tree) return;
   tree.innerHTML = '';
   const panel = el('catPanel');
-  if (panel) panel.hidden = state.categories.filter(c => c.scope === state.categoryScope).length === 0 && !state.orphans;
+  /// The tree filters the list you are looking at, so it belongs to Keys and
+  /// Servers and nowhere else - it used to sit under Settings too, offering to
+  /// filter a view with nothing in it to filter.
+  const relevant = state.view === 'keys' || state.view === 'connect';
+  const title = el('catPanelTitle');
+  if (title) title.textContent = state.categoryScope === 'host' ? 'Host categories' : 'Key categories';
+  if (panel) {
+    panel.hidden = !relevant
+      || (state.categories.filter(c => c.scope === state.categoryScope).length === 0 && !state.orphans);
+  }
   if (state.orphans) {
     const u = document.createElement('div');
     u.className = 'cat-node uncategorized';
@@ -540,7 +549,6 @@ function setActiveCategory(id) {
   updateBreadcrumb();
   if (state.categoryScope === 'host') renderServerList();
   else renderKeyList();
-  updateCatFilterButton();
   updateSelectionHint();
 }
 
@@ -555,7 +563,6 @@ async function loadCategories() {
   rebuildCategoryIndex();
   renderCategoryTree();
   updateBreadcrumb();
-  updateCatFilterButton();
 }
 
 async function createCategory(name, parentId, color) {
@@ -757,21 +764,6 @@ function updateBreadcrumb() {
   bc.appendChild(clear);
 }
 
-function updateCatFilterButton() {
-  const btn = el('catFilterBtn'); if (!btn) return;
-  btn.disabled = false;
-  const lbl = el('catFilterLabel'); if (!lbl) return;
-  if (activeCategoryId() === 'all') {
-    lbl.textContent = state.categoryScope === 'host' ? 'All hosts' : 'All categories';
-    btn.classList.remove('active');
-  } else if (activeCategoryId() === 'uncategorized') {
-    lbl.textContent = state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized';
-    btn.classList.add('active');
-  } else {
-    lbl.textContent = catPathString(activeCategoryId());
-    btn.classList.add('active');
-  }
-}
 
 // ─── multi-select picker (shared widget) ──────────────────────────────────
 
@@ -1037,10 +1029,11 @@ async function refreshVaultStatus(silent) {
   if (vaultIcon) vaultIcon.innerHTML = info.icon;
   const lbl = el('vaultLabel');
   if (lbl) lbl.textContent = info.label;
+  const caret = el('vaultCaret');
+  if (caret) caret.innerHTML = s.unlocked || s.hasVault ? ico('chevron-down') : '';
   el('newKeyBtn').disabled = !s.unlocked;
-  el('lockBtn').disabled = !s.unlocked;
-  el('changePasswordBtn').disabled = !s.unlocked;
   applyNavLockState();
+  updateNavCounts();
 
   if (!s.hasVault) {
     showVaultModal('create');
@@ -1055,7 +1048,76 @@ async function refreshVaultStatus(silent) {
   resetAutoLockTimer();
 }
 
-// Lock/unlock the nav buttons that require an unlocked vault (Connect, Deploy).
+/// Counts beside the two nav destinations. The Servers count is deliberately
+/// the number of LIVE sessions, not of saved servers: how many shells you have
+/// open is the thing you lose track of, and it is the only number that changes
+/// while you are not looking at that view.
+function updateNavCounts() {
+  const keyCount = el('navKeyCount');
+  if (keyCount) {
+    const n = state.keys.length;
+    keyCount.hidden = !state.unlocked || n === 0;
+    keyCount.textContent = String(n);
+  }
+  const live = el('navSessionCount');
+  if (live) {
+    let n = 0;
+    for (const tabId of state.sessions.keys()) {
+      if (window.tabSessionLive && window.tabSessionLive(tabId)) n += 1;
+    }
+    live.hidden = n === 0;
+    live.textContent = String(n);
+  }
+}
+window.updateNavCounts = updateNavCounts;
+
+/// The vault menu: state, countdown and both vault actions in one control.
+function openVaultMenu(anchor) {
+  closeKeyConnectMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.id = 'keyConnectMenu';
+  const mk = (label, icon, fn, disabled) => {
+    const b = document.createElement('button');
+    b.className = 'ctx-item';
+    b.disabled = !!disabled;
+    b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
+    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
+    menu.appendChild(b);
+    return b;
+  };
+  if (!state.hasVault) {
+    mk('Create a vault...', 'lock', () => showVaultModal('create'));
+  } else if (!state.unlocked) {
+    mk('Unlock vault...', 'lock-open', () => showVaultModal('unlock'));
+  } else {
+    mk('Lock now  (Ctrl+L)', 'lock', lockNow);
+    mk('Change master password...', 'key-round', () => showVaultModal('change'));
+    const sep = document.createElement('div');
+    sep.className = 'ctx-sep';
+    menu.appendChild(sep);
+    mk('Auto-lock settings...', 'settings', () => { switchView('settings'); showSettingsSection('general'); });
+  }
+  document.body.appendChild(menu);
+  // Anchored above the control: it sits at the bottom of the sidebar, so a
+  // menu dropped below it would open off-screen.
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = r.left + 'px';
+  menu.style.top = Math.max(8, r.top - menu.offsetHeight - 6) + 'px';
+  anchor.setAttribute('aria-expanded', 'true');
+  setTimeout(() => document.addEventListener('mousedown', onVaultMenuOutside), 0);
+}
+
+function onVaultMenuOutside(e) {
+  const menu = el('keyConnectMenu');
+  if (menu && menu.contains(e.target)) return;
+  closeKeyConnectMenu();
+  const anchor = el('vaultStatus');
+  if (anchor) anchor.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('mousedown', onVaultMenuOutside);
+}
+
+// Lock/unlock the nav buttons that require an unlocked vault (Servers).
 function applyNavLockState() {
   for (const b of document.querySelectorAll('.nav-item[data-requires-unlock]')) {
     b.classList.toggle('locked', !state.unlocked);
@@ -1143,7 +1205,6 @@ function clearKeysUI() {
   state.orphans = false;
   updateSelectionHint();
   updateBreadcrumb();
-  updateCatFilterButton();
 }
 
 function openTerminalContextMenu(x, y, tabId) {
@@ -1194,25 +1255,24 @@ function markTerminalBell(tabId) {
 }
 window.markTerminalBell = markTerminalBell;
 
+/// The selection bar is the whole of what used to be the Deploy view's entry
+/// point. It appears where the selection is, so no instruction to go and tick
+/// boxes somewhere else is needed.
 function updateSelectionHint() {
   const n = state.deploySelected.size;
+  const bar = el('selectionBar');
+  if (bar) bar.hidden = n === 0;
   const hint = el('selectionHint');
-  if (hint) hint.textContent = n > 0 ? n + ' selected for deploy' : '';
-  const dHint = el('deploySelectionHint');
-  if (dHint) dHint.textContent = n > 0
-    ? n + ' key(s) will be deployed.'
-    : 'Select keys to deploy using the checkboxes in the Keys view.';
-  const chip = el('deployCount');
-  if (chip) {
-    chip.hidden = n === 0;
-    chip.textContent = n === 1 ? '1 key ready' : n + ' keys ready';
-  }
+  if (hint) hint.textContent = n === 1 ? '1 key selected' : n + ' keys selected';
   const sub = el('viewSubtitle');
-  if (sub) {
+  if (sub && state.view === 'keys') {
+    const total = state.keys.length;
+    const deployed = state.keys.filter(k => k.deployed).length;
     sub.textContent = n > 0
-      ? (n === 1 ? '1 key staged for deploy' : n + ' keys staged for deploy')
-      : (state.keys.length === 1 ? '1 key in vault' : state.keys.length + ' keys in vault');
+      ? n + ' of ' + total + ' selected'
+      : (total === 0 ? '' : total + (total === 1 ? ' key' : ' keys') + ' · ' + deployed + ' deployed');
   }
+  updateNavCounts();
 }
 
 function renderKeyList() {
@@ -1275,6 +1335,11 @@ function renderKeyList() {
   const rootCats = state.categories
     .filter(c => c.scope === 'key' && (!c.parent_id || !catById(c.parent_id)))
     .sort((a, b) => a.sort_index - b.sort_index || a.name.localeCompare(b.name));
+  /// `rows`, not state.keys: this walk used to read the full vault, so the
+  /// search box and the type filter did nothing at all in the default grouped
+  /// view - the only visible effect of a query was the all-or-nothing
+  /// `rows.length === 0` bail above. With no filter active `rows` is the whole
+  /// vault in the same order, so grouping and ordering are unchanged.
   for (const root of rootCats) {
     // A key appears once per root ancestor it has a category under - the
     // natural "EU DC1" vs "Asia DC1" grouping - and only once per root even
@@ -1282,7 +1347,7 @@ function renderKeyList() {
     // root, since naming it after one descendant would misdescribe what it
     // collects. Walking roots outer and keys inner is what keeps both the
     // group order and the order within each group stable.
-    for (const k of state.keys) {
+    for (const k of rows) {
       if (!catsOf(k).some(c => rootOf(c).id === root.id)) continue;
       const id = 'cat:' + root.id;
       if (seen.has(id + ':' + k.id)) continue;
@@ -1290,7 +1355,7 @@ function renderKeyList() {
       groupFor(id, catPathString(root.id)).keys.push(k);
     }
   }
-  for (const k of state.keys) {
+  for (const k of rows) {
     if (!catsOf(k).length) groupFor('uncategorized', 'Uncategorized').keys.push(k);
   }
 
@@ -1372,12 +1437,43 @@ function keyRowEl(k, groupKeys) {
       name.appendChild(b);
     }
   }
+  /// The row used to lead with the full SHA-256 fingerprint: 50-odd
+  /// undifferentiated base64 characters, in mono, on every row. Nobody scans a
+  /// list by fingerprint - they scan by what the key is for. The fingerprint is
+  /// one click away in the detail pane, which is where you compare it anyway.
   const sub = document.createElement('div');
   sub.className = 'key-row-sub';
-  sub.textContent = k.fingerprint_sha256 || '';
+  sub.textContent = k.comment || '';
+  sub.hidden = !k.comment;
   main.appendChild(name);
   main.appendChild(sub);
   row.appendChild(main);
+
+  const actions = document.createElement('div');
+  actions.className = 'key-row-actions';
+  if (k.deployed) {
+    const dep = document.createElement('span');
+    dep.className = 'chip ok';
+    dep.title = 'A copy of this key is deployed on this machine';
+    dep.innerHTML = `${ico('check-circle')}<span>Deployed</span>`;
+    actions.appendChild(dep);
+  }
+  if (k.has_private) {
+    // Connecting with a key was reachable only by right-clicking the row, which
+    // nothing on screen suggested. Same menu, now with an affordance.
+    const conn = document.createElement('button');
+    conn.className = 'ghost-btn row-btn';
+    conn.title = 'Use this key to connect...';
+    conn.innerHTML = `${ico('plug-zap')}<span>Connect</span>`;
+    conn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      selectKey(k.id);
+      const r = conn.getBoundingClientRect();
+      openKeyConnectMenu(r.left, r.bottom + 4, k);
+    });
+    actions.appendChild(conn);
+  }
+  row.appendChild(actions);
   row.appendChild(typeBadge(k.key_type));
   row.addEventListener('click', () => selectKey(k.id));
   row.addEventListener('contextmenu', (ev) => {
@@ -1464,6 +1560,9 @@ async function selectKey(id) {
   try {
     const k = await call('key_get', { id });
     pane.hidden = false;
+    // A different key means a different set of secrets: never carry the Export
+    // tab (or a typed passphrase) across from the key you were just looking at.
+    showDetailTab('overview');
     el('detailName').textContent = k.name || '(unnamed)';
     const dType = el('detailType');
     dType.dataset.kind = String(k.key_type || '').split('-')[0];
@@ -1489,7 +1588,7 @@ async function selectKey(id) {
     add('Created', fmtTime(k.created_at), true);
     add('Deployed', k.deployed ? k.deploy_path : 'no', true);
     add('Bitwarden sync', k.bitwarden_sync ? 'yes' : 'no');
-    add('Private key', k.has_private ? 'stored (AES-256-GCM encrypted)' : 'not stored');
+    add('Private key', k.has_private ? 'sealed · AES-256-GCM' : 'not stored');
     // Categories
     const catIds = k.category_ids || [];
     state.keyCategories[k.id] = catIds;
@@ -1502,21 +1601,27 @@ async function selectKey(id) {
       },
       onClickPath: (catId) => { setActiveCategory(catId); },
     });
-    const browseBtn = el('detailBrowseCategoriesBtn');
-    browseBtn.disabled = false;
-    browseBtn.onclick = () => openCategoryPicker({
+    /// The "+" chip replaces a "Browse categories..." button that opened a modal
+    /// over whatever you were doing. It is the same picker, reached from the
+    /// chips it edits rather than from a button below them.
+    const addChip = document.createElement('button');
+    addChip.className = 'cat-chip add-chip';
+    addChip.title = 'Add this key to a category';
+    addChip.innerHTML = `${ico('plus')}<span>Add</span>`;
+    addChip.addEventListener('click', () => openCategoryPicker({
       title: 'Assign categories',
       initial: catIds,
       onSave: async (ids) => {
         try { await call('key_set_categories', { keyId: k.id, categoryIds: ids }); await loadKeys(); toast('Categories updated.', 'ok'); }
         catch (e) { toast(e.message || String(e), 'err'); }
       },
-    });
+    }));
+    el('detailCategories').appendChild(addChip);
+
     el('detailFingerprint').textContent = k.fingerprint_sha256 || '\u2014';
     el('detailAuthorized').value = k.public_key || '';
-    el('detailExportFormat').disabled = !k.has_private;
-    el('detailExportPass').disabled = !k.has_private;
-    el('detailExportBtn').disabled = !k.has_private;
+    el('detailConnectBtn').disabled = !k.has_private;
+    renderExportFormats(k);
   } catch (e) {
     pane.hidden = true;
     toast(e.message || String(e), 'err');
@@ -1540,6 +1645,40 @@ async function deleteSelected() {
   } catch (e) {
     toast(e.message || String(e), 'err');
   }
+}
+
+/// Bulk delete from the selection bar. Separate from deleteSelected(), which
+/// acts on the one key open in the detail pane; the checkbox selection and the
+/// detail selection are different things and conflating them would delete keys
+/// the user was only looking at.
+async function deleteSelectedKeys() {
+  const ids = [...state.deploySelected];
+  if (!ids.length) return;
+  const names = ids.map(id => {
+    const k = state.keys.find(x => x.id === id);
+    return k ? (k.name || '(unnamed)') : id;
+  });
+  const listed = names.slice(0, 8).join('\n  ');
+  const more = names.length > 8 ? `\n  ...and ${names.length - 8} more` : '';
+  if (state.settings.confirmDelete !== false) {
+    const ok = window.confirm(
+      `Delete ${ids.length} key(s) from the vault?\n\n  ${listed}${more}\n\nDeployed copies on disk are not removed.`);
+    if (!ok) return;
+  }
+  let failed = 0;
+  for (const id of ids) {
+    try { await call('key_delete', { id }); } catch (e) { failed += 1; }
+  }
+  state.deploySelected.clear();
+  if (ids.includes(state.selectedId)) {
+    state.selectedId = null;
+    el('detailPane').hidden = true;
+  }
+  await loadKeys();
+  updateSelectionHint();
+  toast(failed
+    ? `${ids.length - failed} deleted, ${failed} failed.`
+    : `${ids.length} key(s) deleted.`, failed ? 'err' : 'ok');
 }
 
 async function copyPublic() {
@@ -1567,6 +1706,82 @@ const EXPORT_EXT = {
 // file so the decrypted key never crosses the IPC boundary into the WebView.
 const PRIVATE_EXPORT_FORMATS = ['openssh-private', 'ppk', 'pkcs8', 'pkcs8-encrypted'];
 
+// Formats that wrap the private key in a passphrase. Only these show the
+// passphrase field; it used to sit on screen permanently, including for the
+// four formats that ignore it and the two that carry no private key at all.
+const SEALED_EXPORT_FORMATS = ['pkcs8-encrypted'];
+
+/// What each format actually hands you, in the terms that matter when you are
+/// about to write it to a file someone else might read.
+const EXPORT_FORMATS = [
+  { id: 'openssh-private', name: 'OpenSSH private key', sub: 'The usual id_ed25519 file. Unprotected.', risk: 'secret' },
+  { id: 'ppk', name: 'PuTTY private key (.ppk v3)', sub: 'For PuTTY, WinSCP and FileZilla on Windows.', risk: 'secret' },
+  { id: 'pkcs8-encrypted', name: 'PKCS#8 PEM, encrypted', sub: 'Wrapped with a passphrase you choose below.', risk: 'sealed' },
+  { id: 'pkcs8', name: 'PKCS#8 PEM, unencrypted', sub: 'Plain private key in PEM form.', risk: 'secret' },
+  { id: 'public-pem', name: 'Public key PEM (SPKI)', sub: 'No private material. Safe to hand out.', risk: 'public' },
+  { id: 'authorized_keys', name: 'authorized_keys line', sub: 'One line to paste on the remote host.', risk: 'public' },
+];
+
+const RISK_LABEL = { secret: 'Secret', sealed: 'Sealed', public: 'Public' };
+
+/// Renders the Export tab's format list and keeps the hidden <select> (which
+/// exportSelected() reads) in step with it.
+function renderExportFormats(k) {
+  const list = el('exportFormatList');
+  if (!list) return;
+  const sel = el('detailExportFormat');
+  const available = EXPORT_FORMATS.filter(f =>
+    k.has_private || PRIVATE_EXPORT_FORMATS.indexOf(f.id) === -1);
+  if (!available.some(f => f.id === sel.value)) sel.value = available[0] ? available[0].id : '';
+
+  list.innerHTML = '';
+  for (const f of available) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'format-row' + (sel.value === f.id ? ' selected' : '');
+    row.setAttribute('role', 'radio');
+    row.setAttribute('aria-checked', sel.value === f.id ? 'true' : 'false');
+    row.dataset.format = f.id;
+    row.innerHTML =
+      `<span class="format-radio"></span>` +
+      `<span class="format-text"><span class="format-name">${escapeHtml(f.name)}</span>` +
+      `<span class="format-sub">${escapeHtml(f.sub)}</span></span>` +
+      `<span class="risk-chip ${f.risk}">${RISK_LABEL[f.risk]}</span>`;
+    row.addEventListener('click', () => { sel.value = f.id; renderExportFormats(k); });
+    list.appendChild(row);
+  }
+  syncExportControls();
+}
+
+/// The passphrase field appears only when the chosen format uses one, and the
+/// button says what pressing it does - a private-key export opens a save dialog
+/// in the Rust process; a public one downloads straight away.
+function syncExportControls() {
+  const format = el('detailExportFormat').value;
+  const sealed = SEALED_EXPORT_FORMATS.indexOf(format) !== -1;
+  el('detailExportPass').hidden = !sealed;
+  el('exportPassLabel').hidden = !sealed;
+  if (!sealed) el('detailExportPass').value = '';
+  const isPrivate = PRIVATE_EXPORT_FORMATS.indexOf(format) !== -1;
+  el('detailExportBtnLabel').textContent = isPrivate ? 'Choose where to save...' : 'Export';
+  el('exportHint').textContent = isPrivate
+    ? 'Private material is serialised in the Rust process and written straight to the file you pick - it never crosses into this window.'
+    : 'This format carries no private key material.';
+}
+
+/// Overview / Export. Switching away from Export clears any typed passphrase:
+/// leaving a secret in a field you cannot see is how it ends up in a screenshot.
+function showDetailTab(tab) {
+  for (const b of document.querySelectorAll('.detail-tab')) {
+    const on = b.dataset.detailTab === tab;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  el('detailPanel-overview').hidden = tab !== 'overview';
+  el('detailPanel-export').hidden = tab !== 'export';
+  if (tab !== 'export') el('detailExportPass').value = '';
+}
+
 async function exportSelected() {
   if (!state.selectedId) return;
   const format = el('detailExportFormat').value;
@@ -1589,6 +1804,151 @@ async function exportSelected() {
   } finally {
     el('detailExportPass').value = '';
   }
+}
+
+// ─── command palette ───────────────────────────────────────────────────────
+//
+// Keys, servers and categories each had their own search box, and every action
+// beyond the five nav items had no keyboard path at all. This is one entry
+// point for all of it. It never invents data: servers are loaded on demand,
+// exactly as the key->host picker does, because nothing but the Servers view
+// used to fetch them.
+
+let paletteItems = [];
+let paletteActive = 0;
+
+async function openPalette() {
+  const modal = el('paletteModal');
+  if (!modal.hidden) return;
+  modal.hidden = false;
+  el('paletteInput').value = '';
+  if (state.unlocked && state.servers.length === 0) {
+    try { await loadServers(); } catch (e) { /* palette still works without them */ }
+  }
+  renderPalette('');
+  el('paletteInput').focus();
+}
+
+function closePalette() {
+  el('paletteModal').hidden = true;
+  paletteItems = [];
+  paletteActive = 0;
+}
+
+/// Everything the palette can reach, before filtering. Actions are listed with
+/// the words someone would actually type ("lock", "deploy", "audit").
+function paletteCandidates() {
+  const out = [];
+  for (const s of state.servers) {
+    const live = [...state.sessions.values()].some(t => t.serverId === s.id && window.tabSessionLive(t.tabId));
+    out.push({
+      group: 'Servers', icon: 'server', name: s.name || '(unnamed)',
+      sub: `${s.username || '?'}@${s.host || '?'}:${s.port || 22}` + (live ? ' · session open' : ''),
+      hint: live ? 'Switch to session' : 'Connect', live,
+      terms: [s.name, s.host, s.username, s.keyName],
+      run: () => {
+        switchView('connect');
+        selectServer(s.id);
+        const open = [...state.sessions.values()].find(t => t.serverId === s.id);
+        if (open) activateSessionTab(open.tabId); else openSessionTab(s);
+      },
+      runAlt: () => { switchView('connect'); selectServer(s.id); openSessionTab(s); },
+    });
+  }
+  for (const k of state.keys) {
+    const cats = (state.keyCategories[k.id] || []).map(catPathString).filter(Boolean);
+    out.push({
+      group: 'Keys', icon: 'key-round', name: k.name || '(unnamed)',
+      sub: [k.key_type, k.comment, cats.join(', ')].filter(Boolean).join(' · '),
+      hint: 'Open key',
+      terms: [k.name, k.comment, k.fingerprint_sha256],
+      run: () => { switchView('keys'); selectKey(k.id); },
+    });
+  }
+  for (const c of state.categories) {
+    out.push({
+      group: 'Categories', icon: 'folder', name: catPathString(c.id),
+      sub: c.scope === 'host' ? 'host category' : 'key category',
+      hint: 'Filter',
+      terms: [c.name],
+      run: () => { switchView(c.scope === 'host' ? 'connect' : 'keys'); setActiveCategory(c.id); },
+    });
+  }
+  const n = state.deploySelected.size;
+  out.push(
+    { group: 'Actions', icon: 'plus', name: 'New key...', terms: ['new', 'generate', 'import'], run: openKeyModal },
+    { group: 'Actions', icon: 'server', name: 'New server...', terms: ['new', 'server', 'host'], run: () => { switchView('connect'); openServerModal({}); } },
+    { group: 'Actions', icon: 'shield-check', name: n ? `Deploy ${n} selected key(s)...` : 'Deploy keys (select some first)',
+      terms: ['deploy', 'ssh config'], run: () => { switchView('keys'); openDeploySheet(); } },
+    { group: 'Actions', icon: 'scroll-text', name: 'Open the audit log', terms: ['audit', 'log', 'history'],
+      run: () => { switchView('settings').then(() => showSettingsSection('audit')); } },
+    { group: 'Actions', icon: 'settings', name: 'Settings', terms: ['settings', 'preferences', 'options'], run: () => switchView('settings') },
+    { group: 'Actions', icon: 'lock', name: 'Lock the vault', terms: ['lock'], run: lockNow },
+  );
+  return out;
+}
+
+function renderPalette(query) {
+  const q = query.trim().toLowerCase();
+  const all = state.unlocked ? paletteCandidates()
+    : [{ group: 'Actions', icon: 'lock-open', name: 'Unlock the vault...', terms: ['unlock'], run: () => showVaultModal('unlock') }];
+  paletteItems = !q ? all : all.filter(it =>
+    [it.name, it.sub, ...(it.terms || [])].filter(Boolean).some(t => String(t).toLowerCase().includes(q)));
+  if (paletteActive >= paletteItems.length) paletteActive = 0;
+
+  const results = el('paletteResults');
+  results.innerHTML = '';
+  el('paletteCount').textContent = paletteItems.length
+    ? paletteItems.length + (paletteItems.length === 1 ? ' result' : ' results') : '';
+  if (!paletteItems.length) {
+    const none = document.createElement('div');
+    none.className = 'palette-empty';
+    none.textContent = 'Nothing matches "' + query.trim() + '".';
+    results.appendChild(none);
+    return;
+  }
+  let lastGroup = null;
+  paletteItems.forEach((it, i) => {
+    if (it.group !== lastGroup) {
+      lastGroup = it.group;
+      const h = document.createElement('div');
+      h.className = 'palette-group';
+      h.textContent = it.group;
+      results.appendChild(h);
+    }
+    const row = document.createElement('button');
+    row.className = 'palette-row' + (i === paletteActive ? ' active' : '');
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', i === paletteActive ? 'true' : 'false');
+    row.innerHTML =
+      (it.live ? '<span class="live-dot"></span>' : `<span class="palette-ico">${ico(it.icon)}</span>`) +
+      `<span class="palette-text"><span class="palette-name">${escapeHtml(it.name)}</span>` +
+      (it.sub ? `<span class="palette-sub">${escapeHtml(it.sub)}</span>` : '') + '</span>' +
+      (it.hint ? `<span class="palette-hint">${escapeHtml(it.hint)}</span>` : '');
+    row.addEventListener('click', () => runPaletteItem(i, false));
+    row.addEventListener('mousemove', () => {
+      if (paletteActive === i) return;
+      paletteActive = i;
+      renderPalette(el('paletteInput').value);
+    });
+    results.appendChild(row);
+  });
+  const active = results.querySelector('.palette-row.active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
+}
+
+function runPaletteItem(i, alt) {
+  const it = paletteItems[i];
+  if (!it) return;
+  closePalette();
+  const fn = alt && it.runAlt ? it.runAlt : it.run;
+  try { fn(); } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+function movePaletteActive(delta) {
+  if (!paletteItems.length) return;
+  paletteActive = (paletteActive + delta + paletteItems.length) % paletteItems.length;
+  renderPalette(el('paletteInput').value);
 }
 
 // ─── new key modal ─────────────────────────────────────────────────────────
@@ -1686,9 +2046,39 @@ async function submitKeyModal() {
 
 // ─── deploy view ───────────────────────────────────────────────────────────
 
+/// Open the deploy sheet over whatever you are looking at, with the current
+/// selection already in it. Deploy used to be a top-level view you navigated
+/// to AFTER ticking checkboxes in Keys, and its own copy said so.
+async function openDeploySheet() {
+  if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
+  const ids = [...state.deploySelected];
+  if (ids.length === 0) { toast('Select at least one key first.', 'err'); return; }
+  const chips = el('deployKeyChips');
+  chips.innerHTML = '';
+  for (const id of ids) {
+    const k = state.keys.find(x => x.id === id);
+    const chip = document.createElement('span');
+    chip.className = 'cat-chip';
+    chip.textContent = k ? (k.name || '(unnamed)') : id;
+    chips.appendChild(chip);
+  }
+  el('deployModalTitle').textContent = ids.length === 1 ? 'Deploy 1 key' : 'Deploy ' + ids.length + ' keys';
+  el('deployConfigBtnLabel').textContent = ids.length === 1 ? 'Deploy 1 key' : 'Deploy ' + ids.length + ' keys';
+  await fillPathHints();
+  el('deployModal').hidden = false;
+  await previewConfig();
+  el('cfgHost').focus();
+}
+
+function closeDeploySheet() {
+  el('deployModal').hidden = true;
+  const pass = el('keyPassphraseInput');
+  if (pass) pass.value = '';
+}
+
 async function previewConfig() {
   const ids = [...state.deploySelected];
-  if (ids.length === 0) { toast('Select at least one key in the Keys view.', 'err'); return; }
+  if (ids.length === 0) { el('configPreview').value = ''; return; }
   const host = el('cfgHost').value.trim() || 'sshspan-host';
   const user = el('cfgUser').value.trim();
   const port = Number(el('cfgPort').value) || 22;
@@ -1706,15 +2096,19 @@ async function previewConfig() {
       `  IdentityFile ${keyFile}`,
       '  IdentitiesOnly yes',
       `  StrictHostKeyChecking ${strict ? 'yes' : 'no'}`,
-      encrypted ? '  (deployed private key is passphrase-protected)' : '',
-    ].filter(Boolean).join('\\n');
+      encrypted ? '  # deployed private key is passphrase-protected' : '',
+    ].filter(Boolean).join('\n');
   });
-  el('configPreview').value = blocks.join('\\n\\n') + '\\n\\n# Selected keys: ' + ids.length;
+  /// These joins were '\\n' - an escaped backslash, so the preview rendered the
+  /// two characters \n instead of a line break and the whole config came out as
+  /// one unreadable line. deployConfig() a few lines down always used '\n'.
+  el('configPreview').value =
+    '# >>> SSHSpan managed >>>\n' + blocks.join('\n\n') + '\n# <<< SSHSpan managed <<<\n';
 }
 
 async function deployConfig() {
   const ids = [...state.deploySelected];
-  if (ids.length === 0) { toast('Select at least one key in the Keys view.', 'err'); return; }
+  if (ids.length === 0) { toast('Select at least one key first.', 'err'); return; }
   // Real paths, from the backend. This prompt used to say it updated
   // ~/.ssh/config; it does not - the managed config lives in the app config
   // dir, while the private key really does land in ~/.ssh. Someone ticking
@@ -1738,8 +2132,14 @@ async function deployConfig() {
     el('configPreview').value = 'Deployed ' + res.keys.length + ' key(s)\n'
       + res.keys.map(k => '  ' + k.name + ' -> ' + k.file).join('\n');
     toast('Keys deployed.', 'ok');
+    // The sheet has done its job; the Deployed chips on the rows behind it are
+    // now the record, so reload them and get out of the way.
+    closeDeploySheet();
+    state.deploySelected.clear();
+    await loadKeys();
+    updateSelectionHint();
 
-    // Optionally register the deployed keys as Connect servers (Deploy ↔ Connect bridge).
+    // Optionally register the deployed keys as saved servers (Deploy ↔ Servers bridge).
     if (el('deployRegisterToggle')?.checked) {
       const alias = el('cfgHost').value.trim();
       const user = el('cfgUser').value.trim();
@@ -1769,7 +2169,7 @@ async function deployConfig() {
       }
       if (registered) {
         await loadServers();
-        toast(`${registered} server(s) registered in Connect.`, 'ok');
+        toast(`${registered} server(s) saved under Servers.`, 'ok');
       }
     }
   } catch (e) {
@@ -1965,6 +2365,19 @@ async function fillPathHints() {
   set('deployDirHint', p.deployDir + '/sshspan_<name>');
 }
 
+/// Settings is one page with a section rail, not five destinations. Audit used
+/// to be a top-level nav item beside your keys; it is a log you consult, so it
+/// lives here with the other things you open once a month.
+function showSettingsSection(section) {
+  for (const b of document.querySelectorAll('.settings-nav-item')) {
+    b.classList.toggle('active', b.dataset.section === section);
+  }
+  for (const s of document.querySelectorAll('.settings-section')) {
+    s.hidden = s.dataset.section !== section;
+  }
+}
+window.showSettingsSection = showSettingsSection;
+
 async function loadSettings() {
   fillPathHints();
   try {
@@ -1974,16 +2387,43 @@ async function loadSettings() {
     toast(e.message || String(e), 'err');
     return;
   }
-  const grid = document.querySelector('.settings-grid');
+  const grid = el('settingsRows');
   grid.innerHTML = '';
 
-  const mkRow = (labelText, control) => {
-    const label = document.createElement('label');
-    const span = document.createElement('span');
-    span.textContent = labelText;
-    label.appendChild(span);
-    label.appendChild(control);
-    grid.appendChild(label);
+  /// One row shape for every setting: what it is on the left, what it costs you
+  /// underneath, the control on the right. A bare checkbox gets the same toggle
+  /// the rest of the app uses - Settings rendered raw browser checkboxes while
+  /// the deploy options one screen away used styled toggles, so the same control
+  /// had two appearances depending on where you found it.
+  const mkRow = (labelText, control, description) => {
+    const row = document.createElement('label');
+    row.className = 'settings-row';
+    const text = document.createElement('span');
+    text.className = 'settings-row-text';
+    const title = document.createElement('span');
+    title.className = 'settings-row-title';
+    title.textContent = labelText;
+    text.appendChild(title);
+    if (description) {
+      const sub = document.createElement('span');
+      sub.className = 'settings-row-sub';
+      sub.textContent = description;
+      text.appendChild(sub);
+    }
+    row.appendChild(text);
+    const ctl = document.createElement('span');
+    ctl.className = 'settings-row-control';
+    if (control.tagName === 'INPUT' && control.type === 'checkbox') {
+      control.classList.add('toggle-input');
+      const box = document.createElement('span');
+      box.className = 'toggle-box';
+      ctl.appendChild(control);
+      ctl.appendChild(box);
+    } else {
+      ctl.appendChild(control);
+    }
+    row.appendChild(ctl);
+    grid.appendChild(row);
   };
 
   const autoLock = document.createElement('input');
@@ -1999,7 +2439,8 @@ async function loadSettings() {
       toast('Auto-lock updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Auto-lock after (minutes)', autoLock);
+  mkRow('Lock the vault when idle', autoLock,
+    'Minutes of inactivity before the vault seals itself. 0 turns auto-lock off.');
 
   // Interface scale. The stylesheet is written in px throughout, so a root
   // font-size would only resize text and leave every control the same size.
@@ -2023,7 +2464,8 @@ async function loadSettings() {
       toast('Interface scale set to ' + pct + '%.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Interface scale', uiScale);
+  mkRow('Interface scale', uiScale,
+    'Scales the whole window, not just text - the layout is sized in pixels.');
 
   const confirmDelete = document.createElement('input');
   confirmDelete.type = 'checkbox';
@@ -2034,7 +2476,8 @@ async function loadSettings() {
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Confirm before deleting keys', confirmDelete);
+  mkRow('Confirm before deleting a key', confirmDelete,
+    'Deletion is permanent. The audit log keeps a record either way.');
 
   const confirmPaste = document.createElement('input');
   confirmPaste.type = 'checkbox';
@@ -2046,7 +2489,8 @@ async function loadSettings() {
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Confirm before pasting multiple terminal lines', confirmPaste);
+  mkRow('Confirm multi-line pastes into the terminal', confirmPaste,
+    'A pasted newline runs the line. This catches a copied block before it executes.');
 
   const autoUpdate = document.createElement('input');
   autoUpdate.type = 'checkbox';
@@ -2058,13 +2502,15 @@ async function loadSettings() {
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Automatically check GitHub for a newer release', autoUpdate);
+  mkRow('Check GitHub for new releases', autoUpdate,
+    'Fetches a version number only. Nothing about your vault leaves this machine.');
 
   const checkNow = document.createElement('button');
   checkNow.className = 'ghost-btn';
   checkNow.innerHTML = `${ico('refresh-cw')}<span>Check now</span>`;
   checkNow.addEventListener('click', manualUpdateCheck);
-  mkRow('Updates', checkNow);
+  mkRow('Check for an update now', checkNow,
+    'Compares this build against the latest GitHub release.');
 
   const sftpParallel = document.createElement('input');
   sftpParallel.type = 'number';
@@ -2080,7 +2526,8 @@ async function loadSettings() {
       toast('Parallel transfers updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('SFTP parallel transfers (1-4)', sftpParallel);
+  mkRow('Parallel file transfers', sftpParallel,
+    'More streams help on fast links and hurt on congested ones. 1 to 4.');
 
   const sftpHidden = document.createElement('input');
   sftpHidden.type = 'checkbox';
@@ -2092,7 +2539,8 @@ async function loadSettings() {
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Show hidden files in SFTP by default', sftpHidden);
+  mkRow('Show hidden files in the file browser', sftpHidden,
+    'Dotfiles are hidden by default; you can always toggle this per session.');
 
   // sftpMaxBps and sftpVerifyTransfers below aren't in settings_get's
   // (Rust) key allowlist, so unlike every setting above, this renderer can
@@ -2141,6 +2589,7 @@ async function loadSettings() {
   const applyThrottle = async () => {
     bpsNum.disabled = bpsUnlimited.checked;
     bpsUnit.disabled = bpsUnlimited.checked;
+    bpsUnlimitedTag.classList.toggle('active', bpsUnlimited.checked);
     const mag = Math.max(1, Math.min(1000000, parseInt(bpsNum.value, 10) || 1));
     bpsNum.value = mag;
     const bytesPerSec = bpsUnlimited.checked ? 0 : mag * parseInt(bpsUnit.value, 10);
@@ -2161,11 +2610,13 @@ async function loadSettings() {
   bpsUnlimited.addEventListener('change', applyThrottle);
   bpsNum.addEventListener('change', applyThrottle);
   bpsUnit.addEventListener('change', applyThrottle);
+  bpsUnlimitedTag.classList.toggle('active', bpsUnlimited.checked);
   bpsWrap.appendChild(bpsUnlimited);
   bpsWrap.appendChild(bpsUnlimitedTag);
   bpsWrap.appendChild(bpsNum);
   bpsWrap.appendChild(bpsUnit);
-  mkRow('SFTP bandwidth limit (all transfers, shared)', bpsWrap);
+  mkRow('Bandwidth limit', bpsWrap,
+    'Shared across every transfer, not per file.');
 
   // Verify toggle (Task 4): off by default - the label states the actual
   // cost up front rather than burying it in a tooltip, since re-reading
@@ -2182,7 +2633,8 @@ async function loadSettings() {
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Verify transfers with SHA-256 after upload/download (re-reads both sides - roughly doubles transfer traffic)', sftpVerify);
+  mkRow('Verify transfers with SHA-256', sftpVerify,
+    'Re-reads both sides to compare hashes - roughly doubles the traffic a transfer uses.');
 
   // Conflict default actions (the "Always use this action" checkbox in the
   // transfer conflict dialog writes the same keys). Values are mirrored
@@ -2192,7 +2644,7 @@ async function loadSettings() {
     '<option value="skip">Skip</option>' +
     '<option value="rename">Rename (auto)</option>' +
     '<option value="resume">Resume</option>';
-  const mkConflictRow = (labelText, key) => {
+  const mkConflictRow = (labelText, key, description) => {
     const sel = document.createElement('select');
     sel.innerHTML = conflictOptions;
     sel.value = (state.settings && state.settings[key]) ||
@@ -2205,10 +2657,12 @@ async function loadSettings() {
         toast('Saved.', 'ok');
       } catch (e) { toast(e.message || String(e), 'err'); }
     });
-    mkRow(labelText, sel);
+    mkRow(labelText, sel, description);
   };
-  mkConflictRow('Upload when the file exists', 'sftpConflictUpload');
-  mkConflictRow('Download when the file exists', 'sftpConflictDownload');
+  mkConflictRow('When an upload would overwrite a file', 'sftpConflictUpload',
+    'The conflict dialog writes this same setting when you tick "always use this action".');
+  mkConflictRow('When a download would overwrite a file', 'sftpConflictDownload',
+    'Resume continues a part-finished transfer; rename keeps both copies.');
 
   const termScrollback = document.createElement('input');
   termScrollback.type = 'number';
@@ -2226,7 +2680,8 @@ async function loadSettings() {
       toast('Terminal scrollback updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Terminal scrollback lines', termScrollback);
+  mkRow('Terminal scrollback', termScrollback,
+    'Lines of history kept per session. More costs memory in every open tab.');
 
   const termBell = document.createElement('select');
   termBell.innerHTML = '<option value="visual">Visual</option><option value="sound">Sound</option><option value="silent">Silent</option>';
@@ -2238,7 +2693,8 @@ async function loadSettings() {
       toast('Terminal bell updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Terminal bell', termBell);
+  mkRow('Terminal bell', termBell,
+    'What happens when a remote program rings the bell. Visual flashes the tab.');
 
   const termBackspace = document.createElement('select');
   termBackspace.innerHTML = '<option value="default">Delete (0x7f)</option><option value="backspace">Backspace (0x08)</option>';
@@ -2250,7 +2706,8 @@ async function loadSettings() {
       toast('Backspace compatibility updated; it applies to new terminals.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Backspace key sends', termBackspace);
+  mkRow('Backspace key sends', termBackspace,
+    'Change this only if Backspace prints ^H on a particular host. Applies to new terminals.');
 
   const termHomeEnd = document.createElement('select');
   termHomeEnd.innerHTML = '<option value="default">xterm/Home+End standard</option><option value="rxvt">rxvt/Home+End compatibility</option>';
@@ -2262,7 +2719,8 @@ async function loadSettings() {
       toast('Home/End compatibility updated; it applies to new terminals.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Home/End key mode', termHomeEnd);
+  mkRow('Home and End key mode', termHomeEnd,
+    'Switch to rxvt if those keys misbehave on an older host. Applies to new terminals.');
 
   const termAppCursor = document.createElement('select');
   termAppCursor.innerHTML = '<option value="default">Allow application cursor keys</option><option value="disabled">Disable application cursor keys</option>';
@@ -2274,7 +2732,8 @@ async function loadSettings() {
       toast('Cursor-key compatibility updated; it applies to new terminals.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Application cursor keys', termAppCursor);
+  mkRow('Application cursor keys', termAppCursor,
+    'Disable if arrow keys emit escape sequences inside an editor. Applies to new terminals.');
 
   const termAppKeypad = document.createElement('select');
   termAppKeypad.innerHTML = '<option value="default">Allow application keypad</option><option value="disabled">Disable application keypad</option>';
@@ -2286,7 +2745,8 @@ async function loadSettings() {
       toast('Keypad compatibility updated; it applies to new terminals.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
-  mkRow('Application keypad', termAppKeypad);
+  mkRow('Application keypad', termAppKeypad,
+    'Disable if the numeric keypad types the wrong characters. Applies to new terminals.');
 
   // Keepalives moved to the SSH protocol layer (russh keepalive@openssh.com
   // every 30 s); the old per-second data-channel ping sent NUL bytes the
@@ -2294,7 +2754,8 @@ async function loadSettings() {
   const keepaliveInfo = document.createElement('span');
   keepaliveInfo.className = 'hint';
   keepaliveInfo.textContent = 'Automatic - protocol-level, every 30 s';
-  mkRow('SSH keepalive', keepaliveInfo);
+  mkRow('SSH keepalive', keepaliveInfo,
+    'Protocol-level, so it never sends bytes your remote shell can see.');
 
   loadKnownHosts();
 }
@@ -2377,6 +2838,11 @@ async function loadKnownHosts() {
     const res = await call('known_hosts_list');
     const hosts = res.hosts || [];
     empty.hidden = hosts.length > 0;
+    const chip = el('knownHostsCount');
+    if (chip) {
+      chip.hidden = hosts.length === 0;
+      chip.textContent = hosts.length === 1 ? '1 pinned' : hosts.length + ' pinned';
+    }
     for (const h of hosts) {
       const tr = document.createElement('tr');
       const tdHost = document.createElement('td');
@@ -2447,13 +2913,11 @@ async function loadAudit() {
 
 // ─── navigation ────────────────────────────────────────────────────────────
 
-const VIEW_TITLES = { keys: 'Keys', connect: 'Connect', config: 'Deploy', settings: 'Settings', audit: 'Audit Log' };
+const VIEW_TITLES = { keys: 'Keys', connect: 'Servers', settings: 'Settings' };
 const VIEW_SUBS = {
   keys: '',
-  connect: 'Saved servers + an interactive remote shell (vault-gated)',
-  config: 'Deploy staged keys to ~/.ssh and manage your SSH config',
-  settings: 'Vault preferences and Bitwarden / Vaultwarden sync',
-  audit: 'A local record of every sensitive action',
+  connect: '',
+  settings: 'Vault, transfers, sync and the audit trail',
 };
 
 async function switchView(view) {
@@ -2474,8 +2938,8 @@ async function switchView(view) {
     await loadSettings();
     await loadBitwardenConfig();
     await loadKnownHosts();
+    await loadAudit();
   }
-  if (view === 'audit') await loadAudit();
   if (view === 'keys') {
     state.categoryScope = 'key'; rebuildCategoryIndex(); renderCategoryTree();
     renderKeyList();
@@ -2506,9 +2970,9 @@ function wire() {
     openTerminalContextMenu(ev.clientX, ev.clientY, state.activeTabId);
   });
 
-  // topbar
-  el('lockBtn').addEventListener('click', lockNow);
-  el('changePasswordBtn').addEventListener('click', () => showVaultModal('change'));
+  // topbar + vault control
+  el('paletteBtn').addEventListener('click', () => openPalette());
+  el('vaultStatus').addEventListener('click', (ev) => openVaultMenu(ev.currentTarget));
 
   // vault modal
   el('vaultPrimary').addEventListener('click', submitVaultModal);
@@ -2528,21 +2992,85 @@ function wire() {
   if (emptyNew) emptyNew.addEventListener('click', openKeyModal);
   el('searchInput').addEventListener('input', renderKeyList);
   el('typeFilter').addEventListener('change', renderKeyList);
-  el('catFilterBtn').addEventListener('click', () => {
-    const scope = currentCategoryScope();
+  el('catAddRootBtn').addEventListener('click', () => addCategoryPrompt(null));
+
+  // selection actions (what used to be the Deploy view's entry point)
+  el('selDeployBtn').addEventListener('click', openDeploySheet);
+  el('selDeleteBtn').addEventListener('click', deleteSelectedKeys);
+  el('selClearBtn').innerHTML = ico('x');
+  el('selClearBtn').addEventListener('click', () => {
+    state.deploySelected.clear();
+    renderKeyList();
+    updateSelectionHint();
+  });
+  el('selCategoryBtn').addEventListener('click', () => {
+    const ids = [...state.deploySelected];
+    if (!ids.length) return;
     openCategoryPicker({
-      title: scope === 'host' ? 'Filter hosts by category' : 'Filter keys by category',
-      scope,
-      initial: activeCategoryId() !== 'all' && activeCategoryId() !== 'uncategorized' ? [activeCategoryId()] : [],
-      single: true,
-      onSave: (ids) => {
-        if (ids.length) setActiveCategory(ids[0]);
-        else setActiveCategory('all');
+      title: 'Add ' + ids.length + ' key(s) to categories',
+      initial: [],
+      onSave: async (catIds) => {
+        if (!catIds.length) return;
+        try {
+          for (const keyId of ids) {
+            const merged = [...new Set([...(state.keyCategories[keyId] || []), ...catIds])];
+            await call('key_set_categories', { keyId, categoryIds: merged });
+          }
+          await loadKeys();
+          toast('Categories updated.', 'ok');
+        } catch (e) { toast(e.message || String(e), 'err'); }
       },
     });
   });
-  el('catAddRootBtn').addEventListener('click', () => addCategoryPrompt(null));
-  el('catFilterBtn').setAttribute('aria-label', 'Filter current view by category');
+
+  // detail pane tabs + export
+  for (const b of document.querySelectorAll('.detail-tab')) {
+    b.addEventListener('click', () => showDetailTab(b.dataset.detailTab));
+  }
+  el('detailCopyFprBtn').innerHTML = ico('copy');
+  el('detailCopyFprBtn').addEventListener('click', async () => {
+    const ok = await copyText(el('detailFingerprint').textContent || '');
+    toast(ok ? 'Fingerprint copied.' : 'Clipboard unavailable.', ok ? 'ok' : 'err');
+  });
+  el('detailConnectBtn').addEventListener('click', (ev) => {
+    const k = state.keys.find(x => x.id === state.selectedId);
+    if (!k) return;
+    const r = ev.currentTarget.getBoundingClientRect();
+    openKeyConnectMenu(r.left, r.bottom + 4, k);
+  });
+
+  // deploy sheet
+  el('deployModal').addEventListener('click', (ev) => {
+    if (ev.target === el('deployModal')) closeDeploySheet();
+  });
+  for (const b of el('deployModal').querySelectorAll('[data-close]')) {
+    b.addEventListener('click', closeDeploySheet);
+  }
+  // Live preview: the old one stayed empty until you pressed a Preview button,
+  // so the first answer to "what will this write?" was nothing.
+  for (const id of ['cfgHost', 'cfgUser', 'cfgPort']) {
+    el(id).addEventListener('input', previewConfig);
+  }
+  for (const id of ['strictHostKeyToggle', 'keyPassphraseToggle']) {
+    el(id).addEventListener('change', previewConfig);
+  }
+
+  // command palette
+  el('paletteModal').addEventListener('click', (ev) => {
+    if (ev.target === el('paletteModal')) closePalette();
+  });
+  el('paletteInput').addEventListener('input', (ev) => { paletteActive = 0; renderPalette(ev.target.value); });
+  el('paletteInput').addEventListener('keydown', (ev) => {
+    if (ev.key === 'ArrowDown') { ev.preventDefault(); movePaletteActive(1); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); movePaletteActive(-1); }
+    else if (ev.key === 'Enter') { ev.preventDefault(); runPaletteItem(paletteActive, ev.ctrlKey || ev.metaKey); }
+  });
+
+  // settings section rail
+  for (const b of document.querySelectorAll('.settings-nav-item')) {
+    b.addEventListener('click', () => showSettingsSection(b.dataset.section));
+  }
+
   el('detailRenameBtn').addEventListener('click', () => {
     if (!state.selectedId) return;
     const k = state.keys.find(x => x.id === state.selectedId);
@@ -2598,10 +3126,13 @@ function wire() {
   el('genType').addEventListener('change', onGenTypeChange);
   el('importBrowseBtn').addEventListener('click', browseForImport);
 
-  // deploy view
-  el('previewConfigBtn').addEventListener('click', previewConfig);
+  // deploy sheet actions (Preview is gone - the preview is always live now)
   el('deployConfigBtn').addEventListener('click', deployConfig);
   el('copyConfigBtn').addEventListener('click', copyConfig);
+
+  // vault actions, now in Settings rather than the corner of every view
+  el('lockBtn').addEventListener('click', lockNow);
+  el('changePasswordBtn').addEventListener('click', () => showVaultModal('change'));
 
   // bitwarden sync (settings view)
   el('bwSaveBtn').addEventListener('click', () => {
@@ -2684,7 +3215,12 @@ function wire() {
       // handlers only cover the search box and the tree - with focus on Save
       // or Cancel the keystroke arrives here instead, and closing the modal
       // underneath would discard the form the user is still filling in.
-      if (!el('pickerModal').hidden) closeCategoryPicker();
+      // Topmost first. The palette opens over everything, and the deploy sheet
+      // opens over the key list, so both have to be checked before the modals
+      // they can appear on top of.
+      if (!el('paletteModal').hidden) closePalette();
+      else if (!el('pickerModal').hidden) closeCategoryPicker();
+      else if (!el('deployModal').hidden) closeDeploySheet();
       else if (!el('modalBackdrop').hidden) closeKeyModal();
       else if (!el('serverModal').hidden) closeServerModal();
       else if (el('app').classList.contains('term-max')) toggleTermMax();
@@ -2695,10 +3231,9 @@ function wire() {
     const k = ev.key.toLowerCase();
     if (k === '1') { switchView('keys'); ev.preventDefault(); }
     else if (k === '2') { switchView('connect'); ev.preventDefault(); }
-    else if (k === '3') { switchView('config'); ev.preventDefault(); }
-    else if (k === '4') { switchView('settings'); ev.preventDefault(); }
-    else if (k === '5') { switchView('audit'); ev.preventDefault(); }
+    else if (k === '3') { switchView('settings'); ev.preventDefault(); }
     else if (k === ',') { switchView('settings'); ev.preventDefault(); }
+    else if (k === 'k') { ev.preventDefault(); openPalette(); }
     else if (k === 'n') {
       ev.preventDefault();
       if (state.unlocked) openKeyModal();
@@ -2725,11 +3260,15 @@ function wire() {
     const srv = currentSelectedServer();
     if (srv) testSelectedServer(srv);
   });
-  const termModeBtn = el('termModeBtn');
-  if (termModeBtn) termModeBtn.addEventListener('click', () => {
-    if (typeof window.toggleSshSftpMode === 'function') window.toggleSshSftpMode();
-    else toast('SFTP is still loading - try again in a moment.', 'err');
-  });
+  const modeSeg = el('termModeSeg');
+  if (modeSeg) {
+    for (const b of modeSeg.querySelectorAll('.seg-btn')) {
+      b.addEventListener('click', () => {
+        if (typeof window.setSessionMode === 'function') window.setSessionMode(b.dataset.mode);
+        else toast('The file browser is still loading - try again in a moment.', 'err');
+      });
+    }
+  }
   el('keyPassphraseToggle')?.addEventListener('change', (ev) => {
     const input = el('keyPassphraseInput');
     if (input) input.hidden = !ev.target.checked;
@@ -2801,11 +3340,15 @@ async function lockNow() {
 // ─── Auto-lock (idle timer, honors the autoLockMinutes setting) ────────────
 
 let autoLockTimer = null;
+let autoLockDeadline = 0;
+let autoLockTicker = null;
 
 function resetAutoLockTimer() {
   if (autoLockTimer) { clearTimeout(autoLockTimer); autoLockTimer = null; }
   const mins = parseInt(state.settings.autoLockMinutes, 10);
-  if (!state.unlocked || !mins || mins <= 0) return;
+  if (!state.unlocked || !mins || mins <= 0) { autoLockDeadline = 0; renderVaultCountdown(); return; }
+  autoLockDeadline = Date.now() + mins * 60 * 1000;
+  renderVaultCountdown();
   autoLockTimer = setTimeout(async () => {
     autoLockTimer = null;
     if (state.unlocked) {
@@ -2814,6 +3357,23 @@ function resetAutoLockTimer() {
     }
   }, mins * 60 * 1000);
 }
+
+/// The countdown under the vault label. Auto-lock has always been a setting
+/// with no feedback: you could not tell whether it was on, or how long you
+/// had, until the vault locked under you mid-task.
+function renderVaultCountdown() {
+  const sub = el('vaultSub');
+  if (!sub) return;
+  if (!state.unlocked) { sub.hidden = true; sub.textContent = ''; return; }
+  if (!autoLockDeadline) { sub.hidden = false; sub.textContent = 'auto-lock off'; return; }
+  const left = Math.max(0, autoLockDeadline - Date.now());
+  const m = Math.floor(left / 60000);
+  const s = Math.floor((left % 60000) / 1000);
+  sub.hidden = false;
+  sub.textContent = 'locks in ' + m + ':' + String(s).padStart(2, '0');
+}
+
+if (!autoLockTicker) autoLockTicker = setInterval(renderVaultCountdown, 1000);
 
 // Renderer liveness heartbeat: the backend runs its own idle auto-lock
 // watchdog that locks the vault when no heartbeat has arrived for
@@ -2933,8 +3493,18 @@ function renderServerList() {
     const row = document.createElement('div');
     row.className = 'server-row' + (s.id === state.connectSelectedId ? ' selected' : '');
     row.dataset.id = s.id;
+    row.tabIndex = 0;
     const head = document.createElement('div');
     head.className = 'server-row-head';
+    /// Whether a session is open was only visible in the tab strip; the list
+    /// you pick from said nothing, so you would reconnect to a host you were
+    /// already on. The dot is the same state the tab chip shows.
+    const openTab = [...state.sessions.values()].find(t => t.serverId === s.id);
+    const isLive = !!(openTab && window.tabSessionLive(openTab.tabId));
+    const dot = document.createElement('span');
+    dot.className = 'server-dot' + (isLive ? ' live' : '');
+    dot.title = isLive ? 'Session open' : 'Not connected';
+    head.appendChild(dot);
     const name = document.createElement('span');
     name.className = 'server-name';
     name.textContent = s.name || '(unnamed)';
@@ -2963,8 +3533,30 @@ function renderServerList() {
     auth.innerHTML = `${ico(authIcon)}<span>${escapeHtml(authLabel)}</span>`;
     row.appendChild(auth);
 
+    /// Connecting used to be a double-click and nothing else, with nothing on
+    /// screen saying so. The button is the affordance; double-click and Enter
+    /// still work for anyone who already knew.
+    const go = document.createElement('button');
+    go.className = 'server-go' + (isLive ? ' ghost-btn' : ' primary-btn');
+    go.title = isLive ? 'Switch to the open session' : 'Connect to this server';
+    go.innerHTML = `${ico(isLive ? 'terminal' : 'plug-zap')}<span>${isLive ? 'Open' : 'Connect'}</span>`;
+    go.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      selectServer(s.id);
+      if (isLive) activateSessionTab(openTab.tabId);
+      else openSessionTab(s);
+    });
+    head.appendChild(go);
+
     row.addEventListener('click', () => selectServer(s.id));
     row.addEventListener('dblclick', () => openSessionTab(s));
+    row.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Enter') return;
+      ev.preventDefault();
+      selectServer(s.id);
+      if (isLive) activateSessionTab(openTab.tabId);
+      else openSessionTab(s);
+    });
     row.addEventListener('contextmenu', (ev) => {
       ev.preventDefault();
       openServerContextMenu(ev.clientX, ev.clientY, s);
@@ -3458,7 +4050,10 @@ function activateSessionSurface(tabId) {
   window.__activeSessionSurface = tabId;
   tab.bell = false;
   state.activeTabId = tabId;
-  if (tab.mode === 'sftp') {
+  if (tab.mode === 'split') {
+    if (typeof window.showSplitForTab !== 'function') return;
+    window.showSplitForTab(tabId);
+  } else if (tab.mode === 'sftp') {
     if (typeof window.showSftpForTab !== 'function') return;
     window.showSftpForTab(tabId);
   } else {
@@ -3539,6 +4134,10 @@ function renderTermTabs() {
     });
     strip.insertBefore(chip, addBtn);
   }
+  // The server list carries the same live/idle state on its rows, so it has to
+  // be redrawn whenever the set of sessions changes.
+  if (state.view === 'connect' && el('serverList')) renderServerList();
+  updateNavCounts();
 }
 
 /// Head title + buttons follow the active tab, or the selected server.
@@ -3553,21 +4152,35 @@ function updateTerminalHead() {
     const live = window.tabSessionLive(tab.tabId);
     el('termDisconnectBtn').hidden = !live;
     el('termReconnectBtn').hidden = live;
-    el('termModeBtn').hidden = !live;
-    el('termModeLabel').textContent = tab.mode === 'sftp' ? 'SSH' : 'SFTP';
+    setModeSeg(live, tab.mode);
   } else if (srv) {
     el('termTitle').textContent = srv.name;
     el('termBadge').textContent = `${srv.host}:${srv.port}`;
     el('termBadge').hidden = false;
     el('termDisconnectBtn').hidden = true;
     el('termReconnectBtn').hidden = false;
-    el('termModeBtn').hidden = true;
+    setModeSeg(false);
   } else {
     el('termTitle').textContent = 'No connection';
     el('termBadge').hidden = true;
     el('termDisconnectBtn').hidden = true;
     el('termReconnectBtn').hidden = true;
-    el('termModeBtn').hidden = true;
+    setModeSeg(false);
+  }
+  updateNavCounts();
+}
+
+/// The surface control shows which of the three you are LOOKING AT. The button
+/// it replaced was labelled with the mode you would switch to, so it read
+/// "SFTP" while you were in the shell - unreadable in either direction.
+function setModeSeg(visible, mode) {
+  const seg = el('termModeSeg');
+  if (!seg) return;
+  seg.hidden = !visible;
+  if (!visible) return;
+  for (const b of seg.querySelectorAll('.seg-btn')) {
+    b.classList.toggle('active', b.dataset.mode === (mode || 'ssh'));
+    b.setAttribute('aria-selected', b.dataset.mode === (mode || 'ssh') ? 'true' : 'false');
   }
 }
 
@@ -3674,7 +4287,7 @@ function escapeHtml(s) {
   // Build marker: visible in the sidebar brand on every screen (the window
   // title is owned by the OS window and does not follow document.title).
   const brandSub = document.querySelector('.brand-sub');
-  if (brandSub) brandSub.textContent = 'KEY MANAGER · ' + window.__SSHPAN_BUILD__;
+  if (brandSub) brandSub.textContent = 'KEYS & SESSIONS · ' + window.__SSHPAN_BUILD__;
 
   if (!window.__SSHPAN_TERMINAL_JS__) {
     toast('terminal.js loaded but did not initialize - Connect view will not work.', 'err');
