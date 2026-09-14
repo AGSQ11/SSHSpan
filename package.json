@@ -36,7 +36,8 @@
     "dist:linux": "tauri build --target x86_64-unknown-linux-gnu",
     "icon": "node scripts/make-icon.js",
     "icon:sidebar": "node scripts/make-sidebar-icon.js",
-    "test": "cargo test --manifest-path src-tauri/Cargo.toml"
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:ui": "node scripts/check-renderer-ui.js"
   },
   "engines": {
     "node": ">=18.0.0"
