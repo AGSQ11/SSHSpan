@@ -1397,15 +1397,48 @@ pub async fn sftp_server_copy(
             visited,
             scanned.clone(),
         );
-        // Bounded so a stalled/pathological source surfaces an error instead of
-        // leaving "Sending..." frozen forever.
-        if tokio::time::timeout(std::time::Duration::from_secs(120), walk)
-            .await
-            .is_err()
-        {
-            return Err(CmdError(
-                "Folder scan timed out (source server too slow or unresponsive).".into(),
-            ));
+        // Progress-aware bound, not a flat wall-clock cap: a large tree on a
+        // slow-but-advancing source (e.g. mailcow-dockerized) must not be
+        // killed just because the whole scan takes longer than a fixed
+        // ceiling. The walk streams batches into the queue; `scanned` only
+        // advances on each enqueue, so a STALLED scan stops advancing it. Poll
+        // for progress: abort only when no new files have been enqueued for
+        // SCAN_STALL_WINDOW, otherwise let a long scan run.
+        const SCAN_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+        tokio::pin!(walk);
+        let mut last_count = 0usize;
+        let mut stalled_since: Option<std::time::Instant> = None;
+        let walk_result = loop {
+            tokio::select! {
+                res = &mut walk => break Some(res),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    let n = scanned.load(std::sync::atomic::Ordering::SeqCst);
+                    if n != last_count {
+                        last_count = n;
+                        stalled_since = None; // progress made; reset the stall clock
+                    } else {
+                        let since = stalled_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= SCAN_STALL_WINDOW {
+                            break None; // genuinely stalled - abort the walk
+                        }
+                    }
+                }
+            }
+        };
+        match walk_result {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(CmdError(e)),
+            None => {
+                let n = scanned.load(std::sync::atomic::Ordering::SeqCst);
+                return Err(CmdError(if n > 0 {
+                    format!(
+                        "Folder scan stalled after {n} file(s) (source server unresponsive); \
+                         {n} already-queued transfer(s) are still running."
+                    )
+                } else {
+                    "Folder scan stalled (source server unresponsive).".into()
+                }));
+            }
         }
         let n = scanned.load(std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
