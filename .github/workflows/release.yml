@@ -83,7 +83,8 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            desktop-file-utils
 
       - name: Sync package version with tag (v1.3 -> 1.3.0)
         shell: bash
