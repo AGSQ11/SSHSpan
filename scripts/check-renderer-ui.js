@@ -264,12 +264,239 @@ async function checkConnectPicker(browser, server) {
   await page.close();
 }
 
+// ─── SFTP local pane: selection, context menu, column toggle ───────────────
+
+async function checkSftpLocalPane(browser, server) {
+  console.log('sftp local pane');
+  const { page, errors } = await openPage(browser, server, {
+    vault_status: { hasVault: true, unlocked: true },
+    key_list: { keys: [KEY('k1', 'a-key', [])] },
+    category_list: { categories: [], allKeyCategories: {}, orphans: false, hostOrphans: false },
+    server_list: { servers: [] },
+    settings_get: {},
+    // Stub reply for the fake sftp_local_list IPC - a Windows-shaped path so
+    // the separator handling gets exercised, with no real user in it.
+    sftp_local_list: {
+      path: 'C:\\Users\\example', home: 'C:\\Users\\example',
+      entries: [
+        { name: '.anaconda', isDir: true, size: null, modifiedMs: 1756075901000 },
+        { name: '.bun', isDir: true, size: null, modifiedMs: 1777576926000 },
+        { name: 'notes.txt', isDir: false, size: 1234, modifiedMs: 1777576926000 },
+      ],
+    },
+    sftp_list_dir: { entries: [] },
+    sftp_bookmarks_list: { bookmarks: [] },
+    sftp_queue_list: { jobs: [] },
+  });
+
+  const built = await page.evaluate(async () => {
+    const tabId = 't1';
+    state.sessions.set(tabId, {
+      tabId, sessionId: 'sess', serverId: 'srv', serverName: 'host',
+      host: '10.0.0.1', port: 22, mode: 'sftp', sftpReady: true, sftpPath: '/', ended: false,
+    });
+    const panel = buildSftpPanel(tabId);
+    document.getElementById('sftpBody').appendChild(panel);
+    panel.style.display = 'flex';
+    document.getElementById('sftpBody').classList.add('visible');
+    toggleDualPane(tabId);                       // open the local pane
+    await new Promise(r => setTimeout(r, 300));
+    const tbody = document.getElementById('sftpLocalTbody-' + tabId);
+    return tbody ? tbody.querySelectorAll('tr.sftp-entry').length : 0;
+  });
+  check('the local pane lists its entries', built, 3);
+
+  // A right-click that nothing handles falls through to the webview's own
+  // Back/Reload/Save-as menu, which is what users saw here.
+  const ctx = await page.evaluate(async () => {
+    const rows = document.querySelectorAll('#sftpLocalTbody-t1 tr.sftp-entry');
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 300 });
+    rows[0].dispatchEvent(ev);
+    await new Promise(r => setTimeout(r, 60));
+    const menu = document.getElementById('keyConnectMenu');
+    return {
+      prevented: ev.defaultPrevented,
+      items: menu ? Array.from(menu.querySelectorAll('.ctx-item')).map(b => b.textContent.trim()) : [],
+      selected: document.querySelectorAll('#sftpLocalTbody-t1 tr.selected').length,
+    };
+  });
+  check('a right-click on a local row suppresses the webview menu', ctx.prevented, true);
+  check('it opens the app menu for a folder', ctx.items, ['Open', 'Upload folder', 'Copy path', 'Refresh']);
+  check('and retargets the selection to the row under the pointer', ctx.selected, 1);
+
+  const empty = await page.evaluate(async () => {
+    closeKeyConnectMenu();
+    const wrap = document.querySelector('#sftpLocalPane-t1 .sftp-tablewrap');
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 700 });
+    wrap.dispatchEvent(ev);
+    await new Promise(r => setTimeout(r, 60));
+    const menu = document.getElementById('keyConnectMenu');
+    return {
+      prevented: ev.defaultPrevented,
+      items: menu ? Array.from(menu.querySelectorAll('.ctx-item')).map(b => b.textContent.trim()) : [],
+    };
+  });
+  check('the empty space below the rows is covered too', empty.prevented, true);
+  check('with a directory-level menu', empty.items,
+    ['Parent directory', 'Copy current path', 'Set as default local directory', 'Refresh']);
+
+  const sel = await page.evaluate(async () => {
+    closeKeyConnectMenu();
+    const rows = document.querySelectorAll('#sftpLocalTbody-t1 tr.sftp-entry');
+    rows[0].click();
+    const after1 = document.querySelectorAll('#sftpLocalTbody-t1 tr.selected').length;
+    rows[2].dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    const afterShift = document.querySelectorAll('#sftpLocalTbody-t1 tr.selected').length;
+    const ev = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 200, clientY: 300 });
+    rows[2].dispatchEvent(ev);
+    await new Promise(r => setTimeout(r, 60));
+    const menu = document.getElementById('keyConnectMenu');
+    return {
+      after1, afterShift,
+      items: menu ? Array.from(menu.querySelectorAll('.ctx-item')).map(b => b.textContent.trim()) : [],
+      status: (document.getElementById('sftpStatusLeft-t1') || {}).textContent || '',
+    };
+  });
+  check('a plain click selects one row', sel.after1, 1);
+  check('shift-click extends the range', sel.afterShift, 3);
+  check('the menu acts on the whole selection', sel.items,
+    ['Upload 3 items', 'Copy 3 paths', 'Refresh']);
+  check('the status bar counts the local selection', /local: 3 items, 3 selected/.test(sel.status), true);
+
+  // The Columns button flips .show-owner-cols on the panel; nothing read it.
+  const cols = await page.evaluate(async () => {
+    closeKeyConnectMenu();
+    const panel = document.getElementById('sftpPanel-t1');
+    const btn = Array.from(panel.querySelectorAll('.sftp-toolbar .ghost-btn'))
+      .find(b => b.textContent.trim() === 'Columns');
+    const cell = panel.querySelector('.col-extra');
+    const before = getComputedStyle(cell).display;
+    btn.click();
+    await new Promise(r => setTimeout(r, 40));
+    const off = getComputedStyle(cell).display;
+    btn.click();
+    await new Promise(r => setTimeout(r, 40));
+    return { before, off, on: getComputedStyle(cell).display };
+  });
+  check('permissions/owner columns start visible', cols.before, 'table-cell');
+  check('the Columns button actually hides them', cols.off, 'none');
+  check('and brings them back', cols.on, 'table-cell');
+  check('no page errors', errors, []);
+  await page.close();
+}
+
+// ─── transfer queue: grouped by server, then by remote directory ───────────
+
+async function checkQueueGrouping(browser, server) {
+  console.log('transfer queue grouping');
+  const { page, errors } = await openPage(browser, server, {
+    vault_status: { hasVault: true, unlocked: true },
+    key_list: { keys: [KEY('k1', 'a-key', [])] },
+    category_list: { categories: [], allKeyCategories: {}, orphans: false, hostOrphans: false },
+    server_list: { servers: [] },
+    settings_get: {},
+    sftp_queue_list: { jobs: [] },
+  });
+
+  // Oldest first, the order queueJobs itself holds.
+  const JOB = (id, server, remotePath, state, extra) => Object.assign({
+    id, kind: 'upload', serverName: server, remotePath,
+    localPath: '/tmp/' + id, size: 1000, bytesDone: 0, state,
+  }, extra || {});
+  const jobs = [
+    JOB('1', 'us-slc', '/root/dump.sql', 'done', { kind: 'download', bytesDone: 1000 }),
+    JOB('2', 'eu-da-mx', '/var/www/html/index.php', 'queued'),
+    JOB('3', 'eu-da-mx', '/var/www/html/app.js', 'active', { bytesDone: 500 }),
+    JOB('4', 'eu-da-mx', '/var/www/html/css/site.css', 'queued'),
+    JOB('5', 'eu-da-mx', '/var/www/html/css/img/logo.png', 'queued'),
+    JOB('6', 'eu-da-mx', '/var/www/README.md', 'queued'),
+    JOB('7', 'eu-da-mx', '/top-level.txt', 'queued'),
+  ];
+
+  const draw = () => page.evaluate(() =>
+    Array.from(document.getElementById('sftpQueueList').children).map((el) => {
+      const depth = Number(getComputedStyle(el).getPropertyValue('--q-depth')) || 0;
+      if (el.classList.contains('sftp-queuegroup')) {
+        return { depth, kind: el.classList.contains('q-group-server') ? 'server' : 'dir',
+                 label: el.querySelector('.q-grouplabel').textContent,
+                 count: Number(el.querySelector('.q-groupcount').textContent),
+                 collapsed: el.classList.contains('collapsed') };
+      }
+      return { depth, kind: 'job', label: el.querySelector('.q-name').textContent.trim() };
+    }));
+
+  await page.evaluate((jobs) => {
+    queueJobs.clear();
+    for (const j of jobs) queueJobs.set(j.id, j);
+    const panel = buildQueuePanel();
+    document.getElementById('sftpBody').appendChild(panel);
+    panel.style.display = 'flex';
+    document.getElementById('sftpBody').classList.add('visible');
+    queueTab = 'queued';
+    renderQueuePanel();
+  }, jobs);
+
+  check('the queue nests server > folder > file', await draw(), [
+    { depth: 0, kind: 'server', label: 'eu-da-mx', count: 6, collapsed: false },
+    // A run of folders holding nothing but one subfolder collapses to one row.
+    { depth: 1, kind: 'dir', label: 'var/www', count: 5, collapsed: false },
+    { depth: 2, kind: 'dir', label: 'html', count: 4, collapsed: false },
+    { depth: 3, kind: 'dir', label: 'css', count: 2, collapsed: false },
+    { depth: 4, kind: 'dir', label: 'img', count: 1, collapsed: false },
+    { depth: 5, kind: 'job', label: 'logo.png' },
+    // Files sit beside the subfolders at their own level, not after all of them.
+    { depth: 4, kind: 'job', label: 'site.css' },
+    { depth: 3, kind: 'job', label: 'app.js' },
+    { depth: 3, kind: 'job', label: 'index.php' },
+    { depth: 2, kind: 'job', label: 'README.md' },
+    { depth: 1, kind: 'job', label: 'top-level.txt' },
+  ]);
+
+  // Only the filename indents; the progress columns stay in one line.
+  check('indentation does not move the progress column', await page.evaluate(() => {
+    const lefts = Array.from(document.querySelectorAll('#sftpQueueList .sftp-queueitem .q-prog'))
+      .map(c => Math.round(c.getBoundingClientRect().left));
+    return new Set(lefts).size;
+  }), 1);
+
+  const collapsed = await page.evaluate(async () => {
+    Array.from(document.querySelectorAll('.sftp-queuegroup'))
+      .find(r => r.querySelector('.q-grouplabel').textContent === 'css').click();
+    await new Promise(r => setTimeout(r, 40));
+    return Array.from(document.getElementById('sftpQueueList').children).length;
+  });
+  check('collapsing a folder hides its whole branch', collapsed, 8); // 11 - css's 3 rows
+
+  check('the collapse survives a progress redraw', await page.evaluate(async () => {
+    renderQueuePanel();
+    await new Promise(r => setTimeout(r, 40));
+    return Array.from(document.querySelectorAll('.sftp-queuegroup.collapsed'))
+      .map(r => r.querySelector('.q-grouplabel').textContent);
+  }), ['css']);
+
+  // The Done tab is a different job set; the same grouping has to apply.
+  check('the other tabs group too', await page.evaluate(async () => {
+    queueTab = 'done';
+    renderQueuePanel();
+    await new Promise(r => setTimeout(r, 40));
+    return Array.from(document.getElementById('sftpQueueList').children).map(el =>
+      el.classList.contains('sftp-queuegroup')
+        ? el.querySelector('.q-grouplabel').textContent
+        : el.querySelector('.q-name').textContent.trim());
+  }), ['us-slc', 'root', 'dump.sql']);
+
+  check('no page errors', errors, []);
+  await page.close();
+}
+
 (async () => {
   const server = await serve();
   const browser = await chromium.launch();
   try {
     await checkKeyListGrouping(browser, server);
     await checkConnectPicker(browser, server);
+    await checkSftpLocalPane(browser, server);
+    await checkQueueGrouping(browser, server);
   } finally {
     await browser.close();
     server.close();
