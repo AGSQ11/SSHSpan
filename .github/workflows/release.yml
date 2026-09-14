@@ -58,6 +58,10 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.0
+          # rustfmt is needed by the `cargo fmt --check` step below; the pinned
+          # toolchain installs without it by default (CI installs it
+          # explicitly, which is why the same step passes there).
+          components: rustfmt
 
       - name: Rust cache
         uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
@@ -134,7 +138,7 @@ jobs:
           shopt -s nullglob
           appimages=(src-tauri/target/*/release/bundle/appimage/*.AppImage)
           if [ ${#appimages[@]} -eq 0 ]; then
-            echo "::error::No AppImage produced — nothing to repack."; exit 1
+            echo "::error::No AppImage produced - nothing to repack."; exit 1
           fi
           # Pinned by tag AND verified by SHA-256, exactly as the minisign
           # step below does. This previously fetched the mutable "continuous"
@@ -176,7 +180,7 @@ jobs:
             flag { print }
           ' CHANGELOG.md > RELEASE_BODY.md
           if [ ! -s RELEASE_BODY.md ]; then
-            echo "Changes in this release — see [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)." > RELEASE_BODY.md
+            echo "Changes in this release - see [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)." > RELEASE_BODY.md
           fi
 
       # ── Release signing (minisign) ──────────────────────────────────────────
@@ -232,8 +236,8 @@ jobs:
           curl -fsSL -o "$RUNNER_TEMP/minisign-dl" "$url"
           # Hash a bare filename from inside RUNNER_TEMP: on Windows the
           # absolute path contains backslashes, and GNU coreutils escapes an
-          # output line with a leading '\' when the filename does — which
-          # broke the string comparison below ("got \37b6003…" ≠ expected).
+          # output line with a leading '\' when the filename does - which
+          # broke the string comparison below ("got \37b6003..." ≠ expected).
           actual="$(cd "$RUNNER_TEMP" && sha256sum minisign-dl | cut -d' ' -f1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error::minisign download checksum mismatch (expected $expected, got $actual); refusing to sign with it."
