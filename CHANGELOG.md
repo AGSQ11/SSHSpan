@@ -7,7 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-09-14
+
 ### Security
+
+- **Executable staging bypass closed (renderer-to-native escalation).** The
+  "open staged file" command (`system_open_external`) verified only that the
+  file lived inside the SSHSpan staging directory and was a regular file - it
+  did not check the extension. A compromised renderer could stage remote bytes
+  into `<staging>/x.exe` via `sftp_stage_path` + `sftp_download` and have the
+  Windows shell execute them through this command. The opener now enforces the
+  same inert editor/viewer extension allowlist the edit flow uses, at launch
+  time, and refuses everything else before any OS call. Regression test added.
+
+- **A vault lock now revokes in-progress operations, not just live sessions.**
+  Previously, clearing the in-memory password store did not cancel work that
+  had already copied it: an SSH connection that crossed the lock event could
+  still authenticate and register a live session into the "locked" vault, and
+  a long-running export or Bitwarden sync kept going. A new monotonic vault
+  generation is captured before any network await; `start_interactive`
+  re-checks it before registering (aborting by dropping the connection),
+  `terminal_send` refuses while locked, `key_export_to_file` re-checks after
+  the save dialog closes, and `bitwarden_sync` is cancelled mid-run by a
+  generation-backed predicate polled at every push/pull. The lock bumps the
+  generation FIRST, before any teardown.
+
+- **Master-password rotation is now atomic and covers the Bitwarden
+  credential.** Rotation previously issued separate pool-backed UPDATEs per
+  record followed by a separate verifier write, with no encompassing
+  transaction - an I/O error or crash part-way left some records sealed under
+  the new password and the rest (plus the verifier) under the old, a vault
+  that unlocks but cannot decrypt half its contents. It also never re-sealed
+  the stored Bitwarden master password, silently stranding sync on the old
+  password. All re-sealed records, the Bitwarden credential, and the verifier
+  now commit in a single SQLite transaction (`apply_vault_rotation`): the
+  database holds either the complete old state or the complete new state.
+  Rollback and Bitwarden-re-seal regression tests added.
+
+- **Download resume no longer follows a planted `.part` symlink.** The resume
+  path used `metadata()` (which follows symlinks) to read the partial length,
+  then opened with plain append mode: an attacker who could plant
+  `dest/name.part -> victim` in a writable download folder would have remote
+  bytes appended to the victim (the final rename then moved the link). Resume
+  now lstat-checks the `.part` is a real regular file and opens it with
+  `O_NOFOLLOW` (Unix), re-aligning the offset against the exact object opened;
+  anything else starts the download over.
+
+- **Recursive uploads re-check every descendant against the protected-path
+  rule.** The app-data/system guard was applied only to the user-selected
+  root; descendants were enqueued/uploaded without re-checking, so an allowed
+  ancestor containing app data (or a symlink to it) would upload the vault
+  database. Every expanded file - and symlink target - now re-passes the
+  source authorization check in both the queued (`expand_upload`) and direct
+  (`upload_directory`) paths.
+
+- **Backup restore no longer trusts machine-local deployment paths.** A backup
+  carries `deployed`/`deploy_path` verbatim; authenticated encryption of the
+  backup does not make those local paths trustworthy, and `key_remove_deployed`
+  would then delete the stored path (and its `.pub` sibling) anywhere the user
+  could write. Restore now discards deployment state (and preserves an
+  existing local deployment on re-import); `key_remove_deployed` additionally
+  refuses to delete outside the managed `~/.ssh` directory and now requires an
+  unlocked vault. Regression test added.
+
+- **The updater resolves the release signature from the correct URL and binds
+  the version to the asset.** The `.minisig` sibling was built by appending
+  the suffix to the FINAL post-redirect CDN URL - GitHub serves the installer
+  and its signature as separate release assets (each redirecting to its own
+  signed object URL), so the suffix landed on the wrong object and mangled the
+  signed query, breaking signed-update retrieval. The signature is now
+  resolved from the original repo-pinned release URL. The claimed version is
+  also bound to the release tag in the asset URL, so a compromised renderer
+  cannot pair a future version number with an older (still signed) asset to
+  force a silent downgrade.
+
+- **Bitwarden Argon2id derivation now matches the official client.** The
+  Argon2 salt was the raw normalized email; the official Bitwarden SDK first
+  hashes the email with SHA-256 and uses that digest as the salt, so identical
+  credentials produced different master keys and an Argon2-configured account
+  could never authenticate. The salt is now `SHA-256(normalized email)`; the
+  official SDK test vector is baked in as a regression test. (PBKDF2 accounts
+  are unaffected - that path already used the raw email correctly.)
+
+- **Tray "Lock Vault" now enforces the lock in the backend.** The tray handler
+  previously only emitted `vault-lock-requested` to the renderer, which a hung
+  or compromised webview could ignore; it now calls the backend teardown
+  directly (kill sessions, stop watches, clear the password, bump the
+  generation) and only then notifies the renderer.
+
+- **Secret wiping extended.** Command-level Bitwarden master passwords
+  (save/test/sync) and the serialized private-key export text are now wrapped
+  in `Zeroizing` and wiped on drop, instead of living as freed heap.
+
+- **Security documentation corrected.** `SECURITY.md` no longer overstates
+  guarantees: the private-key file import path reads the file in the renderer
+  (private text transits IPC/renderer memory), the password-rotation
+  description matches the new atomic behavior, and the network summary now
+  includes the user-initiated SSH/SFTP flows alongside the update check and
+  Bitwarden sync.
+
+### Added
+
+- **SFTP transfer queue: pause/resume, auto-retry, throttle, persistence, and
+  integrity verification.** Transfers can be paused and resumed (a paused job
+  keeps its `.part` and continues rather than restarting), failed transfers
+  auto-retry with a countdown and a retryable/terminal error classifier,
+  total throughput can be rate-limited across all workers, unfinished
+  transfers survive a restart (restored as paused), and completed transfers
+  can be verified against a remote SHA-256 digest.
+- **Richer remote listings and operations.** Symlink flags and target
+  resolution, mode/uid/gid columns, a remote "Calculate size" action,
+  on-demand remote file digest, and an in-app delete confirmation with
+  visible delete feedback. The queue panel groups transfers by server and
+  remote folder.
+- **File-explorer usability.** Quick-find in panes, a working Columns toggle,
+  a local-pane context menu, and stale listings are dropped after remote
+  mutations.
+
+### Fixed
+
+- **Renderer stability.** Two globals in `terminal.js` were shadowing `app.js`
+  functions; the category filter never applied (a duplicate `filteredKeys`);
+  categorized keys were invisible in the default "all categories" view; the
+  SFTP panel hit a `ReferenceError`; the queue refused an unrecognised
+  transfer direction instead of silently defaulting to download; a call to a
+  never-written function was removed.
+- **Keys / Connect UX.** The connect picker no longer jumps away to Connect
+  and follows the host category tree; the local pane context menu and Columns
+  button now work.
+- **UI safety and accessibility.** Destructive-prompt safety, modal focus
+  handling, toast stacking, and the category picker no longer opens behind the
+  host modal. User-reported 1.7.2 issues fixed: vault entry, backup freeze,
+  AppImage launch, and UI scale.
+- **CI / renderer tests.** The renderer test drives the real page in CI
+  (not just parsing it), the SFTP local-list stub uses a neutral home path,
+  and the Rust toolchain is pinned via the toolchain action input
+  (dropping `rust-toolchain.toml`).
+
+### Security (prior round, 2026-09-13/14 reviews)
 
 - **Fixed a Windows path-guard bypass that allowed writing into (or reading
   from) the application data directory.** `std::fs::canonicalize` returns
@@ -98,7 +235,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Updater installers are now verified with embedded-key minisign signatures
   (enforced since key provisioning on 2026-09-12).** The updater previously
   verified the downloaded installer against the SHA-256 digest from the GitHub
-  releases API — but the digest travels in the same API response as the
+  releases API - but the digest travels in the same API response as the
   download URL, so anyone able to alter the release (repository compromise,
   token theft) could replace the installer *and* its digest together. The
   release workflow signs every installer with
@@ -113,8 +250,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sources for provisioned builds. **This is the first signed release.**
 
 - **Updater URL pinning.** The initial installer URL is pinned to
-  `github.com/AGSQ11/SSHSpan/releases/download/…` — the previous host-only
-  allowlist admitted any public GitHub repository as an update source — and
+  `github.com/AGSQ11/SSHSpan/releases/download/...` - the previous host-only
+  allowlist admitted any public GitHub repository as an update source - and
   the renderer-supplied version is sanitized before temp-filename
   interpolation.
 
@@ -201,7 +338,7 @@ or syncs with Bitwarden.
 
 - **Critical: encrypted PKCS#8 export rewritten to real PBES2.** Exporting a
   private key in "PKCS#8 (encrypted)" form previously produced a file that
-  (a) could never be decrypted back — the encryption salt was never written
+  (a) could never be decrypted back - the encryption salt was never written
   into the output, (b) derived the cipher IV from the same value as the
   encryption key, and (c) printed that IV in cleartext in the file header,
   disclosing half of the AES key and enabling fast offline passphrase
@@ -214,8 +351,8 @@ or syncs with Bitwarden.
   leak key material.
 - **Bitwarden sync can no longer silently destroy keys or server passwords.**
   On an encryption (seal) failure during sync, the app previously wrote an
-  *empty* value in place of a private key — and in the update path could
-  overwrite a previously-good stored key — while reporting success. A
+  *empty* value in place of a private key - and in the update path could
+  overwrite a previously-good stored key - while reporting success. A
   decryption (unseal) failure during push could likewise send the encrypted
   blob to the server as if it were the key. Sync now skips or fails the
   affected item with a clear, logged error instead of writing placeholder or
@@ -292,15 +429,15 @@ Feature release focused on PuTTY-grade terminal behavior and safer everyday SSH 
 
 ### Added
 
-- **Terminal context menu** — right-click inside the terminal or on a session tab to Copy, Copy All, Paste, Clear scrollback, Reset terminal, open a New session, Duplicate the current session, Restart the session, or switch between SSH and SFTP.
-- **Copy All to Clipboard** — copies the active terminal buffer plus scrollback without manual selection.
-- **Multi-line paste confirmation** — clipboard content containing line breaks asks before being sent to a live SSH session. The confirmation can be disabled in Settings.
-- **Duplicate and restart sessions** — duplicate opens a new independent tab for the same saved server/auth; restart reconnects in the same tab while preserving tab identity and scrollback.
-- **Configurable scrollback** — terminal scrollback can be set between 1,000 and 50,000 lines.
-- **Terminal bell behavior** — choose visual, sound, or silent bell; background tabs receive a visible bell indicator.
-- **Keyboard compatibility settings** — Backspace mode (`0x7f` or `0x08`), Home/End mode, application cursor-key mode, and application keypad mode are persisted for future terminal keymap compatibility.
-- **SSH keepalive** — optional per-terminal keepalive interval (disabled by default), independent of SFTP keepalive.
-- **Normal remote Tab completion** — interactive SSH now declares UTF-8 input and explicitly requests `TERM=xterm-256color`, allowing remote Bash/Zsh/Fish/readline completion to behave like PuTTY and normal terminals.
+- **Terminal context menu** - right-click inside the terminal or on a session tab to Copy, Copy All, Paste, Clear scrollback, Reset terminal, open a New session, Duplicate the current session, Restart the session, or switch between SSH and SFTP.
+- **Copy All to Clipboard** - copies the active terminal buffer plus scrollback without manual selection.
+- **Multi-line paste confirmation** - clipboard content containing line breaks asks before being sent to a live SSH session. The confirmation can be disabled in Settings.
+- **Duplicate and restart sessions** - duplicate opens a new independent tab for the same saved server/auth; restart reconnects in the same tab while preserving tab identity and scrollback.
+- **Configurable scrollback** - terminal scrollback can be set between 1,000 and 50,000 lines.
+- **Terminal bell behavior** - choose visual, sound, or silent bell; background tabs receive a visible bell indicator.
+- **Keyboard compatibility settings** - Backspace mode (`0x7f` or `0x08`), Home/End mode, application cursor-key mode, and application keypad mode are persisted for future terminal keymap compatibility.
+- **SSH keepalive** - optional per-terminal keepalive interval (disabled by default), independent of SFTP keepalive.
+- **Normal remote Tab completion** - interactive SSH now declares UTF-8 input and explicitly requests `TERM=xterm-256color`, allowing remote Bash/Zsh/Fish/readline completion to behave like PuTTY and normal terminals.
 
 ### Changed
 
@@ -325,13 +462,13 @@ Feature release focused on category organization and everyday picker usability.
 
 ### Added
 
-- **Separate key and host categories** — categories now have an explicit `key` or `host` scope. The Keys view shows only key categories; the Hosts/Connect view shows only host categories, with independent filters and uncategorized counts.
-- **Host category filtering** — saved servers can be filtered recursively through their host-category tree, including an explicit uncategorized-hosts entry.
-- **Scope-safe assignments** — keys can only use key categories, servers can only use host categories, and category parents must stay within the same scope.
-- **Scoped backup and restore** — category scope is preserved in vault backups. Older backups without scope continue to restore as key categories, while invalid cross-scope assignments are ignored safely.
-- **Bitwarden host-category namespace** — server category paths are exported with a `Hosts-` prefix, such as `Hosts-Production/Web`, and the prefix is removed on import so host categories remain separate from key categories.
-- **Compact category picker** — the picker now uses a bounded layout with a fixed search area, scrollable results, selected chips, remove/clear actions, empty states, and keyboard navigation.
-- **Accessible picker interactions** — category selection now exposes combobox/listbox semantics, active-row navigation, `aria-selected` state, Escape dismissal, and focus restoration.
+- **Separate key and host categories** - categories now have an explicit `key` or `host` scope. The Keys view shows only key categories; the Hosts/Connect view shows only host categories, with independent filters and uncategorized counts.
+- **Host category filtering** - saved servers can be filtered recursively through their host-category tree, including an explicit uncategorized-hosts entry.
+- **Scope-safe assignments** - keys can only use key categories, servers can only use host categories, and category parents must stay within the same scope.
+- **Scoped backup and restore** - category scope is preserved in vault backups. Older backups without scope continue to restore as key categories, while invalid cross-scope assignments are ignored safely.
+- **Bitwarden host-category namespace** - server category paths are exported with a `Hosts-` prefix, such as `Hosts-Production/Web`, and the prefix is removed on import so host categories remain separate from key categories.
+- **Compact category picker** - the picker now uses a bounded layout with a fixed search area, scrollable results, selected chips, remove/clear actions, empty states, and keyboard navigation.
+- **Accessible picker interactions** - category selection now exposes combobox/listbox semantics, active-row navigation, `aria-selected` state, Escape dismissal, and focus restoration.
 
 ### Compatibility and safety
 
@@ -353,44 +490,44 @@ per-server bookmarks, multi-select, and more.
 
 ### Added
 
-- **Background transfer queue** — uploads and downloads run on dedicated SFTP
+- **Background transfer queue** - uploads and downloads run on dedicated SFTP
   channels over the live SSH connection, so browsing stays responsive during
   transfers. Queued/Failed/Done tabs with per-job progress bars, transfer
   speed, cancel and retry, aggregate status, and clear-finished. Two transfers
-  run in parallel by default; configurable 1–4 in Settings. Double-clicking a
-  remote file enqueues a download to the last-used directory; "Download as…"
+  run in parallel by default; configurable 1-4 in Settings. Double-clicking a
+  remote file enqueues a download to the last-used directory; "Download as..."
   keeps the save dialog. Directory transfers expand recursively in both
   directions.
-- **File permissions (chmod)** — dialog with an owner/group/other read/write/
+- **File permissions (chmod)** - dialog with an owner/group/other read/write/
   execute grid, live two-way octal sync, recursion, and files/directories/all
   targeting. Prefilled from the server's current mode.
-- **Recursive remote search** — inline search bar over the current directory
+- **Recursive remote search** - inline search bar over the current directory
   tree (case-insensitive, 500-result cap, depth-limited); results stream in
   live and clicking one navigates to its folder.
-- **Per-server bookmarks** — save the current remote (and local) directory as
+- **Per-server bookmarks** - save the current remote (and local) directory as
   a named bookmark via the toolbar star; one click navigates; right-click
   removes.
-- **Dual-pane mode** — optional local pane alongside the remote listing with
+- **Dual-pane mode** - optional local pane alongside the remote listing with
   a draggable splitter. Drag a local file onto the remote pane (or
   double-click it) to enqueue an upload; double-click local folders to
   navigate. OS drag-and-drop onto the remote pane continues to upload.
-- **Multi-select** — Ctrl-click, Shift-click ranges, Ctrl+A, and empty-area
+- **Multi-select** - Ctrl-click, Shift-click ranges, Ctrl+A, and empty-area
   click to clear. Context-menu actions (download, delete, chmod) apply to the
   whole selection with batch-aware labels and a single confirmation.
-- **Sortable columns** — Name/Size/Modified headers with ascending/descending
+- **Sortable columns** - Name/Size/Modified headers with ascending/descending
   indicators; directories always group first.
-- **New file** — create an empty remote file from the context menu (refuses
+- **New file** - create an empty remote file from the context menu (refuses
   to overwrite an existing path).
-- **Remote disk usage** — free/total space via `statvfs@openssh.com` shown
+- **Remote disk usage** - free/total space via `statvfs@openssh.com` shown
   beside the path bar; hidden automatically when the server lacks support.
-- **Per-tab activity log** — timestamped connect/transfer/chmod/search/delete
+- **Per-tab activity log** - timestamped connect/transfer/chmod/search/delete
   events, 200-line cap, failures mirrored into it.
-- **SFTP keep-alive** — a 30-second round-trip keeps idle sessions alive
+- **SFTP keep-alive** - a 30-second round-trip keeps idle sessions alive
   through NATs and firewalls; stopped automatically on close, disconnect, or
   vault lock.
-- **Settings** — parallel transfer count (1–4), show-hidden-files default,
+- **Settings** - parallel transfer count (1-4), show-hidden-files default,
   and the dual-pane preference persists across sessions.
-- Context menu: Copy path, Copy `sftp://` URL, Select all, Download as….
+- Context menu: Copy path, Copy `sftp://` URL, Select all, Download as....
 
 ### Fixed
 
@@ -450,7 +587,7 @@ SSHSpan gains an **embedded SSH client**. Full migration story:
 
 ### Added
 
-- **Connect — embedded SSH client** (russh 0.63 + xterm.js 5.5, both vendored/offline):
+- **Connect - embedded SSH client** (russh 0.63 + xterm.js 5.5, both vendored/offline):
   - Saved servers with per-server username + SSH-key binding, auth methods
     (publickey / password / keyboard-interactive), optional password sealed with the vault
     master, latency test, last-connected tracking.
@@ -459,7 +596,7 @@ SSHSpan gains an **embedded SSH client**. Full migration story:
   - PuTTY behaviors: select-to-copy, right-click paste, Ctrl+Shift+C/V, blinking block cursor,
     solid accent selection highlight.
   - TOFU host-key pinning (`known_hosts` table); mismatch refuses the connection.
-  - Right-click any key → **"Use this key to connect…"** (server's username + clicked key).
+  - Right-click any key → **"Use this key to connect..."** (server's username + clicked key).
   - Vault-gated: locking the vault disconnects every live session.
   - Audit events: `connect.start/stop`, `server.save/delete`, `server.test_ok/fail`,
     `known_hosts.forget`.
@@ -480,7 +617,7 @@ SSHSpan gains an **embedded SSH client**. Full migration story:
 
 ### Added
 
-- Import legacy PuTTY **version 2** `.ppk` files (PuTTY 0.52–0.74), encrypted or
+- Import legacy PuTTY **version 2** `.ppk` files (PuTTY 0.52-0.74), encrypted or
   not, for all supported key types. v2 uses a SHA-1 based KDF and HMAC-SHA-1,
   which is weak but mandated by that format; it is accepted for **import only**,
   and exporting a v2 key writes the current **v3** format, so importing one
@@ -491,7 +628,7 @@ SSHSpan gains an **embedded SSH client**. Full migration story:
 ### Added
 
 - Import keys from a file, not only by pasting: the Import tab has a
-  "Browse for key file…" button that opens a native file picker
+  "Browse for key file..." button that opens a native file picker
   (`.ppk`, `.pem`, `.key`, `.pub`, `.txt` and all files). The main process
   reads the chosen file and feeds it through the same import path as pasted
   material, so both routes behave identically; the name field pre-fills from
@@ -501,7 +638,7 @@ SSHSpan gains an **embedded SSH client**. Full migration story:
 
 ### Added
 
-- PuTTY key support (`.ppk`, version 3 — the format current PuTTYgen writes):
+- PuTTY key support (`.ppk`, version 3 - the format current PuTTYgen writes):
   import passphrase-protected or plain `.ppk` files, and export any stored key
   as a `.ppk` (encrypted with Argon2id + AES-256-CBC when a passphrase is
   given). Covers RSA, Ed25519 and ECDSA (nistp256/384/521). Import/export are
@@ -550,7 +687,7 @@ SSHSpan gains an **embedded SSH client**. Full migration story:
 ### Fixed
 
 - Linux CI: the release upload step failed with "Pattern 'release/*.AppImage
-  release/*.deb' does not match any files" — space-separated globs are read as
+  release/*.deb' does not match any files" - space-separated globs are read as
   a single literal pattern. Artifact globs are one per line again, with an
   explicit job `name` so the Actions UI stays readable.
 
