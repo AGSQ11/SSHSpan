@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The SFTP "Columns" toggle never persisted.** The toolbar button wrote
+  `sftpShowOwnerCols` through `settings_set`, but the key was absent from the
+  backend's `SETTINGS_KEYS` allowlist, so every write was rejected with
+  "Unknown setting" - and the call site swallowed the error. Hiding the
+  permissions/owner columns therefore appeared to work and silently reverted on
+  the next launch. The key is now allowlisted, and the write reports failures
+  instead of discarding them.
+
+- **Saved bandwidth limit and SHA-256 verify toggle reset on every launch.**
+  Both rows read their persisted value through an optional
+  `sftpSettingCacheGet/Set` pair on `window` that nothing ever defined, so the
+  calls fell through to the default while the backend kept enforcing the real
+  stored value. They now read `state.settings` like every other row.
+
+- **Download-rename and Resume in the transfer conflict dialog were disabled
+  with "needs the next backend update".** The backend has supported both for
+  some time: the queue's download and upload legs already honor `ResumeMode`,
+  and the renderer was already sending `localName` / per-item `resume` that the
+  backend ignored. Both are now honored - `expand_download` applies a
+  renderer-supplied `localName` through the same containment check as the
+  derived basename, and `sftp_queue_add` reads a per-item `resume` so one batch
+  can mix overwrite/skip/resume decisions. The stale UI disables are removed.
+
+- **Closing the window now hides to the tray instead of exiting.** The app has
+  always shipped a tray offering Show and Quit, but the X button killed the
+  process and the tray with it. Quit (tray menu) is now the only exit, which is
+  what the tray implied.
+
+### Added
+
+- **Local-pane file management.** The dual-pane local side could browse and
+  upload but not manage: there was no local rename, delete, mkdir, or
+  open-folder command at all, so a right-click there offered four entries
+  against the remote pane's ten. Four new commands
+  (`sftp_local_mkdir` / `sftp_local_rename` / `sftp_local_remove` /
+  `sftp_local_open_folder`) are gated on an unlocked vault and on the same
+  app-data and system-directory rules the transfer paths use, with every
+  destructive action confirming first. The local menu now offers Rename, Delete,
+  Open containing folder, and New folder.
+
+- **Ctrl+A follows the pane you last clicked.** The select-all shortcut only
+  ever touched the remote selection; with the local pane open it now selects in
+  whichever pane was last clicked.
+
+- **Audit log: export, clear, and a retention cap.** The table grew without
+  bound while the UI could only ever display the newest 200 rows, so the oldest
+  history was both invisible and unreclaimable. Inserts now trim to the newest
+  10,000 entries, the panel reports the true total rather than implying the
+  visible page is everything, "Export as CSV..." writes the full retained set
+  through a native save dialog, and "Clear log" empties it behind a
+  confirmation (recording the clear itself, so an emptied log still shows it was
+  emptied).
+
+- **`sftpResumeDefault` is reachable from Settings.** The backend has always
+  read this key as the fallback for transfers that never reach the conflict
+  dialog, but no UI could set it, leaving it pinned at "ask".
+
+### Changed
+
+- **Four settings that nothing read were removed from the allowlist.**
+  `theme`, `sshKeysDir`, and `sshConfigPath` had no reader anywhere (the real
+  paths are derived at runtime by `system_paths`), and
+  `terminalKeepaliveSeconds` became inert when keepalives moved to the SSH
+  protocol layer. All four were accepted, persisted, and copied into every
+  backup while doing nothing. Backups carrying them are now filtered on restore
+  against the same allowlist `settings_set` enforces.
+
+- **Vault backups carry the full settings set.** `vault_backup_create` wrote a
+  hand-maintained list of six keys, three of them the dead ones above; it now
+  shares one collector with `settings_get`, so the two cannot disagree.
+
+- **Importing a host from `~/.ssh/config` warns about directives that are
+  ignored.** `ProxyJump`, `ProxyCommand`, and `ForwardAgent` are parsed and
+  preserved on write but are not honored when connecting, so a user importing a
+  bastion-hosted entry could believe they were connecting through it.
+
 ## [1.8.0] - 2026-09-14
 
 A UX pass over the whole renderer, plus the Send-to scan fix and the rustls

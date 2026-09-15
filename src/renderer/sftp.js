@@ -259,7 +259,11 @@ function buildSftpPanel(tabId) {
     panel.classList.toggle('show-owner-cols', tab.showOwnerCols);
     state.settings = state.settings || {};
     state.settings.sftpShowOwnerCols = tab.showOwnerCols ? '1' : '0';
-    call('settings_set', { key: 'sftpShowOwnerCols', value: tab.showOwnerCols ? '1' : '0' }).catch(() => {});
+    // Report a failure rather than swallowing it: this write used to be
+    // rejected by the backend allowlist and the silent `.catch` is what hid it,
+    // so the toggle appeared to work and silently reset on the next launch.
+    call('settings_set', { key: 'sftpShowOwnerCols', value: tab.showOwnerCols ? '1' : '0' })
+      .catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
   }, 'Columns');
   const logBtn = mkBtn('history', 'Activity log', () => {
     const log = document.getElementById('sftpLog-' + tabId);
@@ -1200,6 +1204,9 @@ function sftpWireTbodyDelegation(tabId) {
     const tab = sftpTab(tabId);
     const entry = tab && tab._entryMap && tab._entryMap.get(tr.dataset.name);
     if (!tab || !entry) return;
+    // Remember which pane the user is working in, so pane-scoped shortcuts
+    // (Ctrl+A) act where they were aimed.
+    tab._lastPane = 'remote';
     const visible = tab._visibleEntries || [];
     if (ev.ctrlKey || ev.metaKey) {
       if (tab.sftpSelected.has(entry.name)) tab.sftpSelected.delete(entry.name);
@@ -1380,7 +1387,9 @@ function sftpMarkLinkRow(tabId, name, broken) {
 
 // Ctrl+A within the panel selects all rows - the full filtered list (Task 4:
 // hidden-file toggling and quick-find already narrowed tab._visibleEntries),
-// not just whatever the windowed renderer currently has mounted.
+// not just whatever the windowed renderer currently has mounted. With the
+// local pane open it selects in whichever pane was last clicked, so the
+// shortcut follows the user's focus instead of always hitting the remote side.
 document.addEventListener('keydown', (ev) => {
   if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== 'a') return;
   const active = sftpTab(state.activeTabId);
@@ -1389,6 +1398,14 @@ document.addEventListener('keydown', (ev) => {
   if (!panel) return;
   ev.preventDefault();
   sftpTabState(active);
+  if (active._lastPane === 'local' && !document.getElementById('sftpLocalPane-' + active.tabId)?.hidden) {
+    const localVisible = active._localEntries || [];
+    active.localSelected.clear();
+    for (const e of localVisible) active.localSelected.add(e.name);
+    sftpRefreshLocalSelectionClasses(active.tabId);
+    sftpUpdateStatusBar(active.tabId);
+    return;
+  }
   const visible = active._visibleEntries || [];
   active.sftpSelected.clear();
   for (const e of visible) active.sftpSelected.add(e.name);
@@ -2066,6 +2083,8 @@ function sftpWireLocalTbodyDelegation(tabId, wrap) {
   host.addEventListener('click', (ev) => {
     const tab = sftpTabState(sftpTab(tabId));
     if (!tab) return;
+    // See the remote tbody handler: Ctrl+A follows the pane last clicked in.
+    tab._lastPane = 'local';
     const tr = ev.target.closest('tr.sftp-entry');
     if (!tr) {
       // Click on empty space clears, as the remote pane does.
@@ -2115,11 +2134,11 @@ function sftpWireLocalTbodyDelegation(tabId, wrap) {
   });
 }
 
-/// Right-click menu for the local pane (selection-aware). Deliberately
-/// shorter than the remote one: the backend exposes only sftp_local_list on
-/// this side - there is no local rename, delete or mkdir command to call - and
-/// a menu entry that cannot work is worse than one that is absent. Passing a
-/// null entry builds the empty-space menu.
+/// Right-click menu for the local pane (selection-aware). The backend gates
+/// every local mutation through the same app-data + system-directory rules the
+/// transfer paths use (see `validate_local_mutation`), so the entries here are
+/// safe to offer; each destructive one confirms first. Passing a null entry
+/// builds the empty-space menu.
 function openSftpLocalMenu(x, y, tabId, entry) {
   closeKeyConnectMenu();
   const tab = sftpTabState(sftpTab(tabId));
@@ -2165,6 +2184,22 @@ function openSftpLocalMenu(x, y, tabId, entry) {
       const text = names.map(n => joinLocal(tab.localPath, n)).join('\n');
       copyText(text).then(ok => toast(ok ? 'Path copied.' : 'Clipboard unavailable.', ok ? 'ok' : 'err'));
     });
+    sep();
+    // Local-side file management. The backend commands behind these
+    // (sftp_local_rename/remove/mkdir/open_folder) are gated by the same
+    // app-data + system-directory rules as the transfer paths, and every
+    // destructive one confirms first.
+    if (!multi) {
+      mk('Rename...', 'pencil', () => sftpLocalRenamePrompt(tabId, entry));
+    }
+    mk(multi ? `Delete ${names.length} items` : 'Delete', 'trash-2',
+      () => sftpLocalDelete(tabId, names, entry));
+    mk(multi ? 'Open containing folder' : (entry.isDir ? 'Open in file manager' : 'Open containing folder'),
+      'folder-open', () => {
+        const target = multi ? tab.localPath : joinLocal(tab.localPath, entry.name);
+        call('sftp_local_open_folder', { path: target })
+          .catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
+      });
   } else {
     mk('Parent directory', 'arrow-up', () => localNavigateUp(tabId));
     mk('Copy current path', 'copy', () => {
@@ -2172,6 +2207,7 @@ function openSftpLocalMenu(x, y, tabId, entry) {
       copyText(tab.localPath).then(ok => toast(ok ? 'Path copied.' : 'Clipboard unavailable.', ok ? 'ok' : 'err'));
     });
     mk('Set as default local directory', 'star', () => sftpSetLocalDirDefault(tabId));
+    mk('New folder...', 'folder-plus', () => sftpLocalMkdirPrompt(tabId));
     sep();
   }
   mk('Refresh', 'refresh-cw', () => refreshLocalPane(tabId));
@@ -2184,6 +2220,75 @@ function openSftpLocalMenu(x, y, tabId, entry) {
     closeKeyConnectMenu();
   };
   setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+}
+
+/// Prompt for and create a folder in the local pane (the dual-pane counterpart
+/// to the remote "New folder" button).
+function sftpLocalMkdirPrompt(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab || !tab.localPath) { toast('Local pane has no path yet.', 'info'); return; }
+  promptModal('New folder', 'Folder name:', '', async (name) => {
+    const trimmed = (name || '').trim();
+    if (!trimmed) return;
+    try {
+      await call('sftp_local_mkdir', { path: joinLocal(tab.localPath, trimmed) });
+      await refreshLocalPane(tabId);
+      toast('Folder created.', 'ok');
+    } catch (e) { toast((e && (e.message || e.error)) || String(e), 'err'); }
+  });
+}
+
+/// Rename one local entry (single-selection only - the backend takes one pair).
+function sftpLocalRenamePrompt(tabId, entry) {
+  const tab = sftpTab(tabId);
+  if (!tab || !entry) return;
+  promptModal('Rename', 'New name:', entry.name, async (name) => {
+    const trimmed = (name || '').trim();
+    if (!trimmed || trimmed === entry.name) return;
+    try {
+      await call('sftp_local_rename', {
+        from: joinLocal(tab.localPath, entry.name),
+        to: joinLocal(tab.localPath, trimmed),
+      });
+      tab.localSelected.delete(entry.name);
+      await refreshLocalPane(tabId);
+      toast('Renamed.', 'ok');
+    } catch (e) { toast((e && (e.message || e.error)) || String(e), 'err'); }
+  });
+}
+
+/// Delete the selected local entries, after a confirmation that names them.
+/// Unlike the remote pane's delete there is no in-flight guard flag: local
+/// removal is synchronous on the backend and cannot interleave.
+async function sftpLocalDelete(tabId, names, entry) {
+  const tab = sftpTab(tabId);
+  if (!tab || !names.length) return;
+  const anyDir = names.some(n => {
+    const e = (tab._localEntries || []).find(x => x.name === n);
+    return e ? e.isDir : (entry && entry.isDir);
+  });
+  const message = names.length === 1
+    ? (anyDir
+      ? `Delete the local folder "${names[0]}" and everything inside it? This cannot be undone.`
+      : `Delete the local file "${names[0]}"? This cannot be undone.`)
+    : `Delete these ${names.length} local items? This cannot be undone.`;
+  sftpConfirmDelete(message, async () => {
+    let ok = 0, fail = 0, lastErr = null;
+    for (const name of names) {
+      const e = (tab._localEntries || []).find(x => x.name === name);
+      try {
+        await call('sftp_local_remove', {
+          path: joinLocal(tab.localPath, name),
+          isDir: !!(e && e.isDir),
+        });
+        tab.localSelected.delete(name);
+        ok++;
+      } catch (err) { fail++; lastErr = (err && (err.message || err.error)) || String(err); }
+    }
+    await refreshLocalPane(tabId);
+    if (fail) toast(`${ok} deleted, ${fail} failed${lastErr ? `: ${lastErr}` : ''}`, 'err');
+    else toast(ok === 1 ? 'Deleted.' : `${ok} items deleted.`, 'ok');
+  });
 }
 
 async function refreshLocalPane(tabId) {
@@ -2304,9 +2409,10 @@ async function queueDownloads(tabId, remotePaths) {
       const d = decided.find(x => x.remote === p);
       if (d) {
         if (d.action === 'skip') continue;
-        // `localName` is the renamed destination for Agent B's backend
-        // update; today the backend derives the local name from the remote
-        // basename and ignores it (falls back to overwrite).
+        // `localName` is the renamed destination the backend applies in
+        // `expand_download` (validated by the same containment check as the
+        // derived basename); `resume` is per-item, so one batch can mix
+        // overwrite/skip/resume decisions.
         const item = { remote: d.remote, resume: d.action };
         if (d.localName) item.localName = d.localName;
         survivors.push(item);
@@ -2406,11 +2512,7 @@ const sftpConflictDefaults = { sftpConflictUpload: 'ask', sftpConflictDownload: 
 
 function sftpConflictDefault(direction) {
   const key = direction === 'upload' ? 'sftpConflictUpload' : 'sftpConflictDownload';
-  let v = (state.settings && state.settings[key]) || sftpConflictDefaults[key] || 'ask';
-  // Download rename needs the backend `localName` field (remote-basename
-  // derivation can't be redirected today) - asking beats silently
-  // overwriting when the user asked for a rename.
-  if (direction === 'download' && v === 'rename') v = 'ask';
+  const v = (state.settings && state.settings[key]) || sftpConflictDefaults[key] || 'ask';
   return CONFLICT_ACTIONS.includes(v) && v !== 'ask' ? v : 'ask';
 }
 
@@ -2552,17 +2654,9 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
         rb.id = id;
         rb.value = act;
         rb.checked = act === 'overwrite';
-        if (act === 'resume') {
-          rb.disabled = true;
-          rb.title = 'Resume needs the next backend update';
-        } else if (act === 'rename' && !isUp) {
-          rb.disabled = true;
-          rb.title = 'Download rename needs the next backend update';
-        }
         const lab = document.createElement('label');
-        lab.className = 'conflict-action' + (rb.disabled ? ' disabled' : '');
+        lab.className = 'conflict-action';
         lab.htmlFor = id;
-        if (rb.title) lab.title = rb.title;
         const names = { overwrite: 'Overwrite', skip: 'Skip', rename: 'Rename', resume: 'Resume' };
         lab.appendChild(rb);
         lab.appendChild(document.createTextNode(names[act]));

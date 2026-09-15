@@ -41,6 +41,10 @@ A single Rust process hosts:
   memory-only, cleared on lock), `Arc<SessionRegistry>` (live SSH sessions; cleared on lock).
 
 The system tray (Show / Lock Vault / Quit) and the single-instance plugin live in `lib.rs`.
+Closing the window hides it to the tray rather than exiting; only the tray's Quit (or
+`app.exit`) ends the process, and the `QUITTING` flag is what lets the window-close handler
+distinguish the two. Hiding is not a security boundary - the vault stays unlocked - so the
+tray's Lock Vault and the idle auto-lock remain the controls for that.
 The master password is never persisted — only a verification hash — and locking the vault both
 clears it and disconnects all SSH sessions.
 

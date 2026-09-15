@@ -6,6 +6,7 @@ use sshspan::crypto::keys::{self, KeyFormat, KeyType};
 use sshspan::crypto::utils;
 use sshspan::db::BitwardenConfig;
 use sshspan::db::Database;
+use sshspan::db::AUDIT_RETENTION_ROWS;
 
 /// Parse the algorithm tag out of an exported OpenSSH public-key line
 /// ("<algo> <base64> [comment]") — used to assert roundtrip structure.
@@ -348,6 +349,42 @@ fn db_audit_log() {
     db.add_audit("vault.created", None, "test").unwrap();
     db.add_audit("vault.unlock", None, "test2").unwrap();
     // Audit log should have entries (we can verify no error)
+    assert_eq!(db.count_audit().unwrap(), 2);
+}
+
+/// The log is capped so it cannot grow without bound. The cap is enforced on
+/// insert, which is the only place rows are created.
+#[test]
+fn db_audit_retention_caps_row_count() {
+    let db = get_test_db();
+    // A couple of rows over the cap is enough to prove the trim fires without
+    // writing 10k rows in a test.
+    let cap = AUDIT_RETENTION_ROWS as usize;
+    let total = cap + 3;
+    for i in 0..total {
+        db.add_audit("probe", None, &format!("row {i}")).unwrap();
+    }
+    assert_eq!(db.count_audit().unwrap(), AUDIT_RETENTION_ROWS);
+
+    // The NEWEST rows survive: the trim deletes by id ascending from the
+    // oldest, so the most recent write must still be present.
+    let newest = db.list_audit(1).unwrap();
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].details, format!("row {}", total - 1));
+}
+
+/// Clearing empties the table and reports how much went.
+#[test]
+fn db_audit_clear_removes_every_row() {
+    let db = get_test_db();
+    db.add_audit("a", None, "1").unwrap();
+    db.add_audit("b", None, "2").unwrap();
+    assert_eq!(db.count_audit().unwrap(), 2);
+
+    let removed = db.clear_audit().unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(db.count_audit().unwrap(), 0);
+    assert!(db.list_audit(10).unwrap().is_empty());
 }
 
 #[test]

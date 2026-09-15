@@ -284,13 +284,24 @@ async function checkSftpLocalPane(browser, server) {
         { name: 'notes.txt', isDir: false, size: 1234, modifiedMs: 1777576926000 },
       ],
     },
-    sftp_list_dir: { entries: [] },
+    // Remote side needs real rows too: the Ctrl+A check below proves the
+    // shortcut switches panes, which needs something on both sides.
+    sftp_list_dir: {
+      path: '/',
+      entries: [
+        { name: 'etc', isDir: true, size: null, modifiedMs: 1756075901000 },
+        { name: 'var', isDir: true, size: null, modifiedMs: 1756075901000 },
+      ],
+    },
     sftp_bookmarks_list: { bookmarks: [] },
     sftp_queue_list: { jobs: [] },
   });
 
   const built = await page.evaluate(async () => {
     const tabId = 't1';
+    // Pane-scoped shortcuts (Ctrl+A) resolve the active tab, so the harness has
+    // to name one - the same thing activateSessionTab does in the real app.
+    state.activeTabId = tabId;
     state.sessions.set(tabId, {
       tabId, sessionId: 'sess', serverId: 'srv', serverName: 'host',
       host: '10.0.0.1', port: 22, mode: 'sftp', sftpReady: true, sftpPath: '/', ended: false,
@@ -299,6 +310,10 @@ async function checkSftpLocalPane(browser, server) {
     document.getElementById('sftpBody').appendChild(panel);
     panel.style.display = 'flex';
     document.getElementById('sftpBody').classList.add('visible');
+    // buildSftpPanel wires the toolbar but does not fetch; the real app calls
+    // this on connect. Needed here so the remote side has rows for the
+    // pane-scoped Ctrl+A check.
+    await refreshSftpPanel(tabId);
     toggleDualPane(tabId);                       // open the local pane
     await new Promise(r => setTimeout(r, 300));
     const tbody = document.getElementById('sftpLocalTbody-' + tabId);
@@ -321,7 +336,11 @@ async function checkSftpLocalPane(browser, server) {
     };
   });
   check('a right-click on a local row suppresses the webview menu', ctx.prevented, true);
-  check('it opens the app menu for a folder', ctx.items, ['Open', 'Upload folder', 'Copy path', 'Refresh']);
+  // The local pane offers file management now: rename/delete/open-folder for a
+  // row, new-folder on empty space. It previously carried only Open/Upload/
+  // Copy path because the backend had no local mutation commands at all.
+  check('it opens the app menu for a folder', ctx.items,
+    ['Open', 'Upload folder', 'Copy path', 'Rename...', 'Delete', 'Open in file manager', 'Refresh']);
   check('and retargets the selection to the row under the pointer', ctx.selected, 1);
 
   const empty = await page.evaluate(async () => {
@@ -338,7 +357,7 @@ async function checkSftpLocalPane(browser, server) {
   });
   check('the empty space below the rows is covered too', empty.prevented, true);
   check('with a directory-level menu', empty.items,
-    ['Parent directory', 'Copy current path', 'Set as default local directory', 'Refresh']);
+    ['Parent directory', 'Copy current path', 'Set as default local directory', 'New folder...', 'Refresh']);
 
   const sel = await page.evaluate(async () => {
     closeKeyConnectMenu();
@@ -360,8 +379,35 @@ async function checkSftpLocalPane(browser, server) {
   check('a plain click selects one row', sel.after1, 1);
   check('shift-click extends the range', sel.afterShift, 3);
   check('the menu acts on the whole selection', sel.items,
-    ['Upload 3 items', 'Copy 3 paths', 'Refresh']);
+    ['Upload 3 items', 'Copy 3 paths', 'Delete 3 items', 'Open containing folder', 'Refresh']);
   check('the status bar counts the local selection', /local: 3 items, 3 selected/.test(sel.status), true);
+
+  // Ctrl+A follows the pane last clicked: clicking a local row then pressing
+  // Ctrl+A must select every local entry, not the remote listing. The handler
+  // only ever touched the remote selection before.
+  const selectAll = await page.evaluate(async () => {
+    closeKeyConnectMenu();
+    const localRows = document.querySelectorAll('#sftpLocalTbody-t1 tr.sftp-entry');
+    localRows[0].click();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+    await new Promise(r => setTimeout(r, 60));
+    const localSelected = document.querySelectorAll('#sftpLocalTbody-t1 tr.selected').length;
+    const remoteSelected = document.querySelectorAll('#sftpTbody-t1 tr.selected').length;
+    // Now click a REMOTE row and repeat: the same shortcut must target remote.
+    const remoteRows = document.querySelectorAll('#sftpTbody-t1 tr.sftp-entry');
+    if (remoteRows.length) remoteRows[0].click();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+    await new Promise(r => setTimeout(r, 60));
+    return {
+      localSelected,
+      remoteSelected,
+      afterRemoteClick: document.querySelectorAll('#sftpTbody-t1 tr.selected').length,
+    };
+  });
+  check('Ctrl+A selects every local entry when the local pane has focus', selectAll.localSelected, 3);
+  check('and leaves the remote selection alone', selectAll.remoteSelected, 0);
+  check('Ctrl+A follows the pointer back to the remote pane',
+    selectAll.afterRemoteClick > 0, true);
 
   // The Columns button flips .show-owner-cols on the panel; nothing read it.
   const cols = await page.evaluate(async () => {

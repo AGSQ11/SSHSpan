@@ -170,6 +170,13 @@ pub struct Database {
     pub db_path: PathBuf,
 }
 
+/// How many audit rows to keep. Enforced on every insert (see `add_audit`),
+/// which is the only place rows are created, so the table cannot outgrow this
+/// regardless of how long the app runs. Sized well above the renderer's
+/// 200-row page so the cap is about reclaiming space, not about what the user
+/// can see.
+pub const AUDIT_RETENTION_ROWS: i64 = 10_000;
+
 use std::sync::OnceLock;
 
 /// Lazily-created, long-lived tokio runtime used by the DB layer when no
@@ -769,7 +776,44 @@ impl Database {
             .bind(Utc::now().to_rfc3339())
             .execute(&self.pool)
             .await?;
+            // Retention: the table previously grew without bound (nothing ever
+            // deleted a row), while the UI could only ever display the newest
+            // 200 - so the oldest history was invisible AND unreclaimable.
+            // Trim by row count rather than by age: the cap is what the
+            // display limit can meaningfully represent, and a quiet install
+            // should not lose years of history to a time-based rule.
+            sqlx::query(
+                "DELETE FROM audit_log WHERE id NOT IN \
+                 (SELECT id FROM audit_log ORDER BY id DESC LIMIT ?)",
+            )
+            .bind(AUDIT_RETENTION_ROWS)
+            .execute(&self.pool)
+            .await?;
             Ok(())
+        })
+    }
+
+    /// Total number of audit rows, so the UI can say how many exist rather
+    /// than implying the visible page is everything.
+    pub fn count_audit(&self) -> Result<i64> {
+        block(async {
+            let row = sqlx::query("SELECT COUNT(*) AS n FROM audit_log")
+                .fetch_one(&self.pool)
+                .await?;
+            Ok(row.get::<i64, _>("n"))
+        })
+    }
+
+    /// Delete every audit row. The audit trail is a local record for the user,
+    /// not a tamper-evident log, so the user clearing it is a supported
+    /// action - and it is itself recorded (the caller writes the marker row
+    /// afterwards) so a cleared log still shows that a clear happened.
+    pub fn clear_audit(&self) -> Result<u64> {
+        block(async {
+            let res = sqlx::query("DELETE FROM audit_log")
+                .execute(&self.pool)
+                .await?;
+            Ok(res.rows_affected())
         })
     }
 

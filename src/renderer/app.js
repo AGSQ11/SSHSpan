@@ -903,6 +903,43 @@ function promptModal(title, message, initial, onOk) {
 }
 function closePrompt() { el('promptModal').hidden = true; state.promptCallback = null; }
 
+// ─── generic confirm modal (promise-based) ─────────────────────────────────
+
+/// Ask a yes/no question and resolve to the answer. Promise-based rather than
+/// callback-based because its callers (audit clear) are async and want to
+/// branch on the answer inline. The SFTP delete dialog keeps its own modal:
+/// that one carries a session-scoped "don't ask again" checkbox that this
+/// deliberately does not offer.
+function confirmModal(title, message, okLabel) {
+  return new Promise((resolve) => {
+    el('confirmTitle').textContent = title;
+    el('confirmMessage').textContent = message || '';
+    el('confirmOkBtn').textContent = okLabel || 'Confirm';
+    const modal = el('confirmModal');
+    modal.hidden = false;
+    const finish = (answer) => {
+      modal.hidden = true;
+      el('confirmOkBtn').removeEventListener('click', onOk);
+      el('confirmCancelBtn').removeEventListener('click', onCancel);
+      document.removeEventListener('keydown', onKey, true);
+      resolve(answer);
+    };
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    const onKey = (ev) => {
+      if (ev.key !== 'Escape') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      finish(false);
+    };
+    el('confirmOkBtn').addEventListener('click', onOk);
+    el('confirmCancelBtn').addEventListener('click', onCancel);
+    // Capture phase so Escape closes this modal rather than the one below it.
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => el('confirmOkBtn').focus(), 0);
+  });
+}
+
 // ─── category chip rendering (shared) ─────────────────────────────────────
 
 function renderCategoryChips(targetEl, ids, { removable, onRemove, onClickPath } = {}) {
@@ -2203,6 +2240,21 @@ async function importFromSshConfig(anchorEl) {
             pemPath: h.identity_file || '',
           },
         });
+        // SSHSpan's SSH client does not implement jump hosts or agent
+        // forwarding: `proxy_jump` / `forward_agent` are parsed out of the
+        // user's config and preserved on write, but nothing consults them when
+        // connecting. Importing such a host and staying silent would leave the
+        // user believing they are connecting through a bastion when the
+        // connection goes direct - so name the directives that will be ignored.
+        const ignored = [];
+        if (h.proxy_jump) ignored.push('ProxyJump');
+        if (h.forward_agent) ignored.push('ForwardAgent');
+        if (h.extra && Object.keys(h.extra).some(k => k.toLowerCase() === 'proxycommand')) {
+          ignored.push('ProxyCommand');
+        }
+        if (ignored.length) {
+          toast(`${ignored.join(' and ')} from your SSH config ${ignored.length > 1 ? 'are' : 'is'} not supported - this connection goes direct.`, 'info');
+        }
       });
       menu.appendChild(b);
     }
@@ -2542,23 +2594,18 @@ async function loadSettings() {
   mkRow('Show hidden files in the file browser', sftpHidden,
     'Dotfiles are hidden by default; you can always toggle this per session.');
 
-  // sftpMaxBps and sftpVerifyTransfers below aren't in settings_get's
-  // (Rust) key allowlist, so unlike every setting above, this renderer can
-  // never read the persisted value back through settings_get - there's no
-  // generic "read one key" command either. settings_set is still the
-  // source of truth (it writes the same setting.<key> row every setting
-  // uses, and the queue backend reads it directly - see set_rate_limit /
-  // verify_enabled in queue.rs), but redisplaying the current value here on
-  // next launch needs its own copy; sftpSettingCacheGet/Set (sftp.js) keep
-  // one in localStorage, which - like the rest of a Tauri webview's storage
-  // - persists on disk across restarts same as the DB does.
-  const cacheGet = (k, d) => (typeof window.sftpSettingCacheGet === 'function' ? window.sftpSettingCacheGet(k, d) : d);
-  const cacheSet = (k, v) => { if (typeof window.sftpSettingCacheSet === 'function') window.sftpSettingCacheSet(k, v); };
+  // sftpMaxBps and sftpVerifyTransfers are in settings_get's (Rust) key
+  // allowlist, so the persisted value comes back through `state.settings` like
+  // every other row above. They used to be read through an optional
+  // `sftpSettingCacheGet/Set` pair on `window` that nothing ever defined: the
+  // calls silently fell through to the default, so a saved bandwidth limit or
+  // verify toggle re-rendered as "Unlimited"/"off" on every launch while the
+  // backend kept enforcing the real value.
 
   // Bandwidth throttle (Task 3): stored as whole bytes/sec (sftpMaxBps), but
   // shown as a magnitude + KB/s-or-MB/s unit with an explicit Unlimited
   // toggle - nobody thinks in raw bytes/sec.
-  const bpsStored = parseInt(cacheGet('sftpMaxBps', '0'), 10) || 0;
+  const bpsStored = parseInt(state.settings.sftpMaxBps || '0', 10) || 0;
   const bpsWrap = document.createElement('span');
   bpsWrap.className = 'settings-combo';
   const bpsUnlimited = document.createElement('input');
@@ -2595,7 +2642,6 @@ async function loadSettings() {
     const bytesPerSec = bpsUnlimited.checked ? 0 : mag * parseInt(bpsUnit.value, 10);
     try {
       await call('settings_set', { key: 'sftpMaxBps', value: String(bytesPerSec) });
-      cacheSet('sftpMaxBps', String(bytesPerSec));
       // Also push it live - settings_set alone only takes effect on the
       // NEXT transfer (restore_pending re-reads it at startup); workers
       // already running re-check rate_bps every chunk, so this applies the
@@ -2623,12 +2669,11 @@ async function loadSettings() {
   // both sides to hash them roughly doubles the traffic a transfer uses.
   const sftpVerify = document.createElement('input');
   sftpVerify.type = 'checkbox';
-  sftpVerify.checked = cacheGet('sftpVerifyTransfers', 'false') === 'true';
+  sftpVerify.checked = state.settings.sftpVerifyTransfers === 'true';
   sftpVerify.addEventListener('change', async () => {
     const value = sftpVerify.checked ? 'true' : 'false';
     try {
       await call('settings_set', { key: 'sftpVerifyTransfers', value });
-      cacheSet('sftpVerifyTransfers', value);
       state.settings.sftpVerifyTransfers = value;
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
@@ -2663,6 +2708,27 @@ async function loadSettings() {
     'The conflict dialog writes this same setting when you tick "always use this action".');
   mkConflictRow('When a download would overwrite a file', 'sftpConflictDownload',
     'Resume continues a part-finished transfer; rename keeps both copies.');
+
+  // Fallback for transfers that never reach the conflict dialog (a batch whose
+  // destinations are all new, and the Send-to path). The backend has always
+  // read this key - `resolve_resume_mode` in commands/sftp.rs - but nothing in
+  // the UI could set it, so it sat at "ask" forever.
+  const resumeDefault = document.createElement('select');
+  resumeDefault.innerHTML =
+    '<option value="ask">Ask every time</option>' +
+    '<option value="overwrite">Overwrite</option>' +
+    '<option value="resume">Resume</option>';
+  resumeDefault.value = state.settings.sftpResumeDefault || 'ask';
+  if (!resumeDefault.value) resumeDefault.value = 'ask';
+  resumeDefault.addEventListener('change', async () => {
+    try {
+      await call('settings_set', { key: 'sftpResumeDefault', value: resumeDefault.value });
+      state.settings.sftpResumeDefault = resumeDefault.value;
+      toast('Saved.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  mkRow('Default transfer mode when no conflict is detected', resumeDefault,
+    'Applies when a transfer never reaches the conflict dialog. Resume continues a part-finished transfer.');
 
   const termScrollback = document.createElement('input');
   termScrollback.type = 'number';
@@ -2884,6 +2950,23 @@ async function loadAudit() {
   try {
     const res = await call('audit_list', { limit: 200 });
     const rows = res.rows || [];
+    // The table is capped in the backend (AUDIT_RETENTION_ROWS) and this call
+    // asks for a page of 200, so say how many exist rather than letting the
+    // visible page imply it is everything.
+    const total = typeof res.total === 'number' ? res.total : rows.length;
+    const countChip = el('auditCount');
+    if (countChip) {
+      countChip.hidden = total === 0;
+      countChip.textContent = total > rows.length
+        ? `newest ${rows.length} of ${total}`
+        : `${total} ${total === 1 ? 'entry' : 'entries'}`;
+    }
+    const capHint = el('auditCapHint');
+    if (capHint) {
+      capHint.textContent = total >= 10000
+        ? 'The log keeps the newest 10,000 entries; older ones are discarded automatically.'
+        : '';
+    }
     if (rows.length === 0) {
       const tr = document.createElement('tr');
       const td = document.createElement('td');
@@ -2908,6 +2991,55 @@ async function loadAudit() {
   } catch (e) {
     toast(e.message || String(e), 'err');
   }
+}
+
+/// RFC 4180 field escaping: wrap in quotes and double any embedded quote.
+/// The detail column carries arbitrary strings (file paths, host names,
+/// sanitized key names), so a comma or quote in one must not shift columns.
+function csvField(value) {
+  const s = value === undefined || value === null ? '' : String(value);
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+/// Export the audit log as CSV through a native save dialog. Pulls the full
+/// retained set (not the 200-row page the table shows), so the export is
+/// complete even when the view is truncated.
+async function auditExport() {
+  try {
+    const res = await call('audit_list', { limit: 10000 });
+    const rows = res.rows || [];
+    if (!rows.length) { toast('Nothing to export yet.', 'info'); return; }
+    const header = ['time', 'event', 'key_id', 'detail'].join(',');
+    const lines = rows.map(r => [fmtTime(r.ts), r.event, r.keyId, r.detail].map(csvField).join(','));
+    // Leading BOM so Excel opens UTF-8 correctly; the CSV is otherwise plain.
+    const csv = '\ufeff' + header + '\r\n' + lines.join('\r\n') + '\r\n';
+    const pick = await call('system_pick_save_path', {
+      title: 'Export audit log',
+      defaultName: `sshspan-audit-${new Date().toISOString().slice(0, 10)}.csv`,
+    });
+    if (pick.canceled) return;
+    await call('system_write_text_file', { path: pick.path, contents: csv });
+    toast(`Exported ${rows.length} entrie(s).`, 'ok');
+  } catch (e) { toast((e && (e.message || e.error)) || String(e), 'err'); }
+}
+
+/// Clear the audit log after a confirmation. The backend records the clear
+/// itself, so the log is never left with no trace that it was emptied.
+async function auditClear() {
+  try {
+    const res = await call('audit_list', { limit: 1 });
+    const total = typeof res.total === 'number' ? res.total : 0;
+    if (total === 0) { toast('The audit log is already empty.', 'info'); return; }
+    const confirmed = await confirmModal(
+      'Clear audit log',
+      `Delete all ${total} recorded event(s)? This cannot be undone, and the log is your only local record of key and vault activity.`,
+      'Clear log',
+    );
+    if (!confirmed) return;
+    const out = await call('audit_clear');
+    await loadAudit();
+    toast(`Cleared ${out.removed} entrie(s).`, 'ok');
+  } catch (e) { toast((e && (e.message || e.error)) || String(e), 'err'); }
 }
 
 
@@ -3151,6 +3283,10 @@ function wire() {
   // backup & restore (Settings)
   el('backupExportBtn').addEventListener('click', backupCreate);
   el('backupImportBtn').addEventListener('click', backupRestore);
+
+  // audit log (Settings)
+  el('auditExportBtn').addEventListener('click', auditExport);
+  el('auditClearBtn').addEventListener('click', auditClear);
 
   // picker modal
   el('pickerCloseBtn').addEventListener('click', closeCategoryPicker);

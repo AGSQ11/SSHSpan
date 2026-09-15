@@ -175,6 +175,10 @@ pub fn run() {
             sftp_bookmarks_list,
             sftp_bookmarks_save,
             sftp_local_list,
+            sftp_local_mkdir,
+            sftp_local_rename,
+            sftp_local_remove,
+            sftp_local_open_folder,
             sftp_close,
             sftp_stage_path,
             // Bitwarden commands
@@ -188,6 +192,7 @@ pub fn run() {
             settings_set,
             // Audit log commands
             audit_list,
+            audit_clear,
             // System commands
             system_open_external,
             system_open_url,
@@ -197,6 +202,21 @@ pub fn run() {
             update_check,
             update_download_and_run,
         ])
+        // Closing the window hides it to the tray instead of exiting, which is
+        // what the tray has always implied (it offers Show and Quit, and until
+        // now the X button silently killed the process and the tray with it).
+        // The vault deliberately stays unlocked: hiding is not a security
+        // boundary, and the tray's "Lock Vault" and the idle auto-lock are the
+        // controls for that. Quit goes through `app.exit`, which sets QUITTING
+        // first so this handler lets the exit proceed.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         // Best-effort lifecycle teardown: Tauri v2's desktop run loop does NOT
@@ -219,6 +239,12 @@ pub fn run() {
             _ => {}
         });
 }
+
+/// True once a real quit is under way, so the window-close handler can tell
+/// "the user clicked X" (hide to tray) from "the app is exiting" (let it
+/// through). Set by the tray's Quit item; without it `prevent_close()` would
+/// also swallow the tray's own Quit and the app could never be exited.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Create system tray with menu
 fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
@@ -251,6 +277,9 @@ fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
                     let _ = window.emit("vault-lock-requested", "");
                 }
                 "quit" => {
+                    // Mark the exit as deliberate BEFORE asking to exit, so the
+                    // CloseRequested handler does not hide the window instead.
+                    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
                     app.exit(0);
                 }
                 _ => {}
