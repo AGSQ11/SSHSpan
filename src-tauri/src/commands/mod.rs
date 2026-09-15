@@ -869,6 +869,82 @@ mod tests {
             .join("sshspan-export-test.txt");
         assert!(validate_export_path(&good.display().to_string()).is_ok());
     }
+
+    /// Every key the renderer writes through `settings_set` must be in the
+    /// allowlist, or the write is rejected and - because the call sites catch -
+    /// silently resets on the next launch. `sftpShowOwnerCols` shipped in that
+    /// exact state: the Columns toggle wrote it, the backend refused it, and
+    /// nothing surfaced the error.
+    #[test]
+    fn settings_allowlist_covers_every_renderer_written_key() {
+        let renderer = [
+            "sftpShowOwnerCols",
+            "sftpParallel",
+            "sftpShowHidden",
+            "sftpDualPane",
+            "sftpConflictUpload",
+            "sftpConflictDownload",
+            "sftpPreserveTs",
+            "sftpCmpMode",
+            "sftpResumeDefault",
+            "sftpMaxBps",
+            "sftpVerifyTransfers",
+            "autoLockMinutes",
+            "autoUpdateCheck",
+            "confirmDelete",
+            "confirmMultiLinePaste",
+            "uiScale",
+            "terminalScrollback",
+            "terminalBell",
+            "terminalBackspace",
+            "terminalHomeEnd",
+            "terminalAppCursorKeys",
+            "terminalAppKeypad",
+        ];
+        for key in renderer {
+            assert!(
+                SETTINGS_KEYS.contains(&key),
+                "{key} is written by the renderer but absent from SETTINGS_KEYS"
+            );
+        }
+    }
+
+    /// The per-server local-directory family is addressed by prefix, so it is
+    /// valid even though it is not in the fixed list - and a bare prefix with
+    /// no server id is not.
+    #[test]
+    fn settings_allowlist_accepts_prefixed_local_dir_family() {
+        let known = |key: &str| {
+            SETTINGS_KEYS.contains(&key)
+                || (key.starts_with(SFTP_LOCAL_DIR_PREFIX)
+                    && key.len() > SFTP_LOCAL_DIR_PREFIX.len())
+        };
+        assert!(known("sftpLocalDir:server-1"));
+        assert!(!known(SFTP_LOCAL_DIR_PREFIX));
+        assert!(!known("bwSync.masterPassword"));
+    }
+
+    /// A backup taken by an older build can carry keys this build no longer
+    /// recognises. They must be dropped before `restore_backup` writes every
+    /// key of the payload into the `config` table, which also holds the
+    /// Bitwarden secrets.
+    #[test]
+    fn backup_settings_sanitizer_drops_unknown_keys() {
+        let mut settings = serde_json::Map::new();
+        settings.insert("sftpParallel".into(), serde_json::json!("4"));
+        settings.insert("sftpLocalDir:server-1".into(), serde_json::json!("/tmp"));
+        // Removed in this change, and a key that was never a setting at all.
+        settings.insert("theme".into(), serde_json::json!("dark"));
+        settings.insert("bwSync.masterPassword".into(), serde_json::json!("secret"));
+
+        let dropped = sanitize_backup_settings(&mut settings);
+
+        assert_eq!(dropped, 2);
+        assert!(settings.contains_key("sftpParallel"));
+        assert!(settings.contains_key("sftpLocalDir:server-1"));
+        assert!(!settings.contains_key("theme"));
+        assert!(!settings.contains_key("bwSync.masterPassword"));
+    }
 }
 
 /// NOT REGISTERED in `generate_handler!`, deliberately.
@@ -1002,22 +1078,7 @@ pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
     let servers = db.list_servers().map_err(|e| e.to_string())?;
     let known_hosts = db.list_known_hosts().map_err(|e| e.to_string())?;
 
-    let settings: serde_json::Map<String, serde_json::Value> = [
-        "autoLockMinutes",
-        "sshKeysDir",
-        "sshConfigPath",
-        "theme",
-        "confirmDelete",
-        "autoUpdateCheck",
-    ]
-    .iter()
-    .filter_map(|k| {
-        db.get_config(&format!("setting.{k}"))
-            .ok()
-            .flatten()
-            .map(|v| (k.to_string(), serde_json::json!(v)))
-    })
-    .collect();
+    let settings = collect_settings(&db)?;
 
     let payload = serde_json::json!({
         "keys": keys,
@@ -1153,6 +1214,17 @@ pub fn vault_backup_restore(
         }
     }
 
+    // Prune settings the allowlist does not recognise BEFORE the payload
+    // reaches `restore_backup`, which writes each key straight into the
+    // `config` table (the table that also holds the Bitwarden secrets) inside
+    // its transaction. An older build's backup is the realistic source of an
+    // unknown key here.
+    let dropped_settings = data
+        .get_mut("settings")
+        .and_then(|v| v.as_object_mut())
+        .map(sanitize_backup_settings)
+        .unwrap_or(0);
+
     let counts = app
         .state::<AppState>()
         .db
@@ -1162,6 +1234,13 @@ pub fn vault_backup_restore(
         app.state::<AppState>()
             .db
             .add_audit("vault.backup_restored", None, &counts.to_string());
+    if dropped_settings > 0 {
+        let _ = app.state::<AppState>().db.add_audit(
+            "vault.restore_settings_skipped",
+            None,
+            &format!("{dropped_settings} unknown setting(s) ignored on restore"),
+        );
+    }
     if reseal_failures > 0 {
         let _ = app.state::<AppState>().db.add_audit(
             "vault.restore_reseal_skipped",
@@ -2521,7 +2600,32 @@ pub fn audit_list(app: AppHandle, limit: Option<i64>) -> CmdResult<serde_json::V
             })
         })
         .collect();
-    Ok(serde_json::json!({ "rows": rows }))
+    // `total` distinguishes "this is everything" from "this is the newest page
+    // of many" - the table is capped at AUDIT_RETENTION_ROWS, so the page the
+    // UI requests can be a strict subset of what exists.
+    let total = app
+        .state::<AppState>()
+        .db
+        .count_audit()
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "rows": rows, "total": total }))
+}
+
+/// Wipe the audit log. Records the clear itself as the first new row, so an
+/// empty-looking log still shows that it was emptied (and when).
+#[tauri::command]
+pub fn audit_clear(app: AppHandle) -> CmdResult<serde_json::Value> {
+    let removed = app
+        .state::<AppState>()
+        .db
+        .clear_audit()
+        .map_err(|e| e.to_string())?;
+    let _ = app.state::<AppState>().db.add_audit(
+        "audit.cleared",
+        None,
+        &format!("{removed} entrie(s) removed by the user"),
+    );
+    Ok(serde_json::json!({ "ok": true, "removed": removed }))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2536,16 +2640,22 @@ const SFTP_LOCAL_DIR_PREFIX: &str = "sftpLocalDir:";
 /// Every setting key the app reads. `settings_get` returns these (plus the
 /// `sftpLocalDir:` family) and `settings_set` accepts only these, so the two
 /// cannot drift and the renderer cannot write keys nothing will ever read.
+///
+/// A key belongs here only if something actually reads it back. Four keys used
+/// to sit in this list with no reader anywhere - `theme` and `sshKeysDir` /
+/// `sshConfigPath` (the real paths are derived at runtime by `system_paths`)
+/// were never consumed, and `terminalKeepaliveSeconds` became inert when
+/// keepalives moved to the SSH protocol layer. They were accepted, persisted
+/// and copied into every backup while doing nothing, so a renderer writing one
+/// got a silent success for a no-op. Removed rather than left as decoration.
 const SETTINGS_KEYS: &[&str] = &[
     "autoLockMinutes",
-    "sshKeysDir",
-    "sshConfigPath",
-    "theme",
     "confirmDelete",
     "autoUpdateCheck",
     "sftpParallel",
     "sftpShowHidden",
     "sftpDualPane",
+    "sftpShowOwnerCols",
     // FileZilla-parity transfer behavior (renderer mirror only works
     // in-session unless these load at startup).
     "sftpConflictUpload",
@@ -2562,7 +2672,6 @@ const SETTINGS_KEYS: &[&str] = &[
     "terminalAppCursorKeys",
     "terminalAppKeypad",
     "terminalBell",
-    "terminalKeepaliveSeconds",
     "confirmMultiLinePaste",
 ];
 
@@ -2592,26 +2701,25 @@ pub fn system_paths(app: AppHandle) -> CmdResult<serde_json::Value> {
     }))
 }
 
-#[tauri::command]
-pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
+/// Read every persisted setting into one map: the `SETTINGS_KEYS` allowlist
+/// plus the `sftpLocalDir:` family (one key per server id, so it cannot live in
+/// the fixed list). Shared by `settings_get` and the vault backup so the two
+/// can never disagree about what "the settings" are - the backup used to carry
+/// a hand-written list of six keys, three of which nothing read, and restore
+/// dropped the whole map on the floor.
+fn collect_settings(
+    db: &crate::db::Database,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let mut settings = serde_json::Map::new();
     for key in SETTINGS_KEYS {
-        if let Some(val) = app
-            .state::<AppState>()
-            .db
+        if let Some(val) = db
             .get_config(&format!("setting.{}", key))
             .map_err(|e| e.to_string())?
         {
             settings.insert(key.to_string(), serde_json::Value::String(val));
         }
     }
-    // Per-server defaults are one key per server id, so they cannot live in
-    // the fixed list above. Read the family by prefix instead, which keeps
-    // the allowlist boundary that stops `bwSync.*` secrets in the same table
-    // from being readable here.
-    for (key, val) in app
-        .state::<AppState>()
-        .db
+    for (key, val) in db
         .list_config_prefix(&format!("setting.{SFTP_LOCAL_DIR_PREFIX}"))
         .map_err(|e| e.to_string())?
     {
@@ -2619,6 +2727,29 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
             settings.insert(bare.to_string(), serde_json::Value::String(val));
         }
     }
+    Ok(settings)
+}
+
+/// Drop settings a backup should not be allowed to seed. `restore_backup`
+/// writes every key in the payload straight into the `config` table - the same
+/// table that holds the Bitwarden secrets - so the payload has to pass the
+/// allowlist `settings_set` enforces before it gets there. A backup is
+/// authenticated, but it can have been taken by an older build (which is how
+/// the four since-removed keys would arrive), and a key nothing reads is
+/// exactly the decoration this list exists to keep out. Returns the number of
+/// keys dropped.
+fn sanitize_backup_settings(settings: &mut serde_json::Map<String, serde_json::Value>) -> usize {
+    let before = settings.len();
+    settings.retain(|key, _| {
+        SETTINGS_KEYS.contains(&key.as_str())
+            || (key.starts_with(SFTP_LOCAL_DIR_PREFIX) && key.len() > SFTP_LOCAL_DIR_PREFIX.len())
+    });
+    before - settings.len()
+}
+
+#[tauri::command]
+pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
+    let settings = collect_settings(&app.state::<AppState>().db)?;
     Ok(serde_json::Value::Object(settings))
 }
 

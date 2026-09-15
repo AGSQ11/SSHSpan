@@ -149,7 +149,8 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
   run in parallel by default (1-4 configurable).
 - **Dual-pane mode** - optional local pane with a draggable splitter; drag or double-click a
   local file to upload, double-click folders to navigate, drop files from your OS onto the
-  remote pane.
+  remote pane, and manage the local side directly (new folder, rename, delete, open in your
+  file manager).
 - **Resumable transfers** - interrupted uploads and downloads continue from verified partials
   (atomic `.part` staging, so a crash never leaves a corrupt "complete" file); per-transfer
   conflict handling with Ask/Overwrite/Skip/Rename/Resume and persistable defaults.
@@ -182,8 +183,9 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
   single encrypted file, restorable only with the master password current at backup time.
 
 ### Trust & ops
-- **Audit log** - append-only local record of every sensitive action (key lifecycle, vault
-  lock/unlock, connects, server changes, backups). Lives under Settings.
+- **Audit log** - local record of every sensitive action (key lifecycle, vault
+  lock/unlock, connects, server changes, backups), exportable as CSV and clearable from
+  Settings. Retains the newest 10,000 entries. Lives under Settings.
 - **Signed auto-updates** - installers are downloaded only from this repository over HTTPS,
   verified against a SHA-256 digest *and* a minisign signature whose public key is embedded
   in the app; a missing or invalid signature refuses the update.

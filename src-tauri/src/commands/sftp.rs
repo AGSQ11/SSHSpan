@@ -802,6 +802,16 @@ fn resolve_resume_mode(app: &AppHandle, resume: Option<&str>) -> ResumeMode {
     ResumeMode::from_str_loose(&raw)
 }
 
+/// Resolve the resume mode for one queued item: the item's own `resume` field
+/// wins, otherwise the batch-wide value. The renderer's conflict dialog decides
+/// per file, so a batch may mix actions.
+fn item_resume(item: &serde_json::Value, batch: ResumeMode) -> ResumeMode {
+    match item.get("resume").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => ResumeMode::from_str_loose(s),
+        _ => batch,
+    }
+}
+
 /// Expand a local directory into upload jobs (recursive); a file becomes one.
 ///
 /// Symlink-aware and cycle-breaking: recursion only ever enters REAL
@@ -1038,6 +1048,7 @@ fn expand_download(
     session_id: String,
     server_name: String,
     resume: ResumeMode,
+    local_name: Option<String>,
     out: Vec<QueuedItem>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<QueuedItem>, String>> + Send>> {
     Box::pin(async move {
@@ -1049,8 +1060,13 @@ fn expand_download(
         if !md.is_dir() {
             // Single file: its name comes from the user-picked remote path
             // (not a ReadDir entry), but sanitize anyway - the path string
-            // still originates from the server's view of the filesystem.
-            let raw = remote.rsplit('/').next().unwrap_or("file");
+            // still originates from the server's view of the filesystem. A
+            // renderer-supplied `local_name` (the download-rename conflict
+            // action) replaces the basename and goes through the same
+            // containment check, so a rename cannot escape the destination.
+            let raw = local_name
+                .as_deref()
+                .unwrap_or_else(|| remote.rsplit('/').next().unwrap_or("file"));
             let Some(local) = safe_join_under(&root, &local_dir, raw) else {
                 log::warn!(
                     "[sshspan-sftp] skipping download of {remote}: unsafe local name {raw:?}"
@@ -1111,6 +1127,9 @@ fn expand_download(
                 session_id.clone(),
                 server_name.clone(),
                 resume,
+                // A rename applies to the single file the user acted on, not to
+                // the descendants of a directory it happened to contain.
+                None,
                 out,
             )
             .await?;
@@ -1157,8 +1176,12 @@ pub async fn sftp_queue_add(
         }
     };
     // Ask/Overwrite/Resume - resolved once here, threaded into every
-    // expanded job.
-    let resume = resolve_resume_mode(&app, resume.as_deref());
+    // expanded job. An item may override it (`resume` on the item object):
+    // the renderer resolves conflicts per file in its dialog, so a batch can
+    // legitimately contain "skip this one, resume that one". Without the
+    // per-item read the batch-wide value won and every dialog decision was
+    // silently flattened to it.
+    let batch_resume = resolve_resume_mode(&app, resume.as_deref());
     let preserve_ts = preserve_ts.unwrap_or(false);
     let server_name = app
         .state::<StdArc<SessionRegistry>>()
@@ -1193,7 +1216,7 @@ pub async fn sftp_queue_add(
                     remote.to_string(),
                     session_id.clone(),
                     server_name.clone(),
-                    resume,
+                    item_resume(item, batch_resume),
                     preserve_ts,
                     &mut jobs,
                 );
@@ -1224,6 +1247,14 @@ pub async fn sftp_queue_add(
                 if remote.is_empty() {
                     continue;
                 }
+                // Download-side rename: the renderer resolves a conflict to a
+                // free local name and passes it here. Only the FILE case can
+                // use it (a directory expands into many names), which
+                // `expand_download` enforces.
+                let local_name = item
+                    .get("localName")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
                 jobs = expand_download(
                     sftp.clone(),
                     remote.to_string(),
@@ -1231,7 +1262,8 @@ pub async fn sftp_queue_add(
                     root.clone(),
                     session_id.clone(),
                     server_name.clone(),
-                    resume,
+                    item_resume(item, batch_resume),
+                    local_name.map(String::from),
                     jobs,
                 )
                 .await
@@ -1850,6 +1882,118 @@ pub fn sftp_local_list(path: String) -> CmdResult<serde_json::Value> {
         "path": dir.display().to_string(),
         "home": home,
     }))
+}
+
+/// Guard a local filesystem MUTATION (delete/rename/mkdir) on the local pane.
+///
+/// This is the destructive counterpart to `validate_sftp_local_path`, which
+/// only ever gated transfer SOURCES and DESTINATIONS. A renderer that can ask
+/// the backend to delete an arbitrary local path has a capability the vault
+/// lock does not take away, so the same two boundaries apply: nothing inside
+/// the app data directory (the vault database lives there) and nothing inside
+/// a system directory. The vault must also be unlocked, matching every other
+/// command that touches the filesystem on the user's behalf.
+fn validate_local_mutation(app: &AppHandle, path: &str) -> CmdResult<PathBuf> {
+    require_unlocked(app)?;
+    validate_sftp_local_path(path)?;
+    let p = PathBuf::from(path);
+    // A bare drive root (`C:\`) or `/` is technically absolute and outside the
+    // app data dir, but "delete the root of the filesystem" is never what the
+    // user meant and the recursive delete below would happily attempt it.
+    if p.parent().is_none() {
+        return Err("Refusing to operate on a filesystem root.".into());
+    }
+    Ok(p)
+}
+
+/// Create a directory on the LOCAL filesystem (dual-pane counterpart to
+/// `sftp_mkdir`, which only ever creates remote directories).
+#[tauri::command]
+pub fn sftp_local_mkdir(app: AppHandle, path: String) -> CmdResult<serde_json::Value> {
+    let dir = validate_local_mutation(&app, &path)?;
+    if dir.exists() {
+        return Err(CmdError(format!("Already exists: {}", dir.display())).into());
+    }
+    std::fs::create_dir(&dir).map_err(|e| CmdError(format!("Could not create folder: {e}")))?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Rename or move a LOCAL file/directory. Both endpoints are validated, so a
+/// rename cannot be used to move a file INTO the app data directory either.
+#[tauri::command]
+pub fn sftp_local_rename(app: AppHandle, from: String, to: String) -> CmdResult<serde_json::Value> {
+    let src = validate_local_mutation(&app, &from)?;
+    let dst = validate_local_mutation(&app, &to)?;
+    if !src.exists() {
+        return Err(CmdError(format!("Not found: {}", src.display())).into());
+    }
+    if dst.exists() {
+        return Err(CmdError(format!("Already exists: {}", dst.display())).into());
+    }
+    std::fs::rename(&src, &dst).map_err(|e| CmdError(format!("Rename failed: {e}")))?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Delete a LOCAL file or directory. Directories are removed recursively, so
+/// this is the most destructive command in the app; the renderer asks for
+/// confirmation before it is reached, and the path gate above is the backend's
+/// own boundary (a compromised renderer does not get to skip the dialog).
+#[tauri::command]
+pub fn sftp_local_remove(
+    app: AppHandle,
+    path: String,
+    is_dir: bool,
+) -> CmdResult<serde_json::Value> {
+    let target = validate_local_mutation(&app, &path)?;
+    if !target.exists() {
+        return Err(CmdError(format!("Not found: {}", target.display())).into());
+    }
+    // Re-check the resolved target, not just the string: a symlink inside an
+    // allowed directory can point at a protected one, and removing through it
+    // would reach the same files the path gate just refused. Mirrors the
+    // canonicalized check `is_protected_upload_source` performs for uploads.
+    if is_protected_upload_source(&target) {
+        return Err("That path resolves into a protected location.".into());
+    }
+    let result = if is_dir {
+        std::fs::remove_dir_all(&target)
+    } else {
+        std::fs::remove_file(&target)
+    };
+    result.map_err(|e| CmdError(format!("Delete failed: {e}")))?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Open a local path's containing folder in the OS file manager
+/// (Explorer/Finder/whatever the desktop provides). Read-only with respect to
+/// the file: the app data and system-directory gates still apply so the
+/// renderer cannot use this as a probe for locations it is not allowed to
+/// name, and the vault must be unlocked like every other local-filesystem
+/// command.
+///
+/// Opens the FOLDER rather than the item itself: `opener::open` on a file
+/// launches it with its associated application, which for an executable is a
+/// code-execution primitive - the same reason `system_open_external` refuses
+/// non-inert extensions. The `reveal` variant of the crate would select the
+/// item inside the folder, but it is behind a feature flag that pulls in new
+/// dependencies (`url`, `dbus`) for a cosmetic difference, so this opens the
+/// containing folder instead.
+#[tauri::command]
+pub fn sftp_local_open_folder(app: AppHandle, path: String) -> CmdResult<serde_json::Value> {
+    let target = validate_local_mutation(&app, &path)?;
+    if !target.exists() {
+        return Err(CmdError(format!("Not found: {}", target.display())).into());
+    }
+    let folder = if target.is_dir() {
+        target
+    } else {
+        target
+            .parent()
+            .ok_or_else(|| CmdError("That path has no containing folder.".into()))?
+            .to_path_buf()
+    };
+    opener::open(&folder).map_err(|e| CmdError(e.to_string()))?;
+    Ok(serde_json::json!({ "ok": true, "folder": folder.display().to_string() }))
 }
 
 /// Read the current permission bits of a remote path (prefill for the dialog).
@@ -2678,5 +2822,72 @@ mod tests {
         let md = std::fs::metadata(&file).unwrap();
         assert_eq!(local_owner_bits(&md), (None, None, None));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The conflict dialog decides per file, so one batch can mix actions. The
+    /// backend used to read only the batch-wide `resume`, which flattened every
+    /// per-file choice to the same value.
+    #[test]
+    fn item_resume_overrides_batch_value() {
+        let with = |v: serde_json::Value| item_resume(&v, ResumeMode::Overwrite);
+        assert_eq!(
+            with(serde_json::json!({ "remote": "/a", "resume": "resume" })),
+            ResumeMode::Resume
+        );
+        assert_eq!(
+            with(serde_json::json!({ "remote": "/a", "resume": "skip" })),
+            ResumeMode::Overwrite
+        );
+        // Absent, empty, and non-string all fall back to the batch value.
+        assert_eq!(
+            with(serde_json::json!({ "remote": "/a" })),
+            ResumeMode::Overwrite
+        );
+        assert_eq!(
+            with(serde_json::json!({ "remote": "/a", "resume": "" })),
+            ResumeMode::Overwrite
+        );
+        assert_eq!(
+            with(serde_json::json!({ "remote": "/a", "resume": 7 })),
+            ResumeMode::Overwrite
+        );
+        // And a missing per-item value inherits the batch value.
+        assert_eq!(
+            item_resume(&serde_json::json!({ "remote": "/a" }), ResumeMode::Resume),
+            ResumeMode::Resume
+        );
+    }
+
+    /// A renderer-supplied rename must not escape the download destination.
+    /// `safe_join_under` is the boundary `expand_download` applies to the
+    /// `localName` it now accepts, so prove it rejects traversal rather than
+    /// trusting the renderer to send a bare basename.
+    #[test]
+    fn download_rename_cannot_escape_destination() {
+        let root = std::path::PathBuf::from("/tmp/sshspan-dest");
+        assert!(safe_join_under(&root, &root, "../escape.txt").is_none());
+        assert!(safe_join_under(&root, &root, "nested/../../escape.txt").is_none());
+        assert!(safe_join_under(&root, &root, "plain.txt").is_some());
+        assert!(safe_join_under(&root, &root, "renamed copy.txt").is_some());
+    }
+
+    /// Local mutations are gated on an unlocked vault and on the same
+    /// app-data/system-directory rules the transfer paths use. This covers the
+    /// pure path rules; `validate_local_mutation` additionally requires the
+    /// vault password, which needs an AppHandle.
+    #[test]
+    fn local_mutation_rules_reject_protected_paths() {
+        // A filesystem root is refused by the mutation guard before anything
+        // else - the recursive delete would otherwise be aimed at the volume.
+        assert!(std::path::Path::new("/").parent().is_none());
+        // App data (the vault) and system directories stay off-limits.
+        use directories::ProjectDirs;
+        let app_data = ProjectDirs::from("org", "sshspan", "SSHSpan")
+            .expect("project dirs")
+            .data_dir()
+            .join("sshspan.db");
+        assert!(validate_sftp_local_path(&app_data.display().to_string()).is_err());
+        assert!(validate_sftp_local_path("/etc/passwd").is_err());
+        assert!(validate_sftp_local_path("relative/path").is_err());
     }
 }

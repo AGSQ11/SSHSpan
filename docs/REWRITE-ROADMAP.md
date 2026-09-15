@@ -231,14 +231,19 @@ surface with the key's name.
 
 ## 6. Roadmap from here (unchanged direction)
 
-1. **Known-hosts management UI** — the IPC (`known_hosts_list` / `known_hosts_forget`)
-   already exists; a settings-page panel completes the TOFU story.
-2. **Minimize-to-tray on window close** — today the X button exits; tray-aware close would
-   match the tray's promise.
+1. ~~**Known-hosts management UI**~~ — **done.** The Settings pane's "Known hosts"
+   section lists pinned keys and offers forget, backed by `known_hosts_list` /
+   `known_hosts_forget`.
+2. ~~**Minimize-to-tray on window close**~~ — **done.** Closing the window hides it to
+   the tray; Quit (tray menu) is what exits, matching the tray's promise.
 3. **ssh-agent story** — feed Pageant/OpenSSH agent instead of shipping our own (per the
    standing roadmap decision), with auto-remove on vault lock.
-4. **Session tabs** — multiple simultaneous terminals in the Connect view.
+4. ~~**Session tabs**~~ — **done.** The Connect view renders a tab strip
+   (`renderTermTabs`) with one chip per live session plus a "+" button.
 5. **PuTTY session import/export (`.reg`)**, jump hosts, port forwarding — in that order.
+   Note: `~/.ssh/config` `ProxyJump` / `ProxyCommand` / `ForwardAgent` are parsed and
+   preserved on write but are **not** honored when connecting; the import flow now warns
+   when a host carries one.
 6. **Health panel** — key age, cipher strength, deployed-file drift.
 
 ---
