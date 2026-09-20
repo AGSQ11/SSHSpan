@@ -141,6 +141,24 @@ two shots no longer match a view you can navigate to.
 - **Vault-gated**: locking the vault immediately disconnects every live session.
 - Test button per server (open -> authenticate -> close, with latency).
 
+### AI assistant (optional, off by default)
+An [OI]-compatible or Anthropic-compatible chat panel docked beside the terminal
+(`Ctrl+Shift+A`), configured under Settings -> AI assistant with your own provider and API
+key (works with [OI], OpenRouter, Groq, Anthropic, and local servers like Ollama or LM
+Studio). It can read the live terminal and help with server administration; what it is
+allowed to do is a per-tab choice, shown on a color-coded control at the top of the panel:
+- **Read** - advise only: sees the terminal, answers, and proposes commands as cards you
+  can insert or run yourself. It cannot touch the session.
+- **Draft** - may also type into your prompt line, but never presses Enter.
+- **Execute** - may run commands, each one behind an Approve/Deny card.
+- **YOLO** - runs commands without asking, behind a deliberately scary opt-in dialog and a
+  persistent red badge. Full autonomous control of the session - use with care.
+
+The API key is sealed with your vault master password like every other secret, all
+provider traffic goes through the Rust backend (nothing is fetched from the page), every
+AI-executed command is written to the audit log, and the backend independently re-checks
+the access level before anything reaches the SSH channel.
+
 ### SFTP - embedded file transfer
 Runs over the same live SSH connection as the terminal - no second login, no extra port:
 - **Background transfer queue** - uploads and downloads run on dedicated SFTP channels, so

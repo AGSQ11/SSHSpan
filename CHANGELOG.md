@@ -39,6 +39,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AI assistant (optional, off by default).** A chat panel docked beside the
+  terminal (`Ctrl+Shift+A`) that talks to [OI]-compatible or Anthropic-compatible
+  providers - [OI], OpenRouter, Groq, Anthropic, or a local server such as
+  Ollama / LM Studio - configured under Settings -> AI assistant. The assistant
+  can read the live terminal, answer questions, and propose or run shell
+  commands against the session. What it may do is a per-tab access level chosen
+  on a color-coded control at the top of the panel: **Read** (advise only,
+  commands arrive as cards you insert or run yourself), **Draft** (may type
+  into your prompt, never presses Enter), **Execute** (runs commands behind a
+  per-command Approve/Deny card), and **YOLO** (no confirmations, behind a
+  deliberately scary opt-in dialog and a persistent red badge). The API key is
+  sealed with the vault master password like every other stored secret, all
+  provider traffic goes through the Rust backend (the page never fetches
+  provider URLs), every AI-executed command is recorded in the audit log, and
+  the backend independently re-checks the access level before a command reaches
+  the SSH channel.
+
 - **Local-pane file management.** The dual-pane local side could browse and
   upload but not manage: there was no local rename, delete, mkdir, or
   open-folder command at all, so a right-click there offered four entries
