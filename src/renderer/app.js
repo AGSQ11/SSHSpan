@@ -422,7 +422,7 @@ function keysInCategoryRecursive(catId) {
 /// There used to be a second `function filteredKeys()` further down this file
 /// that applied only the search and type filters. Function declarations hoist,
 /// so the later one silently replaced this one for the single caller
-/// (renderKeyList) — and the category filter did nothing at all. Selecting a
+/// (renderKeyList) - and the category filter did nothing at all. Selecting a
 /// category in the sidebar rendered every key in the vault, which also made
 /// "All categories" and a specific category look identical.
 function filteredKeys() {
@@ -3092,6 +3092,22 @@ async function switchView(view) {
 // ─── wiring ────────────────────────────────────────────────────────────────
 
 function wire() {
+  // The webview's own context menu (Back / Refresh / Save as / Print) is
+  // browser chrome leaking into a desktop app - suppress it everywhere. Text
+  // fields keep the native editing menu (cut/copy/paste), since the forms
+  // have no other affordance for it. App context menus are unaffected:
+  // preventDefault() here does not stop propagation, so their handlers still
+  // run, and they call preventDefault() for their own area anyway. Capture
+  // phase so an inner stopPropagation cannot let the native menu through.
+  window.addEventListener('contextmenu', (ev) => {
+    const t = ev.target;
+    const editable = t instanceof HTMLElement
+      && (t.isContentEditable || t instanceof HTMLTextAreaElement
+          || (t instanceof HTMLInputElement
+              && !/^(checkbox|radio|button|submit|reset|range|color|file|hidden)$/i.test(t.type)));
+    if (!editable) ev.preventDefault();
+  }, true);
+
   // nav
   for (const b of document.querySelectorAll('.nav-item')) {
     b.addEventListener('click', () => switchView(b.dataset.view));
@@ -3207,7 +3223,7 @@ function wire() {
     if (!state.selectedId) return;
     const k = state.keys.find(x => x.id === state.selectedId);
     if (!k) return;
-    promptModal('Rename key', 'New name (no spaces — it is used as the Host alias in your SSH config):', k.name, async (name) => {
+    promptModal('Rename key', 'New name (no spaces - it is used as the Host alias in your SSH config):', k.name, async (name) => {
       const next = (name || '').trim();
       if (!next || next === k.name) return;
       try {
@@ -3415,7 +3431,11 @@ function wire() {
   el('serverModal').addEventListener('click', (e) => {
     if (e.target === el('serverModal')) closeServerModal();
   });
-  for (const b of document.querySelectorAll('.seg-btn')) {
+  // Scoped to the server modal: '.seg-btn' alone also matches the Shell /
+  // Files / Split view switch, and those buttons carry data-mode, not
+  // data-auth - so every click on them called setConnectAuthMethod(undefined),
+  // which lit up all three and corrupted the modal's auth state.
+  for (const b of document.querySelectorAll('#serverModal .seg-btn')) {
     b.addEventListener('click', () => setConnectAuthMethod(b.dataset.auth));
   }
   el('srvBrowsePemBtn').addEventListener('click', async () => {
@@ -3795,7 +3815,9 @@ function closeServerModal() {
 
 function setConnectAuthMethod(method) {
   state.connectAuthMethod = method;
-  for (const b of document.querySelectorAll('.seg-btn')) {
+  // Only the modal's Key / Password / Kbd-int buttons - the terminal's
+  // Shell / Files / Split switch shares the .seg-btn class.
+  for (const b of document.querySelectorAll('#serverModal .seg-btn')) {
     b.classList.toggle('active', b.dataset.auth === method);
   }
   el('srvKeyRow').hidden = method !== 'publickey';
