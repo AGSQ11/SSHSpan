@@ -94,7 +94,7 @@ function terminalBufferText(rec) {
 /// Deliberately not named `markTerminalBell`. app.js defines a global of that
 /// name and assigns it to `window.markTerminalBell`; every renderer script is
 /// a classic <script> sharing one global scope, and terminal.js loads AFTER
-/// app.js, so a same-named function declaration here replaced the global —
+/// app.js, so a same-named function declaration here replaced the global -
 /// making the `window.markTerminalBell(tabId)` call below call THIS function,
 /// recursively, until the stack blew:
 ///   RangeError: Maximum call stack size exceeded
@@ -122,7 +122,7 @@ function playTerminalBell() {
 
 // copyText lives in app.js and is shared. It used to be duplicated here, and
 // because terminal.js loads after app.js in the same global scope, THIS
-// version won — a fire-and-forget function returning undefined.
+// version won - a fire-and-forget function returning undefined.
 //
 // Two consequences, both live until now:
 //   * sftp.js does `copyText(x).then(...)` in three places (Copy path, Copy
@@ -130,7 +130,7 @@ function playTerminalBell() {
 //     nothing visible.
 //   * app.js does `const ok = await copyText(x)`. The clipboard write DID
 //     succeed, but `ok` was undefined, so both call sites reported
-//     "Clipboard unavailable." on a copy that had worked — the exact symptom
+//     "Clipboard unavailable." on a copy that had worked - the exact symptom
 //     reported against 1.7.2 and thought fixed.
 //
 // app.js's version is the one to keep: it tries the Tauri plugin, falls back
@@ -511,13 +511,20 @@ window.terminalReset = (tabId) => {
   setTimeout(() => { try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {} }, 30);
 };
 window.terminalPaste = async (tabId, text) => {
+  // Paste paths that leave the terminal (context menu click, confirm()
+  // dialog) drop focus to <body>; the next keystroke goes nowhere and the
+  // terminal looks dead until clicked. Hand focus back first so typing
+  // works whether or not the paste lands.
+  const rec = tabRecord(tabId);
+  try { rec && rec.term.focus(); } catch (e) {}
   if (typeof text !== 'string' || !text) return false;
   const needsConfirm = terminalSetting('confirmMultiLinePaste', '1') !== '0';
   if (needsConfirm && (text.includes('\n') || text.includes('\r'))) {
     const lines = text.split(/\r\n|\r|\n/).length;
     if (!window.confirm(`Paste ${lines} lines into this SSH session? Review clipboard content before running commands.`)) return false;
+    try { rec && rec.term.focus(); } catch (e) {}
   }
-  return sendTerminalBytes(tabRecord(tabId), text);
+  return sendTerminalBytes(rec, text);
 };
 window.terminalReadClipboard = readClipboard;
 window.terminalApplySettings = () => {

@@ -1255,7 +1255,13 @@ function openTerminalContextMenu(x, y, tabId) {
     const b = document.createElement('button');
     b.className = 'ctx-item';
     b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
-    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
+    b.addEventListener('click', () => {
+      closeKeyConnectMenu();
+      fn();
+      // Menu clicks strand focus on <body>; hand it back to the terminal so
+      // the user can keep typing without re-clicking the surface.
+      try { window.tabRecord(tabId)?.term.focus(); } catch (e) {}
+    });
     menu.appendChild(b);
     return b;
   };
