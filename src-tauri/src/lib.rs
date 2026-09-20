@@ -2,6 +2,7 @@
 //! Tauri v2 library entry point
 
 pub mod bitwarden;
+pub mod assistant;
 pub mod commands;
 pub mod config;
 pub mod crypto;
@@ -63,6 +64,8 @@ pub fn run() {
             app.manage(commands::ActivityTracker::new());
             // Vault generation: bumped on lock so pending operations abort
             app.manage(commands::VaultGeneration::new());
+            // Per-tab AI access levels; in-memory, cleared on vault lock
+            app.manage(assistant::AssistantLevels::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -186,6 +189,14 @@ pub fn run() {
             bitwarden_save_config,
             bitwarden_test_connection,
             bitwarden_sync,
+            // AI assistant commands
+            assistant::assistant_get_config,
+            assistant::assistant_save_config,
+            assistant::assistant_test_connection,
+            assistant::assistant_chat,
+            assistant::assistant_set_level,
+            assistant::assistant_get_level,
+            assistant::assistant_exec,
             // Settings commands
             settings_get,
             system_paths,

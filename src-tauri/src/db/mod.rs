@@ -163,6 +163,16 @@ impl Default for BitwardenConfig {
     }
 }
 
+/// AI assistant provider settings. `api_key` holds the vault-sealed blob
+/// (AES-256-GCM via crypto::vault::seal), never the plaintext key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssistantConfig {
+    pub provider: Option<String>, // "openai" | "anthropic"
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>, // sealed JSON blob
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub pool: SqlitePool,
@@ -323,6 +333,21 @@ impl Database {
             sqlx::query(
                 r#"
                 CREATE TABLE IF NOT EXISTS bitwarden_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+
+            // AI assistant provider settings. Same key/value shape as
+            // bitwarden_config; the api_key row holds the vault-sealed blob,
+            // never the plaintext key.
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS assistant_config (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -899,6 +924,65 @@ impl Database {
                             .map(|d| d.with_timezone(&Utc))
                     }
                     "last_result" => config.last_result = Some(value),
+                    _ => {}
+                }
+            }
+            Ok(config)
+        })
+    }
+
+    // ── AI assistant config ────────────────────────────────────────────────
+
+    pub fn save_assistant_config(&self, config: &AssistantConfig) -> Result<()> {
+        block(async {
+            let fields: [(&str, Option<String>); 4] = [
+                ("provider", config.provider.clone()),
+                ("base_url", config.base_url.clone()),
+                ("model", config.model.clone()),
+                ("api_key", config.api_key.clone()),
+            ];
+
+            for (key, value) in fields {
+                if let Some(v) = value {
+                    sqlx::query(
+                        "INSERT INTO assistant_config (key, value, updated_at) VALUES (?, ?, ?) \
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+                    )
+                    .bind(key)
+                    .bind(v)
+                    .bind(Utc::now().to_rfc3339())
+                    .execute(&self.pool)
+                    .await?;
+                } else {
+                    // None means "clear this row" - the bitwarden table keeps
+                    // stale values on None, which is fine for folder names but
+                    // wrong for a sealed secret: clearing the provider must
+                    // not leave its key behind.
+                    sqlx::query("DELETE FROM assistant_config WHERE key = ?")
+                        .bind(key)
+                        .execute(&self.pool)
+                        .await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn load_assistant_config(&self) -> Result<AssistantConfig> {
+        block(async {
+            let rows = sqlx::query("SELECT key, value FROM assistant_config")
+                .fetch_all(&self.pool)
+                .await?;
+
+            let mut config = AssistantConfig::default();
+            for row in rows {
+                let key: String = row.get("key");
+                let value: String = row.get("value");
+                match key.as_str() {
+                    "provider" => config.provider = Some(value),
+                    "base_url" => config.base_url = Some(value),
+                    "model" => config.model = Some(value),
+                    "api_key" => config.api_key = Some(value),
                     _ => {}
                 }
             }

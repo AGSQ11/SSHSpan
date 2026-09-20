@@ -77,7 +77,7 @@ fn now() -> String {
 /// `Zeroizing` so every per-command copy is wiped on drop, matching the
 /// store's own hygiene (the store holds the canonical `Zeroizing` copy; each
 /// command previously cloned a plain `String` that lived until free).
-fn vault_password(app: &AppHandle) -> CmdResult<zeroize::Zeroizing<String>> {
+pub(crate) fn vault_password(app: &AppHandle) -> CmdResult<zeroize::Zeroizing<String>> {
     Ok(app
         .state::<VaultPasswordStore>()
         .get()
@@ -391,6 +391,7 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) {
     // transfer queue carried on writing files.
     app.state::<crate::sftp::SftpRegistry>().clear();
     crate::sftp::queue::pause_all(app);
+    app.state::<crate::assistant::AssistantLevels>().clear();
     app.state::<VaultPasswordStore>().clear();
     let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
 }
