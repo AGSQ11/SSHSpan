@@ -59,7 +59,14 @@ function sftpTabState(tab) {
   if (!tab.sortKey) tab.sortKey = 'name';
   if (tab.sortDesc === undefined) tab.sortDesc = false;
   if (!tab.log) tab.log = [];
-  if (!tab.showHidden) tab.showHidden = state.settings?.sftpShowHidden === '1';
+  // Tri-state: undefined = follow the persisted sftpShowHidden setting;
+  // true/false = the user's explicit per-tab choice, which must win over the
+  // setting. The old falsy-guard (`if (!tab.showHidden) ...`) could not tell
+  // "user turned it off" from "never touched", so every re-entry into this
+  // function (each refreshSftpPanel navigation, mkdir, chmod...) silently
+  // re-applied the SETTING over the user's choice - and the button lost its
+  // active state with it.
+  if (tab.showHidden === undefined) tab.showHidden = state.settings?.sftpShowHidden === '1';
   if (tab.dualPane === undefined) tab.dualPane = state.sftpDualPane === true;
   // Per-server default local directory, if the user has set one (Task 6);
   // falls back to '' (the OS home directory, sftp_local_list's own default)
@@ -244,10 +251,11 @@ function buildSftpPanel(tabId) {
   const hiddenBtn = mkBtn('eye', 'Show/hide dotfiles', () => {
     const tab = sftpTabState(sftpTab(tabId));
     tab.showHidden = !tab.showHidden;
-    hiddenBtn.classList.toggle('active', tab.showHidden);
     // Client-side re-filter only: sftp_list_dir already returned the hidden
     // entries (the server doesn't filter them), so this never needs a
-    // network round trip - just re-run the existing cached listing.
+    // network round trip - just re-run the existing cached listing. The
+    // button's active class is set inside renderEntries from tab.showHidden,
+    // the single place that keeps it in sync with what the list shows.
     renderEntries(tabId);
     if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
   }, 'Hidden');
@@ -1046,7 +1054,7 @@ function sftpBuildRemoteRow(tab, entry) {
 
   const tdOwner = document.createElement('td');
   tdOwner.className = 'sftp-ownercell col-extra';
-  tdOwner.textContent = (entry.uid == null && entry.gid == null) ? '—' : `${entry.uid ?? '?'}:${entry.gid ?? '?'}`;
+  tdOwner.textContent = (entry.uid == null && entry.gid == null) ? '-' : `${entry.uid ?? '?'}:${entry.gid ?? '?'}`;
 
   tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
   tr.appendChild(tdPerm); tr.appendChild(tdOwner);
@@ -1151,6 +1159,12 @@ function renderEntries(tabId) {
   if (!tab || !tab._entries) return;
   const tbody = document.getElementById('sftpTbody-' + tabId);
   if (!tbody) return;
+  // The Hidden button's active class is display state, set here from the
+  // tab's actual flag rather than only in the click handler: anything that
+  // re-renders (navigation, mode switch, compare refresh) then re-asserts it,
+  // so the button can never drift out of sync with what the list shows.
+  const hiddenBtn = document.querySelector(`#sftpPanel-${tabId} .sftp-toolbar button[title="Show/hide dotfiles"]`);
+  if (hiddenBtn) hiddenBtn.classList.toggle('active', !!tab.showHidden);
   sftpWireTbodyDelegation(tabId); // idempotent - the panel already wires this once
   const thead = tbody.parentElement.querySelector('thead');
   if (thead) {
@@ -1426,7 +1440,7 @@ function formatSftpSize(bytes) {
 /// also set, upper-case otherwise). Null (a Windows local, or a server that
 /// omitted it) renders as an em dash, never a guess.
 function formatMode(mode) {
-  if (mode == null) return '—';
+  if (mode == null) return '-';
   let typeChar;
   switch (mode & 0o170000) {
     case 0o120000: typeChar = 'l'; break; // symlink
@@ -1522,8 +1536,8 @@ function sftpConfirmDelete(message, onYes) {
     el('deleteModal').hidden = true;
     // Only a confirmed delete may disarm the prompt. Reading the checkbox on
     // every exit meant ticking it and then backing out via Cancel still
-    // switched the safety prompt off for the session, so the NEXT delete —
-    // one the user never agreed to skip confirming — went through silently.
+    // switched the safety prompt off for the session, so the NEXT delete -
+    // one the user never agreed to skip confirming - went through silently.
     if (yes && el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed = true;
     document.removeEventListener('keydown', onKey, true);
     el('deleteModal').removeEventListener('click', onBackdrop);
@@ -1540,7 +1554,7 @@ function sftpConfirmDelete(message, onYes) {
   }
   el('deleteYesBtn').onclick = () => finish(true);
   el('deleteCancelBtn').onclick = () => finish(false);
-  // Escape and a backdrop click both mean "no" — abandoning a destructive
+  // Escape and a backdrop click both mean "no" - abandoning a destructive
   // prompt must never be harder than confirming it, and both exits are the
   // safe answer. Capture phase so the dialog wins over any handler behind it.
   document.addEventListener('keydown', onKey, true);
@@ -2675,7 +2689,7 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
       document.removeEventListener('keydown', onKey, true);
     };
     // Escape means "cancel the whole batch", the same as the X and Cancel
-    // buttons — it must resolve(null) too, or the transfer awaiting this
+    // buttons - it must resolve(null) too, or the transfer awaiting this
     // promise would hang forever with the dialog gone.
     function onKey(ev) {
       if (ev.key !== 'Escape') return;
@@ -3162,7 +3176,7 @@ function sftpQueueRowEl(j, depth) {
     : '';
   // Auto-retry countdown (Task 2): a backoff-queued job carries
   // attempts > 0 and a future retryAt, plus a human error like
-  // "connection reset — retrying (2/3)". Pull just the "(2/3)" back out
+  // "connection reset - retrying (2/3)". Pull just the "(2/3)" back out
   // of that string rather than hardcoding the retry cap here, so the two
   // stay in sync automatically; the full backend message is still the
   // tooltip. A single shared ticker (see setInterval above) redraws this
@@ -3222,7 +3236,7 @@ function sftpQueueRowEl(j, depth) {
       resume.disabled = true;
     }
     actions.appendChild(resume);
-    // Cancel is the way off a paused row that can never resume — a job
+    // Cancel is the way off a paused row that can never resume - a job
     // restored from a previous run whose session is gone. cancel_job
     // transitions Paused as well as Queued, so this is not a no-op.
     const cancel = document.createElement('button');
