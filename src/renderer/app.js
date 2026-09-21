@@ -2453,6 +2453,7 @@ function showSettingsSection(section) {
   }
 }
 window.showSettingsSection = showSettingsSection;
+window.switchView = switchView;
 
 async function loadSettings() {
   fillPathHints();
@@ -3462,6 +3463,11 @@ function wire() {
     const srv = currentSelectedServer();
     if (srv) testSelectedServer(srv);
   });
+  const assistantToggleBtn = el('assistantToggleBtn');
+  if (assistantToggleBtn) assistantToggleBtn.addEventListener('click', () => {
+    if (typeof window.assistantToggle === 'function') window.assistantToggle();
+    else toast('The assistant is still loading - try again in a moment.', 'err');
+  });
   const modeSeg = el('termModeSeg');
   if (modeSeg) {
     for (const b of modeSeg.querySelectorAll('.seg-btn')) {
@@ -4261,6 +4267,7 @@ function activateSessionSurface(tabId) {
   window.__activeSessionSurface = tabId;
   tab.bell = false;
   state.activeTabId = tabId;
+  if (typeof window.assistantOnTabSwitch === 'function') window.assistantOnTabSwitch(tabId);
   if (tab.mode === 'split') {
     if (typeof window.showSplitForTab !== 'function') return;
     window.showSplitForTab(tabId);
@@ -4493,7 +4500,7 @@ function escapeHtml(s) {
     document.head.appendChild(s);
   });
   const results = [];
-  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js', 'sftp.js']) {
+  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js', 'sftp.js', 'assistant.js']) {
     const r = await loadScript(src);
     results.push(r);
     if (!r.ok) toast('Failed to load ' + src + ' - Connect will not work.', 'err');

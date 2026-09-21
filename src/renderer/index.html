@@ -213,6 +213,7 @@
                   <button type="button" class="seg-btn" data-mode="split" role="tab" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span>Split</button>
                 </div>
                 <button id="termTestBtn" class="ghost-btn" hidden><span data-ico="plug-zap"></span>Test</button>
+                <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)"><span data-ico="message-square"></span>Assistant</button>
                 <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span>Reconnect</button>
                 <button id="termDisconnectBtn" class="danger-btn" hidden><span data-ico="x"></span>Disconnect</button>
               </div>
@@ -226,6 +227,31 @@
               <div class="terminal-body" id="terminalBody"></div>
               <div class="surface-splitter" id="surfaceSplitter" hidden></div>
               <div class="sftp-body" id="sftpBody"></div>
+              <aside class="assistant-panel" id="assistantPanel" hidden>
+                <header class="ai-head">
+                  <span class="ai-title"><span data-ico="message-square"></span>AI assistant</span>
+                  <span class="ai-yolo-badge" id="assistantYoloBadge" hidden>YOLO</span>
+                  <button class="icon-btn ai-close" id="assistantCloseBtn" title="Close assistant" data-ico="x"></button>
+                </header>
+                <div class="ai-levels">
+                  <div class="seg ai-level-seg" id="assistantLevelSeg" role="tablist" aria-label="Assistant access level">
+                    <button type="button" class="seg-btn level-read active" data-level="read" role="tab" title="Advise only">Read</button>
+                    <button type="button" class="seg-btn level-draft" data-level="draft" role="tab" title="Type, never submit">Draft</button>
+                    <button type="button" class="seg-btn level-execute" data-level="execute" role="tab" title="Run with approval">Execute</button>
+                    <button type="button" class="seg-btn level-yolo" data-level="yolo" role="tab" title="Full autonomy - dangerous">YOLO</button>
+                  </div>
+                  <div class="ai-level-caption level-read" id="assistantLevelCaption">Advise only - AI can read the terminal, never touch it.</div>
+                </div>
+                <div class="ai-messages" id="assistantMessages"></div>
+                <div class="ai-thinking" id="assistantThinking" hidden>
+                  <span class="ai-thinking-dot"></span><span>thinking...</span>
+                  <button class="ghost-btn" id="assistantStopBtn">Stop</button>
+                </div>
+                <footer class="ai-foot">
+                  <textarea id="assistantInput" rows="2" placeholder="Ask about this session... (Enter sends, Shift+Enter for a newline)"></textarea>
+                  <button class="primary-btn ai-send" id="assistantSendBtn" title="Send"><span data-ico="send"></span></button>
+                </footer>
+              </aside>
             </div>
             <button id="termMaxBtn" class="term-max-btn" title="Expand terminal to full window" data-ico="maximize-2"></button>
             <div class="terminal-strip" id="termStrip">Ready.</div>
@@ -243,6 +269,7 @@
             <button class="settings-nav-item" data-section="hosts"><span data-ico="shield-check"></span>Known hosts</button>
             <button class="settings-nav-item" data-section="backup"><span data-ico="download"></span>Backup &amp; restore</button>
             <button class="settings-nav-item" data-section="sync"><span data-ico="cloud-cog"></span>Bitwarden sync</button>
+            <button class="settings-nav-item" data-section="assistant"><span data-ico="message-square"></span>AI assistant</button>
             <button class="settings-nav-item" data-section="audit"><span data-ico="scroll-text"></span>Audit log</button>
           </nav>
 
@@ -323,6 +350,56 @@
               <div class="status-strip" id="bwStatus">Not configured yet.</div>
             </section>
 
+            <section class="card settings-section" data-section="assistant" hidden>
+              <div class="card-head">
+                <div>
+                  <h2>AI assistant</h2>
+                  <p class="card-sub">
+                    An optional chat assistant docked beside the terminal (Ctrl+Shift+A). It can
+                    read the live terminal and help with server administration; what it may do is a
+                    per-tab access level chosen on the panel (Read / Draft / Execute / YOLO). The
+                    API key is sealed with your vault master password, all provider traffic goes
+                    through the app backend, and every AI-executed command is written to the audit
+                    log. Off by default.
+                  </p>
+                </div>
+              </div>
+              <div class="settings-grid">
+                <label>Provider
+                  <select id="aiProvider">
+                    <option value="openai" selected>[OI]-compatible (chat/completions)</option>
+                    <option value="anthropic">Anthropic-compatible (messages)</option>
+                  </select>
+                </label>
+                <label>Base URL
+                  <div class="ai-urlrow">
+                    <input type="text" id="aiBaseUrl" placeholder="https://api.openai.com/v1" spellcheck="false" />
+                    <select id="aiBaseUrlPreset" title="Preset base URLs">
+                      <option value="" selected>Preset...</option>
+                      <option value="https://api.openai.com/v1">[OI]</option>
+                      <option value="https://openrouter.ai/api/v1">OpenRouter</option>
+                      <option value="https://api.groq.com/openai/v1">Groq</option>
+                      <option value="http://localhost:11434/v1">Ollama (local)</option>
+                      <option value="http://localhost:1234/v1">LM Studio (local)</option>
+                      <option value="https://api.anthropic.com">Anthropic</option>
+                    </select>
+                  </div>
+                </label>
+                <label>Model
+                  <input type="text" id="aiModel" placeholder="gpt-4o-mini / " spellcheck="false" />
+                </label>
+                <label>API key
+                  <input type="password" id="aiApiKey" placeholder="Leave blank to keep the stored key" autocomplete="off" />
+                  <span class="hint ai-key-hint" id="aiKeyHint"></span>
+                </label>
+              </div>
+              <div class="bw-actions">
+                <button id="aiSaveBtn" class="primary-btn">Save</button>
+                <button id="aiTestBtn" class="ghost-btn"><span data-ico="plug-zap"></span>Test connection</button>
+              </div>
+              <div class="status-strip" id="aiStatus">Works with [OI], OpenRouter, Groq, Anthropic, and local servers like Ollama / LM Studio.</div>
+            </section>
+
             <section class="card settings-section" data-section="audit" hidden>
               <div class="card-head">
                 <div>
@@ -347,6 +424,35 @@
         </div>
       </div>
     </main>
+  </div>
+
+  <!-- Modal: enable YOLO access level (deliberately hard to miss) -->
+  <div class="modal-backdrop" id="yoloModal" hidden>
+    <div class="modal modal-sm assistant-yolo-modal" role="alertdialog" aria-modal="true" aria-labelledby="yoloTitle">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico yolo-ico" data-ico="triangle-alert"></span>
+          <h2 id="yoloTitle">Enable YOLO mode?</h2>
+        </div>
+      </header>
+      <div class="modal-body">
+        <p>
+          At YOLO the assistant runs commands <strong>without asking you each
+          time</strong>. It has full autonomous control of the live SSH session: it
+          can read and change anything the account you connected with can reach,
+          and it is logged in as that user.
+        </p>
+        <p class="yolo-warn">
+          Every command is written to the audit log, but nothing is confirmed
+          with you first. Only enable this if you trust the current session, the
+          provider, and the model - or nothing on the server can hurt you.
+        </p>
+      </div>
+      <footer class="modal-foot">
+        <button class="ghost-btn" id="yoloCancelBtn">Cancel</button>
+        <button class="danger-btn yolo-enable" id="yoloEnableBtn">Enable YOLO</button>
+      </footer>
+    </div>
   </div>
 
   <!-- Modal: New / Import Key -->
