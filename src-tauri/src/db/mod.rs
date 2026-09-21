@@ -173,6 +173,68 @@ pub struct AssistantConfig {
     pub api_key: Option<String>, // sealed JSON blob
 }
 
+/// One MCP (Model Context Protocol) tool served by an `McpServerRecord`.
+///
+/// `name` is the REAL name the server used in tools/list; the
+/// renderer-exposed name (`mcp__<server>__<tool>`) is derived from it on the
+/// fly (deterministic, no second stored spelling to drift out of sync).
+///
+/// `description` is the display copy, already truncated to the 1024-char cap
+/// with a marker - the FULL description only ever exists transiently at
+/// fetch time, where it feeds `current_hash`.
+///
+/// Two hashes, deliberately separate:
+/// - `pin_hash`    - the definition the user APPROVED. Set when the tool is
+///                   enabled, never touched by a later tools/list.
+/// - `current_hash`- the NEWEST definition the server sent. Updated on every
+///                   tools/list; a mismatch with `pin_hash` while enabled
+///                   disables the tool and audits
+///                   `mcp.tool_definition_changed` (definition rug-pull).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolRecord {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: String,
+    pub enabled: bool,
+    pub auto_approve: bool,
+    /// SHA-256 (canonical JSON) of the tool definition the user approved.
+    pub pin_hash: Option<String>,
+    /// SHA-256 (canonical JSON) of the most recently fetched definition.
+    pub current_hash: Option<String>,
+    /// Server-provided annotations (readOnlyHint, destructiveHint, ...) for
+    /// DISPLAY ONLY - never consulted by any gate (a lying server must not
+    /// be able to mark its own tool safe).
+    pub annotations: Option<serde_json::Value>,
+}
+
+/// A configured MCP server (Streamable HTTP transport). `auth_secret` holds
+/// a vault-sealed blob, never the plaintext header value; `auth_env_var`
+/// stores only the variable NAME - the value is resolved from the process
+/// environment at request time and never persisted.
+///
+/// `confirmed` gates every connect/test: an entry that arrived from a
+/// backup restore, sync, or import is stored with `confirmed = false` and
+/// must be re-confirmed in the UI (re-save) before any network traffic can
+/// send its secret toward the stored URL - otherwise a crafted backup makes
+/// the first initialize leak a stored secret or env var to an attacker's
+/// URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerRecord {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// none | bearer | custom_header
+    pub auth_type: String,
+    pub auth_header_name: Option<String>,
+    pub auth_secret: Option<String>,
+    pub auth_env_var: Option<String>,
+    pub confirmed: bool,
+    #[serde(default)]
+    pub tools: Vec<McpToolRecord>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub pool: SqlitePool,
@@ -350,6 +412,26 @@ impl Database {
                 CREATE TABLE IF NOT EXISTS assistant_config (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+
+            // MCP servers (Model Context Protocol, Streamable HTTP). Same
+            // key/value shape as assistant_config: one row per server with
+            // the whole record (including per-tool state) as JSON in `value`.
+            // The auth_secret field inside that JSON is a vault-sealed blob,
+            // never plaintext. `confirmed` lives inside the JSON too; the
+            // extra column duplicates it so an unconfirmed restore can be
+            // recognized from the row alone.
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS mcp_servers (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    confirmed INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 )
                 "#,
@@ -990,6 +1072,91 @@ impl Database {
         })
     }
 
+    // ── MCP servers ────────────────────────────────────────────────────────
+
+    /// Upsert one MCP server record (the whole record, tools included, as
+    /// JSON). `key` is the record id.
+    pub fn save_mcp_server(&self, record: &McpServerRecord) -> Result<()> {
+        block(async {
+            let value = serde_json::to_string(record)?;
+            sqlx::query(
+                "INSERT INTO mcp_servers (key, value, confirmed, updated_at) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                   confirmed = excluded.confirmed, updated_at = excluded.updated_at",
+            )
+            .bind(&record.id)
+            .bind(value)
+            .bind(record.confirmed as i64)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    pub fn get_mcp_server(&self, id: &str) -> Result<Option<McpServerRecord>> {
+        block(async {
+            let row = sqlx::query("SELECT value FROM mcp_servers WHERE key = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+            row.map(|r| serde_json::from_str(&r.get::<String, _>("value")))
+                .transpose()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServerRecord>> {
+        block(async {
+            let rows = sqlx::query("SELECT value FROM mcp_servers ORDER BY key ASC")
+                .fetch_all(&self.pool)
+                .await?;
+            rows.into_iter()
+                .map(|r| serde_json::from_str(&r.get::<String, _>("value")))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn delete_mcp_server(&self, id: &str) -> Result<bool> {
+        block(async {
+            let res = sqlx::query("DELETE FROM mcp_servers WHERE key = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            Ok(res.rows_affected() > 0)
+        })
+    }
+
+    /// Re-seal every stored MCP `auth_secret` with the new vault password,
+    /// writing each full record (still keyed by `key = record.id`) with the
+    /// NEW password in the caller's transaction; `confirmed` rides along,
+    /// never silently confirmed by a rotation. Called only from
+    /// [`Database::apply_vault_rotation`], where the re-sealed values (in
+    /// memory) and the verifier must commit together: one unsealable blob
+    /// aborts the whole rotation rather than stranding the entry on the old
+    /// password.
+    async fn rotate_mcp_secrets(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        records: &[McpServerRecord],
+    ) -> Result<()> {
+        for record in records {
+            let value = serde_json::to_string(record)?;
+            sqlx::query(
+                "INSERT INTO mcp_servers (key, value, confirmed, updated_at) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                   confirmed = excluded.confirmed, updated_at = excluded.updated_at",
+            )
+            .bind(&record.id)
+            .bind(value)
+            .bind(record.confirmed as i64)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+
     // ── Category operations ───────────────────────────────────────────────
 
     /// All categories, ordered for tree display: roots first, then by sibling sort_index, then by name.
@@ -1461,6 +1628,7 @@ impl Database {
         servers: &[ServerRecord],
         bitwarden_master_password: Option<&str>,
         assistant_api_key: Option<&str>,
+        mcp_servers: &[McpServerRecord],
         new_master_hash: &str,
     ) -> Result<()> {
         block(async {
@@ -1539,6 +1707,12 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
             }
+            // MCP server auth secrets are sealed with the same vault password
+            // and must rotate in the same transaction, or every MCP call
+            // fails at unseal after the change (same rule as the assistant
+            // API key above). The caller re-seals in memory first; an
+            // unsealable blob aborts the whole rotation there.
+            Self::rotate_mcp_secrets(&mut tx, mcp_servers).await?;
             // The verifier rotates last, inside the same transaction: if any
             // earlier statement failed, the whole rotation rolls back and the
             // old password keeps working against untouched rows.
@@ -2114,12 +2288,56 @@ impl Database {
                 }
             }
 
+            let mut mcp_n = 0u32;
+            if let Some(arr) = data.get("mcpServers").and_then(|v| v.as_array()) {
+                for m in arr {
+                    let Some(id) = m
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    // SECURITY: a backup is untrusted input. MCP entries are
+                    // restored INERT - `confirmed = false` - no matter what
+                    // the payload claims, and every tool is restored disabled
+                    // with its pin cleared. Until the user re-confirms the URL
+                    // and auth source in the UI (mcp_save_server), no
+                    // connect/test can run, so a crafted backup cannot make
+                    // the first initialize send a stored secret or env var to
+                    // an attacker's URL, and cannot pre-approve a tool.
+                    let mut record: McpServerRecord = match serde_json::from_value(m.clone()) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    record.id = id.to_string();
+                    record.confirmed = false;
+                    for tool in record.tools.iter_mut() {
+                        tool.enabled = false;
+                        tool.auto_approve = false;
+                        tool.pin_hash = None;
+                    }
+                    let value = serde_json::to_string(&record)?;
+                    sqlx::query(
+                        "INSERT INTO mcp_servers (key, value, confirmed, updated_at) VALUES (?, ?, 0, ?) \
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value, confirmed = 0, updated_at = excluded.updated_at",
+                    )
+                    .bind(id)
+                    .bind(value)
+                    .bind(Utc::now().to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+                    mcp_n += 1;
+                }
+            }
+
             tx.commit().await?;
             Ok(serde_json::json!({
                 "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
                 "servers": servers_n, "knownHosts": hosts_n,
                 "knownHostsImported": known_hosts_imported,
                 "knownHostsConflicts": known_hosts_conflicts, "settings": settings_n,
+                "mcpServers": mcp_n,
             }))
         })
     }
@@ -2466,6 +2684,23 @@ mod tests {
         let mut ai = AssistantConfig::default();
         ai.api_key = Some(ai_old);
         db.save_assistant_config(&ai).unwrap();
+        // And an MCP server whose auth secret is sealed under the OLD
+        // password (the whole record is one JSON row).
+        let mcp_old = crate::crypto::vault::seal(old_pw, b"mcp-bearer-secret").unwrap();
+        db.save_mcp_server(&McpServerRecord {
+            id: "mcp1".into(),
+            name: "tools".into(),
+            url: "https://mcp.example.com".into(),
+            auth_type: "bearer".into(),
+            auth_header_name: None,
+            auth_secret: Some(mcp_old),
+            auth_env_var: None,
+            confirmed: true,
+            tools: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
         db.set_config("master.hash", "OLD-VERIFIER").unwrap();
 
         // Rotate: re-seal key + BW cred in memory, commit atomically.
@@ -2474,8 +2709,21 @@ mod tests {
         key.private_key_encrypted = crate::crypto::vault::seal(new_pw, &plain).unwrap();
         let bw_new = crate::crypto::vault::seal(new_pw, b"bw-master-secret").unwrap();
         let ai_new = crate::crypto::vault::seal(new_pw, b"sk-assistant-key").unwrap();
-        db.apply_vault_rotation(&[key], &[], Some(&bw_new), Some(&ai_new), "NEW-VERIFIER")
-            .unwrap();
+        // MCP: unseal under OLD, re-seal under NEW, in memory, same
+        // transaction as everything else.
+        let mut mcp = db.get_mcp_server("mcp1").unwrap().unwrap();
+        let mcp_plain =
+            crate::crypto::vault::unseal(old_pw, mcp.auth_secret.as_deref().unwrap()).unwrap();
+        mcp.auth_secret = Some(crate::crypto::vault::seal(new_pw, &mcp_plain).unwrap());
+        db.apply_vault_rotation(
+            &[key],
+            &[],
+            Some(&bw_new),
+            Some(&ai_new),
+            std::slice::from_ref(&mcp),
+            "NEW-VERIFIER",
+        )
+        .unwrap();
 
         // Key unseals under NEW, not OLD.
         let stored = db.get_key("k1").unwrap().unwrap();
@@ -2498,6 +2746,17 @@ mod tests {
             b"sk-assistant-key"
         );
         assert!(crate::crypto::vault::unseal(old_pw, &sk).is_err());
+        // The MCP auth secret rotated in the same transaction: NEW unseals,
+        // OLD fails, and `confirmed` was not silently flipped.
+        let mcp2 = db.get_mcp_server("mcp1").unwrap().unwrap();
+        assert_eq!(
+            crate::crypto::vault::unseal(new_pw, mcp2.auth_secret.as_deref().unwrap()).unwrap(),
+            b"mcp-bearer-secret"
+        );
+        assert!(
+            crate::crypto::vault::unseal(old_pw, mcp2.auth_secret.as_deref().unwrap()).is_err()
+        );
+        assert!(mcp2.confirmed);
         // Verifier rotated.
         assert_eq!(
             db.get_config("master.hash").unwrap().as_deref(),
