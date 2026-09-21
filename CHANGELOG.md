@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The AI assistant no longer feeds raw terminal output to the model with
+  system-level authority.** The system prompt used to embed the terminal
+  snapshot directly, so anything printed on the remote (logs, files, MOTD,
+  command output) reached the model as a system instruction - and in YOLO mode
+  `run_command` executes with no approval, so injected text could steer
+  commands. The snapshot is now delivered as a separate nonce-wrapped
+  non-system block whose boundary the payload cannot forge (a fresh per-turn
+  nonce, with the closing tag stripped from the text), tool results that carry
+  remote output get the same wrapper, and the system prompt now states that
+  terminal content is untrusted data and that only the user's own chat
+  messages are instructions. The YOLO opt-in dialog warns that on-screen
+  content can influence what the AI runs. Assistant replies also render
+  markdown (headings, bold, lists, inline code) instead of showing raw `**`
+  and `##` markers. Injection resistance is probabilistic - these defenses
+  raise the cost, they are not a proof.
+
 ## [1.9.0] - 2026-09-21
 
 A full code-audit remediation (26 findings, two of them critical) plus the

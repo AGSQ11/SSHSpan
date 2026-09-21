@@ -851,6 +851,42 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_block_in_user_message_shapes_for_both_providers() {
+        // The prompt-injection hardening delivers the terminal snapshot inside
+        // a single user message (nonce-wrapped, closing tag stripped). Both
+        // providers must shape that list into a valid request - critically,
+        // Anthropic must NOT split it into adjacent same-role messages.
+        let nonce = "1234567890123456";
+        let snapshot = format!(
+            "<terminal_output_{nonce} trust=\"untrusted\">\n$ df -h\nFilesystem  Size\n</terminal_output_{nonce}>"
+        );
+        let user_content = format!("summarize the screen\n\n{snapshot}");
+        let msgs = vec![
+            ChatMessage::System { content: "rules".into() },
+            ChatMessage::User { content: user_content.clone() },
+        ];
+
+        // [OI]: system stays in-band, user content passes through verbatim.
+        let oi = openai_body("m", &msgs, &[], 1024).unwrap();
+        let oi_msgs = oi["messages"].as_array().unwrap();
+        assert_eq!(oi_msgs[0]["role"], "system");
+        assert_eq!(oi_msgs[1]["role"], "user");
+        assert_eq!(oi_msgs[1]["content"], serde_json::Value::String(user_content.clone()));
+        assert!(oi_msgs[1]["content"].as_str().unwrap().contains(&format!("terminal_output_{nonce}")));
+
+        // Anthropic: system hoisted, exactly one user message (no adjacent
+        // same-role split), and the untrusted block survives inside it.
+        let an = anthropic_body("m", &msgs, &[], 1024).unwrap();
+        assert_eq!(an["system"], "rules");
+        let an_msgs = an["messages"].as_array().unwrap();
+        assert_eq!(an_msgs.len(), 1, "must be exactly one non-system message");
+        assert_eq!(an_msgs[0]["role"], "user");
+        let an_text = an_msgs[0]["content"].as_str().unwrap();
+        assert!(an_text.contains(&format!("terminal_output_{nonce}")));
+        assert!(an_text.contains("summarize the screen"));
+    }
+
+    #[test]
     fn anthropic_rejects_system_only_conversation() {
         let msgs = vec![ChatMessage::System {
             content: "s".into(),
