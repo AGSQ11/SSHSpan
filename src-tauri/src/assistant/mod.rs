@@ -19,6 +19,8 @@
 //! compromised webview - which is outside the threat model (release builds
 //! ship without devtools).
 
+pub mod mcp;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
