@@ -4173,9 +4173,12 @@ function toggleTermMax() {
   if (typeof terminalSetStatus === 'function') {
     terminalSetStatus(max ? 'Terminal maximized - press Esc or <> to restore.' : 'Restored.');
   }
-  // Let the layout settle, then refit + push the new PTY size.
-  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 80);
-  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 250);
+  // Let the layout settle, then refit + push the new PTY size. Focus after
+  // maximize is wanted (the terminal is the whole view); fitActiveTerminal
+  // alone does not focus, so a window resize never steals keystrokes from a
+  // modal or input.
+  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(); }, 80);
+  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(); }, 250);
 }
 
 /// Reconnect the active tab: new session in the SAME tab (keeps scrollback).
