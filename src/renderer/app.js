@@ -27,6 +27,16 @@ async function call(cmd, args) {
 
 function el(id) { return document.getElementById(id); }
 
+/// Boolean settings read. The backend's collect_settings returns every
+/// value as a JSON string, so a stored false arrives as "false" - and the
+/// strict comparisons this replaces ("!== false") never matched it, which
+/// made the confirm-before-delete and update-check toggles impossible to
+/// turn off. On means true, "true", "1", or unset; off means false, "false",
+/// "0". Everything else is truthy-preserving.
+function settingOn(v) {
+  return v !== false && v !== 'false' && v !== '0' && v !== 0;
+}
+
 // Toasts stack instead of overwriting one another. A batch operation that
 // reports several failures used to show only the last one, because a single
 // #toast element had its text replaced each time.
@@ -422,7 +432,7 @@ function keysInCategoryRecursive(catId) {
 /// There used to be a second `function filteredKeys()` further down this file
 /// that applied only the search and type filters. Function declarations hoist,
 /// so the later one silently replaced this one for the single caller
-/// (renderKeyList) — and the category filter did nothing at all. Selecting a
+/// (renderKeyList) - and the category filter did nothing at all. Selecting a
 /// category in the sidebar rendered every key in the vault, which also made
 /// "All categories" and a specific category look identical.
 function filteredKeys() {
@@ -985,7 +995,7 @@ const state = window.state = {
   orphans: false,            // true when at least one key has no categories
   activeCategoryId: 'all',   // 'all' | 'uncategorized' | categoryId
   expandedCatIds: new Set(), // sidebar expanded nodes
-  groupExpanded: new Set(),  // key-list group headers
+  groupExpanded: new Set(),  // key-list group ids the user COLLAPSED (absent = expanded)
   // picker
   pickerCallback: null,
   pickerSelected: new Set(),  // ids the user has ticked
@@ -1192,7 +1202,13 @@ function clearConnectView() {
   }
   state.activeTabId = null;
   const sbody = document.getElementById('sftpBody');
-  if (sbody) sbody.classList.remove('visible');
+  if (sbody) {
+    sbody.classList.remove('visible');
+    // closeSessionTab removes a closing tab's SFTP panel; the lock path only
+    // hid them, so one DOM subtree per session accumulated across every
+    // lock/unlock cycle. Remove them here too.
+    for (const child of [...sbody.querySelectorAll('[id^="sftpPanel-"]')]) child.remove();
+  }
   const tbody = document.getElementById('terminalBody');
   if (tbody) tbody.style.display = 'flex';
   renderTermTabs();
@@ -1255,7 +1271,13 @@ function openTerminalContextMenu(x, y, tabId) {
     const b = document.createElement('button');
     b.className = 'ctx-item';
     b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
-    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
+    b.addEventListener('click', () => {
+      closeKeyConnectMenu();
+      fn();
+      // Menu clicks strand focus on <body>; hand it back to the terminal so
+      // the user can keep typing without re-clicking the surface.
+      try { window.tabRecord(tabId)?.term.focus(); } catch (e) {}
+    });
     menu.appendChild(b);
     return b;
   };
@@ -1408,20 +1430,22 @@ function renderKeyList() {
     head.appendChild(name);
     const expandBtn = document.createElement('button');
     expandBtn.className = 'icon-btn';
-    const expanded = state.groupExpanded.has(g.id) === false; // default expanded
-    if (!expanded) {
+    // The Set tracks COLLAPSED group ids (absent = expanded, the default).
+    // The handler must write the toggle back into it: renderKeyList rebuilds
+    // the whole list (search, select, category switch), and a choice kept
+    // only on the old DOM node popped back open on the next render.
+    const collapsed = state.groupExpanded.has(g.id);
+    if (collapsed) {
       grp.classList.add('collapsed');
     }
-    expandBtn.innerHTML = ico(expanded ? 'minus' : 'plus');
-    expandBtn.title = expanded ? 'Collapse group' : 'Expand group';
+    expandBtn.innerHTML = ico(collapsed ? 'plus' : 'minus');
+    expandBtn.title = collapsed ? 'Expand group' : 'Collapse group';
     expandBtn.addEventListener('click', () => {
-      if (grp.classList.toggle('collapsed')) {
-        expandBtn.innerHTML = ico('plus');
-        expandBtn.title = 'Expand group';
-      } else {
-        expandBtn.innerHTML = ico('minus');
-        expandBtn.title = 'Collapse group';
-      }
+      const nowCollapsed = grp.classList.toggle('collapsed');
+      if (nowCollapsed) state.groupExpanded.add(g.id);
+      else state.groupExpanded.delete(g.id);
+      expandBtn.innerHTML = ico(nowCollapsed ? 'plus' : 'minus');
+      expandBtn.title = nowCollapsed ? 'Expand group' : 'Collapse group';
     });
     head.appendChild(expandBtn);
     grp.appendChild(head);
@@ -1668,7 +1692,7 @@ async function selectKey(id) {
 async function deleteSelected() {
   if (!state.selectedId) return;
   const k = state.keys.find(x => x.id === state.selectedId);
-  if (state.settings.confirmDelete !== false) {
+  if (settingOn(state.settings.confirmDelete)) {
     const ok = window.confirm('Delete key "' + (k ? k.name : state.selectedId) + '" from the vault?\nDeployed copies on disk are not removed.');
     if (!ok) return;
   }
@@ -1697,7 +1721,7 @@ async function deleteSelectedKeys() {
   });
   const listed = names.slice(0, 8).join('\n  ');
   const more = names.length > 8 ? `\n  ...and ${names.length - 8} more` : '';
-  if (state.settings.confirmDelete !== false) {
+  if (settingOn(state.settings.confirmDelete)) {
     const ok = window.confirm(
       `Delete ${ids.length} key(s) from the vault?\n\n  ${listed}${more}\n\nDeployed copies on disk are not removed.`);
     if (!ok) return;
@@ -2521,10 +2545,14 @@ async function loadSettings() {
 
   const confirmDelete = document.createElement('input');
   confirmDelete.type = 'checkbox';
-  confirmDelete.checked = state.settings.confirmDelete !== false;
+  confirmDelete.checked = settingOn(state.settings.confirmDelete);
   confirmDelete.addEventListener('change', async () => {
     try {
       await call('settings_set', { key: 'confirmDelete', value: String(confirmDelete.checked) });
+      // Mirror into state: the delete guards read it, and collect_settings
+      // returns strings, so a stale undefined here meant the guard could
+      // not see this session's change.
+      state.settings.confirmDelete = String(confirmDelete.checked);
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
@@ -2546,11 +2574,11 @@ async function loadSettings() {
 
   const autoUpdate = document.createElement('input');
   autoUpdate.type = 'checkbox';
-  autoUpdate.checked = state.settings.autoUpdateCheck !== false;
+  autoUpdate.checked = settingOn(state.settings.autoUpdateCheck);
   autoUpdate.addEventListener('change', async () => {
     try {
       await call('settings_set', { key: 'autoUpdateCheck', value: String(autoUpdate.checked) });
-      state.settings.autoUpdateCheck = autoUpdate.checked;
+      state.settings.autoUpdateCheck = String(autoUpdate.checked);
       toast('Saved.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
@@ -3092,6 +3120,22 @@ async function switchView(view) {
 // ─── wiring ────────────────────────────────────────────────────────────────
 
 function wire() {
+  // The webview's own context menu (Back / Refresh / Save as / Print) is
+  // browser chrome leaking into a desktop app - suppress it everywhere. Text
+  // fields keep the native editing menu (cut/copy/paste), since the forms
+  // have no other affordance for it. App context menus are unaffected:
+  // preventDefault() here does not stop propagation, so their handlers still
+  // run, and they call preventDefault() for their own area anyway. Capture
+  // phase so an inner stopPropagation cannot let the native menu through.
+  window.addEventListener('contextmenu', (ev) => {
+    const t = ev.target;
+    const editable = t instanceof HTMLElement
+      && (t.isContentEditable || t instanceof HTMLTextAreaElement
+          || (t instanceof HTMLInputElement
+              && !/^(checkbox|radio|button|submit|reset|range|color|file|hidden)$/i.test(t.type)));
+    if (!editable) ev.preventDefault();
+  }, true);
+
   // nav
   for (const b of document.querySelectorAll('.nav-item')) {
     b.addEventListener('click', () => switchView(b.dataset.view));
@@ -3207,7 +3251,7 @@ function wire() {
     if (!state.selectedId) return;
     const k = state.keys.find(x => x.id === state.selectedId);
     if (!k) return;
-    promptModal('Rename key', 'New name (no spaces — it is used as the Host alias in your SSH config):', k.name, async (name) => {
+    promptModal('Rename key', 'New name (no spaces - it is used as the Host alias in your SSH config):', k.name, async (name) => {
       const next = (name || '').trim();
       if (!next || next === k.name) return;
       try {
@@ -3363,6 +3407,22 @@ function wire() {
       else if (!el('vaultModal').hidden && state.vaultMode === 'change') hideVaultModal();
       return;
     }
+    // Ctrl+Shift+1/2/3 switch the session surface (Shell/Files/Split) - the
+    // mode buttons' tooltips advertise these. Must be handled BEFORE the
+    // Ctrl+Shift-rejecting branch below, and only when a session surface is
+    // actually active.
+    if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && !ev.altKey
+        && ['1', '2', '3'].includes(ev.key)) {
+      const view = el('view-connect');
+      if (view && !view.hidden && state.activeTabId) {
+        const mode = { '1': 'ssh', '2': 'sftp', '3': 'split' }[ev.key];
+        if (typeof window.setSessionMode === 'function') {
+          window.setSessionMode(mode);
+          ev.preventDefault();
+        }
+      }
+      return;
+    }
     if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.shiftKey) return;
     const k = ev.key.toLowerCase();
     if (k === '1') { switchView('keys'); ev.preventDefault(); }
@@ -3380,6 +3440,12 @@ function wire() {
 
   // Listen for vault-lock-requested from the tray menu
   listen('vault-lock-requested', () => { lockNow(); });
+
+  // The "+" tab-strip chip: show the server list so the user can pick (or
+  // add) the host for a new session. It previously had no handler at all -
+  // hover styles and a title promising an action, doing nothing.
+  const termAddBtn = el('termTabAdd');
+  if (termAddBtn) termAddBtn.addEventListener('click', () => switchView('connect'));
 
   // ─── Connect view wiring ────────────────────────────────────────────────
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
@@ -3415,7 +3481,11 @@ function wire() {
   el('serverModal').addEventListener('click', (e) => {
     if (e.target === el('serverModal')) closeServerModal();
   });
-  for (const b of document.querySelectorAll('.seg-btn')) {
+  // Scoped to the server modal: '.seg-btn' alone also matches the Shell /
+  // Files / Split view switch, and those buttons carry data-mode, not
+  // data-auth - so every click on them called setConnectAuthMethod(undefined),
+  // which lit up all three and corrupted the modal's auth state.
+  for (const b of document.querySelectorAll('#serverModal .seg-btn')) {
     b.addEventListener('click', () => setConnectAuthMethod(b.dataset.auth));
   }
   el('srvBrowsePemBtn').addEventListener('click', async () => {
@@ -3546,7 +3616,7 @@ async function manualUpdateCheck() {
 }
 
 async function autoUpdateCheckOnBoot() {
-  if (state.settings.autoUpdateCheck === false) return;
+  if (!settingOn(state.settings.autoUpdateCheck)) return;
   try {
     const r = await call('update_check');
     if (r.available) {
@@ -3795,7 +3865,9 @@ function closeServerModal() {
 
 function setConnectAuthMethod(method) {
   state.connectAuthMethod = method;
-  for (const b of document.querySelectorAll('.seg-btn')) {
+  // Only the modal's Key / Password / Kbd-int buttons - the terminal's
+  // Shell / Files / Split switch shares the .seg-btn class.
+  for (const b of document.querySelectorAll('#serverModal .seg-btn')) {
     b.classList.toggle('active', b.dataset.auth === method);
   }
   el('srvKeyRow').hidden = method !== 'publickey';
@@ -4145,9 +4217,12 @@ function toggleTermMax() {
   if (typeof terminalSetStatus === 'function') {
     terminalSetStatus(max ? 'Terminal maximized - press Esc or <> to restore.' : 'Restored.');
   }
-  // Let the layout settle, then refit + push the new PTY size.
-  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 80);
-  setTimeout(() => { if (typeof fitActiveTerminal === 'function') fitActiveTerminal(); }, 250);
+  // Let the layout settle, then refit + push the new PTY size. Focus after
+  // maximize is wanted (the terminal is the whole view); fitActiveTerminal
+  // alone does not focus, so a window resize never steals keystrokes from a
+  // modal or input.
+  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(); }, 80);
+  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(); }, 250);
 }
 
 /// Reconnect the active tab: new session in the SAME tab (keeps scrollback).
@@ -4329,7 +4404,11 @@ function onSessionClosed(tabId) {
     call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
     tab.sftpReady = false;
   }
-  if (tab.mode === 'sftp') tab.mode = 'ssh';
+  // Any non-shell mode falls back to the shell. Resetting only 'sftp' left a
+  // split tab stranded: split re-activated the dead SFTP surface (every
+  // navigation then toasted a list error) while setModeSeg(false) hid the
+  // Shell/Files/Split control, so there was no visible way out.
+  if (tab.mode !== 'ssh') tab.mode = 'ssh';
   tab.sessionId = null;
   if (tabId === state.activeTabId) {
     activateSessionSurface(tabId);

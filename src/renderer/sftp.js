@@ -53,18 +53,37 @@ function sftpLocalDirKey(serverId) {
   return 'sftpLocalDir:' + (serverId || 'unknown');
 }
 
+/// Is the SFTP panel visible for this tab? Split shows the full file browser
+/// beside the shell, so it counts. A dozen handlers used to gate on
+/// `mode !== 'sftp'`, which silently disabled Ctrl+A, drag&drop, uploads,
+/// compare shortcuts and the transfer-done auto-refresh in split mode while
+/// navigation still worked - a half-broken panel is worse than a disabled one.
+function sftpPanelVisible(tab) {
+  return !!tab && tab.mode !== 'ssh';
+}
+
 /// Ensure the tab record has all the SFTP fields this module uses.
 function sftpTabState(tab) {
   if (!tab.sftpSelected) tab.sftpSelected = new Set();
   if (!tab.sortKey) tab.sortKey = 'name';
   if (tab.sortDesc === undefined) tab.sortDesc = false;
   if (!tab.log) tab.log = [];
-  if (!tab.showHidden) tab.showHidden = state.settings?.sftpShowHidden === '1';
+  // Tri-state: undefined = follow the persisted sftpShowHidden setting;
+  // true/false = the user's explicit per-tab choice, which must win over the
+  // setting. The old falsy-guard (`if (!tab.showHidden) ...`) could not tell
+  // "user turned it off" from "never touched", so every re-entry into this
+  // function (each refreshSftpPanel navigation, mkdir, chmod...) silently
+  // re-applied the SETTING over the user's choice - and the button lost its
+  // active state with it.
+  if (tab.showHidden === undefined) tab.showHidden = state.settings?.sftpShowHidden === '1';
   if (tab.dualPane === undefined) tab.dualPane = state.sftpDualPane === true;
   // Per-server default local directory, if the user has set one (Task 6);
   // falls back to '' (the OS home directory, sftp_local_list's own default)
-  // exactly like before this existed.
-  if (!tab.localPath) tab.localPath = sftpSettingGet(sftpLocalDirKey(tab.serverId), '');
+  // exactly like before this existed. Tri-state like its neighbours: '' is
+  // the deliberate "Home" choice set by the pane's Home button, so a falsy
+  // guard would silently re-seed the remembered default over it on every
+  // re-entry here.
+  if (tab.localPath === undefined) tab.localPath = sftpSettingGet(sftpLocalDirKey(tab.serverId), '');
   if (tab.sftpPreserveTs === undefined) tab.sftpPreserveTs = state.settings?.sftpPreserveTs === '1';
   // Permissions/Owner columns default ON; toggleable per the toolbar button
   // (they widen the table noticeably, so narrow windows may prefer them off -
@@ -176,6 +195,9 @@ function showSftpForTab(tabId) {
       sbody.appendChild(panel);
     }
     panel.style.display = 'flex';
+    // A persisted dual pane (or one opened elsewhere for this tab) must show
+    // its chrome on every activation, not only when toggled in this session.
+    applySftpDualChrome(tabId);
   }
   let queuePanel = document.getElementById('sftpQueuePanel');
   if (!queuePanel && sbody) {
@@ -244,10 +266,11 @@ function buildSftpPanel(tabId) {
   const hiddenBtn = mkBtn('eye', 'Show/hide dotfiles', () => {
     const tab = sftpTabState(sftpTab(tabId));
     tab.showHidden = !tab.showHidden;
-    hiddenBtn.classList.toggle('active', tab.showHidden);
     // Client-side re-filter only: sftp_list_dir already returned the hidden
     // entries (the server doesn't filter them), so this never needs a
-    // network round trip - just re-run the existing cached listing.
+    // network round trip - just re-run the existing cached listing. The
+    // button's active class is set inside renderEntries from tab.showHidden,
+    // the single place that keeps it in sync with what the list shows.
     renderEntries(tabId);
     if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
   }, 'Hidden');
@@ -469,17 +492,27 @@ function buildSftpPanel(tabId) {
   splitter.className = 'sftp-splitter';
   splitter.id = 'sftpSplitter-' + tabId;
   let dragState = null;
-  splitter.addEventListener('mousedown', (ev) => {
-    dragState = { startX: ev.clientX, startW: remotePane.getBoundingClientRect().width };
-    ev.preventDefault();
-  });
-  document.addEventListener('mousemove', (ev) => {
+  // Drag listeners attach on mousedown and remove themselves on mouseup, not
+  // on every panel build: attaching per build leaked one document-level
+  // mousemove/mouseup pair per opened session tab for the app's lifetime.
+  const splitterMove = (ev) => {
     if (!dragState) return;
     const panelRect = panel.getBoundingClientRect();
     const pct = ((dragState.startW + ev.clientX - dragState.startX) / panelRect.width) * 100;
     panel.style.setProperty('--local-pct', `${Math.min(70, Math.max(20, pct)).toFixed(1)}%`);
+  };
+  const splitterUp = () => {
+    if (!dragState) return;
+    dragState = null;
+    document.removeEventListener('mousemove', splitterMove);
+    document.removeEventListener('mouseup', splitterUp);
+  };
+  splitter.addEventListener('mousedown', (ev) => {
+    dragState = { startX: ev.clientX, startW: remotePane.getBoundingClientRect().width };
+    document.addEventListener('mousemove', splitterMove);
+    document.addEventListener('mouseup', splitterUp);
+    ev.preventDefault();
   });
-  document.addEventListener('mouseup', () => { dragState = null; });
 
   // ── activity log (hidden until toggled) ──
   const log = document.createElement('pre');
@@ -538,8 +571,8 @@ function ensureSftpPreserveTsToggle(tabId) {
   const panel = document.getElementById('sftpPanel-' + tabId);
   if (!panel || document.getElementById('sftpPreserveTsBtn-' + tabId)) return;
   const toolbar = panel.querySelector('.sftp-toolbar');
-  const hiddenBtn = [...toolbar.querySelectorAll('button')].find(b => b.title === 'Show/hide dotfiles');
   if (!toolbar) return;
+  const hiddenBtn = [...toolbar.querySelectorAll('button')].find(b => b.title === 'Show/hide dotfiles');
   const tab = sftpTabState(sftpTab(tabId));
   const btn = document.createElement('button');
   btn.className = 'ghost-btn';
@@ -560,7 +593,8 @@ function sftpPreserveTsToggle(tabId) {
   if (btn) btn.classList.toggle('active', tab.sftpPreserveTs);
   state.settings = state.settings || {};
   state.settings.sftpPreserveTs = tab.sftpPreserveTs ? '1' : '0';
-  call('settings_set', { key: 'sftpPreserveTs', value: tab.sftpPreserveTs ? '1' : '0' }).catch(() => {});
+  call('settings_set', { key: 'sftpPreserveTs', value: tab.sftpPreserveTs ? '1' : '0' })
+    .catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
   sftpLog(tabId, `preserve timestamps ${tab.sftpPreserveTs ? 'ON' : 'OFF'}`);
 }
 window.sftpPreserveTsToggle = sftpPreserveTsToggle;
@@ -864,6 +898,7 @@ const sftpPrevOnSessionClosed = window.onSessionClosed;
 window.onSessionClosed = function sftpOnSessionClosedWithCacheDrop(tabId) {
   const tab = sftpTab(tabId);
   if (tab) sftpCacheInvalidateAll(tab);
+  sftpDisposeSearch(tabId); // an in-flight recursive search dies with its session
   if (typeof sftpPrevOnSessionClosed === 'function') sftpPrevOnSessionClosed(tabId);
 };
 
@@ -893,6 +928,7 @@ async function refreshSftpPanel(tabId, opts = {}) {
     if (pathBox && document.activeElement !== pathBox) pathBox.value = tab.sftpPath;
     renderRemoteCrumbs(tabId);
     renderEntries(tabId);
+    applySftpDualChrome(tabId);
     if (tab.dualPane) refreshLocalPane(tabId);
     if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
     if (typeof sftpCmpEnsureButtons === 'function') sftpCmpEnsureButtons(tabId);
@@ -1021,6 +1057,12 @@ function sftpBuildRemoteRow(tab, entry) {
   tr.dataset.islink = entry.isLink ? '1' : '0';
   tr.dataset.name = entry.name;
   tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
+  // Comparison tint, re-applied on every virtualized rebuild so scrolling a
+  // >300-entry directory does not mount untinted rows mid-compare.
+  if (tab._sftpCmpClasses && !entry.isDir) {
+    const c = tab._sftpCmpClasses.remote.get(entry.name);
+    if (c) tr.classList.add(c);
+  }
   tr.tabIndex = 0;
   tr.draggable = true;
   tr.title = entry.isLink
@@ -1046,7 +1088,7 @@ function sftpBuildRemoteRow(tab, entry) {
 
   const tdOwner = document.createElement('td');
   tdOwner.className = 'sftp-ownercell col-extra';
-  tdOwner.textContent = (entry.uid == null && entry.gid == null) ? '—' : `${entry.uid ?? '?'}:${entry.gid ?? '?'}`;
+  tdOwner.textContent = (entry.uid == null && entry.gid == null) ? '-' : `${entry.uid ?? '?'}:${entry.gid ?? '?'}`;
 
   tr.appendChild(tdName); tr.appendChild(tdSize); tr.appendChild(tdMod);
   tr.appendChild(tdPerm); tr.appendChild(tdOwner);
@@ -1136,11 +1178,19 @@ function sftpReflowWindow(tbody) {
   const frag = document.createDocumentFragment();
   for (let i = start; i < end; i++) frag.appendChild(win.buildRowFn(entries[i]));
   tbody.appendChild(frag);
-  if (!win.measured) {
-    const first = tbody.querySelector('tr.sftp-entry');
-    if (first) {
-      const h = first.getBoundingClientRect().height;
-      if (h > 4) { win.rowH = h; win.measured = true; }
+  // Re-measure on EVERY reflow, not just the first: a UI-scale change alters
+  // row heights while the cached win.rowH kept the old pixel math (jumpy
+  // scrollbar, blank stretches) until the panel was rebuilt. Only a real
+  // deviation (>2px) re-runs the windowing with the corrected height.
+  const first = tbody.querySelector('tr.sftp-entry');
+  if (first) {
+    const h = first.getBoundingClientRect().height;
+    if (h > 4 && Math.abs(h - win.rowH) > 2) {
+      win.rowH = h;
+      win.measured = true;
+      win.lastRange = null;
+      sftpReflowWindow(tbody);
+      return;
     }
   }
   if (bottomH > 0) tbody.appendChild(sftpMakeSpacerRow(bottomH, win.colCount));
@@ -1151,6 +1201,12 @@ function renderEntries(tabId) {
   if (!tab || !tab._entries) return;
   const tbody = document.getElementById('sftpTbody-' + tabId);
   if (!tbody) return;
+  // The Hidden button's active class is display state, set here from the
+  // tab's actual flag rather than only in the click handler: anything that
+  // re-renders (navigation, mode switch, compare refresh) then re-asserts it,
+  // so the button can never drift out of sync with what the list shows.
+  const hiddenBtn = document.querySelector(`#sftpPanel-${tabId} .sftp-toolbar button[title="Show/hide dotfiles"]`);
+  if (hiddenBtn) hiddenBtn.classList.toggle('active', !!tab.showHidden);
   sftpWireTbodyDelegation(tabId); // idempotent - the panel already wires this once
   const thead = tbody.parentElement.querySelector('thead');
   if (thead) {
@@ -1393,7 +1449,7 @@ function sftpMarkLinkRow(tabId, name, broken) {
 document.addEventListener('keydown', (ev) => {
   if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== 'a') return;
   const active = sftpTab(state.activeTabId);
-  if (!active || active.mode !== 'sftp') return;
+  if (!sftpPanelVisible(active)) return;
   const panel = document.getElementById('sftpPanel-' + active.tabId);
   if (!panel) return;
   ev.preventDefault();
@@ -1426,7 +1482,7 @@ function formatSftpSize(bytes) {
 /// also set, upper-case otherwise). Null (a Windows local, or a server that
 /// omitted it) renders as an em dash, never a guess.
 function formatMode(mode) {
-  if (mode == null) return '—';
+  if (mode == null) return '-';
   let typeChar;
   switch (mode & 0o170000) {
     case 0o120000: typeChar = 'l'; break; // symlink
@@ -1522,8 +1578,8 @@ function sftpConfirmDelete(message, onYes) {
     el('deleteModal').hidden = true;
     // Only a confirmed delete may disarm the prompt. Reading the checkbox on
     // every exit meant ticking it and then backing out via Cancel still
-    // switched the safety prompt off for the session, so the NEXT delete —
-    // one the user never agreed to skip confirming — went through silently.
+    // switched the safety prompt off for the session, so the NEXT delete -
+    // one the user never agreed to skip confirming - went through silently.
     if (yes && el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed = true;
     document.removeEventListener('keydown', onKey, true);
     el('deleteModal').removeEventListener('click', onBackdrop);
@@ -1540,7 +1596,7 @@ function sftpConfirmDelete(message, onYes) {
   }
   el('deleteYesBtn').onclick = () => finish(true);
   el('deleteCancelBtn').onclick = () => finish(false);
-  // Escape and a backdrop click both mean "no" — abandoning a destructive
+  // Escape and a backdrop click both mean "no" - abandoning a destructive
   // prompt must never be harder than confirming it, and both exits are the
   // safe answer. Capture phase so the dialog wins over any handler behind it.
   document.addEventListener('keydown', onKey, true);
@@ -1689,12 +1745,13 @@ function openSftpFileMenu(x, y, tabId, entry) {
     copyText(url).then(ok => ok && toast('URL copied.', 'ok'));
   });
   mk('Select all', 'check-circle', () => {
-    for (const row of document.querySelectorAll(`#sftpTbody-${tabId} .sftp-entry`)) {
-      if (!row.dataset.name.startsWith('.') || tab.showHidden) {
-        tab.sftpSelected.add(row.dataset.name);
-        toggleRowSelected(row, true);
-      }
-    }
+    // Same source as Ctrl+A (_visibleEntries), not the mounted rows: in a
+    // virtualized directory (>300 entries) the DOM holds only the visible
+    // window, so the row scan selected a screenful while the status bar
+    // reported the full count.
+    const visible = tab._visibleEntries || [];
+    for (const e of visible) tab.sftpSelected.add(e.name);
+    sftpRefreshSelectionClasses(tabId);
     sftpUpdateStatusBar(tabId);
   });
 
@@ -1840,7 +1897,16 @@ function openChmodDialog(tabId, paths, entry) {
 
 // ─── search ─────────────────────────────────────────────────────────────────
 
-let searchUnlisten = null;
+// One listener per TAB (not one global): a single module-global meant
+// starting a search in tab B unlistened tab A's in-flight search, stranding
+// its status at "Searching..." and dropping its results. Disposed on session
+// close via sftpDisposeSearch.
+const searchUnlisteners = new Map();
+
+function sftpDisposeSearch(tabId) {
+  const un = searchUnlisteners.get(tabId);
+  if (un) { try { un(); } catch (e) {} searchUnlisteners.delete(tabId); }
+}
 
 function toggleSearchBar(tabId) {
   const bar = document.getElementById('sftpSearchBar-' + tabId);
@@ -1861,11 +1927,12 @@ async function runSearch(tabId, query) {
   sftpLog(tabId, `search "${query}" under ${tab.sftpPath}`);
   let count = 0;
 
-  if (searchUnlisten) { searchUnlisten(); searchUnlisten = null; }
-  searchUnlisten = await sftpListen('sftp-search', (ev) => {
+  sftpDisposeSearch(tabId);
+  const un = await sftpListen('sftp-search', (ev) => {
     const p = ev.payload;
     if (p.sessionId !== tab.sessionId) return;
     if (p.done) {
+      sftpDisposeSearch(tabId); // done: no more events for this tab
       status.textContent = `${p.matched} match(es)${p.capped ? ' (capped at 500)' : ''} · ${p.scanned} scanned`;
       return;
     }
@@ -1883,6 +1950,7 @@ async function runSearch(tabId, query) {
     });
     results.appendChild(item);
   });
+  searchUnlisteners.set(tabId, un);
 
   try {
     await sftpCall('sftp_search', {
@@ -1890,6 +1958,7 @@ async function runSearch(tabId, query) {
     });
   } catch (e) {
     status.textContent = 'Search failed: ' + (e.message || e);
+    sftpDisposeSearch(tabId);
   }
 }
 
@@ -1898,6 +1967,10 @@ async function runSearch(tabId, query) {
 async function openBookmarkMenu(ev, tabId) {
   const tab = sftpTab(tabId);
   if (!tab) return;
+  // Capture the anchor rect BEFORE the first await: ev.currentTarget is
+  // reset to null once event dispatch completes, so reading it after the
+  // bookmarks round-trip threw a TypeError and the menu never appeared.
+  const anchorRect = ev.currentTarget.getBoundingClientRect();
   const r = await sftpCall('sftp_bookmarks_list', { serverId: tab.serverId });
   const bookmarks = r.bookmarks || [];
 
@@ -1954,9 +2027,8 @@ async function openBookmarkMenu(ev, tabId) {
   });
   menu.appendChild(addBtn);
 
-  const rect = ev.currentTarget.getBoundingClientRect();
-  menu.style.left = rect.left + 'px';
-  menu.style.top = (rect.bottom + 4) + 'px';
+  menu.style.left = anchorRect.left + 'px';
+  menu.style.top = (anchorRect.bottom + 4) + 'px';
   document.body.appendChild(menu);
   const onAway = (e2) => {
     if (e2.target.closest && e2.target.closest('#keyConnectMenu')) return;
@@ -1967,24 +2039,40 @@ async function openBookmarkMenu(ev, tabId) {
 
 // ─── local pane (dual mode) ─────────────────────────────────────────────────
 
+/// Single source of truth for the dual-pane chrome: panel class, pane and
+/// splitter visibility, and the Dual button's active state, all derived from
+/// tab.dualPane. Called on toggle AND on build/refresh/show: the toggle used
+/// to be the only writer, so a persisted-on dual pane opened hidden (its
+/// listing loaded and the status bar counted local items - nothing visible),
+/// and queue-driven auto-open never lit the button.
+function applySftpDualChrome(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  const panel = document.getElementById('sftpPanel-' + tabId);
+  if (panel) panel.classList.toggle('dual', !!tab.dualPane);
+  const localPane = document.getElementById('sftpLocalPane-' + tabId);
+  const splitter = document.getElementById('sftpSplitter-' + tabId);
+  if (localPane) localPane.hidden = !tab.dualPane;
+  if (splitter) splitter.hidden = !tab.dualPane;
+  const dualBtn = [...(panel ? panel.querySelectorAll('.sftp-toolbar button') : [])]
+    .find(b => b.title === 'Toggle local pane');
+  if (dualBtn) dualBtn.classList.toggle('active', !!tab.dualPane);
+}
+
 function toggleDualPane(tabId) {
   const tab = sftpTabState(sftpTab(tabId));
   if (!tab) return;
   tab.dualPane = !tab.dualPane;
-  const panel = document.getElementById('sftpPanel-' + tabId);
-  if (panel) panel.classList.toggle('dual', tab.dualPane);
-  const localPane = document.getElementById('sftpLocalPane-' + tabId);
-  const splitter = document.getElementById('sftpSplitter-' + tabId);
-  if (localPane && splitter) {
-    localPane.hidden = !tab.dualPane;
-    splitter.hidden = !tab.dualPane;
-  }
+  applySftpDualChrome(tabId);
   if (tab.dualPane) refreshLocalPane(tabId);
   // ── agent-e: apply persisted comparison mode + recompute when dual opens ──
   if (typeof sftpCmpApplyPersisted === 'function') sftpCmpApplyPersisted(tabId);
-  // Persist the preference globally.
+  // Persist the preference globally. Mirror only on success: a failed write
+  // used to update state anyway, so the session ran ahead of what the next
+  // launch would restore.
   state.sftpDualPane = tab.dualPane;
-  call('settings_set', { key: 'sftpDualPane', value: tab.dualPane ? '1' : '0' }).catch(() => {});
+  call('settings_set', { key: 'sftpDualPane', value: tab.dualPane ? '1' : '0' })
+    .catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
 }
 
 /// Core local-pane refresh: lists, renders rows, updates path + status bar.
@@ -2006,6 +2094,11 @@ async function sftpUiLocalLoad(tabId) {
   for (const entry of r.entries || []) {
     const tr = document.createElement('tr');
     tr.className = entry.isDir ? 'sftp-entry sftp-dir' : 'sftp-entry sftp-file';
+    // Comparison tint, mirroring sftpBuildRemoteRow (virtualized rebuilds).
+    if (tab._sftpCmpClasses && !entry.isDir) {
+      const c = tab._sftpCmpClasses.local.get(entry.name);
+      if (c) tr.classList.add(c);
+    }
     tr.dataset.isdir = entry.isDir ? '1' : '0';
     tr.dataset.name = entry.name;
     const tdName = document.createElement('td');
@@ -2173,7 +2266,7 @@ function openSftpLocalMenu(x, y, tabId, entry) {
     // same entry for files and folders rather than two that differ only in
     // wording.
     mk(multi ? `Upload ${names.length} items` : (entry.isDir ? 'Upload folder' : 'Upload'), 'upload-cloud', () => {
-      if (tab.mode !== 'sftp' || !tab.sessionId) { toast('Not connected.', 'err'); return; }
+      if (!sftpPanelVisible(tab) || !tab.sessionId) { toast('Not connected.', 'err'); return; }
       queueUploads(tabId, names.map(n => ({
         local: joinLocal(tab.localPath, n),
         remote: sftpJoin(tab.sftpPath, n),
@@ -2322,8 +2415,11 @@ function sftpSetLocalDirDefault(tabId) {
   // Keep state.settings in step so reopening the panel in this same session
   // sees the new default without waiting for the next settings_get.
   if (state.settings) state.settings[key] = dir;
-  call('settings_set', { key, value: dir }).catch(() => {});
-  toast(`Default local directory for ${tab.serverName || 'this server'} set to ${tab.localPath}`, 'ok');
+  // Toast the OUTCOME, not the intent: the old unconditional success toast
+  // fired even when the write was rejected, and the next launch reverted.
+  call('settings_set', { key, value: dir })
+    .then(() => toast(`Default local directory for ${tab.serverName || 'this server'} set to ${tab.localPath}`, 'ok'))
+    .catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
 }
 
 function joinLocal(dir, name) {
@@ -2675,7 +2771,7 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
       document.removeEventListener('keydown', onKey, true);
     };
     // Escape means "cancel the whole batch", the same as the X and Cancel
-    // buttons — it must resolve(null) too, or the transfer awaiting this
+    // buttons - it must resolve(null) too, or the transfer awaiting this
     // promise would hang forever with the dialog gone.
     function onKey(ev) {
       if (ev.key !== 'Escape') return;
@@ -2700,7 +2796,7 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
         call('settings_set', { key, value: first }).then(() => {
           sftpConflictDefaults[key] = first;
           if (state.settings) state.settings[key] = first;
-        }).catch(() => {});
+        }).catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
         sftpLog(tabId, `default for ${direction} conflicts: ${first}`);
       }
       close();
@@ -2894,18 +2990,27 @@ function buildQueuePanel() {
   handle.className = 'sftp-queuehandle';
   handle.title = 'Drag to resize the transfer panel';
   let qDrag = null;
-  handle.addEventListener('mousedown', (ev) => {
-    const rect = panel.getBoundingClientRect();
-    qDrag = { startY: ev.clientY, startH: rect.height };
-    ev.preventDefault();
-  });
-  document.addEventListener('mousemove', (ev) => {
+  // Same attach-on-mousedown / remove-on-mouseup pattern as the dual-pane
+  // splitter: no permanent document listeners sitting idle between drags.
+  const qMove = (ev) => {
     if (!qDrag) return;
     const h = Math.min(window.innerHeight * 0.7, Math.max(120, qDrag.startH - (ev.clientY - qDrag.startY)));
     sftpUiQueueH = Math.round(h);
     panel.style.height = sftpUiQueueH + 'px';
+  };
+  const qUp = () => {
+    if (!qDrag) return;
+    qDrag = null;
+    document.removeEventListener('mousemove', qMove);
+    document.removeEventListener('mouseup', qUp);
+  };
+  handle.addEventListener('mousedown', (ev) => {
+    const rect = panel.getBoundingClientRect();
+    qDrag = { startY: ev.clientY, startH: rect.height };
+    document.addEventListener('mousemove', qMove);
+    document.addEventListener('mouseup', qUp);
+    ev.preventDefault();
   });
-  document.addEventListener('mouseup', () => { qDrag = null; });
 
   // Head: title / summary / tabs / actions. Extra action buttons (pause,
   // priority, ...) append to .sftp-queueactions-head without layout changes.
@@ -3162,7 +3267,7 @@ function sftpQueueRowEl(j, depth) {
     : '';
   // Auto-retry countdown (Task 2): a backoff-queued job carries
   // attempts > 0 and a future retryAt, plus a human error like
-  // "connection reset — retrying (2/3)". Pull just the "(2/3)" back out
+  // "connection reset - retrying (2/3)". Pull just the "(2/3)" back out
   // of that string rather than hardcoding the retry cap here, so the two
   // stay in sync automatically; the full backend message is still the
   // tooltip. A single shared ticker (see setInterval above) redraws this
@@ -3222,7 +3327,7 @@ function sftpQueueRowEl(j, depth) {
       resume.disabled = true;
     }
     actions.appendChild(resume);
-    // Cancel is the way off a paused row that can never resume — a job
+    // Cancel is the way off a paused row that can never resume - a job
     // restored from a previous run whose session is gone. cancel_job
     // transitions Paused as well as Queued, so this is not a no-op.
     const cancel = document.createElement('button');
@@ -3300,7 +3405,7 @@ setInterval(() => {
   const done = [...queueJobs.values()].filter(j => j.state === 'done').length;
   if (done > lastDoneCount) {
     const tab = sftpTab(state.activeTabId);
-    if (tab && tab.mode === 'sftp' && tab.sftpReady) refreshSftpPanel(tab.tabId);
+    if (sftpPanelVisible(tab) && tab.sftpReady) refreshSftpPanel(tab.tabId);
   }
   lastDoneCount = done;
 }, 1500);
@@ -3308,22 +3413,25 @@ setInterval(() => {
 // ─── OS drag-and-drop upload ────────────────────────────────────────────────
 
 let sftpDropWired = false;
-function wireSftpDrop(panel, tabId, hint) {
+function wireSftpDrop(_panel, _tabId, _hint) {
   if (sftpDropWired) return;
   sftpDropWired = true;
   const win = sftpWindow && sftpWindow.getCurrentWindow ? sftpWindow.getCurrentWindow() : null;
   if (!win || !win.onDragDropEvent) return;
+  // One window-level handler, resolving the ACTIVE tab's panel at event time
+  // instead of closing over the first panel's hint element - the old closure
+  // meant the drop overlay only ever appeared in the first tab ever built.
   win.onDragDropEvent(async (event) => {
     const tab = state.sessions.get(state.activeTabId);
-    if (!tab || tab.mode !== 'sftp') return;
+    if (!sftpPanelVisible(tab)) return;
+    const hint = document.querySelector(`#sftpPanel-${tab.tabId} .sftp-drop-hint`);
+    if (!hint) return;
     if (event.payload.type === 'enter' || event.payload.type === 'over') {
       hint.classList.add('dragover');
     } else if (event.payload.type === 'leave') {
       hint.classList.remove('dragover');
     } else if (event.payload.type === 'drop') {
       hint.classList.remove('dragover');
-      const tab = state.sessions.get(state.activeTabId);
-      if (!tab || tab.mode !== 'sftp') return;
       const paths = event.payload.paths || [];
       if (!paths.length) return;
       // Target the hovered pane: over a remote DIRECTORY row the upload goes
@@ -3429,7 +3537,7 @@ function wireSftpPaneDnd(tabId) {
       clearSftpDropHighlights(ev.target.closest('.sftp-panel'));
       const { data } = payload;
       const tab = sftpTab(tabId);
-      if (!tab || tab.mode !== 'sftp') return;
+      if (!sftpPanelVisible(tab)) return;
       // Over a local DIRECTORY row → download into that dir; else pane cwd.
       const row = ev.target.closest('tr.sftp-entry');
       if (row && row.dataset.isdir === '1' && tab.localPath) {
@@ -3456,7 +3564,7 @@ function wireSftpPaneDnd(tabId) {
       ev.stopPropagation();
       clearSftpDropHighlights(ev.target.closest('.sftp-panel'));
       const tab = sftpTab(tabId);
-      if (!tab || tab.mode !== 'sftp') return;
+      if (!sftpPanelVisible(tab)) return;
       const row = ev.target.closest('tr.sftp-entry');
       const overDir = row && row.dataset.isdir === '1' ? row.dataset.name : null;
       if (payload.type === 'text/sftp-local') {
@@ -3499,7 +3607,7 @@ document.addEventListener('drop', (ev) => {
   if (!payload) return;
   ev.preventDefault();
   const tab = sftpTab(state.activeTabId);
-  if (!tab || tab.mode !== 'sftp') return;
+  if (!sftpPanelVisible(tab)) return;
   clearSftpDropHighlights(document.getElementById('sftpPanel-' + tab.tabId));
   // Only handle drops NOT on a directory row (those were consumed by the
   // tbody delegation with stopPropagation; this is the belt-and-braces path
@@ -3569,7 +3677,8 @@ async function sftpCmpToggle(tabId) {
   if (next) sftpCmpTabs.set(tabId, next);
   else sftpCmpTabs.delete(tabId);
   // Persist the last-used mode ('' when turned off from mtime → default off).
-  call('settings_set', { key: 'sftpCmpMode', value: next || '' }).catch(() => {});
+  call('settings_set', { key: 'sftpCmpMode', value: next || '' })
+    .catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
   sftpLog(tabId, `directory comparison: ${next ? 'by ' + (next === 'size' ? 'file size' : 'modified time') : 'off'}`);
   sftpCmpUpdateButton(tabId);
   if (next) sftpCmpRun(tabId);
@@ -3633,11 +3742,18 @@ function sftpCmpRun(tabId) {
 
   sftpCmpPaint(remoteTbody, cls.remote);
   sftpCmpPaint(localTbody, cls.local);
+  // Stash the maps on the tab: the virtualized panes rebuild rows through the
+  // row builders on every scroll, and those builders re-apply the tint from
+  // here - without it, rows mounted after a scroll came up untinted while
+  // the still-mounted ones kept theirs (a contradictory half-tinted view).
+  tab._sftpCmpClasses = cls;
   sftpLog(tabId, `compare (${mode === 'size' ? 'by size' : 'by mtime'}): ${onlyLocal} only-local, ${onlyRemote} only-remote, ${differ} differ, ${same} identical`);
 }
 
 /// Remove all comparison classes from both panes (mode turned off).
 function sftpCmpClear(tabId) {
+  const tab = sftpTab(tabId);
+  if (tab) tab._sftpCmpClasses = null; // stop future scroll-rebuilds re-tinting
   const remoteTbody = document.getElementById('sftpTbody-' + tabId);
   const localTbody = document.getElementById('sftpLocalTbody-' + tabId);
   if (remoteTbody) for (const tr of remoteTbody.querySelectorAll('.sftp-cmp-only, .sftp-cmp-diff, .sftp-cmp-same')) {
@@ -3702,7 +3818,7 @@ function sftpCmpUpdateButton(tabId) {
 document.addEventListener('keydown', (ev) => {
   if (!(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'y') return;
   const tab = sftpTab(state.activeTabId);
-  if (!tab || tab.mode !== 'sftp') return;
+  if (!sftpPanelVisible(tab)) return;
   const panel = document.getElementById('sftpPanel-' + tab.tabId);
   if (!panel) return;
   ev.preventDefault();
@@ -3856,7 +3972,7 @@ function sftpSyncParentLocal(p) {
 document.addEventListener('keydown', (ev) => {
   if (!(ev.ctrlKey || ev.metaKey) || !ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'b') return;
   const tab = sftpTab(state.activeTabId);
-  if (!tab || tab.mode !== 'sftp') return;
+  if (!sftpPanelVisible(tab)) return;
   const panel = document.getElementById('sftpPanel-' + tab.tabId);
   if (!panel) return;
   ev.preventDefault();

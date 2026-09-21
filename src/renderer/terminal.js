@@ -60,6 +60,85 @@ function terminalAppKeypad() {
   return terminalSetting('terminalAppKeypad', 'default');
 }
 
+// ─── wheel policy (alternate screen) ────────────────────────────────────────
+//
+// xterm.js converts wheel events into ArrowUp/Down sequences whenever the
+// active buffer has no scrollback - always true in the alternate screen that
+// full-screen apps switch to. For less/vim that is a useful fallback; for a
+// multiplexer like `screen`/`tmux` it is garbage: the arrows are passed to
+// the inner program, which echoes them literally (^[[A^[[A... on screen).
+// When the remote has NOT enabled mouse reporting we therefore swallow
+// plain wheel events in the alternate screen (what Windows Terminal does
+// there). With mouse reporting on (screen's `mousetrack on`, vim, htop) the
+// wheel reaches the app as real mouse events, untouched.
+//
+// xterm exposes no accessor for the DEC mouse modes, so they are tracked by
+// sniffing the output stream for DECSET/DECRST 1000/1002/1003 (the enable
+// modes; 1005/1006/1015 are encodings and irrelevant to the decision).
+
+const MOUSE_MODE_RE = /\x1b\[\?(1000|1002|1003)([hl])/g;
+
+function trackMouseReporting(rec, text) {
+  if (typeof text !== 'string' || !text.length) return;
+  // A DECSET can straddle output chunks; carry the tail of the previous
+  // chunk so the regex still sees the whole sequence.
+  const hay = (rec._mouseCarry || '') + text;
+  let m;
+  let last = null;
+  MOUSE_MODE_RE.lastIndex = 0;
+  while ((m = MOUSE_MODE_RE.exec(hay))) last = m[2];
+  if (last) rec.mouseReporting = last === 'h';
+  rec._mouseCarry = hay.slice(-8);
+}
+
+function wireTerminalWheelPolicy(rec, host, term) {
+  host.addEventListener('wheel', (ev) => {
+    // Modified wheels (ctrl-zoom, shift horizontal) are left alone.
+    if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return;
+    if (rec.mouseReporting) return;
+    let type = 'normal';
+    try { type = term.buffer.active.type; } catch (e) {}
+    if (type === 'alternate') ev.stopPropagation();
+  }, { capture: true, passive: true });
+}
+
+/// Key-compatibility layer for the three keyboard settings that were
+/// previously persisted but never applied. Returns null when every setting
+/// is at its default, so nothing is intercepted in the common case.
+/// Sequences:
+/// - rxvt Home/End: CSI 7~ / CSI 8~ (xterm's own Home/End send CSI H / CSI F
+///   or SS3 H / F once the app switches DECCKM on).
+/// - cursor keys forced to CSI A-D: what arrow keys send before the remote
+///   enables application mode, ignoring DECCKM when the user asked for it.
+/// - keypad forced to ASCII: the numeric meaning, ignoring DECNKM.
+function buildKeyCompatibilityHandler(term) {
+  const rxvtHomeEnd = terminalHomeEndMode() === 'rxvt';
+  const cursorKeysOff = terminalAppCursorKeys() === 'disabled';
+  const keypadOff = terminalAppKeypad() === 'disabled';
+  if (!rxvtHomeEnd && !cursorKeysOff && !keypadOff) return null;
+  const CURSOR = { ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowRight: '\x1b[C', ArrowLeft: '\x1b[D' };
+  const KEYPAD = {
+    Enter: '\r', '+': '+', '-': '-', '*': '*', '/': '/', '.': '.',
+    '0': '0', '1': '1', '2': '2', '3': '3', '4': '4',
+    '5': '5', '6': '6', '7': '7', '8': '8', '9': '9',
+  };
+  return (event) => {
+    if (event.type !== 'keydown') return true;
+    if (event.ctrlKey || event.altKey || event.metaKey) return true;
+    if (rxvtHomeEnd) {
+      if (event.key === 'Home') { term.write('\x1b[7~'); return false; }
+      if (event.key === 'End') { term.write('\x1b[8~'); return false; }
+    }
+    if (cursorKeysOff && CURSOR[event.key]) { term.write(CURSOR[event.key]); return false; }
+    // KeyboardEvent.DOM_KEY_LOCATION_NUMPAD
+    if (keypadOff && event.location === 3 && KEYPAD[event.key] !== undefined) {
+      term.write(KEYPAD[event.key]);
+      return false;
+    }
+    return true;
+  };
+}
+
 // (terminalKeepaliveSeconds removed: keepalives are SSH-protocol-level now -
 // see startTabKeepalive. The terminalKeepaliveSeconds setting remains stored
 // but has no effect.)
@@ -94,7 +173,7 @@ function terminalBufferText(rec) {
 /// Deliberately not named `markTerminalBell`. app.js defines a global of that
 /// name and assigns it to `window.markTerminalBell`; every renderer script is
 /// a classic <script> sharing one global scope, and terminal.js loads AFTER
-/// app.js, so a same-named function declaration here replaced the global —
+/// app.js, so a same-named function declaration here replaced the global -
 /// making the `window.markTerminalBell(tabId)` call below call THIS function,
 /// recursively, until the stack blew:
 ///   RangeError: Maximum call stack size exceeded
@@ -122,7 +201,7 @@ function playTerminalBell() {
 
 // copyText lives in app.js and is shared. It used to be duplicated here, and
 // because terminal.js loads after app.js in the same global scope, THIS
-// version won — a fire-and-forget function returning undefined.
+// version won - a fire-and-forget function returning undefined.
 //
 // Two consequences, both live until now:
 //   * sftp.js does `copyText(x).then(...)` in three places (Copy path, Copy
@@ -130,7 +209,7 @@ function playTerminalBell() {
 //     nothing visible.
 //   * app.js does `const ok = await copyText(x)`. The clipboard write DID
 //     succeed, but `ok` was undefined, so both call sites reported
-//     "Clipboard unavailable." on a copy that had worked — the exact symptom
+//     "Clipboard unavailable." on a copy that had worked - the exact symptom
 //     reported against 1.7.2 and thought fixed.
 //
 // app.js's version is the one to keep: it tries the Tauri plugin, falls back
@@ -163,10 +242,22 @@ function wireTerminalClipboard(t) {
     });
   } catch (e) {}
   try {
-    t.textarea.addEventListener('contextmenu', async (e) => {
+    // xterm keeps its hidden helper textarea positioned ON the cursor cell
+    // (a ~9x17px box, despite the off-screen CSS), so a right-click at the
+    // prompt hits it and this fires. Route it through terminalPaste - the
+    // multi-line paste confirmation and focus restoration live there, and
+    // the raw t.paste() call bypassed both. stopPropagation keeps the same
+    // click from ALSO opening the app's terminal context menu, which would
+    // double-paste when its Paste item is used.
+    t.textarea.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      const text = await readClipboard();
-      if (text) t.paste(text);
+      e.stopPropagation();
+      const tabId = t.__sshspanTabId;
+      readClipboard().then(text => {
+        if (!text) return;
+        if (typeof window.terminalPaste === 'function' && tabId) window.terminalPaste(tabId, text);
+        else t.paste(text);
+      });
     });
     t.textarea.addEventListener('keydown', (e) => {
       if (!e.ctrlKey || !e.shiftKey) return;
@@ -222,7 +313,20 @@ function createTabTerminal(tabId) {
     convertEol: false,
     allowProposedApi: true,
     windowsMode: terminalSetting('terminalBackspace', 'default') === 'backspace',
+    // 'visual' lets xterm flash the ACTIVE tab's terminal; 'sound'/'silent'
+    // are produced by the app itself (WebAudio beep / nothing) in onBell.
+    bellStyle: terminalBellMode() === 'visual' ? 'visual' : 'none',
   });
+
+  // The keyboard-compatibility settings (rxvt Home/End, application cursor
+  // keys, application keypad) are enforced here, at creation - xterm has no
+  // runtime option for rewriting what a key sends, only this hook. Each
+  // branch writes the compatibility sequence and returns false so xterm does
+  // not also emit its own.
+  const compatHandler = buildKeyCompatibilityHandler(term);
+  if (compatHandler) {
+    try { term.attachCustomKeyEventHandler(compatHandler); } catch (e) {}
+  }
 
   let fitAddon = null;
   if (FitAddonCtor) {
@@ -261,6 +365,7 @@ function createTabTerminal(tabId) {
     sessionEnded: false, gotFirstData: false,
   };
   sshTabs.set(tabId, record);
+  wireTerminalWheelPolicy(record, host, term);
 
   // Refit the tab when it becomes visible again (display:none -> block).
   const ro = new ResizeObserver(() => {
@@ -346,7 +451,16 @@ function fitActiveTerminal() {
       }
     }
   } catch (e) {}
-  try { rec.term.focus(); } catch (e) {}
+  // No focus() here: this runs on every window resize and UI-scale change,
+  // where yanking focus into the terminal would steal keystrokes aimed at a
+  // modal or the SFTP path box. Callers that want focus after a refit
+  // (tab switch, maximize restore) use fitActiveTerminalAndFocus.
+}
+
+function fitActiveTerminalAndFocus() {
+  fitActiveTerminal();
+  const rec = activeTab();
+  if (rec) { try { rec.term.focus(); } catch (e) {} }
 }
 
 function terminalResetActive() {
@@ -369,6 +483,24 @@ function terminalConnectInTab(tabId, server, opts) {
     if (!rec) return reject(new Error('xterm.js unavailable'));
     if (!server || !server.id) return reject(new Error('Server is required.'));
 
+    // Restart-on-a-live-tab: tear down the previous connect's poll interval,
+    // keystroke subscription, and backend session BEFORE nulling the
+    // session id. Without this, the old poll's closure killed the NEW
+    // handle (no close detection afterwards), both onData subscriptions
+    // stayed live and duplicated every keystroke, and the old SSH session
+    // was never disconnected.
+    if (rec.pollHandle) { clearInterval(rec.pollHandle); rec.pollHandle = null; }
+    if (rec.dataSub) { try { rec.dataSub.dispose(); } catch (e) {} rec.dataSub = null; }
+    if (rec.sessionId) {
+      const oldSession = rec.sessionId;
+      tcore.invoke('terminal_disconnect', { sessionId: oldSession }).catch(() => {});
+    }
+    if (rec.keepaliveHandle) { clearInterval(rec.keepaliveHandle); rec.keepaliveHandle = null; }
+    // Fresh session: the previous session's DEC mouse modes do not carry
+    // over (the remote app re-enables them if it wants them).
+    rec.mouseReporting = false;
+    rec._mouseCarry = '';
+
     const t = rec.term;
     rec.sessionEnded = false;
     rec.gotFirstData = false;
@@ -385,6 +517,7 @@ function terminalConnectInTab(tabId, server, opts) {
         rec.gotFirstData = true;
         if (tabId === activeTabId) terminalSetStatus(`Connected to ${server.host}:${server.port} - streaming`);
       }
+      trackMouseReporting(rec, text);
       try { t.write(text); } catch (e) {}
     };
 
@@ -414,6 +547,11 @@ function terminalConnectInTab(tabId, server, opts) {
         });
       } catch (e) { /* closed channel - close-detection handles teardown */ }
     });
+    // Stored on the record so the restart path (top of this function) and
+    // destroyTabTerminal can dispose it; previously only this closure held
+    // it, so a second connect attached a second subscription that nothing
+    // could ever remove.
+    rec.dataSub = dataSub;
 
     const teardown = (sid) => {
       if (rec.sessionEnded || rec.sessionId !== sid) return;
@@ -483,6 +621,7 @@ window.destroyTabTerminal = destroyTabTerminal;
 window.tabSessionLive = tabSessionLive;
 window.setTabSession = setTabSession;
 window.fitActiveTerminal = fitActiveTerminal;
+window.fitActiveTerminalAndFocus = fitActiveTerminalAndFocus;
 window.terminalResetActive = terminalResetActive;
 window.terminalSetStatus = terminalSetStatus;
 window.tabRecord = tabRecord;
@@ -508,24 +647,39 @@ window.terminalReset = (tabId) => {
   const rec = tabRecord(tabId);
   if (!rec) return;
   rec.term.reset();
+  // reset() clears every DEC mode in xterm, including mouse reporting; drop
+  // the sniffed flag so the wheel policy does not assume mouse mode.
+  rec.mouseReporting = false;
+  rec._mouseCarry = '';
   setTimeout(() => { try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {} }, 30);
 };
 window.terminalPaste = async (tabId, text) => {
+  // Paste paths that leave the terminal (context menu click, confirm()
+  // dialog) drop focus to <body>; the next keystroke goes nowhere and the
+  // terminal looks dead until clicked. Hand focus back first so typing
+  // works whether or not the paste lands.
+  const rec = tabRecord(tabId);
+  try { rec && rec.term.focus(); } catch (e) {}
   if (typeof text !== 'string' || !text) return false;
   const needsConfirm = terminalSetting('confirmMultiLinePaste', '1') !== '0';
   if (needsConfirm && (text.includes('\n') || text.includes('\r'))) {
     const lines = text.split(/\r\n|\r|\n/).length;
     if (!window.confirm(`Paste ${lines} lines into this SSH session? Review clipboard content before running commands.`)) return false;
+    try { rec && rec.term.focus(); } catch (e) {}
   }
-  return sendTerminalBytes(tabRecord(tabId), text);
+  return sendTerminalBytes(rec, text);
 };
 window.terminalReadClipboard = readClipboard;
 window.terminalApplySettings = () => {
   const scrollback = terminalScrollback();
+  const bellStyle = terminalBellMode() === 'visual' ? 'visual' : 'none';
   for (const rec of sshTabs.values()) {
     try { rec.term.options.scrollback = scrollback; } catch (e) {}
+    try { rec.term.options.bellStyle = bellStyle; } catch (e) {}
   }
 };
+// Introspection hook for the keyboard-compatibility settings; the values are
+// enforced per-terminal at creation via buildKeyCompatibilityHandler.
 window.terminalModeSettings = () => ({
   backspace: terminalSetting('terminalBackspace', 'default'),
   homeEnd: terminalHomeEndMode(),

@@ -163,6 +163,16 @@ impl Default for BitwardenConfig {
     }
 }
 
+/// AI assistant provider settings. `api_key` holds the vault-sealed blob
+/// (AES-256-GCM via crypto::vault::seal), never the plaintext key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssistantConfig {
+    pub provider: Option<String>, // "openai" | "anthropic"
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>, // sealed JSON blob
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub pool: SqlitePool,
@@ -323,6 +333,21 @@ impl Database {
             sqlx::query(
                 r#"
                 CREATE TABLE IF NOT EXISTS bitwarden_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+
+            // AI assistant provider settings. Same key/value shape as
+            // bitwarden_config; the api_key row holds the vault-sealed blob,
+            // never the plaintext key.
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS assistant_config (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -906,6 +931,65 @@ impl Database {
         })
     }
 
+    // ── AI assistant config ────────────────────────────────────────────────
+
+    pub fn save_assistant_config(&self, config: &AssistantConfig) -> Result<()> {
+        block(async {
+            let fields: [(&str, Option<String>); 4] = [
+                ("provider", config.provider.clone()),
+                ("base_url", config.base_url.clone()),
+                ("model", config.model.clone()),
+                ("api_key", config.api_key.clone()),
+            ];
+
+            for (key, value) in fields {
+                if let Some(v) = value {
+                    sqlx::query(
+                        "INSERT INTO assistant_config (key, value, updated_at) VALUES (?, ?, ?) \
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+                    )
+                    .bind(key)
+                    .bind(v)
+                    .bind(Utc::now().to_rfc3339())
+                    .execute(&self.pool)
+                    .await?;
+                } else {
+                    // None means "clear this row" - the bitwarden table keeps
+                    // stale values on None, which is fine for folder names but
+                    // wrong for a sealed secret: clearing the provider must
+                    // not leave its key behind.
+                    sqlx::query("DELETE FROM assistant_config WHERE key = ?")
+                        .bind(key)
+                        .execute(&self.pool)
+                        .await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn load_assistant_config(&self) -> Result<AssistantConfig> {
+        block(async {
+            let rows = sqlx::query("SELECT key, value FROM assistant_config")
+                .fetch_all(&self.pool)
+                .await?;
+
+            let mut config = AssistantConfig::default();
+            for row in rows {
+                let key: String = row.get("key");
+                let value: String = row.get("value");
+                match key.as_str() {
+                    "provider" => config.provider = Some(value),
+                    "base_url" => config.base_url = Some(value),
+                    "model" => config.model = Some(value),
+                    "api_key" => config.api_key = Some(value),
+                    _ => {}
+                }
+            }
+            Ok(config)
+        })
+    }
+
     // ── Category operations ───────────────────────────────────────────────
 
     /// All categories, ordered for tree display: roots first, then by sibling sort_index, then by name.
@@ -1376,6 +1460,7 @@ impl Database {
         keys: &[KeyRecord],
         servers: &[ServerRecord],
         bitwarden_master_password: Option<&str>,
+        assistant_api_key: Option<&str>,
         new_master_hash: &str,
     ) -> Result<()> {
         block(async {
@@ -1434,6 +1519,19 @@ impl Database {
             if let Some(sealed) = bitwarden_master_password {
                 sqlx::query(
                     "INSERT INTO bitwarden_config (key, value, updated_at) VALUES ('master_password', ?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                )
+                .bind(sealed)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            }
+            // The AI assistant API key is sealed with the same vault password;
+            // it must rotate in the same transaction or every assistant call
+            // fails at unseal after the change.
+            if let Some(sealed) = assistant_api_key {
+                sqlx::query(
+                    "INSERT INTO assistant_config (key, value, updated_at) VALUES ('api_key', ?, ?) \
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 )
                 .bind(sealed)
@@ -1906,15 +2004,24 @@ impl Database {
                         }
                         _ => None,
                     };
+                    // 17 columns, 17 placeholders, 17 binds. The bitwarden_*
+                    // trio was bound with no matching placeholder, and sqlx's
+                    // non-macro query() silently drops extra binds (it only
+                    // iterates 1..=bind_parameter_count), so a restored
+                    // server lost its remote-cipher identity and the next
+                    // sync pushed duplicates of it into the vault.
                     sqlx::query(
                         "INSERT INTO servers (id, name, host, port, username, key_id, pem_path, auth_method, \
-                           saved_password, category_id, color, last_connected_at, created_at, updated_at) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                           saved_password, category_id, color, last_connected_at, created_at, updated_at, \
+                           bitwarden_id, bitwarden_revision_ts, bitwarden_updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                          ON CONFLICT(id) DO UPDATE SET name=excluded.name, host=excluded.host, port=excluded.port, \
                            username=excluded.username, key_id=excluded.key_id, pem_path=excluded.pem_path, \
                            auth_method=excluded.auth_method, saved_password=excluded.saved_password, \
                            category_id=excluded.category_id, color=excluded.color, \
-                           last_connected_at=excluded.last_connected_at, updated_at=excluded.updated_at",
+                           last_connected_at=excluded.last_connected_at, updated_at=excluded.updated_at, \
+                           bitwarden_id=excluded.bitwarden_id, bitwarden_revision_ts=excluded.bitwarden_revision_ts, \
+                           bitwarden_updated_at=excluded.bitwarden_updated_at",
                     )
                     .bind(id)
                     .bind(s("name").unwrap_or("imported"))
@@ -2354,6 +2461,11 @@ mod tests {
         let mut cfg = BitwardenConfig::default();
         cfg.master_password = Some(bw_old);
         db.save_bitwarden_config(&cfg).unwrap();
+        // And an assistant API key sealed under the OLD password.
+        let ai_old = crate::crypto::vault::seal(old_pw, b"sk-assistant-key").unwrap();
+        let mut ai = AssistantConfig::default();
+        ai.api_key = Some(ai_old);
+        db.save_assistant_config(&ai).unwrap();
         db.set_config("master.hash", "OLD-VERIFIER").unwrap();
 
         // Rotate: re-seal key + BW cred in memory, commit atomically.
@@ -2361,7 +2473,8 @@ mod tests {
         let plain = crate::crypto::vault::unseal(old_pw, &key.private_key_encrypted).unwrap();
         key.private_key_encrypted = crate::crypto::vault::seal(new_pw, &plain).unwrap();
         let bw_new = crate::crypto::vault::seal(new_pw, b"bw-master-secret").unwrap();
-        db.apply_vault_rotation(&[key], &[], Some(&bw_new), "NEW-VERIFIER")
+        let ai_new = crate::crypto::vault::seal(new_pw, b"sk-assistant-key").unwrap();
+        db.apply_vault_rotation(&[key], &[], Some(&bw_new), Some(&ai_new), "NEW-VERIFIER")
             .unwrap();
 
         // Key unseals under NEW, not OLD.
@@ -2376,6 +2489,15 @@ mod tests {
             b"bw-master-secret"
         );
         assert!(crate::crypto::vault::unseal(old_pw, &mp).is_err());
+        // The assistant API key rotated in the same transaction: NEW unseals,
+        // OLD fails, so the assistant does not strand on the old password.
+        let ai2 = db.load_assistant_config().unwrap();
+        let sk = ai2.api_key.unwrap();
+        assert_eq!(
+            crate::crypto::vault::unseal(new_pw, &sk).unwrap(),
+            b"sk-assistant-key"
+        );
+        assert!(crate::crypto::vault::unseal(old_pw, &sk).is_err());
         // Verifier rotated.
         assert_eq!(
             db.get_config("master.hash").unwrap().as_deref(),
@@ -2413,6 +2535,40 @@ mod tests {
         assert!(
             key.deploy_path.is_none(),
             "restored key must not carry a deployment path"
+        );
+    }
+
+    #[test]
+    fn restore_backup_preserves_server_bitwarden_linkage() {
+        // Regression for the silent arity drop: the servers INSERT bound 17
+        // values against 14 placeholders, and sqlx's non-macro query()
+        // ignores the excess, so bitwarden_id/revision/updated came back
+        // NULL after a restore - and the next sync pushed duplicates of
+        // every server into the Bitwarden vault.
+        let db = test_db();
+        let payload = serde_json::json!({
+            "servers": [{
+                "id": "srv-bw",
+                "name": "linked",
+                "host": "example.com",
+                "port": 22,
+                "username": "root",
+                "auth_method": "publickey",
+                "bitwarden_id": "cipher-123",
+                "bitwarden_revision_ts": "2026-09-01T00:00:00Z",
+                "bitwarden_updated_at": "2026-09-02T00:00:00Z"
+            }]
+        });
+        db.restore_backup(&payload).unwrap();
+        let server = db.get_server("srv-bw").unwrap().expect("server restored");
+        assert_eq!(
+            server.bitwarden_id.as_deref(),
+            Some("cipher-123"),
+            "restored server must keep its Bitwarden cipher id"
+        );
+        assert!(
+            server.bitwarden_revision_ts.is_some() && server.bitwarden_updated_at.is_some(),
+            "restored server must keep its sync revision metadata"
         );
     }
 }

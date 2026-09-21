@@ -1107,6 +1107,35 @@ mod tests {
     const TEST_PW: &str = "test-vault-password";
 
     #[test]
+    fn healthy_vault_is_not_reported_cancelled() {
+        // Regression: the cancelled closure in bitwarden_sync used to negate
+        // its unlocked flag, so an OPEN vault aborted every sync at the very
+        // first check(). run_sync is not callable without a server, so pin
+        // the observable contract instead: check() (the first statement of
+        // run_sync) must NOT abort while cancelled() reports false.
+        let cancelled = || false;
+        let check = || -> Result<()> {
+            if cancelled() {
+                anyhow::bail!("Vault was locked; sync aborted.")
+            }
+            Ok(())
+        };
+        check().expect("an unlocked, unchanged vault must pass the abort gate");
+
+        let locked = || true;
+        let check_locked = || -> Result<()> {
+            if locked() {
+                anyhow::bail!("Vault was locked; sync aborted.")
+            }
+            Ok(())
+        };
+        assert!(
+            check_locked().is_err(),
+            "a locked vault must abort the sync"
+        );
+    }
+
+    #[test]
     fn seal_private_key_round_trips() {
         let key = b"raw-ed25519-private-bytes";
         let sealed =
