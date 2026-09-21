@@ -66,6 +66,9 @@ pub fn run() {
             app.manage(commands::VaultGeneration::new());
             // Per-tab AI access levels; in-memory, cleared on vault lock
             app.manage(assistant::AssistantLevels::new());
+            // Live MCP sessions + connect statuses; torn down on vault lock
+            // (HTTP DELETE with Mcp-Session-Id where a session exists)
+            app.manage(assistant::mcp::McpState::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -197,6 +200,13 @@ pub fn run() {
             assistant::assistant_set_level,
             assistant::assistant_get_level,
             assistant::assistant_exec,
+            // MCP (Model Context Protocol) commands
+            assistant::mcp::mcp_list_servers,
+            assistant::mcp::mcp_save_server,
+            assistant::mcp::mcp_remove_server,
+            assistant::mcp::mcp_test_connection,
+            assistant::mcp::mcp_set_tool_state,
+            assistant::mcp::mcp_call_tool,
             // Settings commands
             settings_get,
             system_paths,
