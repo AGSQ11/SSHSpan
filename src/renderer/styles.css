@@ -2327,3 +2327,132 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .server-list-head .search-wrap { flex: 1 1 100%; min-width: 0; max-width: none; }
 .server-list-head .ghost-btn,
 .server-list-head .primary-btn { flex: 1; justify-content: center; }
+
+/* ─── AI assistant panel ────────────────────────────────────────────────────
+   Docks at the right of the session surface; the surface is a column by
+   default and a row when .split, so .assistant-open flips it to a row in
+   either case and the terminal/SFTP share what is left. */
+.session-surface.assistant-open { flex-direction: row; }
+.assistant-open .terminal-body { flex: 1; min-width: 0; }
+
+.assistant-panel {
+  flex: 0 0 380px;
+  display: flex; flex-direction: column; min-width: 0;
+  border-left: 1px solid var(--line);
+  background: var(--bg-elev);
+}
+.assistant-panel[hidden] { display: none !important; }
+
+.ai-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--line-soft);
+}
+.ai-title {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 600; color: var(--text);
+}
+.ai-title svg { width: 14px; height: 14px; }
+.ai-yolo-badge {
+  padding: 1px 7px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+  color: #fff; background: var(--danger);
+}
+.ai-yolo-badge[hidden] { display: none !important; }
+.ai-close { margin-left: auto; }
+
+.ai-levels { padding: 8px 10px 6px; border-bottom: 1px solid var(--line-soft); }
+.ai-level-seg { width: 100%; }
+.ai-level-seg .seg-btn { flex: 1; font-size: 11px; padding: 4px 0; }
+.ai-level-seg .seg-btn.active.level-read { border-color: var(--accent); color: var(--accent); }
+.ai-level-seg .seg-btn.active.level-draft { border-color: var(--accent); color: var(--accent); }
+.ai-level-seg .seg-btn.active.level-execute { border-color: var(--warn); color: var(--warn); }
+.ai-level-seg .seg-btn.active.level-yolo { border-color: var(--danger); color: var(--danger); }
+.ai-level-caption { margin-top: 6px; font-size: 11px; line-height: 1.35; }
+.ai-level-caption.level-read, .ai-level-caption.level-draft { color: var(--text-dim); }
+.ai-level-caption.level-execute { color: var(--warn); }
+.ai-level-caption.level-yolo { color: var(--danger); }
+
+.ai-messages { flex: 1; overflow-y: auto; padding: 10px; min-height: 0; }
+.ai-tab-list { display: flex; flex-direction: column; gap: 8px; }
+.ai-tab-list[hidden] { display: none !important; }
+
+.ai-msg { font-size: 12.5px; line-height: 1.45; max-width: 100%; }
+.ai-msg .ai-text { white-space: pre-wrap; word-break: break-word; }
+.ai-msg pre {
+  margin: 4px 0; padding: 6px 8px; border-radius: var(--r-sm);
+  background: var(--panel); border: 1px solid var(--line-soft);
+  overflow-x: auto;
+}
+.ai-msg pre code { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
+.ai-msg.user {
+  align-self: flex-end; max-width: 90%;
+  padding: 6px 9px; border-radius: var(--r-sm);
+  background: var(--panel-2); border: 1px solid var(--line);
+}
+.ai-tab-list .ai-msg.user { margin-left: 18px; }
+.ai-msg.assistant { color: var(--text); }
+.ai-msg.notice { color: var(--text-faint); font-style: italic; font-size: 11.5px; }
+.ai-msg.error { color: var(--danger); font-size: 12px; white-space: pre-wrap; }
+
+.ai-card {
+  padding: 7px 9px; border-radius: var(--r-sm);
+  border: 1px solid var(--line); background: var(--panel);
+  font-size: 12px; line-height: 1.4;
+}
+.ai-card .ai-card-why { color: var(--text-dim); margin-bottom: 4px; }
+.ai-card pre {
+  margin: 0 0 6px; padding: 6px 8px; border-radius: var(--r-sm);
+  background: var(--bg); border: 1px solid var(--line-soft); overflow-x: auto;
+}
+.ai-card pre code { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
+.ai-card-actions { display: flex; gap: 6px; }
+.ai-card-actions button { font-size: 11px; padding: 3px 10px; }
+.ai-card.confirm { border-color: var(--warn); }
+.ai-card.approved { border-color: var(--accent); opacity: 0.75; }
+.ai-card.denied { opacity: 0.55; }
+
+.ai-thinking {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-top: 1px solid var(--line-soft);
+  font-size: 12px; color: var(--text-dim);
+}
+.ai-thinking[hidden] { display: none !important; }
+.ai-thinking-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  animation: aiPulse 1.1s ease-in-out infinite;
+}
+.ai-thinking button { margin-left: auto; font-size: 11px; padding: 2px 10px; }
+@keyframes aiPulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+
+.ai-foot {
+  display: flex; align-items: flex-end; gap: 8px;
+  padding: 10px; border-top: 1px solid var(--line-soft);
+}
+.ai-foot textarea {
+  flex: 1; resize: none; min-height: 34px; max-height: 120px;
+  padding: 6px 8px; border-radius: var(--r-sm);
+  background: var(--panel); border: 1px solid var(--line);
+  color: var(--text); font-family: inherit; font-size: 12.5px;
+}
+.ai-foot textarea:focus { outline: none; border-color: var(--ring); }
+.ai-send { flex: 0 0 auto; }
+.ai-send svg { width: 14px; height: 14px; }
+
+/* YOLO opt-in dialog: deliberately red, hard to click through. */
+.assistant-yolo-modal { border-color: var(--danger); }
+.assistant-yolo-modal .modal-title h2 { color: var(--danger); }
+.assistant-yolo-modal .yolo-ico svg { color: var(--danger); }
+.assistant-yolo-modal .yolo-warn {
+  color: var(--danger); font-weight: 600; margin-top: 8px;
+}
+.assistant-yolo-modal .yolo-enable { background: var(--danger); border-color: var(--danger); }
+
+/* Settings section bits. */
+.ai-urlrow { display: flex; gap: 6px; }
+.ai-urlrow input { flex: 1; }
+.ai-urlrow select { flex: 0 0 130px; }
+.ai-key-hint { display: block; margin-top: 3px; color: var(--accent); }
+
+/* Terminal-max keeps its full-window cleanliness: the panel hides. */
+#app.term-max .assistant-panel { display: none !important; }
