@@ -1202,7 +1202,13 @@ function clearConnectView() {
   }
   state.activeTabId = null;
   const sbody = document.getElementById('sftpBody');
-  if (sbody) sbody.classList.remove('visible');
+  if (sbody) {
+    sbody.classList.remove('visible');
+    // closeSessionTab removes a closing tab's SFTP panel; the lock path only
+    // hid them, so one DOM subtree per session accumulated across every
+    // lock/unlock cycle. Remove them here too.
+    for (const child of [...sbody.querySelectorAll('[id^="sftpPanel-"]')]) child.remove();
+  }
   const tbody = document.getElementById('terminalBody');
   if (tbody) tbody.style.display = 'flex';
   renderTermTabs();
