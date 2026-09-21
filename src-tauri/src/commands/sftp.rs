@@ -184,6 +184,13 @@ pub(crate) fn describe_download_read_error(e: std::io::Error) -> CmdError {
 #[tauri::command]
 pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
     require_unlocked(&app)?;
+    // The registry insert below is the commit point of a secret-consuming
+    // operation (it hands out an authenticated channel), and it sits after
+    // two awaits - so the generation must be re-checked there, like
+    // terminal_connect and key_export_to_file do. Without it, a lock that
+    // lands while the subsystem request is in flight leaves a live channel
+    // registered in the locked vault, usable again after the next unlock.
+    let generation = crate::commands::capture_vault_generation(&app)?;
     let sftp_tx = app
         .state::<StdArc<SessionRegistry>>()
         .get_sftp_tx(&session_id)
@@ -201,6 +208,7 @@ pub async fn sftp_open(app: AppHandle, session_id: String) -> CmdResult<serde_js
         .canonicalize(".")
         .await
         .unwrap_or_else(|_| "/".to_string());
+    crate::commands::require_generation_current(&app, generation)?;
     app.state::<SftpRegistry>()
         .insert(session_id.clone(), Arc::new(sftp));
     Ok(serde_json::json!({ "ok": true, "cwd": cwd }))

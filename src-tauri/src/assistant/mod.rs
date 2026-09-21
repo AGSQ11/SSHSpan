@@ -106,6 +106,11 @@ pub fn assistant_save_config(
     base_url: Option<String>,
     model: String,
     api_key: Option<String>,
+    // Explicit removal signal: null/empty api_key alone means "keep the
+    // stored key" (so a save from a form that blanks the password field for
+    // privacy does not silently destroy it), which otherwise made a stored
+    // key impossible to remove.
+    clear_api_key: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let pw = vault_password(&app)?;
     if pw.is_empty() {
@@ -144,6 +149,9 @@ pub fn assistant_save_config(
         config.api_key = Some(
             crate::crypto::vault::seal(&pw, key.trim().as_bytes()).map_err(|e| e.to_string())?,
         );
+    } else if clear_api_key.unwrap_or(false) {
+        // save_assistant_config's None => DELETE removes the sealed row.
+        config.api_key = None;
     }
     db.save_assistant_config(&config).map_err(|e| e.to_string())?;
     db.add_audit("assistant.config", None, "saved")

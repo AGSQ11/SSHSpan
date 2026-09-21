@@ -508,6 +508,21 @@ pub fn vault_change_password(
         None => None,
     };
 
+    // The AI assistant's provider API key is sealed with the same vault
+    // password; it must rotate in the same transaction or every assistant
+    // call fails at unseal after the change while has_api_key still says
+    // true. Same rule as the Bitwarden credential above: missing is fine,
+    // unsealable aborts the whole change.
+    let assistant_config = db.load_assistant_config().map_err(|e| e.to_string())?;
+    migration.assistant_api_key = match assistant_config.api_key.as_ref() {
+        Some(sealed) => {
+            let plain = crate::crypto::vault::unseal(&current_password, sealed)
+                .map_err(|e| format!("Cannot re-encrypt the stored AI assistant API key: {e}"))?;
+            Some(crate::crypto::vault::seal(&new_password, &plain).map_err(CmdError::from)?)
+        }
+        None => None,
+    };
+
     let hashed = hash_master_password(&new_password).map_err(CmdError::from)?;
     // Single transaction: every re-sealed record, the Bitwarden credential,
     // and the verifier commit together or not at all (F3). A crash or I/O
@@ -517,6 +532,7 @@ pub fn vault_change_password(
         &migration.keys,
         &migration.servers,
         migration.bitwarden_master_password.as_deref(),
+        migration.assistant_api_key.as_deref(),
         &hashed,
     )
     .map_err(|e| e.to_string())?;
@@ -543,6 +559,9 @@ struct VaultMigration {
     /// Re-sealed Bitwarden master password (None when sync is not configured).
     /// Filled in by the caller after `migrate_vault_records` runs.
     bitwarden_master_password: Option<String>,
+    /// Re-sealed AI assistant API key (None when the assistant is not
+    /// configured). Filled in by the caller, same rule as above.
+    assistant_api_key: Option<String>,
 }
 
 /// Unseal every stored private key and saved server password with the current
@@ -594,6 +613,7 @@ fn migrate_vault_records(
         keys: migrated_keys,
         servers: migrated_servers,
         bitwarden_master_password: None,
+        assistant_api_key: None,
     })
 }
 
@@ -2536,18 +2556,15 @@ pub async fn bitwarden_sync(
 
     // Capture the vault generation so a lock mid-sync cancels the run at the
     // next mutation boundary (sync pushes/pulls secrets; it must not continue
-    // after the vault that authorized it has locked).
+    // after the vault that authorized it has locked). Same predicate as
+    // require_generation_current: the closure must be FALSE while the vault
+    // stays unlocked and the generation is unchanged. The first version of
+    // this closure negated the unlocked flag (an extra `!`), which made every
+    // healthy sync abort with "Vault was locked" before any network work.
     let generation = capture_vault_generation(&app)?;
     let app_for_cancel = app.clone();
     let cancelled = move || {
-        let unlocked = !app_for_cancel
-            .state::<VaultPasswordStore>()
-            .get()
-            .map(|p| !p.is_empty())
-            .unwrap_or(false);
-        !app_for_cancel
-            .state::<VaultGeneration>()
-            .is_current(generation, unlocked)
+        require_generation_current(&app_for_cancel, generation).is_err()
     };
 
     // run_sync is async (network + DB). The DB layer internally hops onto a
