@@ -1,5 +1,5 @@
 /* ==========================================================================
-   SSHSpan renderer — premium dark theme
+   SSHSpan renderer - premium dark theme
    --------------------------------------------------------------------------
    Layered "precision instrument" aesthetic. Fully offline: system font
    stack only, zero web fonts, zero remote requests. All icons are inline
@@ -691,7 +691,7 @@ label:focus-within { color: var(--text); }
 /* The category picker is a SECONDARY modal: it opens on top of the host and
    key modals, which are .modal-backdrop too. Equal z-index means DOM order
    decides what paints on top, and #serverModal is declared after #pickerModal,
-   so the picker rendered behind the host form — invisible and unclickable,
+   so the picker rendered behind the host form - invisible and unclickable,
    which made it impossible to assign a category while adding a server. Give it
    its own layer above every other backdrop (and above .cat-menu at 60), but
    below the toast layer at 99 so errors stay readable over it. */
@@ -771,7 +771,7 @@ label:focus-within { color: var(--text); }
 
    The kind classes are err/warn/ok/info, matching what toast() is actually
    called with. The previous rule styled `.error`, which no call site ever
-   passed — all 108 error toasts rendered in neutral styling with no red. */
+   passed - all 108 error toasts rendered in neutral styling with no red. */
 #toast {
   position: fixed; bottom: 22px; left: 50%;
   transform: translateX(-50%);
@@ -846,7 +846,7 @@ label:focus-within { color: var(--text); }
   .keys-layout { flex-direction: column; }
   .detail-pane, .key-list-col { flex: 1 1 auto; width: 100%; }
   /* The sidebar drops to 66px here and every other label is hidden with it,
-     but the category tree was left rendering full-width rows — long category
+     but the category tree was left rendering full-width rows - long category
      names then spilled out of the sidebar across the key list. The Keys page
      keeps its own "All categories" filter button, so the tree is redundant at
      this width rather than lost. Note the window minimum is 880px, so this
@@ -866,7 +866,7 @@ label:focus-within { color: var(--text); }
 }
 
 /* ==========================================================================
-   Categories — sidebar tree, breadcrumb, chips, picker
+   Categories - sidebar tree, breadcrumb, chips, picker
    ========================================================================== */
 
 /* shrink the .nav so the categories panel can claim the flex:1 space below it */
@@ -1262,7 +1262,7 @@ label:focus-within { color: var(--text); }
   overflow: hidden;
 }
 /* xterm sizes its own rows/cols; FitAddon picks dimensions that fill this box.
-   Do NOT force heights on .xterm-* elements — that breaks rendering. */
+   Do NOT force heights on .xterm-* elements - that breaks rendering. */
 
 /* Floating maximize/restore (<>) control, lower-right above the strip. */
 .term-max-btn {
@@ -1295,7 +1295,7 @@ label:focus-within { color: var(--text); }
    row grid collapses to free-flowing text (no white-space: pre), and the
    selection layer has no positioning. Verified via CDP against the packaged
    app. The renderer's own injected <style> (colors, span layout, cursor) needs
-   CSP style-src 'unsafe-inline' to apply — see tauri.conf.json. */
+   CSP style-src 'unsafe-inline' to apply - see tauri.conf.json. */
 .xterm .xterm-rows {
   position: absolute;
   right: 0;
@@ -1544,7 +1544,7 @@ label:focus-within { color: var(--text); }
 .sftp-pathcopy { flex: none; }
 .sftp-fsinfo { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
 
-/* pane headers (Local site / Remote site) — FileZilla-style orientation */
+/* pane headers (Local site / Remote site) - FileZilla-style orientation */
 .sftp-panehead {
   display: flex; align-items: center; gap: 6px;
   padding: 4px 8px;
@@ -2378,6 +2378,21 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 
 .ai-msg { font-size: 12.5px; line-height: 1.45; max-width: 100%; }
 .ai-msg .ai-text { white-space: pre-wrap; word-break: break-word; }
+/* The markdown subset (assistant replies): headings, lists, inline code. */
+.ai-h { font-weight: 700; color: var(--text); margin: 6px 0 2px; }
+.ai-h1 { font-size: 15px; }
+.ai-h2 { font-size: 13.5px; }
+.ai-h3, .ai-h4 { font-size: 12.5px; }
+.ai-list { margin: 2px 0 2px 4px; padding-left: 16px; }
+.ai-list li { margin: 1px 0; }
+.ai-code-inline {
+  font-family: var(--mono); font-size: 11.5px;
+  padding: 0 3px; border-radius: 4px;
+  background: var(--panel); border: 1px solid var(--line-soft);
+  color: var(--text);
+}
+.ai-msg strong { font-weight: 700; }
+.ai-msg em { font-style: italic; }
 .ai-msg pre {
   margin: 4px 0; padding: 6px 8px; border-radius: var(--r-sm);
   background: var(--panel); border: 1px solid var(--line-soft);
