@@ -127,7 +127,7 @@ AI assistant's backend, which arrives ahead of its panel.
 
 ### Added
 
-- **AI assistant backend (the panel ships separately).** Seven Tauri
+- **AI assistant backend.** Seven Tauri
   commands in the new `assistant` module: provider configuration for
   [OI]-compatible or Anthropic-compatible servers (API key sealed with
   the vault master password, never returned over IPC, rotatable with it,
@@ -139,7 +139,9 @@ AI assistant's backend, which arrives ahead of its panel.
   re-checking the level server-side before writing to the SSH channel and
   audit-logging every execution. 12 unit tests cover the wire shaping and
   response parsing for both providers, the level gate, and the sealed-key
-  round-trip.
+  round-trip. The chat panel below is its frontend: the renderer owns the
+  conversation, the five tools, and the agent loop; the backend stays a
+  non-streaming proxy and the policy gate.
 
 - **AI assistant (optional, off by default).** A chat panel docked beside the
 

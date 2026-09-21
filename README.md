@@ -24,7 +24,7 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
 
 ## What's new
 
-- **v1.9.0** - Audit remediation and the AI assistant backend. Two critical defects
+- **v1.9.0** - Audit remediation and the AI assistant. Two critical defects
   fixed: Bitwarden sync aborted every healthy run with a bogus "vault was locked"
   error (an inverted flag in the lock gate), and restoring a backup silently dropped
   each server's Bitwarden linkage - the next sync then pushed duplicates of every
@@ -38,10 +38,11 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
   Split mode no longer half-disables the file browser, "Confirm before deleting a
   key" and the update-check opt-out actually take effect now, and the keyboard
   compatibility settings (rxvt Home/End, application cursor keys, keypad) are
-  finally enforced. The AI assistant's Rust backend lands in this release (provider
-  proxy for [OI]- and Anthropic-compatible servers, vault-sealed API key, per-tab
-  access levels with a server-side execution gate and audit logging); its panel
-  ships separately.
+  finally enforced. The AI assistant lands in this release: a chat panel
+  docked beside the terminal (Ctrl+Shift+A) for [OI]- and Anthropic-compatible
+  providers, with a per-tab access level (Read / Draft / Execute / YOLO) chosen
+  on a color-coded control - YOLO behind a red opt-in dialog - a vault-sealed
+  API key, a server-side execution gate, and audit logging of every command.
 - **v1.8.0** - UX pass over the whole renderer. The navigation is two objects (Keys,
   Servers) plus Settings: Deploy is now an action on the keys you have selected rather
   than a destination you visit afterwards, and the audit log is a Settings section. A Ctrl+K
