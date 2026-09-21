@@ -862,8 +862,12 @@ mod tests {
         );
         let user_content = format!("summarize the screen\n\n{snapshot}");
         let msgs = vec![
-            ChatMessage::System { content: "rules".into() },
-            ChatMessage::User { content: user_content.clone() },
+            ChatMessage::System {
+                content: "rules".into(),
+            },
+            ChatMessage::User {
+                content: user_content.clone(),
+            },
         ];
 
         // [OI]: system stays in-band, user content passes through verbatim.
@@ -871,8 +875,14 @@ mod tests {
         let oi_msgs = oi["messages"].as_array().unwrap();
         assert_eq!(oi_msgs[0]["role"], "system");
         assert_eq!(oi_msgs[1]["role"], "user");
-        assert_eq!(oi_msgs[1]["content"], serde_json::Value::String(user_content.clone()));
-        assert!(oi_msgs[1]["content"].as_str().unwrap().contains(&format!("terminal_output_{nonce}")));
+        assert_eq!(
+            oi_msgs[1]["content"],
+            serde_json::Value::String(user_content.clone())
+        );
+        assert!(oi_msgs[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("terminal_output_{nonce}")));
 
         // Anthropic: system hoisted, exactly one user message (no adjacent
         // same-role split), and the untrusted block survives inside it.

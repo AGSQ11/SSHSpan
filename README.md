@@ -43,6 +43,9 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
   providers, with a per-tab access level (Read / Draft / Execute / YOLO) chosen
   on a color-coded control - YOLO behind a red opt-in dialog - a vault-sealed
   API key, a server-side execution gate, and audit logging of every command.
+  Terminal output reaches the model only as untrusted data (a per-turn
+  nonce-wrapped block the payload cannot forge), so text printed on the remote
+  cannot pose as instructions.
 - **v1.8.0** - UX pass over the whole renderer. The navigation is two objects (Keys,
   Servers) plus Settings: Deploy is now an action on the keys you have selected rather
   than a destination you visit afterwards, and the audit log is a Settings section. A Ctrl+K

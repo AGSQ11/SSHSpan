@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-21
+
+A full code-audit remediation (26 findings, two of them critical) plus the
+AI assistant (panel and backend), hardened against prompt injection.
+
 ### Security
 
 - **The AI assistant no longer feeds raw terminal output to the model with
@@ -24,11 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   markdown (headings, bold, lists, inline code) instead of showing raw `**`
   and `##` markers. Injection resistance is probabilistic - these defenses
   raise the cost, they are not a proof.
-
-## [1.9.0] - 2026-09-21
-
-A full code-audit remediation (26 findings, two of them critical) plus the
-AI assistant's backend, which arrives ahead of its panel.
 
 ### Fixed
 
