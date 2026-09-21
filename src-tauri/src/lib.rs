@@ -1,8 +1,8 @@
 //! SSHSpan - Cross-platform SSH Key Manager
 //! Tauri v2 library entry point
 
-pub mod bitwarden;
 pub mod assistant;
+pub mod bitwarden;
 pub mod commands;
 pub mod config;
 pub mod crypto;

@@ -153,7 +153,8 @@ pub fn assistant_save_config(
         // save_assistant_config's None => DELETE removes the sealed row.
         config.api_key = None;
     }
-    db.save_assistant_config(&config).map_err(|e| e.to_string())?;
+    db.save_assistant_config(&config)
+        .map_err(|e| e.to_string())?;
     db.add_audit("assistant.config", None, "saved")
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
@@ -178,15 +179,16 @@ fn load_provider(app: &AppHandle) -> CmdResult<ResolvedProvider> {
         .db
         .load_assistant_config()
         .map_err(|e| e.to_string())?;
-    let provider = config
-        .provider
-        .ok_or_else(|| "AI assistant is not configured - open Settings > AI assistant.".to_string())?;
+    let provider = config.provider.ok_or_else(|| {
+        "AI assistant is not configured - open Settings > AI assistant.".to_string()
+    })?;
     let sealed = config
         .api_key
         .ok_or_else(|| "No API key stored - save one in Settings > AI assistant.".to_string())?;
     let key_bytes = crate::crypto::vault::unseal(&pw, &sealed).map_err(|e| e.to_string())?;
     let api_key = Zeroizing::new(
-        String::from_utf8(key_bytes).map_err(|_| "Stored API key is not valid UTF-8.".to_string())?,
+        String::from_utf8(key_bytes)
+            .map_err(|_| "Stored API key is not valid UTF-8.".to_string())?,
     );
     let base_url = config.base_url.unwrap_or_else(|| {
         if provider == "anthropic" {
@@ -242,8 +244,12 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum ChatMessage {
-    System { content: String },
-    User { content: String },
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
     Assistant {
         content: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
@@ -282,16 +288,21 @@ fn openai_body(
             ChatMessage::User { content } => serde_json::json!({
                 "role": "user", "content": content,
             }),
-            ChatMessage::Assistant { content, tool_calls } => {
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 let calls: Vec<serde_json::Value> = tool_calls
                     .clone()
                     .unwrap_or_default()
                     .iter()
-                    .map(|c| serde_json::json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": { "name": c.name, "arguments": c.arguments_json },
-                    }))
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": { "name": c.name, "arguments": c.arguments_json },
+                        })
+                    })
                     .collect();
                 if calls.is_empty() {
                     serde_json::json!({ "role": "assistant", "content": content })
@@ -323,8 +334,13 @@ fn openai_body(
     if !tools.is_empty() {
         let mut wire_tools = Vec::with_capacity(tools.len());
         for t in tools {
-            let params: serde_json::Value = serde_json::from_str(&t.parameters_json)
-                .map_err(|e| CmdError(format!("tool '{}' has invalid parameters_json: {e}", t.name)))?;
+            let params: serde_json::Value =
+                serde_json::from_str(&t.parameters_json).map_err(|e| {
+                    CmdError(format!(
+                        "tool '{}' has invalid parameters_json: {e}",
+                        t.name
+                    ))
+                })?;
             wire_tools.push(serde_json::json!({
                 "type": "function",
                 "function": {
@@ -345,7 +361,10 @@ fn parse_openai_response(body: &serde_json::Value) -> CmdResult<serde_json::Valu
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .ok_or_else(|| CmdError("Provider returned no choices[0].message.".into()))?;
-    let text = msg.get("content").cloned().unwrap_or(serde_json::Value::Null);
+    let text = msg
+        .get("content")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let mut calls = Vec::new();
     if let Some(arr) = msg.get("tool_calls").and_then(|t| t.as_array()) {
         for c in arr {
@@ -389,7 +408,10 @@ fn anthropic_body(
             ChatMessage::User { content } => wire_msgs.push(serde_json::json!({
                 "role": "user", "content": content,
             })),
-            ChatMessage::Assistant { content, tool_calls } => {
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
                 if let Some(t) = content.as_ref().filter(|t| !t.is_empty()) {
                     blocks.push(serde_json::json!({ "type": "text", "text": t }));
@@ -461,8 +483,13 @@ fn anthropic_body(
     if !tools.is_empty() {
         let mut wire_tools = Vec::with_capacity(tools.len());
         for t in tools {
-            let schema: serde_json::Value = serde_json::from_str(&t.parameters_json)
-                .map_err(|e| CmdError(format!("tool '{}' has invalid parameters_json: {e}", t.name)))?;
+            let schema: serde_json::Value =
+                serde_json::from_str(&t.parameters_json).map_err(|e| {
+                    CmdError(format!(
+                        "tool '{}' has invalid parameters_json: {e}",
+                        t.name
+                    ))
+                })?;
             wire_tools.push(serde_json::json!({
                 "name": t.name,
                 "description": t.description,
@@ -671,8 +698,12 @@ mod tests {
 
     fn history() -> Vec<ChatMessage> {
         vec![
-            ChatMessage::System { content: "You help administer servers.".into() },
-            ChatMessage::User { content: "check disk".into() },
+            ChatMessage::System {
+                content: "You help administer servers.".into(),
+            },
+            ChatMessage::User {
+                content: "check disk".into(),
+            },
             ChatMessage::Assistant {
                 content: None,
                 tool_calls: Some(vec![ToolCall {
@@ -699,7 +730,10 @@ mod tests {
         assert_eq!(body["model"], "gpt-4o-mini");
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "get_terminal_output");
+        assert_eq!(
+            msgs[2]["tool_calls"][0]["function"]["name"],
+            "get_terminal_output"
+        );
         // Arguments cross the wire as the string the renderer supplied.
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["arguments"], "{}");
         assert_eq!(msgs[3]["role"], "tool");
@@ -760,7 +794,11 @@ mod tests {
     fn anthropic_hoists_system_and_shapes_tools() {
         let body = anthropic_body("claude-sonnet-4-5", &history(), &tools(), 1024).unwrap();
         assert_eq!(body["system"], "You help administer servers.");
-        assert!(body["messages"].as_array().unwrap().iter().all(|m| m["role"] != "system"));
+        assert!(body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["role"] != "system"));
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         let msgs = body["messages"].as_array().unwrap();
         // user, assistant(text absent, tool_use), user(tool_result), assistant(text)
@@ -775,16 +813,34 @@ mod tests {
     #[test]
     fn anthropic_merges_consecutive_tool_results() {
         let msgs = vec![
-            ChatMessage::User { content: "go".into() },
+            ChatMessage::User {
+                content: "go".into(),
+            },
             ChatMessage::Assistant {
                 content: None,
                 tool_calls: Some(vec![
-                    ToolCall { id: "a".into(), name: "t1".into(), arguments_json: "{}".into() },
-                    ToolCall { id: "b".into(), name: "t2".into(), arguments_json: "{}".into() },
+                    ToolCall {
+                        id: "a".into(),
+                        name: "t1".into(),
+                        arguments_json: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "t2".into(),
+                        arguments_json: "{}".into(),
+                    },
                 ]),
             },
-            ChatMessage::Tool { tool_call_id: "a".into(), name: "t1".into(), content: "one".into() },
-            ChatMessage::Tool { tool_call_id: "b".into(), name: "t2".into(), content: "two".into() },
+            ChatMessage::Tool {
+                tool_call_id: "a".into(),
+                name: "t1".into(),
+                content: "one".into(),
+            },
+            ChatMessage::Tool {
+                tool_call_id: "b".into(),
+                name: "t2".into(),
+                content: "two".into(),
+            },
         ];
         let body = anthropic_body("m", &msgs, &[], 1024).unwrap();
         let wire = body["messages"].as_array().unwrap();
@@ -796,7 +852,9 @@ mod tests {
 
     #[test]
     fn anthropic_rejects_system_only_conversation() {
-        let msgs = vec![ChatMessage::System { content: "s".into() }];
+        let msgs = vec![ChatMessage::System {
+            content: "s".into(),
+        }];
         assert!(anthropic_body("m", &msgs, &[], 1024).is_err());
     }
 
@@ -813,7 +871,10 @@ mod tests {
         let r = parse_anthropic_response(&body).unwrap();
         assert_eq!(r["text"], "Let me check. Running it.");
         assert_eq!(r["tool_calls"][0]["id"], "tu_1");
-        assert_eq!(r["tool_calls"][0]["arguments_json"], "{\"command\":\"df -h\"}");
+        assert_eq!(
+            r["tool_calls"][0]["arguments_json"],
+            "{\"command\":\"df -h\"}"
+        );
 
         let no_content = serde_json::json!({ "id": "msg_1" });
         assert!(parse_anthropic_response(&no_content).is_err());

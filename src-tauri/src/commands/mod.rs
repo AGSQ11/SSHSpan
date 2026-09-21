@@ -2563,9 +2563,7 @@ pub async fn bitwarden_sync(
     // healthy sync abort with "Vault was locked" before any network work.
     let generation = capture_vault_generation(&app)?;
     let app_for_cancel = app.clone();
-    let cancelled = move || {
-        require_generation_current(&app_for_cancel, generation).is_err()
-    };
+    let cancelled = move || require_generation_current(&app_for_cancel, generation).is_err();
 
     // run_sync is async (network + DB). The DB layer internally hops onto a
     // blocking thread when called from within the async runtime, so awaiting
