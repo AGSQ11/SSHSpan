@@ -81,6 +81,9 @@ function assistantToggle() {
   if (opening) {
     const tabId = (window.state && window.state.activeTabId) || null;
     if (tabId) assistantOnTabSwitch(tabId);
+    // Pull the MCP registry so a fresh merge happens on the next turn (the
+    // refresh is fire-and-forget: the last snapshot serves turns meanwhile).
+    if (typeof window.mcpRefresh === 'function') window.mcpRefresh().catch(() => {});
     const input = document.getElementById('assistantInput');
     if (input) setTimeout(() => input.focus(), 60);
   }
@@ -384,6 +387,58 @@ function aiConfirmCard(tabId, command) {
   });
 }
 
+// Approve/Deny card for an MCP tool call: the same single approval path
+// run_command uses (and the same Stop-denies-card unblock). Shows the
+// SERVER, the TOOL, and the pretty-printed arguments. Server-reported
+// annotation hints (readOnlyHint / destructiveHint) may appear as text -
+// they are display-only and NEVER bypass the card; only the user's own
+// per-tool auto_approve flag (or YOLO) skips it, checked in aiRunTool.
+function aiConfirmMcpCard(tabId, serverName, toolName, args, annotations) {
+  return new Promise((resolve) => {
+    const s = aiTabState(tabId);
+    const row = document.createElement('div');
+    row.className = 'ai-card confirm';
+    const why = document.createElement('div');
+    why.className = 'ai-card-why';
+    why.textContent = 'The assistant wants to call a tool on an MCP server:';
+    row.appendChild(why);
+    const target = document.createElement('div');
+    target.className = 'ai-card-why';
+    const hints = [];
+    const ann = annotations || {};
+    if (ann.readOnlyHint === true || ann.read_only_hint === true) hints.push('read-only');
+    if (ann.destructiveHint === true || ann.destructive_hint === true) hints.push('may be destructive');
+    target.textContent = 'Server "' + serverName + '" - tool ' + toolName
+      + (hints.length ? ' (server claims: ' + hints.join(', ') + ')' : '');
+    row.appendChild(target);
+    let pretty = '';
+    try { pretty = JSON.stringify(args == null ? {} : args, null, 2); } catch (e) { pretty = String(args); }
+    aiCardCmd(row, pretty == null ? '' : pretty);
+    const actions = document.createElement('div');
+    actions.className = 'ai-card-actions';
+    const approve = document.createElement('button');
+    approve.className = 'danger-btn';
+    approve.textContent = 'Approve';
+    const deny = document.createElement('button');
+    deny.className = 'ghost-btn';
+    deny.textContent = 'Deny';
+    const finish = (ok) => {
+      s._pendingConfirm = null;
+      approve.disabled = deny.disabled = true;
+      row.classList.add(ok ? 'approved' : 'denied');
+      resolve(ok);
+    };
+    approve.addEventListener('click', () => finish(true));
+    deny.addEventListener('click', () => finish(false));
+    actions.appendChild(approve);
+    actions.appendChild(deny);
+    row.appendChild(actions);
+    s._pendingConfirm = { deny: () => finish(false) };
+    s.listEl.appendChild(row);
+    aiScrollBottom(s.listEl);
+  });
+}
+
 // ─── tools ──────────────────────────────────────────────────────────────────
 
 const AI_TOOL_SPECS = [
@@ -429,11 +484,24 @@ const AI_TOOL_SPECS = [
   },
 ];
 
+// Hard cap on the merged tool list offered to the model (built-ins + MCP).
+const AI_MAX_TOOLS_TOTAL = 64;
+
+// Built-ins ALWAYS come first, exactly as before; MCP tools (mcp.js) only
+// FILL the remaining slots up to AI_MAX_TOOLS_TOTAL. By construction an MCP
+// tool can never displace a built-in - the built-ins are taken unfiltered
+// and only the leftover count is offered to the merge.
 function aiToolsForLevel(level) {
   const i = AI_LEVEL_INDEX[level];
-  if (i >= AI_LEVEL_INDEX.execute) return AI_TOOL_SPECS;
-  if (i >= AI_LEVEL_INDEX.draft) return AI_TOOL_SPECS.filter(t => t.name !== 'run_command');
-  return AI_TOOL_SPECS.filter(t => t.name === 'get_terminal_output' || t.name === 'get_session_info' || t.name === 'propose_command');
+  let tools;
+  if (i >= AI_LEVEL_INDEX.execute) tools = AI_TOOL_SPECS;
+  else if (i >= AI_LEVEL_INDEX.draft) tools = AI_TOOL_SPECS.filter(t => t.name !== 'run_command');
+  else tools = AI_TOOL_SPECS.filter(t => t.name === 'get_terminal_output' || t.name === 'get_session_info' || t.name === 'propose_command');
+  if (typeof window.mcpGetTools === 'function') {
+    const remaining = AI_MAX_TOOLS_TOTAL - tools.length;
+    if (remaining > 0) tools = tools.concat(window.mcpGetTools().slice(0, remaining));
+  }
+  return tools;
 }
 
 function aiGetTerminalText(tabId) {
@@ -508,6 +576,28 @@ async function aiRunTool(tabId, tc) {
     const ok = await aiConfirmCard(tabId, command);
     if (!ok) return 'denied by user';
     return wrap(await aiExecCommand(tabId, command));
+  }
+  // MCP server tools (mcp.js). The approval card is asked at read/draft/
+  // execute - only the user's own per-tool auto_approve flag or YOLO skips
+  // it; server annotations never do. The result is output from a third-party
+  // service: UNTRUSTED, so it goes through the same nonce wrap as terminal
+  // text before entering s.messages.
+  if (name.lastIndexOf('mcp__', 0) === 0
+      || (typeof window.mcpIsMcpTool === 'function' && window.mcpIsMcpTool(name))) {
+    const meta = typeof window.mcpToolInfo === 'function' ? window.mcpToolInfo(name) : null;
+    if (!meta) return 'error: unknown or disabled MCP tool: ' + name;
+    if (s.level !== 'yolo' && !meta.autoApprove) {
+      const ok = await aiConfirmMcpCard(tabId, meta.serverName, meta.toolName, args, meta.annotations);
+      if (!ok) return 'denied by user';
+    }
+    let text;
+    try {
+      text = await window.mcpCallTool(tabId, name, args);
+    } catch (e) {
+      // Error bodies are untrusted server text too - wrap them the same way.
+      text = 'error: ' + ((e && (e.message || e.error)) || String(e));
+    }
+    return wrap(text);
   }
   return 'unknown tool: ' + name;
 }
@@ -766,6 +856,9 @@ function aiWire() {
 window.assistantToggle = assistantToggle;
 window.assistantOnTabSwitch = assistantOnTabSwitch;
 window.assistantClearTab = assistantClearTab;
+// The built-in tool names (mcp.js refuses to merge any MCP tool whose
+// sanitized name collides with one of these, so built-ins stay unique).
+window.aiBuiltinToolNames = () => AI_TOOL_SPECS.map(t => t.name);
 window.assistantOpenSettings = async () => {
   if (typeof window.switchView === 'function') await window.switchView('settings');
   if (typeof window.showSettingsSection === 'function') window.showSettingsSection('assistant');
