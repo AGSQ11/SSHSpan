@@ -523,7 +523,13 @@ async function aiRunTool(tabId, tc) {
 // payload, so remote text cannot forge the boundary. Injection resistance is
 // probabilistic - this raises the cost, it is not a proof.
 function aiWrapUntrusted(text, nonce) {
-  const clean = String(text == null ? '' : text).replace(/<\/terminal_output/g, '');
+  // Strip in a loop: a single replace can be nested around
+  // ("</terminal_</terminal_outputoutput_x>" -> "</terminal_output_x>"), so
+  // remove every occurrence until none remain. The random nonce is still the
+  // real boundary - a forged closing tag would have to match it, and the
+  // remote side never sees it - but nested stripping costs nothing.
+  let clean = String(text == null ? '' : text);
+  while (clean.includes('</terminal_output')) clean = clean.replaceAll('</terminal_output', '');
   return `<terminal_output_${nonce} trust="untrusted">\n${clean}\n</terminal_output_${nonce}>`;
 }
 
