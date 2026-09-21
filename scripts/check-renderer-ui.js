@@ -671,7 +671,7 @@ async function checkUxRefactor(browser, server) {
   await page.waitForTimeout(250);
   check('settings has a section rail including the audit log',
     await page.$$eval('.settings-nav-item', ns => ns.map(n => n.dataset.section)),
-    ['general', 'vault', 'hosts', 'backup', 'sync', 'audit']);
+    ['general', 'vault', 'hosts', 'backup', 'sync', 'assistant', 'audit']);
   check('only one section shows at a time',
     await page.$$eval('.settings-section', ss => ss.filter(s => !s.hidden).length), 1);
   // Settings used to render bare browser checkboxes while the deploy options
