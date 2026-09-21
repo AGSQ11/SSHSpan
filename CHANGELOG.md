@@ -7,7 +7,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-21
+
+A full code-audit remediation (26 findings, two of them critical) plus the
+AI assistant's backend, which arrives ahead of its panel.
+
 ### Fixed
+
+- **Bitwarden sync aborted every healthy run.** The `cancelled` closure in
+  `bitwarden_sync` negated its unlocked flag, so an OPEN vault failed every
+  sync with "Vault was locked; sync aborted." before any network work -
+  the entire two-way sync feature was dead. The closure now uses the same
+  `require_generation_current` predicate as every other lock-gated command;
+  a regression test pins the gate's contract.
+
+- **Restoring a backup silently dropped each server's Bitwarden linkage.**
+  The servers `INSERT` bound 17 values against 14 placeholders, and sqlx's
+  non-macro `query()` silently ignores the excess, so `bitwarden_id` /
+  revision / updated came back NULL after a restore - and the next sync
+  pushed duplicates of every server into the Bitwarden vault. The columns,
+  placeholders, `ON CONFLICT` clauses, and binds now match, with a
+  round-trip test.
+
+- **A vault lock racing an in-flight SFTP open left a live channel behind.**
+  `sftp_open` registered its channel after two awaits without re-checking
+  the vault generation, so a lock landing mid-open left an authenticated
+  channel in the locked vault's registry, usable again after the next
+  unlock. The generation is now captured at entry and re-checked at the
+  insert - the same pattern `terminal_connect` and `key_export_to_file`
+  already used.
+
+- **Master-password rotation stranded the AI assistant's sealed API key.**
+  Every assistant call failed at unseal after a rotation while
+  `has_api_key` still reported true. The key now rotates in the same
+  transaction as the keys, server passwords, and the Bitwarden credential.
+
+- **Right-click at the prompt pasted the clipboard with no confirmation.**
+  xterm keeps its hidden helper textarea positioned on the cursor cell, so
+  a right-click at the prompt hit it and pasted via the raw path, bypassing
+  the multi-line paste confirmation - and the app's context menu opened on
+  the same click, so choosing Paste double-pasted. The handler now routes
+  through `terminalPaste` (confirmation and focus restoration) and stops
+  the menu from opening on that click.
+
+- **"Restart session" on a live tab doubled every keystroke and lost
+  close-detection.** The old poll interval's closure killed the NEW handle,
+  both keystroke subscriptions stayed attached, and the old SSH session was
+  never disconnected - the tab showed live forever. The previous session is
+  now torn down before reconnecting, and the subscription is stored on the
+  tab record so teardown can actually dispose it (the cleanup was
+  previously dead code - the field was never assigned).
+
+- **The wheel printed `^[[A^[[A^[[B` garbage inside screen/tmux.** xterm
+  converts wheel events into arrow keys when the buffer has no scrollback
+  - always true in the alternate screen - and a multiplexer passes them to
+  the inner program, which echoes them literally. Plain wheel events in
+  the alternate screen are now swallowed unless the remote enabled mouse
+  reporting (vim, htop, screen's `mousetrack on`), in which case they
+  reach the app as real mouse events. Mouse modes are tracked by sniffing
+  DECSET/DECRST 1000/1002/1003 in the output stream, with a carry so a
+  sequence split across chunks is still recognized.
+
+- **Window resizes and UI-scale changes stole focus into the terminal**
+  from modals and inputs. `fitActiveTerminal` no longer focuses;
+  maximize uses the new `fitActiveTerminalAndFocus`.
+
+- **"Confirm before deleting a key" and "Check GitHub for new releases"
+  had no effect.** The backend returns every setting as a string, so the
+  stored `"false"` never matched the strict `!== false` guards (the delete
+  confirmation always appeared; the boot update check always ran); the
+  delete handler also never mirrored the value into state. A `settingOn()`
+  helper normalizes string/boolean/undefined for both.
+
+- **Split mode half-disabled the file browser.** Ten `mode !== 'sftp'`
+  gates excluded split - which shows the full panel beside the shell - so
+  Ctrl+A, OS file drops, two-pane drag & drop, uploads, compare/sync
+  shortcuts, and the transfer-done auto-refresh were dead while navigation
+  still worked. A `sftpPanelVisible()` helper now gates all ten sites.
+
+- **Dual-pane state was never re-asserted on render.** A persisted-on pane
+  opened invisible (its listing loaded and the status bar counted local
+  items - nothing shown) and needed two clicks; queue-driven auto-open
+  never lit the button. `applySftpDualChrome()` derives the pane, splitter,
+  panel class, and button state from `tab.dualPane` on build, refresh,
+  show, and toggle.
+
+- **A batch of smaller renderer fixes from the same audit:** the SFTP
+  Bookmarks button never opened its menu (`ev.currentTarget` is null after
+  the await; the anchor rect is now captured before it); the local pane's
+  Home choice was re-seeded to the remembered default by a falsy guard;
+  recursive-search listeners hijacked each other across tabs (now
+  per-tab, disposed on completion and session close); compare tints were
+  lost on rows mounted by virtualized scrolling; the OS-drag overlay only
+  appeared in the first tab ever built; virtualization cached the row
+  height forever (jumpy scrollbar after a UI-scale change); the
+  context-menu Select all selected only the mounted screenful; four
+  swallowed `settings_set` failures now surface; group collapse survived
+  no re-render; a session ending in Split mode stranded the tab with a
+  dead file browser and no visible way out; the "+" tab button and the
+  advertised Ctrl+Shift+1/2/3 shortcuts were dead; vault lock no longer
+  leaks orphaned SFTP panel DOM; and the view-switch buttons all lit up
+  after clicking Split (a document-wide `.seg-btn` selector that also
+  matched the server modal's auth buttons).
+
+- **The webview's own right-click menu (Back/Refresh/Print) appeared
+  everywhere.** It is now suppressed app-wide except in text fields, where
+  the native editing menu is kept.
+
+- **The keyboard-compatibility settings were persisted but never applied**
+  (rxvt Home/End, application cursor keys, application keypad) - they are
+  now enforced per-terminal via `attachCustomKeyEventHandler`. Visual
+  bell mode likewise was a no-op on the active tab (`bellStyle` was never
+  set); it is now applied at creation and live.
+
+- **Pasting from the terminal context menu lost focus** - the next
+  keystrokes went nowhere until the terminal was clicked again. Focus is
+  now restored after menu actions and after the multi-line paste
+  confirmation dialog.
+
+### Added
+
+- **AI assistant backend (the panel ships separately).** Seven Tauri
+  commands in the new `assistant` module: provider configuration for
+  [OI]-compatible or Anthropic-compatible servers (API key sealed with
+  the vault master password, never returned over IPC, rotatable with it,
+  and clearable on demand); a connection test with actionable errors; a
+  non-streaming chat proxy that maps a normalized message/tool contract
+  onto each provider's wire format; and per-tab access levels
+  (read/draft/execute/yolo) held in memory only - cleared on vault lock,
+  never persisted, so YOLO cannot survive a restart - with `assistant_exec`
+  re-checking the level server-side before writing to the SSH channel and
+  audit-logging every execution. 12 unit tests cover the wire shaping and
+  response parsing for both providers, the level gate, and the sealed-key
+  round-trip.
+
+- **AI assistant (optional, off by default).** A chat panel docked beside the
 
 - **The SFTP "Columns" toggle never persisted.** The toolbar button wrote
   `sftpShowOwnerCols` through `settings_set`, but the key was absent from the
