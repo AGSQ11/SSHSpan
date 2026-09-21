@@ -60,6 +60,48 @@ function terminalAppKeypad() {
   return terminalSetting('terminalAppKeypad', 'default');
 }
 
+// ─── wheel policy (alternate screen) ────────────────────────────────────────
+//
+// xterm.js converts wheel events into ArrowUp/Down sequences whenever the
+// active buffer has no scrollback - always true in the alternate screen that
+// full-screen apps switch to. For less/vim that is a useful fallback; for a
+// multiplexer like `screen`/`tmux` it is garbage: the arrows are passed to
+// the inner program, which echoes them literally (^[[A^[[A... on screen).
+// When the remote has NOT enabled mouse reporting we therefore swallow
+// plain wheel events in the alternate screen (what Windows Terminal does
+// there). With mouse reporting on (screen's `mousetrack on`, vim, htop) the
+// wheel reaches the app as real mouse events, untouched.
+//
+// xterm exposes no accessor for the DEC mouse modes, so they are tracked by
+// sniffing the output stream for DECSET/DECRST 1000/1002/1003 (the enable
+// modes; 1005/1006/1015 are encodings and irrelevant to the decision).
+
+const MOUSE_MODE_RE = /\x1b\[\?(1000|1002|1003)([hl])/g;
+
+function trackMouseReporting(rec, text) {
+  if (typeof text !== 'string' || !text.length) return;
+  // A DECSET can straddle output chunks; carry the tail of the previous
+  // chunk so the regex still sees the whole sequence.
+  const hay = (rec._mouseCarry || '') + text;
+  let m;
+  let last = null;
+  MOUSE_MODE_RE.lastIndex = 0;
+  while ((m = MOUSE_MODE_RE.exec(hay))) last = m[2];
+  if (last) rec.mouseReporting = last === 'h';
+  rec._mouseCarry = hay.slice(-8);
+}
+
+function wireTerminalWheelPolicy(rec, host, term) {
+  host.addEventListener('wheel', (ev) => {
+    // Modified wheels (ctrl-zoom, shift horizontal) are left alone.
+    if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return;
+    if (rec.mouseReporting) return;
+    let type = 'normal';
+    try { type = term.buffer.active.type; } catch (e) {}
+    if (type === 'alternate') ev.stopPropagation();
+  }, { capture: true, passive: true });
+}
+
 /// Key-compatibility layer for the three keyboard settings that were
 /// previously persisted but never applied. Returns null when every setting
 /// is at its default, so nothing is intercepted in the common case.
@@ -323,6 +365,7 @@ function createTabTerminal(tabId) {
     sessionEnded: false, gotFirstData: false,
   };
   sshTabs.set(tabId, record);
+  wireTerminalWheelPolicy(record, host, term);
 
   // Refit the tab when it becomes visible again (display:none -> block).
   const ro = new ResizeObserver(() => {
@@ -453,6 +496,10 @@ function terminalConnectInTab(tabId, server, opts) {
       tcore.invoke('terminal_disconnect', { sessionId: oldSession }).catch(() => {});
     }
     if (rec.keepaliveHandle) { clearInterval(rec.keepaliveHandle); rec.keepaliveHandle = null; }
+    // Fresh session: the previous session's DEC mouse modes do not carry
+    // over (the remote app re-enables them if it wants them).
+    rec.mouseReporting = false;
+    rec._mouseCarry = '';
 
     const t = rec.term;
     rec.sessionEnded = false;
@@ -470,6 +517,7 @@ function terminalConnectInTab(tabId, server, opts) {
         rec.gotFirstData = true;
         if (tabId === activeTabId) terminalSetStatus(`Connected to ${server.host}:${server.port} - streaming`);
       }
+      trackMouseReporting(rec, text);
       try { t.write(text); } catch (e) {}
     };
 
@@ -599,6 +647,10 @@ window.terminalReset = (tabId) => {
   const rec = tabRecord(tabId);
   if (!rec) return;
   rec.term.reset();
+  // reset() clears every DEC mode in xterm, including mouse reporting; drop
+  // the sniffed flag so the wheel policy does not assume mouse mode.
+  rec.mouseReporting = false;
+  rec._mouseCarry = '';
   setTimeout(() => { try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {} }, 30);
 };
 window.terminalPaste = async (tabId, text) => {
