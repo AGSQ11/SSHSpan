@@ -4500,7 +4500,7 @@ function escapeHtml(s) {
     document.head.appendChild(s);
   });
   const results = [];
-  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js', 'sftp.js', 'assistant.js']) {
+  for (const src of ['vendor/xterm.js', 'vendor/addon-fit.js', 'vendor/addon-web-links.js', 'terminal.js', 'sftp.js', 'assistant.js', 'mcp.js']) {
     const r = await loadScript(src);
     results.push(r);
     if (!r.ok) toast('Failed to load ' + src + ' - Connect will not work.', 'err');

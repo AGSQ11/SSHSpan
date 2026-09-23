@@ -202,6 +202,63 @@ download path is hardened:
   update, so releases published before provisioning cannot serve as auto-update sources
   for provisioned builds.
 
+## MCP servers
+
+The AI assistant can attach remote **MCP (Model Context Protocol) servers** (Streamable
+HTTP only) to extend the assistant with external tools. MCP widens the assistant's reach
+from the one host in the terminal to every service the user connects - and every one of
+those services is an untrusted peer, so the controls below are the whole point of the
+feature. Stdio and the legacy HTTP+SSE (2024-11-05) transports are deliberately
+unsupported and are refused with a clear error.
+
+- **All MCP traffic goes through the Rust backend.** The renderer never fetches an MCP
+  URL, and the page's CSP `connect-src` is unchanged. Two reqwest clients are used: an
+  unguarded one for the *configured* origin (a self-hosted/LAN server is legitimate) and
+  the guarded DNS resolver (`bitwarden::ssrf`) for any URL *discovered* from a server
+  response - discovered URLs must also be https and pass the SSRF guard. Redirects are
+  never followed: a 3xx is a hard error, so an auth header can never be carried to a
+  different origin.
+- **Tool descriptions, schemas, and results are untrusted.** Anything an MCP server
+  returns is text written by a potentially hostile peer and lands in the model's context.
+  It is treated exactly like terminal output: every MCP result is wrapped in the
+  assistant's per-turn nonce-boundary untrusted block before it enters the conversation,
+  and the system prompt tells the model that only the user's own chat messages are
+  instructions. This is a defense that *raises the cost* of an injection; injection
+  resistance is probabilistic and is not a proof.
+- **Per-tool approval and pinning.** No MCP tool is enabled until the user approves it
+  individually (default: all disabled). At approval, the tool's definition is pinned as
+  SHA-256 over canonical JSON of `{name, title, description, inputSchema, annotations}`.
+  If a tool's definition ever changes (a "rug pull"), the pin mismatches, the tool is
+  disabled and audit-logged, and the user must re-approve. Server-provided annotations
+  (`readOnlyHint`, `destructiveHint`) are shown to the user as hints from an untrusted
+  source but are never used to bypass approval.
+- **Execution is gated like `assistant_exec`.** The access levels are unchanged
+  (read/draft/execute/yolo). At read/draft/execute, every MCP call requires the user's
+  approval (unless that tool is explicitly flagged auto-approve); at yolo, calls run
+  without a card. The Rust `mcp_call_tool` command independently enforces the level, the
+  tool's enabled state, the pin match, and the auto-approve flag. **The human approval
+  itself is attested by the renderer** - the backend enforces everything it can verify
+  itself, but the click that says "this user approved this call" comes from the renderer,
+  so a compromised renderer can attest approval it did not actually receive (same
+  boundary as every other approval in the app; see the threat model). An optional
+  hardening under consideration is to raise the MCP approval as a native Rust dialog,
+  which a compromised renderer cannot click.
+- **Credential origin-binding.** Static-auth secrets are sealed with the vault master
+  password (never returned over IPC, rotated in the same transaction as the other
+  secrets, zeroized after use). The environment-variable source stores only the variable
+  *name* and resolves the value from the process environment at request time, never
+  persisting it. An auth header is only ever sent to the origin of the server it was
+  configured for - never to a redirected or discovered URL.
+- **Backup/restore entries are inert.** An MCP server entry restored from a backup,
+  sync, or import is not connected until the user re-confirms its URL and auth source in
+  the UI, so a malicious backup cannot point a stored secret or env var at an attacker's
+  URL on first connect. Vault backups carry server configuration and static secrets but
+  never OAuth tokens (Phase 2).
+- **Vault lock tears down sessions.** Locking the vault sends an HTTP `DELETE` with the
+  `Mcp-Session-Id` for each live session (a 405 is valid and ignored), drops the in-memory
+  decrypted secrets, and uses the same vault-generation capture/re-check pattern as the
+  SFTP and terminal paths around every await that registers state.
+
 ## Threat model
 
 SSHSpan is designed to defend against a specific, realistic class of attacker:

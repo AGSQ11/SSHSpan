@@ -392,6 +392,10 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) {
     app.state::<crate::sftp::SftpRegistry>().clear();
     crate::sftp::queue::pause_all(app);
     app.state::<crate::assistant::AssistantLevels>().clear();
+    // MCP sessions die with the vault too: HTTP DELETE with Mcp-Session-Id
+    // (405 is valid per spec - ignored), session + status state dropped. The
+    // decrypted secrets only ever lived in command frames, which end here.
+    crate::assistant::mcp::teardown_all(app);
     app.state::<VaultPasswordStore>().clear();
     let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
 }
@@ -523,6 +527,29 @@ pub fn vault_change_password(
         None => None,
     };
 
+    // MCP server auth secrets are sealed with the same vault password; each
+    // must rotate in the same transaction or every MCP call fails at unseal
+    // after the change. Same rule as the assistant key: missing is fine, an
+    // unsealable blob aborts the whole change (in memory, before anything
+    // commits). Per-tool pin state rides along untouched - re-approving
+    // tools after a password change would be noise, and pin hashes are not
+    // password-derived.
+    let mcp_servers = db.list_mcp_servers().map_err(|e| e.to_string())?;
+    let mut rotated_mcp = Vec::with_capacity(mcp_servers.len());
+    for mut record in mcp_servers {
+        if let Some(sealed) = record.auth_secret.as_ref() {
+            let plain = crate::crypto::vault::unseal(&current_password, sealed).map_err(|e| {
+                format!(
+                    "Cannot re-encrypt the MCP auth secret for '{}': {e}",
+                    record.name
+                )
+            })?;
+            record.auth_secret =
+                Some(crate::crypto::vault::seal(&new_password, &plain).map_err(CmdError::from)?);
+        }
+        rotated_mcp.push(record);
+    }
+
     let hashed = hash_master_password(&new_password).map_err(CmdError::from)?;
     // Single transaction: every re-sealed record, the Bitwarden credential,
     // and the verifier commit together or not at all (F3). A crash or I/O
@@ -533,6 +560,7 @@ pub fn vault_change_password(
         &migration.servers,
         migration.bitwarden_master_password.as_deref(),
         migration.assistant_api_key.as_deref(),
+        &rotated_mcp,
         &hashed,
     )
     .map_err(|e| e.to_string())?;
@@ -1098,6 +1126,10 @@ pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
     let categories = db.list_categories().map_err(|e| e.to_string())?;
     let servers = db.list_servers().map_err(|e| e.to_string())?;
     let known_hosts = db.list_known_hosts().map_err(|e| e.to_string())?;
+    // MCP servers travel with the backup (sealed auth secret included, same
+    // vault password as everything else). They come back INERT on restore
+    // (confirmed=false, all tools disabled) - see `restore_backup`.
+    let mcp_servers = db.list_mcp_servers().map_err(|e| e.to_string())?;
 
     let settings = collect_settings(&db)?;
 
@@ -1107,6 +1139,7 @@ pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
         "servers": servers,
         "known_hosts": known_hosts,
         "settings": settings,
+        "mcpServers": mcp_servers,
     });
     let payload_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let sealed =
@@ -1230,6 +1263,33 @@ pub fn vault_backup_restore(
                 // (the server record itself is kept) rather than importing a
                 // stranded blob.
                 sv["saved_password"] = serde_json::Value::Null;
+                reseal_failures += 1;
+            }
+        }
+        // MCP auth secrets get the same treatment. The entry itself is kept
+        // (and restored inert regardless); only a stranded sealed secret is
+        // dropped so it cannot outlive the backup password that could open
+        // it. Env-var-sourced auth stores no secret, so there is nothing to
+        // re-seal there.
+        if let Some(arr) = data.get_mut("mcpServers").and_then(|v| v.as_array_mut()) {
+            for m in arr.iter_mut() {
+                let Some(blob) = m
+                    .get("auth_secret")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                else {
+                    continue;
+                };
+                if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
+                    if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
+                        m["auth_secret"] = serde_json::json!(resealed);
+                        continue;
+                    }
+                }
+                if crate::crypto::vault::unseal(&pw, &blob).is_ok() {
+                    continue;
+                }
+                m["auth_secret"] = serde_json::Value::Null;
                 reseal_failures += 1;
             }
         }

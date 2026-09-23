@@ -2471,3 +2471,77 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 
 /* Terminal-max keeps its full-window cleanliness: the panel hides. */
 #app.term-max .assistant-panel { display: none !important; }
+
+/* ==========================================================================
+   MCP servers (Settings -> AI assistant). Server and tool names, URLs,
+   descriptions and annotations are untrusted MCP-server text - they are
+   rendered with textContent only, and these rules only ever style them.
+   ========================================================================== */
+
+.mcp-section {
+  margin-top: 18px; padding-top: 14px;
+  border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 12px;
+}
+.mcp-section .card-head { margin-bottom: 0; }
+.mcp-section .card-head h3 { font-size: 13px; }
+
+.mcp-server-list { display: flex; flex-direction: column; gap: 8px; }
+.mcp-server-row {
+  display: flex; flex-direction: column; gap: 7px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--panel-2); padding: 10px 12px;
+}
+.mcp-server-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mcp-server-name {
+  font-weight: 600; font-size: 13px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none;
+}
+.mcp-server-url {
+  flex: 1; min-width: 0;
+  font-size: 11.5px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mcp-server-count {
+  flex: none; font-size: 11px; font-weight: 600;
+  color: var(--text-faint); white-space: nowrap;
+}
+/* Status dot reuses the server-dot geometry with an MCP error state. */
+.mcp-dot.err { background: var(--danger); box-shadow: 0 0 0 3px rgba(var(--danger-rgb), 0.15); }
+.mcp-loopback-warn { font-size: 11.5px; color: var(--warn); }
+.mcp-server-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.mcp-server-actions button { font-size: 11px; padding: 3px 10px; }
+
+.mcp-form {
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: var(--bg-elev); padding: 12px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.mcp-form-title { font-size: 12px; font-weight: 700; color: var(--text-dim); }
+.mcp-url-warn { color: var(--warn); font-size: 11.5px; margin: 0; }
+.mcp-url-error { color: var(--danger); font-size: 11.5px; margin: 0; }
+.mcp-env-hint { display: block; margin-top: 3px; }
+
+.mcp-tools { display: flex; flex-direction: column; gap: 8px; }
+.mcp-tools-title { font-size: 12px; font-weight: 600; color: var(--text-dim); }
+.mcp-tool-row {
+  display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--panel-2); padding: 10px 12px;
+}
+.mcp-tool-row.changed { border-color: rgba(var(--warn-rgb), 0.5); }
+.mcp-tool-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mcp-tool-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.mcp-ann-chip {
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px;
+  padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--line-strong); color: var(--text-dim);
+}
+.mcp-ann-chip.destructive { color: var(--danger); border-color: rgba(var(--danger-rgb), 0.45); }
+.mcp-tool-desc {
+  font-size: 11.5px; color: var(--text-dim);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 120px; overflow-y: auto;
+}
+.mcp-tool-changed { font-size: 11.5px; color: var(--warn); font-weight: 600; }
+.mcp-tool-toggles { display: flex; gap: 8px; flex-wrap: wrap; }

@@ -398,6 +398,81 @@
                 <button id="aiTestBtn" class="ghost-btn"><span data-ico="plug-zap"></span>Test connection</button>
               </div>
               <div class="status-strip" id="aiStatus">Works with [OI], OpenRouter, Groq, Anthropic, and local servers like Ollama / LM Studio.</div>
+
+              <!-- MCP servers: the assistant's tool belt beyond this app. Each
+                   server is added by you, every tool is off until you approve
+                   it, and definitions that change need re-approval. -->
+              <div class="mcp-section">
+                <div class="card-head">
+                  <div>
+                    <h3>MCP servers</h3>
+                    <p class="card-sub">
+                      Optional Model Context Protocol servers - external tool
+                      providers (search, databases, SaaS APIs) the assistant
+                      can call when you enable their tools. Tools stay off
+                      until you approve them here, are re-checked when their
+                      definition changes, and every call still goes through the
+                      panel's access level and per-call approval (except in
+                      YOLO or when you tick Auto-approve for a tool).
+                    </p>
+                  </div>
+                </div>
+                <div id="mcpServerList" class="mcp-server-list"></div>
+                <div class="bw-actions">
+                  <button id="mcpAddBtn" class="primary-btn"><span data-ico="plus"></span>Add MCP server</button>
+                </div>
+
+                <div id="mcpFormHost" class="mcp-form" hidden>
+                  <div class="mcp-form-title" id="mcpFormTitle">Add MCP server</div>
+                  <div class="settings-grid">
+                    <label>Name
+                      <input type="text" id="mcpName" placeholder="github" spellcheck="false" />
+                    </label>
+                    <label>URL
+                      <input type="text" id="mcpUrl" placeholder="https://mcp.example.com/sse" spellcheck="false" />
+                    </label>
+                    <p class="mcp-url-warn" id="mcpUrlWarn" hidden>
+                      Plain HTTP on a loopback address - traffic to this server is not encrypted or authenticated. Fine for a local proxy, not for anything remote.
+                    </p>
+                    <p class="mcp-url-error" id="mcpUrlError" hidden></p>
+                    <label>Auth type
+                      <select id="mcpAuthType">
+                        <option value="none" selected>None</option>
+                        <option value="bearer">Bearer token</option>
+                        <option value="custom">Custom header</option>
+                      </select>
+                    </label>
+                    <label id="mcpSecretSourceRow" hidden>Token source
+                      <select id="mcpSecretSource">
+                        <option value="stored" selected>Stored secret (sealed in your vault)</option>
+                        <option value="env">Environment variable</option>
+                      </select>
+                    </label>
+                    <label id="mcpHeaderRow" hidden>Header name
+                      <input type="text" id="mcpHeaderName" placeholder="X-Api-Key" spellcheck="false" />
+                    </label>
+                    <label id="mcpSecretRow" hidden>Secret
+                      <input type="password" id="mcpAuthSecret" placeholder="Leave blank to keep the stored one" autocomplete="off" />
+                      <span class="hint" id="mcpSecretHint"></span>
+                    </label>
+                    <label id="mcpEnvRow" hidden>Environment variable name
+                      <input type="text" id="mcpAuthEnvVar" placeholder="e.g. GITHUB_MCP_TOKEN" spellcheck="false" />
+                      <span class="hint mcp-env-hint">
+                        Apps launched from a desktop menu or start menu do not see variables
+                        exported in shell rc files (~/.bashrc, ~/.zshrc, profile) - set a
+                        system/user environment variable in your OS, or use the stored-secret option instead.
+                      </span>
+                    </label>
+                  </div>
+                  <div class="bw-actions">
+                    <button id="mcpSaveBtn" class="primary-btn">Save server</button>
+                    <button id="mcpCancelBtn" class="ghost-btn">Cancel</button>
+                  </div>
+                </div>
+
+                <div id="mcpToolsHost" class="mcp-tools"></div>
+                <div class="status-strip" id="mcpStatus">MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.</div>
+              </div>
             </section>
 
             <section class="card settings-section" data-section="audit" hidden>
@@ -451,6 +526,11 @@
           Anything printed in this terminal (logs, files, command output) can
           influence what the AI decides to run. Only enable YOLO on sessions
           where you trust everything that appears on screen.
+        </p>
+        <p class="yolo-warn">
+          With MCP servers connected, injected terminal text can make the AI
+          act on those services with your credentials. YOLO used to reach one
+          host; with MCP it reaches every connected account.
         </p>
       </div>
       <footer class="modal-foot">
