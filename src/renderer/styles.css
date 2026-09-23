@@ -2362,12 +2362,19 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 
 .ai-levels { padding: 8px 10px 6px; border-bottom: 1px solid var(--line-soft); }
 .ai-level-seg { width: 100%; }
-.ai-level-seg .seg-btn { flex: 1; font-size: 11px; padding: 4px 0; }
-.ai-level-seg .seg-btn.active.level-read { border-color: var(--accent); color: var(--accent); }
-.ai-level-seg .seg-btn.active.level-draft { border-color: var(--accent); color: var(--accent); }
-.ai-level-seg .seg-btn.active.level-execute { border-color: var(--warn); color: var(--warn); }
-.ai-level-seg .seg-btn.active.level-yolo { border-color: var(--danger); color: var(--danger); }
-.ai-level-caption { margin-top: 6px; font-size: 11px; line-height: 1.35; }
+.ai-level-seg .seg-btn { flex: 1; font-size: 11.5px; padding: 6px 0; }
+/* The active level is filled with that level's own colour, with dark text on
+   it - the same treatment `.mode-seg` already uses for Shell/Files/Split. The
+   text colour must be set explicitly: the older base `.seg-btn.active` paints
+   `color: white`, and a first version of this rule overrode only the colour,
+   which put accent-on-accent and made the label vanish. All three tokens are
+   light pastels on a dark theme, so dark text is readable on every fill. */
+.ai-level-seg .seg-btn.active { color: #0a1120; font-weight: 600; }
+.ai-level-seg .seg-btn.active.level-read,
+.ai-level-seg .seg-btn.active.level-draft { background: var(--accent); }
+.ai-level-seg .seg-btn.active.level-execute { background: var(--warn); }
+.ai-level-seg .seg-btn.active.level-yolo { background: var(--danger); }
+.ai-level-caption { margin-top: 7px; font-size: 11px; line-height: 1.35; }
 .ai-level-caption.level-read, .ai-level-caption.level-draft { color: var(--text-dim); }
 .ai-level-caption.level-execute { color: var(--warn); }
 .ai-level-caption.level-yolo { color: var(--danger); }
@@ -2420,6 +2427,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   background: var(--bg); border: 1px solid var(--line-soft); overflow-x: auto;
 }
 .ai-card pre code { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
+/* Long commands wrap rather than scroll sideways: the panel is 380px wide,
+   and a one-line command with a long path is the common case. */
+.ai-cmd { white-space: pre-wrap; word-break: break-word; }
 .ai-card-actions { display: flex; gap: 6px; }
 .ai-card-actions button { font-size: 11px; padding: 3px 10px; }
 .ai-card.confirm { border-color: var(--warn); }
@@ -2455,13 +2465,27 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .ai-send svg { width: 14px; height: 14px; }
 
 /* YOLO opt-in dialog: deliberately red, hard to click through. */
-.assistant-yolo-modal { border-color: var(--danger); }
+.assistant-yolo-modal { border-color: rgba(var(--danger-rgb), 0.45); }
 .assistant-yolo-modal .modal-title h2 { color: var(--danger); }
-.assistant-yolo-modal .yolo-ico svg { color: var(--danger); }
-.assistant-yolo-modal .yolo-warn {
-  color: var(--danger); font-weight: 600; margin-top: 8px;
+/* The icon chip inherits the accent-tinted default; retint it to match. */
+.assistant-yolo-modal .yolo-ico {
+  background: rgba(var(--danger-rgb), 0.14);
+  border-color: rgba(var(--danger-rgb), 0.3);
+  color: var(--danger);
 }
-.assistant-yolo-modal .yolo-enable { background: var(--danger); border-color: var(--danger); }
+.assistant-yolo-modal .yolo-ico svg { color: var(--danger); }
+/* No extra margin: .modal-body already spaces its children with a gap, and
+   stacking margin-top on top of it opened a visible hole between paragraphs. */
+.assistant-yolo-modal .yolo-warn { color: var(--danger); font-weight: 500; }
+/* Dark text on the light-red fill; the base .danger-btn paints its text the
+   same red as the background this rule adds, which hid the label. */
+.assistant-yolo-modal .yolo-enable {
+  background: var(--danger); border-color: var(--danger); color: #0a1120;
+  font-weight: 600;
+}
+.assistant-yolo-modal .yolo-enable:hover:not(:disabled) {
+  background: #f6858f; border-color: #f6858f;
+}
 
 /* Settings section bits. */
 .ai-urlrow { display: flex; gap: 6px; }
