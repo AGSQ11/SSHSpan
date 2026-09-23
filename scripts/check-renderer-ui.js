@@ -25,6 +25,148 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
+// ─── static MCP IPC contract check (no browser, no live provider) ───────────
+//
+// Tauri v2 converts a command's snake_case parameters to camelCase by default
+// and looks up EXACTLY that one key in the payload at runtime; a differently
+// spelled key is not an error for Option<T> parameters - it silently becomes
+// None. That is the bug class scripts/check-ipc-args.js was written for, but
+// its JS_FILES list never covered mcp.js, so every MCP call site was
+// unchecked. This block fails the run if any `mcpCall('<cmd>', {...})`
+// payload in src/renderer/mcp.js carries a top-level key the Rust
+// #[tauri::command] does not declare, or omits a required argument. It also
+  // checks the schema-forwarding half of the contract: the MCP wire field is
+  // `inputSchema` (camelCase), which renderer validation serializes to the
+  // provider-facing `parameters_json`. If tool_view stops forwarding it, every
+  // MCP tool reaches the model with a missing parameter schema.
+//
+// No MCP known-issue pins remain: the renderer now uses camelCase command
+// args and backend tool_view returns the bounded input schema. Any recurrence
+// is a hard failure, not tracked debt.
+const MCP_KNOWN = [];
+
+function mcpContractProblems() {
+  const ROOT = path.resolve(__dirname, '..');
+  const js = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'mcp.js'), 'utf8');
+  const rust = fs.readFileSync(path.join(ROOT, 'src-tauri', 'src', 'assistant', 'mcp.rs'), 'utf8');
+  const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+
+  // Commands: name -> [{ key, required }], skipping Tauri-injected params.
+  const commands = {};
+  const cmdRe = /#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(mcp_[a-z_0-9]+)\s*\(([\s\S]*?)\)\s*->/g;
+  let m;
+  while ((m = cmdRe.exec(rust))) {
+    const args = [];
+    for (let part of m[2].split(',')) {
+      part = part.split('\n').filter((l) => !/^\s*(\/\/|#\[)/.test(l)).join(' ').trim();
+      if (!part) continue;
+      const pm = part.match(/^(?:mut\s+)?([a-z_0-9]+)\s*:\s*([\s\S]+)$/);
+      if (!pm || /AppHandle|tauri::/.test(pm[2])) continue;
+      args.push({ key: toCamel(pm[1]), required: !/^Option</.test(pm[2].trim()) });
+    }
+    commands[m[1]] = args;
+  }
+  if (Object.keys(commands).length < 5) {
+    throw new Error(`MCP contract check: parsed only ${Object.keys(commands).length} mcp_* commands - the regex or mcp.rs moved.`);
+  }
+
+  // Top-level keys of an object literal starting at src[openIdx] === '{'.
+  const literalKeys = (src, openIdx) => {
+    const keys = [];
+    let depth = 0, str = null, tok = '', skipValue = false;
+    for (let j = openIdx; j < src.length; j++) {
+      const c = src[j];
+      if (str) { if (c === '\\') { j++; continue; } if (c === str) str = null; continue; }
+      if (c === "'" || c === '"' || c === '`') { str = c; continue; }
+      if ('([{'.includes(c)) { depth++; continue; }
+      if (')]}'.includes(c)) { depth--; if (depth === 0) { if (!skipValue && /^[A-Za-z_$][\w$]*$/.test(tok.trim())) keys.push(tok.trim()); break; } continue; }
+      if (depth === 1) {
+        if (c === ':') { if (/^[A-Za-z_$][\w$]*$/.test(tok.trim())) keys.push(tok.trim()); tok = ''; skipValue = true; }
+        else if (c === ',') { if (!skipValue && /^[A-Za-z_$][\w$]*$/.test(tok.trim())) keys.push(tok.trim()); tok = ''; skipValue = false; }
+        else tok += c;
+      }
+    }
+    return keys;
+  };
+
+  const problems = [];
+  // Direct literal payloads.
+  const siteRe = /mcpCall\('(mcp_[a-z_0-9]+)',\s*\{/g;
+  while ((m = siteRe.exec(js))) {
+    const line = js.slice(0, m.index).split('\n').length;
+    const keys = literalKeys(js, siteRe.lastIndex - 1);
+    checkSite(m[1], keys, line, commands, problems, toCamel);
+  }
+  // The `const payload = {...}` block passed to mcp_save_server by variable.
+  if (/mcpCall\('mcp_save_server',\s*payload\s*\)/.test(js)) {
+    const def = js.match(/const payload = \{/);
+    const line = js.slice(0, def.index).split('\n').length;
+    checkSite('mcp_save_server', literalKeys(js, def.index + def[0].length - 1), line, commands, problems, toCamel);
+  }
+
+  // Schema forwarding: tool_view must emit the key the renderer reads.
+  const view = rust.match(/fn tool_view\([\s\S]*?json!\(\{([\s\S]*?)\n    \}\)/m);
+  const viewKeys = view ? new Set([...view[1].matchAll(/"(\w+)":/g)].map((x) => x[1])) : null;
+  if (!viewKeys) {
+    problems.push('mcp.rs: tool_view() shape unparseable - the contract check must be updated with it');
+  } else if (/\bt\.inputSchema\b/.test(js) && !viewKeys.has('inputSchema')) {
+    problems.push(`src/renderer/mcp.js reads t.inputSchema but tool_view emits only {${[...viewKeys].join(', ')}} - MCP tool schemas never reach the model`);
+  }
+  return problems;
+}
+
+function checkSite(cmd, keys, line, commands, problems, toCamel) {
+  const def = commands[cmd];
+  if (!def) { problems.push(`mcp.js:${line}  mcpCall('${cmd}') - no such MCP command on the Rust side`); return; }
+  const expected = new Set(def.map((a) => a.key));
+  for (const k of keys) {
+    if (!expected.has(k)) {
+      const hint = expected.has(toCamel(k)) ? ` (did you mean '${toCamel(k)}'? Tauri camelCases parameters)` : '';
+      problems.push(`mcp.js:${line}  '${cmd}' got unexpected arg '${k}'${hint}`);
+    }
+  }
+  for (const a of def) {
+    if (a.required && !keys.includes(a.key)) {
+      problems.push(`mcp.js:${line}  '${cmd}' is missing required arg '${a.key}'`);
+    }
+  }
+}
+
+console.log('mcp IPC contract (static, no browser)');
+let mcpProblems = [];
+try {
+  mcpProblems = mcpContractProblems();
+} catch (e) {
+  mcpProblems = [String(e.message || e)];
+}
+// Apply the ratchet: a problem matching a pin is reported as known debt,
+// not a failure. A pin that matches nothing is a failure - either the bug
+// was fixed and the pin must go, or the check's message drifted and the
+// pin must follow it.
+const mcpKnown = [];
+const mcpNew = [];
+for (const p of mcpProblems) {
+  const pin = MCP_KNOWN.find((k) => k.match(p));
+  if (pin) mcpKnown.push({ p, pin });
+  else mcpNew.push(p);
+}
+const mcpStale = MCP_KNOWN.filter((k) => !mcpKnown.some((m) => m.pin === k));
+for (const m of mcpKnown) console.log(`  known  ${m.p}\n         tracked: ${m.pin.why}`);
+if (mcpStale.length) {
+  for (const k of mcpStale) {
+    console.log(`  FAIL  pinned MCP known-issue no longer reproduces: ${k.why}\n        fix landed - remove the pin from MCP_KNOWN in this file.`);
+    mcpNew.push('stale pin: ' + k.why);
+  }
+}
+if (mcpNew.length) {
+  for (const p of mcpNew) console.log(`  FAIL  ${p}`);
+  console.log('\nTauri v2 silently drops an argument whose key does not match,');
+  console.log('so these fail quietly (or loudly) at runtime.');
+} else if (!mcpKnown.length) {
+  console.log('  ok    all MCP IPC payloads match the Rust command signatures');
+}
+const MCP_FAILED = mcpNew.length > 0;
+
 let chromium;
 try {
   ({ chromium } = require('playwright'));
@@ -34,7 +176,7 @@ try {
       require('child_process').execSync('npm root -g', { encoding: 'utf8' }).trim(), 'playwright')));
   } catch {
     console.log('playwright not installed - skipping renderer UI checks.');
-    process.exit(0);
+    process.exit(MCP_FAILED ? 1 : 0);
   }
 }
 
@@ -778,8 +920,9 @@ async function checkSessionSurface(browser, server) {
     await browser.close();
     server.close();
   }
-  if (failures.length) {
-    console.error(`\n${failures.length} renderer UI check(s) failed.`);
+  if (failures.length || MCP_FAILED) {
+    const n = failures.length + (MCP_FAILED ? mcpNew.length : 0);
+    console.error(`\n${n} renderer UI / MCP contract check(s) failed.`);
     process.exit(1);
   }
   console.log('\nAll renderer UI checks passed.');

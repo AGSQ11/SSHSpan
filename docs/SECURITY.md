@@ -3,12 +3,13 @@
 SSHSpan is a local-first SSH key manager. It stores no data on any server and ships no
 telemetry. Its network traffic is (1) an update check against GitHub, on by default and
 disableable in Settings, (2) the optional **Bitwarden/Vaultwarden sync**, which talks
-only to the server the user explicitly configures, and (3) the **SSH/SFTP connections and
+only to the server the user explicitly configures, (3) the **SSH/SFTP connections and
 transfers the user initiates** via Connect/SFTP - by design these carry vault secrets to the
-target hosts the user chose. This document describes the cryptographic
+target hosts the user chose, and (4) when the AI assistant is configured and used, its
+**model-provider and MCP-server traffic**, both to user-entered URLs (below). This document describes the cryptographic
 controls, the storage layout, and the threat model the app is designed to defend against, as
 well as the things it deliberately does not defend against. It describes the current
-Rust/Tauri implementation (v1.7.x).
+Rust/Tauri implementation.
 
 ## Cryptographic primitives
 
@@ -103,7 +104,10 @@ profile directory (Windows) / user-owned permissions (Unix).
    against GitHub's asset digest and a minisign release signature) and the opt-in Bitwarden
    sync (below). The SSH/SFTP sessions and transfers the user initiates (Connect, SFTP,
    Send-to) are the third, by-design network flow - they carry the vault secrets the user
-   chose to use to the target hosts the user chose to reach. No other endpoint is contacted.
+   chose to use to the target hosts the user chose to reach. The fourth and fifth belong to
+   the AI assistant and exist only while it is configured and used: the model provider
+   endpoint (user-configured base URL; defaults `api.openai.com` / `api.anthropic.com`) and
+   the user-added **MCP servers** (below). No other endpoint is contacted.
 
 ## SSH client, SFTP, and host keys
 
@@ -212,10 +216,13 @@ feature. Stdio and the legacy HTTP+SSE (2024-11-05) transports are deliberately
 unsupported and are refused with a clear error.
 
 - **All MCP traffic goes through the Rust backend.** The renderer never fetches an MCP
-  URL, and the page's CSP `connect-src` is unchanged. Two reqwest clients are used: an
-  unguarded one for the *configured* origin (a self-hosted/LAN server is legitimate) and
-  the guarded DNS resolver (`bitwarden::ssrf`) for any URL *discovered* from a server
-  response - discovered URLs must also be https and pass the SSRF guard. Redirects are
+  URL, and the page's CSP `connect-src` is unchanged. In Phase 1 the only MCP destination
+  is the *configured* origin: one plain reqwest client, deliberately without the SSRF
+  resolver, because a self-hosted/LAN server is legitimate. No URL is ever *discovered*
+  from a server response, so there is nothing to guard beyond the configured origin - the
+  guarded resolver (`bitwarden::ssrf`) is wired to a reserved `guarded_client()` seam for
+  Phase 2 (e.g. OAuth endpoints learned via WWW-Authenticate) so discovered-URL handling
+  cannot silently dial unguarded. Redirects are
   never followed: a 3xx is a hard error, so an auth header can never be carried to a
   different origin.
 - **Tool descriptions, schemas, and results are untrusted.** Anything an MCP server
@@ -248,15 +255,26 @@ unsupported and are refused with a clear error.
   secrets, zeroized after use). The environment-variable source stores only the variable
   *name* and resolves the value from the process environment at request time, never
   persisting it. An auth header is only ever sent to the origin of the server it was
-  configured for - never to a redirected or discovered URL.
+  configured for - never to a redirected URL (3xx is refused outright), and, once Phase 2
+  adds discovered URLs, never to those either.
 - **Backup/restore entries are inert.** An MCP server entry restored from a backup,
-  sync, or import is not connected until the user re-confirms its URL and auth source in
-  the UI, so a malicious backup cannot point a stored secret or env var at an attacker's
-  URL on first connect. Vault backups carry server configuration and static secrets.
+  sync, or import is stored with `confirmed = false` and the backend refuses to connect
+  it - no initialize is ever sent - until the user re-confirms its URL and auth source
+  by re-saving it in the UI, so a malicious backup cannot point a stored secret or env
+  var at an attacker's URL on first connect. The inert flag is only cleared by that
+  re-save: a vault lock/unlock does not inert a configured entry (it only drops live
+  sessions), and unlocking the vault makes the next call re-initialize a fresh session
+  transparently. Vault backups carry server configuration and static secrets.
+  Tested: `backup_restored_entries_come_back_inert` (unit).
 - **Vault lock tears down sessions.** Locking the vault sends an HTTP `DELETE` with the
-  `Mcp-Session-Id` for each live session (a 405 is valid and ignored), drops the in-memory
-  decrypted secrets, and uses the same vault-generation capture/re-check pattern as the
-  SFTP and terminal paths around every await that registers state.
+  `Mcp-Session-Id` for each live session (a 405 is valid and ignored; the DELETE is
+  fire-and-forget so the lock path never blocks on network I/O), drops the in-memory
+  session/status state, and uses the same vault-generation capture/re-check pattern as
+  the SFTP and terminal paths around every await that registers state; the decrypted
+  secrets only ever live in command frames, which end at the lock. Tested: the
+  generation pattern and session storage are unit/integration covered; the DELETE
+  side-effect is verified in the manual smoke checklist (docs/MCP-SMOKE-TEST.md step
+  21), as the teardown call needs a live Tauri AppHandle.
 
 ## Threat model
 
