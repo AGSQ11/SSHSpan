@@ -252,8 +252,7 @@ unsupported and are refused with a clear error.
 - **Backup/restore entries are inert.** An MCP server entry restored from a backup,
   sync, or import is not connected until the user re-confirms its URL and auth source in
   the UI, so a malicious backup cannot point a stored secret or env var at an attacker's
-  URL on first connect. Vault backups carry server configuration and static secrets but
-  never OAuth tokens (Phase 2).
+  URL on first connect. Vault backups carry server configuration and static secrets.
 - **Vault lock tears down sessions.** Locking the vault sends an HTTP `DELETE` with the
   `Mcp-Session-Id` for each live session (a 405 is valid and ignored), drops the in-memory
   decrypted secrets, and uses the same vault-generation capture/re-check pattern as the

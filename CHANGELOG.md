@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the audit log with the argument hash (not the arguments). Servers restored
   from a backup are inert until the URL and auth source are re-confirmed in
   the UI. Vault lock tears down sessions (DELETE with the session id) and
-  drops decrypted secrets. OAuth arrives in Phase 2.
+  drops decrypted secrets.
 
 ## [1.9.0] - 2026-09-21
 
