@@ -24,6 +24,15 @@ configure. Auto-updates are minisign-signature-verified and fail closed.
 
 ## What's new
 
+- **v1.9.1** - Remote MCP servers for the AI assistant, plus a legibility fix for
+  the panel. The assistant can attach remote MCP servers over Streamable HTTP (MCP
+  2025-11-25) and use their tools next to the built-in ones: per-tool approval
+  with a SHA-256 pin that disables and demands re-approval if a definition
+  changes, static auth (none / bearer / custom header / environment variable),
+  a server-side execution gate matching the four access levels, every result
+  wrapped as untrusted data, and audit logging of every call by argument hash.
+  Also fixed: the active access-level button and the YOLO dialog's Enable
+  button now show readable text, and the YOLO dialog's layout is corrected.
 - **v1.9.0** - Audit remediation and the AI assistant. Two critical defects
   fixed: Bitwarden sync aborted every healthy run with a bogus "vault was locked"
   error (an inverted flag in the lock gate), and restoring a backup silently dropped

@@ -7,26 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-09-23
+
+Remote MCP servers for the AI assistant (static auth), plus the assistant
+panel legibility fix.
+
 ### Added
 
-- **Remote MCP servers for the AI assistant (Phase 1: transport, tools, static
-  auth).** The assistant can attach remote MCP servers over Streamable HTTP
-  (MCP 2025-11-25; stdio and legacy HTTP+SSE are refused with a clear
-  "unsupported transport" error) and use their tools alongside the built-in
-  ones. All MCP traffic goes through the Rust backend with the guarded
-  DNS/SSRF handling for discovered URLs and no redirect following; static
-  bearer / custom-header secrets are sealed with the vault master password
-  (or resolved from an environment variable by name at request time). Every
-  tool starts disabled until the user approves it, its definition is pinned
-  (SHA-256 over canonical JSON), and a changed definition disables it and
-  demands re-approval - the rug-pull guard. Every MCP call respects the
-  existing access levels (approval card at read/draft/execute unless the tool
-  is auto-approve-flagged; free at yolo), the gate is enforced server-side,
+- **Remote MCP servers for the AI assistant.** The assistant can attach
+  remote MCP servers over Streamable HTTP (MCP 2025-11-25; stdio and legacy
+  HTTP+SSE are refused with a clear "unsupported transport" error) and use
+  their tools alongside the built-in ones. Static auth: none, a bearer token,
+  a custom header, or an environment variable by name (resolved at request
+  time, never persisted). All MCP traffic goes through the Rust backend with
+  guarded DNS/SSRF handling for discovered URLs and no redirect following;
+  static secrets are sealed with the vault master password. Every tool starts
+  disabled until the user approves it, its definition is pinned (SHA-256 over
+  canonical JSON), and a changed definition disables it and demands
+  re-approval - the rug-pull guard. Every MCP call respects the existing
+  access levels (approval card at read/draft/execute unless the tool is
+  auto-approve-flagged; free at yolo), the gate is enforced server-side,
   every result is wrapped as untrusted data, and every call is recorded in
   the audit log with the argument hash (not the arguments). Servers restored
   from a backup are inert until the URL and auth source are re-confirmed in
   the UI. Vault lock tears down sessions (DELETE with the session id) and
   drops decrypted secrets.
+
+### Fixed
+
+- **The assistant panel and YOLO dialog were illegible.** The active
+  access-level button showed no label (accent text on an accent fill),
+  "Enable YOLO" was red-on-red, the YOLO dialog's footer was unstyled
+  (`modal-foot` vs the app's `modal-footer`), and stacked margins opened
+  holes between the warning paragraphs. The active level is now filled with
+  its own colour with dark text on it (the same treatment the Shell/Files/
+  Split control already uses), the dialog uses the correct footer class with
+  even spacing and a red-tinted icon chip, and long commands wrap instead of
+  scrolling sideways in the 380px panel.
 
 ## [1.9.0] - 2026-09-21
 
