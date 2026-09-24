@@ -136,6 +136,16 @@ class Handler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_length)
 
+        # The client POSTs everything (initialize/test-connection is a POST),
+        # so /mcp-redirect must answer the POST with a 302 - a GET-only
+        # redirect would never be seen by the app. Body is discarded.
+        if path == "/mcp-redirect":
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:9999/mcp")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         # Special endpoint: inject notifications/tools/list_changed into SSE stream.
         if path == "/mcp-listchanged":
             self._handle_listchanged_stream(raw)
@@ -150,8 +160,9 @@ class Handler(BaseHTTPRequestHandler):
 
         # One-shot re-init path: a known test session id 404s once.
         if session_id == "00000000-0000-0000-0000-000000000404":
-            self._404_once(session_id)
-            return
+            if self._404_once(session_id):
+                return
+            # already fired - fall through to serve this request normally
 
         try:
             req = json.loads(raw.decode("utf-8")) if raw else {}
@@ -183,11 +194,23 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def _404_once(self, session_id: str):
+        # One-shot per session id: the first request 404s (the client must
+        # re-initialize), everything after it is served normally - otherwise
+        # the "retry after re-init" leg can never be observed.
+        fired = getattr(Handler, "_404_fired", None)
+        if fired is None:
+            fired = Handler._404_fired = set()
+        if session_id in fired:
+            print(f"[404-once] session={session_id} already expired -> serving normally")
+            return False
+        fired.add(session_id)
         print(f"[404-once] session={session_id}")
         self.send_response(404)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "27")
         self.end_headers()
         self.wfile.write(b'{"error":"session expired"}')
+        return True
 
     def _handle_initialize(self, req_id, params, session_id: str):
         protocol = params.get("protocolVersion") if params else None

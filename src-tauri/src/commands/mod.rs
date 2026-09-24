@@ -392,9 +392,12 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) {
     app.state::<crate::sftp::SftpRegistry>().clear();
     crate::sftp::queue::pause_all(app);
     app.state::<crate::assistant::AssistantLevels>().clear();
-    // MCP sessions die with the vault too: HTTP DELETE with Mcp-Session-Id
-    // (405 is valid per spec - ignored), session + status state dropped. The
-    // decrypted secrets only ever lived in command frames, which end here.
+    // MCP sessions die with the vault too: HTTP DELETE with Mcp-Session-Id,
+    // carrying the static auth header resolved BEFORE the password store
+    // clears below (405 is valid per spec - ignored; other refusals are
+    // audited, never swallowed). Session + status state is dropped
+    // synchronously; the DELETEs themselves run on the async runtime so the
+    // lock path stays nonblocking.
     crate::assistant::mcp::teardown_all(app);
     app.state::<VaultPasswordStore>().clear();
     let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");

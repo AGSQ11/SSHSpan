@@ -201,10 +201,28 @@ pub struct McpToolRecord {
     pub pin_hash: Option<String>,
     /// SHA-256 (canonical JSON) of the most recently fetched definition.
     pub current_hash: Option<String>,
+    /// The tool's `inputSchema` as bounded canonical JSON (object-only, at
+    /// most `MAX_INPUT_SCHEMA_BYTES` bytes, keys sorted). Stored so the
+    /// model-facing tool list can carry the real per-tool schema; the PIN
+    /// hash still covers the full untruncated definition. `None` when the
+    /// server sent no schema, a non-object, or one above the cap (views
+    /// substitute an empty object schema).
+    #[serde(default)]
+    pub input_schema: Option<String>,
     /// Server-provided annotations (readOnlyHint, destructiveHint, ...) for
     /// DISPLAY ONLY - never consulted by any gate (a lying server must not
     /// be able to mark its own tool safe).
     pub annotations: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpCapOutcome {
+    /// The record was committed; `enabled_total` MCP tools are now enabled
+    /// across all servers.
+    Committed { enabled_total: usize },
+    /// The write was ROLLED BACK because the post-write enabled total
+    /// exceeded the cap; `enabled_total` is the refused total.
+    OverCap { enabled_total: usize },
 }
 
 /// A configured MCP server (Streamable HTTP transport). `auth_secret` holds
@@ -1125,6 +1143,57 @@ impl Database {
                 .execute(&self.pool)
                 .await?;
             Ok(res.rows_affected() > 0)
+        })
+    }
+
+    /// Write one server record AND count the enabled MCP tools across ALL
+    /// servers inside a single SQLite transaction, so the count reads the
+    /// post-write state that no concurrent toggle can interleave with. When
+    /// the post-write enabled total exceeds `max_enabled`, the write is
+    /// ROLLED BACK (the record keeps its previous state) and `OverCap` is
+    /// returned; otherwise the transaction commits and `Committed` carries
+    /// the new enabled total. Used by `mcp_set_tool_state`'s aggregate cap.
+    pub fn save_mcp_server_capped(
+        &self,
+        record: &McpServerRecord,
+        max_enabled: usize,
+    ) -> Result<McpCapOutcome> {
+        block(async {
+            let mut tx = self.pool.begin().await?;
+            let value = serde_json::to_string(record)?;
+            sqlx::query(
+                "INSERT INTO mcp_servers (key, value, confirmed, updated_at) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                   confirmed = excluded.confirmed, updated_at = excluded.updated_at",
+            )
+            .bind(&record.id)
+            .bind(value)
+            .bind(record.confirmed as i64)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+            // Count enabled tools from the rows INSIDE the transaction (the
+            // just-written record is read back from the table, not from
+            // memory), so the count is the committed state. json_each over
+            // a missing/null $.tools yields no rows, which counts as 0.
+            let count: i64 = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mcp_servers AS s, \
+                   json_each(json_extract(s.value, '$.tools')) AS t \
+                 WHERE json_extract(t.value, '$.enabled') = 1",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if count > max_enabled as i64 {
+                // Over the cap: return WITHOUT committing - the tx is
+                // dropped here and the write rolls back.
+                return Ok(McpCapOutcome::OverCap {
+                    enabled_total: count as usize,
+                });
+            }
+            tx.commit().await?;
+            Ok(McpCapOutcome::Committed {
+                enabled_total: count as usize,
+            })
         })
     }
 
@@ -2828,6 +2897,91 @@ mod tests {
         assert!(
             server.bitwarden_revision_ts.is_some() && server.bitwarden_updated_at.is_some(),
             "restored server must keep its sync revision metadata"
+        );
+    }
+
+    // ── MCP aggregate tool cap (transactional) ───────────────────────────
+
+    fn mcp_db() -> Database {
+        let db_path =
+            std::env::temp_dir().join(format!("sshspan-mcp-cap-{}.db", uuid::Uuid::new_v4()));
+        Database::open_at(db_path).expect("open test db")
+    }
+
+    fn mcp_record(id: &str, tools: &[(&str, bool)]) -> McpServerRecord {
+        McpServerRecord {
+            id: id.into(),
+            name: format!("srv-{id}"),
+            url: "https://mcp.example.com".into(),
+            auth_type: "none".into(),
+            auth_header_name: None,
+            auth_secret: None,
+            auth_env_var: None,
+            confirmed: true,
+            tools: tools
+                .iter()
+                .map(|(n, enabled)| McpToolRecord {
+                    name: (*n).into(),
+                    display_name: None,
+                    description: String::new(),
+                    enabled: *enabled,
+                    auto_approve: false,
+                    pin_hash: None,
+                    current_hash: None,
+                    input_schema: None,
+                    annotations: None,
+                })
+                .collect(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// The capped save commits a within-cap enable and reports the true
+    /// aggregate enabled total across ALL servers.
+    #[test]
+    fn save_mcp_server_capped_commits_within_cap() {
+        let db = mcp_db();
+        db.save_mcp_server(&mcp_record("a", &[("t1", true), ("t2", false)]))
+            .unwrap();
+        // Enabling t2 on server "a": 2 enabled in total, cap 2.
+        let rec = mcp_record("a", &[("t1", true), ("t2", true)]);
+        match db.save_mcp_server_capped(&rec, 2).unwrap() {
+            McpCapOutcome::Committed { enabled_total } => assert_eq!(enabled_total, 2),
+            McpCapOutcome::OverCap { .. } => panic!("2 of 2 must commit"),
+        }
+        // A second server's enable counts across servers.
+        db.save_mcp_server(&mcp_record("b", &[("u1", false)]))
+            .unwrap();
+        let rec = mcp_record("b", &[("u1", true)]);
+        match db.save_mcp_server_capped(&rec, 2).unwrap() {
+            // 3 enabled total (t1, t2, u1) > cap 2 -> must roll back.
+            McpCapOutcome::OverCap { enabled_total } => assert_eq!(enabled_total, 3),
+            McpCapOutcome::Committed { .. } => panic!("3 of 2 must be over cap"),
+        }
+    }
+
+    /// An over-cap enable is ROLLED BACK: the stored record keeps its
+    /// previous (pre-enable) state, so the refused toggle leaves nothing
+    /// behind - the exact property mcp_set_tool_state relies on.
+    #[test]
+    fn save_mcp_server_capped_rolls_back_over_cap_writes() {
+        let db = mcp_db();
+        db.save_mcp_server(&mcp_record("a", &[("t1", true)]))
+            .unwrap();
+        // Try to enable two more on a second server with cap 2.
+        db.save_mcp_server(&mcp_record("b", &[("u1", false), ("u2", false)]))
+            .unwrap();
+        let rec = mcp_record("b", &[("u1", true), ("u2", true)]);
+        match db.save_mcp_server_capped(&rec, 2).unwrap() {
+            McpCapOutcome::OverCap { enabled_total } => assert_eq!(enabled_total, 3),
+            McpCapOutcome::Committed { .. } => panic!("3 of 2 must be over cap"),
+        }
+        // The write was rolled back: server b is stored still disabled.
+        let stored = db.get_mcp_server("b").unwrap().unwrap();
+        assert!(
+            stored.tools.iter().all(|t| !t.enabled),
+            "an over-cap enable must not persist"
         );
     }
 }

@@ -100,7 +100,8 @@ function mcpGetTools() {
         : 'MCP server "' + sv.name + '", tool "' + t.name + '"';
       const desc = rawDesc.length > MCP_DESC_LIMIT
         ? rawDesc.slice(0, MCP_DESC_LIMIT) : rawDesc;
-      out.push({ name, description: desc, parameters_json: t.parameters_json || '{}' });
+      const parameters_json = mcpValidateToolSchema(t, sv.name, t.name);
+      out.push({ name, description: desc, parameters_json });
     }
   }
   return out;
@@ -149,6 +150,39 @@ async function mcpCallTool(tabId, name, args, approved) {
   });
   if (res && res.is_error) throw new Error(String(res.content == null ? 'MCP tool error' : res.content));
   return res ? String(res.content == null ? '' : res.content) : '';
+}
+
+// Validate that a tool schema coming from the backend is usable JSON and not
+// empty. Returns the schema as a JSON string; throws a visible error if missing/invalid.
+function mcpValidateToolSchema(t, serverName, toolName) {
+  const raw = t && typeof t === 'object' ? t.inputSchema : undefined;
+  if (raw == null) {
+    throw new Error(
+      'MCP tool "' + toolName + '" from server "' + serverName + '" has no inputSchema.'
+    );
+  }
+  let parsed;
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      throw new Error(
+        'MCP tool "' + toolName + '" from server "' + serverName + '" has invalid inputSchema: ' + String(e.message || e)
+      );
+    }
+  } else if (typeof raw === 'object') {
+    parsed = raw;
+  } else {
+    throw new Error(
+      'MCP tool "' + toolName + '" from server "' + serverName + '" has a non-object inputSchema.'
+    );
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      'MCP tool "' + toolName + '" from server "' + serverName + '" has a non-object inputSchema.'
+    );
+  }
+  return typeof raw === 'string' ? raw : JSON.stringify(raw);
 }
 
 // ─── settings: server list ──────────────────────────────────────────────────
@@ -249,19 +283,19 @@ function mcpSecretKind() { const e = mcpF('mcpSecretSource'); return e ? e.value
 
 function mcpShowIf(id, on) { const e = mcpF(id); if (e) e.hidden = !on; }
 
-// bearer / custom-header show a value-source picker: a sealed stored secret
+// bearer / custom_header show a value-source picker: a sealed stored secret
 // (password field, blank keeps the stored one) or the NAME of an environment
 // variable the backend should read.
 function mcpSyncAuthRows() {
   const kind = mcpAuthKind();
   const secret = mcpSecretKind();
-  const withSecret = kind === 'bearer' || kind === 'custom';
+  const withSecret = kind === 'bearer' || kind === 'custom_header';
   mcpShowIf('mcpSecretSourceRow', withSecret);
-  mcpShowIf('mcpHeaderRow', kind === 'custom');
+  mcpShowIf('mcpHeaderRow', kind === 'custom_header');
   mcpShowIf('mcpSecretRow', withSecret && secret === 'stored');
   mcpShowIf('mcpEnvRow', withSecret && secret === 'env');
   const env = mcpF('mcpAuthEnvVar');
-  if (env) env.placeholder = kind === 'custom' ? 'e.g. MY_SERVICE_TOKEN' : 'e.g. GITHUB_MCP_TOKEN';
+  if (env) env.placeholder = kind === 'custom_header' ? 'e.g. MY_SERVICE_TOKEN' : 'e.g. GITHUB_MCP_TOKEN';
   mcpUrlCheck();
 }
 
@@ -356,10 +390,10 @@ async function mcpSaveServer() {
     name,
     url,
     auth_type: kind,
-    auth_header_name: kind === 'custom' ? (val('mcpHeaderName') || null) : null,
-    auth_secret: (kind === 'bearer' || kind === 'custom') && secret === 'stored'
+    auth_header_name: kind === 'custom_header' ? (val('mcpHeaderName') || null) : null,
+    auth_secret: (kind === 'bearer' || kind === 'custom_header') && secret === 'stored'
       ? (val('mcpAuthSecret') || null) : null,
-    auth_env_var: (kind === 'bearer' || kind === 'custom') && secret === 'env'
+    auth_env_var: (kind === 'bearer' || kind === 'custom_header') && secret === 'env'
       ? (val('mcpAuthEnvVar') || null) : null,
   };
   try {

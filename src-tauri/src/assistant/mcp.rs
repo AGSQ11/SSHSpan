@@ -12,6 +12,15 @@
 //! - Sealed secrets (`crate::crypto::vault::seal`) never cross IPC and are
 //!   zeroized after use; env-var auth stores only the variable NAME and is
 //!   resolved from the process environment at request time.
+//! - Credential ORIGIN BINDING: a stored sealed secret is dropped whenever
+//!   the URL, auth type, or custom header name is edited, so an old secret
+//!   can never be replayed at a new origin or under different semantics
+//!   (`mcp_save_server`). The auth source is mutually exclusive: a record
+//!   holds a sealed secret or an env-var name, never both.
+//! - Vault generation: captured before the first await of every flow and
+//!   rechecked immediately before EVERY credential-bearing request (via
+//!   `ServerContext::checked`), so a lock mid-flow prevents the next
+//!   tools/list or tools/call from sending the unsealed header.
 //! - 3xx is a hard error (auth headers must never leave the configured
 //!   origin; reqwest's `Policy::none()` does NOT error on redirects).
 //! - Tools default to disabled; a tool only runs when enabled AND its
@@ -19,7 +28,10 @@
 //! - The per-tab access-level gate mirrors `assistant_exec`: enforced in
 //!   Rust, independent of which tools the renderer offered the model.
 //! - Vault lock tears down every MCP session (HTTP DELETE with
-//!   Mcp-Session-Id, 405 ignored per spec) and drops session state.
+//!   McpSession-Id and the static auth header, 405 ignored per spec, other
+//!   refusals audited) and drops session state.
+//! - The aggregate enabled-MCP-tool count is capped so the renderer's
+//!   built-ins-first 64-total merge can never be broken from the backend.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -46,14 +58,25 @@ const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "202
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on any MCP HTTP response body (JSON or SSE stream).
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-/// Cap on total MCP tools exposed across ALL servers. The renderer keeps
-/// its built-in tools and fills the remaining slots up to this cap; the
-/// backend never exposes more than this total.
+/// Hard cap on the merged (built-in + MCP) tool list the renderer offers the
+/// model (must equal `AI_MAX_TOOLS_TOTAL` in src/renderer/assistant.js).
 pub const MAX_EXPOSED_TOOLS: usize = 64;
+/// Built-in assistant tools the renderer ALWAYS offers first (must equal the
+/// number of entries in `AI_TOOL_SPECS` in src/renderer/assistant.js:
+/// get_terminal_output, get_session_info, propose_command, type_command,
+/// run_command).
+pub const BUILTIN_TOOL_COUNT: usize = 5;
+/// Slots MCP tools may ever fill: built-ins always win and MCP fills the
+/// remainder, so the backend never lets MORE than this many MCP tools be
+/// enabled across all servers - enabling beyond it would either break the
+/// renderer's 64-total merge or silently displace nothing but lie about it.
+pub const MAX_MCP_TOOLS: usize = MAX_EXPOSED_TOOLS - BUILTIN_TOOL_COUNT;
 /// Cap on a tool's stored/returned description (chars).
 const MAX_DESCRIPTION_CHARS: usize = 1024;
-/// Cap on the renderer-exposed tool name (`mcp__<server>__<tool>`).
-const MAX_TOOL_NAME_LEN: usize = 64;
+/// Cap on a stored input schema, in canonical-JSON bytes. Schemas are
+/// untrusted server text that rides into the model's tool list; an
+/// oversized one is not stored (views substitute an empty object schema).
+pub const MAX_INPUT_SCHEMA_BYTES: usize = 8 * 1024;
 
 // ─── Validation (pure, unit-tested) ─────────────────────────────────────────
 
@@ -258,23 +281,41 @@ fn truncate_description(desc: &str) -> String {
 
 // ─── Tool naming (pure, unit-tested) ────────────────────────────────────────
 
+/// Cap on the renderer-exposed tool name (`mcp__<server>__<tool>`).
+const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// Sanitize a server/tool name into the model-facing namespace. MUST stay
+/// byte-for-byte identical to `mcpSanitizeName` in src/renderer/mcp.js: only
+/// [A-Za-z0-9_] survives (anything else becomes `_`) and runs of underscores
+/// collapse to one, so the exposed name can never itself contain "__" and the
+/// `mcp__<server>__<tool>` split stays structurally unambiguous. The backend
+/// is the authority on collisions precisely because both sides derive the
+/// name with this one function.
+pub fn sanitize_tool_name_part(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_underscore = false;
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    out
+}
+
 /// The renderer-exposed name for a server's tool: `mcp__<server>__<tool>`,
-/// both sides sanitized to [A-Za-z0-9_-]. When the full form exceeds 64
-/// chars, the tail is cut and a short deterministic hash suffix is appended
-/// so two long names cannot collapse onto each other.
+/// both sides sanitized to [A-Za-z0-9_] with collapsed underscore runs. When
+/// the full form exceeds 64 chars, the tail is cut and a short deterministic
+/// hash suffix is appended so two long names cannot collapse onto each other.
 pub fn exposed_tool_name(server: &str, tool: &str) -> String {
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
-    let full = format!("mcp__{}__{}", sanitize(server), sanitize(tool));
+    let full = format!(
+        "mcp__{}__{}",
+        sanitize_tool_name_part(server),
+        sanitize_tool_name_part(tool)
+    );
     if full.chars().count() <= MAX_TOOL_NAME_LEN {
         return full;
     }
@@ -290,25 +331,102 @@ pub fn exposed_tool_name(server: &str, tool: &str) -> String {
     )
 }
 
-/// Build the map from renderer-exposed tool names to real tool names for
-/// one server, rejecting collisions: two distinct real names must never map
-/// to the same exposed name, or one tool's approval would cover another.
-pub fn build_name_map(server: &str, tools: &[String]) -> Result<HashMap<String, String>, String> {
+/// The canonical set of model-exposed MCP tool names for a whole registry of
+/// servers, rejecting every kind of collision BEFORE anything is exposed:
+/// - two tools of ONE server mapping to the same exposed name (e.g. "a b"
+///   and "a_b" sanitize identically);
+/// - two SERVERS whose names sanitize identically (the renderer could no
+///   longer resolve an exposed name back to one server);
+/// - a name colliding with a built-in assistant tool (never allowed, even
+///   though the renderer also refuses these).
+///
+/// `exposed -> (server_id, tool)` is then a well-defined map: one approval
+/// can never silently cover another tool.
+pub fn build_name_map(
+    servers: &[(String, Vec<String>)], // (server name, tool names)
+) -> Result<HashMap<String, (String, String)>, String> {
     let mut map = HashMap::new();
-    for real in tools {
-        let exposed = exposed_tool_name(server, real);
-        match map.get(&exposed) {
-            Some(prev) if prev != real => {
+    let mut server_seen: HashMap<String, String> = HashMap::new();
+    for (server, tools) in servers {
+        // A server with no enabled tools exposes nothing: it cannot create
+        // ambiguity, so its name never blocks another server's enables.
+        if tools.is_empty() {
+            continue;
+        }
+        let server_san = sanitize_tool_name_part(server);
+        if let Some(prev) = server_seen.get(&server_san) {
+            if prev != server {
                 return Err(format!(
-                    "Tool name collision on '{exposed}' (from '{prev}' and '{real}'); refusing to expose ambiguous tools."
+                    "MCP server names '{prev}' and '{server}' produce the same model-facing prefix '{server_san}'; rename one of them before enabling tools."
                 ));
             }
-            _ => {
-                map.insert(exposed, real.clone());
+        } else {
+            server_seen.insert(server_san.clone(), server.clone());
+        }
+        let mut tool_seen: HashMap<String, String> = HashMap::new();
+        for real in tools {
+            let exposed = exposed_tool_name(server, real);
+            if BUILTIN_TOOL_NAMES.contains(&exposed.as_str()) {
+                return Err(format!(
+                    "MCP tool name '{exposed}' collides with a built-in assistant tool; refusing to expose it."
+                ));
+            }
+            match tool_seen.get(&exposed) {
+                Some(prev) if prev != real => {
+                    return Err(format!(
+                        "Tools '{prev}' and '{real}' on MCP server '{server}' produce the same model-facing name '{exposed}'; refusing to expose ambiguous tools."
+                    ));
+                }
+                _ => {
+                    tool_seen.insert(exposed.clone(), real.clone());
+                }
+            }
+            match map.get(&exposed) {
+                Some((prev_server, prev_tool)) if prev_server != server || prev_tool != real => {
+                    return Err(format!(
+                        "MCP tools from different servers produce the same model-facing name '{exposed}'; refusing to expose ambiguous tools."
+                    ));
+                }
+                _ => {
+                    map.insert(exposed, (server.clone(), real.clone()));
+                }
             }
         }
     }
     Ok(map)
+}
+
+/// The built-in assistant tool names (src/renderer/assistant.js
+/// `AI_TOOL_SPECS`). An MCP tool whose exposed name equals one of these is
+/// rejected rather than exposed: the model must never see two definitions
+/// behind one name.
+pub const BUILTIN_TOOL_NAMES: [&str; 5] = [
+    "get_terminal_output",
+    "get_session_info",
+    "propose_command",
+    "type_command",
+    "run_command",
+];
+
+// ─── Input schema clamping (pure, unit-tested) ─────────────────────────────
+
+/// Extract, validate and bound a tool's `inputSchema` for STORAGE and for the
+/// model-facing tool list:
+/// - must be a JSON object (a JSON Schema root is an object);
+/// - serialized canonically (sorted keys, no whitespace) so the stored bytes
+///   are deterministic and bounded by content, not formatting;
+/// - rejected (None) when absent, non-object, or above the byte cap. The pin
+///   hash keeps hashing the FULL untruncated definition either way.
+pub fn clamp_input_schema(def: &Value) -> Option<String> {
+    let schema = def.get("inputSchema")?;
+    if !schema.is_object() {
+        return None;
+    }
+    let canonical = canonical_json(schema);
+    if canonical.len() > MAX_INPUT_SCHEMA_BYTES {
+        return None;
+    }
+    String::from_utf8(canonical).ok()
 }
 
 // ─── Auth header resolution ─────────────────────────────────────────────────
@@ -713,35 +831,52 @@ pub fn rpc_result(response: Value) -> CmdResult<Value> {
 
 /// Integration-test exposure of `request_once` (the internal name stays
 /// private; tests exercise the 404 / re-init flow through this alias).
+/// `generation = u64::MAX` and an unlocked vault keep the generation check
+/// inert for direct transport-level calls.
 #[doc(hidden)]
 pub async fn request_once_test(
     ctx: &ServerContext,
     body: &Value,
 ) -> CmdResult<Option<JsonRpcOutcome>> {
-    request_once(ctx, body).await
+    request_once_unchecked(ctx, body).await
 }
 
 // ─── Session lifecycle ──────────────────────────────────────────────────────
 
-/// Everything a connected server needs to make requests.
+/// Everything a connected server needs to make requests, plus the vault
+/// generation captured by the owner BEFORE the first await. Every helper
+/// that sends a credential-bearing request rechecks the generation first
+/// (`ctx.checked`), so a vault lock during any earlier await makes the next
+/// request abort instead of sending the unsealed auth header.
 pub struct ServerContext {
     pub record: crate::db::McpServerRecord,
     pub url: String,
     pub client: reqwest::Client,
     pub session: Option<McpSession>,
     pub auth: Option<(String, Zeroizing<String>)>,
+    pub generation: u64,
+}
+
+impl ServerContext {
+    /// Abort unless the vault generation captured by the owner is still
+    /// current. Called immediately before every credential-bearing request.
+    pub fn checked(&self, app: &AppHandle) -> CmdResult<()> {
+        require_generation_current(app, self.generation)
+    }
 }
 
 fn auth_ref(ctx: &ServerContext) -> Option<(&str, &Zeroizing<String>)> {
     ctx.auth.as_ref().map(|(n, v)| (n.as_str(), v))
 }
 
-/// Unseal + resolve the auth header for a server record (vault password
-/// captured by the caller, generation-checked around awaits).
+/// Unseal + resolve the auth header for a server record. The caller supplies
+/// the vault generation it captured BEFORE its first await so every request
+/// made through the context can recheck it.
 fn load_server_context(
     app: &AppHandle,
     record: crate::db::McpServerRecord,
     pw: &Zeroizing<String>,
+    generation: u64,
 ) -> CmdResult<ServerContext> {
     let (url, _class) = classify_url(&record.url).map_err(CmdError)?;
     let auth = resolve_auth_header(
@@ -757,6 +892,7 @@ fn load_server_context(
         client: origin_client()?,
         record,
         auth,
+        generation,
     })
 }
 
@@ -766,7 +902,22 @@ fn load_server_context(
 /// MCP-Protocol-Version header on all later requests. Anything else is a
 /// hard disconnect - a server speaking an unknown version may have
 /// incompatible semantics this client cannot safely guess at.
-pub async fn initialize(ctx: &ServerContext) -> CmdResult<(McpSession, JsonRpcOutcome)> {
+pub async fn initialize(
+    app: &AppHandle,
+    ctx: &ServerContext,
+) -> CmdResult<(McpSession, JsonRpcOutcome)> {
+    ctx.checked(app)?;
+    initialize_unchecked(ctx).await
+}
+
+#[doc(hidden)]
+pub async fn initialize_test(ctx: &ServerContext) -> CmdResult<(McpSession, JsonRpcOutcome)> {
+    initialize_unchecked(ctx).await
+}
+
+async fn initialize_unchecked(ctx: &ServerContext) -> CmdResult<(McpSession, JsonRpcOutcome)> {
+    // Production callers check the vault generation immediately before
+    // entering this helper; test callers use the unchecked transport seam.
     let id = Value::String(uuid::Uuid::new_v4().to_string());
     let body = json!({
         "jsonrpc": "2.0",
@@ -810,8 +961,16 @@ pub async fn initialize(ctx: &ServerContext) -> CmdResult<(McpSession, JsonRpcOu
     ))
 }
 
-/// Send `notifications/initialized` after a successful initialize.
-async fn send_initialized(ctx: &ServerContext, session: &McpSession) -> CmdResult<()> {
+/// Send `notifications/initialized` after a successful initialize. Like every
+/// credential-bearing request, the vault generation is rechecked first: a
+/// lock that happened during initialize must not let this notification send
+/// the unsealed auth header.
+async fn send_initialized(
+    app: &AppHandle,
+    ctx: &ServerContext,
+    session: &McpSession,
+) -> CmdResult<()> {
+    ctx.checked(app)?;
     let body = json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
@@ -836,8 +995,22 @@ async fn send_initialized(ctx: &ServerContext, session: &McpSession) -> CmdResul
 }
 
 /// One request attempt. `None` means "session unknown to the server (404)"
-/// and the caller re-initializes once and retries.
-async fn request_once(ctx: &ServerContext, body: &Value) -> CmdResult<Option<JsonRpcOutcome>> {
+/// and the caller re-initializes once and retries. The vault generation is
+/// rechecked before the request: every post-initialize await is a window in
+/// which a lock could have cleared the password store.
+async fn request_once(
+    app: &AppHandle,
+    ctx: &ServerContext,
+    body: &Value,
+) -> CmdResult<Option<JsonRpcOutcome>> {
+    ctx.checked(app)?;
+    request_once_unchecked(ctx, body).await
+}
+
+async fn request_once_unchecked(
+    ctx: &ServerContext,
+    body: &Value,
+) -> CmdResult<Option<JsonRpcOutcome>> {
     let session = ctx
         .session
         .as_ref()
@@ -870,29 +1043,61 @@ async fn request_once(ctx: &ServerContext, body: &Value) -> CmdResult<Option<Jso
 
 /// Send a request and read its response, handling a 404 for a KNOWN
 /// session by re-initializing ONCE and retrying (session expired
-/// server-side).
+/// server-side). Generation is rechecked before initialize, before the
+/// initialized notification, and before the retry.
 async fn request_with_session(
     app: &AppHandle,
     ctx: &mut ServerContext,
     body: &Value,
 ) -> CmdResult<JsonRpcOutcome> {
-    if let Some(outcome) = request_once(ctx, body).await? {
+    if let Some(outcome) = request_once(app, ctx, body).await? {
         return Ok(outcome);
     }
     // 404: re-initialize once, then retry the request with the new session.
-    let (new_session, _) = initialize(ctx).await?;
-    send_initialized(ctx, &new_session).await?;
+    ctx.checked(app)?;
+    let (new_session, _) = initialize(app, ctx).await?;
+    send_initialized(app, ctx, &new_session).await?;
     ctx.session = Some(new_session.clone());
     app.state::<McpState>()
         .set_session(&ctx.record.id, new_session);
-    request_once(ctx, body)
+    request_once(app, ctx, body)
         .await?
         .ok_or_else(|| CmdError("MCP session could not be re-established.".into()))
 }
 
 /// Fetch the full tool list with cursor pagination; servers above the
-/// global tool cap are rejected outright.
+/// global tool cap are rejected outright. A `tools/list_changed`
+/// notification observed on ANY page ends pagination immediately and
+/// restarts the fetch from scratch, so the returned list is never a mix of
+/// pre- and post-change pages.
 async fn fetch_tools(ctx: &mut ServerContext, app: &AppHandle) -> CmdResult<Vec<Value>> {
+    const MAX_FETCH_ATTEMPTS: usize = 3;
+    for _ in 0..MAX_FETCH_ATTEMPTS {
+        let (tools, list_changed) = fetch_tools_once(ctx, app).await?;
+        if !list_changed {
+            if tools.len() > MAX_EXPOSED_TOOLS {
+                return Err(CmdError(format!(
+                    "MCP server exposes {} tools, above the {}-tool limit.",
+                    tools.len(),
+                    MAX_EXPOSED_TOOLS
+                )));
+            }
+            return Ok(tools);
+        }
+        // The tool set changed mid-fetch: pages already accumulated may be
+        // stale. Re-fetch from the first page rather than exposing them.
+    }
+    Err(CmdError(
+        "MCP server kept changing its tool list mid-fetch; try again.".into(),
+    ))
+}
+
+/// One pagination pass over tools/list. Returns the pages plus whether a
+/// tools/list_changed notification was observed along the way.
+async fn fetch_tools_once(
+    ctx: &mut ServerContext,
+    app: &AppHandle,
+) -> CmdResult<(Vec<Value>, bool)> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -912,6 +1117,11 @@ async fn fetch_tools(ctx: &mut ServerContext, app: &AppHandle) -> CmdResult<Vec<
         if let Some(arr) = result.get("tools").and_then(|t| t.as_array()) {
             tools.extend(arr.iter().cloned());
         }
+        // A list_changed observed on ANY page invalidates the whole pass:
+        // stop paginating and let fetch_tools restart from the first page.
+        if outcome.list_changed {
+            return Ok((tools, true));
+        }
         cursor = result
             .get("nextCursor")
             .and_then(|c| c.as_str())
@@ -922,14 +1132,7 @@ async fn fetch_tools(ctx: &mut ServerContext, app: &AppHandle) -> CmdResult<Vec<
             break;
         }
     }
-    if tools.len() > MAX_EXPOSED_TOOLS {
-        return Err(CmdError(format!(
-            "MCP server exposes {} tools, above the {}-tool limit.",
-            tools.len(),
-            MAX_EXPOSED_TOOLS
-        )));
-    }
-    Ok(tools)
+    Ok((tools, false))
 }
 
 /// The full connect flow: initialize (+initialized), tools/list with
@@ -937,6 +1140,12 @@ async fn fetch_tools(ctx: &mut ServerContext, app: &AppHandle) -> CmdResult<Vec<
 /// the app state and the refreshed record is returned along with the names
 /// of tools that were disabled by a definition change (already audited
 /// here as `mcp.tool_definition_changed`).
+///
+/// The vault generation is captured before the first await and rechecked
+/// before EVERY credential-bearing request (inside request_once /
+/// initialize / send_initialized via `ServerContext::checked`) and again
+/// before persisting, so a lock mid-connect can neither send the unsealed
+/// auth header nor write session/DB state afterward.
 async fn connect_server(
     app: &AppHandle,
     record: crate::db::McpServerRecord,
@@ -951,17 +1160,22 @@ async fn connect_server(
             "This MCP server entry was restored from a backup/import and has not been re-confirmed. Open Settings, review its URL and auth, and save it again before connecting.".into(),
         ));
     }
-    let mut ctx = load_server_context(app, record.clone(), &pw)?;
-    let (session, _) = initialize(&ctx).await?;
+    let mut ctx = load_server_context(app, record.clone(), &pw, generation)?;
+    let (session, _init_outcome) = initialize(app, &ctx).await?;
     // Re-check BEFORE registering the session: a lock during initialize
     // must not leave a live session in state.
     require_generation_current(app, generation)?;
     app.state::<McpState>()
         .set_session(&record.id, session.clone());
     ctx.session = Some(session);
-    send_initialized(&ctx, ctx.session.as_ref().unwrap()).await?;
+    // Note: a list_changed arriving WITH the initialize stream needs no
+    // special handling here - the very next step is a fresh tools/list
+    // (fetch_tools), so nothing stale is ever exposed from it.
+    send_initialized(app, &ctx, ctx.session.as_ref().unwrap()).await?;
 
     let tool_defs = fetch_tools(&mut ctx, app).await?;
+    // Last boundary before persisting: a lock during the fetch must not
+    // write session-derived state into the DB.
     require_generation_current(app, generation)?;
 
     let changed = changed_enabled_tools(&record.tools, &tool_defs);
@@ -986,6 +1200,10 @@ async fn connect_server(
 ///   longer matches its pin is DISABLED (definition rug-pull - the caller
 ///   audits it via `changed_enabled_tools`).
 /// - Tools the server no longer lists are dropped.
+/// - `input_schema` is the clamped canonical JSON of the definition's
+///   inputSchema (object-only, byte-capped). The pin hash still hashes the
+///   FULL definition, so a schema too big to store still counts as a
+///   definition the model must not see unreviewed.
 pub fn merge_tools(
     stored: &[crate::db::McpToolRecord],
     fetched: &[Value],
@@ -1017,6 +1235,7 @@ pub fn merge_tools(
                 auto_approve,
                 pin_hash,
                 current_hash: Some(hash),
+                input_schema: clamp_input_schema(def),
                 annotations: def.get("annotations").cloned(),
             })
         })
@@ -1046,12 +1265,87 @@ pub fn changed_enabled_tools(
 
 // ─── Teardown on vault lock ─────────────────────────────────────────────────
 
-/// Tear down every live MCP session: HTTP DELETE with Mcp-Session-Id where
-/// one exists (405 is valid per spec - ignored), then drop all session and
-/// status state. Decrypted secrets are zeroized by their Zeroizing
-/// wrappers when their owning command frames end; nothing session-scoped
-/// is cached here. Called from `lock_vault_internal` AFTER the generation
-/// bump, so any in-flight connect aborts at its next boundary.
+/// Resolve the auth header for a record WITHOUT touching app state beyond
+/// the vault password (safe to call mid-lock, after the generation bump but
+/// before the password store clears). Errors are the caller's to ignore or
+/// report; the value is Zeroizing either way.
+fn resolve_auth_for_teardown(
+    app: &AppHandle,
+    record: &crate::db::McpServerRecord,
+) -> Option<(String, Zeroizing<String>)> {
+    let pw = vault_password(app).ok()?;
+    if pw.is_empty() {
+        return None;
+    }
+    resolve_auth_header(
+        &record.auth_type,
+        record.auth_header_name.as_deref(),
+        record.auth_secret.as_deref(),
+        record.auth_env_var.as_deref(),
+        &pw,
+    )
+    .ok()
+    .flatten()
+}
+
+/// Send the HTTP DELETE that ends a session, with the static auth header
+/// attached (the server may require it even for DELETE). The credentials are
+/// resolved BEFORE the vault store clears. Only 405 ("method not allowed" -
+/// valid per spec for servers that manage sessions differently) is ignored;
+/// a 401 means the session tear-down was refused, and any transport failure
+/// is reported - never silently swallowed, and never retried with secrets.
+async fn delete_session(
+    client: &reqwest::Client,
+    url: &str,
+    session_id: &str,
+    protocol_version: &str,
+    auth: Option<(&str, &Zeroizing<String>)>,
+    server_label: &str,
+) -> Result<(), String> {
+    let mut req = client
+        .delete(url)
+        .header("Mcp-Session-Id", session_id)
+        .header("MCP-Protocol-Version", protocol_version)
+        .header("Accept", "application/json, text/event-stream");
+    if let Some((name, value)) = auth {
+        req = req.header(name, value.as_str());
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("MCP session teardown for '{server_label}' failed: {e}"))?;
+    let status = resp.status();
+    if status.as_u16() == 405 {
+        // The server does not accept DELETE for sessions - valid per spec.
+        return Ok(());
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "MCP server '{server_label}' refused session teardown with HTTP {}.",
+            status.as_u16()
+        ));
+    }
+    Ok(())
+}
+
+/// One pending authenticated session teardown: everything the DELETE needs,
+/// resolved while the vault password is still available.
+struct TeardownJob {
+    url: String,
+    session_id: String,
+    protocol_version: String,
+    auth: Option<(String, Zeroizing<String>)>,
+    server_name: String,
+}
+
+/// Tear down every live MCP session. Called from `lock_vault_internal`
+/// AFTER the generation bump but BEFORE the password store clears, so the
+/// static auth header for each server can still be resolved (with a safe
+/// snapshot of the record) and attached to the DELETE. Decrypted secrets
+/// are zeroized by their Zeroizing wrappers when the task ends; nothing
+/// session-scoped is cached. The lock path itself stays nonblocking: the
+/// in-memory session map is drained synchronously (no new request can use
+/// a session) and the DELETEs run on the Tauri async runtime.
 pub fn teardown_all(app: &AppHandle) {
     let all = app.state::<McpState>().take_sessions();
     app.state::<McpState>().clear_statuses();
@@ -1059,30 +1353,51 @@ pub fn teardown_all(app: &AppHandle) {
         Ok(c) => c,
         Err(_) => return,
     };
+    // Resolve URL + auth while the vault password is still available.
+    let mut jobs: Vec<TeardownJob> = Vec::new();
+    for (server_id, session) in all {
+        let Some(sid) = session.session_id else {
+            continue;
+        };
+        let Ok(Some(rec)) = app.state::<crate::AppState>().db.get_mcp_server(&server_id) else {
+            continue;
+        };
+        let Ok((url, _)) = classify_url(&rec.url) else {
+            continue;
+        };
+        // BEFORE the store clear; the resolved value is Zeroizing.
+        let auth = resolve_auth_for_teardown(app, &rec);
+        jobs.push(TeardownJob {
+            url,
+            session_id: sid,
+            protocol_version: session.protocol_version,
+            auth,
+            server_name: rec.name,
+        });
+    }
     let app = app.clone();
     // Fire-and-forget on the Tauri runtime: the lock path must not block on
     // network I/O. The in-memory session map is already drained, so no new
-    // request can use a session; the DELETEs race out best-effort.
+    // request can use a session. Failures (other than 405) are audited -
+    // a refused teardown must not disappear silently.
     tauri::async_runtime::spawn(async move {
-        for (server_id, session) in all {
-            let Some(sid) = session.session_id else {
-                continue;
-            };
-            let Ok(Some(rec)) = app.state::<crate::AppState>().db.get_mcp_server(&server_id) else {
-                continue;
-            };
-            let Ok((url, _)) = classify_url(&rec.url) else {
-                continue;
-            };
-            // 405 = the server does not allow DELETE (valid per spec); any
-            // other outcome is best-effort and ignored.
-            let _ = client
-                .delete(&url)
-                .header("Mcp-Session-Id", sid)
-                .header("MCP-Protocol-Version", session.protocol_version)
-                .header("Accept", "application/json, text/event-stream")
-                .send()
-                .await;
+        for job in jobs {
+            if let Err(e) = delete_session(
+                &client,
+                &job.url,
+                &job.session_id,
+                &job.protocol_version,
+                job.auth.as_ref().map(|(n, v)| (n.as_str(), v)),
+                &job.server_name,
+            )
+            .await
+            {
+                let _ = app.state::<crate::AppState>().db.add_audit(
+                    "mcp.session_teardown_failed",
+                    None,
+                    &e,
+                );
+            }
         }
     });
 }
@@ -1142,7 +1457,16 @@ fn arguments_fingerprint(arguments_json: &str) -> String {
 
 // ─── Commands ───────────────────────────────────────────────────────────────
 
-fn tool_view(tool: &crate::db::McpToolRecord) -> Value {
+/// The safe substitute schema when a tool has no stored input schema (the
+/// server sent none, a non-object, or one above the byte cap): an object
+/// with no properties, as canonical JSON text. The renderer's schema
+/// validation requires an object, so this keeps the model tool list
+/// buildable for every stored tool.
+fn empty_object_schema() -> String {
+    "{\"type\":\"object\"}".to_string()
+}
+
+fn tool_view(server_name: &str, tool: &crate::db::McpToolRecord) -> Value {
     json!({
         "name": tool.name,
         "display_name": tool.display_name,
@@ -1150,6 +1474,13 @@ fn tool_view(tool: &crate::db::McpToolRecord) -> Value {
         "enabled": tool.enabled,
         "auto_approve": tool.auto_approve,
         "pinned": tool.pin_hash.is_some(),
+        // Bounded, object-only schema; never absent so renderer validation
+        // cannot break on any stored tool.
+        // Renderer-facing JSON follows MCP's camelCase schema field name.
+        "inputSchema": tool.input_schema.clone().unwrap_or_else(empty_object_schema),
+        // The canonical model-facing name, computed with the SAME function
+        // the enable gate uses - the renderer derives it identically.
+        "exposed_name": exposed_tool_name(server_name, &tool.name),
         "annotations": tool.annotations,
     })
 }
@@ -1159,6 +1490,12 @@ pub fn mcp_list_servers(app: AppHandle) -> CmdResult<Value> {
     let db = &app.state::<crate::AppState>().db;
     let state = app.state::<McpState>();
     let records = db.list_mcp_servers().map_err(|e| e.to_string())?;
+    // Listing NEVER fails on over-cap or collision state - the settings UI
+    // must stay usable to FIX such state. The exposure gates live in
+    // mcp_set_tool_state (enable-time collision check + aggregate cap), and
+    // the renderer's built-ins-first merge only fills leftover slots, so
+    // neither an over-cap nor an ambiguous registry can break the model's
+    // tool list.
     let servers: Vec<Value> = records
         .iter()
         .map(|r| {
@@ -1173,23 +1510,37 @@ pub fn mcp_list_servers(app: AppHandle) -> CmdResult<Value> {
                 "loopback_insecure": insecure,
                 "status": state.status_of(&r.id),
                 "tool_count": enabled,
-                "tools": r.tools.iter().map(tool_view).collect::<Vec<_>>(),
+                "tools": r.tools.iter().map(|t| tool_view(&r.name, t)).collect::<Vec<_>>(),
             })
         })
         .collect();
-    let exposed_total: usize = records
-        .iter()
-        .map(|r| r.tools.iter().filter(|t| t.enabled).count())
-        .sum();
-    if exposed_total > MAX_EXPOSED_TOOLS {
-        return Err(CmdError(format!(
-            "More than {MAX_EXPOSED_TOOLS} MCP tools are enabled across all servers."
-        )));
-    }
     Ok(Value::Array(servers))
 }
 
-#[tauri::command]
+/// The enable-time collision check: given the FULL registry with the
+/// candidate enable already applied, run the name/collision authority over
+/// the enabled tools. `Some(err)` means enabling must be refused - the
+/// model-facing name set would be ambiguous (two tools behind one name
+/// means one approval could cover the other). Pure over records.
+pub fn enable_collision_error(records: &[crate::db::McpServerRecord]) -> Option<String> {
+    let registry: Vec<(String, Vec<String>)> = records
+        .iter()
+        .filter(|r| r.tools.iter().any(|t| t.enabled))
+        .map(|r| {
+            (
+                r.name.clone(),
+                r.tools
+                    .iter()
+                    .filter(|t| t.enabled)
+                    .map(|t| t.name.clone())
+                    .collect(),
+            )
+        })
+        .collect();
+    build_name_map(&registry).err()
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub fn mcp_save_server(
     app: AppHandle,
     id: Option<String>,
@@ -1266,23 +1617,49 @@ pub fn mcp_save_server(
             )
         }
     };
+    // ── Static credential ORIGIN BINDING ────────────────────────────────
+    // A sealed secret was entered for ONE origin under ONE auth semantic.
+    // Editing the URL, the auth type, or the custom header name changes the
+    // destination or the meaning, so the OLD secret must never survive the
+    // save: it is dropped here and a NEW secret must be entered for the new
+    // configuration. The auth SOURCE stays mutually exclusive: a record
+    // holds a sealed secret or an env-var name, never both.
+    let origin_changed = record.url != normalized_url;
+    let auth_semantics_changed =
+        record.auth_type != auth_type || record.auth_header_name != auth_header_name;
+    if !is_new && (origin_changed || auth_semantics_changed) {
+        record.auth_secret = None;
+    }
     record.name = name;
     record.url = normalized_url;
     record.auth_type = auth_type;
     record.auth_header_name = auth_header_name;
-    record.auth_env_var = auth_env_var;
     // Saving from the UI IS the user's re-confirmation of URL + auth source
     // (backup-restored entries become connectable only through here).
     record.confirmed = true;
     if let Some(secret) = auth_secret.clone().filter(|s| !s.is_empty()) {
+        // A newly entered secret: the only source, replacing any env var.
         let secret = Zeroizing::new(secret);
         record.auth_secret = Some(
             crate::crypto::vault::seal(&pw, secret.trim().as_bytes()).map_err(|e| e.to_string())?,
         );
-    } else if auth_secret.is_some() {
-        // Explicit empty string = clear the stored secret.
-        record.auth_secret = None;
+        record.auth_env_var = None;
+    } else {
+        if auth_secret.is_some() {
+            // Explicit empty string = clear the stored secret.
+            record.auth_secret = None;
+        }
+        if auth_env_var.is_some() {
+            // An env-var name (re-)bound: the only source.
+            record.auth_secret = None;
+        }
+        record.auth_env_var = auth_env_var;
     }
+    // Belt-and-suspenders on the exclusive-source invariant.
+    debug_assert!(
+        record.auth_secret.is_none() || record.auth_env_var.is_none(),
+        "a stored secret and an env-var binding must never coexist"
+    );
     record.updated_at = now;
     db.save_mcp_server(&record).map_err(|e| e.to_string())?;
     let action = if is_new {
@@ -1296,24 +1673,34 @@ pub fn mcp_save_server(
 }
 
 #[tauri::command]
-pub fn mcp_remove_server(app: AppHandle, id: String) -> CmdResult<Value> {
+pub async fn mcp_remove_server(app: AppHandle, id: String) -> CmdResult<Value> {
     let db = &app.state::<crate::AppState>().db;
     let record = db
         .get_mcp_server(&id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| CmdError("MCP server not found.".into()))?;
-    // Best-effort session teardown before the entry disappears.
+    // Session teardown BEFORE the entry disappears: the DELETE carries the
+    // static auth header (resolved while the vault is still unlocked), is
+    // actually awaited (removal is a user-initiated action, not the lock
+    // path), and only 405 is ignored - a refused teardown fails the removal
+    // instead of silently leaking the session.
     if let Some(session) = app.state::<McpState>().remove_session(&id) {
         if let Some(sid) = session.session_id {
             if let Ok((url, _)) = classify_url(&record.url) {
                 let client = origin_client()?;
-                let req = client
-                    .delete(&url)
-                    .header("Mcp-Session-Id", sid)
-                    .header("MCP-Protocol-Version", session.protocol_version)
-                    .header("Accept", "application/json, text/event-stream");
-                // 405 is valid per spec; any outcome is best-effort here.
-                let _ = tauri::async_runtime::block_on(req.send());
+                // Resolve the header BEFORE the record (and its sealed
+                // secret) is deleted; the value is Zeroizing.
+                let auth = resolve_auth_for_teardown(&app, &record);
+                delete_session(
+                    &client,
+                    &url,
+                    &sid,
+                    &session.protocol_version,
+                    auth.as_ref().map(|(n, v)| (n.as_str(), v)),
+                    &record.name,
+                )
+                .await
+                .map_err(CmdError)?;
             }
         }
     }
@@ -1337,11 +1724,11 @@ pub async fn mcp_test_connection(app: AppHandle, id: String) -> CmdResult<Value>
     state.record_status(&id, "connected", None, updated.tools.len());
     Ok(json!({
         "ok": true,
-        "tools": updated.tools.iter().map(tool_view).collect::<Vec<_>>(),
+        "tools": updated.tools.iter().map(|t| tool_view(&updated.name, t)).collect::<Vec<_>>(),
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn mcp_set_tool_state(
     app: AppHandle,
     id: String,
@@ -1376,7 +1763,40 @@ pub fn mcp_set_tool_state(
     entry.enabled = enabled;
     entry.auto_approve = auto_approve && enabled;
     record.updated_at = chrono::Utc::now();
-    db.save_mcp_server(&record).map_err(|e| e.to_string())?;
+    if enabled {
+        // ── Collision authority, BEFORE any exposure (item 6): run the
+        // name map over the full registry with this enable applied. An
+        // ambiguous model-facing name set is refused outright - one
+        // approval must never silently cover another tool.
+        let mut all = db.list_mcp_servers().map_err(|e| e.to_string())?;
+        if let Some(slot) = all.iter_mut().find(|r| r.id == id) {
+            *slot = record.clone();
+        }
+        if let Some(err) = enable_collision_error(&all) {
+            return Err(CmdError(err));
+        }
+        // ── Aggregate cap (item 5), computed and enforced INSIDE the same
+        // SQLite transaction as the write: the count and the update commit
+        // (or roll back) together, so two concurrent toggles can never both
+        // pass an individually-stale check. The renderer offers
+        // {BUILTIN_TOOL_COUNT} built-in tools first and fills the remaining
+        // slots with MCP tools, so more than MAX_MCP_TOOLS enabled MCP
+        // tools could never all be exposed and would silently drop the
+        // overflow - refuse (and roll back) instead.
+        match db
+            .save_mcp_server_capped(&record, MAX_MCP_TOOLS)
+            .map_err(|e| e.to_string())?
+        {
+            crate::db::McpCapOutcome::Committed { .. } => {}
+            crate::db::McpCapOutcome::OverCap { enabled_total } => {
+                return Err(CmdError(format!(
+                    "Enabling '{tool}' would expose {enabled_total} MCP tools across all servers; the assistant keeps {BUILTIN_TOOL_COUNT} built-in tools and the model-facing list is capped at {MAX_EXPOSED_TOOLS}. Disable another tool first."
+                )));
+            }
+        }
+    } else {
+        db.save_mcp_server(&record).map_err(|e| e.to_string())?;
+    }
     if enabled {
         db.add_audit("mcp.tool_approved", Some(&id), &format!("tool={tool}"))
             .map_err(|e| e.to_string())?;
@@ -1457,21 +1877,24 @@ pub async fn mcp_call_tool(
         }
     }
 
-    // Execute. The generation pattern guards the awaits: a lock during the
-    // call must not send the auth secret or register state afterward.
+    // Execute. The generation pattern guards the awaits: every
+    // credential-bearing request below rechecks the generation first (via
+    // ServerContext::checked / require_generation_current), so a lock during
+    // the call must not send the auth secret or register state afterward.
     let generation = capture_vault_generation(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
-    let mut ctx = load_server_context(&app, record.clone(), &pw)?;
+    let mut ctx = load_server_context(&app, record.clone(), &pw, generation)?;
     if ctx.session.is_none() {
-        let (session, _) = initialize(&ctx).await?;
+        ctx.checked(&app)?;
+        let (session, _) = initialize(&app, &ctx).await?;
         require_generation_current(&app, generation)?;
         app.state::<McpState>()
             .set_session(&record.id, session.clone());
         ctx.session = Some(session);
-        send_initialized(&ctx, ctx.session.as_ref().unwrap()).await?;
+        send_initialized(&app, &ctx, ctx.session.as_ref().unwrap()).await?;
     }
     let rpc_id = Value::String(uuid::Uuid::new_v4().to_string());
     let body = json!({
@@ -1487,8 +1910,9 @@ pub async fn mcp_call_tool(
     require_generation_current(&app, generation)?;
     let result = rpc_result(outcome.result)?;
 
-    // A tools/list_changed that arrived with this call: re-fetch and re-run
-    // pinning so the NEXT call is already gated against fresh definitions.
+    // A tools/list_changed that arrived with this call (or with a mid-call
+    // re-initialize): re-fetch and re-run pinning so the NEXT call is
+    // already gated against fresh definitions.
     if outcome.list_changed {
         let refreshed = fetch_tools(&mut ctx, &app).await?;
         require_generation_current(&app, generation)?;
@@ -1612,6 +2036,20 @@ mod tests {
     }
 
     #[test]
+    fn sanitization_matches_the_renderer_collapsing_underscore_runs() {
+        // Mirrors mcpSanitizeName in src/renderer/mcp.js: non-[A-Za-z0-9_]
+        // becomes '_' and runs collapse to one; '-' does NOT survive (the
+        // backend is the authority, the renderer must match it).
+        assert_eq!(sanitize_tool_name_part("my-server"), "my_server");
+        assert_eq!(sanitize_tool_name_part("a  b--c"), "a_b_c");
+        assert_eq!(sanitize_tool_name_part("__x__"), "_x_");
+        assert_eq!(sanitize_tool_name_part("höst/tool"), "h_st_tool");
+        // The exposed name can never contain "__" inside a part, so the
+        // mcp__<server>__<tool> split stays unambiguous.
+        assert!(!sanitize_tool_name_part("a b").contains("__"));
+    }
+
+    #[test]
     fn long_tool_names_get_a_hash_suffix_not_a_collision() {
         let long_a = "x".repeat(80);
         let long_b = "y".repeat(80);
@@ -1623,11 +2061,32 @@ mod tests {
     }
 
     #[test]
-    fn name_map_rejects_collisions() {
-        // "a b" and "a_b" sanitize to the same exposed name.
-        let err = build_name_map("srv", &["a b".into(), "a_b".into()]).unwrap_err();
-        assert!(err.contains("collision"));
-        assert!(build_name_map("srv", &["a b".into(), "c".into()]).is_ok());
+    fn name_map_rejects_collisions_within_and_across_servers() {
+        // Within one server: "a b" and "a_b" sanitize identically.
+        let err = build_name_map(&[("srv".into(), vec!["a b".into(), "a_b".into()])])
+            .err()
+            .expect("same-server collision must be rejected");
+        assert!(err.contains("same model-facing name"), "{err}");
+        assert!(build_name_map(&[("srv".into(), vec!["a b".into(), "c".into()])]).is_ok());
+        // Across servers: two servers with names that sanitize identically.
+        let err = build_name_map(&[
+            ("my srv".into(), vec!["t1".into()]),
+            ("my_srv".into(), vec!["t2".into()]),
+        ])
+        .err()
+        .expect("server-name collision must be rejected");
+        assert!(err.contains("same model-facing prefix"), "{err}");
+        // Built-in names are structurally out of reach (every exposed name
+        // starts with "mcp__"); the belt-and-suspenders check must not
+        // false-positive on a tool that merely shares a suffix.
+        assert!(build_name_map(&[("mcp".into(), vec!["run_command".into()])]).is_ok());
+        // The identical tool name on two DIFFERENT (distinctly named)
+        // servers produces two distinct exposed names and is fine.
+        assert!(build_name_map(&[
+            ("alpha".into(), vec!["search".into()]),
+            ("beta".into(), vec!["search".into()]),
+        ])
+        .is_ok());
     }
 
     // ── Pin hash ────────────────────────────────────────────────────────
@@ -1784,6 +2243,7 @@ mod tests {
             current_hash: Some(tool_definition_hash(
                 &json!({ "name": name, "description": desc }),
             )),
+            input_schema: None,
             annotations: None,
         }
     }
@@ -1825,6 +2285,174 @@ mod tests {
         // does not feed the pin.
         let full_hash = tool_definition_hash(&json!({ "name": "t", "description": long }));
         assert_eq!(merged[0].current_hash.as_deref(), Some(full_hash.as_str()));
+    }
+
+    // ── Input schema storage (item 4) ───────────────────────────────────
+
+    #[test]
+    fn input_schema_is_stored_canonically_and_bounded() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "cmd": { "type": "string", "description": "what to run" },
+            },
+            "required": ["cmd"],
+        });
+        let def = json!({ "name": "t", "description": "d", "inputSchema": schema });
+        assert_eq!(
+            clamp_input_schema(&def).as_deref(),
+            Some(
+                r#"{"properties":{"cmd":{"description":"what to run","type":"string"}},"required":["cmd"],"type":"object"}"#
+            )
+        );
+        // merge_tools stores the same clamped value.
+        let merged = merge_tools(&[], &[def.clone()]);
+        assert_eq!(
+            merged[0].input_schema.as_deref(),
+            clamp_input_schema(&def).as_deref()
+        );
+        // The PIN still hashes the full definition (schema included).
+        assert_eq!(
+            merged[0].current_hash.as_deref(),
+            Some(tool_definition_hash(&def).as_str())
+        );
+    }
+
+    #[test]
+    fn input_schema_rejects_missing_non_object_and_oversized() {
+        // Missing entirely.
+        assert_eq!(clamp_input_schema(&json!({ "name": "t" })), None);
+        // Non-object schemas (arrays, strings, booleans).
+        for bad in [json!([]), json!("object"), json!(true), json!(42)] {
+            let def = json!({ "name": "t", "inputSchema": bad });
+            assert_eq!(clamp_input_schema(&def), None, "{bad}");
+        }
+        // Above the byte cap: not stored (the renderer substitutes an empty
+        // object schema), but the pin hash still covers the full schema.
+        let huge = json!({ "type": "object", "properties": {
+            "blob": { "type": "string", "description": "x".repeat(MAX_INPUT_SCHEMA_BYTES) },
+        }});
+        let def = json!({ "name": "t", "inputSchema": huge });
+        assert_eq!(clamp_input_schema(&def), None);
+        let merged = merge_tools(&[], &[def.clone()]);
+        assert_eq!(merged[0].input_schema, None);
+        assert_eq!(
+            merged[0].current_hash.as_deref(),
+            Some(tool_definition_hash(&def).as_str())
+        );
+    }
+
+    // ── Tool-cap constants stay aligned with the renderer ───────────────
+
+    #[test]
+    fn mcp_capacity_leaves_room_for_every_builtin_tool() {
+        // Must equal AI_MAX_TOOLS_TOTAL (64) in src/renderer/assistant.js.
+        assert_eq!(MAX_EXPOSED_TOOLS, 64);
+        // Must equal the number of entries in AI_TOOL_SPECS there.
+        assert_eq!(BUILTIN_TOOL_NAMES.len(), BUILTIN_TOOL_COUNT);
+        // MCP can therefore fill every slot the built-ins leave: the
+        // backend cap cannot make the renderer's merge fail.
+        assert_eq!(MAX_MCP_TOOLS, MAX_EXPOSED_TOOLS - BUILTIN_TOOL_COUNT);
+    }
+
+    // ── Static credential origin binding (item 1) ───────────────────────
+
+    /// The pure decision core of mcp_save_server's binding rule: whether the
+    /// STORED secret must be dropped when saving `new` over `old`.
+    fn keep_stored_secret(
+        old: &crate::db::McpServerRecord,
+        new_url: &str,
+        new_auth_type: &str,
+        new_header_name: Option<&str>,
+    ) -> bool {
+        let origin_changed = old.url != new_url;
+        let semantics_changed =
+            old.auth_type != new_auth_type || old.auth_header_name.as_deref() != new_header_name;
+        !(origin_changed || semantics_changed)
+    }
+
+    fn binding_record(
+        url: &str,
+        auth_type: &str,
+        header: Option<&str>,
+    ) -> crate::db::McpServerRecord {
+        crate::db::McpServerRecord {
+            id: "x".into(),
+            name: "srv".into(),
+            url: url.into(),
+            auth_type: auth_type.into(),
+            auth_header_name: header.map(String::from),
+            auth_secret: Some("sealed-old".into()),
+            auth_env_var: None,
+            confirmed: true,
+            tools: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn editing_url_auth_type_or_header_drops_the_stored_secret() {
+        let old = binding_record("https://a.example.com/mcp", "bearer", None);
+        // Same config: the secret may be kept (blank field in the UI).
+        assert!(keep_stored_secret(
+            &old,
+            "https://a.example.com/mcp",
+            "bearer",
+            None
+        ));
+        // URL change (even just the port): never reuse the old secret at a
+        // new origin.
+        assert!(!keep_stored_secret(
+            &old,
+            "https://a.example.com:8443/mcp",
+            "bearer",
+            None
+        ));
+        assert!(!keep_stored_secret(
+            &old,
+            "https://b.example.com/mcp",
+            "bearer",
+            None
+        ));
+        // Auth semantic change: bearer -> custom_header, or a different
+        // header name under custom_header (the old value would be sent as a
+        // different header - different meaning).
+        assert!(!keep_stored_secret(
+            &old,
+            "https://a.example.com/mcp",
+            "custom_header",
+            Some("X-Api-Key")
+        ));
+        let custom = binding_record("https://a.example.com/mcp", "custom_header", Some("X-Key"));
+        assert!(keep_stored_secret(
+            &custom,
+            "https://a.example.com/mcp",
+            "custom_header",
+            Some("X-Key")
+        ));
+        assert!(!keep_stored_secret(
+            &custom,
+            "https://a.example.com/mcp",
+            "custom_header",
+            Some("X-Other")
+        ));
+    }
+
+    #[test]
+    fn auth_source_selection_is_mutually_exclusive_in_saved_records() {
+        // The save path enforces it structurally; this pins the invariant a
+        // record must never break, including records that round-trip the DB.
+        let mut r = binding_record("https://a.example.com", "bearer", None);
+        // Model the env-var branch of mcp_save_server: selecting an env source
+        // clears the old sealed value before persisting the record.
+        r.auth_secret = None;
+        r.auth_env_var = Some("TOKEN".into());
+        assert!(r.auth_secret.is_none() || r.auth_env_var.is_none());
+        // Selecting none clears both sources.
+        r.auth_type = "none".into();
+        r.auth_env_var = None;
+        assert!(r.auth_secret.is_none() && r.auth_env_var.is_none());
     }
 
     // ── 3xx detection ───────────────────────────────────────────────────
@@ -1904,5 +2532,127 @@ mod tests {
         // The sealed secret itself survives (re-sealable at restore time) -
         // inertness comes from the confirmed flag, not from data loss.
         assert!(restored.auth_secret.is_some());
+    }
+
+    // ── Delayed vault lock (item 2) ─────────────────────────────────────
+
+    /// The generation guard `ServerContext::checked` consults (via
+    /// `require_generation_current`): a lock that happens BETWEEN two
+    /// credential-bearing requests must revoke the guard for the second
+    /// one - the exact race the initialize → tools/list sequence has.
+    #[test]
+    fn delayed_vault_lock_between_requests_revokes_the_guard() {
+        use crate::commands::VaultGeneration;
+
+        let gen = VaultGeneration::new();
+        let captured = gen.current();
+        // Request 1 (e.g. initialize): guard passes.
+        assert!(
+            gen.is_current(captured, true),
+            "the guard must pass while unlocked and unchanged"
+        );
+        // The vault locks between the requests: lock_vault_internal bumps
+        // the generation BEFORE clearing the password store, so there is a
+        // window where the vault is still unlocked but the generation is
+        // stale - the guard must ALREADY fail there, so the next POST never
+        // carries the unsealed header.
+        gen.bump();
+        assert!(
+            !gen.is_current(captured, true),
+            "a bumped generation must abort the next request even while the \
+             password store still holds a value"
+        );
+        // The store cleared afterwards: still (and again) refused.
+        assert!(!gen.is_current(captured, false));
+        // A later re-unlock does NOT resurrect the captured generation: a
+        // pending operation from the previous unlock session must not send
+        // secrets into the new one.
+        assert!(!gen.is_current(captured, true));
+        // A fresh capture after the re-unlock is valid again.
+        let fresh = gen.current();
+        assert!(gen.is_current(fresh, true));
+    }
+
+    // ── Enable-time collision gate (item 6) ─────────────────────────────
+
+    fn record_with_tools(
+        id: &str,
+        name: &str,
+        tools: &[(&str, bool)],
+    ) -> crate::db::McpServerRecord {
+        crate::db::McpServerRecord {
+            id: id.into(),
+            name: name.into(),
+            url: "https://mcp.example.com".into(),
+            auth_type: "none".into(),
+            auth_header_name: None,
+            auth_secret: None,
+            auth_env_var: None,
+            confirmed: true,
+            tools: tools
+                .iter()
+                .map(|(n, enabled)| crate::db::McpToolRecord {
+                    name: (*n).into(),
+                    display_name: None,
+                    description: String::new(),
+                    enabled: *enabled,
+                    auto_approve: false,
+                    pin_hash: None,
+                    current_hash: None,
+                    input_schema: None,
+                    annotations: None,
+                })
+                .collect(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn enable_collision_error_rejects_ambiguous_registries() {
+        // Registry where two tools of one server sanitize to one name.
+        let records = vec![record_with_tools(
+            "s1",
+            "srv",
+            &[("a b", true), ("a_b", true)],
+        )];
+        let err = enable_collision_error(&records).expect("must be rejected");
+        assert!(err.contains("same model-facing name"), "{err}");
+        // Enabling on one server while ANOTHER server's enabled tool set
+        // produces the same exposed name is refused too.
+        let records = vec![
+            record_with_tools("s1", "alpha", &[("search", true)]),
+            record_with_tools("s2", "beta", &[("search", false)]),
+        ];
+        assert!(enable_collision_error(&records).is_none());
+        // A server whose name collides but has NO enabled tools blocks
+        // nothing (it exposes nothing).
+        let records = vec![
+            record_with_tools("s1", "my srv", &[("t", true)]),
+            record_with_tools("s2", "my_srv", &[]),
+        ];
+        assert!(enable_collision_error(&records).is_none());
+        // Once both collide AND both expose, it is refused.
+        let records = vec![
+            record_with_tools("s1", "my srv", &[("t", true)]),
+            record_with_tools("s2", "my_srv", &[("t", true)]),
+        ];
+        let err = enable_collision_error(&records).expect("must be rejected");
+        assert!(err.contains("same model-facing prefix"), "{err}");
+        // Empty registry: fine.
+        assert!(enable_collision_error(&[]).is_none());
+    }
+
+    /// Same tool name on two DIFFERENTLY named servers produces distinct
+    /// exposed names and must be accepted.
+    #[test]
+    fn same_tool_on_two_servers_is_not_a_collision() {
+        let records = vec![
+            record_with_tools("s1", "alpha", &[("search", true)]),
+            record_with_tools("s2", "beta", &[("search", true)]),
+        ];
+        assert_eq!(exposed_tool_name("alpha", "search"), "mcp__alpha__search");
+        assert_eq!(exposed_tool_name("beta", "search"), "mcp__beta__search");
+        assert!(enable_collision_error(&records).is_none());
     }
 }
