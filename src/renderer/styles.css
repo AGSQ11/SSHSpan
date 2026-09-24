@@ -2546,16 +2546,23 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .mcp-url-error { color: var(--danger); font-size: 11.5px; margin: 0; }
 .mcp-env-hint { display: block; margin-top: 3px; }
 
-.mcp-tools { display: flex; flex-direction: column; gap: 8px; }
+.mcp-tools {
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: 460px; overflow-y: auto; min-width: 0;
+}
 .mcp-tools-title { font-size: 12px; font-weight: 600; color: var(--text-dim); }
 .mcp-tool-row {
   display: flex; flex-direction: column; gap: 6px;
   border: 1px solid var(--line); border-radius: var(--r-sm);
   background: var(--panel-2); padding: 10px 12px;
+  min-width: 0; max-width: 100%;
 }
 .mcp-tool-row.changed { border-color: rgba(var(--warn-rgb), 0.5); }
 .mcp-tool-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.mcp-tool-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.mcp-tool-name {
+  font-size: 12.5px; font-weight: 600; color: var(--text);
+  overflow-wrap: anywhere; word-break: break-word;
+}
 .mcp-ann-chip {
   font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px;
   padding: 2px 7px; border-radius: 999px;

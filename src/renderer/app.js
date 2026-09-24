@@ -3084,6 +3084,14 @@ const VIEW_SUBS = {
 async function switchView(view) {
   state.view = view;
   state.categoryScope = currentCategoryScope();
+  // Terminal-maximized is a state of the Connect surface, not of the app:
+  // under term-max every .view is overflow:hidden (the terminal must not
+  // scroll), so leaving Connect while maximized left Settings/Keys clipped
+  // at the viewport with no way to scroll - content below the fold was
+  // simply unreachable.
+  if (view !== 'connect' && el('app').classList.contains('term-max')) {
+    toggleTermMax();
+  }
   rebuildCategoryIndex();
   state.orphans = state.categoryScope === 'host' ? state.servers.some(s => !s.categoryId) : uncategorizedKeyCount() > 0;
   renderCategoryTree();
