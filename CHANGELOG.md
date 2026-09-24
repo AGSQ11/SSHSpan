@@ -7,87 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-MCP audit follow-up: tests, docs, tooling, and the renderer's MCP IPC payloads
-brought in line with what the code actually does.
-
-### Fixed
-
-- **The MCP settings form did not reach the backend.** `mcp.js` sent the
-  save-server payload with snake_case keys (`auth_type`, `auth_secret`,
-  `auth_env_var`, `auth_header_name`) and the auth-type select offered the
-  value `custom`, while the Tauri commands expect camelCase arguments and
-  the backend accepts only `custom_header`. Tauri v2 camelCases command
-  parameters by default and looks up exactly one key, so a saved server's
-  auth configuration silently degraded to `None`. The payloads are now
-  camelCase, the option value matches the backend's vocabulary, and each
-  tool's input schema is validated before being offered to the model.
-
-### Tests
-
-- **The 404 → re-init integration test now drives the full
-  `request_with_session` recovery sequence.** It asserts the dead-session
-  request 404s, the re-initialize does not reuse the stale session id,
-  `notifications/initialized` rides the new session, the new session is
-  registered in the production `McpState` map (the AppHandle-owned step,
-  mirrored), the retry carries the new session/version headers, and the
-  recovery happens exactly once - no re-init loop.
-- **`list_changed` now proves the DB refresh, not just the flag.** A new
-  integration test replays `mcp_call_tool`'s refresh block
-  (fetch → pin check → merge → save) against a real SQLite database and
-  reads it back through `get_mcp_server`: the rug-pulled tool persists
-  disabled with the new `current_hash`, the unchanged pinned tool stays
-  enabled, the new tool is stored default-deny.
-- Added wire-level coverage for static-auth origin binding (the header
-  reaches the configured origin; the redirect target receives nothing) and
-  the 2 MB response-body cap (an oversized body aborts the read).
-  MCP integration suite: 11 tests.
-- Smoke-rig fixes: `/mcp-redirect` now answers **POST** with the 302 (the
-  client POSTs, so the old GET-only stub meant the redirect path was never
-  exercised), and the one-shot 404 session now expires only once - repeated
-  requests on that id are served normally, matching what the re-init retry
-  leg needs.
-
-### Tooling
-
-- **`npm run test:ui` now enforces the MCP IPC argument contract
-  statically.** `scripts/check-renderer-ui.js` cross-checks every
-  `mcpCall(...)` payload (including the `mcp_save_server` variable
-  payload) against the Rust `mcp_*` command signatures - the bug class
-  `check-ipc-args.js` exists for, which never covered `mcp.js` - plus the
-  `tool_view` schema-forwarding contract. It runs before the playwright
-  skip, so CI enforces it everywhere. Two live defects the payload fix
-  above does not cover are pinned as a ratchet (reported as `known`, not
-  CI-red): `mcp_set_tool_state` is still called with `auto_approve` (the
-  command expects `autoApprove`, so the flag silently never persists),
-  and `tool_view` emits no `parameters_json`/`inputSchema`, so MCP tool
-  schemas never reach the model. A fix landing without removing its pin
-  fails the gate, so the debt cannot outlive its bug.
-- **`scripts/check-mcp-contract.js`** - a plain-Node (no browser) pin of
-  the fixed payloads: camelCase keys for save/call, `custom_header` in
-  the HTML option set, and schema validation before tools are offered.
-
-### Documentation
-
-- **SECURITY.md:** the "no other endpoint is contacted" claim now accounts
-  for assistant model-provider and MCP-server traffic (destinations listed);
-  the guarded-SSRF-for-discovered-URLs bullet is corrected to Phase 1
-  reality (configured origin only, guarded client is a reserved Phase-2
-  seam); the inert-restore bullet distinguishes it from vault-lock teardown
-  (locking never un-confirms an entry; unlock re-initializes sessions
-  transparently), and the session-DELETE claim is qualified as manual-
-  checklist-verified rather than automatically tested.
-- **MCP-SMOKE-TEST.md:** removed the inaccurate claim that an entry is
-  inert after vault unlock (that is the backup/restore path only), corrected
-  the mock pagination layout and tool count, fixed the 404 re-init step to
-  say the mock's fixed dead session is curl-driven proof while the client
-  path is the integration test's, replaced the unreachable "stream flag"
-  step with the `/mcp-listchanged` SSE path, and added the network-
-  destinations section each step reconciles against.
-
 ## [1.9.1] - 2026-09-23
 
-Remote MCP servers for the AI assistant (static auth), plus the assistant
-panel legibility fix.
+Remote MCP servers for the AI assistant (static auth), the assistant panel
+legibility fix, and the MCP audit remediation.
 
 ### Added
 
@@ -121,6 +44,31 @@ panel legibility fix.
   Split control already uses), the dialog uses the correct footer class with
   even spacing and a red-tinted icon chip, and long commands wrap instead of
   scrolling sideways in the 380px panel.
+
+- **MCP save and tool-state commands had inconsistent argument casing.**
+  `mcp_save_server` and `mcp_set_tool_state` now explicitly declare
+  `rename_all = "snake_case"`, and the renderer sends the matching
+  `auth_type`, `auth_header_name`, `auth_secret`, `auth_env_var`, and
+  `auto_approve` keys. This resolves the runtime
+  `missing required key authType` failure and prevents Tauri's automatic
+  argument conversion from silently dropping auth configuration.
+
+- **MCP static credentials could outlive their configured origin.** Editing
+  a server URL, auth type, or custom header name now clears the stored
+  sealed secret; stored-secret, environment-variable, and no-auth sources
+  are mutually exclusive. Vault generation is rechecked before every
+  credential-bearing MCP request, and lock/removal teardown resolves and
+  attaches the auth header before clearing vault secrets (only HTTP 405 is
+  ignored).
+
+- **MCP tool definitions could reach the model without their schemas.**
+  Bounded canonical `inputSchema` is now persisted, returned by `tool_view`,
+  validated by the renderer, and forwarded as provider-facing
+  `parameters_json`. The aggregate MCP tool cap is enforced transactionally
+  while preserving built-in capacity, and backend/renderer name sanitization
+  and collision rejection now use the same canonical algorithm. A
+  `tools/list_changed` notification observed during pagination aborts the
+  stale pass and refetches from the first page.
 
 ## [1.9.0] - 2026-09-21
 
