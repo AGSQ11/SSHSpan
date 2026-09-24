@@ -389,11 +389,11 @@ async function mcpSaveServer() {
     id: mcpEditing ? mcpEditing.id : null,
     name,
     url,
-    authType: kind,
-    authHeaderName: kind === 'custom_header' ? (val('mcpHeaderName') || null) : null,
-    authSecret: (kind === 'bearer' || kind === 'custom_header') && secret === 'stored'
+    auth_type: kind,
+    auth_header_name: kind === 'custom_header' ? (val('mcpHeaderName') || null) : null,
+    auth_secret: (kind === 'bearer' || kind === 'custom_header') && secret === 'stored'
       ? (val('mcpAuthSecret') || null) : null,
-    authEnvVar: (kind === 'bearer' || kind === 'custom_header') && secret === 'env'
+    auth_env_var: (kind === 'bearer' || kind === 'custom_header') && secret === 'env'
       ? (val('mcpAuthEnvVar') || null) : null,
   };
   try {
@@ -498,7 +498,7 @@ function mcpToolRow(serverId, t) {
 
   const setToolState = async (enabled, autoApprove) => {
     try {
-      await mcpCall('mcp_set_tool_state', { id: serverId, tool: t.name, enabled, autoApprove });
+      await mcpCall('mcp_set_tool_state', { id: serverId, tool: t.name, enabled, auto_approve: autoApprove });
       t.enabled = enabled;
       t.auto_approve = enabled ? autoApprove : false;
     } catch (e) {

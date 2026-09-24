@@ -1540,7 +1540,7 @@ pub fn enable_collision_error(records: &[crate::db::McpServerRecord]) -> Option<
     build_name_map(&registry).err()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn mcp_save_server(
     app: AppHandle,
     id: Option<String>,
@@ -1728,7 +1728,7 @@ pub async fn mcp_test_connection(app: AppHandle, id: String) -> CmdResult<Value>
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub fn mcp_set_tool_state(
     app: AppHandle,
     id: String,

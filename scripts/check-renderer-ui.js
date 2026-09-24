@@ -53,18 +53,19 @@ function mcpContractProblems() {
 
   // Commands: name -> [{ key, required }], skipping Tauri-injected params.
   const commands = {};
-  const cmdRe = /#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(mcp_[a-z_0-9]+)\s*\(([\s\S]*?)\)\s*->/g;
+  const cmdRe = /#\[tauri::command((?:\([^\]]*\))?)\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(mcp_[a-z_0-9]+)\s*\(([\s\S]*?)\)\s*->/g;
   let m;
   while ((m = cmdRe.exec(rust))) {
+    const snakeCmd = /rename_all\s*=\s*"snake_case"/.test(m[1]);
     const args = [];
-    for (let part of m[2].split(',')) {
+    for (let part of m[3].split(',')) {
       part = part.split('\n').filter((l) => !/^\s*(\/\/|#\[)/.test(l)).join(' ').trim();
       if (!part) continue;
       const pm = part.match(/^(?:mut\s+)?([a-z_0-9]+)\s*:\s*([\s\S]+)$/);
       if (!pm || /AppHandle|tauri::/.test(pm[2])) continue;
-      args.push({ key: toCamel(pm[1]), required: !/^Option</.test(pm[2].trim()) });
+      args.push({ key: snakeCmd ? pm[1] : toCamel(pm[1]), required: !/^Option</.test(pm[2].trim()) });
     }
-    commands[m[1]] = args;
+    commands[m[2]] = args;
   }
   if (Object.keys(commands).length < 5) {
     throw new Error(`MCP contract check: parsed only ${Object.keys(commands).length} mcp_* commands - the regex or mcp.rs moved.`);

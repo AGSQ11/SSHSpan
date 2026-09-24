@@ -32,28 +32,29 @@ function fail(name, got, want) {
 console.log('mcp.js contract checks');
 
 // 1. mcp_save_server payload uses camelCase keys matching Rust command args.
-const payloadMatch = code.match(/const payload = \{[\s\S]*?authEnvVar[\s\S]*?\};/);
+const payloadMatch = code.match(/const payload = \{[\s\S]*?auth_env_var[\s\S]*?\};/);
 if (!payloadMatch) {
   fail('mcp_save_server payload found', 'not found', 'payload object');
 } else {
   const payload = payloadMatch[0];
-  if (!/authType:/.test(payload)) fail('authType key present', 'missing', 'authType:');
-  else ok('authType key present');
-  if (!/authHeaderName:/.test(payload)) fail('authHeaderName key present', 'missing', 'authHeaderName:');
-  else ok('authHeaderName key present');
-  if (!/authSecret:/.test(payload)) fail('authSecret key present', 'missing', 'authSecret:');
-  else ok('authSecret key present');
-  if (!/authEnvVar:/.test(payload)) fail('authEnvVar key present', 'missing', 'authEnvVar:');
-  else ok('authEnvVar key present');
-  // Ensure no snake_case top-level keys remain in the payload block.
-  if (/auth_type:/.test(payload)) fail('no snake_case auth_type in save payload', 'found', 'none');
-  else ok('no snake_case auth_type in save payload');
-  if (/auth_header_name:/.test(payload)) fail('no snake_case auth_header_name in save payload', 'found', 'none');
-  else ok('no snake_case auth_header_name in save payload');
-  if (/auth_secret:/.test(payload)) fail('no snake_case auth_secret in save payload', 'found', 'none');
-  else ok('no snake_case auth_secret in save payload');
-  if (/auth_env_var:/.test(payload)) fail('no snake_case auth_env_var in save payload', 'found', 'none');
-  else ok('no snake_case auth_env_var in save payload');
+  if (!/auth_type:/.test(payload)) fail('auth_type key present', 'missing', 'auth_type:');
+  else ok('auth_type key present');
+  if (!/auth_header_name:/.test(payload)) fail('auth_header_name key present', 'missing', 'auth_header_name:');
+  else ok('auth_header_name key present');
+  if (!/auth_secret:/.test(payload)) fail('auth_secret key present', 'missing', 'auth_secret:');
+  else ok('auth_secret key present');
+  if (!/auth_env_var:/.test(payload)) fail('auth_env_var key present', 'missing', 'auth_env_var:');
+  else ok('auth_env_var key present');
+  // The command explicitly uses snake_case. A camelCase payload would be
+  // silently dropped by Tauri and is therefore rejected here.
+  if (/authType:/.test(payload)) fail('no camelCase authType in save payload', 'found', 'none');
+  else ok('no camelCase authType in save payload');
+  if (/authHeaderName:/.test(payload)) fail('no camelCase authHeaderName in save payload', 'found', 'none');
+  else ok('no camelCase authHeaderName in save payload');
+  if (/authSecret:/.test(payload)) fail('no camelCase authSecret in save payload', 'found', 'none');
+  else ok('no camelCase authSecret in save payload');
+  if (/authEnvVar:/.test(payload)) fail('no camelCase authEnvVar in save payload', 'found', 'none');
+  else ok('no camelCase authEnvVar in save payload');
 }
 
 // 2. The form option value for custom header auth is 'custom_header'.

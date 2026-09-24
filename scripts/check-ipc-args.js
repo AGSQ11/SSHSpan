@@ -22,7 +22,7 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const RUST_DIR = path.join(ROOT, 'src-tauri/src');
-const JS_FILES = ['src/renderer/app.js', 'src/renderer/sftp.js', 'src/renderer/terminal.js'];
+const JS_FILES = ['src/renderer/app.js', 'src/renderer/sftp.js', 'src/renderer/terminal.js', 'src/renderer/mcp.js', 'src/renderer/assistant.js'];
 
 // Parameters injected by Tauri itself - never sent from JS.
 const INJECTED = /^(AppHandle|tauri::AppHandle|Window|tauri::Window|WebviewWindow|tauri::WebviewWindow|State<|tauri::State<|tauri::ipc::|Request|Channel<|tauri::Runtime)/;
@@ -89,7 +89,7 @@ function parseJsCallSites() {
     const file = path.join(ROOT, rel);
     if (!fs.existsSync(file)) continue;
     const src = fs.readFileSync(file, 'utf8');
-    const re = /(?:\bcall|\.invoke|\binvoke)\(\s*(['"`])([a-z_0-9]+)\1\s*(,|\))/g;
+    const re = /(?:\bcall|mcpCall|\.invoke|\binvoke)\(\s*(['"`])([a-z_0-9]+)\1\s*(,|\))/g;
     let m;
     while ((m = re.exec(src))) {
       const line = src.slice(0, m.index).split('\n').length;
