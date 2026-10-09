@@ -17,7 +17,10 @@ use crate::config::SshConfigService;
 use crate::crypto::keys;
 use crate::crypto::keys::{KeyFormat, KeyType};
 use crate::db::{self, KeyRecord};
-use crate::ssh::SshService;
+use crate::ssh::{
+    DeployFiles, DeployHostFields, DeployKey, DeployPlan, DeployTarget, RecordedDeployment,
+    SshService,
+};
 use crate::AppState;
 use base64ct::Encoding;
 
@@ -598,10 +601,14 @@ pub(crate) fn spawn_auto_lock_watchdog(app: AppHandle) {
 /// with a hundred keys the window froze for tens of seconds. The work now runs
 /// on a blocking worker, under the [`VaultRotationLock`] write lock (C1): the
 /// rest of the app stays usable, but nothing can seal or rewrite vault data
-/// until the change is committed and the new password installed. A lock
-/// landing meanwhile (the tray's Lock Vault, the idle watchdog) aborts the
-/// change before it commits, and the new password is never installed over a
-/// lock that happened meanwhile.
+/// until the change is committed and the new password installed. If another
+/// vault operation (a Bitwarden sync, an MCP call, a backup export or restore,
+/// a deploy, another change) still holds that lock after 30 s, the change
+/// gives up with [`ROTATION_LOCK_BUSY`] and nothing is changed. A lock (the
+/// tray's Lock Vault, the idle watchdog) landing while the records are being
+/// re-sealed aborts the change before it commits; one landing after that last
+/// check lets the commit finish but leaves the vault locked - the new password
+/// is never installed over a lock, and it is the one that unlocks the vault.
 #[tauri::command]
 pub async fn vault_change_password(
     app: AppHandle,
@@ -645,12 +652,15 @@ struct RotationContext<'a> {
     lock_wait: std::time::Duration,
 }
 
-/// How long a master-password change waits for a running Bitwarden sync or
-/// MCP call to release the [`VaultRotationLock`] before it gives up.
+/// How long a master-password change waits for a running vault operation to
+/// release the [`VaultRotationLock`] before it gives up.
 const ROTATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What a master-password change says when it gave up waiting for the lock.
-const ROTATION_LOCK_BUSY: &str = "Finish the running sync or MCP call, then try again.";
+/// The holder can be a sync, an MCP call, a backup export or restore, a
+/// deploy or another change, so the message names none of them.
+const ROTATION_LOCK_BUSY: &str =
+    "Another vault operation is still running - try again when it finishes.";
 
 /// [`vault_change_password`] on its blocking worker, without the
 /// `AppHandle`. The write lock is taken before the current-password check
@@ -1336,6 +1346,523 @@ mod tests {
         assert_eq!(db.get_key("k1").unwrap().unwrap().name, "key-k1");
         key_rename_in(&db, &unlocked_vault(), &rotation, "k1", "renamed").unwrap();
         assert_eq!(db.get_key("k1").unwrap().unwrap().name, "renamed");
+    }
+
+    /// A2-46 / A5-25: a rename onto another key's name - compared without
+    /// regard to case - is refused with a message naming that key; changing
+    /// the case of a key's own name is not a clash.
+    #[test]
+    fn key_rename_refuses_another_keys_name_in_any_case() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", "pw")).unwrap();
+        db.insert_key(&sample_key("k2", "pw")).unwrap();
+        let rotation = VaultRotationLock::new();
+        let clash = key_rename_in(&db, &unlocked_vault(), &rotation, "k2", "KEY-K1");
+        assert_eq!(
+            clash.unwrap_err().0,
+            "A key named \"key-k1\" already exists. Choose a different name."
+        );
+        assert_eq!(db.get_key("k2").unwrap().unwrap().name, "key-k2");
+        key_rename_in(&db, &unlocked_vault(), &rotation, "k1", "KEY-K1").unwrap();
+        assert_eq!(db.get_key("k1").unwrap().unwrap().name, "KEY-K1");
+    }
+
+    // ── RU3: key generation, import and export ──
+
+    const PW: &str = "test-master-pw"; // what unlocked_vault() holds
+
+    /// An OpenSSH private key file for import tests.
+    fn openssh_key_file(comment: &str) -> String {
+        let mut key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        key.set_comment(comment);
+        key.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string()
+    }
+
+    fn import(
+        db: &db::Database,
+        pem: &str,
+        name: &str,
+        comment: Option<&str>,
+    ) -> CmdResult<serde_json::Value> {
+        key_import_in(
+            db,
+            &unlocked_vault(),
+            &VaultRotationLock::new(),
+            pem,
+            Some(name.to_string()),
+            comment.map(String::from),
+            None,
+        )
+    }
+
+    #[test]
+    fn key_import_explains_a_pem_format_it_cannot_read() {
+        let pem =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----";
+        let err = import(&test_db(), pem, "aws", None).unwrap_err();
+        assert!(err.0.contains("PKCS#1 RSA private key"), "{}", err.0);
+        assert!(err.0.contains("ssh-keygen -p -o -f"), "{}", err.0);
+    }
+
+    #[test]
+    fn key_import_refuses_a_name_already_in_use() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", PW)).unwrap();
+        let err = import(&db, &openssh_key_file("x"), "KEY-k1", None).unwrap_err();
+        assert_eq!(
+            err.0,
+            "A key named \"key-k1\" already exists. Choose a different name."
+        );
+        assert_eq!(db.list_keys().unwrap().len(), 1);
+    }
+
+    /// A7-45: a comment typed into the import dialog is cleaned like one
+    /// read from the file, so the stored authorized_keys line is one line.
+    #[test]
+    fn key_import_cleans_comments_from_the_file_and_from_the_dialog() {
+        let db = test_db();
+        let id = import(&db, &openssh_key_file("file\ncomment"), "one", None).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stored = db.get_key(&id).unwrap().unwrap();
+        assert_eq!(stored.comment, "file comment");
+        assert_eq!(stored.public_key.lines().count(), 1);
+        let id = import(&db, &openssh_key_file("x"), "two", Some("typed\r\nline")).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stored = db.get_key(&id).unwrap().unwrap();
+        assert_eq!(stored.comment, "typed  line");
+        assert_eq!(stored.public_key.lines().count(), 1);
+    }
+
+    #[test]
+    fn key_import_refuses_while_rotating_or_locked() {
+        let db = test_db();
+        let rotation = VaultRotationLock::new();
+        let busy = rotation
+            .exclusive_within(std::time::Duration::from_secs(5))
+            .unwrap();
+        let pem = openssh_key_file("x");
+        let refused = key_import_in(&db, &unlocked_vault(), &rotation, &pem, None, None, None);
+        drop(busy);
+        assert_eq!(refused.unwrap_err().0, VAULT_REENCRYPTING);
+        assert_refused_while_locked(key_import_in(
+            &db,
+            &locked_vault(),
+            &rotation,
+            &pem,
+            None,
+            None,
+            None,
+        ));
+        assert!(db.list_keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_key_requests_are_checked_before_any_generation() {
+        let rsa = NewKey::parse("rsa", Some(1024), Some("k".into()), None, None);
+        assert_eq!(
+            rsa.err().unwrap().0,
+            "RSA key size must be between 2048 and 8192 bits (got 1024)."
+        );
+        // The dialog sends its RSA size for every type; only RSA uses it.
+        let ed = NewKey::parse("ed25519", Some(4096), Some("k".into()), None, None).unwrap();
+        assert_eq!((ed.key_type, ed.bits), (KeyType::Ed25519, None));
+        let ec = NewKey::parse("ecdsa-nistp384", None, Some("k".into()), None, None).unwrap();
+        assert_eq!(ec.key_type, KeyType::EcdsaP384);
+        assert!(NewKey::parse("ed25519", None, Some("a b".into()), None, None).is_err());
+    }
+
+    #[test]
+    fn create_key_refuses_a_name_in_use_and_cleans_the_comment() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", PW)).unwrap();
+        db.insert_category(&sample_category("c1", "key")).unwrap();
+        let rotation = VaultRotationLock::new();
+        let request = |name: &str| {
+            NewKey::parse(
+                "ed25519",
+                None,
+                Some(name.into()),
+                Some("me@host\nx".into()),
+                Some(vec!["c1".into()]),
+            )
+            .unwrap()
+        };
+        let clash = create_key_in(&db, &unlocked_vault(), &rotation, request("Key-K1"));
+        assert_eq!(
+            clash.unwrap_err().0,
+            "A key named \"key-k1\" already exists. Choose a different name."
+        );
+        let created = create_key_in(&db, &unlocked_vault(), &rotation, request("fresh")).unwrap();
+        let id = created["id"].as_str().unwrap();
+        let stored = db.get_key(id).unwrap().unwrap();
+        assert_eq!(stored.comment, "me@host x");
+        assert_eq!(stored.public_key.lines().count(), 1);
+        assert!(crate::crypto::vault::unseal(PW, &stored.private_key_encrypted).is_ok());
+        assert_eq!(
+            db.list_categories_for_key(id).unwrap(),
+            vec!["c1".to_string()]
+        );
+    }
+
+    /// A2-03 / A7-05 / A5-38: "PKCS#8 PEM, encrypted" without a passphrase
+    /// is refused before the save dialog opens - it used to write a
+    /// plaintext key and report success.
+    #[test]
+    fn encrypted_pkcs8_export_needs_a_passphrase() {
+        for missing in [None, Some("")] {
+            assert_eq!(
+                private_export_passphrase("pkcs8-encrypted", missing)
+                    .unwrap_err()
+                    .0,
+                "A passphrase is required for an encrypted PKCS#8 export."
+            );
+        }
+        assert_eq!(
+            private_export_passphrase("pkcs8-encrypted", Some("s3cret")).unwrap(),
+            Some("s3cret")
+        );
+        assert_eq!(private_export_passphrase("pkcs8", Some("")).unwrap(), None);
+        assert_eq!(private_export_passphrase("ppk", None).unwrap(), None);
+        assert!(private_export_passphrase("public", None).is_err());
+    }
+
+    // ── RU3: deploy writes what it shows (R3) ──
+
+    fn deploy_target(tag: &str) -> (std::path::PathBuf, crate::ssh::DeployTarget) {
+        let root = scratch_dir(&format!("deploy-{tag}"));
+        let target = crate::ssh::DeployTarget::new(
+            root.join("home").join(".ssh"),
+            root.join("config").join("ssh").join("config"),
+        );
+        (root, target)
+    }
+
+    /// A real Ed25519 key sealed with [`PW`], stored under `name`.
+    fn insert_real_key(db: &db::Database, id: &str, name: &str) {
+        let data = keys::generate_key_pair(KeyType::Ed25519, None, format!("{name}@test")).unwrap();
+        let mut record = sample_key(id, PW);
+        record.name = name.into();
+        record.public_key = keys::export_public_key(&data, KeyFormat::OpenSsh).unwrap();
+        record.private_key_encrypted = crate::crypto::vault::seal(PW, &data.private_key).unwrap();
+        record.fingerprint_sha256 = keys::compute_fingerprint_sha256(&data.public_key);
+        db.insert_key(&record).unwrap();
+    }
+
+    fn host_fields() -> crate::ssh::DeployHostFields {
+        crate::ssh::DeployHostFields::parse(
+            Some("prod".into()),
+            Some("web.example.com".into()),
+            Some("deploy".into()),
+            Some(2222),
+            Some(true),
+        )
+        .unwrap()
+    }
+
+    fn deploy(
+        db: &db::Database,
+        target: &crate::ssh::DeployTarget,
+        ids: &[&str],
+        fields: &crate::ssh::DeployHostFields,
+    ) -> CmdResult<serde_json::Value> {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        key_deploy_in(
+            db,
+            &unlocked_vault(),
+            &VaultRotationLock::new(),
+            target,
+            &ids,
+            None,
+            fields,
+            &|| Ok(()),
+        )
+    }
+
+    #[test]
+    fn deploy_writes_exactly_the_previewed_stanza_and_records_it() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("preview");
+        let ids = vec!["k1".to_string()];
+        let preview = key_deploy_preview_in(&db, &target, &ids, &host_fields()).unwrap();
+        let result = deploy(&db, &target, &["k1"], &host_fields());
+        let written = std::fs::read_to_string(&target.config_path);
+        let private = std::fs::read_to_string(target.ssh_dir.join("sshspan_web"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let result = result.unwrap();
+        let file = target.ssh_dir.join("sshspan_web").display().to_string();
+        assert_eq!(preview["keys"][0]["file"], serde_json::json!(file));
+        assert_eq!(preview["keys"][0]["alias"], "prod");
+        assert_eq!(preview["keys"][0]["ownedByOtherKey"], false);
+        assert_eq!(preview["keys"][0]["overwritesFile"], false);
+        assert_eq!(
+            preview["configPath"],
+            serde_json::json!(target.config_path.display().to_string())
+        );
+        assert_eq!(
+            preview["includeLine"],
+            serde_json::json!(target.include_line())
+        );
+        assert_eq!(result["keys"][0]["file"], serde_json::json!(file));
+        assert_eq!(written.unwrap(), preview["configText"].as_str().unwrap());
+        let parsed = ssh_key::PrivateKey::from_openssh(private.unwrap()).unwrap();
+        let stored = db.get_key("k1").unwrap().unwrap();
+        assert_eq!(
+            keys::compute_fingerprint_sha256(&parsed.public_key().to_bytes().unwrap()),
+            stored.fingerprint_sha256
+        );
+        assert!(stored.deployed);
+        assert_eq!(stored.deploy_path.as_deref(), Some(file.as_str()));
+        assert!(db
+            .list_audit(10)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "keys.deployed"));
+    }
+
+    /// A2-46 / A7-59: a key whose file is another key's deployed file is
+    /// refused, and that file is left alone.
+    #[test]
+    fn deploy_refuses_a_file_another_key_owns() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "a.b");
+        insert_real_key(&db, "k2", "a_b");
+        let (root, target) = deploy_target("collision");
+        let first = deploy(
+            &db,
+            &target,
+            &["k1"],
+            &crate::ssh::DeployHostFields::default(),
+        );
+        let before = std::fs::read(target.ssh_dir.join("sshspan_a_b"));
+        let ids = vec!["k2".to_string()];
+        let preview =
+            key_deploy_preview_in(&db, &target, &ids, &crate::ssh::DeployHostFields::default());
+        let second = deploy(
+            &db,
+            &target,
+            &["k2"],
+            &crate::ssh::DeployHostFields::default(),
+        );
+        let after = std::fs::read(target.ssh_dir.join("sshspan_a_b"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        first.unwrap();
+        assert_eq!(preview.unwrap()["keys"][0]["ownedByOtherKey"], true);
+        let err = second.unwrap_err().0;
+        assert!(err.contains("\"a.b\""), "{err}");
+        assert_eq!(
+            before.unwrap(),
+            after.unwrap(),
+            "the first key's file is untouched"
+        );
+        assert!(!db.get_key("k2").unwrap().unwrap().deployed);
+    }
+
+    #[test]
+    fn deploy_refuses_while_rotating_or_locked_and_stops_at_a_lock() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("gates");
+        let ids = vec!["k1".to_string()];
+        let fields = crate::ssh::DeployHostFields::default();
+        let rotation = VaultRotationLock::new();
+        let busy = rotation
+            .exclusive_within(std::time::Duration::from_secs(5))
+            .unwrap();
+        let rotating = key_deploy_in(
+            &db,
+            &unlocked_vault(),
+            &rotation,
+            &target,
+            &ids,
+            None,
+            &fields,
+            &|| Ok(()),
+        );
+        drop(busy);
+        let locked = key_deploy_in(
+            &db,
+            &locked_vault(),
+            &rotation,
+            &target,
+            &ids,
+            None,
+            &fields,
+            &|| Ok(()),
+        );
+        let lock_midway = key_deploy_in(
+            &db,
+            &unlocked_vault(),
+            &rotation,
+            &target,
+            &ids,
+            None,
+            &fields,
+            &|| {
+                Err(CmdError(
+                    "Vault was locked while the operation was in progress.".into(),
+                ))
+            },
+        );
+        let written = target.ssh_dir.join("sshspan_web").exists();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(rotating.unwrap_err().0, VAULT_REENCRYPTING);
+        assert_refused_while_locked(locked);
+        assert!(lock_midway
+            .unwrap_err()
+            .0
+            .contains("Vault was locked while the operation was in progress."));
+        assert!(!written, "nothing may be written after a lock");
+    }
+
+    /// A7-22 / A8-24: undeploy removes both files and the Host stanza,
+    /// clears the record and audits it.
+    #[test]
+    fn remove_deployed_removes_files_stanza_and_record() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("undeploy");
+        deploy(&db, &target, &["k1"], &host_fields()).unwrap();
+        let file = target.ssh_dir.join("sshspan_web").display().to_string();
+        let result = key_remove_deployed_in(
+            &db,
+            &unlocked_vault(),
+            &VaultRotationLock::new(),
+            &target,
+            "k1",
+        );
+        let config = std::fs::read_to_string(&target.config_path).unwrap_or_default();
+        let gone = !std::path::Path::new(&file).exists();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let result = result.unwrap();
+        assert_eq!(
+            result["removed"],
+            serde_json::json!([file.clone(), format!("{file}.pub")])
+        );
+        assert_eq!(result["removedHosts"], serde_json::json!(["prod"]));
+        assert_eq!(result["warnings"], serde_json::json!([]));
+        assert!(gone);
+        assert!(!config.contains("Host prod"), "{config}");
+        let stored = db.get_key("k1").unwrap().unwrap();
+        assert!(!stored.deployed && stored.deploy_path.is_none());
+        assert!(db
+            .list_audit(10)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "keys.undeployed"));
+    }
+
+    /// A private key file that cannot be deleted is an error, and the key
+    /// stays marked as deployed - the old code dropped the error and cleared
+    /// the record while the secret stayed on disk.
+    #[test]
+    fn remove_deployed_keeps_the_record_when_the_file_cannot_be_removed() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("undeploy-fails");
+        let stuck = target.ssh_dir.join("sshspan_web");
+        std::fs::create_dir_all(&stuck).unwrap(); // remove_file cannot delete it
+        db.set_key_deployment("k1", Some(&stuck.display().to_string()))
+            .unwrap();
+        let result = key_remove_deployed_in(
+            &db,
+            &unlocked_vault(),
+            &VaultRotationLock::new(),
+            &target,
+            "k1",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.unwrap_err().0.contains("still marked as deployed"));
+        assert!(db.get_key("k1").unwrap().unwrap().deployed);
+        assert!(db
+            .list_audit(10)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "keys.undeploy_failed"));
+    }
+
+    /// A recorded path that is not one of SSHSpan's own files in the managed
+    /// directory is never deleted (a pre-F9 restore could have planted one);
+    /// the record is cleared and the result says why.
+    #[test]
+    fn remove_deployed_never_deletes_a_file_sshspan_did_not_write() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("undeploy-foreign");
+        std::fs::create_dir_all(&target.ssh_dir).unwrap();
+        let users_key = target.ssh_dir.join("id_ed25519");
+        std::fs::write(&users_key, "THE USER'S OWN KEY").unwrap();
+        db.set_key_deployment("k1", Some(&users_key.display().to_string()))
+            .unwrap();
+        let result = key_remove_deployed_in(
+            &db,
+            &unlocked_vault(),
+            &VaultRotationLock::new(),
+            &target,
+            "k1",
+        );
+        let kept = users_key.exists();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let result = result.unwrap();
+        assert!(kept);
+        assert_eq!(result["removed"], serde_json::json!([]));
+        assert_eq!(result["warnings"].as_array().unwrap().len(), 1);
+        assert!(!db.get_key("k1").unwrap().unwrap().deployed);
+        assert_refused_while_locked(key_remove_deployed_in(
+            &db,
+            &locked_vault(),
+            &VaultRotationLock::new(),
+            &target,
+            "k1",
+        ));
+    }
+
+    /// Minor 6: undeploying a key that was never deployed changes nothing and
+    /// leaves no "keys.undeployed" audit row claiming otherwise.
+    #[test]
+    fn remove_deployed_of_an_undeployed_key_audits_nothing() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("undeploy-noop");
+        let result = key_remove_deployed_in(
+            &db,
+            &unlocked_vault(),
+            &VaultRotationLock::new(),
+            &target,
+            "k1",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let result = result.unwrap();
+        assert_eq!(result["removed"], serde_json::json!([]));
+        assert!(!db
+            .list_audit(10)
+            .unwrap()
+            .iter()
+            .any(|a| a.action.starts_with("keys.undeploy")));
+    }
+
+    /// RU1 leftover: the busy message is also what a restore, an export or
+    /// another password change produces, so it must not name only two of them.
+    #[test]
+    fn rotation_busy_message_names_any_vault_operation() {
+        assert_eq!(
+            ROTATION_LOCK_BUSY,
+            "Another vault operation is still running - try again when it finishes."
+        );
     }
 
     #[test]
@@ -3296,7 +3823,8 @@ pub fn key_list(app: AppHandle) -> CmdResult<serde_json::Value> {
         .map(|k| {
             serde_json::json!({
                 "id": k.id, "name": k.name, "key_type": k.key_type,
-                "public_key": k.public_key,
+                // The UI copies this as the authorized_keys line (A7-45).
+                "public_key": keys::sanitize_public_line(&k.public_key),
                 "fingerprint_sha256": k.fingerprint_sha256, "fingerprint_md5": k.fingerprint_md5,
                 "comment": k.comment, "created_at": k.created_at.to_rfc3339(),
                 "deployed": k.deployed, "bitwarden_sync": k.bitwarden_sync,
@@ -3343,7 +3871,8 @@ pub fn key_get(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
             };
             Ok(serde_json::json!({
                 "id": key.id, "name": key.name, "key_type": key.key_type,
-                "public_key": key.public_key,
+                // The detail pane's authorized_keys line (A7-45).
+                "public_key": keys::sanitize_public_line(&key.public_key),
                 "fingerprint_sha256": key.fingerprint_sha256, "fingerprint_md5": key.fingerprint_md5,
                 "comment": key.comment, "created_at": key.created_at.to_rfc3339(),
                 "deployed": key.deployed, "deploy_path": key.deploy_path,
@@ -3367,13 +3896,19 @@ fn parse_openssh_public_line(line: &str) -> Result<Vec<u8>, String> {
     base64ct::Base64::decode_vec(b64).map_err(|e| format!("Malformed stored public key: {e}"))
 }
 
-/// Reconstruct a `PrivateKeyData` for a stored key, decrypting the private
-/// half with the (already-verified) vault password.
+/// [`unseal_key_data`] for callers that hold an `AppHandle` (the terminal's
+/// connect path); the handle is not needed.
 fn load_private_key_data(
     _app: &AppHandle,
     key: &KeyRecord,
     vault_pw: &str,
 ) -> Result<keys::PrivateKeyData, String> {
+    unseal_key_data(key, vault_pw)
+}
+
+/// Reconstruct a `PrivateKeyData` for a stored key, decrypting the private
+/// half with the (already-verified) vault password.
+fn unseal_key_data(key: &KeyRecord, vault_pw: &str) -> Result<keys::PrivateKeyData, String> {
     let key_type = KeyType::from_db_tag(&key.key_type).map_err(|e| e.to_string())?;
     let private_bytes = crate::crypto::vault::unseal(vault_pw, &key.private_key_encrypted)
         .map_err(|_| "Failed to decrypt this key \u{2014} the vault password may have changed since it was stored.".to_string())?;
@@ -3386,66 +3921,40 @@ fn load_private_key_data(
     ))
 }
 
-#[tauri::command]
-pub fn key_generate(
-    app: AppHandle,
-    key_type: String,
-    bits: Option<u32>,
-    name: Option<String>,
-    comment: Option<String>,
-) -> CmdResult<serde_json::Value> {
-    // Seals with the master password: not while it is being changed (C1).
-    let _rotation = rotation_shared(&app)?;
-    let pw = vault_password(&app)?;
-    if pw.is_empty() {
-        return Err("Vault is locked.".into());
+/// Serialises "is this key name free?" with the write that takes it, so two
+/// commands racing each other - a double-clicked Create runs twice off the
+/// main thread now - cannot both pass the check (A2-46 / A5-25).
+static KEY_NAME_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Refuse a key name another key already has, compared without regard to
+/// case. Existing duplicates in older vaults stay as they are; only a new
+/// create, import or rename is refused.
+fn ensure_key_name_free(db: &db::Database, name: &str, except_id: Option<&str>) -> CmdResult<()> {
+    match db
+        .key_name_in_use(name, except_id)
+        .map_err(|e| e.to_string())?
+    {
+        Some(existing) => Err(CmdError(format!(
+            "A key named \"{existing}\" already exists. Choose a different name."
+        ))),
+        None => Ok(()),
     }
+}
 
-    let kt = KeyType::from_db_tag(&key_type).map_err(|e| e.to_string())?;
-    let comment_str = comment.clone().unwrap_or_default();
-    let name_str =
-        name.unwrap_or_else(|| format!("{}-{}", key_type, &Uuid::new_v4().to_string()[..8]));
-    // Names become Host aliases in ~/.ssh/config - reject anything that could
-    // break out of a single Host token before it ever reaches the vault.
-    keys::validate_key_name(&name_str)?;
-
-    let key_data =
-        keys::generate_key_pair(kt, bits, comment_str.clone()).map_err(|e| e.to_string())?;
-    let public_openssh =
-        keys::export_public_key(&key_data, KeyFormat::OpenSsh).map_err(|e| e.to_string())?;
-    let fingerprint = keys::compute_fingerprint_sha256(&key_data.public_key);
-    let sealed_private =
-        crate::crypto::vault::seal(&pw, &key_data.private_key).map_err(|e| e.to_string())?;
-
-    let key_record = KeyRecord {
-        id: Uuid::new_v4().to_string(),
-        name: name_str.clone(),
-        key_type: kt.db_tag().to_string(),
-        public_key: public_openssh,
-        private_key_encrypted: sealed_private,
-        fingerprint_sha256: fingerprint.clone(),
-        fingerprint_md5: keys::compute_fingerprint_md5(&key_data.public_key),
-        comment: comment_str,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        deployed: false,
-        deploy_path: None,
-        bitwarden_id: None,
-        bitwarden_sync: false,
-        bitwarden_revision_ts: None,
-        bitwarden_updated_at: None,
-        category_ids: Vec::new(),
-    };
-
-    app.state::<AppState>()
-        .db
-        .insert_key(&key_record)
-        .map_err(|e| e.to_string())?;
-    app.state::<AppState>()
-        .db
-        .add_audit("keys.created", Some(&key_record.id), &name_str)?;
-
-    Ok(serde_json::json!({ "ok": true, "id": key_record.id, "fingerprint": fingerprint }))
+/// Run `write` - the insert or rename that takes `name` - only if no other
+/// key has that name, with the check and the write together under
+/// [`KEY_NAME_WRITES`]. The one place create, import and rename go through.
+fn write_with_free_key_name<T>(
+    db: &db::Database,
+    name: &str,
+    except_id: Option<&str>,
+    write: impl FnOnce() -> anyhow::Result<T>,
+) -> CmdResult<T> {
+    let _names = KEY_NAME_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ensure_key_name_free(db, name, except_id)?;
+    write().map_err(|e| CmdError(e.to_string()))
 }
 
 #[tauri::command]
@@ -3456,24 +3965,48 @@ pub fn key_import(
     comment: Option<String>,
     passphrase: Option<String>,
 ) -> CmdResult<serde_json::Value> {
+    key_import_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        app.state::<VaultRotationLock>().inner(),
+        &pem,
+        name,
+        comment,
+        passphrase.as_deref(),
+    )
+}
+
+/// [`key_import`] without the `AppHandle`. Reads only OpenSSH private keys
+/// and PuTTY .ppk files (ruling R9); anything else is refused with a message
+/// that names what it is and how to convert it.
+fn key_import_in(
+    db: &db::Database,
+    store: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    pem: &str,
+    name: Option<String>,
+    comment: Option<String>,
+    passphrase: Option<&str>,
+) -> CmdResult<serde_json::Value> {
     // Seals with the master password: not while it is being changed (C1).
-    let _rotation = rotation_shared(&app)?;
-    let pw = vault_password(&app)?;
+    let _rotation = rotation.try_shared()?;
+    let pw = store.get().unwrap_or_default();
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
     let pem = pem.trim();
 
     let mut key_data = if pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
-        keys::import_openssh_private(pem, passphrase.as_deref()).map_err(|e| e.to_string())?
+        keys::import_openssh_private(pem, passphrase).map_err(|e| e.to_string())?
     } else if crate::crypto::putty::looks_like_ppk(pem) {
-        crate::crypto::putty::import_ppk(pem, passphrase.as_deref()).map_err(|e| e.to_string())?
+        crate::crypto::putty::import_ppk(pem, passphrase).map_err(|e| e.to_string())?
     } else {
-        return Err("Unsupported key format. Expected an OpenSSH private key (-----BEGIN OPENSSH PRIVATE KEY-----) or a PuTTY .ppk file.".into());
+        return Err(keys::unsupported_import_message(pem).into());
     };
 
     if let Some(c) = comment {
-        key_data.comment = c;
+        // Cleaned like a comment read from the file (A7-45).
+        key_data.comment = keys::sanitize_key_comment(&c);
     }
 
     let public_openssh =
@@ -3482,11 +4015,7 @@ pub fn key_import(
     let fingerprint_md5 = keys::compute_fingerprint_md5(&key_data.public_key);
 
     // Dedupe by fingerprint so the same key can't be imported twice.
-    let existing = app
-        .state::<AppState>()
-        .db
-        .list_keys()
-        .map_err(|e| e.to_string())?;
+    let existing = db.list_keys().map_err(|e| e.to_string())?;
     if let Some(dup) = existing
         .iter()
         .find(|k| k.fingerprint_sha256 == fingerprint)
@@ -3498,6 +4027,9 @@ pub fn key_import(
     // Names become Host aliases in ~/.ssh/config - reject anything that could
     // break out of a single Host token before it ever reaches the vault.
     keys::validate_key_name(&name_str)?;
+    // Checked before the (slow) seal for a quick answer, and again under the
+    // lock right before the insert.
+    ensure_key_name_free(db, &name_str, None)?;
     let sealed_private =
         crate::crypto::vault::seal(&pw, &key_data.private_key).map_err(|e| e.to_string())?;
 
@@ -3521,15 +4053,8 @@ pub fn key_import(
         category_ids: Vec::new(),
     };
 
-    app.state::<AppState>()
-        .db
-        .insert_key(&key_record)
-        .map_err(|e| e.to_string())?;
-    app.state::<AppState>().db.add_audit(
-        "keys.imported",
-        Some(&key_record.id),
-        &key_record.name,
-    )?;
+    write_with_free_key_name(db, &key_record.name, None, || db.insert_key(&key_record))?;
+    db.add_audit("keys.imported", Some(&key_record.id), &key_record.name)?;
 
     Ok(serde_json::json!({ "ok": true, "id": key_record.id }))
 }
@@ -3576,9 +4101,11 @@ pub fn key_export(
     }
 
     let data = match format.as_str() {
-        "public" | "authorized_keys" => key.public_key.clone(),
+        // Re-checked (A7-45): a line stored before import-time comment
+        // cleaning could carry a second, injected key line.
+        "public" | "authorized_keys" => keys::sanitize_public_line(&key.public_key),
         "public-pem" => {
-            let key_data = load_private_key_data(&app, &key, &pw)?;
+            let key_data = unseal_key_data(&key, &pw)?;
             keys::export_public_key(&key_data, KeyFormat::Pkcs8).map_err(|e| e.to_string())?
         }
         _ => unreachable!("format restricted above"),
@@ -3602,13 +4129,38 @@ fn private_export_extension(format: &str) -> &'static str {
     }
 }
 
+/// The passphrase a private-key export uses, after the format rules: only
+/// the private formats come through here, and "pkcs8-encrypted" - the format
+/// whose whole point is the passphrase - refuses to run without one (A2-03 /
+/// A7-05 / A5-38). It used to fall back to a PLAINTEXT `BEGIN PRIVATE KEY`
+/// file and report "Exported pkcs8-encrypted". The other formats encrypt
+/// only when a passphrase is given. Checked before the save dialog opens.
+fn private_export_passphrase<'a>(
+    format: &str,
+    passphrase: Option<&'a str>,
+) -> CmdResult<Option<&'a str>> {
+    match format {
+        "openssh-private" | "ppk" | "pkcs8" | "pkcs8-encrypted" => {}
+        other => {
+            return Err(CmdError(format!(
+                "Format \"{other}\" is public material; use the regular export path."
+            )))
+        }
+    }
+    let pass = passphrase.filter(|p| !p.is_empty());
+    if format == "pkcs8-encrypted" && pass.is_none() {
+        return Err("A passphrase is required for an encrypted PKCS#8 export.".into());
+    }
+    Ok(pass)
+}
+
 /// Export a PRIVATE key straight to a user-chosen file. The PEM text is
 /// serialized in the backend and written to the path the user picks in the
 /// native save dialog - the key material never crosses the IPC boundary into
-/// the renderer. The file is written 0600 from the first byte on Unix; on
-/// Windows the current-user-only ACL is attempted and a failure is logged
-/// (exports may legitimately target volumes that cannot store ACLs, unlike
-/// the deploy destination, where a restriction failure is fatal).
+/// the renderer. The file is owner-only from the first byte: 0600 on Unix; on
+/// Windows it is restricted to the current user while still empty, and the
+/// export fails - leaving no file - if that is impossible (a volume that
+/// cannot store ACLs, say), as for every secret file SSHSpan writes.
 #[tauri::command]
 /// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
 /// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
@@ -3622,45 +4174,50 @@ pub async fn key_export_to_file(
     format: String,
     passphrase: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    let pw = vault_password(&app)?;
-    if pw.is_empty() {
+    if !app.state::<VaultPasswordStore>().is_set() {
         return Err("Vault is locked.".into());
     }
+    // Format and passphrase first: an encrypted PKCS#8 export without a
+    // passphrase is refused before anything is decrypted or a dialog opens.
+    let pass = private_export_passphrase(&format, passphrase.as_deref())?;
     // Capture the generation before the (decrypt → dialog → write) sequence:
     // the save dialog blocks on user input for an unbounded time, during
     // which the vault could be locked. Re-checked before the write below.
     let generation = capture_vault_generation(&app)?;
-    match format.as_str() {
-        "openssh-private" | "ppk" | "pkcs8" | "pkcs8-encrypted" => {}
-        other => {
-            return Err(CmdError(format!(
-                "Format \"{other}\" is public material; use the regular export path."
-            )))
+
+    let (key, data) = {
+        // Read access to the rotation lock while the key is unsealed, so a
+        // master-password change in progress gives the "being re-encrypted"
+        // answer rather than a failed decryption. Released before the
+        // dialog: the user may sit in it for any length of time.
+        let _rotation = rotation_shared(&app)?;
+        let pw = vault_password(&app)?;
+        if pw.is_empty() {
+            return Err("Vault is locked.".into());
         }
-    }
+        let key = app
+            .state::<AppState>()
+            .db
+            .get_key(&id)
+            .map_err(|e| e.to_string())?;
+        let key = key.ok_or_else(|| "Key not found.".to_string())?;
 
-    let key = app
-        .state::<AppState>()
-        .db
-        .get_key(&id)
-        .map_err(|e| e.to_string())?;
-    let key = key.ok_or_else(|| "Key not found.".to_string())?;
-
-    let key_data = load_private_key_data(&app, &key, &pw)?;
-    let pass = passphrase.as_deref().filter(|p| !p.is_empty());
-    // Zeroizing: the serialized private key is wiped from this frame once
-    // written, not left as freed heap (secret-wiping hardening).
-    let data = zeroize::Zeroizing::new(
-        match format.as_str() {
-            "openssh-private" => keys::export_private_key(&key_data, KeyFormat::OpenSsh, pass),
-            "pkcs8" | "pkcs8-encrypted" => {
-                keys::export_private_key(&key_data, KeyFormat::Pkcs8, pass)
+        let key_data = unseal_key_data(&key, &pw)?;
+        // Zeroizing: the serialized private key is wiped from this frame once
+        // written, not left as freed heap (secret-wiping hardening).
+        let data = zeroize::Zeroizing::new(
+            match format.as_str() {
+                "openssh-private" => keys::export_private_key(&key_data, KeyFormat::OpenSsh, pass),
+                "pkcs8" | "pkcs8-encrypted" => {
+                    keys::export_private_key(&key_data, KeyFormat::Pkcs8, pass)
+                }
+                "ppk" => keys::export_private_key(&key_data, KeyFormat::Putty, pass),
+                _ => unreachable!("format restricted above"),
             }
-            "ppk" => keys::export_private_key(&key_data, KeyFormat::Putty, pass),
-            _ => unreachable!("format restricted above"),
-        }
-        .map_err(|e| e.to_string())?,
-    );
+            .map_err(|e| e.to_string())?,
+        );
+        (key, data)
+    };
 
     use tauri_plugin_dialog::DialogExt;
     let default_name = format!("{}{}", key.name, private_export_extension(&format));
@@ -3747,13 +4304,15 @@ fn key_rename_in(
     name: &str,
 ) -> CmdResult<serde_json::Value> {
     require_unlocked(vault)?;
-    // Reads the whole row and writes it back: not while a master-password
-    // change could re-seal it in between (C1).
+    // A vault write like the others: not while a master-password change
+    // runs (C1). The rename itself touches only the name (`rename_key`), so
+    // it can no longer write back a stale row - a deployment recorded by a
+    // deploy running off the main thread used to be erased that way.
     let _rotation = rotation.try_shared()?;
     let name = name.trim().to_string();
     crate::crypto::keys::validate_key_name(&name).map_err(CmdError)?;
 
-    let mut key = db
+    let key = db
         .get_key(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Key not found.".to_string())?;
@@ -3761,151 +4320,323 @@ fn key_rename_in(
     if key.name == name {
         return Ok(serde_json::json!({ "ok": true, "name": name }));
     }
-    let previous = key.name.clone();
-    key.name = name.clone();
-    key.updated_at = chrono::Utc::now();
-    db.update_key(&key).map_err(|e| e.to_string())?;
-    db.add_audit("keys.renamed", Some(id), &format!("{previous} -> {name}"))?;
+    // Another key's name, in any case, is refused (A2-46 / A5-25); a change
+    // of case to the key's own name is not a clash.
+    write_with_free_key_name(db, &name, Some(id), || db.rename_key(id, &name))?;
+    db.add_audit("keys.renamed", Some(id), &format!("{} -> {name}", key.name))?;
     Ok(serde_json::json!({ "ok": true, "name": name }))
 }
 
-#[tauri::command]
-pub fn key_fingerprint(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
-    let key = app
-        .state::<AppState>()
-        .db
-        .get_key(&id)
-        .map_err(|e| e.to_string())?;
-    let key = key.ok_or_else(|| "Key not found.".to_string())?;
-    Ok(serde_json::json!({ "sha256": key.fingerprint_sha256, "md5": key.fingerprint_md5 }))
+/// Write an audit row for something that already happened. A failure cannot
+/// undo the action, so it does not fail the command - but it is logged, not
+/// dropped without a trace.
+fn audit_or_warn(db: &db::Database, action: &str, key_id: Option<&str>, details: &str) {
+    if let Err(e) = db.add_audit(action, key_id, details) {
+        log::warn!("[sshspan-keys] could not write the audit row {action}: {e}");
+    }
 }
 
+/// The keys of a deploy request, each once, in request order. An empty
+/// request is fine for the preview (nothing to show) and refused by the deploy.
+fn load_deploy_records(db: &db::Database, ids: &[String]) -> CmdResult<Vec<KeyRecord>> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter()
+        .filter(|id| seen.insert(id.as_str()))
+        .map(|id| {
+            db.get_key(id)
+                .map_err(|e| CmdError(e.to_string()))?
+                .ok_or_else(|| CmdError(format!("Key not found: {id}")))
+        })
+        .collect()
+}
+
+/// [`SshService::plan_deploy`] for vault keys: their recorded deployments
+/// are what a file must not collide with.
+fn plan_key_deploy(
+    db: &db::Database,
+    target: &DeployTarget,
+    records: &[KeyRecord],
+    fields: &DeployHostFields,
+) -> CmdResult<DeployPlan> {
+    let keys: Vec<DeployKey> = records
+        .iter()
+        .map(|k| DeployKey {
+            id: k.id.clone(),
+            name: k.name.clone(),
+            deploy_path: k.deploy_path.clone(),
+        })
+        .collect();
+    let recorded: Vec<RecordedDeployment> = db
+        .list_key_deployments()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(id, name, path)| RecordedDeployment { id, name, path })
+        .collect();
+    SshService::plan_deploy(target, &keys, &recorded, fields).map_err(|e| CmdError(e.to_string()))
+}
+
+/// What a deploy would write, without writing it (ruling R3): per key the
+/// alias, the files and whether it will be refused, and `configText` -
+/// exactly the stanza text the deploy writes into the managed config, by the
+/// same code. The deploy sheet shows this instead of building its own guess
+/// (A2-05 / A7-04 / A8-01 / A5-04). Nothing is decrypted.
 #[tauri::command]
-pub fn key_deploy(
+pub fn key_deploy_preview(
+    app: AppHandle,
+    ids: Vec<String>,
+    host_alias: Option<String>,
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    strict_host_key: Option<bool>,
+) -> CmdResult<serde_json::Value> {
+    let fields = DeployHostFields::parse(host_alias, hostname, user, port, strict_host_key)
+        .map_err(CmdError)?;
+    let target = DeployTarget::user_default().map_err(|e| CmdError(e.to_string()))?;
+    key_deploy_preview_in(&app.state::<AppState>().db, &target, &ids, &fields)
+}
+
+/// [`key_deploy_preview`] without the `AppHandle`.
+fn key_deploy_preview_in(
+    db: &db::Database,
+    target: &DeployTarget,
+    ids: &[String],
+    fields: &DeployHostFields,
+) -> CmdResult<serde_json::Value> {
+    let records = load_deploy_records(db, ids)?;
+    let plan = plan_key_deploy(db, target, &records, fields)?;
+    Ok(serde_json::json!({
+        "configPath": target.config_path.display().to_string(),
+        "sshDir": target.ssh_dir.display().to_string(),
+        "includeLine": plan.include_line(),
+        "keys": plan.keys,
+        "configText": plan.config_text(),
+    }))
+}
+
+/// Deploy keys: each private key to `~/.ssh/sshspan_<name>` (owner-only),
+/// its `.pub` beside it, and a Host stanza into SSHSpan's managed config
+/// carrying the HostName / User / Port / alias the sheet collected (R3) -
+/// exactly what [`key_deploy_preview`] showed. A key whose file belongs to
+/// another key, or is a file SSHSpan did not write for it, is refused rather
+/// than overwritten; the others still deploy. Returns `{ok, keys: [{id, name,
+/// alias, file, pubFile}], errors: [{id, name, error}], warnings, configPath,
+/// includeLine}`; when no key could be deployed it fails with the reasons.
+///
+/// Async on purpose (A7-13): every key is unsealed (Argon2id) and possibly
+/// re-encrypted, which froze the window as a synchronous command. The work
+/// runs on a blocking worker under the [`VaultRotationLock`], and a vault lock
+/// meanwhile stops it before the next key is decrypted.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn key_deploy(
     app: AppHandle,
     ids: Vec<String>,
     passphrase: Option<String>,
     strict_host_key: Option<bool>,
+    host_alias: Option<String>,
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
 ) -> CmdResult<serde_json::Value> {
-    // Writes each deployed key's whole row back: not while a master-password
-    // change could re-seal it in between (C1).
-    let _rotation = rotation_shared(&app)?;
-    let pw = vault_password(&app)?;
+    let passphrase = passphrase.map(zeroize::Zeroizing::new);
+    let fields = DeployHostFields::parse(host_alias, hostname, user, port, strict_host_key)
+        .map_err(CmdError)?;
+    let target = DeployTarget::user_default().map_err(|e| CmdError(e.to_string()))?;
+    let generation = app.state::<VaultGeneration>().current();
+    let worker = app.clone();
+    run_blocking(move || {
+        key_deploy_in(
+            &worker.state::<AppState>().db,
+            worker.state::<VaultPasswordStore>().inner(),
+            worker.state::<VaultRotationLock>().inner(),
+            &target,
+            &ids,
+            passphrase.as_deref().map(String::as_str),
+            &fields,
+            &|| require_generation_current(&worker, generation),
+        )
+    })
+    .await
+}
+
+/// [`key_deploy`] on its blocking worker, without the `AppHandle`.
+/// `still_current` is the vault-generation check, run before each key is
+/// decrypted.
+#[allow(clippy::too_many_arguments)]
+fn key_deploy_in(
+    db: &db::Database,
+    store: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    target: &DeployTarget,
+    ids: &[String],
+    passphrase: Option<&str>,
+    fields: &DeployHostFields,
+    still_current: &dyn Fn() -> CmdResult<()>,
+) -> CmdResult<serde_json::Value> {
+    // Unseals with the master password and records the deployment: taken
+    // before the first read, not while a master-password change runs (C1).
+    let _rotation = rotation.try_shared()?;
+    let pw = store.get().unwrap_or_default();
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
-
-    let mut results = Vec::new();
-    for id in &ids {
-        let key = app
-            .state::<AppState>()
-            .db
-            .get_key(id)
-            .map_err(|e| e.to_string())?;
-        let key = key.ok_or_else(|| format!("Key not found: {}", id))?;
-
-        let key_data = load_private_key_data(&app, &key, &pw)?;
-        let openssh_private = keys::export_private_key(
-            &key_data,
-            KeyFormat::OpenSsh,
-            passphrase.as_deref().filter(|p| !p.is_empty()),
-        )
-        .map_err(|e| e.to_string())?;
-        let openssh_public =
-            keys::export_public_key(&key_data, KeyFormat::OpenSsh).map_err(|e| e.to_string())?;
-
-        let result = SshService::deploy_key(
-            &key.name,
-            &openssh_private,
-            &openssh_public,
-            Some(&key.name),
-            None,
-            None,
-            None,
-            strict_host_key,
-        )
-        .map_err(|e| e.to_string())?;
-
-        let mut updated = key.clone();
-        updated.deployed = true;
-        updated.deploy_path = Some(result.private_key_path.clone());
-        updated.updated_at = chrono::Utc::now();
-        app.state::<AppState>()
-            .db
-            .update_key(&updated)
-            .map_err(|e| e.to_string())?;
-
-        results.push(serde_json::json!({
-            "id": id, "name": key.name, "file": result.private_key_path,
-        }));
+    let records = load_deploy_records(db, ids)?;
+    if records.is_empty() {
+        return Err("Select at least one key to deploy.".into());
     }
-    app.state::<AppState>().db.add_audit(
-        "keys.deployed",
-        None,
-        &format!("{} key(s)", results.len()),
-    )?;
-    Ok(serde_json::json!({ "ok": true, "keys": results }))
-}
+    let plan = plan_key_deploy(db, target, &records, fields)?;
+    let by_id: std::collections::HashMap<&str, &KeyRecord> =
+        records.iter().map(|k| (k.id.as_str(), k)).collect();
+    let passphrase = passphrase.filter(|p| !p.is_empty());
 
-#[tauri::command]
-pub fn key_remove_deployed(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
-    // Deleting local files is a privileged side effect; refuse while locked.
-    if vault_password(&app)?.is_empty() {
-        return Err("Vault is locked.".into());
-    }
-    // Writes the key's whole row back: not while a master-password change
-    // could re-seal it in between (C1).
-    let _rotation = rotation_shared(&app)?;
-    let key = app
-        .state::<AppState>()
-        .db
-        .get_key(&id)
-        .map_err(|e| e.to_string())?;
-    let key = key.ok_or_else(|| "Key not found.".to_string())?;
+    let mut outcome = SshService::apply_deploy(&plan, |planned| {
+        still_current().map_err(|e| e.0)?;
+        let key = by_id[planned.id.as_str()];
+        let data = unseal_key_data(key, &pw)?;
+        let private_key = zeroize::Zeroizing::new(
+            keys::export_private_key(&data, KeyFormat::OpenSsh, passphrase)
+                .map_err(|e| e.to_string())?,
+        );
+        let public_key =
+            keys::export_public_key(&data, KeyFormat::OpenSsh).map_err(|e| e.to_string())?;
+        Ok(DeployFiles {
+            private_key,
+            public_key,
+        })
+    });
 
-    if let Some(deploy_path) = &key.deploy_path {
-        // Only ever delete inside the managed SSH directory (~/.ssh). The
-        // stored path is normally produced by deploy_key, but a pre-F9 backup
-        // restore (or direct DB tampering) could have written an arbitrary
-        // path here; authenticated encryption of a backup does not make its
-        // local deployment paths trustworthy. Canonicalize the parent so
-        // `..`/junction games cannot escape, then require containment before
-        // touching the filesystem.
-        let candidate = std::path::Path::new(deploy_path);
-        let managed = dirs::home_dir().map(|h| h.join(".ssh"));
-        let contained = match (&managed, candidate.parent()) {
-            (Some(m), Some(parent)) => {
-                let m_norm = dunce::canonicalize(m).unwrap_or_else(|_| m.clone());
-                let p_norm = dunce::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-                p_norm.starts_with(&m_norm)
-            }
-            _ => false,
-        };
-        if contained {
-            let _ = fs::remove_file(deploy_path);
-            let _ = fs::remove_file(format!("{}.pub", deploy_path));
-        } else {
-            // Refuse to delete outside the managed directory; still clear the
-            // record so the UI no longer reports a phantom deployment.
-            log::warn!(
-                "[sshspan-keys] key_remove_deployed: refusing to delete {deploy_path} (outside managed ~/.ssh); clearing the deployment record only"
-            );
-            let _ = app.state::<AppState>().db.add_audit(
-                "keys.undeploy_refused",
-                Some(&id),
-                "stored deploy_path outside managed directory; record cleared, file untouched",
-            );
+    for deployed in &outcome.deployed {
+        if let Err(e) = db.set_key_deployment(&deployed.id, Some(&deployed.file)) {
+            outcome.warnings.push(format!(
+                "{} was written, but the vault could not record the deployment: {e}",
+                deployed.file
+            ));
         }
     }
-    let mut updated = key;
-    updated.deployed = false;
-    updated.deploy_path = None;
-    updated.updated_at = chrono::Utc::now();
-    app.state::<AppState>()
-        .db
-        .update_key(&updated)
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
+    if !outcome.deployed.is_empty() {
+        let files: Vec<&str> = outcome.deployed.iter().map(|d| d.file.as_str()).collect();
+        audit_or_warn(
+            db,
+            "keys.deployed",
+            None,
+            &format!("{} key(s): {}", files.len(), files.join(", ")),
+        );
+    }
+    if !outcome.errors.is_empty() {
+        let names: Vec<&str> = outcome.errors.iter().map(|e| e.name.as_str()).collect();
+        audit_or_warn(
+            db,
+            "keys.deploy_failed",
+            None,
+            &format!("{} key(s) not deployed: {}", names.len(), names.join(", ")),
+        );
+    }
+    if outcome.deployed.is_empty() {
+        let reasons: Vec<&str> = outcome.errors.iter().map(|e| e.error.as_str()).collect();
+        return Err(CmdError(reasons.join("\n")));
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "keys": outcome.deployed,
+        "errors": outcome.errors,
+        "warnings": outcome.warnings,
+        "configPath": target.config_path.display().to_string(),
+        "includeLine": plan.include_line(),
+    }))
+}
+
+/// Undo a deployment (A7-22 / A8-16): delete the key's deployed private key
+/// and `.pub` and the managed-config stanza that points at them, and clear
+/// the record. Returns `{ok, removed: [paths], removedHosts: [aliases],
+/// warnings: [...]}`. If the private key file cannot be deleted it fails and
+/// the key stays marked as deployed - this used to drop every file error
+/// (`let _ = fs::remove_file`) and clear the record anyway, with the secret
+/// still on disk, and it never touched the stanza.
+#[tauri::command]
+pub fn key_remove_deployed(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
+    let target = DeployTarget::user_default().map_err(|e| CmdError(e.to_string()))?;
+    key_remove_deployed_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        app.state::<VaultRotationLock>().inner(),
+        &target,
+        &id,
+    )
+}
+
+/// [`key_remove_deployed`] without the `AppHandle`.
+fn key_remove_deployed_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    target: &DeployTarget,
+    id: &str,
+) -> CmdResult<serde_json::Value> {
+    // Deleting local files is a privileged side effect; refuse while locked.
+    require_unlocked(vault)?;
+    // Rewrites the key's deployment columns: taken before the first read,
+    // not while a master-password change runs (C1).
+    let _rotation = rotation.try_shared()?;
+    let key = db
+        .get_key(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Key not found.".to_string())?;
+
+    let mut removed = crate::ssh::RemovedDeployment::default();
+    let mut undeployed_files = false;
+    if let Some(deploy_path) = key.deploy_path.as_deref() {
+        // Only a file a deploy writes - `sshspan_*` directly in the managed
+        // SSH directory - is ever deleted. The stored path is normally the
+        // deploy's own, but a pre-F9 backup restore or a tampered database
+        // could point it anywhere, the user's own keys in ~/.ssh included.
+        if SshService::is_managed_deploy_path(target, deploy_path) {
+            removed = match SshService::remove_key(target, deploy_path) {
+                Ok(done) => done,
+                Err(e) => {
+                    audit_or_warn(db, "keys.undeploy_failed", Some(id), &e);
+                    return Err(CmdError(e));
+                }
+            };
+            undeployed_files = true;
+        } else {
+            log::warn!(
+                "[sshspan-keys] key_remove_deployed: refusing to delete {deploy_path} (not a file SSHSpan deploys); clearing the deployment record only"
+            );
+            audit_or_warn(
+                db,
+                "keys.undeploy_refused",
+                Some(id),
+                "stored deploy_path is not an SSHSpan deploy file; record cleared, file untouched",
+            );
+            removed.warnings.push(format!(
+                "{deploy_path} was not deleted: it is not a file SSHSpan deploys into {}. The deployment record was cleared.",
+                target.ssh_dir.display()
+            ));
+        }
+    }
+    // A key that was never deployed is left as it is: no write, no audit row.
+    if key.deployed || key.deploy_path.is_some() {
+        db.set_key_deployment(id, None).map_err(|e| e.to_string())?;
+    }
+    if undeployed_files {
+        audit_or_warn(
+            db,
+            "keys.undeployed",
+            Some(id),
+            &format!(
+                "removed [{}]; Host [{}]",
+                removed.removed.join(", "),
+                removed.removed_hosts.join(", ")
+            ),
+        );
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "removed": removed.removed,
+        "removedHosts": removed.removed_hosts,
+        "warnings": removed.warnings,
+    }))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -4173,8 +4904,53 @@ fn key_set_categories_in(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// A New Key request, checked before any generation starts.
+struct NewKey {
+    key_type: KeyType,
+    /// RSA only: 2048..=8192 ([`keys::rsa_key_bits`]); `None` otherwise.
+    bits: Option<u32>,
+    name: String,
+    comment: String,
+    category_ids: Vec<String>,
+}
+
+impl NewKey {
+    fn parse(
+        key_type: &str,
+        bits: Option<u32>,
+        name: Option<String>,
+        comment: Option<String>,
+        category_ids: Option<Vec<String>>,
+    ) -> CmdResult<Self> {
+        let kt = KeyType::from_db_tag(key_type).map_err(|e| e.to_string())?;
+        // The dialog sends its RSA size whatever the type; only RSA uses it.
+        let bits = match kt {
+            KeyType::Rsa => Some(keys::rsa_key_bits(bits).map_err(|e| e.to_string())?),
+            _ => None,
+        };
+        let name =
+            name.unwrap_or_else(|| format!("{}-{}", key_type, &Uuid::new_v4().to_string()[..8]));
+        // Names become Host aliases in ~/.ssh/config - reject anything that
+        // could break out of a single Host token before it reaches the vault.
+        keys::validate_key_name(&name)?;
+        Ok(Self {
+            key_type: kt,
+            bits,
+            name,
+            comment: comment.unwrap_or_default(),
+            category_ids: category_ids.unwrap_or_default(),
+        })
+    }
+}
+
+/// Generate a key and store it in the vault with its categories.
+///
+/// Async on purpose (A7-12): RSA generation takes seconds (4096 bits) to
+/// minutes (8192) in pure Rust, and as a synchronous command it ran on the
+/// main thread - the window froze ("Not Responding") until it finished. The
+/// generation and the Argon2id seal now run on a blocking worker.
 #[tauri::command]
-pub fn key_create_with_categories(
+pub async fn key_create_with_categories(
     app: AppHandle,
     key_type: String,
     bits: Option<u32>,
@@ -4182,50 +4958,73 @@ pub fn key_create_with_categories(
     comment: Option<String>,
     category_ids: Option<Vec<String>>,
 ) -> CmdResult<serde_json::Value> {
-    // Seals with the master password: not while it is being changed (C1).
-    let _rotation = rotation_shared(&app)?;
-    let pw = vault_password(&app)?;
-    if pw.is_empty() {
+    // Cheap refusals first, before a long prime search.
+    if !app.state::<VaultPasswordStore>().is_set() {
         return Err("Vault is locked.".into());
     }
-    let kt = KeyType::from_db_tag(&key_type).map_err(|e| e.to_string())?;
-    let comment_str = comment.clone().unwrap_or_default();
-    let name_str =
-        name.unwrap_or_else(|| format!("{}-{}", key_type, &Uuid::new_v4().to_string()[..8]));
-    // Names become Host aliases in ~/.ssh/config - reject anything that could
-    // break out of a single Host token before it ever reaches the vault.
-    keys::validate_key_name(&name_str)?;
+    let request = NewKey::parse(&key_type, bits, name, comment, category_ids)?;
+    let worker = app.clone();
+    run_blocking(move || {
+        create_key_in(
+            &worker.state::<AppState>().db,
+            worker.state::<VaultPasswordStore>().inner(),
+            worker.state::<VaultRotationLock>().inner(),
+            request,
+        )
+    })
+    .await
+}
 
-    let key_data =
-        keys::generate_key_pair(kt, bits, comment_str.clone()).map_err(|e| e.to_string())?;
-    let public_openssh =
-        keys::export_public_key(&key_data, KeyFormat::OpenSsh).map_err(|e| e.to_string())?;
-    let fingerprint = keys::compute_fingerprint_sha256(&key_data.public_key);
-    let sealed_private =
-        crate::crypto::vault::seal(&pw, &key_data.private_key).map_err(|e| e.to_string())?;
-
-    let cats = category_ids.unwrap_or_default();
-    let valid_ids: std::collections::HashSet<String> = app
-        .state::<AppState>()
-        .db
+/// [`key_create_with_categories`] on its blocking worker, without the
+/// `AppHandle`. The key is generated BEFORE the [`VaultRotationLock`] read
+/// access is taken - the generation reads nothing from the vault, and a
+/// password change should not wait out a prime search - and the seal and the
+/// insert happen under it.
+fn create_key_in(
+    db: &db::Database,
+    store: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    request: NewKey,
+) -> CmdResult<serde_json::Value> {
+    let valid_ids: std::collections::HashSet<String> = db
         .list_categories()
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|c| c.scope == "key")
         .map(|c| c.id)
         .collect();
-    if cats.iter().any(|id| !valid_ids.contains(id)) {
+    if request
+        .category_ids
+        .iter()
+        .any(|id| !valid_ids.contains(id))
+    {
         return Err("Keys can only use key categories.".into());
     }
+    ensure_key_name_free(db, &request.name, None)?;
+
+    let key_data = keys::generate_key_pair(request.key_type, request.bits, request.comment)
+        .map_err(|e| e.to_string())?;
+
+    // Seals with the master password: not while it is being changed (C1).
+    let _rotation = rotation.try_shared()?;
+    let pw = store.get().unwrap_or_default();
+    if pw.is_empty() {
+        return Err("Vault is locked.".into());
+    }
+    let public_openssh =
+        keys::export_public_key(&key_data, KeyFormat::OpenSsh).map_err(|e| e.to_string())?;
+    let fingerprint = keys::compute_fingerprint_sha256(&key_data.public_key);
+    let sealed_private =
+        crate::crypto::vault::seal(&pw, &key_data.private_key).map_err(|e| e.to_string())?;
     let key_record = KeyRecord {
         id: Uuid::new_v4().to_string(),
-        name: name_str.clone(),
-        key_type: kt.db_tag().to_string(),
+        name: request.name.clone(),
+        key_type: request.key_type.db_tag().to_string(),
         public_key: public_openssh,
         private_key_encrypted: sealed_private,
         fingerprint_sha256: fingerprint.clone(),
         fingerprint_md5: keys::compute_fingerprint_md5(&key_data.public_key),
-        comment: comment_str,
+        comment: key_data.comment.clone(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         deployed: false,
@@ -4237,23 +5036,16 @@ pub fn key_create_with_categories(
         category_ids: Vec::new(),
     };
 
-    let db = &app.state::<AppState>().db;
-    db.insert_key_with_categories(&key_record, &cats)
-        .map_err(|e| e.to_string())?;
-    db.add_audit("keys.created", Some(&key_record.id), &name_str)?;
+    write_with_free_key_name(db, &key_record.name, None, || {
+        db.insert_key_with_categories(&key_record, &request.category_ids)
+    })?;
+    db.add_audit("keys.created", Some(&key_record.id), &key_record.name)?;
     Ok(serde_json::json!({ "ok": true, "id": key_record.id, "fingerprint": fingerprint }))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  SSH CONFIG commands
 // ═════════════════════════════════════════════════════════════════════════════
-
-#[tauri::command]
-pub fn ssh_config_read() -> CmdResult<serde_json::Value> {
-    let config_service = SshConfigService::new().map_err(|e| e.to_string())?;
-    let config = config_service.read().map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "hosts": config.hosts }))
-}
 
 /// NOT REGISTERED in `generate_handler!`, deliberately.
 ///

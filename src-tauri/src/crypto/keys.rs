@@ -70,13 +70,17 @@ impl KeyType {
         }
     }
 
+    /// Parse a stored tag or a key type sent over IPC. `ecdsa-nistpNNN` - the
+    /// curve's SSH name, which the New Key dialog's curve options use - is
+    /// accepted beside the stored `ecdsa-pNNN` (A2-02 / A7-02): without it
+    /// every ECDSA key generated from the UI failed with "Unknown key type".
     pub fn from_db_tag(tag: &str) -> anyhow::Result<Self> {
         match tag {
             "rsa" => Ok(KeyType::Rsa),
             "ed25519" => Ok(KeyType::Ed25519),
-            "ecdsa" | "ecdsa-p256" => Ok(KeyType::EcdsaP256),
-            "ecdsa-p384" => Ok(KeyType::EcdsaP384),
-            "ecdsa-p521" => Ok(KeyType::EcdsaP521),
+            "ecdsa" | "ecdsa-p256" | "ecdsa-nistp256" => Ok(KeyType::EcdsaP256),
+            "ecdsa-p384" | "ecdsa-nistp384" => Ok(KeyType::EcdsaP384),
+            "ecdsa-p521" | "ecdsa-nistp521" => Ok(KeyType::EcdsaP521),
             other => anyhow::bail!("Unknown key type: {other}"),
         }
     }
@@ -129,19 +133,140 @@ impl PrivateKeyData {
     }
 }
 
+/// Smallest RSA modulus SSHSpan generates (also `ssh-key`'s own minimum).
+pub const RSA_MIN_BITS: u32 = 2048;
+/// Largest RSA modulus SSHSpan generates - the biggest size the New Key
+/// dialog offers. The pure-Rust prime search for larger keys runs for many
+/// minutes.
+pub const RSA_MAX_BITS: u32 = 8192;
+/// RSA modulus size when a request names none.
+pub const RSA_DEFAULT_BITS: u32 = 3072;
+
+/// The RSA modulus size for a generate request: absent means the default,
+/// and anything outside 2048..=8192 is refused with the range in the message
+/// (A7-12). It used to be clamped to 2048-16384 without a word, so 1024 quietly
+/// became 2048 and 16384 - effectively a hang - went through.
+pub fn rsa_key_bits(bits: Option<u32>) -> anyhow::Result<u32> {
+    let bits = bits.unwrap_or(RSA_DEFAULT_BITS);
+    if !(RSA_MIN_BITS..=RSA_MAX_BITS).contains(&bits) {
+        anyhow::bail!(
+            "RSA key size must be between {RSA_MIN_BITS} and {RSA_MAX_BITS} bits (got {bits})."
+        );
+    }
+    Ok(bits)
+}
+
+/// A key comment that cannot break the one-line formats it is written into
+/// (A7-45): every control character (newline, carriage return, tab, NUL, ...)
+/// becomes a space, and surrounding whitespace is trimmed.
+///
+/// The OpenSSH private-key format and PPK carry the comment as a counted or
+/// header string that nothing validates, so a crafted key file could hold
+/// `x\nssh-ed25519 AAAA... attacker` and turn the `authorized_keys` line a
+/// user copies, a deployed `.pub` file or a PPK header into several lines.
+/// Applied when a key is generated or imported, and again by every exporter
+/// for keys stored before this check existed.
+pub fn sanitize_key_comment(comment: &str) -> String {
+    comment
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// A stored `authorized_keys` line, made safe to hand out as ONE line - the
+/// rule of [`sanitize_key_comment`]. The algorithm and the base64 never hold
+/// control characters, so only a comment stored before that check changes.
+pub fn sanitize_public_line(line: &str) -> String {
+    sanitize_key_comment(line)
+}
+
+/// What `key_import` says about text that is neither an OpenSSH private key
+/// nor a PuTTY .ppk (A7-03 / A5-39, ruling R9). Those are the only formats it
+/// reads, so the message names what the text looks like and how to turn it
+/// into one of them, instead of a bare "unsupported format".
+pub fn unsupported_import_message(text: &str) -> String {
+    const SUPPORTED: &str = "SSHSpan imports OpenSSH private keys (-----BEGIN OPENSSH PRIVATE KEY-----) and PuTTY .ppk files only.";
+    // `-o`: before OpenSSH 7.8, `-p` alone rewrote the key in its old PEM
+    // format; later versions accept `-o` and ignore it.
+    const CONVERT: &str = "Convert a copy with: ssh-keygen -p -o -f <copy-of-the-key-file> (it rewrites that file in OpenSSH format and asks for a passphrase to keep or set), then import the result.";
+    const PUTTYGEN: &str = " Or load it in PuTTYgen and use \"Save private key\" to get a .ppk.";
+    // (header, what it is, whether PuTTYgen can load it)
+    const PRIVATE_PEM: [(&str, &str, bool); 4] = [
+        (
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "a PKCS#1 RSA private key",
+            true,
+        ),
+        (
+            "-----BEGIN EC PRIVATE KEY-----",
+            "a SEC1 EC private key",
+            true,
+        ),
+        (
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+            "an encrypted PKCS#8 private key",
+            false,
+        ),
+        ("-----BEGIN PRIVATE KEY-----", "a PKCS#8 private key", false),
+    ];
+    for (header, what, puttygen) in PRIVATE_PEM {
+        if text.contains(header) {
+            return format!(
+                "Unsupported key format: this is {what} ({header}). {SUPPORTED} {CONVERT}{}",
+                if puttygen { PUTTYGEN } else { "" }
+            );
+        }
+    }
+    let public = if text.contains("-----BEGIN PUBLIC KEY-----") {
+        Some("an SPKI public key (-----BEGIN PUBLIC KEY-----)")
+    } else if text.contains("---- BEGIN SSH2 PUBLIC KEY ----") {
+        Some("an RFC 4716 public key (---- BEGIN SSH2 PUBLIC KEY ----)")
+    } else if looks_like_openssh_public_line(text) {
+        Some("an OpenSSH public key line (authorized_keys / .pub)")
+    } else {
+        None
+    };
+    match public {
+        Some(what) => format!(
+            "Unsupported key format: this is {what}, which holds only the public half. A vault key needs the private key - import the matching OpenSSH private key or PuTTY .ppk file instead."
+        ),
+        None => "Unsupported key format. Expected an OpenSSH private key (-----BEGIN OPENSSH PRIVATE KEY-----) or a PuTTY .ppk file.".to_string(),
+    }
+}
+
+/// An `authorized_keys` / `.pub` line: an SSH algorithm name followed by base64
+/// that starts `AAAA` (the length prefix of the algorithm name). Options before
+/// the key (`from="..." ssh-ed25519 AAAA...`) are skipped over.
+fn looks_like_openssh_public_line(text: &str) -> bool {
+    text.lines().any(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        tokens.windows(2).any(|pair| {
+            let algorithm = pair[0];
+            (algorithm.starts_with("ssh-")
+                || algorithm.starts_with("ecdsa-sha2-")
+                || algorithm.starts_with("sk-"))
+                && pair[1].starts_with("AAAA")
+        })
+    })
+}
+
 /// Generate a new key pair of the given type.
 ///
-/// `bits` only applies to RSA (clamped to 2048-16384; default 3072).
+/// `bits` only applies to RSA: 2048 to 8192, 3072 when absent (see
+/// [`rsa_key_bits`]). The comment is cleaned with [`sanitize_key_comment`].
 pub fn generate_key_pair(
     key_type: KeyType,
     bits: Option<u32>,
     comment: String,
 ) -> anyhow::Result<PrivateKeyData> {
     let mut rng = OsRng;
+    let comment = sanitize_key_comment(&comment);
 
     let keypair_data: KeypairData = match key_type {
         KeyType::Rsa => {
-            let bits = bits.unwrap_or(3072).clamp(2048, 16384) as usize;
+            let bits = rsa_key_bits(bits)? as usize;
             KeypairData::Rsa(RsaKeypair::random(&mut rng, bits).map_err(|e| anyhow::anyhow!(e))?)
         }
         KeyType::Ed25519 => KeypairData::Ed25519(Ed25519Keypair::random(&mut rng)),
@@ -193,7 +318,10 @@ pub fn import_openssh_private(
     }
 
     let key_type = KeyType::from_ssh_key_algorithm(&key.algorithm())?;
-    let comment = key.comment().to_string();
+    // The comment comes from the file unchecked (A7-45); the cleaned one is
+    // also what the stored private key carries.
+    let comment = sanitize_key_comment(key.comment());
+    key.set_comment(comment.clone());
     let private_bytes = key.to_bytes().map_err(|e| anyhow::anyhow!(e))?.to_vec();
     let public_bytes = key
         .public_key()
@@ -353,12 +481,15 @@ pub fn export_public_key(key_data: &PrivateKeyData, format: KeyFormat) -> anyhow
 }
 
 /// Export as OpenSSH format, optionally encrypted with a passphrase
-/// (aes256-ctr + bcrypt KDF, matching modern `ssh-keygen` defaults).
+/// (aes256-ctr + bcrypt KDF, matching modern `ssh-keygen` defaults). The
+/// embedded comment is the key's (cleaned) comment - a key stored before
+/// comments were checked still carries the raw one in its private bytes.
 fn export_openssh_private(
     key_data: &PrivateKeyData,
     passphrase: Option<&str>,
 ) -> anyhow::Result<String> {
-    let key = key_data.to_ssh_key()?;
+    let mut key = key_data.to_ssh_key()?;
+    key.set_comment(sanitize_key_comment(&key_data.comment));
     let key = match passphrase {
         Some(pass) if !pass.is_empty() => {
             let mut rng = OsRng;
@@ -373,13 +504,15 @@ fn export_openssh_private(
         .to_string())
 }
 
+/// The `authorized_keys` line. The comment is re-checked here (A7-45): keys
+/// stored before comments were cleaned on import may still hold a newline.
 fn export_openssh_public(key_data: &PrivateKeyData) -> anyhow::Result<String> {
     let b64 = Base64::encode_string(&key_data.public_key);
     Ok(format!(
         "{} {} {}",
         key_data.key_type.algorithm_name(),
         b64,
-        key_data.comment
+        sanitize_key_comment(&key_data.comment)
     )
     .trim_end()
     .to_string())
@@ -441,15 +574,19 @@ fn export_rfc4716_public(key_data: &PrivateKeyData) -> anyhow::Result<String> {
         anyhow::bail!("Invalid OpenSSH public key");
     }
     let base64_key = parts[1];
-    let comment = parts
-        .get(2)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| key_data.comment.clone());
+    // The whole (cleaned) comment: taking the third whitespace-separated
+    // word of the OpenSSH line kept only the comment's first word.
+    let comment = sanitize_key_comment(&key_data.comment);
 
     let mut output = String::new();
     output.push_str("---- BEGIN SSH2 PUBLIC KEY ----\n");
     output.push_str(&format!("Comment: \"{}\"\n", comment));
-    output.push_str(&format!("{}\n", base64_key));
+    // RFC 4716 3.3: no line longer than 72 bytes. 70 per line, as
+    // `ssh-keygen -e` writes it.
+    for chunk in base64_key.as_bytes().chunks(70) {
+        output.push_str(&String::from_utf8_lossy(chunk));
+        output.push('\n');
+    }
     output.push_str("---- END SSH2 PUBLIC KEY ----\n");
     Ok(output)
 }
@@ -495,9 +632,265 @@ fn encrypt_pkcs8_with_passphrase(pkcs8_der: &[u8], passphrase: &str) -> anyhow::
     pem_wrap("ENCRYPTED PRIVATE KEY", &der)
 }
 
+/// One key of every supported type, generated once per test run and shared by
+/// the format round-trip tests here and in `putty`/`pkcs8`: RSA generation is
+/// slow in a debug build. The comments carry a space on purpose.
+#[cfg(test)]
+pub(crate) fn sample_keys() -> &'static [PrivateKeyData] {
+    static KEYS: std::sync::OnceLock<Vec<PrivateKeyData>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        [
+            KeyType::Rsa,
+            KeyType::Ed25519,
+            KeyType::EcdsaP256,
+            KeyType::EcdsaP384,
+            KeyType::EcdsaP521,
+        ]
+        .into_iter()
+        .map(|kt| {
+            generate_key_pair(kt, Some(2048), format!("sample {}", kt.db_tag()))
+                .expect("generate a sample key")
+        })
+        .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── A2-02 / A7-02 / A5-37: the New Key dialog's key types parse ──
+
+    #[test]
+    fn ecdsa_curve_tags_accept_the_ssh_spellings() {
+        for (tag, want) in [
+            ("ecdsa-nistp256", KeyType::EcdsaP256),
+            ("ecdsa-nistp384", KeyType::EcdsaP384),
+            ("ecdsa-nistp521", KeyType::EcdsaP521),
+            ("ecdsa-p256", KeyType::EcdsaP256),
+            ("ecdsa-p384", KeyType::EcdsaP384),
+            ("ecdsa-p521", KeyType::EcdsaP521),
+        ] {
+            assert_eq!(KeyType::from_db_tag(tag).ok(), Some(want), "{tag}");
+        }
+        assert!(KeyType::from_db_tag("ecdsa-nistp999").is_err());
+    }
+
+    /// The `<option value>`s of one `<select id="...">` in index.html.
+    fn select_options(html: &str, id: &str) -> Vec<String> {
+        let start = html
+            .find(&format!("<select id=\"{id}\""))
+            .unwrap_or_else(|| panic!("index.html has no <select id=\"{id}\">"));
+        let body = &html[start..];
+        let body = &body[..body.find("</select>").expect("unterminated <select>")];
+        body.split("<option value=\"")
+            .skip(1)
+            .map(|rest| rest[..rest.find('"').expect("unterminated value")].to_string())
+            .collect()
+    }
+
+    /// Contract test against the LIVE dialog: every key type, curve and RSA
+    /// size the New Key dialog offers must be accepted by the backend, built
+    /// the way `submitKeyModal` builds it (`ecdsa-` + the curve option).
+    #[test]
+    fn every_key_type_the_new_key_dialog_offers_is_accepted() {
+        let html = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/renderer/index.html"),
+        )
+        .expect("read src/renderer/index.html");
+        let types = select_options(&html, "genType");
+        let curves = select_options(&html, "genCurve");
+        let sizes = select_options(&html, "genBits");
+        assert!(!types.is_empty() && !curves.is_empty() && !sizes.is_empty());
+        let mut refused = Vec::new();
+        for t in &types {
+            let tags: Vec<String> = if t == "ecdsa" {
+                curves.iter().map(|c| format!("ecdsa-{c}")).collect()
+            } else {
+                vec![t.clone()]
+            };
+            for tag in tags {
+                if let Err(e) = KeyType::from_db_tag(&tag) {
+                    refused.push(format!("{tag}: {e}"));
+                }
+            }
+        }
+        for size in &sizes {
+            let bits: u32 = size.parse().expect("numeric RSA size");
+            if !(2048..=8192).contains(&bits) {
+                refused.push(format!("RSA {bits} bits is outside 2048..=8192"));
+            }
+        }
+        assert!(refused.is_empty(), "refused: {refused:?}");
+    }
+
+    // ── A7-12: RSA sizes outside 2048..=8192 are refused, not clamped ──
+
+    #[test]
+    fn rsa_generation_refuses_sizes_below_2048_bits() {
+        let err = generate_key_pair(KeyType::Rsa, Some(1024), String::new())
+            .err()
+            .expect("1024-bit RSA must be refused");
+        assert!(err.to_string().contains("2048"), "{err}");
+    }
+
+    #[test]
+    fn rsa_key_bits_accepts_2048_to_8192_and_names_the_range_otherwise() {
+        assert_eq!(rsa_key_bits(None).unwrap(), 3072);
+        for ok in [2048, 3072, 4096, 8192] {
+            assert_eq!(rsa_key_bits(Some(ok)).unwrap(), ok);
+        }
+        for bad in [0, 1024, 2047, 8193, 16384] {
+            assert_eq!(
+                rsa_key_bits(Some(bad)).unwrap_err().to_string(),
+                format!("RSA key size must be between 2048 and 8192 bits (got {bad}).")
+            );
+        }
+    }
+
+    // ── A7-03 / A5-39 / R9: the import error names what was pasted ──
+
+    #[test]
+    fn unsupported_import_message_names_each_detected_format() {
+        let private_pem = |label: &str| {
+            format!("-----BEGIN {label}-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END {label}-----\n")
+        };
+        let cases = [
+            (private_pem("RSA PRIVATE KEY"), "a PKCS#1 RSA private key"),
+            (private_pem("EC PRIVATE KEY"), "a SEC1 EC private key"),
+            (private_pem("PRIVATE KEY"), "a PKCS#8 private key"),
+            (
+                private_pem("ENCRYPTED PRIVATE KEY"),
+                "an encrypted PKCS#8 private key",
+            ),
+        ];
+        for (text, what) in &cases {
+            let msg = unsupported_import_message(text);
+            assert!(msg.contains(what), "{what}: {msg}");
+            // `-o`: before OpenSSH 7.8, `-p` alone kept the PEM format.
+            assert!(msg.contains("ssh-keygen -p -o -f"), "{what}: {msg}");
+            assert!(msg.contains("OpenSSH") && msg.contains(".ppk"), "{msg}");
+        }
+        // PuTTYgen reads PKCS#1 and SEC1 PEM files.
+        assert!(unsupported_import_message(&cases[0].0).contains("PuTTYgen"));
+        assert!(unsupported_import_message(&cases[1].0).contains("PuTTYgen"));
+
+        for (text, what) in [
+            (
+                "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA\n-----END PUBLIC KEY-----".to_string(),
+                "an SPKI public key",
+            ),
+            (
+                "---- BEGIN SSH2 PUBLIC KEY ----\nComment: \"x\"\nAAAAC3Nza\n---- END SSH2 PUBLIC KEY ----".to_string(),
+                "an RFC 4716 public key",
+            ),
+            (
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample me@host".to_string(),
+                "an OpenSSH public key line",
+            ),
+            (
+                "from=\"10.0.0.1\" ecdsa-sha2-nistp256 AAAAE2VjZHNh me".to_string(),
+                "an OpenSSH public key line",
+            ),
+        ] {
+            let msg = unsupported_import_message(&text);
+            assert!(msg.contains(what), "{what}: {msg}");
+            assert!(msg.contains("private"), "{msg}");
+            assert!(!msg.contains("ssh-keygen -p"), "no conversion for a public key: {msg}");
+        }
+
+        assert_eq!(
+            unsupported_import_message("hello"),
+            "Unsupported key format. Expected an OpenSSH private key (-----BEGIN OPENSSH PRIVATE KEY-----) or a PuTTY .ppk file."
+        );
+    }
+
+    // ── A7-45: a comment can never put a second line into a key file ──
+
+    const INJECTED_COMMENT: &str =
+        "me@host\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIATTACKER attacker\r\n";
+
+    #[test]
+    fn generated_key_comments_lose_their_control_characters() {
+        let key = generate_key_pair(KeyType::Ed25519, None, INJECTED_COMMENT.into()).unwrap();
+        assert!(
+            !key.comment.chars().any(char::is_control),
+            "{:?}",
+            key.comment
+        );
+        let line = export_public_key(&key, KeyFormat::OpenSsh).unwrap();
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+    }
+
+    #[test]
+    fn imported_openssh_comments_lose_their_control_characters() {
+        let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        key.set_comment(INJECTED_COMMENT);
+        let pem = key.to_openssh(LineEnding::LF).unwrap();
+        let imported = import_openssh_private(&pem, None).unwrap();
+        assert!(
+            !imported.comment.chars().any(char::is_control),
+            "{:?}",
+            imported.comment
+        );
+        // The comment inside the stored private key is the cleaned one too.
+        let stored = PrivateKey::from_bytes(&imported.private_key).unwrap();
+        assert_eq!(stored.comment(), imported.comment);
+        let line = export_public_key(&imported, KeyFormat::OpenSsh).unwrap();
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+    }
+
+    /// Keys stored before the import-time check keep their raw comment; every
+    /// exporter re-checks, so the line a user copies is still one line.
+    #[test]
+    fn exporters_recheck_comments_stored_before_the_fix() {
+        // Exactly what an import stored before the check: the raw comment in
+        // the comment column AND inside the private key bytes.
+        let mut raw = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        raw.set_comment(INJECTED_COMMENT);
+        let key = PrivateKeyData::new(
+            KeyType::Ed25519,
+            raw.to_bytes().unwrap().to_vec(),
+            raw.public_key().to_bytes().unwrap(),
+            INJECTED_COMMENT.to_string(),
+        );
+        let public = export_public_key(&key, KeyFormat::OpenSsh).unwrap();
+        assert_eq!(public.lines().count(), 1, "{public:?}");
+        let ppk = export_private_key(&key, KeyFormat::Putty, None).unwrap();
+        let comment_lines: Vec<&str> = ppk
+            .lines()
+            .filter(|l| l.contains("attacker") || l.starts_with("Comment:"))
+            .collect();
+        assert_eq!(comment_lines.len(), 1, "{ppk}");
+        assert!(comment_lines[0].starts_with("Comment: "));
+        let openssh = export_private_key(&key, KeyFormat::OpenSsh, None).unwrap();
+        let reread = PrivateKey::from_openssh(&openssh).unwrap();
+        assert!(!reread.comment().chars().any(char::is_control));
+    }
+
+    /// A7-53 (comment handling): the RFC 4716 header carries the whole
+    /// comment, not its first word.
+    /// RFC 4716 3.3: no line longer than 72 bytes - the base64 body wraps.
+    #[test]
+    fn rfc4716_public_export_wraps_the_body() {
+        let rsa = &sample_keys()[0];
+        let text = export_public_key(rsa, KeyFormat::Rfc4716).unwrap();
+        let body: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with("----") && !l.starts_with("Comment:"))
+            .collect();
+        assert!(body.len() > 1, "{text}");
+        assert!(body.iter().all(|l| l.len() <= 72), "{text}");
+        let joined: String = body.concat();
+        assert_eq!(Base64::decode_vec(&joined).unwrap(), rsa.public_key);
+    }
+
+    #[test]
+    fn rfc4716_public_export_keeps_the_whole_comment() {
+        let key = generate_key_pair(KeyType::Ed25519, None, "deploy key\tfor web".into()).unwrap();
+        let text = export_public_key(&key, KeyFormat::Rfc4716).unwrap();
+        assert!(text.contains("Comment: \"deploy key for web\"\n"), "{text}");
+    }
 
     #[test]
     fn validate_key_name_accepts_single_token_names() {

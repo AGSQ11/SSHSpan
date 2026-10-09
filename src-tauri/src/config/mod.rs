@@ -62,12 +62,12 @@ impl SshConfig {
                 }
                 "hostname" => {
                     if let Some(ref mut h) = current_host {
-                        h.hostname = Some(value.to_string());
+                        h.hostname = Some(config_word(value));
                     }
                 }
                 "user" => {
                     if let Some(ref mut h) = current_host {
-                        h.user = Some(value.to_string());
+                        h.user = Some(config_word(value));
                     }
                 }
                 "port" => {
@@ -77,7 +77,7 @@ impl SshConfig {
                 }
                 "identityfile" => {
                     if let Some(ref mut h) = current_host {
-                        h.identity_file = Some(expand_tilde(value));
+                        h.identity_file = Some(expand_tilde(&config_word(value)));
                     }
                 }
                 "identitiesonly" => {
@@ -123,17 +123,22 @@ impl SshConfig {
         for host in &self.hosts {
             output.push_str(&format!("Host {}\n", sv(&host.host)));
 
+            // Single-argument directives are quoted when ssh would otherwise
+            // split or misread them (a space in a Windows profile path ended
+            // every ssh command once the file was Included). The Host line
+            // and the `extra` directives can hold several arguments on
+            // purpose, so they are written as they are.
             if let Some(v) = &host.hostname {
-                output.push_str(&format!("    HostName {}\n", sv(v)));
+                output.push_str(&format!("    HostName {}\n", quote_config_word(&sv(v))));
             }
             if let Some(v) = &host.user {
-                output.push_str(&format!("    User {}\n", sv(v)));
+                output.push_str(&format!("    User {}\n", quote_config_word(&sv(v))));
             }
             if let Some(v) = host.port {
                 output.push_str(&format!("    Port {}\n", v));
             }
             if let Some(v) = &host.identity_file {
-                output.push_str(&format!("    IdentityFile {}\n", sv(v)));
+                output.push_str(&format!("    IdentityFile {}\n", quote_config_word(&sv(v))));
             }
             if let Some(v) = host.identities_only {
                 output.push_str(&format!(
@@ -151,7 +156,12 @@ impl SshConfig {
                 output.push_str(&format!("    ProxyJump {}\n", sv(v)));
             }
 
-            for (k, v) in &host.extra {
+            // Sorted: the deploy preview shows this text and the deploy later
+            // writes it from another HashMap, whose order is random per
+            // instance - the same config must always serialize the same (R3).
+            let mut extra: Vec<(&String, &String)> = host.extra.iter().collect();
+            extra.sort();
+            for (k, v) in extra {
                 output.push_str(&format!("    {} {}\n", sv(k), sv(v)));
             }
 
@@ -176,6 +186,85 @@ fn sanitize_config_value(value: &str) -> String {
     }
 }
 
+/// One ssh_config argument, quoted when ssh would otherwise split or misread
+/// it: whitespace, a quote or a backslash anywhere, or a leading `#` (which
+/// starts a comment). Inside double quotes ssh_config unescapes `\\`, `\"`
+/// and `\'` (OpenSSH's `argv_split`), so `\` and `"` are escaped; [`config_word`]
+/// is the inverse. Ordinary values are left exactly as they are.
+fn quote_config_word(value: &str) -> String {
+    let plain = !value.is_empty()
+        && !value.starts_with('#')
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
+    if plain {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// The value of a single-argument directive as ssh reads it (OpenSSH's
+/// `argv_split`): quotes and the escapes `\\`, `\"`, `\'` - and `\ ` outside
+/// quotes - are processed, and a `#` that starts a word ends the line. A value
+/// that does not come to exactly one argument, or has an unterminated quote,
+/// is kept as written.
+fn config_word(value: &str) -> String {
+    match split_config_args(value) {
+        Some(mut args) if args.len() == 1 => args.remove(0),
+        _ => value.to_string(),
+    }
+}
+
+/// OpenSSH's `argv_split` for one line; `None` for an unterminated quote.
+fn split_config_args(line: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut args = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ' ' || chars[i] == '\t' {
+            i += 1;
+            continue;
+        }
+        if chars[i] == '#' {
+            break;
+        }
+        let mut arg = String::new();
+        let mut quote: Option<char> = None;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' {
+                match chars.get(i + 1) {
+                    Some(&next)
+                        if matches!(next, '\'' | '"' | '\\')
+                            || (quote.is_none() && next == ' ') =>
+                    {
+                        arg.push(next);
+                        i += 2;
+                    }
+                    _ => {
+                        arg.push(c);
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            match quote {
+                None if c == ' ' || c == '\t' => break,
+                None if c == '"' || c == '\'' => quote = Some(c),
+                Some(q) if c == q => quote = None,
+                _ => arg.push(c),
+            }
+            i += 1;
+        }
+        if quote.is_some() {
+            return None;
+        }
+        args.push(arg);
+    }
+    Some(args)
+}
+
 fn whitespace(c: char) -> bool {
     c.is_whitespace()
 }
@@ -194,9 +283,16 @@ pub struct SshConfigService {
 }
 
 impl SshConfigService {
+    /// SSHSpan's managed config file ([`ssh_config_path`]).
     pub fn new() -> Result<Self> {
         let config_path = ssh_config_path()?;
         Ok(Self { config_path })
+    }
+
+    /// A config file at an explicit path - the deploy code takes its target
+    /// directories as parameters so tests can use a temp dir.
+    pub fn at(config_path: PathBuf) -> Self {
+        Self { config_path }
     }
 
     pub fn read(&self) -> Result<SshConfig> {
@@ -230,29 +326,6 @@ impl SshConfigService {
         }
 
         Ok(())
-    }
-
-    pub fn add_host(&self, host: SshHostConfig) -> Result<()> {
-        let mut config = self.read()?;
-        config.hosts.push(host);
-        self.write(&config)
-    }
-
-    pub fn remove_host(&self, host_pattern: &str) -> Result<()> {
-        let mut config = self.read()?;
-        config.hosts.retain(|h| h.host != host_pattern);
-        self.write(&config)
-    }
-
-    pub fn get_deployable_keys(&self) -> Vec<String> {
-        self.read()
-            .map(|c| {
-                c.hosts
-                    .iter()
-                    .filter_map(|h| h.identity_file.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -331,9 +404,10 @@ mod tests {
             !out.contains("\nProxyCommand evil"),
             "injected ProxyCommand must not survive"
         );
-        // Sanitized (control chars -> '_') values are still present.
+        // Sanitized (control chars -> '_') values are still present; a
+        // single-argument value with a space in it is written quoted.
         assert!(out.contains("Host x_Host *_ ProxyCommand evil"));
-        assert!(out.contains("HostName evil_ProxyCommand pwned"));
+        assert!(out.contains("HostName \"evil_ProxyCommand pwned\""));
     }
 
     #[test]
@@ -348,6 +422,71 @@ mod tests {
         assert!(out.contains("    HostName github.com\n"));
         assert!(out.contains("    IdentityFile /home/u/.ssh/sshspan_deploy-key-1\n"));
         assert!(out.contains("    ProxyCommand ssh -W %h:%p jumphost\n"));
+    }
+
+    /// R3: the deploy preview shows the serializer's output and the deploy
+    /// writes it later from a different `HashMap` - extra directives must
+    /// come out in one stable order or the preview is not what is written.
+    #[test]
+    fn to_config_string_orders_extra_directives_stably() {
+        let mut config = host_with("h", "example.com", "/k");
+        config.hosts[0].extra.clear();
+        for k in [
+            "zeta", "alpha", "mike", "bravo", "yankee", "delta", "kilo", "echo",
+        ] {
+            config.hosts[0].extra.insert(k.to_string(), "v".to_string());
+        }
+        let out = config.to_config_string();
+        let extras: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.trim().strip_suffix(" v"))
+            .collect();
+        assert_eq!(
+            extras,
+            vec!["alpha", "bravo", "delta", "echo", "kilo", "mike", "yankee", "zeta"]
+        );
+    }
+
+    /// RU3 fix 1: a value with whitespace, quotes, a backslash or a leading
+    /// `#` is written quoted and escaped the way ssh_config reads it back - an
+    /// unquoted `IdentityFile /home/John Smith/...` stopped every ssh command
+    /// once the managed file was Included ("extra arguments at end of
+    /// line") - and `parse` undoes it exactly, which undeploy relies on.
+    #[test]
+    fn single_value_directives_are_quoted_when_needed_and_parse_back() {
+        let tricky = [
+            "/home/John Smith/.ssh/sshspan_web",
+            r#"C:\Users\Bob "B" O'Neil\.ssh\sshspan_x"#,
+            r"C:\Users\bob\.ssh\sshspan_y",
+            "#leading-hash",
+        ];
+        for value in tricky {
+            let mut config = host_with("h", "example.com", value);
+            config.hosts[0].extra.clear();
+            config.hosts[0].user = Some(value.to_string());
+            config.hosts[0].hostname = Some(value.to_string());
+            let out = config.to_config_string();
+            for keyword in ["IdentityFile", "User", "HostName"] {
+                let line = out
+                    .lines()
+                    .find(|l| l.trim_start().starts_with(&format!("{keyword} ")))
+                    .unwrap();
+                let arg = line.trim_start()[keyword.len() + 1..].to_string();
+                assert!(arg.starts_with('"') && arg.ends_with('"'), "{line}");
+            }
+            let back = SshConfig::parse(&out);
+            assert_eq!(back.hosts[0].identity_file.as_deref(), Some(value), "{out}");
+            assert_eq!(back.hosts[0].user.as_deref(), Some(value), "{out}");
+            assert_eq!(back.hosts[0].hostname.as_deref(), Some(value), "{out}");
+        }
+        // Ordinary values are left exactly as they were.
+        let plain = host_with("deploy-key-1", "github.com", "/home/u/.ssh/sshspan_x");
+        let out = plain.to_config_string();
+        assert!(
+            out.contains("    IdentityFile /home/u/.ssh/sshspan_x\n"),
+            "{out}"
+        );
+        assert!(out.contains("    User root\n"));
     }
 
     #[test]

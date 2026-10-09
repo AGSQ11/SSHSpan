@@ -17,10 +17,6 @@ use crate::crypto::utils::generate_random_vec;
 pub struct VaultKey([u8; 32]);
 
 impl VaultKey {
-    pub fn new(key: [u8; 32]) -> Self {
-        Self(key)
-    }
-
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -50,16 +46,6 @@ impl VaultKey {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
         let mut okm = Zeroizing::new([0u8; 32]);
         hk.expand(context, okm.as_mut_slice())
-            .map_err(|e| anyhow::anyhow!(e))
-            .expect("HKDF expand failed");
-        okm
-    }
-
-    /// Derive authentication key from vault key using HKDF
-    pub fn derive_auth_key(&self, context: &[u8]) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::new(None, &self.0);
-        let mut okm = [0u8; 32];
-        hk.expand(&[context, b"auth"].concat(), &mut okm)
             .map_err(|e| anyhow::anyhow!(e))
             .expect("HKDF expand failed");
         okm
@@ -220,7 +206,7 @@ mod tests {
     /// the Argon2id output it is derived from.
     #[test]
     fn derived_aes_key_is_zeroizing() {
-        let vault_key = VaultKey::new([7u8; 32]);
+        let vault_key = VaultKey([7u8; 32]);
         let enc: zeroize::Zeroizing<[u8; 32]> =
             vault_key.derive_encryption_key(b"vault-encryption");
         assert_ne!(*enc, [0u8; 32]);

@@ -267,6 +267,29 @@ pub struct Database {
     pub db_path: PathBuf,
 }
 
+/// The `keys` columns `row_to_key` reads, NAMED for every key query rather
+/// than `SELECT *` (RU1 handoff). A pooled connection whose schema predates
+/// `migrate()`'s ALTER TABLEs prepares `*` against its stale column list,
+/// SQLite re-prepares with the new one, and sqlx then indexed past its cached
+/// columns ("index out of bounds: the len is 14"). A named column that a stale
+/// schema lacks makes SQLite reload the schema instead.
+macro_rules! key_columns {
+    () => {
+        "id, name, key_type, public_key, private_key_encrypted, fingerprint_sha256, \
+         fingerprint_md5, comment, created_at, updated_at, deployed, deploy_path, \
+         bitwarden_id, bitwarden_sync, bitwarden_revision_ts, bitwarden_updated_at"
+    };
+}
+
+/// The `servers` columns `row_to_server` reads - see [`key_columns`].
+macro_rules! server_columns {
+    () => {
+        "id, name, host, port, username, key_id, pem_path, auth_method, saved_password, \
+         category_id, color, last_connected_at, created_at, updated_at, bitwarden_id, \
+         bitwarden_revision_ts, bitwarden_updated_at"
+    };
+}
+
 /// How many audit rows to keep. Enforced on every insert (see `add_audit`),
 /// which is the only place rows are created, so the table cannot outgrow this
 /// regardless of how long the app runs. Sized well above the renderer's
@@ -540,6 +563,12 @@ impl Database {
             )
             .execute(&self.pool)
             .await?;
+            // Links to keys that no longer exist: `delete_key` left them
+            // behind until it learned to remove them (A7-28), and they kept
+            // inflating category counts. The table has no foreign key.
+            sqlx::query("DELETE FROM key_categories WHERE key_id NOT IN (SELECT id FROM keys)")
+                .execute(&self.pool)
+                .await?;
 
             // Connect: saved SSH servers (PuTTY-style sessions) + trusted host keys.
             // key_id references keys.id; the private key itself is never copied -
@@ -776,13 +805,87 @@ impl Database {
         })
     }
 
+    /// Delete a key together with its category links, in one transaction
+    /// (A7-28): `key_categories` has no foreign key, and links left behind
+    /// kept counting the deleted key in every category it had belonged to.
     pub fn delete_key(&self, id: &str) -> Result<()> {
         block(async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM key_categories WHERE key_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("DELETE FROM keys WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// The name of another key that already uses `name`, compared without
+    /// regard to case, or `None` when the name is free (A2-46 / A5-25: names
+    /// had no uniqueness at all). `except_id` is the key being renamed. The
+    /// comparison is Unicode-aware, so it is done here rather than with
+    /// SQLite's ASCII-only `lower()`.
+    pub fn key_name_in_use(&self, name: &str, except_id: Option<&str>) -> Result<Option<String>> {
+        let wanted = name.to_lowercase();
+        block(async {
+            let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM keys")
+                .fetch_all(&self.pool)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .find(|(id, existing)| {
+                    Some(id.as_str()) != except_id && existing.to_lowercase() == wanted
+                })
+                .map(|(_, existing)| existing))
+        })
+    }
+
+    /// Rename a key - the name and `updated_at`, nothing else. A rename used to
+    /// write back the whole row it had read, which could erase a deployment
+    /// recorded meanwhile by a deploy running off the main thread.
+    pub fn rename_key(&self, id: &str, name: &str) -> Result<()> {
+        block(async {
+            sqlx::query("UPDATE keys SET name = ?, updated_at = ? WHERE id = ?")
+                .bind(name)
+                .bind(Utc::now().to_rfc3339())
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
             Ok(())
+        })
+    }
+
+    /// Record (`Some`) or clear (`None`) where a key is deployed - those two
+    /// columns and `updated_at`, nothing else (C1): the deploy commands used
+    /// to write the whole row back, sealed blob included.
+    pub fn set_key_deployment(&self, id: &str, deploy_path: Option<&str>) -> Result<()> {
+        block(async {
+            sqlx::query(
+                "UPDATE keys SET deployed = ?, deploy_path = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(deploy_path.is_some() as i64)
+            .bind(deploy_path)
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// `(id, name, deploy_path)` of every key with a recorded deployment -
+    /// what the deploy collision check compares against.
+    pub fn list_key_deployments(&self) -> Result<Vec<(String, String, String)>> {
+        block(async {
+            Ok(sqlx::query_as(
+                "SELECT id, name, deploy_path FROM keys WHERE deploy_path IS NOT NULL",
+            )
+            .fetch_all(&self.pool)
+            .await?)
         })
     }
 
@@ -813,19 +916,27 @@ impl Database {
 
     pub fn get_key(&self, id: &str) -> Result<Option<KeyRecord>> {
         block(async {
-            let row = sqlx::query("SELECT * FROM keys WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+            let row = sqlx::query(concat!(
+                "SELECT ",
+                key_columns!(),
+                " FROM keys WHERE id = ?"
+            ))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
             Ok(row.map(|r| Self::row_to_key(r)))
         })
     }
 
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         block(async {
-            let rows = sqlx::query("SELECT * FROM keys ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                key_columns!(),
+                " FROM keys ORDER BY created_at DESC"
+            ))
+            .fetch_all(&self.pool)
+            .await?;
             Ok(rows.into_iter().map(|r| Self::row_to_key(r)).collect())
         })
     }
@@ -1373,10 +1484,14 @@ impl Database {
         })
     }
 
-    /// Delete a category. Children are reassigned to the deleted node's parent
-    /// (or become roots if the deleted node was itself a root). All
-    /// `key_categories` rows for this category are removed. Returns the list
-    /// of category IDs that were reassigned.
+    /// Delete a category, in one transaction. Its children move up to the
+    /// deleted node's parent (or become roots), and so do the servers filed
+    /// under it - a host category's servers used to keep pointing at the
+    /// deleted id, vanishing from every category view and failing to save
+    /// until the next launch (A7-28 / A2-54). Its `key_categories` rows are
+    /// removed. Returns the ids of the children that were re-parented - only
+    /// those: this used to list every category under the parent, siblings
+    /// included, and every root of both scopes for a root (A7-40 / A2-31).
     pub fn delete_category(&self, id: &str) -> Result<Vec<String>> {
         block(async {
             let mut tx = self.pool.begin().await?;
@@ -1386,38 +1501,34 @@ impl Database {
                     .fetch_optional(&mut *tx)
                     .await?
                     .flatten();
-            // Reassign children to the deleted node's parent.
-            sqlx::query("UPDATE categories SET parent_id = ? WHERE parent_id IS ?")
+            let children: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM categories WHERE parent_id = ? ORDER BY sort_index, name",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE categories SET parent_id = ? WHERE parent_id = ?")
                 .bind(&parent)
-                .bind(&Some(id.to_string()))
+                .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            // Drop the join rows for this category.
+            // A host category's parent is a host category (create/reparent
+            // enforce the scope), so the servers stay correctly filed.
+            sqlx::query("UPDATE servers SET category_id = ? WHERE category_id = ?")
+                .bind(&parent)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("DELETE FROM key_categories WHERE category_id = ?")
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            // Finally, drop the category itself.
             sqlx::query("DELETE FROM categories WHERE id = ?")
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            // Return the children we just reassigned.
-            let mut reassigned: Vec<String> = Vec::new();
-            let children: Vec<Option<String>> = sqlx::query_scalar(
-                "SELECT id FROM categories WHERE parent_id IS ? OR (parent_id IS NULL AND ? IS NULL)"
-            )
-            .bind(&parent)
-            .bind(&parent)
-            .fetch_all(&mut *tx)
-            .await?;
-            for c in children.into_iter().flatten() {
-                if c != id {
-                    reassigned.push(c);
-                }
-            }
             tx.commit().await?;
-            Ok(reassigned)
+            Ok(children)
         })
     }
 
@@ -1526,9 +1637,13 @@ impl Database {
     /// the renderer doesn't have to fan out N+1 calls.
     pub fn list_keys_with_categories(&self) -> Result<Vec<KeyRecord>> {
         block(async {
-            let rows = sqlx::query("SELECT * FROM keys ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                key_columns!(),
+                " FROM keys ORDER BY created_at DESC"
+            ))
+            .fetch_all(&self.pool)
+            .await?;
             let mut keys: Vec<KeyRecord> = rows.into_iter().map(Self::row_to_key).collect();
             let kc_map = self.all_key_categories_inner(&self.pool).await?;
             for k in keys.iter_mut() {
@@ -1542,10 +1657,14 @@ impl Database {
 
     pub fn get_key_with_categories(&self, id: &str) -> Result<Option<KeyRecord>> {
         block(async {
-            let row = sqlx::query("SELECT * FROM keys WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+            let row = sqlx::query(concat!(
+                "SELECT ",
+                key_columns!(),
+                " FROM keys WHERE id = ?"
+            ))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
             let Some(row) = row else {
                 return Ok(None);
             };
@@ -1883,19 +2002,27 @@ impl Database {
 
     pub fn get_server(&self, id: &str) -> Result<Option<ServerRecord>> {
         block(async {
-            let row = sqlx::query("SELECT * FROM servers WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+            let row = sqlx::query(concat!(
+                "SELECT ",
+                server_columns!(),
+                " FROM servers WHERE id = ?"
+            ))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
             Ok(row.map(|r| Self::row_to_server(r)))
         })
     }
 
     pub fn list_servers(&self) -> Result<Vec<ServerRecord>> {
         block(async {
-            let rows = sqlx::query("SELECT * FROM servers ORDER BY name COLLATE NOCASE ASC")
-                .fetch_all(&self.pool)
-                .await?;
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                server_columns!(),
+                " FROM servers ORDER BY name COLLATE NOCASE ASC"
+            ))
+            .fetch_all(&self.pool)
+            .await?;
             Ok(rows.into_iter().map(|r| Self::row_to_server(r)).collect())
         })
     }
@@ -3232,11 +3359,7 @@ mod tests {
         };
         db.insert_server(&server).unwrap();
         db.touch_server_last_connected("s1", now).unwrap();
-        // Named columns, not get_server's `SELECT *`: a pooled connection
-        // whose schema cache predates migrate()'s ALTER TABLEs can compile
-        // `SELECT *` against the half-migrated table, and sqlx then indexes
-        // past its cached column list (the hazard list_pending_queue_jobs
-        // documents). Pre-existing, and not what this test is about.
+        // The two columns the statement may touch, read directly.
         let (saved, last): (Option<String>, Option<String>) = block(async {
             sqlx::query_as("SELECT saved_password, last_connected_at FROM servers WHERE id = ?")
                 .bind("s1")
@@ -3313,6 +3436,233 @@ mod tests {
             server.bitwarden_revision_ts.is_some() && server.bitwarden_updated_at.is_some(),
             "restored server must keep its sync revision metadata"
         );
+    }
+
+    // ── A7-28 / A2-54 / A2-31 / A7-40: delete paths leave nothing dangling ──
+
+    fn category(id: &str, parent: Option<&str>, scope: &str) -> Category {
+        Category {
+            id: id.into(),
+            name: format!("cat-{id}"),
+            parent_id: parent.map(String::from),
+            scope: scope.into(),
+            color: None,
+            sort_index: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn server_in(id: &str, category_id: Option<&str>) -> ServerRecord {
+        ServerRecord {
+            id: id.into(),
+            name: format!("srv-{id}"),
+            host: "example.com".into(),
+            port: 22,
+            username: "root".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "publickey".into(),
+            saved_password: None,
+            category_id: category_id.map(String::from),
+            color: None,
+            last_connected_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            bitwarden_id: None,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        }
+    }
+
+    /// A deleted key's category links go with it, so category counts stop
+    /// counting a key that no longer exists.
+    #[test]
+    fn delete_key_removes_its_category_links() {
+        let db = test_db();
+        db.insert_category(&category("c1", None, "key")).unwrap();
+        db.insert_key(&rotation_key("k1", "pw")).unwrap();
+        db.insert_key(&rotation_key("k2", "pw")).unwrap();
+        db.set_key_categories("k1", &["c1".to_string()]).unwrap();
+        db.set_key_categories("k2", &["c1".to_string()]).unwrap();
+
+        db.delete_key("k1").unwrap();
+
+        let links = db.all_key_categories().unwrap();
+        assert_eq!(links.get("k1"), None, "the deleted key's links remain");
+        assert_eq!(links.get("k2"), Some(&vec!["c1".to_string()]));
+    }
+
+    /// Deleting a host category moves its servers to the deleted node's
+    /// parent, and `reassigned` names only the children that really moved -
+    /// not the siblings (or, for a root, every other root category).
+    #[test]
+    fn delete_category_moves_servers_up_and_reports_only_moved_children() {
+        let db = test_db();
+        for c in [
+            category("top", None, "host"),
+            category("mid", Some("top"), "host"),
+            category("leaf", Some("mid"), "host"),
+            category("sibling", Some("top"), "host"),
+            category("other-root", None, "host"),
+            category("key-root", None, "key"),
+        ] {
+            db.insert_category(&c).unwrap();
+        }
+        db.insert_server(&server_in("s-mid", Some("mid"))).unwrap();
+        db.insert_server(&server_in("s-root", Some("other-root")))
+            .unwrap();
+
+        let moved = db.delete_category("mid").unwrap();
+        assert_eq!(moved, vec!["leaf".to_string()]);
+        let leaf = db.get_category("leaf").unwrap().unwrap();
+        assert_eq!(leaf.parent_id.as_deref(), Some("top"));
+        let s_mid = db.get_server("s-mid").unwrap().unwrap();
+        assert_eq!(s_mid.category_id.as_deref(), Some("top"));
+
+        // A childless root: nothing moved, its servers become uncategorized.
+        let moved = db.delete_category("other-root").unwrap();
+        assert!(moved.is_empty(), "nothing was re-parented: {moved:?}");
+        let s_root = db.get_server("s-root").unwrap().unwrap();
+        assert_eq!(s_root.category_id, None);
+    }
+
+    /// Minor 3: a rename writes the name (and `updated_at`) only. Deploy now
+    /// runs off the main thread, so a rename that wrote back the whole row it
+    /// had read could erase a deployment recorded in between.
+    #[test]
+    fn rename_key_writes_only_the_name() {
+        let db = test_db();
+        let stale = rotation_key("k1", "pw");
+        db.insert_key(&stale).unwrap();
+        // Meanwhile a deploy records itself and the blob is re-sealed.
+        db.set_key_deployment("k1", Some("/home/u/.ssh/sshspan_k1"))
+            .unwrap();
+        block(async {
+            sqlx::query("UPDATE keys SET private_key_encrypted = 'RESEALED' WHERE id = 'k1'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        });
+        db.rename_key("k1", "renamed").unwrap();
+        let key = db.get_key("k1").unwrap().unwrap();
+        assert_eq!(key.name, "renamed");
+        assert!(key.deployed);
+        assert_eq!(key.deploy_path.as_deref(), Some("/home/u/.ssh/sshspan_k1"));
+        assert_eq!(key.private_key_encrypted, "RESEALED");
+    }
+
+    /// Databases written before the fix already hold links to deleted keys;
+    /// the startup migration drops them.
+    #[test]
+    fn startup_migration_drops_category_links_of_deleted_keys() {
+        let db = test_db();
+        db.insert_category(&category("c1", None, "key")).unwrap();
+        db.insert_key(&rotation_key("k1", "pw")).unwrap();
+        db.set_key_categories("k1", &["c1".to_string()]).unwrap();
+        db.set_key_categories("ghost", &["c1".to_string()]).unwrap();
+
+        db.migrate().unwrap();
+
+        let links = db.all_key_categories().unwrap();
+        assert_eq!(links.get("ghost"), None, "a link to a missing key survived");
+        assert_eq!(links.get("k1"), Some(&vec!["c1".to_string()]));
+    }
+
+    /// RU1 handoff: a pooled connection that loaded the schema before the
+    /// upgrade added columns must still read key and server rows. With
+    /// `SELECT *` sqlx prepares against the stale column list, SQLite
+    /// re-prepares with the new one, and sqlx indexed past its cached columns
+    /// ("index out of bounds: the len is ..."). Named columns make SQLite
+    /// notice the change instead.
+    #[test]
+    fn key_and_server_rows_read_on_every_pooled_connection_after_an_upgrade() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        const CONNECTIONS: u32 = 4;
+        let db_path =
+            std::env::temp_dir().join(format!("sshspan-stale-schema-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let stamp = Utc::now().to_rfc3339();
+        let (pool, stale) = block(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(CONNECTIONS)
+                .connect(&url)
+                .await
+                .unwrap();
+            // The schema an older release created: no Bitwarden sync columns.
+            for ddl in [
+                "CREATE TABLE keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key_type TEXT NOT NULL, \
+                 public_key TEXT NOT NULL, private_key_encrypted TEXT NOT NULL, \
+                 fingerprint_sha256 TEXT NOT NULL, fingerprint_md5 TEXT NOT NULL, comment TEXT DEFAULT '', \
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deployed INTEGER DEFAULT 0, \
+                 deploy_path TEXT, bitwarden_id TEXT, bitwarden_sync INTEGER DEFAULT 0)",
+                "CREATE TABLE servers (id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, \
+                 port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, key_id TEXT, pem_path TEXT, \
+                 auth_method TEXT NOT NULL DEFAULT 'publickey', saved_password TEXT, category_id TEXT, \
+                 color TEXT, last_connected_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO keys (id, name, key_type, public_key, private_key_encrypted, \
+                 fingerprint_sha256, fingerprint_md5, created_at, updated_at) \
+                 VALUES ('k1', 'old-key', 'ed25519', 'ssh-ed25519 AAAA', 'x', 'SHA256:f', 'MD5:f', ?, ?)",
+            )
+            .bind(&stamp)
+            .bind(&stamp)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO servers (id, name, host, username, created_at, updated_at) \
+                 VALUES ('s1', 'old-server', 'example.com', 'root', ?, ?)",
+            )
+            .bind(&stamp)
+            .bind(&stamp)
+            .execute(&pool)
+            .await
+            .unwrap();
+            // Every connection loads that schema; all but one stay checked
+            // out while the upgrade runs, so they keep the stale view.
+            let mut held = Vec::new();
+            for _ in 0..CONNECTIONS {
+                let mut conn = pool.acquire().await.unwrap();
+                sqlx::query("SELECT COUNT(*) FROM keys")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+                sqlx::query("SELECT COUNT(*) FROM servers")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+                held.push(conn);
+            }
+            drop(held.pop());
+            while pool.num_idle() < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            (pool, held)
+        });
+        let db = Database { pool, db_path };
+        db.migrate().expect("upgrade the old database");
+        block(async {
+            drop(stale);
+            while db.pool.num_idle() < CONNECTIONS as usize {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        // Round-robin over the idle queue: every connection serves reads.
+        for _ in 0..CONNECTIONS * 2 {
+            assert_eq!(db.get_key("k1").unwrap().unwrap().name, "old-key");
+            assert_eq!(db.list_keys().unwrap().len(), 1);
+            assert_eq!(db.list_keys_with_categories().unwrap().len(), 1);
+            assert!(db.get_key_with_categories("k1").unwrap().is_some());
+            assert_eq!(db.get_server("s1").unwrap().unwrap().name, "old-server");
+            assert_eq!(db.list_servers().unwrap().len(), 1);
+        }
+        block(async { db.pool.close().await });
+        let _ = std::fs::remove_file(&db.db_path);
     }
 
     // ── MCP aggregate tool cap (transactional) ───────────────────────────

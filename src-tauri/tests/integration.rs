@@ -612,40 +612,179 @@ fn vault_lifecycle_full_flow() {
 //  Key Deploy to ~/.ssh
 // ═════════════════════════════════════════════════════════════════════════════
 
-use sshspan::ssh::SshService;
+use sshspan::ssh::{DeployFiles, DeployHostFields, DeployKey, DeployTarget, SshService};
 
+/// The deploy writes into the directories it is given - here a temp dir, never
+/// the real `~/.ssh` (A7-56) - and what it writes is checked: the key files,
+/// owner-only permissions on the private one, and a Host stanza carrying the
+/// HostName / User / Port the deploy sheet collects (A7-04), identical to the
+/// preview text.
 #[test]
 fn key_deploy_creates_files() {
-    let tmp_dir = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().join(format!(
         "sshspan_deploy_test_{}",
-        uuid::Uuid::new_v4().to_string().replace('-', "")
+        uuid::Uuid::new_v4().simple()
     ));
-    fs::create_dir_all(&tmp_dir).unwrap();
-
-    // Generate a key
-    let key = keys::generate_key_pair(KeyType::Ed25519, None, "deploy-test".to_string()).unwrap();
-    let private_pem = String::from_utf8_lossy(&key.private_key).to_string();
-    let public_openssh = keys::export_public_key(&key, KeyFormat::OpenSsh).unwrap();
-
-    // Deploy to temp dir (simulate ~/.ssh)
-    let result = SshService::deploy_key(
-        "deploy-test",
-        &private_pem,
-        &public_openssh,
-        Some("myserver"),
-        None,
-        None,
-        None,
-        None,
+    let target = DeployTarget::new(
+        root.join("home").join(".ssh"),
+        root.join("app-config").join("ssh").join("config"),
     );
+    let key = keys::generate_key_pair(KeyType::Ed25519, None, "deploy-test".to_string()).unwrap();
+    let private_pem = keys::export_private_key(&key, KeyFormat::OpenSsh, None).unwrap();
+    let public_openssh = keys::export_public_key(&key, KeyFormat::OpenSsh).unwrap();
+    let fields = DeployHostFields::parse(
+        Some("myserver".into()),
+        Some("server.example.com".into()),
+        Some("deploy".into()),
+        Some(2222),
+        Some(true),
+    )
+    .unwrap();
+    let request = [DeployKey {
+        id: "k1".into(),
+        name: "deploy-test".into(),
+        deploy_path: None,
+    }];
 
-    // Note: deploy_key writes to ~/.ssh, which may not exist in test env
-    // We just verify it doesn't panic and returns a result
-    // In production, this writes to ~/.ssh/sshspan_deploy-test
-    let _ = result; // May fail in test env if ~/.ssh doesn't exist
+    let plan = SshService::plan_deploy(&target, &request, &[], &fields).unwrap();
+    let preview = plan.config_text();
+    let outcome = SshService::apply_deploy(&plan, |_| {
+        Ok(DeployFiles {
+            private_key: zeroize::Zeroizing::new(private_pem.clone()),
+            public_key: public_openssh.clone(),
+        })
+    });
 
-    // Cleanup
-    let _ = fs::remove_dir_all(&tmp_dir);
+    let private_path = root.join("home").join(".ssh").join("sshspan_deploy-test");
+    let written_private = fs::read_to_string(&private_path);
+    let written_public = fs::read_to_string(private_path.with_extension("pub"));
+    let written_config = fs::read_to_string(&target.config_path);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(&private_path).map(|m| m.permissions().mode() & 0o777)
+    };
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert_eq!(outcome.deployed.len(), 1);
+    assert_eq!(outcome.deployed[0].file, private_path.display().to_string());
+    assert_eq!(outcome.deployed[0].alias, "myserver");
+    assert_eq!(written_private.unwrap(), private_pem);
+    assert_eq!(written_public.unwrap(), public_openssh);
+    #[cfg(unix)]
+    assert_eq!(mode.unwrap(), 0o600, "the private key must be owner-only");
+    let config = written_config.unwrap();
+    assert_eq!(config, preview, "the preview is what was written");
+    for line in [
+        "Host myserver\n",
+        "    HostName server.example.com\n",
+        "    User deploy\n",
+        "    Port 2222\n",
+        "    IdentitiesOnly yes\n",
+    ] {
+        assert!(config.contains(line), "missing {line:?} in\n{config}");
+    }
+    // Compared parsed: on Windows the path is written quoted and escaped.
+    assert_eq!(
+        SshConfig::parse(&config).hosts[0].identity_file,
+        Some(private_path.display().to_string())
+    );
+}
+
+/// RU3 fix 1: users are told to `Include` the managed config from
+/// `~/.ssh/config`, so one line OpenSSH rejects stops EVERY ssh command. Deploy
+/// into a home directory whose path has a space and an apostrophe, with key
+/// names holding quote, backslash and comment characters, then let the real
+/// `ssh -G` read the result through the Include line SSHSpan hands out.
+/// Skipped (passes) when no `ssh` client is installed; Unix only (the WSL /
+/// CI check - Win32-OpenSSH formats `ssh -G` paths its own way).
+#[cfg(unix)]
+#[test]
+fn openssh_parses_the_managed_config_through_the_include_line() {
+    let Ok(version) = std::process::Command::new("ssh").arg("-V").output() else {
+        eprintln!("skipped: no ssh client on PATH");
+        return;
+    };
+    eprintln!(
+        "ssh -V: {}",
+        String::from_utf8_lossy(&version.stderr).trim()
+    );
+    let root =
+        std::env::temp_dir().join(format!("sshspan_ssh_g_{}", uuid::Uuid::new_v4().simple()));
+    let target = DeployTarget::new(
+        root.join("John O'Neil Smith").join(".ssh"),
+        root.join("app config").join("ssh").join("config"),
+    );
+    let names = ["bob's key", "back\\slash", "#hash", "web*prod"];
+    let request: Vec<DeployKey> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| DeployKey {
+            id: format!("k{i}"),
+            name: n.to_string(),
+            deploy_path: None,
+        })
+        .collect();
+    let fields = DeployHostFields::parse(
+        None,
+        Some("server.example.com".into()),
+        Some(r"CORP\deploy".into()),
+        Some(2222),
+        Some(true),
+    )
+    .unwrap();
+    let plan = SshService::plan_deploy(&target, &request, &[], &fields).unwrap();
+    let outcome = SshService::apply_deploy(&plan, |planned| {
+        Ok(DeployFiles {
+            private_key: zeroize::Zeroizing::new(format!("PRIVATE {}", planned.id)),
+            public_key: format!("ssh-ed25519 AAAAC3Nza {}", planned.id),
+        })
+    });
+    let main_config = root.join("user ssh config");
+    fs::write(&main_config, format!("{}\n", target.include_line())).unwrap();
+
+    let mut problems = Vec::new();
+    if !outcome.errors.is_empty() {
+        problems.push(format!("deploy errors: {:?}", outcome.errors));
+    }
+    for deployed in &outcome.deployed {
+        let run = std::process::Command::new("ssh")
+            .arg("-G")
+            .arg("-F")
+            .arg(&main_config)
+            .arg(&deployed.alias)
+            .output()
+            .expect("run ssh -G");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let wanted = [
+            format!("identityfile {}", deployed.file),
+            "hostname server.example.com".to_string(),
+            r"user CORP\deploy".to_string(),
+            "port 2222".to_string(),
+        ];
+        let missing: Vec<&String> = wanted
+            .iter()
+            .filter(|w| !stdout.lines().any(|l| l == w.as_str()))
+            .collect();
+        if !run.status.success() || !missing.is_empty() {
+            problems.push(format!(
+                "ssh -G {:?} -> {}: {} missing {missing:?}",
+                deployed.alias,
+                run.status,
+                String::from_utf8_lossy(&run.stderr).trim()
+            ));
+        }
+    }
+    let config_text = fs::read_to_string(&target.config_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(outcome.deployed.len(), names.len(), "{problems:?}");
+    assert!(
+        problems.is_empty(),
+        "{}\nmanaged config:\n{config_text}",
+        problems.join("\n")
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -114,8 +114,11 @@ pub fn run() {
             // (see their doc comments).
             vault_backup_export_to_file,
             vault_backup_restore_from_file,
-            // Key commands
-            key_generate,
+            // Key commands. `key_generate` and `key_fingerprint` were removed:
+            // nothing in the renderer called them (keys are created by
+            // `key_create_with_categories`; fingerprints come with `key_list`),
+            // and an unused command is IPC surface only a compromised renderer
+            // could reach (A8-16).
             key_import,
             key_export,
             key_export_to_file,
@@ -123,8 +126,8 @@ pub fn run() {
             key_rename,
             key_list,
             key_get,
-            key_fingerprint,
             key_deploy,
+            key_deploy_preview,
             key_remove_deployed,
             // Category commands
             category_list,
@@ -135,8 +138,9 @@ pub fn run() {
             // Key ↔ category bridge
             key_set_categories,
             key_create_with_categories,
-            // SSH Config commands
-            ssh_config_read,
+            // SSH Config commands. `ssh_config_read` was removed (no renderer
+            // caller, A8-16); `ssh_config_write` is deliberately NOT registered
+            // (see its doc comment).
             ssh_config_list_hosts,
             // Saved server CRUD
             server_list,

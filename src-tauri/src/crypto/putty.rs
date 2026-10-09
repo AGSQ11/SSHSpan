@@ -38,7 +38,7 @@ use ssh_key::{
     Mpint, PrivateKey, PublicKey,
 };
 
-use crate::crypto::keys::{KeyType, PrivateKeyData};
+use crate::crypto::keys::{sanitize_key_comment, KeyType, PrivateKeyData};
 use crate::crypto::utils::{constant_time_eq, generate_random_vec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,7 +377,7 @@ fn mac_preimage(parsed: &ParsedPpk, plaintext_private_blob: &[u8]) -> Vec<u8> {
 
 fn verify_mac_v3(
     parsed: &ParsedPpk,
-    mac_key: &[u8; 32],
+    mac_key: &[u8],
     plaintext_private_blob: &[u8],
 ) -> anyhow::Result<()> {
     if parsed.mac.is_empty() {
@@ -613,12 +613,27 @@ pub fn import_ppk(data: &str, passphrase: Option<&str>) -> anyhow::Result<Privat
             }
         }
     } else {
+        // An unencrypted file carries a MAC too, and it used to go unchecked.
+        // Its key is what the spec derives for an empty passphrase: v3 has
+        // none at all (cipher key, IV and MAC key "all have zero length"),
+        // v2 takes SHA-1 of the fixed string followed by "".
+        match parsed.version {
+            PpkVersion::V3 => verify_mac_v3(&parsed, &[], &parsed.private_blob),
+            PpkVersion::V2 => verify_mac_v2(&parsed, &derive_v2("").2, &parsed.private_blob),
+        }
+        .map_err(|_| {
+            anyhow::anyhow!("This .ppk file is damaged or was edited (MAC verification failed).")
+        })?;
         parsed.private_blob.clone()
     };
 
     let (key_type, keypair_data) = build_keypair_data(&parsed, &plaintext_private_blob)?;
+    // The MAC above covered the comment exactly as the file has it; what is
+    // stored is the cleaned one (A7-45) - a header line is not a safe place
+    // for control characters to travel on from.
+    let comment = sanitize_key_comment(&parsed.comment);
     let private_key =
-        PrivateKey::new(keypair_data, parsed.comment.clone()).map_err(|e| anyhow::anyhow!(e))?;
+        PrivateKey::new(keypair_data, comment.clone()).map_err(|e| anyhow::anyhow!(e))?;
 
     let private_bytes = private_key
         .to_bytes()
@@ -634,7 +649,7 @@ pub fn import_ppk(data: &str, passphrase: Option<&str>) -> anyhow::Result<Privat
         key_type,
         private_bytes,
         public_bytes,
-        parsed.comment,
+        comment,
     ))
 }
 
@@ -653,7 +668,10 @@ pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow
         "Encryption: {}\n",
         if pass.is_some() { "aes256-cbc" } else { "none" }
     ));
-    out.push_str(&format!("Comment: {}\n", key_data.comment));
+    // Re-checked (A7-45): a comment stored before import-time cleaning could
+    // end this header line early. The MAC below covers the same text.
+    let comment = sanitize_key_comment(&key_data.comment);
+    out.push_str(&format!("Comment: {comment}\n"));
 
     let pub_b64 = Base64::encode_string(&key_data.public_key);
     write_lines_section(&mut out, "Public-Lines", &pub_b64);
@@ -688,7 +706,6 @@ pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow
         let mut padded = private_blob.clone();
         let pad_len = (16 - (padded.len() % 16)) % 16;
         padded.extend(generate_random_vec(pad_len));
-        cbc_encrypt_no_padding(&mut padded, cipher_key, iv)?;
 
         let mut mac_key_arr = [0u8; 32];
         mac_key_arr.copy_from_slice(mac_key);
@@ -696,7 +713,7 @@ pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow
             version: PpkVersion::V3,
             algorithm_name: algorithm_name.to_string(),
             encrypted: true,
-            comment: key_data.comment.clone(),
+            comment: comment.clone(),
             public_blob: key_data.public_key.clone(),
             private_blob: Vec::new(),
             mac: Vec::new(),
@@ -706,17 +723,24 @@ pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow
             argon2_parallelism: parallelism,
             argon2_salt: salt,
         };
-        let preimage = mac_preimage(&parsed_for_mac, &private_blob);
+        // The MAC covers the PADDED plaintext, so it is taken before the
+        // encryption: that is what PuTTY's `ppk_save_sb` hashes and what
+        // `import_ppk` checks (the whole decrypted buffer). It used to cover
+        // the unpadded blob, so every passphrase-protected PPK export whose
+        // key data was not a multiple of 16 bytes - nearly all of them -
+        // failed its own MAC check: unreadable by PuTTY and by SSHSpan.
+        let preimage = mac_preimage(&parsed_for_mac, &padded);
         let mut mac =
             Hmac::<Sha256>::new_from_slice(&mac_key_arr).expect("HMAC accepts any key size");
         mac.update(&preimage);
+        cbc_encrypt_no_padding(&mut padded, cipher_key, iv)?;
         (padded, mac.finalize().into_bytes().to_vec())
     } else {
         let parsed_for_mac = ParsedPpk {
             version: PpkVersion::V3,
             algorithm_name: algorithm_name.to_string(),
             encrypted: false,
-            comment: key_data.comment.clone(),
+            comment: comment.clone(),
             public_blob: key_data.public_key.clone(),
             private_blob: Vec::new(),
             mac: Vec::new(),
@@ -726,9 +750,9 @@ pub fn export_ppk(key_data: &PrivateKeyData, passphrase: Option<&str>) -> anyhow
             argon2_parallelism: 0,
             argon2_salt: Vec::new(),
         };
-        // Unencrypted files still carry a MAC; the key material is
-        // zero-length per the spec ("If encryption-type is none, then all
-        // three of these pieces of data have zero length").
+        // Unencrypted files still carry a MAC, keyed with an EMPTY key: per
+        // the spec, with encryption type "none" the cipher key, IV and MAC
+        // key "all have zero length". `import_ppk` checks it the same way.
         let preimage = mac_preimage(&parsed_for_mac, &private_blob);
         let mut mac = Hmac::<Sha256>::new_from_slice(&[]).expect("HMAC accepts empty key");
         mac.update(&preimage);
@@ -890,6 +914,125 @@ mod tests {
         assert_eq!(parsed.argon2_passes, 4);
         assert_eq!(parsed.argon2_parallelism, 1);
         assert_eq!(parsed.argon2_salt.len(), 16);
+    }
+
+    // ── A7-53: PPK export -> import round trip, every key type ──
+
+    /// What a PPK round trip must preserve: type, public blob, comment and
+    /// the private key itself.
+    fn assert_same_key(back: &PrivateKeyData, key: &PrivateKeyData, what: &str) {
+        assert_eq!(back.key_type, key.key_type, "{what}: key type");
+        assert_eq!(back.public_key, key.public_key, "{what}: public key");
+        assert_eq!(back.comment, key.comment, "{what}: comment");
+        let original = PrivateKey::from_bytes(&key.private_key).unwrap();
+        let reread = PrivateKey::from_bytes(&back.private_key).unwrap();
+        assert!(
+            original.key_data() == reread.key_data(),
+            "{what}: private key"
+        );
+    }
+
+    #[test]
+    fn unencrypted_ppk_export_imports_back_for_every_key_type() {
+        for key in crate::crypto::keys::sample_keys() {
+            let what = format!("{:?} without a passphrase", key.key_type);
+            let ppk = export_ppk(key, None).unwrap();
+            assert!(ppk.contains("Encryption: none\n"), "{what}");
+            let back = import_ppk(&ppk, None).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_same_key(&back, key, &what);
+        }
+    }
+
+    /// The MAC covers the padded plaintext (PuTTY's `ppk_save_sb` hashes the
+    /// padded private blob before encrypting it); anything else makes a
+    /// passphrase-protected export unreadable - by PuTTY and by SSHSpan.
+    #[test]
+    fn encrypted_ppk_export_imports_back_for_every_key_type() {
+        for key in crate::crypto::keys::sample_keys() {
+            let what = format!("{:?} with a passphrase", key.key_type);
+            let ppk = export_ppk(key, Some("ppk round trip")).unwrap();
+            assert!(ppk.contains("Encryption: aes256-cbc\n"), "{what}");
+            let back =
+                import_ppk(&ppk, Some("ppk round trip")).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_same_key(&back, key, &what);
+            let wrong = import_ppk(&ppk, Some("not the passphrase"));
+            assert!(wrong.is_err(), "{what}: a wrong passphrase must fail");
+        }
+    }
+
+    /// Minor 5: an UNENCRYPTED file still carries a MAC (v3: HMAC-SHA-256
+    /// with an empty key; v2: HMAC-SHA-1 keyed with SHA-1 of the fixed
+    /// string and an empty passphrase), and it is checked - an edited file is
+    /// refused instead of imported.
+    #[test]
+    fn unencrypted_ppk_files_have_their_mac_checked() {
+        let key = &crate::crypto::keys::sample_keys()[1];
+        let v3 = export_ppk(key, None).unwrap();
+        let tampered = v3.replace("Comment: sample ed25519\n", "Comment: someone else\n");
+        let err = import_ppk(&tampered, None).expect_err("an edited file must be refused");
+        assert!(err.to_string().contains("MAC"), "{err}");
+
+        // The same key data as a v2 file, MACed the v2 way.
+        let parsed = parse_ppk_file(&v3).unwrap();
+        let (_, _, v2_key) = derive_v2("");
+        let mut mac = Hmac::<Sha1>::new_from_slice(&v2_key).unwrap();
+        mac.update(&mac_preimage(&parsed, &parsed.private_blob));
+        let v2 = v3
+            .replace("PuTTY-User-Key-File-3:", "PuTTY-User-Key-File-2:")
+            .lines()
+            .map(|l| {
+                if l.starts_with("Private-MAC:") {
+                    format!(
+                        "Private-MAC: {}",
+                        hex::encode(mac.clone().finalize().into_bytes())
+                    )
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back = import_ppk(&v2, None).expect("a valid unencrypted v2 file");
+        assert_eq!(back.public_key, key.public_key);
+        let tampered_v2 = v2.replace("Comment: sample ed25519", "Comment: someone else");
+        assert!(import_ppk(&tampered_v2, None).is_err());
+    }
+
+    /// A7-45: a .ppk whose comment carries control characters (here a
+    /// carriage return, which survives `lines()`) imports with them removed.
+    #[test]
+    fn imported_ppk_comments_lose_their_control_characters() {
+        let key = &crate::crypto::keys::sample_keys()[1];
+        let ppk = export_ppk(key, None)
+            .unwrap()
+            .replace("Comment: sample ed25519\n", "Comment: a\rb\u{7}c\n");
+        // An unencrypted v3 file still carries a MAC over the comment (with
+        // an empty MAC key); recompute it so the edited file stays valid.
+        let parsed = parse_ppk_file(&ppk).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[]).unwrap();
+        mac.update(&mac_preimage(&parsed, &parsed.private_blob));
+        let fixed = ppk
+            .lines()
+            .map(|l| {
+                if l.starts_with("Private-MAC:") {
+                    format!(
+                        "Private-MAC: {}",
+                        hex::encode(mac.clone().finalize().into_bytes())
+                    )
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let imported = import_ppk(&fixed, None).unwrap();
+        assert!(
+            !imported.comment.chars().any(char::is_control),
+            "{:?}",
+            imported.comment
+        );
+        let stored = PrivateKey::from_bytes(&imported.private_key).unwrap();
+        assert_eq!(stored.comment(), imported.comment);
     }
 
     #[test]

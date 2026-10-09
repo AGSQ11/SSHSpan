@@ -380,6 +380,160 @@ fn der_oid(arcs: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::keys::{export_private_key, sample_keys, KeyFormat, KeyType};
+
+    // ── A7-53: PKCS#8 exports parse back with independent decoders ──
+    //
+    // The decoders are the RustCrypto crates (`pkcs8`, `rsa`, `p256`/`p384`/
+    // `p521`, `ed25519-dalek`), not this module: each exported private key is
+    // decoded and its PUBLIC half recomputed and compared with the key's SSH
+    // public key, so a byte-level slip in the encoding cannot pass.
+
+    /// The key's public half as SSH stores it: RSA `n || e`, ECDSA the SEC1
+    /// point, Ed25519 the 32 raw bytes.
+    fn public_from_ssh(key: &PrivateKeyData) -> Vec<u8> {
+        let public = ssh_key::PublicKey::from_bytes(&key.public_key).unwrap();
+        match public.key_data() {
+            KeyData::Rsa(rsa) => [
+                rsa.n.as_positive_bytes().unwrap(),
+                rsa.e.as_positive_bytes().unwrap(),
+            ]
+            .concat(),
+            KeyData::Ecdsa(ec) => ec.as_sec1_bytes().to_vec(),
+            KeyData::Ed25519(ed) => ed.0.to_vec(),
+            other => panic!("unexpected key data {other:?}"),
+        }
+    }
+
+    /// Decode a PKCS#8 `PrivateKeyInfo` and recompute its public half in the
+    /// same shape as [`public_from_ssh`].
+    fn public_from_pkcs8(der_bytes: &[u8], key_type: KeyType) -> Vec<u8> {
+        use der::Decode as _;
+        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+        use pkcs8::DecodePrivateKey as _;
+        use rsa::traits::PublicKeyParts as _;
+        match key_type {
+            KeyType::Rsa => {
+                let rsa = rsa::RsaPrivateKey::from_pkcs8_der(der_bytes).unwrap();
+                [rsa.n().to_bytes_be(), rsa.e().to_bytes_be()].concat()
+            }
+            KeyType::EcdsaP256 => p256::SecretKey::from_pkcs8_der(der_bytes)
+                .unwrap()
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec(),
+            KeyType::EcdsaP384 => p384::SecretKey::from_pkcs8_der(der_bytes)
+                .unwrap()
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec(),
+            KeyType::EcdsaP521 => p521::SecretKey::from_pkcs8_der(der_bytes)
+                .unwrap()
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec(),
+            KeyType::Ed25519 => {
+                let info = pkcs8::PrivateKeyInfo::try_from(der_bytes).unwrap();
+                assert_eq!(info.algorithm.oid.to_string(), "1.3.101.112");
+                // RFC 8410: privateKey holds the DER of `CurvePrivateKey ::=
+                // OCTET STRING` (the seed), i.e. it is wrapped twice.
+                let seed = der::asn1::OctetStringRef::from_der(info.private_key).unwrap();
+                let seed: [u8; 32] = seed.as_bytes().try_into().unwrap();
+                ed25519_dalek::SigningKey::from_bytes(&seed)
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec()
+            }
+        }
+    }
+
+    /// The DER inside a PEM block, checking the label.
+    fn pem_body(pem: &str, label: &str) -> Vec<u8> {
+        let (found, doc) = der::Document::from_pem(pem).unwrap();
+        assert_eq!(found, label);
+        doc.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn plain_pkcs8_export_parses_back_for_every_key_type() {
+        for key in sample_keys() {
+            let pem = export_private_key(key, KeyFormat::Pkcs8, None).unwrap();
+            let der_bytes = pem_body(&pem, "PRIVATE KEY");
+            assert_eq!(
+                public_from_pkcs8(&der_bytes, key.key_type),
+                public_from_ssh(key),
+                "{:?}",
+                key.key_type
+            );
+        }
+    }
+
+    /// Decrypt a PBES2 (PBKDF2-HMAC-SHA256 + AES-256-CBC)
+    /// `EncryptedPrivateKeyInfo` with the RustCrypto primitives, reading every
+    /// parameter with the `der` crate - nothing from this module.
+    fn decrypt_encrypted_private_key_info(der_bytes: &[u8], passphrase: &str) -> Vec<u8> {
+        use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+        use der::asn1::{ObjectIdentifier, OctetStringRef};
+        use der::{Reader, SliceReader};
+
+        let mut reader = SliceReader::new(der_bytes).unwrap();
+        let (salt, iterations, iv, ciphertext) = reader
+            .sequence(|epki| {
+                let (salt, iterations, iv) = epki.sequence(|alg| {
+                    let pbes2: ObjectIdentifier = alg.decode()?;
+                    assert_eq!(pbes2.to_string(), "1.2.840.113549.1.5.13");
+                    alg.sequence(|params| {
+                        let (salt, iterations) = params.sequence(|kdf| {
+                            let pbkdf2: ObjectIdentifier = kdf.decode()?;
+                            assert_eq!(pbkdf2.to_string(), "1.2.840.113549.1.5.12");
+                            kdf.sequence(|p| {
+                                let salt: OctetStringRef = p.decode()?;
+                                let iterations: u32 = p.decode()?;
+                                let prf: ObjectIdentifier = p.sequence(|prf| prf.decode())?;
+                                assert_eq!(prf.to_string(), "1.2.840.113549.2.9");
+                                Ok((salt.as_bytes().to_vec(), iterations))
+                            })
+                        })?;
+                        let iv = params.sequence(|enc| {
+                            let aes: ObjectIdentifier = enc.decode()?;
+                            assert_eq!(aes.to_string(), "2.16.840.1.101.3.4.1.42");
+                            let iv: OctetStringRef = enc.decode()?;
+                            Ok(iv.as_bytes().to_vec())
+                        })?;
+                        Ok((salt, iterations, iv))
+                    })
+                })?;
+                let data: OctetStringRef = epki.decode()?;
+                Ok((salt, iterations, iv, data.as_bytes().to_vec()))
+            })
+            .unwrap();
+        let key: [u8; 32] =
+            pbkdf2::pbkdf2_hmac_array::<sha2::Sha256, 32>(passphrase.as_bytes(), &salt, iterations);
+        let mut buf = ciphertext;
+        cbc::Decryptor::<aes::Aes256>::new_from_slices(&key, &iv)
+            .unwrap()
+            .decrypt_padded_mut::<Pkcs7>(&mut buf)
+            .expect("the passphrase decrypts the export")
+            .to_vec()
+    }
+
+    #[test]
+    fn encrypted_pkcs8_export_parses_back_for_every_key_type() {
+        for key in sample_keys() {
+            let pem = export_private_key(key, KeyFormat::Pkcs8, Some("pkcs8 pass")).unwrap();
+            let der_bytes = pem_body(&pem, "ENCRYPTED PRIVATE KEY");
+            let plain = decrypt_encrypted_private_key_info(&der_bytes, "pkcs8 pass");
+            assert_eq!(
+                public_from_pkcs8(&plain, key.key_type),
+                public_from_ssh(key),
+                "{:?}",
+                key.key_type
+            );
+        }
+    }
 
     #[test]
     fn ed25519_oid_matches_rfc8410() {
