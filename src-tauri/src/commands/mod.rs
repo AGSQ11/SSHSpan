@@ -73,16 +73,13 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// In-memory vault password accessor. Returns the password wrapped in
-/// `Zeroizing` so every per-command copy is wiped on drop, matching the
-/// store's own hygiene (the store holds the canonical `Zeroizing` copy; each
-/// command previously cloned a plain `String` that lived until free).
+/// In-memory vault password accessor: a `Zeroizing` copy, wiped when the
+/// command drops it (the store holds the canonical `Zeroizing` copy and hands
+/// out only `Zeroizing` ones); empty while the vault is locked. Callers that
+/// only need to know whether the vault is unlocked use
+/// [`VaultPasswordStore::is_set`] and make no copy at all.
 pub(crate) fn vault_password(app: &AppHandle) -> CmdResult<zeroize::Zeroizing<String>> {
-    Ok(app
-        .state::<VaultPasswordStore>()
-        .get()
-        .map(zeroize::Zeroizing::new)
-        .unwrap_or_default())
+    Ok(app.state::<VaultPasswordStore>().get().unwrap_or_default())
 }
 
 /// Monotonic vault generation, bumped at the very start of every lock.
@@ -157,18 +154,111 @@ impl VaultPasswordStore {
             password: std::sync::Mutex::new(None),
         }
     }
-    pub fn get(&self) -> Option<String> {
+    /// A copy of the password for one command. It is `Zeroizing` from the
+    /// moment it is made (A6-11): this used to hand out a plain `String`,
+    /// which `vault_password` wrapped only afterwards and the boolean callers
+    /// (`vault_status`, the auto-lock watchdog every 30 s) dropped unwiped.
+    pub fn get(&self) -> Option<zeroize::Zeroizing<String>> {
         self.password
             .lock()
             .unwrap()
             .as_ref()
-            .map(|p| p.to_string())
+            .map(|p| zeroize::Zeroizing::new(p.as_str().to_owned()))
+    }
+    /// Whether the vault is unlocked, without copying the password out.
+    pub fn is_set(&self) -> bool {
+        self.password.lock().unwrap().is_some()
     }
     pub fn set(&self, p: String) {
         *self.password.lock().unwrap() = Some(zeroize::Zeroizing::new(p));
     }
     pub fn clear(&self) {
         *self.password.lock().unwrap() = None;
+    }
+}
+
+/// What a command that writes sealed vault data returns while a
+/// master-password change is re-encrypting the vault.
+pub(crate) const VAULT_REENCRYPTING: &str =
+    "The vault is being re-encrypted - try again when it finishes.";
+
+/// Serialises a master-password change against every other write of sealed
+/// vault data (C1).
+///
+/// The change re-seals a snapshot of every key, saved server password, MCP
+/// secret and stored credential, then commits them with the new verifier. Off
+/// the main thread that takes long enough for other commands to run in
+/// between, and two kinds of writes would then be lost: a record sealed with
+/// the OLD password after the snapshot (unreadable once the new password is
+/// in place - and every later change would fail on it), and a whole row read
+/// before the commit and written back after it (its old-sealed blob replacing
+/// the re-sealed one). So the change holds this lock for WRITING from before
+/// the snapshot until the new password is installed, and every command that
+/// seals with the master password or rewrites a whole key/server/MCP row
+/// holds it for READING. Readers never wait: while a change runs or is queued
+/// they fail at once with [`VAULT_REENCRYPTING`] - a synchronous command runs
+/// on the main thread and must not block it.
+///
+/// A tokio lock rather than `std::sync::RwLock`: the Bitwarden sync and the
+/// MCP connect/call/remove commands interleave network awaits with their DB
+/// writes, so they hold the read guard across awaits - and a std guard is
+/// `!Send`, which an async command's future cannot hold. The change itself
+/// takes the write side on its blocking worker, with a time limit.
+#[derive(Default)]
+pub struct VaultRotationLock(tokio::sync::RwLock<()>);
+
+impl VaultRotationLock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read access for one command that writes sealed data, or
+    /// [`VAULT_REENCRYPTING`] at once if a master-password change holds (or
+    /// waits for) the lock. Never blocks.
+    pub fn try_shared(&self) -> CmdResult<tokio::sync::RwLockReadGuard<'_, ()>> {
+        self.0
+            .try_read()
+            .map_err(|_| CmdError(VAULT_REENCRYPTING.into()))
+    }
+
+    /// Write access for a master-password change. It queues like `write()` -
+    /// from the moment it waits, new readers are refused - but gives up after
+    /// `limit` with [`ROTATION_LOCK_BUSY`]: a sync or MCP call that keeps its
+    /// read guard must not leave the change hanging without a word. It
+    /// blocks the calling thread (on a private current-thread runtime that
+    /// only drives the timer and this wait), so it must only run on a
+    /// blocking worker - never on the main thread or inside async code.
+    fn exclusive_within(
+        &self,
+        limit: std::time::Duration,
+    ) -> CmdResult<tokio::sync::RwLockWriteGuard<'_, ()>> {
+        let waiter = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| CmdError(format!("Could not wait for the vault lock: {e}")))?;
+        // Built INSIDE block_on: the timer must belong to `waiter` (an
+        // argument expression would be evaluated outside its context).
+        waiter
+            .block_on(async { tokio::time::timeout(limit, self.0.write()).await })
+            .map_err(|_| CmdError(ROTATION_LOCK_BUSY.into()))
+    }
+}
+
+/// [`VaultRotationLock::try_shared`] for a command that has an `AppHandle`.
+/// Hold the returned guard until the command's last write.
+pub(crate) fn rotation_shared(app: &AppHandle) -> CmdResult<tokio::sync::RwLockReadGuard<'_, ()>> {
+    app.state::<VaultRotationLock>().inner().try_shared()
+}
+
+/// Refuse a vault mutation or a security-policy change while the vault is
+/// locked (A6-08). Locking is the control for an unattended machine; it has to
+/// protect the vault's integrity and its security settings, not only reads of
+/// secret material.
+fn require_unlocked(vault: &VaultPasswordStore) -> CmdResult<()> {
+    if vault.is_set() {
+        Ok(())
+    } else {
+        Err("Vault is locked.".into())
     }
 }
 
@@ -238,6 +328,16 @@ fn is_argon2_hash(s: &str) -> bool {
     s.starts_with("$argon2")
 }
 
+/// Minimum master-password length the messages promise ("at least 8
+/// characters").
+const MIN_MASTER_PASSWORD_CHARS: usize = 8;
+
+/// Counts characters, not UTF-8 bytes (A7-52): `String::len()` let a
+/// 3-character CJK or a 2-emoji password through as "8 characters".
+fn master_password_long_enough(password: &str) -> bool {
+    password.chars().count() >= MIN_MASTER_PASSWORD_CHARS
+}
+
 /// Hash a master password with Argon2id (crate defaults: m=19 MiB, t=2, p=1).
 fn hash_master_password(password: &str) -> Result<String, String> {
     use argon2::password_hash::{PasswordHasher, SaltString};
@@ -295,7 +395,7 @@ pub fn vault_status(app: AppHandle) -> CmdResult<serde_json::Value> {
         .map(|h| h.as_ref().map_or(false, |s| !s.is_empty()))
         .unwrap_or(false);
 
-    let unlocked = app.state::<VaultPasswordStore>().get().is_some();
+    let unlocked = app.state::<VaultPasswordStore>().is_set();
 
     Ok(serde_json::json!({ "hasVault": has_vault, "unlocked": unlocked }))
 }
@@ -303,7 +403,7 @@ pub fn vault_status(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// Create a new vault. Stores an Argon2id verification hash and unlocks in one step.
 #[tauri::command]
 pub fn vault_create(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
-    if password.len() < 8 {
+    if !master_password_long_enough(&password) {
         return Err("Master password must be at least 8 characters.".into());
     }
     if app
@@ -403,10 +503,11 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) {
     let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
 }
 
-/// Last time the renderer signalled it is alive (`heartbeat` IPC). The
-/// backend idle watchdog uses it to enforce `autoLockMinutes` even when the
-/// renderer cannot - a hung or crashed webview stops heartbeating, and the
-/// vault locks on the Rust side instead of staying unsealed forever.
+/// When the user last did something, as reported by the `heartbeat` IPC. The
+/// renderer sends a heartbeat only for real input - a key, a click, the
+/// wheel, a touch, typing into a terminal - at most once every few seconds;
+/// server output, polls and timers never send one. The backend idle watchdog
+/// locks the vault once this is older than `autoLockMinutes`.
 pub struct ActivityTracker(std::sync::Mutex<std::time::Instant>);
 
 impl ActivityTracker {
@@ -427,35 +528,59 @@ pub fn heartbeat(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "ok": true }))
 }
 
-/// Background task enforcing the auto-lock setting on the Rust side. The
-/// renderer's own timer remains the primary UX path; this watchdog covers
-/// the case where the renderer can no longer act (hung/crashed webview,
-/// closed window with a tray-resident process). Locks only when the vault is
-/// currently unlocked; `autoLockMinutes` of 0/absent disables it, matching
-/// the renderer's semantics.
+/// Auto-lock timeout when `autoLockMinutes` is not stored or not readable.
+const AUTO_LOCK_DEFAULT_MINUTES: u64 = 15;
+/// Largest auto-lock timeout (a day), the Settings field's maximum.
+const AUTO_LOCK_MAX_MINUTES: u64 = 1440;
+
+/// Effective auto-lock timeout in minutes for a stored `autoLockMinutes`
+/// value; 0 means off. Read exactly like the renderer's `autoLockMinutes()`:
+/// absent, blank or anything that is not a whole number (a negative
+/// included) is the 15-minute default, an explicit "0" is off, and more than
+/// a day is a day. This used to treat a negative as "off" and apply no upper
+/// limit, so the watchdog and the renderer disagreed at the edges.
+fn effective_auto_lock_minutes(stored: Option<&str>) -> u64 {
+    let Some(text) = stored.map(str::trim) else {
+        return AUTO_LOCK_DEFAULT_MINUTES;
+    };
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return AUTO_LOCK_DEFAULT_MINUTES;
+    }
+    // Digits only, so the parse can fail only by overflowing: more than a day.
+    text.parse::<u64>()
+        .map_or(AUTO_LOCK_MAX_MINUTES, |n| n.min(AUTO_LOCK_MAX_MINUTES))
+}
+
+/// Backend idle watchdog: locks the vault once no `heartbeat` has arrived for
+/// `autoLockMinutes`. The renderer sends a heartbeat only for real user input
+/// (see [`ActivityTracker`]), so this is a genuine idle lock, not a liveness
+/// check: an idle user's vault locks here even when the renderer's own timer
+/// cannot fire (a hung or crashed webview, a window hidden to the tray). The
+/// setting is read the way the renderer reads it
+/// ([`effective_auto_lock_minutes`]): absent or unreadable is 15 minutes, an
+/// explicit "0" is off. Checked every 30 s, and only while the vault is
+/// unlocked.
 pub(crate) fn spawn_auto_lock_watchdog(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let mins: i64 = app
+            let stored = app
                 .state::<AppState>()
                 .db
                 .get_config("setting.autoLockMinutes")
                 .ok()
-                .flatten()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(15);
-            if mins <= 0 {
+                .flatten();
+            let mins = effective_auto_lock_minutes(stored.as_deref());
+            if mins == 0 {
                 continue;
             }
-            let unlocked = app.state::<VaultPasswordStore>().get().is_some();
-            if !unlocked {
+            if !app.state::<VaultPasswordStore>().is_set() {
                 continue;
             }
             if app.state::<ActivityTracker>().elapsed()
-                >= std::time::Duration::from_secs((mins as u64).saturating_mul(60))
+                >= std::time::Duration::from_secs(mins.saturating_mul(60))
             {
-                log::info!("[sshspan-vault] backend idle watchdog locked the vault after {mins} min without renderer activity");
+                log::info!("[sshspan-vault] backend idle watchdog locked the vault after {mins} min without user activity");
                 lock_vault_internal(&app);
                 // Best effort: tell the renderer so its UI reflects the lock.
                 let _ = tauri::Emitter::emit(&app, "vault-locked-by-watchdog", ());
@@ -464,41 +589,165 @@ pub(crate) fn spawn_auto_lock_watchdog(app: AppHandle) {
     });
 }
 
+/// Change the master password. Every record sealed with it - keys, saved
+/// server passwords, the Bitwarden credential, the assistant API key, MCP
+/// secrets - is re-sealed and committed together with the new verifier.
+///
+/// Async on purpose (A7-13): that is two Argon2id derivations (64 MiB, t=3)
+/// per record, and as a synchronous command it all ran on the main thread, so
+/// with a hundred keys the window froze for tens of seconds. The work now runs
+/// on a blocking worker, under the [`VaultRotationLock`] write lock (C1): the
+/// rest of the app stays usable, but nothing can seal or rewrite vault data
+/// until the change is committed and the new password installed. A lock
+/// landing meanwhile (the tray's Lock Vault, the idle watchdog) aborts the
+/// change before it commits, and the new password is never installed over a
+/// lock that happened meanwhile.
 #[tauri::command]
-pub fn vault_change_password(
+pub async fn vault_change_password(
     app: AppHandle,
     current_password: String,
     new_password: String,
 ) -> CmdResult<serde_json::Value> {
-    if new_password.len() < 8 {
+    let current_password = zeroize::Zeroizing::new(current_password);
+    let new_password = zeroize::Zeroizing::new(new_password);
+    if !master_password_long_enough(&new_password) {
         return Err("New master password must be at least 8 characters.".into());
     }
+    let generation = app.state::<VaultGeneration>().current();
+    let worker = app.clone();
+    let reencrypted = run_blocking(move || {
+        let vault = RotationContext {
+            throttle: worker.state::<UnlockThrottle>().inner(),
+            lock: worker.state::<VaultRotationLock>().inner(),
+            store: worker.state::<VaultPasswordStore>().inner(),
+            generations: worker.state::<VaultGeneration>().inner(),
+            lock_wait: ROTATION_LOCK_WAIT,
+        };
+        change_master_password(
+            &worker.state::<AppState>().db,
+            &vault,
+            generation,
+            &current_password,
+            new_password,
+        )
+    })
+    .await?;
+    Ok(serde_json::json!({ "ok": true, "reencrypted": reencrypted }))
+}
+
+/// The in-memory vault state a master-password change works with.
+struct RotationContext<'a> {
+    throttle: &'a UnlockThrottle,
+    lock: &'a VaultRotationLock,
+    store: &'a VaultPasswordStore,
+    generations: &'a VaultGeneration,
+    /// How long to wait for running sealed-data writers before giving up.
+    lock_wait: std::time::Duration,
+}
+
+/// How long a master-password change waits for a running Bitwarden sync or
+/// MCP call to release the [`VaultRotationLock`] before it gives up.
+const ROTATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a master-password change says when it gave up waiting for the lock.
+const ROTATION_LOCK_BUSY: &str = "Finish the running sync or MCP call, then try again.";
+
+/// [`vault_change_password`] on its blocking worker, without the
+/// `AppHandle`. The write lock is taken before the current-password check
+/// and the snapshot (giving up after `lock_wait` with [`ROTATION_LOCK_BUSY`]
+/// while a sync or MCP call holds it) and held until the new password is
+/// installed, so nothing sealed with the old password can slip in between
+/// (C1). Once the rotation has committed nothing can fail the change: the
+/// new password is installed FIRST and the audit row is written afterwards,
+/// best-effort - a failed audit write used to return an error before the
+/// install, leaving the store on the old password over a vault sealed with
+/// the new one. (A lock that landed meanwhile leaves the vault locked
+/// instead; the new password then unlocks it.)
+fn change_master_password(
+    db: &db::Database,
+    vault: &RotationContext<'_>,
+    captured_generation: u64,
+    current_password: &str,
+    new_password: zeroize::Zeroizing<String>,
+) -> CmdResult<u32> {
+    let _exclusive = vault.lock.exclusive_within(vault.lock_wait)?;
+    let summary =
+        rotate_master_password(db, vault.throttle, current_password, &new_password, &|| {
+            vault.generations.current() == captured_generation
+        })?;
+    install_rotated_password(
+        vault.store,
+        vault.generations,
+        captured_generation,
+        new_password,
+    );
+    if let Err(e) = db.add_audit(
+        "vault.password_changed",
+        None,
+        &format!(
+            "Re-encrypted {} key(s), {} saved server password(s)",
+            summary.keys, summary.server_passwords
+        ),
+    ) {
+        log::warn!(
+            "[sshspan-vault] the master password was changed, but its audit row could not be written: {e}"
+        );
+    }
+    Ok(summary.keys)
+}
+
+/// What a committed master-password change re-sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RotationSummary {
+    keys: u32,
+    server_passwords: u32,
+}
+
+/// Run vault work that is too slow for the main thread - Argon2id once per
+/// record, file I/O - on Tauri's blocking pool, and hand back its result.
+async fn run_blocking<T, F>(work: F) -> CmdResult<T>
+where
+    F: FnOnce() -> CmdResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| CmdError(format!("Background task failed: {e}")))?
+}
+
+/// The rotation itself (the caller holds the write lock): verify the current
+/// password, snapshot and re-seal every sealed value in memory, then commit
+/// them with the new verifier in one transaction - unless `still_current()`
+/// reports a lock in the meantime, in which case nothing is written. The
+/// commit is conditional and touches only the sealed values (see
+/// [`db::Database::apply_vault_rotation`]). Nothing after the commit can
+/// fail: installing the password and auditing are the caller's.
+fn rotate_master_password(
+    db: &db::Database,
+    throttle: &UnlockThrottle,
+    current_password: &str,
+    new_password: &str,
+    still_current: &dyn Fn() -> bool,
+) -> CmdResult<RotationSummary> {
     // The current-password check is a password guess too - throttle it with
     // the same counter as unlock attempts.
-    let throttle = app.state::<UnlockThrottle>();
     throttle.check().map_err(CmdError::from)?;
-    let stored = app
-        .state::<AppState>()
-        .db
-        .get_config(MASTER_HASH_KEY)
-        .unwrap_or_default();
+    let stored = db.get_config(MASTER_HASH_KEY).unwrap_or_default();
     if stored.as_ref().map_or(true, |s| s.is_empty()) {
         return Err("No vault exists. Create one first.".into());
     }
-    let ok = verify_master_password(&app.state::<AppState>().db, &current_password)
-        .map_err(|e| e.to_string())?;
+    let ok = verify_master_password(db, current_password).map_err(|e| e.to_string())?;
     if !ok {
         throttle.record_failure();
         return Err("Current master password is incorrect.".into());
     }
     throttle.record_success();
 
-    let db = &app.state::<AppState>().db;
     let keys = db.list_keys().map_err(|e| e.to_string())?;
     let servers = db.list_servers().map_err(|e| e.to_string())?;
     // Everything is re-encrypted in memory first; if any record fails to
     // unseal, the whole change is aborted and nothing is persisted.
-    let mut migration = migrate_vault_records(keys, servers, &current_password, &new_password)?;
+    let migration = migrate_vault_records(keys, servers, current_password, new_password)?;
 
     // The stored Bitwarden master password is sealed with the SAME vault
     // password, so it must be re-sealed too - otherwise sync silently strands
@@ -506,11 +755,15 @@ pub fn vault_change_password(
     // it commits in the same transaction below. A missing/unconfigured
     // credential is fine (None); an unsealable one aborts the whole change.
     let bw_config = db.load_bitwarden_config().map_err(|e| e.to_string())?;
-    migration.bitwarden_master_password = match bw_config.master_password.as_ref() {
+    let bitwarden_master_password = match bw_config.master_password {
         Some(sealed) => {
-            let plain = crate::crypto::vault::unseal(&current_password, sealed)
-                .map_err(|e| format!("Cannot re-encrypt the stored Bitwarden password: {e}"))?;
-            Some(crate::crypto::vault::seal(&new_password, &plain).map_err(CmdError::from)?)
+            let plain = zeroize::Zeroizing::new(
+                crate::crypto::vault::unseal(current_password, &sealed)
+                    .map_err(|e| format!("Cannot re-encrypt the stored Bitwarden password: {e}"))?,
+            );
+            let resealed =
+                crate::crypto::vault::seal(new_password, &plain).map_err(CmdError::from)?;
+            Some((sealed, resealed))
         }
         None => None,
     };
@@ -521,11 +774,16 @@ pub fn vault_change_password(
     // true. Same rule as the Bitwarden credential above: missing is fine,
     // unsealable aborts the whole change.
     let assistant_config = db.load_assistant_config().map_err(|e| e.to_string())?;
-    migration.assistant_api_key = match assistant_config.api_key.as_ref() {
+    let assistant_api_key = match assistant_config.api_key {
         Some(sealed) => {
-            let plain = crate::crypto::vault::unseal(&current_password, sealed)
-                .map_err(|e| format!("Cannot re-encrypt the stored AI assistant API key: {e}"))?;
-            Some(crate::crypto::vault::seal(&new_password, &plain).map_err(CmdError::from)?)
+            let plain = zeroize::Zeroizing::new(
+                crate::crypto::vault::unseal(current_password, &sealed).map_err(|e| {
+                    format!("Cannot re-encrypt the stored AI assistant API key: {e}")
+                })?,
+            );
+            let resealed =
+                crate::crypto::vault::seal(new_password, &plain).map_err(CmdError::from)?;
+            Some((sealed, resealed))
         }
         None => None,
     };
@@ -534,70 +792,88 @@ pub fn vault_change_password(
     // must rotate in the same transaction or every MCP call fails at unseal
     // after the change. Same rule as the assistant key: missing is fine, an
     // unsealable blob aborts the whole change (in memory, before anything
-    // commits). Per-tool pin state rides along untouched - re-approving
-    // tools after a password change would be noise, and pin hashes are not
-    // password-derived.
-    let mcp_servers = db.list_mcp_servers().map_err(|e| e.to_string())?;
-    let mut rotated_mcp = Vec::with_capacity(mcp_servers.len());
-    for mut record in mcp_servers {
-        if let Some(sealed) = record.auth_secret.as_ref() {
-            let plain = crate::crypto::vault::unseal(&current_password, sealed).map_err(|e| {
+    // commits). Only the secret is replaced - per-tool pin state is left as
+    // the record holds it at commit time (pin hashes are not
+    // password-derived).
+    let mut mcp_secrets = Vec::new();
+    for record in db.list_mcp_servers().map_err(|e| e.to_string())? {
+        let Some(sealed) = record.auth_secret else {
+            continue;
+        };
+        let plain = zeroize::Zeroizing::new(
+            crate::crypto::vault::unseal(current_password, &sealed).map_err(|e| {
                 format!(
                     "Cannot re-encrypt the MCP auth secret for '{}': {e}",
                     record.name
                 )
-            })?;
-            record.auth_secret =
-                Some(crate::crypto::vault::seal(&new_password, &plain).map_err(CmdError::from)?);
-        }
-        rotated_mcp.push(record);
+            })?,
+        );
+        mcp_secrets.push(db::ResealedSecret {
+            id: record.id,
+            new: crate::crypto::vault::seal(new_password, &plain).map_err(CmdError::from)?,
+            old: sealed,
+        });
     }
 
-    let hashed = hash_master_password(&new_password).map_err(CmdError::from)?;
-    // Single transaction: every re-sealed record, the Bitwarden credential,
-    // and the verifier commit together or not at all (F3). A crash or I/O
-    // error part-way rolls back to the complete old state instead of leaving
-    // the vault split across two passwords.
-    db.apply_vault_rotation(
-        &migration.keys,
-        &migration.servers,
-        migration.bitwarden_master_password.as_deref(),
-        migration.assistant_api_key.as_deref(),
-        &rotated_mcp,
-        &hashed,
-    )
-    .map_err(|e| e.to_string())?;
-    let reencrypted = migration.keys.len() as u32;
-    db.add_audit(
-        "vault.password_changed",
-        None,
-        &format!(
-            "Re-encrypted {reencrypted} key(s), {} saved server password(s)",
-            migration.servers.len()
-        ),
-    )
-    .map_err(|e| e.to_string())?;
-    app.state::<VaultPasswordStore>().set(new_password);
-    Ok(serde_json::json!({ "ok": true, "reencrypted": reencrypted }))
+    let rotation = db::VaultRotation {
+        keys: migration.keys,
+        server_passwords: migration.servers,
+        mcp_secrets,
+        bitwarden_master_password,
+        assistant_api_key,
+        master_hash: hash_master_password(new_password).map_err(CmdError::from)?,
+    };
+    // A lock while the records were being re-sealed (seconds per record)
+    // aborts here, before anything commits - the rule for every operation
+    // that crosses a lock.
+    if !still_current() {
+        return Err("Vault was locked while the operation was in progress.".into());
+    }
+    // Single transaction: every re-sealed value, the credentials and the
+    // verifier commit together or not at all (F3). A crash or I/O error
+    // part-way rolls back to the complete old state instead of leaving the
+    // vault split across two passwords; so does a row that changed since the
+    // snapshot (C1).
+    db.apply_vault_rotation(&rotation)
+        .map_err(|e| e.to_string())?;
+    Ok(RotationSummary {
+        keys: rotation.keys.len() as u32,
+        server_passwords: rotation.server_passwords.len() as u32,
+    })
 }
 
-/// Result of re-sealing all vault-protected records with a new password.
+/// Make the new master password the unlocked one after a committed rotation -
+/// unless the vault was locked while the rotation ran. Set first, then check:
+/// `lock_vault_internal` bumps the generation before it clears the store, so a
+/// lock that lands in between either clears what was just set or has already
+/// bumped the generation this check sees.
+fn install_rotated_password(
+    store: &VaultPasswordStore,
+    generation: &VaultGeneration,
+    captured: u64,
+    new_password: zeroize::Zeroizing<String>,
+) {
+    store.set(new_password.as_str().to_owned());
+    if generation.current() != captured {
+        store.clear();
+    }
+}
+
+/// Every key blob and saved server password, re-sealed with a new password
+/// (in memory, nothing persisted yet).
 #[derive(Debug)]
 struct VaultMigration {
-    keys: Vec<KeyRecord>,
+    keys: Vec<db::ResealedSecret>,
     /// Only servers that actually had a saved password to re-seal.
-    servers: Vec<db::ServerRecord>,
-    /// Re-sealed Bitwarden master password (None when sync is not configured).
-    /// Filled in by the caller after `migrate_vault_records` runs.
-    bitwarden_master_password: Option<String>,
-    /// Re-sealed AI assistant API key (None when the assistant is not
-    /// configured). Filled in by the caller, same rule as above.
-    assistant_api_key: Option<String>,
+    servers: Vec<db::ResealedSecret>,
 }
 
 /// Unseal every stored private key and saved server password with the current
 /// vault password and re-seal them with the new one, in memory. Any unseal
 /// failure aborts the whole migration (nothing is persisted by this function).
+/// Each plaintext lives in a `Zeroizing` buffer, wiped as soon as it has been
+/// re-sealed (A6-11). The blob that was read is kept beside its replacement:
+/// the commit only writes where it is still in place (C1).
 fn migrate_vault_records(
     keys: Vec<KeyRecord>,
     servers: Vec<db::ServerRecord>,
@@ -605,25 +881,30 @@ fn migrate_vault_records(
     new_password: &str,
 ) -> CmdResult<VaultMigration> {
     let mut migrated_keys = Vec::with_capacity(keys.len());
-    for mut key in keys {
-        let plaintext =
+    for key in keys {
+        let plaintext = zeroize::Zeroizing::new(
             match crate::crypto::vault::unseal(current_password, &key.private_key_encrypted) {
                 Ok(bytes) => bytes,
                 Err(e) => return Err(format!("Cannot re-encrypt key {}: {e}", key.id).into()),
-            };
-        key.private_key_encrypted =
-            crate::crypto::vault::seal(new_password, &plaintext).map_err(|e| e.to_string())?;
-        key.updated_at = chrono::Utc::now();
-        migrated_keys.push(key);
+            },
+        );
+        migrated_keys.push(db::ResealedSecret {
+            new: crate::crypto::vault::seal(new_password, &plaintext).map_err(|e| e.to_string())?,
+            id: key.id,
+            old: key.private_key_encrypted,
+        });
     }
 
     // Saved server passwords are sealed with the same vault password, so they
     // must be re-sealed too - otherwise every stored server password becomes
     // unrecoverable after the change.
     let mut migrated_servers = Vec::with_capacity(servers.len());
-    for mut server in servers {
-        if let Some(sealed_pw) = server.saved_password.as_ref() {
-            let plaintext = match crate::crypto::vault::unseal(current_password, sealed_pw) {
+    for server in servers {
+        let Some(sealed_pw) = server.saved_password else {
+            continue;
+        };
+        let plaintext = zeroize::Zeroizing::new(
+            match crate::crypto::vault::unseal(current_password, &sealed_pw) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     return Err(format!(
@@ -632,19 +913,18 @@ fn migrate_vault_records(
                     )
                     .into());
                 }
-            };
-            server.saved_password =
-                Some(crate::crypto::vault::seal(new_password, &plaintext).map_err(CmdError::from)?);
-            server.updated_at = chrono::Utc::now();
-            migrated_servers.push(server);
-        }
+            },
+        );
+        migrated_servers.push(db::ResealedSecret {
+            new: crate::crypto::vault::seal(new_password, &plaintext).map_err(CmdError::from)?,
+            id: server.id,
+            old: sealed_pw,
+        });
     }
 
     Ok(VaultMigration {
         keys: migrated_keys,
         servers: migrated_servers,
-        bitwarden_master_password: None,
-        assistant_api_key: None,
     })
 }
 
@@ -730,12 +1010,13 @@ mod tests {
             1,
             "only srv-a had a saved password"
         );
-        for server in &migration.servers {
-            db.update_server(server).unwrap();
-        }
-        for key in &migration.keys {
-            db.update_key(key).unwrap();
-        }
+        db.apply_vault_rotation(&db::VaultRotation {
+            keys: migration.keys,
+            server_passwords: migration.servers,
+            master_hash: "NEW-VERIFIER".into(),
+            ..db::VaultRotation::default()
+        })
+        .unwrap();
 
         // Re-read from the db: the sealed blob must have changed and must
         // unseal with the NEW password, not the old one.
@@ -997,6 +1278,1098 @@ mod tests {
         assert!(!settings.contains_key("theme"));
         assert!(!settings.contains_key("bwSync.masterPassword"));
     }
+
+    // ── A6-08: vault mutations and security settings refuse while locked ──
+
+    fn locked_vault() -> VaultPasswordStore {
+        VaultPasswordStore::new()
+    }
+
+    fn unlocked_vault() -> VaultPasswordStore {
+        let vault = VaultPasswordStore::new();
+        vault.set("test-master-pw".into());
+        vault
+    }
+
+    fn assert_refused_while_locked<T: std::fmt::Debug>(result: CmdResult<T>) {
+        match result {
+            Err(e) => assert_eq!(e.0, "Vault is locked."),
+            Ok(v) => panic!("must refuse while the vault is locked, got Ok({v:?})"),
+        }
+    }
+
+    fn sample_category(id: &str, scope: &str) -> db::Category {
+        db::Category {
+            id: id.into(),
+            name: format!("cat-{id}"),
+            parent_id: None,
+            scope: scope.into(),
+            color: None,
+            sort_index: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn key_delete_refuses_while_locked() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", "pw")).unwrap();
+        assert_refused_while_locked(key_delete_in(&db, &locked_vault(), "k1"));
+        assert!(db.get_key("k1").unwrap().is_some(), "the key must survive");
+        key_delete_in(&db, &unlocked_vault(), "k1").unwrap();
+        assert!(db.get_key("k1").unwrap().is_none());
+    }
+
+    #[test]
+    fn key_rename_refuses_while_locked() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", "pw")).unwrap();
+        let rotation = VaultRotationLock::new();
+        assert_refused_while_locked(key_rename_in(
+            &db,
+            &locked_vault(),
+            &rotation,
+            "k1",
+            "renamed",
+        ));
+        assert_eq!(db.get_key("k1").unwrap().unwrap().name, "key-k1");
+        key_rename_in(&db, &unlocked_vault(), &rotation, "k1", "renamed").unwrap();
+        assert_eq!(db.get_key("k1").unwrap().unwrap().name, "renamed");
+    }
+
+    #[test]
+    fn category_create_refuses_while_locked() {
+        let db = test_db();
+        let create = |vault: &VaultPasswordStore| {
+            category_create_in(&db, vault, "Prod".into(), None, None, Some("key".into()))
+        };
+        assert_refused_while_locked(create(&locked_vault()));
+        assert!(db.list_categories().unwrap().is_empty());
+        create(&unlocked_vault()).unwrap();
+        assert_eq!(db.list_categories().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn category_rename_refuses_while_locked() {
+        let db = test_db();
+        db.insert_category(&sample_category("c1", "key")).unwrap();
+        assert_refused_while_locked(category_rename_in(&db, &locked_vault(), "c1", "x".into()));
+        assert_eq!(db.get_category("c1").unwrap().unwrap().name, "cat-c1");
+        category_rename_in(&db, &unlocked_vault(), "c1", "x".into()).unwrap();
+        assert_eq!(db.get_category("c1").unwrap().unwrap().name, "x");
+    }
+
+    #[test]
+    fn category_reparent_refuses_while_locked() {
+        let db = test_db();
+        db.insert_category(&sample_category("parent", "key"))
+            .unwrap();
+        db.insert_category(&sample_category("child", "key"))
+            .unwrap();
+        let reparent = |vault: &VaultPasswordStore| {
+            category_reparent_in(&db, vault, "child".into(), Some("parent".into()), None)
+        };
+        assert_refused_while_locked(reparent(&locked_vault()));
+        assert_eq!(db.get_category("child").unwrap().unwrap().parent_id, None);
+        reparent(&unlocked_vault()).unwrap();
+        assert_eq!(
+            db.get_category("child")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("parent")
+        );
+    }
+
+    #[test]
+    fn category_delete_refuses_while_locked() {
+        let db = test_db();
+        db.insert_category(&sample_category("c1", "host")).unwrap();
+        assert_refused_while_locked(category_delete_in(&db, &locked_vault(), "c1"));
+        assert!(db.get_category("c1").unwrap().is_some(), "must survive");
+        category_delete_in(&db, &unlocked_vault(), "c1").unwrap();
+        assert!(db.get_category("c1").unwrap().is_none());
+    }
+
+    #[test]
+    fn key_set_categories_refuses_while_locked() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", "pw")).unwrap();
+        db.insert_category(&sample_category("c1", "key")).unwrap();
+        let ids = vec!["c1".to_string()];
+        assert_refused_while_locked(key_set_categories_in(&db, &locked_vault(), "k1", &ids));
+        assert!(db.list_categories_for_key("k1").unwrap().is_empty());
+        key_set_categories_in(&db, &unlocked_vault(), "k1", &ids).unwrap();
+        assert_eq!(db.list_categories_for_key("k1").unwrap(), ids);
+    }
+
+    #[test]
+    fn audit_clear_refuses_while_locked() {
+        let db = test_db();
+        db.add_audit("probe", None, "kept").unwrap();
+        assert_refused_while_locked(audit_clear_in(&db, &locked_vault()));
+        assert_eq!(db.count_audit().unwrap(), 1, "the audit trail must survive");
+        audit_clear_in(&db, &unlocked_vault()).unwrap();
+        // Only the marker row of the clear itself remains.
+        assert_eq!(db.count_audit().unwrap(), 1);
+        assert_eq!(db.list_audit(1).unwrap()[0].action, "audit.cleared");
+    }
+
+    #[test]
+    fn known_hosts_forget_refuses_while_locked() {
+        let db = test_db();
+        db.add_known_host("example.com:22", "AAAAhostkey", "SHA256:fp")
+            .unwrap();
+        let forget = terminal::known_hosts_forget_in;
+        assert_refused_while_locked(forget(&db, &locked_vault(), "example.com:22"));
+        assert!(
+            db.get_known_host("example.com:22").unwrap().is_some(),
+            "pin kept"
+        );
+        forget(&db, &unlocked_vault(), "example.com:22").unwrap();
+        assert!(db.get_known_host("example.com:22").unwrap().is_none());
+    }
+
+    /// Only the security-relevant settings are locked; display and
+    /// file-browser preferences stay writable on a locked vault.
+    #[test]
+    fn settings_set_refuses_security_settings_while_locked() {
+        let db = test_db();
+        for (key, value) in [
+            ("autoLockMinutes", "0"),
+            ("confirmDelete", "false"),
+            ("autoUpdateCheck", "false"),
+            ("confirmMultiLinePaste", "0"),
+        ] {
+            assert_refused_while_locked(settings_set_in(&db, &locked_vault(), key, value));
+            assert_eq!(
+                db.get_config(&format!("setting.{key}")).unwrap(),
+                None,
+                "{key} must not be written while locked"
+            );
+            settings_set_in(&db, &unlocked_vault(), key, value).unwrap();
+        }
+        for (key, value) in [
+            ("uiScale", "110"),
+            ("sftpShowHidden", "1"),
+            ("terminalBell", "sound"),
+            ("sftpLocalDir:server-1", "/tmp"),
+        ] {
+            settings_set_in(&db, &locked_vault(), key, value)
+                .unwrap_or_else(|e| panic!("{key} must stay writable while locked: {}", e.0));
+        }
+    }
+
+    // ── A7-11 / A2-14 / A5-32: settings defaults and value validation ──
+
+    /// Every value the renderer writes through `settings_set` today, per key:
+    /// the app.js Settings rows and the sftp.js toggles, conflict dialog and
+    /// local-directory default. All of them must be accepted.
+    const RENDERER_SETTING_VALUES: &[(&str, &[&str])] = &[
+        // String(mins), mins = min(1440, parseInt of /^\d+$/)
+        ("autoLockMinutes", &["0", "1", "15", "60", "1440"]),
+        // clampUiScale(<select>): options 90..200, clamped to 75..200
+        (
+            "uiScale",
+            &["75", "90", "100", "110", "125", "150", "175", "200"],
+        ),
+        ("confirmDelete", &["true", "false"]),
+        ("confirmMultiLinePaste", &["1", "0"]),
+        ("autoUpdateCheck", &["true", "false"]),
+        // clamped to 1..4
+        ("sftpParallel", &["1", "2", "3", "4"]),
+        ("sftpShowHidden", &["1", "0"]),
+        // 0 (unlimited) or 1..=1_000_000 x 1024 (KB/s) / 1048576 (MB/s)
+        (
+            "sftpMaxBps",
+            &[
+                "0",
+                "1024",
+                "524288",
+                "1048576",
+                "1024000000",
+                "1048576000000",
+            ],
+        ),
+        ("sftpVerifyTransfers", &["true", "false"]),
+        // Settings select ("ask") + the conflict dialog's CONFLICT_ACTIONS
+        (
+            "sftpConflictUpload",
+            &["ask", "overwrite", "skip", "rename", "resume"],
+        ),
+        (
+            "sftpConflictDownload",
+            &["ask", "overwrite", "skip", "rename", "resume"],
+        ),
+        ("sftpResumeDefault", &["ask", "overwrite", "resume"]),
+        // clamped to 1000..50000
+        ("terminalScrollback", &["1000", "5000", "50000"]),
+        ("terminalBell", &["visual", "sound", "silent"]),
+        ("terminalBackspace", &["default", "backspace"]),
+        ("terminalHomeEnd", &["default", "rxvt"]),
+        ("terminalAppCursorKeys", &["default", "disabled"]),
+        ("terminalAppKeypad", &["default", "disabled"]),
+        ("sftpShowOwnerCols", &["1", "0"]),
+        ("sftpPreserveTs", &["1", "0"]),
+        ("sftpDualPane", &["1", "0"]),
+        // next || '' - empty turns the comparison off
+        ("sftpCmpMode", &["size", "mtime", ""]),
+        // the local pane's current directory
+        (
+            "sftpLocalDir:server-1",
+            &["/home/me/projects", "C:\\Users\\me\\Downloads"],
+        ),
+    ];
+
+    /// Values outside each key's domain - what the old allowlist-only check
+    /// stored with a success toast.
+    const OUT_OF_DOMAIN_SETTING_VALUES: &[(&str, &[&str])] = &[
+        (
+            "autoLockMinutes",
+            &["-5", "", "1.5", "1441", "abc", " 15", "+5", "15 "],
+        ),
+        ("uiScale", &["74", "201", "", "100%", "1.1"]),
+        ("confirmDelete", &["", "yes", "1", "TRUE"]),
+        ("confirmMultiLinePaste", &["", "true", "2"]),
+        ("autoUpdateCheck", &["", "on", "0"]),
+        ("sftpParallel", &["0", "5", "", "two"]),
+        ("sftpShowHidden", &["true", "", "yes"]),
+        ("sftpMaxBps", &["-1", "", "1e6", "1048576000001"]),
+        ("sftpVerifyTransfers", &["1", "", "on"]),
+        ("sftpConflictUpload", &["", "replace", "ASK"]),
+        ("sftpConflictDownload", &["", "newer"]),
+        ("sftpResumeDefault", &["skip", "rename", ""]),
+        ("terminalScrollback", &["999", "50001", "", "5k"]),
+        ("terminalBell", &["", "beep"]),
+        ("terminalBackspace", &["", "delete"]),
+        ("terminalHomeEnd", &["", "vt100"]),
+        ("terminalAppCursorKeys", &["", "enabled"]),
+        ("terminalAppKeypad", &["", "enabled"]),
+        ("sftpShowOwnerCols", &["", "true"]),
+        ("sftpPreserveTs", &["", "false"]),
+        ("sftpDualPane", &["", "yes"]),
+        ("sftpCmpMode", &["off", "SIZE", "hash"]),
+        ("sftpLocalDir:server-1", &["", "bad\0path"]),
+    ];
+
+    #[test]
+    fn settings_set_accepts_every_value_the_renderer_writes() {
+        let db = test_db();
+        let vault = unlocked_vault();
+        for (key, values) in RENDERER_SETTING_VALUES {
+            for value in *values {
+                settings_set_in(&db, &vault, key, value).unwrap_or_else(|e| {
+                    panic!("{key} = {value:?} is what the renderer sends: {}", e.0)
+                });
+                assert_eq!(
+                    db.get_config(&format!("setting.{key}")).unwrap().as_deref(),
+                    Some(*value)
+                );
+            }
+        }
+        // Every allowlisted key has a domain in the table above.
+        for key in SETTINGS_KEYS {
+            assert!(
+                RENDERER_SETTING_VALUES.iter().any(|(k, _)| k == key),
+                "{key} has no renderer values in this contract test"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_set_rejects_out_of_domain_values() {
+        let db = test_db();
+        let vault = unlocked_vault();
+        for (key, values) in OUT_OF_DOMAIN_SETTING_VALUES {
+            for value in *values {
+                assert!(
+                    settings_set_in(&db, &vault, key, value).is_err(),
+                    "{key} = {value:?} must be rejected"
+                );
+                assert_eq!(
+                    db.get_config(&format!("setting.{key}")).unwrap(),
+                    None,
+                    "{key} = {value:?} must not be stored"
+                );
+            }
+        }
+    }
+
+    /// A fresh install has nothing stored; the UI must still be told the
+    /// values the backend applies (auto-lock 15 minutes, 4 parallel
+    /// transfers), and a stored value always wins over the default.
+    #[test]
+    fn collect_settings_reports_defaults_when_nothing_is_stored() {
+        let db = test_db();
+        let fresh = collect_settings(&db).unwrap();
+        assert_eq!(fresh.get("autoLockMinutes"), Some(&serde_json::json!("15")));
+        assert_eq!(fresh.get("sftpParallel"), Some(&serde_json::json!("4")));
+
+        db.set_config("setting.autoLockMinutes", "0").unwrap();
+        db.set_config("setting.sftpParallel", "2").unwrap();
+        let stored = collect_settings(&db).unwrap();
+        assert_eq!(stored.get("autoLockMinutes"), Some(&serde_json::json!("0")));
+        assert_eq!(stored.get("sftpParallel"), Some(&serde_json::json!("2")));
+    }
+
+    /// The watchdog reads `autoLockMinutes` exactly like the renderer's
+    /// `autoLockMinutes()`: absent / blank / not a whole number (negative
+    /// included) is the 15-minute default, "0" is off, at most 1440.
+    #[test]
+    fn watchdog_reads_auto_lock_minutes_like_the_renderer() {
+        for (stored, expected) in [
+            (None, 15),
+            (Some("15"), 15),
+            (Some("0"), 0),
+            (Some("1"), 1),
+            (Some("1440"), 1440),
+            (Some("-5"), 15),
+            (Some(""), 15),
+            (Some("abc"), 15),
+            (Some("1.5"), 15),
+            (Some("+5"), 15),
+            (Some(" 30 "), 30),
+            (Some("5000"), 1440),
+            (Some("99999999999999999999999"), 1440),
+        ] {
+            assert_eq!(
+                effective_auto_lock_minutes(stored),
+                expected,
+                "stored {stored:?}"
+            );
+        }
+    }
+
+    // ── A7-52: master-password length counts characters ──
+
+    #[test]
+    fn master_password_length_counts_characters_not_bytes() {
+        assert!(!master_password_long_enough("\u{1f511}\u{1f511}")); // 2 chars, 8 bytes
+        assert!(!master_password_long_enough("密码密码")); // 4 chars, 12 bytes
+        assert!(!master_password_long_enough("ééééééé")); // 7 chars, 14 bytes
+        assert!(!master_password_long_enough("short"));
+        assert!(master_password_long_enough("éééééééé")); // 8 chars
+        assert!(master_password_long_enough("abcdefgh"));
+    }
+
+    // ── A6-04 / A7-48: picked files are size-capped before they are read ──
+
+    #[test]
+    fn picked_text_files_over_the_cap_are_refused() {
+        let dir = std::env::temp_dir().join(format!("sshspan-pick-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.pem");
+        std::fs::write(&big, vec![b'a'; (MAX_SELECT_FILE_BYTES + 1) as usize]).unwrap();
+        let at_cap = dir.join("at-cap.pem");
+        std::fs::write(&at_cap, vec![b'a'; MAX_SELECT_FILE_BYTES as usize]).unwrap();
+        let binary = dir.join("key.bin");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+
+        let refused = read_picked_text_file(&big, MAX_SELECT_FILE_BYTES);
+        let accepted = read_picked_text_file(&at_cap, MAX_SELECT_FILE_BYTES);
+        let not_text = read_picked_text_file(&binary, MAX_SELECT_FILE_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The file contents are never echoed: an Ok here would be megabytes.
+        let err = match refused {
+            Err(e) => e,
+            Ok(text) => panic!(
+                "a file over the cap must be refused, read {} bytes",
+                text.len()
+            ),
+        };
+        assert!(
+            err.0.contains("4 MiB"),
+            "the message names the limit: {}",
+            err.0
+        );
+        assert_eq!(
+            accepted.map(|t| t.len()).ok(),
+            Some(MAX_SELECT_FILE_BYTES as usize)
+        );
+        let err = match not_text {
+            Err(e) => e,
+            Ok(text) => panic!("binary data is not text, read {} bytes", text.len()),
+        };
+        assert!(
+            err.0.contains("not a text file"),
+            "clear message: {}",
+            err.0
+        );
+    }
+
+    // ── A6-11: copies of the master password are wiped on drop ──
+
+    #[test]
+    fn vault_password_store_hands_out_zeroizing_copies() {
+        let store = unlocked_vault();
+        let copy: Option<zeroize::Zeroizing<String>> = store.get();
+        assert_eq!(copy.as_deref().map(String::as_str), Some("test-master-pw"));
+        assert!(store.is_set());
+        store.clear();
+        assert!(!store.is_set());
+        assert!(store.get().is_none());
+    }
+
+    // ── A6-03 / A2-48 / R5: backups are written and read by Rust ──
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sshspan-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A restore grant (an OPEN-dialog pick waiting for the backup password)
+    /// must never authorise a write, a save-dialog grant must never authorise
+    /// a restore, and each is good for one use.
+    #[test]
+    fn restore_grants_are_separate_from_write_grants_and_single_use() {
+        let store = DialogPathStore::new();
+        store.allow_restore("/home/me/backup.json");
+        assert!(!store.consume("/home/me/backup.json"), "not a write grant");
+        assert!(store.consume_restore("/home/me/backup.json"));
+        assert!(!store.consume_restore("/home/me/backup.json"), "single use");
+        store.allow("/home/me/export.csv");
+        assert!(
+            !store.consume_restore("/home/me/export.csv"),
+            "not a restore grant"
+        );
+        assert!(store.consume("/home/me/export.csv"));
+    }
+
+    #[test]
+    fn backup_exported_to_a_file_restores_from_that_file() {
+        let pw = "file-round-trip-pw";
+        let src = test_db();
+        src.insert_key(&sample_key("k1", pw)).unwrap();
+        let dir = scratch_dir("backup-file");
+        let path = dir.join("vault.json");
+        let path_str = path.display().to_string();
+
+        let exported = export_backup_to_path(&src, pw, &path_str, &|| Ok(()));
+        let text = std::fs::read_to_string(&path);
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777)
+        };
+        let dst = test_db();
+        let restored = restore_backup_file(&dst, &path, pw, None, &|| Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let exported = exported.unwrap();
+        assert_eq!(exported["path"], serde_json::json!(path_str));
+        assert_eq!(exported["counts"]["keys"], 1);
+        let doc: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
+        assert_eq!(doc["format"], "sshspan-backup");
+        #[cfg(unix)]
+        assert_eq!(mode.unwrap(), 0o600, "written through write_secret_file");
+        assert!(src
+            .list_audit(10)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "vault.backup_created"));
+        match restored.unwrap() {
+            RestoreOutcome::Restored(r) => assert_eq!(r["counts"]["keys"], 1),
+            other => panic!("expected a restore, got {other:?}"),
+        }
+        assert!(dst.get_key("k1").unwrap().is_some());
+    }
+
+    #[test]
+    fn backup_file_from_another_master_password_needs_that_password() {
+        let (old_pw, new_pw) = ("backup-era-pw", "current-master-pw");
+        let src = test_db();
+        src.insert_key(&sample_key("k1", old_pw)).unwrap();
+        let dir = scratch_dir("backup-pw");
+        let path = dir.join("old.json");
+        export_backup_to_path(&src, old_pw, &path.display().to_string(), &|| Ok(())).unwrap();
+
+        let dst = test_db();
+        let no_pw = restore_backup_file(&dst, &path, new_pw, None, &|| Ok(()));
+        let wrong = restore_backup_file(&dst, &path, new_pw, Some("not-it"), &|| Ok(()));
+        let untouched = dst.get_key("k1").unwrap().is_none();
+        let right = restore_backup_file(&dst, &path, new_pw, Some(old_pw), &|| Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(no_pw, Ok(RestoreOutcome::NeedsPassword)),
+            "{no_pw:?}"
+        );
+        assert_eq!(wrong.unwrap_err().0, "Backup password is incorrect.");
+        assert!(
+            untouched,
+            "a missing or wrong backup password restores nothing"
+        );
+        match right.unwrap() {
+            RestoreOutcome::Restored(r) => assert_eq!(r["passwordReLinked"], true),
+            other => panic!("expected a restore, got {other:?}"),
+        }
+        let key = dst.get_key("k1").unwrap().unwrap();
+        assert!(
+            crate::crypto::vault::unseal(new_pw, &key.private_key_encrypted).is_ok(),
+            "re-sealed under the current master password"
+        );
+    }
+
+    #[test]
+    fn oversized_backup_file_is_refused() {
+        let dir = scratch_dir("backup-big");
+        let path = dir.join("huge.json");
+        // Sparse: the size is what matters, not 32 MiB of writes.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_BACKUP_FILE_BYTES + 1)
+            .unwrap();
+        let result = restore_backup_file(&test_db(), &path, "pw", None, &|| Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("a file over the cap must be refused");
+        assert!(
+            err.0.contains("32 MiB"),
+            "the message names the limit: {}",
+            err.0
+        );
+    }
+
+    /// The vault-generation re-check runs between building and writing: a
+    /// lock while the user sat in the save dialog means no file at all.
+    #[test]
+    fn backup_export_writes_nothing_when_the_vault_locked_meanwhile() {
+        let db = test_db();
+        let dir = scratch_dir("backup-locked");
+        let path = dir.join("vault.json");
+        let refused = export_backup_to_path(&db, "pw", &path.display().to_string(), &|| {
+            Err(CmdError(
+                "Vault was locked while the operation was in progress.".into(),
+            ))
+        });
+        let written = path.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refused.is_err());
+        assert!(!written, "nothing may be written after a lock");
+    }
+
+    // ── A7-13: the master-password change runs off the main thread ──
+
+    /// The moved commands do their DB work inside `run_blocking`, i.e. on a
+    /// blocking-pool thread of Tauri's runtime; the DB layer's `block()` must
+    /// work there too, not only on a plain thread or a runtime worker.
+    #[test]
+    fn db_work_runs_inside_run_blocking() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", "pw")).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let names = rt
+            .block_on(run_blocking(move || {
+                let keys = db.list_keys().map_err(|e| e.to_string())?;
+                Ok(keys.into_iter().map(|k| k.name).collect::<Vec<_>>())
+            }))
+            .unwrap();
+        assert_eq!(names, vec!["key-k1".to_string()]);
+    }
+
+    fn vault_db(master_pw: &str) -> db::Database {
+        let db = test_db();
+        db.set_config(MASTER_HASH_KEY, &hash_master_password(master_pw).unwrap())
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn password_rotation_reseals_records_and_the_verifier() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+        db.insert_server(&sample_server("s1", Some("srv-pw"), old_pw))
+            .unwrap();
+        let throttle = UnlockThrottle::new();
+
+        let wrong = rotate_master_password(&db, &throttle, "not-it", new_pw, &|| true);
+        assert_eq!(
+            wrong.unwrap_err().0,
+            "Current master password is incorrect."
+        );
+
+        let summary = rotate_master_password(&db, &throttle, old_pw, new_pw, &|| true).unwrap();
+        assert_eq!(
+            summary,
+            RotationSummary {
+                keys: 1,
+                server_passwords: 1
+            }
+        );
+        assert!(verify_master_password(&db, new_pw).unwrap());
+        let key = db.get_key("k1").unwrap().unwrap();
+        assert!(crate::crypto::vault::unseal(new_pw, &key.private_key_encrypted).is_ok());
+        let srv = db.get_server("s1").unwrap().unwrap();
+        let saved = crate::crypto::vault::unseal(new_pw, srv.saved_password.as_ref().unwrap());
+        assert_eq!(saved.unwrap(), b"srv-pw");
+    }
+
+    /// A lock while the records were being re-sealed aborts before anything
+    /// commits: the old password still opens everything.
+    #[test]
+    fn password_rotation_aborts_when_the_vault_locks_mid_way() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+        let err = rotate_master_password(&db, &UnlockThrottle::new(), old_pw, new_pw, &|| false)
+            .unwrap_err();
+        assert_eq!(
+            err.0,
+            "Vault was locked while the operation was in progress."
+        );
+        assert!(verify_master_password(&db, old_pw).unwrap());
+        let key = db.get_key("k1").unwrap().unwrap();
+        assert!(crate::crypto::vault::unseal(old_pw, &key.private_key_encrypted).is_ok());
+    }
+
+    /// Off the main thread, a tray "Lock Vault" can land while the rotation
+    /// runs. Installing the new password afterwards must not undo that lock.
+    #[test]
+    fn rotated_password_is_not_installed_after_a_lock() {
+        let (store, generation) = (VaultPasswordStore::new(), VaultGeneration::new());
+        let captured = generation.current();
+        install_rotated_password(&store, &generation, captured, "new-pw".to_string().into());
+        assert!(
+            store.is_set(),
+            "no lock in between: the new password is installed"
+        );
+
+        store.clear();
+        let captured = generation.current();
+        generation.bump(); // the lock
+        install_rotated_password(&store, &generation, captured, "new-pw".to_string().into());
+        assert!(
+            !store.is_set(),
+            "a lock during the rotation must stay locked"
+        );
+    }
+
+    // ── C1: nothing sealed or rewritten meanwhile may be stranded or lost ──
+
+    /// A key sealed with the OLD password while the rotation runs - inserted
+    /// here behind every guard's back - must not be stranded: the rotation
+    /// aborts with nothing committed, no record is left that the accepted
+    /// master password cannot open, and the next rotation succeeds.
+    #[test]
+    fn rotation_never_strands_a_record_sealed_with_the_old_password_meanwhile() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+        let throttle = UnlockThrottle::new();
+
+        let result = rotate_master_password(&db, &throttle, old_pw, new_pw, &|| {
+            db.insert_key(&sample_key("late", old_pw)).unwrap();
+            true
+        });
+
+        let master = if verify_master_password(&db, new_pw).unwrap() {
+            new_pw
+        } else {
+            old_pw
+        };
+        let unreadable: Vec<String> = db
+            .list_keys()
+            .unwrap()
+            .into_iter()
+            .filter(|k| crate::crypto::vault::unseal(master, &k.private_key_encrypted).is_err())
+            .map(|k| k.id)
+            .collect();
+        assert!(
+            unreadable.is_empty(),
+            "stranded under the master password: {unreadable:?} (rotation: {result:?})"
+        );
+        assert!(result.is_err(), "the rotation must abort");
+        let next = rotate_master_password(&db, &throttle, master, "newer-master-pw", &|| true);
+        assert_eq!(next.unwrap().keys, 2, "the next change re-seals both keys");
+    }
+
+    /// The commit rewrote every column of every snapshot row, so an edit made
+    /// while the rotation ran (a rename here) was silently reverted. Only the
+    /// sealed column may change.
+    #[test]
+    fn rotation_keeps_edits_made_to_other_columns_meanwhile() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+
+        let reencrypted =
+            rotate_master_password(&db, &UnlockThrottle::new(), old_pw, new_pw, &|| {
+                let mut key = db.get_key("k1").unwrap().unwrap();
+                key.name = "renamed-meanwhile".into();
+                db.update_key(&key).unwrap();
+                true
+            })
+            .unwrap();
+
+        assert_eq!(reencrypted.keys, 1);
+        let key = db.get_key("k1").unwrap().unwrap();
+        assert_eq!(key.name, "renamed-meanwhile", "the rename survives");
+        assert!(crate::crypto::vault::unseal(new_pw, &key.private_key_encrypted).is_ok());
+    }
+
+    /// The MCP step upserted each snapshot record whole, reverting a tool
+    /// toggled (or an approval revoked) while the rotation ran. Only the
+    /// sealed secret may change.
+    #[test]
+    fn rotation_rewrites_only_the_mcp_secret() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.save_mcp_server(&db::McpServerRecord {
+            id: "m1".into(),
+            name: "tools".into(),
+            url: "https://mcp.example.com".into(),
+            auth_type: "bearer".into(),
+            auth_header_name: None,
+            auth_secret: Some(crate::crypto::vault::seal(old_pw, b"mcp-secret").unwrap()),
+            auth_env_var: None,
+            confirmed: true,
+            tools: vec![db::McpToolRecord {
+                name: "search".into(),
+                display_name: None,
+                description: String::new(),
+                enabled: true,
+                auto_approve: true,
+                pin_hash: Some("pin".into()),
+                current_hash: Some("pin".into()),
+                input_schema: None,
+                annotations: None,
+            }],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        rotate_master_password(&db, &UnlockThrottle::new(), old_pw, new_pw, &|| {
+            // The user revokes the approval while the rotation runs.
+            let mut record = db.get_mcp_server("m1").unwrap().unwrap();
+            record.tools[0].enabled = false;
+            record.tools[0].auto_approve = false;
+            record.tools[0].pin_hash = None;
+            db.save_mcp_server(&record).unwrap();
+            true
+        })
+        .unwrap();
+
+        let record = db.get_mcp_server("m1").unwrap().unwrap();
+        assert!(
+            !record.tools[0].enabled && !record.tools[0].auto_approve,
+            "the revoked approval must stay revoked"
+        );
+        assert_eq!(record.tools[0].pin_hash, None);
+        let secret = record.auth_secret.as_deref().unwrap();
+        assert_eq!(
+            crate::crypto::vault::unseal(new_pw, secret).unwrap(),
+            b"mcp-secret"
+        );
+    }
+
+    /// A guarded writer arriving mid-rotation is turned away at once with the
+    /// busy error (instead of sealing with the old password), the rotation
+    /// completes, every key opens with the new password, and the guard is
+    /// free again afterwards.
+    #[test]
+    fn rotation_turns_away_guarded_writers_mid_rotation() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+        let lock = VaultRotationLock::new();
+        let unlocked = unlocked_vault();
+        let throttle = UnlockThrottle::new();
+
+        let exclusive = lock
+            .exclusive_within(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refused = std::cell::RefCell::new(Vec::new());
+        let reencrypted = rotate_master_password(&db, &throttle, old_pw, new_pw, &|| {
+            refused
+                .borrow_mut()
+                .push(key_rename_in(&db, &unlocked, &lock, "k1", "renamed").map(|_| ()));
+            refused.borrow_mut().push(lock.try_shared().map(|_| ()));
+            true
+        });
+        drop(exclusive);
+
+        for attempt in refused.into_inner() {
+            assert_eq!(attempt.unwrap_err().0, VAULT_REENCRYPTING);
+        }
+        assert_eq!(reencrypted.unwrap().keys, 1);
+        let key = db.get_key("k1").unwrap().unwrap();
+        assert_eq!(key.name, "key-k1", "the refused rename changed nothing");
+        assert!(crate::crypto::vault::unseal(new_pw, &key.private_key_encrypted).is_ok());
+        key_rename_in(&db, &unlocked, &lock, "k1", "renamed").unwrap();
+        let next = rotate_master_password(&db, &throttle, new_pw, "newer-master-pw", &|| true);
+        assert_eq!(next.unwrap().keys, 1);
+    }
+
+    /// The whole change, as the command runs it: lock, rotate, install the
+    /// new password, audit it - and the lock is released afterwards.
+    #[test]
+    fn change_master_password_installs_the_new_password_and_releases_the_lock() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+        let (throttle, lock, store, generations) = (
+            UnlockThrottle::new(),
+            VaultRotationLock::new(),
+            unlocked_vault(),
+            VaultGeneration::new(),
+        );
+        let vault = RotationContext {
+            throttle: &throttle,
+            lock: &lock,
+            store: &store,
+            generations: &generations,
+            lock_wait: ROTATION_LOCK_WAIT,
+        };
+        let reencrypted = change_master_password(
+            &db,
+            &vault,
+            generations.current(),
+            old_pw,
+            new_pw.to_string().into(),
+        )
+        .unwrap();
+        assert_eq!(reencrypted, 1);
+        assert_eq!(store.get().as_deref().map(String::as_str), Some(new_pw));
+        assert!(lock.try_shared().is_ok(), "the lock is released");
+        assert!(db
+            .list_audit(10)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "vault.password_changed"));
+    }
+
+    /// Fix 2, MUST B: the export seals the backup with the master password,
+    /// so while a change holds the lock it is refused at once and writes no
+    /// file; afterwards it works again.
+    #[test]
+    fn backup_export_is_refused_while_the_master_password_is_being_changed() {
+        let db = test_db();
+        db.insert_key(&sample_key("k1", "test-master-pw")).unwrap();
+        let (lock, store) = (VaultRotationLock::new(), unlocked_vault());
+        let dir = scratch_dir("backup-busy");
+        let path = dir.join("vault.json");
+        let path_str = path.display().to_string();
+
+        let change = lock
+            .exclusive_within(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refused = export_backup_guarded(&db, &lock, &store, &path_str, &|| Ok(()));
+        let written_while_busy = path.exists();
+        drop(change);
+        let exported = export_backup_guarded(&db, &lock, &store, &path_str, &|| Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(refused.unwrap_err().0, VAULT_REENCRYPTING);
+        assert!(!written_while_busy, "nothing may be written while busy");
+        assert_eq!(exported.unwrap()["counts"]["keys"], 1);
+    }
+
+    /// Fix 2, SHOULD 1: a sync or MCP call that keeps its read guard makes the
+    /// change give up after the wait, with a message - and before the
+    /// current-password check: a wrong password here is never looked at and
+    /// costs no throttle failure.
+    #[test]
+    fn password_change_gives_up_waiting_for_a_running_sync() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+        let (throttle, lock, store, generations) = (
+            UnlockThrottle::new(),
+            VaultRotationLock::new(),
+            unlocked_vault(),
+            VaultGeneration::new(),
+        );
+        let vault = RotationContext {
+            throttle: &throttle,
+            lock: &lock,
+            store: &store,
+            generations: &generations,
+            lock_wait: std::time::Duration::from_millis(200),
+        };
+        let running_sync = lock.try_shared().unwrap();
+        let started = std::time::Instant::now();
+        let err = change_master_password(
+            &db,
+            &vault,
+            generations.current(),
+            "not-the-current-password",
+            new_pw.to_string().into(),
+        )
+        .unwrap_err();
+        drop(running_sync);
+
+        assert_eq!(err.0, ROTATION_LOCK_BUSY);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(throttle.state.lock().unwrap().consecutive_failures, 0);
+        assert!(
+            verify_master_password(&db, old_pw).unwrap(),
+            "nothing changed"
+        );
+        assert!(
+            lock.try_shared().is_ok(),
+            "the given-up wait left no writer"
+        );
+    }
+
+    /// While the change waits for the lock it is queued: new sealed-data
+    /// writers are refused at once instead of extending the wait, and it gets
+    /// the lock as soon as the running one finishes.
+    #[test]
+    fn a_waiting_password_change_refuses_new_writers() {
+        let lock = VaultRotationLock::new();
+        let running_sync = lock.try_shared().unwrap();
+        std::thread::scope(|scope| {
+            let change = scope.spawn(|| {
+                lock.exclusive_within(std::time::Duration::from_secs(10))
+                    .map(|_| ())
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while lock.try_shared().is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the change never queued for the lock"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(lock.try_shared().unwrap_err().0, VAULT_REENCRYPTING);
+            drop(running_sync);
+            change.join().unwrap().unwrap();
+        });
+        assert!(lock.try_shared().is_ok());
+    }
+
+    /// Fix 2, MUST A: once the rotation has committed, the new password must
+    /// be installed even if writing the audit row fails - otherwise the store
+    /// keeps the OLD password over a vault sealed with the new one, and the
+    /// next seal strands its record. Here the audit table is gone.
+    #[test]
+    fn a_failed_audit_write_after_the_commit_still_installs_the_new_password() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = vault_db(old_pw);
+        db.insert_key(&sample_key("k1", old_pw)).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(sqlx::query("DROP TABLE audit_log").execute(&db.pool))
+            .unwrap();
+        let (throttle, lock, store, generations) = (
+            UnlockThrottle::new(),
+            VaultRotationLock::new(),
+            unlocked_vault(),
+            VaultGeneration::new(),
+        );
+        let vault = RotationContext {
+            throttle: &throttle,
+            lock: &lock,
+            store: &store,
+            generations: &generations,
+            lock_wait: ROTATION_LOCK_WAIT,
+        };
+        let result = change_master_password(
+            &db,
+            &vault,
+            generations.current(),
+            old_pw,
+            new_pw.to_string().into(),
+        );
+        assert!(verify_master_password(&db, new_pw).unwrap(), "committed");
+        assert_eq!(
+            store.get().as_deref().map(String::as_str),
+            Some(new_pw),
+            "the committed password must be installed"
+        );
+        assert_eq!(result.unwrap(), 1, "a committed change is reported as done");
+    }
+
+    /// MINOR 1: a lock that lands during a restore's re-seal (the generation
+    /// moved) stops it before anything is committed.
+    #[test]
+    fn restore_commits_nothing_when_the_vault_locked_meanwhile() {
+        let pw = "restore-lock-pw";
+        let src = test_db();
+        src.insert_key(&sample_key("k1", pw)).unwrap();
+        let dir = scratch_dir("restore-locked");
+        let path = dir.join("vault.json");
+        export_backup_to_path(&src, pw, &path.display().to_string(), &|| Ok(())).unwrap();
+        let dst = test_db();
+        let result = restore_backup_file(&dst, &path, pw, None, &|| {
+            Err(CmdError(
+                "Vault was locked while the operation was in progress.".into(),
+            ))
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result.unwrap_err().0,
+            "Vault was locked while the operation was in progress."
+        );
+        assert!(dst.get_key("k1").unwrap().is_none(), "nothing restored");
+        assert!(!dst
+            .list_audit(10)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "vault.backup_restored"));
+    }
+
+    // ── restored settings go through the same validation as settings_set ──
+
+    #[test]
+    fn backup_settings_sanitizer_drops_invalid_values_too() {
+        let mut settings = serde_json::Map::new();
+        settings.insert("autoLockMinutes".into(), serde_json::json!("-5"));
+        settings.insert("sftpParallel".into(), serde_json::json!("9"));
+        settings.insert("confirmDelete".into(), serde_json::json!("yes"));
+        settings.insert("uiScale".into(), serde_json::json!(110)); // not a string
+        settings.insert("terminalBell".into(), serde_json::json!("sound"));
+
+        let dropped = sanitize_backup_settings(&mut settings);
+
+        assert_eq!(dropped, 4);
+        assert_eq!(
+            settings.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["terminalBell"]
+        );
+    }
+
+    /// The restore result says how many settings were left out.
+    #[test]
+    fn restore_result_counts_the_settings_it_dropped() {
+        let pw = "restore-settings-pw";
+        let payload = serde_json::json!({
+            "settings": {
+                "autoLockMinutes": "-5",
+                "theme": "dark",
+                "terminalBell": "sound",
+            },
+        });
+        let doc = serde_json::json!({
+            "format": "sshspan-backup",
+            "version": 1,
+            "sealed": crate::crypto::vault::seal(pw, payload.to_string().as_bytes()).unwrap(),
+        });
+        let db = test_db();
+        match apply_restore(&db, &doc, pw, None, &|| Ok(())).unwrap() {
+            RestoreOutcome::Restored(r) => {
+                assert_eq!(r["counts"]["settingsDropped"], 2);
+                assert_eq!(r["counts"]["settings"], 1);
+            }
+            other => panic!("expected a restore, got {other:?}"),
+        }
+        assert_eq!(db.get_config("setting.autoLockMinutes").unwrap(), None);
+        assert_eq!(
+            db.get_config("setting.terminalBell").unwrap().as_deref(),
+            Some("sound")
+        );
+    }
 }
 
 /// NOT REGISTERED in `generate_handler!`, deliberately.
@@ -1005,7 +2378,7 @@ mod tests {
 /// blobs are sealed with the master password, so this is not plaintext key
 /// material - but it hands a compromised renderer the entire keystore to
 /// attack offline, and nothing in the shipped UI ever called it. Registering
-/// it again needs a reason and a review; `vault_backup_create` is the
+/// it again needs a reason and a review; `vault_backup_export_to_file` is the
 /// supported export path and keeps the material in the backend.
 #[tauri::command]
 pub fn vault_export(app: AppHandle) -> CmdResult<serde_json::Value> {
@@ -1030,10 +2403,11 @@ pub fn vault_export(app: AppHandle) -> CmdResult<serde_json::Value> {
 
 /// NOT REGISTERED in `generate_handler!`, deliberately - the counterpart to
 /// `vault_export`, and likewise never called by the shipped UI. It writes
-/// caller-supplied key records straight into the vault; `vault_backup_restore`
-/// is the reviewed import path.
+/// caller-supplied key records straight into the vault;
+/// `vault_backup_restore_from_file` is the reviewed import path.
 #[tauri::command]
 pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<serde_json::Value> {
+    let _rotation = rotation_shared(&app)?;
     let _pw = vault_password(&app)?;
     let mut imported = 0;
     for item in &keys {
@@ -1112,11 +2486,15 @@ pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<s
 
 // ─── Vault backup / restore ────────────────────────────────────────────────
 
-/// Serialize the whole vault (keys + categories + links + servers +
-/// known_hosts + settings) and seal the payload with the current vault
-/// password. The inner key blobs are sealed with the same password, so a
-/// backup can only be restored with the master password that was current
-/// when it was created (or by supplying that password at restore time).
+/// NOT REGISTERED in `generate_handler!`, deliberately (A6-03 / A2-48, ruling
+/// R5).
+///
+/// It returns the whole sealed backup document to the webview - every sealed
+/// key, saved server password and MCP secret under ONE Argon2id envelope -
+/// which is the exposure `vault_export` was de-registered for: a compromised
+/// renderer could take it for an offline attack on the master password with
+/// one call. `vault_backup_export_to_file` builds the same document and writes
+/// it to the file the user picks without it ever crossing IPC.
 #[tauri::command]
 pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
     let pw = vault_password(&app)?;
@@ -1124,7 +2502,31 @@ pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
         return Err("Vault is locked.".into());
     }
     let db = &app.state::<AppState>().db;
+    let backup = build_backup_document(db, &pw)?;
+    let _ = db.add_audit("vault.backup_created", None, &backup.counts.to_string());
+    Ok(serde_json::json!({
+        "json": backup.document, "filename": backup.filename, "counts": backup.counts,
+    }))
+}
 
+/// A sealed vault backup, built in memory and not yet written anywhere.
+pub struct BackupDocument {
+    /// `{format, version, created, sealed}` - what goes into the file.
+    pub document: serde_json::Value,
+    /// Suggested file name, `sshspan-backup-<UTC stamp>.json`.
+    pub filename: String,
+    /// How many of each entity the backup holds.
+    pub counts: serde_json::Value,
+}
+
+/// Build a vault backup in memory: keys + categories + links + servers +
+/// known_hosts + stored settings + MCP servers + SFTP bookmarks, serialized
+/// into one payload and sealed with `pw`. The inner key blobs are sealed with
+/// the same password, so a backup can only be restored with the master
+/// password that was current when it was created (or by supplying that
+/// password at restore time). No `AppHandle`, so the backup -> restore round
+/// trip is testable against a plain database.
+pub fn build_backup_document(db: &db::Database, pw: &str) -> CmdResult<BackupDocument> {
     let keys = db.list_keys_with_categories().map_err(|e| e.to_string())?;
     let categories = db.list_categories().map_err(|e| e.to_string())?;
     let servers = db.list_servers().map_err(|e| e.to_string())?;
@@ -1134,7 +2536,24 @@ pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
     // (confirmed=false, all tools disabled) - see `restore_backup`.
     let mcp_servers = db.list_mcp_servers().map_err(|e| e.to_string())?;
 
-    let settings = collect_settings(&db)?;
+    let settings = collect_stored_settings(db)?;
+
+    // Per-server SFTP bookmarks live in `config`, outside the settings
+    // allowlist, so the backup used to drop them (A7-41). A stored list that
+    // does not parse reads back as "no bookmarks" in the file browser, so it
+    // is left out rather than copied as garbage.
+    let mut sftp_bookmarks = serde_json::Map::new();
+    for (key, raw) in db
+        .list_config_prefix(db::SFTP_BOOKMARKS_PREFIX)
+        .map_err(|e| e.to_string())?
+    {
+        let Some(server_id) = key.strip_prefix(db::SFTP_BOOKMARKS_PREFIX) else {
+            continue;
+        };
+        if let Ok(list @ serde_json::Value::Array(_)) = serde_json::from_str(&raw) {
+            sftp_bookmarks.insert(server_id.to_string(), list);
+        }
+    }
 
     let payload = serde_json::json!({
         "keys": keys,
@@ -1143,10 +2562,11 @@ pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
         "known_hosts": known_hosts,
         "settings": settings,
         "mcpServers": mcp_servers,
+        "sftpBookmarks": sftp_bookmarks,
     });
     let payload_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let sealed =
-        crate::crypto::vault::seal(&pw, payload_str.as_bytes()).map_err(|e| e.to_string())?;
+        crate::crypto::vault::seal(pw, payload_str.as_bytes()).map_err(|e| e.to_string())?;
 
     let document = serde_json::json!({
         "format": "sshspan-backup",
@@ -1154,44 +2574,292 @@ pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
         "created": now(),
         "sealed": sealed,
     });
-    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let filename = format!("sshspan-backup-{stamp}.json");
-    let count = serde_json::json!({
+    let filename = backup_file_name();
+    let counts = serde_json::json!({
         "keys": keys.len(), "categories": categories.len(),
         "servers": servers.len(), "knownHosts": known_hosts.len(),
+        "sftpBookmarks": sftp_bookmarks.len(),
     });
-    let _ = db.add_audit("vault.backup_created", None, &count.to_string());
-    Ok(serde_json::json!({ "json": document, "filename": filename, "counts": count }))
+    Ok(BackupDocument {
+        document,
+        filename,
+        counts,
+    })
 }
 
-/// Restore a backup document. The outer envelope is unsealed with the current
-/// vault password; on failure the caller may supply the password that was
-/// current when the backup was taken, and key blobs + saved server passwords
-/// are then re-sealed with the current one so everything becomes usable.
+/// `sshspan-backup-<UTC stamp>.json`, the name the save dialog suggests.
+fn backup_file_name() -> String {
+    format!(
+        "sshspan-backup-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    )
+}
+
+/// Largest backup file a restore will read. A backup is a JSON envelope
+/// around the sealed vault - well under this even for a large vault - so a
+/// bigger file is refused before it is read into memory.
+const MAX_BACKUP_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Create a vault backup and save it to the file the user picks in the native
+/// save dialog, all in Rust (A6-03 / A2-48, ruling R5): the sealed document
+/// never reaches the webview. Returns `{ok, canceled: false, path, counts}`,
+/// or `{canceled: true}` when the dialog is dismissed.
+///
+/// The vault generation is captured before the dialog, which can stay open
+/// indefinitely, and re-checked before the file is written (the
+/// `key_export_to_file` pattern): a lock in between means no file.
+#[tauri::command]
+/// NOTE: async on purpose. A synchronous command runs on the MAIN thread,
+/// where tauri-plugin-dialog's `blocking_*` helpers deadlock (see
+/// `system_pick_save_path`); and the Argon2id seal runs on a blocking worker.
+pub async fn vault_backup_export_to_file(app: AppHandle) -> CmdResult<serde_json::Value> {
+    use tauri_plugin_dialog::DialogExt;
+    let generation = capture_vault_generation(&app)?;
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Save vault backup")
+        .set_file_name(backup_file_name())
+        .blocking_save_file();
+    let Some(path) = picked else {
+        return Ok(serde_json::json!({ "canceled": true }));
+    };
+    require_generation_current(&app, generation)?;
+    let path = path.to_string();
+    let worker = app.clone();
+    run_blocking(move || {
+        export_backup_guarded(
+            &worker.state::<AppState>().db,
+            worker.state::<VaultRotationLock>().inner(),
+            worker.state::<VaultPasswordStore>().inner(),
+            &path,
+            &|| require_generation_current(&worker, generation),
+        )
+    })
+    .await
+}
+
+/// The export worker's body. Read access to the [`VaultRotationLock`] comes
+/// FIRST and is held until the file is written (C1, fix 2): the export reads
+/// the master password, lists every sealed row and seals the document with
+/// that password, so a master-password change committing in between would
+/// produce a backup sealed with the old password around blobs sealed with
+/// the new one. While a change runs, the export is refused at once.
+fn export_backup_guarded(
+    db: &db::Database,
+    rotation: &VaultRotationLock,
+    store: &VaultPasswordStore,
+    path: &str,
+    still_current: &dyn Fn() -> CmdResult<()>,
+) -> CmdResult<serde_json::Value> {
+    let _rotation = rotation.try_shared()?;
+    let pw = store.get().unwrap_or_default();
+    if pw.is_empty() {
+        return Err("Vault is locked.".into());
+    }
+    export_backup_to_path(db, &pw, path, still_current)
+}
+
+/// [`vault_backup_export_to_file`] after the dialog, without the `AppHandle`:
+/// build the backup and write it to `path` with `write_secret_file` (0600
+/// from the first byte on Unix, owner-only ACL on Windows, fail closed), then
+/// audit it. `still_current` is the vault-generation re-check, run after the
+/// build and before the write.
+fn export_backup_to_path(
+    db: &db::Database,
+    pw: &str,
+    path: &str,
+    still_current: &dyn Fn() -> CmdResult<()>,
+) -> CmdResult<serde_json::Value> {
+    // The dialog choice is the user's approval; the absolute/app-data/system
+    // checks stay as a backstop (the app-data guard also keeps the vault DB
+    // from being overwritten).
+    validate_export_path(path)?;
+    let backup = build_backup_document(db, pw)?;
+    let text = serde_json::to_string_pretty(&backup.document).map_err(|e| e.to_string())?;
+    still_current()?;
+    crate::ssh::write_secret_file(std::path::Path::new(path), text.as_bytes())
+        .map_err(|e| CmdError(e.to_string()))?;
+    let _ = db.add_audit(
+        "vault.backup_created",
+        None,
+        &format!("{} -> {path}", backup.counts),
+    );
+    Ok(serde_json::json!({
+        "ok": true, "canceled": false, "path": path, "counts": backup.counts,
+    }))
+}
+
+/// Restore a backup from a file, read by Rust (A6-03 / A2-48, ruling R5): the
+/// file never passes through the webview.
+///
+/// With no `path` the native open dialog asks for the file. If the backup is
+/// sealed under a different master password and no `backupPassword` came
+/// with the call, nothing is restored: the answer is `{needsPassword: true,
+/// path}` and that path gets a single-use grant for a few minutes, so the
+/// retry - the same call with `path` and `backupPassword` - is accepted for
+/// that file only. Otherwise the answer is `{canceled: true}` or the restore
+/// result (`ok`, `counts`, `passwordReLinked`, `resealFailures`).
+#[tauri::command]
+/// NOTE: async on purpose: the dialog must not block the main thread (see
+/// `system_pick_save_path`), and reading the file and re-sealing every record
+/// (Argon2id each) run on a blocking worker.
+pub async fn vault_backup_restore_from_file(
+    app: AppHandle,
+    path: Option<String>,
+    backup_password: Option<String>,
+) -> CmdResult<serde_json::Value> {
+    use tauri_plugin_dialog::DialogExt;
+    let backup_password = backup_password.map(zeroize::Zeroizing::new);
+    // Captured before the dialog and re-checked right before the restore
+    // commits: a lock in between - during the per-record re-seal included -
+    // means nothing is restored into the locked vault.
+    let generation = capture_vault_generation(&app)?;
+    // A restore writes sealed rows, so it and a master-password change
+    // exclude each other (C1): read access to the rotation lock is held from
+    // here until the restore has committed. It is taken after the dialog
+    // (never across it - the user may take any time there) and, on a retry,
+    // BEFORE the single-use grant is spent, so a busy refusal does not cost
+    // the user the file they picked.
+    let (path, _rotation) = match path {
+        None => {
+            let picked = app
+                .dialog()
+                .file()
+                .set_title("Restore vault backup")
+                .blocking_pick_file();
+            let Some(picked) = picked else {
+                return Ok(serde_json::json!({ "canceled": true }));
+            };
+            (picked.to_string(), rotation_shared(&app)?)
+        }
+        Some(p) => {
+            let rotation = rotation_shared(&app)?;
+            // Only the file this flow itself offered back with `needsPassword`.
+            if !app.state::<DialogPathStore>().consume_restore(&p) {
+                return Err(
+                    "Choose the backup file again - a restore only reads a file picked in its own dialog, once, within 5 minutes."
+                        .into(),
+                );
+            }
+            (p, rotation)
+        }
+    };
+    let worker = app.clone();
+    let source = path.clone();
+    let outcome = run_blocking(move || {
+        let pw = vault_password(&worker)?;
+        if pw.is_empty() {
+            return Err("Vault is locked.".into());
+        }
+        restore_backup_file(
+            &worker.state::<AppState>().db,
+            std::path::Path::new(&source),
+            &pw,
+            backup_password.as_deref().map(String::as_str),
+            &|| require_generation_current(&worker, generation),
+        )
+    })
+    .await?;
+    match outcome {
+        RestoreOutcome::Restored(result) => Ok(result),
+        RestoreOutcome::NeedsPassword => {
+            app.state::<DialogPathStore>().allow_restore(&path);
+            Ok(serde_json::json!({ "needsPassword": true, "path": path }))
+        }
+    }
+}
+
+/// [`vault_backup_restore_from_file`] after the dialog and the grant, without
+/// the `AppHandle`: read the file (capped at [`MAX_BACKUP_FILE_BYTES`]) and
+/// restore it. `still_current` is the vault-generation re-check
+/// [`apply_restore`] runs right before it commits.
+fn restore_backup_file(
+    db: &db::Database,
+    path: &std::path::Path,
+    pw: &str,
+    backup_password: Option<&str>,
+    still_current: &dyn Fn() -> CmdResult<()>,
+) -> CmdResult<RestoreOutcome> {
+    let text = read_picked_text_file(path, MAX_BACKUP_FILE_BYTES)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| CmdError("Not an SSHSpan backup file.".into()))?;
+    apply_restore(db, &doc, pw, backup_password, still_current)
+}
+
+/// NOT REGISTERED in `generate_handler!`, deliberately (A6-03 / A2-48, ruling
+/// R5) - the counterpart of `vault_backup_create`. It took the backup's text
+/// from the webview, which the restore flow only had because
+/// `system_select_file` had read the file into it.
+/// `vault_backup_restore_from_file` reads the file in Rust instead.
 #[tauri::command]
 pub fn vault_backup_restore(
     app: AppHandle,
     payload_json: String,
     backup_password: Option<String>,
 ) -> CmdResult<serde_json::Value> {
+    let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
     let doc: serde_json::Value = serde_json::from_str(&payload_json).map_err(|e| e.to_string())?;
+    match apply_restore(
+        &app.state::<AppState>().db,
+        &doc,
+        &pw,
+        backup_password.as_deref(),
+        &|| Ok(()),
+    )? {
+        RestoreOutcome::Restored(result) => Ok(result),
+        RestoreOutcome::NeedsPassword => Err(
+            "This backup was created with a different master password. Enter that password to restore it."
+                .into(),
+        ),
+    }
+}
+
+/// What a restore attempt came to.
+#[derive(Debug)]
+pub enum RestoreOutcome {
+    /// The backup is sealed under a different master password and no backup
+    /// password was supplied. Nothing was written.
+    NeedsPassword,
+    /// The restore committed. The value is the IPC result: `ok`, `counts`,
+    /// `passwordReLinked`, `resealFailures`.
+    Restored(serde_json::Value),
+}
+
+/// Restore a parsed backup document into `db`, as the command layer does,
+/// minus the `AppHandle`: `pw` is the current master password, and
+/// `backup_password` the one that was current when the backup was taken (only
+/// needed when they differ; empty counts as absent). `still_current` is the
+/// vault-generation re-check, run right before anything is committed: a lock
+/// during a long re-seal must not restore anything into the locked vault.
+/// The caller holds read access to the [`VaultRotationLock`] through the
+/// restore, so the master password stays current too.
+pub fn apply_restore(
+    db: &db::Database,
+    doc: &serde_json::Value,
+    pw: &str,
+    backup_password: Option<&str>,
+    still_current: &dyn Fn() -> CmdResult<()>,
+) -> CmdResult<RestoreOutcome> {
     if doc.get("format").and_then(|v| v.as_str()) != Some("sshspan-backup") {
         return Err("Not an SSHSpan backup file.".into());
     }
     let Some(sealed) = doc.get("sealed").and_then(|v| v.as_str()) else {
         return Err("Backup file is missing its sealed payload.".into());
     };
+    let backup_password = backup_password.filter(|p| !p.is_empty());
 
     let mut reused_backup_password = false;
-    let plaintext = match crate::crypto::vault::unseal(&pw, sealed) {
+    let plaintext = match crate::crypto::vault::unseal(pw, sealed) {
         Ok(bytes) => bytes,
         Err(_) => {
-            let bp = backup_password.as_deref().filter(|p| !p.is_empty())
-                .ok_or_else(|| "This backup was created with a different master password. Enter that password to restore it.".to_string())?;
+            let Some(bp) = backup_password else {
+                return Ok(RestoreOutcome::NeedsPassword);
+            };
             reused_backup_password = true;
             crate::crypto::vault::unseal(bp, sealed)
                 .map_err(|_| "Backup password is incorrect.".to_string())?
@@ -1209,7 +2877,7 @@ pub fn vault_backup_restore(
     // in the result and the audit log.
     let mut reseal_failures: u32 = 0;
     if reused_backup_password {
-        let bp = backup_password.as_deref().unwrap_or_default().to_string();
+        let bp = backup_password.unwrap_or_default();
         if let Some(arr) = data.get_mut("keys").and_then(|v| v.as_array_mut()) {
             let mut keep: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
             for k in arr.drain(..) {
@@ -1221,8 +2889,10 @@ pub fn vault_backup_restore(
                     keep.push(k);
                     continue;
                 };
-                if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
-                    match crate::crypto::vault::seal(&pw, &plain) {
+                if let Ok(plain) =
+                    crate::crypto::vault::unseal(bp, &blob).map(zeroize::Zeroizing::new)
+                {
+                    match crate::crypto::vault::seal(pw, &plain) {
                         Ok(resealed) => {
                             let mut k = k;
                             k["private_key_encrypted"] = serde_json::json!(resealed);
@@ -1232,7 +2902,7 @@ pub fn vault_backup_restore(
                         // password only, which is being discarded - excluded.
                         Err(_) => reseal_failures += 1,
                     }
-                } else if crate::crypto::vault::unseal(&pw, &blob).is_ok() {
+                } else if crate::crypto::vault::unseal(pw, &blob).is_ok() {
                     // Already usable with the current password (mixed-era
                     // backup): keep as-is.
                     keep.push(k);
@@ -1252,13 +2922,15 @@ pub fn vault_backup_restore(
                 else {
                     continue;
                 };
-                if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
-                    if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
+                if let Ok(plain) =
+                    crate::crypto::vault::unseal(bp, &blob).map(zeroize::Zeroizing::new)
+                {
+                    if let Ok(resealed) = crate::crypto::vault::seal(pw, &plain) {
                         sv["saved_password"] = serde_json::json!(resealed);
                         continue;
                     }
                 }
-                if crate::crypto::vault::unseal(&pw, &blob).is_ok() {
+                if crate::crypto::vault::unseal(pw, &blob).is_ok() {
                     // Already usable with the current password: keep as-is.
                     continue;
                 }
@@ -1283,13 +2955,15 @@ pub fn vault_backup_restore(
                 else {
                     continue;
                 };
-                if let Ok(plain) = crate::crypto::vault::unseal(&bp, &blob) {
-                    if let Ok(resealed) = crate::crypto::vault::seal(&pw, &plain) {
+                if let Ok(plain) =
+                    crate::crypto::vault::unseal(bp, &blob).map(zeroize::Zeroizing::new)
+                {
+                    if let Ok(resealed) = crate::crypto::vault::seal(pw, &plain) {
                         m["auth_secret"] = serde_json::json!(resealed);
                         continue;
                     }
                 }
-                if crate::crypto::vault::unseal(&pw, &blob).is_ok() {
+                if crate::crypto::vault::unseal(pw, &blob).is_ok() {
                     continue;
                 }
                 m["auth_secret"] = serde_json::Value::Null;
@@ -1309,24 +2983,19 @@ pub fn vault_backup_restore(
         .map(sanitize_backup_settings)
         .unwrap_or(0);
 
-    let counts = app
-        .state::<AppState>()
-        .db
-        .restore_backup(&data)
-        .map_err(|e| e.to_string())?;
-    let _ =
-        app.state::<AppState>()
-            .db
-            .add_audit("vault.backup_restored", None, &counts.to_string());
+    still_current()?;
+    let mut counts = db.restore_backup(&data).map_err(|e| e.to_string())?;
+    counts["settingsDropped"] = serde_json::json!(dropped_settings);
+    let _ = db.add_audit("vault.backup_restored", None, &counts.to_string());
     if dropped_settings > 0 {
-        let _ = app.state::<AppState>().db.add_audit(
+        let _ = db.add_audit(
             "vault.restore_settings_skipped",
             None,
-            &format!("{dropped_settings} unknown setting(s) ignored on restore"),
+            &format!("{dropped_settings} unknown or invalid setting(s) ignored on restore"),
         );
     }
     if reseal_failures > 0 {
-        let _ = app.state::<AppState>().db.add_audit(
+        let _ = db.add_audit(
             "vault.restore_reseal_skipped",
             None,
             &format!(
@@ -1334,12 +3003,12 @@ pub fn vault_backup_restore(
             ),
         );
     }
-    Ok(serde_json::json!({
+    Ok(RestoreOutcome::Restored(serde_json::json!({
         "ok": true,
         "counts": counts,
         "passwordReLinked": reused_backup_password,
         "resealFailures": reseal_failures,
-    }))
+    })))
 }
 
 // ─── File save helpers (backup export / generic) ───────────────────────────
@@ -1376,59 +3045,108 @@ pub async fn system_pick_save_path(
     }
 }
 
-/// Paths the user explicitly picked in a native save dialog during this
-/// session. `system_write_text_file` requires membership, so a compromised
-/// renderer cannot use the write command against arbitrary user-writable
-/// locations (Startup folders, shell rc files, ...) - only paths a human
-/// approved in the OS dialog.
-pub struct DialogPathStore(std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>);
+/// Paths the user explicitly picked in a native dialog during this session,
+/// kept per purpose.
+///
+/// Write grants are save-dialog picks: `system_write_text_file` requires one,
+/// so a compromised renderer cannot use the write command against arbitrary
+/// user-writable locations (Startup folders, shell rc files, ...) - only paths
+/// a human approved in the OS dialog.
+///
+/// Restore grants are backup files picked in the restore dialog whose restore
+/// is waiting for the backup password (`vault_backup_restore_from_file`
+/// answered `needsPassword`). They are kept apart on purpose: an OPEN-dialog
+/// pick must never become permission to WRITE that file, and a save-dialog
+/// pick must never let a restore read some other file.
+pub struct DialogPathStore {
+    writes: PathGrants,
+    restores: PathGrants,
+}
 
-/// How long a dialog-approved path stays writable. The backup-export flow
-/// uses the path within seconds of picking it, so a generous window covers
-/// retries without leaving the grant alive for the whole session.
+/// How long a save-dialog path stays writable. The export flows use the path
+/// within seconds of picking it, so a generous window covers retries without
+/// leaving the grant alive for the whole session.
 const DIALOG_PATH_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-impl DialogPathStore {
-    pub fn new() -> Self {
-        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+/// How long a picked backup file stays restorable while the user types the
+/// password it was made with.
+const RESTORE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// One set of dialog grants: path -> when it was granted.
+struct PathGrants {
+    granted: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    ttl: std::time::Duration,
+}
+
+impl PathGrants {
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            granted: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ttl,
+        }
     }
     fn allow(&self, path: &str) {
-        let mut guard = self.0.lock().unwrap();
+        let mut guard = self.granted.lock().unwrap();
         let now = std::time::Instant::now();
         // Prune expired entries so the map cannot grow unboundedly.
-        guard.retain(|_, granted| now.duration_since(*granted) < DIALOG_PATH_TTL);
+        guard.retain(|_, granted| now.duration_since(*granted) < self.ttl);
         guard.insert(path.to_string(), now);
     }
-    /// Consume a grant: a dialog pick authorises exactly ONE write.
+    /// Consume a grant: a dialog pick authorises exactly ONE use.
     ///
     /// SECURITY: checking without consuming meant a path approved for a
-    /// legitimate backup export stayed writable for the rest of the grant
-    /// window, so a compromised renderer could wait for a real export and then
-    /// rewrite that file with contents of its own. The grant is removed
-    /// whether or not it had expired, so a stale entry cannot be retried.
+    /// legitimate export stayed writable for the rest of the grant window, so
+    /// a compromised renderer could wait for a real export and then rewrite
+    /// that file with contents of its own. The grant is removed whether or not
+    /// it had expired, so a stale entry cannot be retried.
     fn consume(&self, path: &str) -> bool {
-        let mut guard = self.0.lock().unwrap();
+        let mut guard = self.granted.lock().unwrap();
         match guard.remove(path) {
-            Some(granted) => std::time::Instant::now().duration_since(granted) < DIALOG_PATH_TTL,
+            Some(granted) => std::time::Instant::now().duration_since(granted) < self.ttl,
             None => false,
         }
     }
 }
 
-/// Write UTF-8 text to an absolute path (used for vault backup export). The
-/// path must have been returned by `system_pick_save_path` in this session
-/// AND must pass the absolute/app-data/system checks - both gates, so the
-/// write target is always a human-approved dialog choice.
+impl DialogPathStore {
+    pub fn new() -> Self {
+        Self {
+            writes: PathGrants::new(DIALOG_PATH_TTL),
+            restores: PathGrants::new(RESTORE_GRANT_TTL),
+        }
+    }
+    /// Grant one `system_write_text_file` to a save-dialog pick.
+    fn allow(&self, path: &str) {
+        self.writes.allow(path);
+    }
+    /// Use up the write grant for `path`; false when there is none (any more).
+    fn consume(&self, path: &str) -> bool {
+        self.writes.consume(path)
+    }
+    /// Grant one follow-up restore of a backup file picked in the restore
+    /// dialog.
+    fn allow_restore(&self, path: &str) {
+        self.restores.allow(path);
+    }
+    /// Use up the restore grant for `path`; false when there is none (any
+    /// more).
+    fn consume_restore(&self, path: &str) -> bool {
+        self.restores.consume(path)
+    }
+}
+
+/// Write UTF-8 text to an absolute path. The path must have been returned by
+/// `system_pick_save_path` in this session AND must pass the
+/// absolute/app-data/system checks - both gates, so the write target is
+/// always a human-approved dialog choice.
 ///
 /// The write goes through `write_secret_file` (0600 at create time, replace
-/// rather than truncate, fail-closed Windows ACL). Its only caller exports
-/// the vault backup, which carries every private key and saved server
-/// password sealed under the master password plus plaintext structure -
-/// server names, hosts, usernames. `fs::write` used to leave that at
-/// `0666 & ~umask`, i.e. 0644 on a normal desktop and 0664 (group-WRITABLE)
-/// under umask 002, so any other local account could copy it and attack the
-/// Argon2id blob offline. The helper for exactly this already existed and
-/// this path simply was not using it.
+/// rather than truncate, fail-closed Windows ACL). Its caller is the audit-log
+/// CSV export. It used to be the vault backup's writer too, which is why the
+/// helper matters: `fs::write` left files at `0666 & ~umask` (0644 on a normal
+/// desktop, group-WRITABLE under umask 002). The backup no longer comes
+/// through here at all - `vault_backup_export_to_file` writes it from Rust, so
+/// the sealed document never crosses IPC.
 #[tauri::command]
 pub fn system_write_text_file(
     app: AppHandle,
@@ -1676,6 +3394,8 @@ pub fn key_generate(
     name: Option<String>,
     comment: Option<String>,
 ) -> CmdResult<serde_json::Value> {
+    // Seals with the master password: not while it is being changed (C1).
+    let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());
@@ -1736,6 +3456,8 @@ pub fn key_import(
     comment: Option<String>,
     passphrase: Option<String>,
 ) -> CmdResult<serde_json::Value> {
+    // Seals with the master password: not while it is being changed (C1).
+    let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());
@@ -1978,13 +3700,22 @@ pub async fn key_export_to_file(
 
 #[tauri::command]
 pub fn key_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
-    app.state::<AppState>()
-        .db
-        .delete_key(&id)
-        .map_err(|e| e.to_string())?;
-    app.state::<AppState>()
-        .db
-        .add_audit("keys.deleted", Some(&id), "")?;
+    key_delete_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        &id,
+    )
+}
+
+/// [`key_delete`] without the `AppHandle`, so its lock gate is testable.
+fn key_delete_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    id: &str,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
+    db.delete_key(id).map_err(|e| e.to_string())?;
+    db.add_audit("keys.deleted", Some(id), "")?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -1998,13 +3729,32 @@ pub fn key_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
 /// touched; the private material is not decrypted or re-encrypted to rename.
 #[tauri::command]
 pub fn key_rename(app: AppHandle, id: String, name: String) -> CmdResult<serde_json::Value> {
+    key_rename_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        app.state::<VaultRotationLock>().inner(),
+        &id,
+        &name,
+    )
+}
+
+/// [`key_rename`] without the `AppHandle`, so its gates are testable.
+fn key_rename_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    id: &str,
+    name: &str,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
+    // Reads the whole row and writes it back: not while a master-password
+    // change could re-seal it in between (C1).
+    let _rotation = rotation.try_shared()?;
     let name = name.trim().to_string();
     crate::crypto::keys::validate_key_name(&name).map_err(CmdError)?;
 
-    let state = app.state::<AppState>();
-    let mut key = state
-        .db
-        .get_key(&id)
+    let mut key = db
+        .get_key(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Key not found.".to_string())?;
 
@@ -2014,10 +3764,8 @@ pub fn key_rename(app: AppHandle, id: String, name: String) -> CmdResult<serde_j
     let previous = key.name.clone();
     key.name = name.clone();
     key.updated_at = chrono::Utc::now();
-    state.db.update_key(&key).map_err(|e| e.to_string())?;
-    state
-        .db
-        .add_audit("keys.renamed", Some(&id), &format!("{previous} -> {name}"))?;
+    db.update_key(&key).map_err(|e| e.to_string())?;
+    db.add_audit("keys.renamed", Some(id), &format!("{previous} -> {name}"))?;
     Ok(serde_json::json!({ "ok": true, "name": name }))
 }
 
@@ -2039,6 +3787,9 @@ pub fn key_deploy(
     passphrase: Option<String>,
     strict_host_key: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
+    // Writes each deployed key's whole row back: not while a master-password
+    // change could re-seal it in between (C1).
+    let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());
@@ -2102,6 +3853,9 @@ pub fn key_remove_deployed(app: AppHandle, id: String) -> CmdResult<serde_json::
     if vault_password(&app)?.is_empty() {
         return Err("Vault is locked.".into());
     }
+    // Writes the key's whole row back: not while a master-password change
+    // could re-seal it in between (C1).
+    let _rotation = rotation_shared(&app)?;
     let key = app
         .state::<AppState>()
         .db
@@ -2193,7 +3947,26 @@ pub fn category_create(
     color: Option<String>,
     scope: Option<String>,
 ) -> CmdResult<db::Category> {
-    let db = &app.state::<AppState>().db;
+    category_create_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        name,
+        parent_id,
+        color,
+        scope,
+    )
+}
+
+/// [`category_create`] without the `AppHandle`, so its lock gate is testable.
+fn category_create_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    name: String,
+    parent_id: Option<String>,
+    color: Option<String>,
+    scope: Option<String>,
+) -> CmdResult<db::Category> {
+    require_unlocked(vault)?;
     let scope = scope.unwrap_or_else(|| "key".to_string());
     if scope != "key" && scope != "host" {
         return Err("Category scope must be key or host.".into());
@@ -2240,9 +4013,24 @@ pub fn category_create(
 
 #[tauri::command]
 pub fn category_rename(app: AppHandle, id: String, name: String) -> CmdResult<serde_json::Value> {
-    let db = &app.state::<AppState>().db;
+    category_rename_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        &id,
+        name,
+    )
+}
+
+/// [`category_rename`] without the `AppHandle`, so its lock gate is testable.
+fn category_rename_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    id: &str,
+    name: String,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
     let mut c = db
-        .get_category(&id)
+        .get_category(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Category not found.".to_string())?;
     c.name = name;
@@ -2258,7 +4046,25 @@ pub fn category_reparent(
     new_parent_id: Option<String>,
     sort_index: Option<i64>,
 ) -> CmdResult<serde_json::Value> {
-    let db = &app.state::<AppState>().db;
+    category_reparent_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        id,
+        new_parent_id,
+        sort_index,
+    )
+}
+
+/// [`category_reparent`] without the `AppHandle`, so its lock gate is
+/// testable.
+fn category_reparent_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    id: String,
+    new_parent_id: Option<String>,
+    sort_index: Option<i64>,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
     let mut c = db
         .get_category(&id)
         .map_err(|e| e.to_string())?
@@ -2300,9 +4106,22 @@ pub fn category_reparent(
 
 #[tauri::command]
 pub fn category_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
-    let db = &app.state::<AppState>().db;
-    let reassigned = db.delete_category(&id).map_err(|e| e.to_string())?;
-    db.add_audit("category.deleted", None, &id)
+    category_delete_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        &id,
+    )
+}
+
+/// [`category_delete`] without the `AppHandle`, so its lock gate is testable.
+fn category_delete_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    id: &str,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
+    let reassigned = db.delete_category(id).map_err(|e| e.to_string())?;
+    db.add_audit("category.deleted", None, id)
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true, "reassigned": reassigned }))
 }
@@ -2313,7 +4132,23 @@ pub fn key_set_categories(
     key_id: String,
     category_ids: Vec<String>,
 ) -> CmdResult<serde_json::Value> {
-    let db = &app.state::<AppState>().db;
+    key_set_categories_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        &key_id,
+        &category_ids,
+    )
+}
+
+/// [`key_set_categories`] without the `AppHandle`, so its lock gate is
+/// testable.
+fn key_set_categories_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    key_id: &str,
+    category_ids: &[String],
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
     // Validate every category exists and belongs to the key scope.
     let known: std::collections::HashSet<String> = db
         .list_categories()
@@ -2322,16 +4157,16 @@ pub fn key_set_categories(
         .filter(|c| c.scope == "key")
         .map(|c| c.id)
         .collect();
-    for cid in &category_ids {
+    for cid in category_ids {
         if !known.contains(cid) {
             return Err(format!("Unknown category: {cid}").into());
         }
     }
-    db.set_key_categories(&key_id, &category_ids)
+    db.set_key_categories(key_id, category_ids)
         .map_err(|e| e.to_string())?;
     db.add_audit(
         "key.categories_set",
-        Some(&key_id),
+        Some(key_id),
         &category_ids.len().to_string(),
     )
     .map_err(|e| e.to_string())?;
@@ -2347,6 +4182,8 @@ pub fn key_create_with_categories(
     comment: Option<String>,
     category_ids: Option<Vec<String>>,
 ) -> CmdResult<serde_json::Value> {
+    // Seals with the master password: not while it is being changed (C1).
+    let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());
@@ -2473,6 +4310,9 @@ pub fn bitwarden_save_config(
     if vault_password(&app)?.is_empty() {
         return Err("Vault is locked.".into());
     }
+    // Seals the Bitwarden password with the master password: not while that
+    // is being changed (C1).
+    let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
 
     // SSRF-validate the server URL at save time
@@ -2580,6 +4420,11 @@ pub async fn bitwarden_sync(
     app: AppHandle,
     allow_remote_overwrite: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
+    // Held for the whole run (C1): the sync seals pulled keys and server
+    // passwords with the master password it reads below, between network
+    // round trips, and rewrites whole key/server rows - a master-password
+    // change must neither start in the middle nor be running when it starts.
+    let _rotation = rotation_shared(&app)?;
     let config = app
         .state::<AppState>()
         .db
@@ -2694,12 +4539,17 @@ pub fn audit_list(app: AppHandle, limit: Option<i64>) -> CmdResult<serde_json::V
 /// empty-looking log still shows that it was emptied (and when).
 #[tauri::command]
 pub fn audit_clear(app: AppHandle) -> CmdResult<serde_json::Value> {
-    let removed = app
-        .state::<AppState>()
-        .db
-        .clear_audit()
-        .map_err(|e| e.to_string())?;
-    let _ = app.state::<AppState>().db.add_audit(
+    audit_clear_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+    )
+}
+
+/// [`audit_clear`] without the `AppHandle`, so its lock gate is testable.
+fn audit_clear_in(db: &db::Database, vault: &VaultPasswordStore) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
+    let removed = db.clear_audit().map_err(|e| e.to_string())?;
+    let _ = db.add_audit(
         "audit.cleared",
         None,
         &format!("{removed} entrie(s) removed by the user"),
@@ -2754,6 +4604,116 @@ const SETTINGS_KEYS: &[&str] = &[
     "confirmMultiLinePaste",
 ];
 
+/// Settings that weaken the vault's protection when changed, so they cannot
+/// be changed while it is locked (A6-08): a script in a locked window could
+/// otherwise switch the idle lock off (`autoLockMinutes` = 0 disables both the
+/// renderer timer and the backend watchdog), drop the delete and multi-line
+/// paste confirmations, or the update check. Display, terminal and
+/// file-browser preferences stay writable on a locked vault.
+const SECURITY_SETTINGS: &[&str] = &[
+    "autoLockMinutes",
+    "confirmDelete",
+    "autoUpdateCheck",
+    "confirmMultiLinePaste",
+];
+
+/// `sftp::queue::parallel_limit`'s fallback when `sftpParallel` is not stored.
+const SFTP_PARALLEL_DEFAULT: u64 = 4;
+
+/// Largest `sftpMaxBps` the Settings row can produce: 1,000,000 MB/s.
+const SFTP_MAX_BPS_LIMIT: u64 = 1_000_000 * 1_048_576;
+
+/// Longest value accepted for a `sftpLocalDir:<id>` directory.
+const MAX_LOCAL_DIR_SETTING_BYTES: usize = 32 * 1024;
+
+/// The values `settings_set` accepts for one key.
+enum SettingDomain {
+    /// Digits only (no sign, no spaces), inside `min..=max`.
+    Whole { min: u64, max: u64 },
+    /// Exactly one of these strings.
+    OneOf(&'static [&'static str]),
+    /// A local directory: non-empty, no NUL, bounded length.
+    LocalDir,
+}
+
+/// Each key's domain, taken from what the renderer writes for it - so nothing
+/// the UI sends is refused. The booleans are not uniform: some rows write
+/// "true"/"false", others "1"/"0", and their readers compare against exactly
+/// that spelling, so each key accepts only its own.
+fn setting_domain(key: &str) -> Option<SettingDomain> {
+    use SettingDomain::{LocalDir, OneOf, Whole};
+    const TRUE_FALSE: &[&str] = &["true", "false"];
+    const ONE_ZERO: &[&str] = &["1", "0"];
+    Some(match key {
+        "autoLockMinutes" => Whole {
+            min: 0,
+            max: AUTO_LOCK_MAX_MINUTES,
+        },
+        "uiScale" => Whole { min: 75, max: 200 },
+        "sftpParallel" => Whole { min: 1, max: 4 },
+        "terminalScrollback" => Whole {
+            min: 1000,
+            max: 50_000,
+        },
+        "sftpMaxBps" => Whole {
+            min: 0,
+            max: SFTP_MAX_BPS_LIMIT,
+        },
+        "confirmDelete" | "autoUpdateCheck" | "sftpVerifyTransfers" => OneOf(TRUE_FALSE),
+        "confirmMultiLinePaste"
+        | "sftpShowHidden"
+        | "sftpShowOwnerCols"
+        | "sftpPreserveTs"
+        | "sftpDualPane" => OneOf(ONE_ZERO),
+        "sftpConflictUpload" | "sftpConflictDownload" => {
+            OneOf(&["ask", "overwrite", "skip", "rename", "resume"])
+        }
+        "sftpResumeDefault" => OneOf(&["ask", "overwrite", "resume"]),
+        // "" is how the comparison toggle stores "off".
+        "sftpCmpMode" => OneOf(&["", "size", "mtime"]),
+        "terminalBell" => OneOf(&["visual", "sound", "silent"]),
+        "terminalBackspace" => OneOf(&["default", "backspace"]),
+        "terminalHomeEnd" => OneOf(&["default", "rxvt"]),
+        "terminalAppCursorKeys" | "terminalAppKeypad" => OneOf(&["default", "disabled"]),
+        k if k.starts_with(SFTP_LOCAL_DIR_PREFIX) => LocalDir,
+        _ => return None,
+    })
+}
+
+/// Check a value against its key's domain (A2-14 / A5-32). `settings_set` used
+/// to check only the key, so `-5`, `""` or `1.5` for the auto-lock were stored
+/// with a success toast. Reads are unaffected: a value an older build stored is
+/// still returned as it is, and each reader keeps its own fallback.
+fn validate_setting_value(key: &str, value: &str) -> CmdResult<()> {
+    let valid = match setting_domain(key) {
+        Some(SettingDomain::Whole { min, max }) => {
+            !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit())
+                && value.parse::<u64>().is_ok_and(|n| (min..=max).contains(&n))
+        }
+        Some(SettingDomain::OneOf(allowed)) => allowed.contains(&value),
+        Some(SettingDomain::LocalDir) => {
+            !value.is_empty() && value.len() <= MAX_LOCAL_DIR_SETTING_BYTES && !value.contains('\0')
+        }
+        None => false,
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = match setting_domain(key) {
+        Some(SettingDomain::Whole { min, max }) => {
+            format!("a whole number from {min} to {max}")
+        }
+        Some(SettingDomain::OneOf(allowed)) => {
+            let shown: Vec<String> = allowed.iter().map(|a| format!("\"{a}\"")).collect();
+            format!("one of {}", shown.join(", "))
+        }
+        Some(SettingDomain::LocalDir) => "a directory path".to_string(),
+        None => "a known setting".to_string(),
+    };
+    Err(format!("Invalid value for {key}: expected {expected}.").into())
+}
+
 /// The real on-disk locations, so the UI can state them instead of guessing.
 ///
 /// The Settings pane and the deploy confirmation used to hard-code three
@@ -2780,13 +4740,34 @@ pub fn system_paths(app: AppHandle) -> CmdResult<serde_json::Value> {
     }))
 }
 
+/// What `settings_get` returns: every stored setting plus the defaults the
+/// backend applies when one is not stored - `autoLockMinutes` "15" (the
+/// watchdog's default) and `sftpParallel` "4" (the transfer queue's) - so the
+/// renderer shows the value in effect instead of guessing (A7-11 / A8-14). On
+/// a fresh install the UI used to show 15 minutes and 2 transfers while
+/// auto-lock was off and 4 transfers ran.
+fn collect_settings(
+    db: &crate::db::Database,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut settings = collect_stored_settings(db)?;
+    settings
+        .entry("autoLockMinutes")
+        .or_insert_with(|| AUTO_LOCK_DEFAULT_MINUTES.to_string().into());
+    settings
+        .entry("sftpParallel")
+        .or_insert_with(|| SFTP_PARALLEL_DEFAULT.to_string().into());
+    Ok(settings)
+}
+
 /// Read every persisted setting into one map: the `SETTINGS_KEYS` allowlist
 /// plus the `sftpLocalDir:` family (one key per server id, so it cannot live in
 /// the fixed list). Shared by `settings_get` and the vault backup so the two
 /// can never disagree about what "the settings" are - the backup used to carry
 /// a hand-written list of six keys, three of which nothing read, and restore
-/// dropped the whole map on the floor.
-fn collect_settings(
+/// dropped the whole map on the floor. The backup takes only what is stored
+/// (no defaults): restoring it must not pin today's defaults over settings
+/// the user set on the target machine.
+fn collect_stored_settings(
     db: &crate::db::Database,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let mut settings = serde_json::Map::new();
@@ -2815,13 +4796,20 @@ fn collect_settings(
 /// allowlist `settings_set` enforces before it gets there. A backup is
 /// authenticated, but it can have been taken by an older build (which is how
 /// the four since-removed keys would arrive), and a key nothing reads is
-/// exactly the decoration this list exists to keep out. Returns the number of
-/// keys dropped.
+/// exactly the decoration this list exists to keep out. Values get the same
+/// per-key check `settings_set` applies ([`validate_setting_value`]), and a
+/// value that is not a string is dropped too (it was never stored). Returns
+/// the number of entries dropped; the restore result reports it as
+/// `counts.settingsDropped`.
 fn sanitize_backup_settings(settings: &mut serde_json::Map<String, serde_json::Value>) -> usize {
     let before = settings.len();
-    settings.retain(|key, _| {
-        SETTINGS_KEYS.contains(&key.as_str())
-            || (key.starts_with(SFTP_LOCAL_DIR_PREFIX) && key.len() > SFTP_LOCAL_DIR_PREFIX.len())
+    settings.retain(|key, value| {
+        let known = SETTINGS_KEYS.contains(&key.as_str())
+            || (key.starts_with(SFTP_LOCAL_DIR_PREFIX) && key.len() > SFTP_LOCAL_DIR_PREFIX.len());
+        known
+            && value
+                .as_str()
+                .is_some_and(|v| validate_setting_value(key, v).is_ok())
     });
     before - settings.len()
 }
@@ -2834,6 +4822,22 @@ pub fn settings_get(app: AppHandle) -> CmdResult<serde_json::Value> {
 
 #[tauri::command]
 pub fn settings_set(app: AppHandle, key: String, value: String) -> CmdResult<serde_json::Value> {
+    settings_set_in(
+        &app.state::<AppState>().db,
+        &app.state::<VaultPasswordStore>(),
+        &key,
+        &value,
+    )
+}
+
+/// [`settings_set`] without the `AppHandle`, so its validation and lock gate
+/// are testable.
+fn settings_set_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    key: &str,
+    value: &str,
+) -> CmdResult<serde_json::Value> {
     if key.starts_with("bwSync.") {
         return Err("Bitwarden sync settings must be changed via the sync settings dialog.".into());
     }
@@ -2842,14 +4846,16 @@ pub fn settings_set(app: AppHandle, key: String, value: String) -> CmdResult<ser
     // here is unreadable clutter at best. Accepting arbitrary keys let a
     // compromised renderer write unbounded rows into the same `config` table
     // that holds the Bitwarden secrets, which is worth refusing outright.
-    let known = SETTINGS_KEYS.contains(&key.as_str())
+    let known = SETTINGS_KEYS.contains(&key)
         || (key.starts_with(SFTP_LOCAL_DIR_PREFIX) && key.len() > SFTP_LOCAL_DIR_PREFIX.len());
     if !known {
         return Err(format!("Unknown setting: {key}").into());
     }
-    app.state::<AppState>()
-        .db
-        .set_config(&format!("setting.{}", key), &value)
+    if SECURITY_SETTINGS.contains(&key) {
+        require_unlocked(vault)?;
+    }
+    validate_setting_value(key, value)?;
+    db.set_config(&format!("setting.{}", key), value)
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
@@ -2931,6 +4937,11 @@ pub fn system_open_url(url: String) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Native open dialog that READS the chosen file and returns its text: the
+/// key-import path, the one documented case where private-key text enters the
+/// webview. Files over 4 MiB are refused before they are read, and the read
+/// runs on a blocking worker (A6-04 / A7-48). Callers that only need a path
+/// use `system_pick_file_path`.
 #[tauri::command]
 /// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
 /// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
@@ -2951,7 +4962,11 @@ pub async fn system_select_file(
     match result {
         Some(path) => {
             let path_str = path.to_string();
-            let content = fs::read_to_string(&path_str).map_err(|e| e.to_string())?;
+            let source = path_str.clone();
+            let content = run_blocking(move || {
+                read_picked_text_file(std::path::Path::new(&source), MAX_SELECT_FILE_BYTES)
+            })
+            .await?;
             Ok(serde_json::json!({
                 "canceled": false, "path": path_str,
                 "name": std::path::Path::new(&path_str).file_name().and_then(|n| n.to_str()).unwrap_or(""),
@@ -2960,4 +4975,69 @@ pub async fn system_select_file(
         }
         None => Ok(serde_json::json!({ "canceled": true })),
     }
+}
+
+/// Native open dialog that returns only the chosen path - the file is NOT
+/// read (A6-04 / A2-19). The server form's ".pem file" browse used
+/// `system_select_file`, which read the private key and shipped its plaintext
+/// into the webview just to fill in a path. Returns `{canceled: true}` or
+/// `{canceled: false, path, name}`.
+#[tauri::command]
+/// NOTE: async on purpose - a dialog must not block the main thread (see
+/// `system_pick_save_path`).
+pub async fn system_pick_file_path(
+    app: AppHandle,
+    title: Option<String>,
+) -> CmdResult<serde_json::Value> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app
+        .dialog()
+        .file()
+        .set_title(title.unwrap_or_else(|| "Select file".into()))
+        .blocking_pick_file();
+    Ok(match picked {
+        Some(path) => {
+            let path = path.to_string();
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            serde_json::json!({ "canceled": false, "path": path, "name": name })
+        }
+        None => serde_json::json!({ "canceled": true }),
+    })
+}
+
+/// Largest file `system_select_file` hands to the renderer. Its one caller is
+/// key import, and a key file is a few KiB.
+const MAX_SELECT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a file the user picked in a native dialog as UTF-8 text, refusing it
+/// when it is larger than `cap` bytes. The size is checked before anything is
+/// read - the old reader pulled in whatever was picked, a multi-GB file
+/// included - and the read itself stops at the cap, so a file that grows after
+/// the check still cannot get past it.
+fn read_picked_text_file(path: &std::path::Path, cap: u64) -> CmdResult<String> {
+    use std::io::Read as _;
+    let too_large = || {
+        CmdError(format!(
+            "That file is larger than {} MiB, so it was not loaded.",
+            cap / (1024 * 1024)
+        ))
+    };
+    let file = fs::File::open(path)
+        .map_err(|e| CmdError(format!("Could not open {}: {e}", path.display())))?;
+    if file.metadata().is_ok_and(|m| m.len() > cap) {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| CmdError(format!("Could not read {}: {e}", path.display())))?;
+    if bytes.len() as u64 > cap {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| CmdError("That file is not a text file (it is not valid UTF-8).".into()))
 }

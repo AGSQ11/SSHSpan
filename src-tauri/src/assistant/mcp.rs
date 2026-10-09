@@ -1092,6 +1092,37 @@ async fn fetch_tools(ctx: &mut ServerContext, app: &AppHandle) -> CmdResult<Vec<
     ))
 }
 
+/// Most tools/list pages one pass reads - far beyond what the tool cap needs.
+const MAX_TOOL_PAGES: usize = 100;
+
+/// The cursor for the next tools/list page once `pages_read` pages are in,
+/// or `None` when the listing is complete. A cursor the server already sent
+/// (an endless loop - including empty pages that never grow the tool count
+/// past the cap check) or a page beyond [`MAX_TOOL_PAGES`] fails the fetch:
+/// such a server must not hold a connect, and the vault guard it holds,
+/// forever. Failing rather than stopping short, because tools missing from a
+/// truncated list would be dropped from the stored record by `merge_tools`.
+fn next_tools_page(
+    seen: &mut std::collections::HashSet<String>,
+    pages_read: usize,
+    next_cursor: Option<String>,
+) -> CmdResult<Option<String>> {
+    let Some(cursor) = next_cursor else {
+        return Ok(None);
+    };
+    if !seen.insert(cursor.clone()) {
+        return Err(CmdError(
+            "MCP server repeated a tools/list page cursor, so its tool list never ends.".into(),
+        ));
+    }
+    if pages_read >= MAX_TOOL_PAGES {
+        return Err(CmdError(format!(
+            "MCP server's tool list ran past {MAX_TOOL_PAGES} pages."
+        )));
+    }
+    Ok(Some(cursor))
+}
+
 /// One pagination pass over tools/list. Returns the pages plus whether a
 /// tools/list_changed notification was observed along the way.
 async fn fetch_tools_once(
@@ -1100,6 +1131,8 @@ async fn fetch_tools_once(
 ) -> CmdResult<(Vec<Value>, bool)> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut pages_read = 0usize;
     loop {
         let id = Value::String(uuid::Uuid::new_v4().to_string());
         let mut params = json!({});
@@ -1113,6 +1146,7 @@ async fn fetch_tools_once(
             "params": params,
         });
         let outcome = request_with_session(app, ctx, &body).await?;
+        pages_read += 1;
         let result = rpc_result(outcome.result)?;
         if let Some(arr) = result.get("tools").and_then(|t| t.as_array()) {
             tools.extend(arr.iter().cloned());
@@ -1122,10 +1156,14 @@ async fn fetch_tools_once(
         if outcome.list_changed {
             return Ok((tools, true));
         }
-        cursor = result
-            .get("nextCursor")
-            .and_then(|c| c.as_str())
-            .map(String::from);
+        cursor = next_tools_page(
+            &mut seen_cursors,
+            pages_read,
+            result
+                .get("nextCursor")
+                .and_then(|c| c.as_str())
+                .map(String::from),
+        )?;
         // A runaway pagination loop (server always returns a cursor) stops
         // well above the tool cap; fetch_tools' caller enforces the cap.
         if cursor.is_none() || tools.len() > 1000 {
@@ -1146,6 +1184,12 @@ async fn fetch_tools_once(
 /// initialize / send_initialized via `ServerContext::checked`) and again
 /// before persisting, so a lock mid-connect can neither send the unsealed
 /// auth header nor write session/DB state afterward.
+///
+/// It writes back the whole `record` its caller read, after the network
+/// round trips, so the CALLER must hold read access to the
+/// `VaultRotationLock` from before it read `record` until this returns (C1):
+/// a master-password change committing in between would otherwise get the
+/// record's old-sealed secret written back over the re-sealed one.
 async fn connect_server(
     app: &AppHandle,
     record: crate::db::McpServerRecord,
@@ -1551,6 +1595,9 @@ pub fn mcp_save_server(
     auth_secret: Option<String>,
     auth_env_var: Option<String>,
 ) -> CmdResult<Value> {
+    // Seals the auth secret and rewrites the whole record: not while a
+    // master-password change is re-encrypting the vault (C1).
+    let _rotation = crate::commands::rotation_shared(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());
@@ -1674,6 +1721,9 @@ pub fn mcp_save_server(
 
 #[tauri::command]
 pub async fn mcp_remove_server(app: AppHandle, id: String) -> CmdResult<Value> {
+    // Not while a master-password change is re-encrypting the vault (C1):
+    // the change re-seals this record's secret in place.
+    let _rotation = crate::commands::rotation_shared(&app)?;
     let db = &app.state::<crate::AppState>().db;
     let record = db
         .get_mcp_server(&id)
@@ -1712,6 +1762,9 @@ pub async fn mcp_remove_server(app: AppHandle, id: String) -> CmdResult<Value> {
 
 #[tauri::command]
 pub async fn mcp_test_connection(app: AppHandle, id: String) -> CmdResult<Value> {
+    // Before the record is read, held until connect_server has written it
+    // back: a master-password change must not commit in between (C1).
+    let _rotation = crate::commands::rotation_shared(&app)?;
     let db = &app.state::<crate::AppState>().db;
     let record = db
         .get_mcp_server(&id)
@@ -1736,6 +1789,9 @@ pub fn mcp_set_tool_state(
     enabled: bool,
     auto_approve: bool,
 ) -> CmdResult<Value> {
+    // Rewrites the whole record: not while a master-password change could
+    // re-seal its secret in between (C1).
+    let _rotation = crate::commands::rotation_shared(&app)?;
     let db = &app.state::<crate::AppState>().db;
     let mut record = db
         .get_mcp_server(&id)
@@ -1877,6 +1933,9 @@ pub async fn mcp_call_tool(
         }
     }
 
+    // A tools/list_changed refresh after the call rewrites the whole record:
+    // a master-password change must not commit in between (C1).
+    let _rotation = crate::commands::rotation_shared(&app)?;
     // Execute. The generation pattern guards the awaits: every
     // credential-bearing request below rechecks the generation first (via
     // ServerContext::checked / require_generation_current), so a lock during
@@ -1953,6 +2012,32 @@ pub async fn mcp_call_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── tools/list pagination is bounded (RU1 fix 2, SHOULD 1) ─────────────
+
+    /// A server that keeps handing out cursors - empty pages included, which
+    /// never trip the tool-count check - must end the fetch with an error: on
+    /// a repeated cursor at once, otherwise after MAX_TOOL_PAGES pages.
+    #[test]
+    fn tools_list_pagination_stops_on_a_repeated_cursor_and_at_the_page_cap() {
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(next_tools_page(&mut seen, 1, None).unwrap(), None);
+        assert_eq!(
+            next_tools_page(&mut seen, 1, Some("c1".into())).unwrap(),
+            Some("c1".into())
+        );
+        assert_eq!(
+            next_tools_page(&mut seen, 2, Some("c2".into())).unwrap(),
+            Some("c2".into())
+        );
+        let looped = next_tools_page(&mut seen, 3, Some("c1".into())).unwrap_err();
+        assert!(looped.0.contains("repeated"), "{}", looped.0);
+
+        let mut fresh = std::collections::HashSet::new();
+        assert!(next_tools_page(&mut fresh, MAX_TOOL_PAGES - 1, Some("a".into())).is_ok());
+        let capped = next_tools_page(&mut fresh, MAX_TOOL_PAGES, Some("b".into())).unwrap_err();
+        assert!(capped.0.contains("pages"), "{}", capped.0);
+    }
 
     // ── URL classification ──────────────────────────────────────────────
 

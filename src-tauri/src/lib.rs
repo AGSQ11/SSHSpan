@@ -64,6 +64,8 @@ pub fn run() {
             app.manage(commands::ActivityTracker::new());
             // Vault generation: bumped on lock so pending operations abort
             app.manage(commands::VaultGeneration::new());
+            // Master-password change vs. every other write of sealed data
+            app.manage(commands::VaultRotationLock::new());
             // Per-tab AI access levels; in-memory, cleared on vault lock
             app.manage(assistant::AssistantLevels::new());
             // Live MCP sessions + connect statuses; torn down on vault lock
@@ -106,8 +108,12 @@ pub fn run() {
             vault_lock,
             vault_change_password,
             vault_status,
-            vault_backup_create,
-            vault_backup_restore,
+            // Backups are written and read by Rust behind native dialogs.
+            // `vault_backup_create` / `vault_backup_restore` are deliberately
+            // NOT registered: they moved the sealed vault through the webview
+            // (see their doc comments).
+            vault_backup_export_to_file,
+            vault_backup_restore_from_file,
             // Key commands
             key_generate,
             key_import,
@@ -221,6 +227,7 @@ pub fn run() {
             system_open_external,
             system_open_url,
             system_select_file,
+            system_pick_file_path,
             system_pick_save_path,
             system_write_text_file,
             update_check,

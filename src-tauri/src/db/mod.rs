@@ -351,10 +351,14 @@ impl Database {
         Ok(db)
     }
 
-    /// Open/migrate a database at an explicit path. Test/isolation entry point
-    /// (the app itself always goes through [`Database::new`], which honors the
-    /// `SSHSPAN_DB` override and the platform data dir).
-    #[cfg(test)]
+    /// Open/migrate a database at an explicit path - for tests and tools only.
+    /// It skips the owner-only permission tightening [`Database::new`]
+    /// applies to the vault file and its directory (and the `SSHSPAN_DB`
+    /// override and platform data dir it resolves), so the app must never use
+    /// it for a real vault. Public rather than `#[cfg(test)]` so the
+    /// integration tests get the real schema instead of hand-copied
+    /// `CREATE TABLE`s; hidden from the docs for the same reason.
+    #[doc(hidden)]
     pub fn open_at(db_path: PathBuf) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1227,31 +1231,78 @@ impl Database {
         })
     }
 
-    /// Re-seal every stored MCP `auth_secret` with the new vault password,
-    /// writing each full record (still keyed by `key = record.id`) with the
-    /// NEW password in the caller's transaction; `confirmed` rides along,
-    /// never silently confirmed by a rotation. Called only from
-    /// [`Database::apply_vault_rotation`], where the re-sealed values (in
-    /// memory) and the verifier must commit together: one unsealable blob
-    /// aborts the whole rotation rather than stranding the entry on the old
-    /// password.
+    /// Swap each MCP record's sealed `auth_secret` for its re-sealed value in
+    /// the caller's transaction - only that field (`json_set`), and only where
+    /// the record still holds the blob that was re-sealed. Everything else in
+    /// the record (tools, approvals, `confirmed`) stays exactly as it is now:
+    /// this used to upsert the whole record as it was read before the
+    /// re-seal, reverting a tool approval revoked in the meantime. A record
+    /// with a secret the rotation does not know about aborts it. Called only
+    /// from [`Database::apply_vault_rotation`].
     async fn rotate_mcp_secrets(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        records: &[McpServerRecord],
+        secrets: &[ResealedSecret],
     ) -> Result<()> {
-        for record in records {
-            let value = serde_json::to_string(record)?;
-            sqlx::query(
-                "INSERT INTO mcp_servers (key, value, confirmed, updated_at) VALUES (?, ?, ?, ?) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
-                   confirmed = excluded.confirmed, updated_at = excluded.updated_at",
+        for secret in secrets {
+            let res = sqlx::query(
+                "UPDATE mcp_servers SET value = json_set(value, '$.auth_secret', ?), \
+                   updated_at = ? \
+                 WHERE key = ? AND json_extract(value, '$.auth_secret') = ?",
             )
-            .bind(&record.id)
-            .bind(value)
-            .bind(record.confirmed as i64)
+            .bind(&secret.new)
             .bind(Utc::now().to_rfc3339())
+            .bind(&secret.id)
+            .bind(&secret.old)
             .execute(&mut **tx)
             .await?;
+            if res.rows_affected() != 1 {
+                anyhow::bail!(VAULT_CHANGED_DURING_ROTATION);
+            }
+        }
+        let sealed: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM mcp_servers WHERE json_extract(value, '$.auth_secret') IS NOT NULL",
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+        ensure_all_resealed(&sealed, secrets)
+    }
+
+    /// Swap one sealed credential row (`key` in the key/value `table`) for its
+    /// re-sealed value, only if it still holds the blob that was re-sealed;
+    /// with nothing to re-seal, the row must still not exist. Anything else
+    /// means it was saved while the rotation ran, which aborts it. Called only
+    /// from [`Database::apply_vault_rotation`] with fixed table names.
+    async fn rotate_config_secret(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table: &str,
+        key: &str,
+        resealed: Option<&(String, String)>,
+    ) -> Result<()> {
+        match resealed {
+            Some((old, new)) => {
+                let res = sqlx::query(&format!(
+                    "UPDATE {table} SET value = ?, updated_at = ? WHERE key = ? AND value = ?"
+                ))
+                .bind(new)
+                .bind(Utc::now().to_rfc3339())
+                .bind(key)
+                .bind(old)
+                .execute(&mut **tx)
+                .await?;
+                if res.rows_affected() != 1 {
+                    anyhow::bail!(VAULT_CHANGED_DURING_ROTATION);
+                }
+            }
+            None => {
+                let present: i64 =
+                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE key = ?"))
+                        .bind(key)
+                        .fetch_one(&mut **tx)
+                        .await?;
+                if present != 0 {
+                    anyhow::bail!(VAULT_CHANGED_DURING_ROTATION);
+                }
+            }
         }
         Ok(())
     }
@@ -1721,97 +1772,83 @@ impl Database {
     /// password. Here every re-sealed record AND the verifier commit inside a
     /// single SQLite transaction: the database holds either the complete old
     /// state or the complete new state, never a split.
-    pub fn apply_vault_rotation(
-        &self,
-        keys: &[KeyRecord],
-        servers: &[ServerRecord],
-        bitwarden_master_password: Option<&str>,
-        assistant_api_key: Option<&str>,
-        mcp_servers: &[McpServerRecord],
-        new_master_hash: &str,
-    ) -> Result<()> {
+    ///
+    /// Each statement writes ONLY the sealed value, and only where the row
+    /// still holds the blob the caller re-sealed (C1). The commit used to
+    /// rewrite every column of every key and server it had read and upsert
+    /// every MCP record whole, so an edit made while the re-seal ran was
+    /// silently reverted - and a record sealed with the old password in the
+    /// meantime stayed behind, unreadable. Now a row that changed, vanished or
+    /// appeared since the snapshot - a sealed key, server password, MCP secret
+    /// or credential the caller did not re-seal - rolls the whole rotation
+    /// back with [`VAULT_CHANGED_DURING_ROTATION`]: the old password keeps
+    /// opening everything and the user simply tries again. (The commands that
+    /// write sealed data are also locked out while a rotation runs; this is
+    /// the backstop.)
+    pub fn apply_vault_rotation(&self, rotation: &VaultRotation) -> Result<()> {
         block(async {
             let mut tx = self.pool.begin().await?;
-            for key in keys {
-                sqlx::query(
-                    r#"
-                    UPDATE keys SET
-                        name = ?, key_type = ?, public_key = ?, private_key_encrypted = ?,
-                        fingerprint_sha256 = ?, fingerprint_md5 = ?, comment = ?, updated_at = ?,
-                        deployed = ?, deploy_path = ?, bitwarden_id = ?, bitwarden_sync = ?,
-                        bitwarden_revision_ts = ?, bitwarden_updated_at = ?
-                    WHERE id = ?
-                    "#,
+            for key in &rotation.keys {
+                let res = sqlx::query(
+                    "UPDATE keys SET private_key_encrypted = ? \
+                     WHERE id = ? AND private_key_encrypted = ?",
                 )
-                .bind(&key.name)
-                .bind(&key.key_type)
-                .bind(&key.public_key)
-                .bind(&key.private_key_encrypted)
-                .bind(&key.fingerprint_sha256)
-                .bind(&key.fingerprint_md5)
-                .bind(&key.comment)
-                .bind(key.updated_at.to_rfc3339())
-                .bind(key.deployed as i64)
-                .bind(&key.deploy_path)
-                .bind(&key.bitwarden_id)
-                .bind(key.bitwarden_sync as i64)
-                .bind(key.bitwarden_revision_ts.map(|v| v.to_string()))
-                .bind(key.bitwarden_updated_at.map(|v| v.to_string()))
+                .bind(&key.new)
                 .bind(&key.id)
+                .bind(&key.old)
                 .execute(&mut *tx)
                 .await?;
+                if res.rows_affected() != 1 {
+                    anyhow::bail!(VAULT_CHANGED_DURING_ROTATION);
+                }
             }
-            for s in servers {
-                sqlx::query(
-                    r#"
-                    UPDATE servers SET name = ?, host = ?, port = ?, username = ?, key_id = ?, pem_path = ?,
-                        auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?,
-                        bitwarden_id = ?, bitwarden_revision_ts = ?, bitwarden_updated_at = ?
-                    WHERE id = ?
-                    "#,
+            let key_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM keys")
+                .fetch_all(&mut *tx)
+                .await?;
+            ensure_all_resealed(&key_ids, &rotation.keys)?;
+
+            for server in &rotation.server_passwords {
+                let res = sqlx::query(
+                    "UPDATE servers SET saved_password = ? WHERE id = ? AND saved_password = ?",
                 )
-                .bind(&s.name).bind(&s.host).bind(s.port as i64).bind(&s.username)
-                .bind(&s.key_id).bind(&s.pem_path).bind(&s.auth_method).bind(&s.saved_password)
-                .bind(&s.category_id).bind(&s.color)
-                .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
-                .bind(s.updated_at.to_rfc3339())
-                .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
-                .bind(&s.id)
+                .bind(&server.new)
+                .bind(&server.id)
+                .bind(&server.old)
                 .execute(&mut *tx)
                 .await?;
+                if res.rows_affected() != 1 {
+                    anyhow::bail!(VAULT_CHANGED_DURING_ROTATION);
+                }
             }
-            // The Bitwarden master password is sealed with the SAME vault
-            // password; it must rotate in the same transaction or sync is
-            // stranded on the old password (F6).
-            if let Some(sealed) = bitwarden_master_password {
-                sqlx::query(
-                    "INSERT INTO bitwarden_config (key, value, updated_at) VALUES ('master_password', ?, ?) \
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                )
-                .bind(sealed)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&mut *tx)
-                .await?;
-            }
-            // The AI assistant API key is sealed with the same vault password;
-            // it must rotate in the same transaction or every assistant call
-            // fails at unseal after the change.
-            if let Some(sealed) = assistant_api_key {
-                sqlx::query(
-                    "INSERT INTO assistant_config (key, value, updated_at) VALUES ('api_key', ?, ?) \
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                )
-                .bind(sealed)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&mut *tx)
-                .await?;
-            }
+            let sealed_servers: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM servers WHERE saved_password IS NOT NULL")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            ensure_all_resealed(&sealed_servers, &rotation.server_passwords)?;
+
             // MCP server auth secrets are sealed with the same vault password
             // and must rotate in the same transaction, or every MCP call
-            // fails at unseal after the change (same rule as the assistant
-            // API key above). The caller re-seals in memory first; an
-            // unsealable blob aborts the whole rotation there.
-            Self::rotate_mcp_secrets(&mut tx, mcp_servers).await?;
+            // fails at unseal after the change. The caller re-seals in memory
+            // first; an unsealable blob aborts the whole rotation there.
+            Self::rotate_mcp_secrets(&mut tx, &rotation.mcp_secrets).await?;
+            // The Bitwarden master password is sealed with the SAME vault
+            // password; it must rotate in the same transaction or sync is
+            // stranded on the old password (F6). Same for the AI assistant's
+            // API key: every assistant call would fail at unseal.
+            Self::rotate_config_secret(
+                &mut tx,
+                "bitwarden_config",
+                "master_password",
+                rotation.bitwarden_master_password.as_ref(),
+            )
+            .await?;
+            Self::rotate_config_secret(
+                &mut tx,
+                "assistant_config",
+                "api_key",
+                rotation.assistant_api_key.as_ref(),
+            )
+            .await?;
             // The verifier rotates last, inside the same transaction: if any
             // earlier statement failed, the whole rotation rolls back and the
             // old password keeps working against untouched rows.
@@ -1820,11 +1857,26 @@ impl Database {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             )
             .bind("master.hash")
-            .bind(new_master_hash)
+            .bind(&rotation.master_hash)
             .bind(Utc::now().to_rfc3339())
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// Stamp `last_connected_at` and nothing else (C1). The SSH connect path
+    /// used to write back the whole server row it had read before the
+    /// handshake, so a master-password change that committed meanwhile had
+    /// its re-sealed `saved_password` overwritten with the old blob.
+    pub fn touch_server_last_connected(&self, id: &str, at: DateTime<Utc>) -> Result<()> {
+        block(async {
+            sqlx::query("UPDATE servers SET last_connected_at = ? WHERE id = ?")
+                .bind(at.to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
             Ok(())
         })
     }
@@ -2145,11 +2197,19 @@ impl Database {
     /// Upsert every entity from an (already unsealed) backup payload in one
     /// transaction. Existing rows with the same id/host are overwritten -
     /// re-running a restore is safe. Returns per-entity row counts.
+    ///
+    /// The audit rows for sanitized key names are written only after the
+    /// commit (A7-25). They used to go through `add_audit` from inside the
+    /// transaction, i.e. through a second pooled connection while this one
+    /// held SQLite's write lock: each rename after the first write waited out
+    /// the 5 s busy timeout, failed with "database is locked", and the row was
+    /// dropped.
     pub fn restore_backup(&self, data: &serde_json::Value) -> Result<serde_json::Value> {
-        block(async {
+        let (counts, renamed) = block(async {
             let mut tx = self.pool.begin().await?;
             let (mut keys_n, mut cats_n, mut kc_n) = (0u32, 0u32, 0u32);
             let (mut servers_n, mut hosts_n, mut settings_n) = (0u32, 0u32, 0u32);
+            let mut renamed: Vec<(String, String)> = Vec::new();
 
             if let Some(arr) = data.get("categories").and_then(|v| v.as_array()) {
                 for c in arr {
@@ -2201,11 +2261,8 @@ impl Database {
                         raw_name.to_string()
                     } else {
                         let sanitized = crate::crypto::keys::sanitize_key_name(raw_name);
-                        let _ = self.add_audit(
-                            "keys.name_sanitized",
-                            None,
-                            &format!("{raw_name:?} -> {sanitized:?}"),
-                        );
+                        // Audited after the commit, see the doc comment.
+                        renamed.push((raw_name.to_string(), sanitized.clone()));
                         sanitized
                     };
                     sqlx::query(
@@ -2244,8 +2301,8 @@ impl Database {
                     .bind(Option::<String>::None)
                     .bind(s("bitwarden_id"))
                     .bind(k.get("bitwarden_sync").and_then(|v| v.as_bool()).unwrap_or(false) as i64)
-                    .bind(s("bitwarden_revision_ts"))
-                    .bind(s("bitwarden_updated_at"))
+                    .bind(backup_sync_ts(k.get("bitwarden_revision_ts")))
+                    .bind(backup_sync_ts(k.get("bitwarden_updated_at")))
                     .execute(&mut *tx).await?;
                     keys_n += 1;
                     if let Some(cats) = k.get("category_ids").and_then(|v| v.as_array()) {
@@ -2404,6 +2461,28 @@ impl Database {
                 }
             }
 
+            // Per-server SFTP bookmarks (A7-41): `{ "<server id>": [ ... ] }`,
+            // written back under the key `sftp_bookmarks_save` uses. Only a
+            // JSON array is a bookmark list; anything else is skipped.
+            let mut bookmarks_n = 0u32;
+            if let Some(obj) = data.get("sftpBookmarks").and_then(|v| v.as_object()) {
+                for (server_id, list) in obj {
+                    if server_id.is_empty() || !list.is_array() {
+                        continue;
+                    }
+                    sqlx::query(
+                        "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    )
+                    .bind(format!("{SFTP_BOOKMARKS_PREFIX}{server_id}"))
+                    .bind(list.to_string())
+                    .bind(Utc::now().to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+                    bookmarks_n += 1;
+                }
+            }
+
             let mut mcp_n = 0u32;
             if let Some(arr) = data.get("mcpServers").and_then(|v| v.as_array()) {
                 for m in arr {
@@ -2448,15 +2527,82 @@ impl Database {
             }
 
             tx.commit().await?;
-            Ok(serde_json::json!({
+            let counts = serde_json::json!({
                 "keys": keys_n, "categories": cats_n, "keyCategoryLinks": kc_n,
                 "servers": servers_n, "knownHosts": hosts_n,
                 "knownHostsImported": known_hosts_imported,
                 "knownHostsConflicts": known_hosts_conflicts, "settings": settings_n,
-                "mcpServers": mcp_n,
-            }))
-        })
+                "mcpServers": mcp_n, "sftpBookmarks": bookmarks_n,
+            });
+            Ok::<_, anyhow::Error>((counts, renamed))
+        })?;
+        for (raw, sanitized) in renamed {
+            let _ = self.add_audit(
+                "keys.name_sanitized",
+                None,
+                &format!("{raw:?} -> {sanitized:?}"),
+            );
+        }
+        Ok(counts)
     }
+}
+
+/// Config-key prefix of the per-server SFTP bookmark lists (one row per
+/// server id), as `sftp_bookmarks_list` / `sftp_bookmarks_save` spell it.
+pub const SFTP_BOOKMARKS_PREFIX: &str = "sftp.bookmarks.";
+
+/// A key's Bitwarden revision metadata as a backup carries it. `KeyRecord`
+/// serializes both fields as JSON numbers, but restore read them with
+/// `as_str()`, which is `None` for a number: every restored key came back with
+/// NULL metadata, so the next sync saw it as changed on both sides and
+/// overwrote the remote copy (A7-27). A number or a numeric string is stored as
+/// text, the way `insert_key` writes it.
+fn backup_sync_ts(v: Option<&serde_json::Value>) -> Option<String> {
+    let v = v?;
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        .map(|n| n.to_string())
+}
+
+/// What a master-password change returns when the vault changed under it.
+pub const VAULT_CHANGED_DURING_ROTATION: &str =
+    "The vault changed while the master password was being changed, so nothing was changed. Try again.";
+
+/// One sealed value re-encrypted by a master-password change: the row it
+/// lives in, the blob that was read and re-sealed, and its replacement.
+#[derive(Debug, Clone)]
+pub struct ResealedSecret {
+    pub id: String,
+    pub old: String,
+    pub new: String,
+}
+
+/// Everything a master-password change writes - see
+/// [`Database::apply_vault_rotation`].
+#[derive(Debug, Default)]
+pub struct VaultRotation {
+    /// `keys.private_key_encrypted`: one entry per key in the vault.
+    pub keys: Vec<ResealedSecret>,
+    /// `servers.saved_password`: one entry per server that stores one.
+    pub server_passwords: Vec<ResealedSecret>,
+    /// The `auth_secret` inside each `mcp_servers` record that stores one.
+    pub mcp_secrets: Vec<ResealedSecret>,
+    /// The sealed Bitwarden master password, `(old, new)`, if one is stored.
+    pub bitwarden_master_password: Option<(String, String)>,
+    /// The sealed AI-assistant API key, `(old, new)`, if one is stored.
+    pub assistant_api_key: Option<(String, String)>,
+    /// The new master-password verifier (Argon2id PHC string).
+    pub master_hash: String,
+}
+
+/// Every row that holds a sealed value must be one the rotation re-sealed;
+/// one it does not know about was sealed while it ran.
+fn ensure_all_resealed(rows: &[String], resealed: &[ResealedSecret]) -> Result<()> {
+    let known: std::collections::HashSet<&str> = resealed.iter().map(|r| r.id.as_str()).collect();
+    if rows.iter().any(|id| !known.contains(id.as_str())) {
+        anyhow::bail!(VAULT_CHANGED_DURING_ROTATION);
+    }
+    Ok(())
 }
 
 /// Decide how a legacy `known_hosts.host` value must be rewritten to the
@@ -2866,14 +3012,14 @@ mod tests {
         db.insert_key(&rotation_key("k1", old_pw)).unwrap();
 
         // Seed a Bitwarden credential sealed under the OLD password.
-        let bw_old = crate::crypto::vault::seal(old_pw, b"bw-master-secret").unwrap();
+        let bw_old_blob = crate::crypto::vault::seal(old_pw, b"bw-master-secret").unwrap();
         let mut cfg = BitwardenConfig::default();
-        cfg.master_password = Some(bw_old);
+        cfg.master_password = Some(bw_old_blob.clone());
         db.save_bitwarden_config(&cfg).unwrap();
         // And an assistant API key sealed under the OLD password.
-        let ai_old = crate::crypto::vault::seal(old_pw, b"sk-assistant-key").unwrap();
+        let ai_old_blob = crate::crypto::vault::seal(old_pw, b"sk-assistant-key").unwrap();
         let mut ai = AssistantConfig::default();
-        ai.api_key = Some(ai_old);
+        ai.api_key = Some(ai_old_blob.clone());
         db.save_assistant_config(&ai).unwrap();
         // And an MCP server whose auth secret is sealed under the OLD
         // password (the whole record is one JSON row).
@@ -2895,25 +3041,33 @@ mod tests {
         db.set_config("master.hash", "OLD-VERIFIER").unwrap();
 
         // Rotate: re-seal key + BW cred in memory, commit atomically.
-        let mut key = db.get_key("k1").unwrap().unwrap();
+        let key = db.get_key("k1").unwrap().unwrap();
         let plain = crate::crypto::vault::unseal(old_pw, &key.private_key_encrypted).unwrap();
-        key.private_key_encrypted = crate::crypto::vault::seal(new_pw, &plain).unwrap();
+        let key_new = crate::crypto::vault::seal(new_pw, &plain).unwrap();
         let bw_new = crate::crypto::vault::seal(new_pw, b"bw-master-secret").unwrap();
         let ai_new = crate::crypto::vault::seal(new_pw, b"sk-assistant-key").unwrap();
         // MCP: unseal under OLD, re-seal under NEW, in memory, same
         // transaction as everything else.
-        let mut mcp = db.get_mcp_server("mcp1").unwrap().unwrap();
-        let mcp_plain =
-            crate::crypto::vault::unseal(old_pw, mcp.auth_secret.as_deref().unwrap()).unwrap();
-        mcp.auth_secret = Some(crate::crypto::vault::seal(new_pw, &mcp_plain).unwrap());
-        db.apply_vault_rotation(
-            &[key],
-            &[],
-            Some(&bw_new),
-            Some(&ai_new),
-            std::slice::from_ref(&mcp),
-            "NEW-VERIFIER",
-        )
+        let mcp = db.get_mcp_server("mcp1").unwrap().unwrap();
+        let mcp_old_blob = mcp.auth_secret.clone().unwrap();
+        let mcp_plain = crate::crypto::vault::unseal(old_pw, &mcp_old_blob).unwrap();
+        let mcp_new = crate::crypto::vault::seal(new_pw, &mcp_plain).unwrap();
+        db.apply_vault_rotation(&VaultRotation {
+            keys: vec![ResealedSecret {
+                id: "k1".into(),
+                old: key.private_key_encrypted.clone(),
+                new: key_new,
+            }],
+            server_passwords: Vec::new(),
+            mcp_secrets: vec![ResealedSecret {
+                id: "mcp1".into(),
+                old: mcp_old_blob,
+                new: mcp_new,
+            }],
+            bitwarden_master_password: Some((bw_old_blob, bw_new)),
+            assistant_api_key: Some((ai_old_blob, ai_new)),
+            master_hash: "NEW-VERIFIER".into(),
+        })
         .unwrap();
 
         // Key unseals under NEW, not OLD.
@@ -2953,6 +3107,145 @@ mod tests {
             db.get_config("master.hash").unwrap().as_deref(),
             Some("NEW-VERIFIER")
         );
+    }
+
+    // ── C1: the rotation commit is conditional and column-precise ───────────
+
+    /// A rotation of the one key `k1` (snapshot taken now), old -> new.
+    fn one_key_rotation(db: &Database, old_pw: &str, new_pw: &str) -> VaultRotation {
+        let key = db.get_key("k1").unwrap().unwrap();
+        let plain = crate::crypto::vault::unseal(old_pw, &key.private_key_encrypted).unwrap();
+        VaultRotation {
+            keys: vec![ResealedSecret {
+                id: "k1".into(),
+                old: key.private_key_encrypted,
+                new: crate::crypto::vault::seal(new_pw, &plain).unwrap(),
+            }],
+            master_hash: "NEW-VERIFIER".into(),
+            ..VaultRotation::default()
+        }
+    }
+
+    /// The rotation left nothing behind: old verifier, `k1` still old-sealed.
+    fn assert_rolled_back(db: &Database, old_pw: &str, err: anyhow::Error) {
+        assert_eq!(err.to_string(), VAULT_CHANGED_DURING_ROTATION);
+        assert_eq!(
+            db.get_config("master.hash").unwrap().as_deref(),
+            Some("OLD-VERIFIER")
+        );
+        let key = db.get_key("k1").unwrap().unwrap();
+        assert!(crate::crypto::vault::unseal(old_pw, &key.private_key_encrypted).is_ok());
+    }
+
+    /// A key whose sealed blob is no longer the one that was re-sealed (a
+    /// stale full-row write-back landed after the snapshot) rolls the whole
+    /// rotation back instead of overwriting it.
+    #[test]
+    fn apply_vault_rotation_rolls_back_when_a_sealed_row_changed() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = test_db();
+        db.set_config("master.hash", "OLD-VERIFIER").unwrap();
+        db.insert_key(&rotation_key("k1", old_pw)).unwrap();
+        let rotation = one_key_rotation(&db, old_pw, new_pw);
+        // Meanwhile: the row is rewritten with another old-password blob.
+        db.update_key(&rotation_key("k1", old_pw)).unwrap();
+        let err = db.apply_vault_rotation(&rotation).unwrap_err();
+        assert_rolled_back(&db, old_pw, err);
+    }
+
+    /// A sealed server password the rotation never saw (saved while it ran)
+    /// would be stranded under the old password - roll back instead.
+    #[test]
+    fn apply_vault_rotation_rolls_back_on_an_unknown_sealed_row() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = test_db();
+        db.set_config("master.hash", "OLD-VERIFIER").unwrap();
+        db.insert_key(&rotation_key("k1", old_pw)).unwrap();
+        let rotation = one_key_rotation(&db, old_pw, new_pw);
+        let now = Utc::now();
+        db.insert_server(&ServerRecord {
+            id: "s-late".into(),
+            name: "late".into(),
+            host: "example.com".into(),
+            port: 22,
+            username: "root".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "password".into(),
+            saved_password: Some(crate::crypto::vault::seal(old_pw, b"pw").unwrap()),
+            category_id: None,
+            color: None,
+            last_connected_at: None,
+            created_at: now,
+            updated_at: now,
+            bitwarden_id: None,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        })
+        .unwrap();
+        let err = db.apply_vault_rotation(&rotation).unwrap_err();
+        assert_rolled_back(&db, old_pw, err);
+    }
+
+    /// A Bitwarden master password saved while the rotation ran (the
+    /// rotation saw none to re-seal) rolls it back.
+    #[test]
+    fn apply_vault_rotation_rolls_back_when_a_credential_appeared() {
+        let (old_pw, new_pw) = ("old-master-pw", "new-master-pw");
+        let db = test_db();
+        db.set_config("master.hash", "OLD-VERIFIER").unwrap();
+        db.insert_key(&rotation_key("k1", old_pw)).unwrap();
+        let rotation = one_key_rotation(&db, old_pw, new_pw);
+        db.save_bitwarden_config(&BitwardenConfig {
+            master_password: Some(crate::crypto::vault::seal(old_pw, b"bw").unwrap()),
+            ..BitwardenConfig::default()
+        })
+        .unwrap();
+        let err = db.apply_vault_rotation(&rotation).unwrap_err();
+        assert_rolled_back(&db, old_pw, err);
+    }
+
+    /// The connect path stamps `last_connected_at` alone: a stale in-memory
+    /// copy of the row (an old `saved_password`, here) is never written back.
+    #[test]
+    fn touch_server_last_connected_only_stamps_the_time() {
+        let db = test_db();
+        let now = Utc::now();
+        let server = ServerRecord {
+            id: "s1".into(),
+            name: "srv".into(),
+            host: "example.com".into(),
+            port: 22,
+            username: "root".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "password".into(),
+            saved_password: Some("CURRENT-BLOB".into()),
+            category_id: None,
+            color: None,
+            last_connected_at: None,
+            created_at: now,
+            updated_at: now,
+            bitwarden_id: None,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        };
+        db.insert_server(&server).unwrap();
+        db.touch_server_last_connected("s1", now).unwrap();
+        // Named columns, not get_server's `SELECT *`: a pooled connection
+        // whose schema cache predates migrate()'s ALTER TABLEs can compile
+        // `SELECT *` against the half-migrated table, and sqlx then indexes
+        // past its cached column list (the hazard list_pending_queue_jobs
+        // documents). Pre-existing, and not what this test is about.
+        let (saved, last): (Option<String>, Option<String>) = block(async {
+            sqlx::query_as("SELECT saved_password, last_connected_at FROM servers WHERE id = ?")
+                .bind("s1")
+                .fetch_one(&db.pool)
+                .await
+        })
+        .unwrap();
+        assert_eq!(saved.as_deref(), Some("CURRENT-BLOB"));
+        assert_eq!(last.as_deref(), Some(now.to_rfc3339().as_str()));
     }
 
     // ── F9: restore clears machine-local deployment state ───────────────────

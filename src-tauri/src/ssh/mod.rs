@@ -6,8 +6,8 @@ use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 
-/// Write secret bytes to `path` so the content is NEVER on disk under
-/// permissions broader than 0600.
+/// Write secret bytes to `path` under owner-only permissions from the first
+/// byte: 0600 on Unix, a current-user-only ACL on Windows.
 ///
 /// SECURITY: `OpenOptions::mode()` applies at CREATION ONLY. Opening an
 /// existing file with `.create(true).truncate(true).mode(0o600)` keeps that
@@ -15,15 +15,29 @@ use std::path::PathBuf;
 /// closes the door after the horse has gone. Reproduced: a pre-existing 0644
 /// file stays 0644 for the whole write and only becomes 0600 afterwards.
 ///
-/// The fix is to remove any existing file first and `create_new`, so the very
-/// first byte lands in a file this process created at 0600. `create_new` also
-/// means we never write through a symlink an attacker planted at the target.
-///
-/// On Windows the current-user-only ACL is applied after creation (there is no
-/// create-time equivalent) and a failure is fatal: the partially written file
-/// is removed and the error propagated, rather than leaving readable key
-/// material behind.
+/// Remove any existing file first and `create_new`: on Unix it is created
+/// with mode 0600; on Windows it is created EMPTY, its ACL restricted, and
+/// only THEN written through the same open handle. A restriction failure
+/// removes the empty file and propagates the error, never leaving readable
+/// secret bytes behind. `create_new` also means we never write through a
+/// symlink an attacker planted at the target.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    write_secret_file_restricted(path, contents, |p| {
+        #[cfg(windows)]
+        restrict_windows_file(&p.to_path_buf())?;
+        #[cfg(not(windows))]
+        let _ = p;
+        Ok(())
+    })
+}
+
+/// The shared write path, with the permission-restriction step separated so a
+/// test can assert it runs on an EMPTY file before any bytes are written.
+fn write_secret_file_restricted(
+    path: &std::path::Path,
+    contents: &[u8],
+    restrict: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> Result<()> {
     use std::io::Write as _;
 
     // Replace rather than truncate: truncating an existing file inherits its
@@ -41,9 +55,31 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> 
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    // Windows: share nothing while the file is ours. Until icacls has
+    // restricted the ACL the file is under the inherited one, and no other
+    // process may open it for reading, writing or deleting in that window
+    // (or while the bytes go in). icacls itself only needs READ_CONTROL and
+    // WRITE_DAC, which sharing does not govern.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
     let mut file = opts
         .open(path)
         .map_err(|e| anyhow::anyhow!("Could not create {}: {e}", path.display()))?;
+
+    // Restrict while the file is still EMPTY. The bytes go in afterwards
+    // through the handle opened above, so the path is never reopened (and
+    // cannot be swapped) in between.
+    if let Err(e) = restrict(path) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(anyhow::anyhow!(
+            "Could not restrict permissions on {}: {e}",
+            path.display()
+        ));
+    }
 
     let written = file
         .write_all(contents)
@@ -53,17 +89,6 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> 
     if let Err(e) = written {
         let _ = fs::remove_file(path);
         return Err(e);
-    }
-
-    #[cfg(windows)]
-    {
-        if let Err(e) = restrict_windows_file(&path.to_path_buf()) {
-            let _ = fs::remove_file(path);
-            return Err(anyhow::anyhow!(
-                "Could not restrict permissions on {}: {e}",
-                path.display()
-            ));
-        }
     }
 
     Ok(())
@@ -296,62 +321,84 @@ fn get_ssh_dir() -> Result<PathBuf> {
     }
 }
 
+/// `%SystemRoot%\System32\<name>`, falling back to `C:\Windows` when the
+/// variable is missing.
+///
+/// Absolute on purpose (A6-13): a bare `Command::new("icacls")` is resolved
+/// through the application's own directory before System32, and a per-user
+/// install lives in a user-writable directory - an `icacls.exe` planted
+/// beside SSHSpan.exe would have run instead of the real one and could have
+/// "succeeded" without restricting anything.
+#[cfg(windows)]
+fn system32_exe(name: &str) -> PathBuf {
+    let root = std::env::var("SystemRoot")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| r"C:\Windows".to_string());
+    PathBuf::from(root).join("System32").join(name)
+}
+
+/// The current user's SID from `whoami /user /fo csv /nh` output, i.e. the
+/// last field of the last line (`"domain\user","S-1-5-21-..."`). Taken from
+/// the end because an account name may itself contain a comma, and checked
+/// for SID shape so nothing else is ever handed to icacls as an account.
+#[cfg(any(windows, test))]
+fn parse_whoami_sid(csv: &str) -> Option<String> {
+    let line = csv.lines().rev().find(|l| !l.trim().is_empty())?;
+    let sid = line.rsplit(',').next()?.trim().trim_matches('"');
+    let well_formed = sid.starts_with("S-1-")
+        && sid.len() > 4
+        && sid[4..].bytes().all(|b| b.is_ascii_digit() || b == b'-');
+    well_formed.then(|| sid.to_string())
+}
+
+/// Leave `path` with exactly one ACE: full control for the current user.
+///
+/// ONE icacls call does both halves - `/inheritance:r /grant:r *<SID>:F`.
+/// The old code ran `/inheritance:r` on its own first and then granted the
+/// user by a bare SID, which icacls rejects ("No mapping between account
+/// names and security IDs was done."): a SID must carry the `*` prefix. So
+/// every secret write on Windows (deploy, private-key export, backup export,
+/// audit CSV export) failed after inheritance had already been stripped
+/// (A7-01). In a single invocation a rejected grant cannot leave the file
+/// with an empty DACL, and `write_secret_file` removes the file on any error.
+///
+/// Both children are started with `CREATE_NO_WINDOW`: SSHSpan is a
+/// GUI-subsystem process, so without it Windows opens a console window for
+/// each console program it runs and every secret write flashed them (A7-43).
 #[cfg(windows)]
 pub(crate) fn restrict_windows_file(path: &PathBuf) -> Result<()> {
+    use std::os::windows::process::CommandExt as _;
     use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    // Get current user SID
-    let output = Command::new("whoami")
-        .arg("/user")
-        .arg("/fo")
-        .arg("csv")
+    let whoami = Command::new(system32_exe("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()?;
-
-    if !output.status.success() {
-        anyhow::bail!("whoami /user failed with status {}", output.status);
+    if !whoami.status.success() {
+        anyhow::bail!("whoami /user failed with status {}", whoami.status);
     }
-
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = output_str.lines().collect();
-
-    let sid = if lines.len() >= 2 {
-        let parts: Vec<&str> = lines[1].split(',').collect();
-        if parts.len() >= 2 {
-            Some(parts[1].trim_matches('"').to_string())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let Some(sid) = sid else {
+    let Some(sid) = parse_whoami_sid(&String::from_utf8_lossy(&whoami.stdout)) else {
         anyhow::bail!("could not parse the current user SID from whoami output");
     };
 
-    // Remove inheritance and set explicit permissions. Both steps must
-    // actually succeed — a silently-skipped restriction leaves the private
-    // key under the default (inherited) ACL.
-    let remove_inheritance = Command::new("icacls")
+    let icacls = Command::new(system32_exe("icacls.exe"))
         .arg(path)
         .arg("/inheritance:r")
-        .output()?;
-    if !remove_inheritance.status.success() {
-        anyhow::bail!(
-            "icacls /inheritance:r failed: {}",
-            String::from_utf8_lossy(&remove_inheritance.stderr).trim()
-        );
-    }
-
-    let grant = Command::new("icacls")
-        .arg(path)
         .arg("/grant:r")
-        .arg(format!("{}:F", sid))
+        .arg(format!("*{sid}:F"))
+        .creation_flags(CREATE_NO_WINDOW)
         .output()?;
-    if !grant.status.success() {
-        anyhow::bail!(
-            "icacls /grant:r failed: {}",
-            String::from_utf8_lossy(&grant.stderr).trim()
-        );
+    if !icacls.status.success() {
+        // icacls reports some failures on stdout and others on stderr.
+        let detail = [&icacls.stderr, &icacls.stdout]
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        anyhow::bail!("icacls failed ({}): {detail}", icacls.status);
     }
 
     Ok(())
@@ -360,6 +407,52 @@ pub(crate) fn restrict_windows_file(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod secret_write_tests {
     use super::*;
+
+    /// Windows's inherited ACL must never cover secret bytes - restrict the
+    /// empty file, then write. The same write path is driven with a
+    /// restriction callback here so the test can observe exactly when it is
+    /// called, without mocking the filesystem.
+    #[test]
+    fn secret_file_is_empty_until_permissions_are_restricted() {
+        let dir = std::env::temp_dir().join(format!("sshspan-restrict-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.pem");
+        let result = write_secret_file_restricted(&path, b"SECRET", |p| {
+            // Metadata, not a read: on Windows the file is held with no
+            // sharing, so only access that sharing does not govern works.
+            assert_eq!(
+                fs::metadata(p).unwrap().len(),
+                0,
+                "no secret bytes before the restriction"
+            );
+            Ok(())
+        });
+        let bytes = fs::read(&path);
+        let _ = fs::remove_dir_all(&dir);
+        result.unwrap();
+        assert_eq!(bytes.unwrap(), b"SECRET");
+    }
+
+    /// Fail closed while the file is still empty: a permission-restriction
+    /// failure removes it and never writes the secret.
+    #[test]
+    fn failed_permission_restriction_writes_no_secret_and_removes_the_file() {
+        let dir =
+            std::env::temp_dir().join(format!("sshspan-restrict-fail-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.pem");
+        let result = write_secret_file_restricted(&path, b"SECRET", |p| {
+            assert_eq!(fs::metadata(p).unwrap().len(), 0);
+            anyhow::bail!("restriction refused")
+        });
+        let exists = path.exists();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("restriction refused"));
+        assert!(!exists, "the empty file must be removed on failure");
+    }
 
     /// REGRESSION: the old sequence was
     ///   OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
@@ -429,5 +522,87 @@ mod secret_write_tests {
             .file_type()
             .is_symlink());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `whoami /user /fo csv /nh` parsing: the SID is the last field of the
+    /// last line, with or without a header line, and nothing that is not
+    /// SID-shaped comes back (it would be handed to icacls as an account).
+    #[test]
+    fn whoami_sid_parser_takes_the_last_sid_shaped_field() {
+        let sid = "S-1-5-21-62050738-523915034-210444172-1001";
+        let row = format!("\"ryzen-main\\andrei\",\"{sid}\"\r\n");
+        assert_eq!(parse_whoami_sid(&row).as_deref(), Some(sid));
+        let with_header = format!("\"User Name\",\"SID\"\r\n{row}");
+        assert_eq!(parse_whoami_sid(&with_header).as_deref(), Some(sid));
+        // A comma inside the account name does not shift the field.
+        let comma = format!("\"corp\\smith, john\",\"{sid}\"");
+        assert_eq!(parse_whoami_sid(&comma).as_deref(), Some(sid));
+        assert_eq!(parse_whoami_sid("\"User Name\",\"SID\""), None);
+        assert_eq!(parse_whoami_sid(""), None);
+        assert_eq!(parse_whoami_sid("\"x\",\"S-1-5 & calc\""), None);
+        assert_eq!(parse_whoami_sid("\"x\",\"S-1-\""), None);
+    }
+
+    /// REGRESSION (A7-01): on Windows every secret write failed. The grant
+    /// named the user by a bare SID (`icacls /grant:r S-1-5-21-...:F`), which
+    /// icacls rejects ("No mapping between account names and security IDs was
+    /// done.") - it only takes a SID with a `*` prefix - and it ran after
+    /// inheritance had already been stripped in a separate call. Deploy,
+    /// private-key export, backup export and the audit CSV export all died
+    /// there. The write must succeed and leave exactly one ACE: full control
+    /// for the current user, nothing inherited.
+    #[cfg(windows)]
+    #[test]
+    fn write_secret_file_leaves_one_full_control_ace_for_the_current_user() {
+        // Resolved here rather than through the code under test, so the test
+        // does not trust the path logic it is checking.
+        let system32 = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+        )
+        .join("System32");
+        let dir =
+            std::env::temp_dir().join(format!("sshspan-acl-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.pem");
+
+        let written = write_secret_file(&path, b"-----BEGIN OPENSSH PRIVATE KEY-----");
+        let listing = std::process::Command::new(system32.join("icacls.exe"))
+            .arg(&path)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        let me = std::process::Command::new(system32.join("whoami.exe"))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let _ = fs::remove_dir_all(&dir);
+
+        written.expect("a secret write must succeed on Windows");
+        let listing = listing.expect("icacls must run");
+        let me = me.expect("whoami must run");
+        // `icacls <file>` prints "<file> <ACE>", one more indented ACE per
+        // line, then a blank line and a summary.
+        let aces: Vec<String> = listing
+            .lines()
+            .take_while(|l| !l.trim().is_empty())
+            .enumerate()
+            .map(|(i, l)| {
+                let l = if i == 0 {
+                    l.strip_prefix(&path.display().to_string())
+                        .unwrap_or_else(|| panic!("unexpected icacls output: {listing}"))
+                } else {
+                    l
+                };
+                l.trim().to_string()
+            })
+            .collect();
+        assert_eq!(
+            aces.len(),
+            1,
+            "exactly one ACE expected, icacls said: {listing}"
+        );
+        assert!(
+            aces[0].eq_ignore_ascii_case(&format!("{me}:(F)")),
+            "the only ACE must be full control for {me}, not inherited; got {:?}",
+            aces[0]
+        );
     }
 }

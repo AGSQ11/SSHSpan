@@ -766,6 +766,188 @@ fn key_full_roundtrip_ecdsa() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  Vault backup -> restore (backups never transit the webview)
+// ═════════════════════════════════════════════════════════════════════════════
+
+use sshspan::commands::{apply_restore, build_backup_document, RestoreOutcome};
+use sshspan::db::KeyRecord;
+
+/// A fresh, fully migrated database in a temp file (the real schema, not a
+/// hand-copied subset - backup and restore touch nearly every table).
+fn fresh_db(tag: &str) -> Database {
+    Database::open_at(std::env::temp_dir().join(format!(
+        "sshspan_it_{tag}_{}.db",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .expect("open test database")
+}
+
+fn backup_key(id: &str, name: &str, private_key_encrypted: String) -> KeyRecord {
+    KeyRecord {
+        id: id.into(),
+        name: name.into(),
+        key_type: "ed25519".into(),
+        public_key: format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake {name}"),
+        private_key_encrypted,
+        fingerprint_sha256: format!("SHA256:fake-{id}"),
+        fingerprint_md5: format!("MD5:fake-{id}"),
+        comment: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        deployed: false,
+        deploy_path: None,
+        bitwarden_id: None,
+        bitwarden_sync: false,
+        bitwarden_revision_ts: None,
+        bitwarden_updated_at: None,
+        category_ids: Vec::new(),
+    }
+}
+
+/// Backup -> restore into a fresh database keeps what the old pair dropped:
+/// a key's Bitwarden revision metadata (serialized as JSON numbers, read back
+/// as strings only - A7-27) and the per-server SFTP bookmarks (A7-41), and the
+/// restore leaves its audit row.
+#[test]
+fn backup_restore_round_trip_keeps_key_sync_metadata_bookmarks_and_audit() {
+    let pw = "round-trip-master-pw";
+    let src = fresh_db("backup_src");
+    let mut key = backup_key(
+        "k-linked",
+        "linked",
+        sshspan::crypto::vault::seal(pw, b"fake-private-key").unwrap(),
+    );
+    key.bitwarden_id = Some("cipher-1".into());
+    key.bitwarden_sync = true;
+    key.bitwarden_revision_ts = Some(1_717_000_000_123);
+    key.bitwarden_updated_at = Some(1_717_000_000_456);
+    src.insert_key(&key).unwrap();
+    let bookmarks = serde_json::json!([
+        { "name": "logs", "remotePath": "/var/log", "localPath": null },
+        { "name": "www", "remotePath": "/srv/www", "localPath": "/home/me/www" },
+    ]);
+    src.set_config("sftp.bookmarks.srv-1", &bookmarks.to_string())
+        .unwrap();
+
+    let backup = build_backup_document(&src, pw).expect("build the backup");
+    assert_eq!(backup.counts["sftpBookmarks"], 1);
+    assert!(backup.filename.starts_with("sshspan-backup-") && backup.filename.ends_with(".json"));
+    // The backup carries what is STORED: `settings_get` reports defaults for
+    // unset keys, but a restore must not pin them over the target's choices.
+    let payload: serde_json::Value = serde_json::from_slice(
+        &sshspan::crypto::vault::unseal(pw, backup.document["sealed"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["settings"], serde_json::json!({}));
+
+    let dst = fresh_db("backup_dst");
+    let outcome = apply_restore(&dst, &backup.document, pw, None, &|| Ok(())).expect("restore");
+    let RestoreOutcome::Restored(result) = outcome else {
+        panic!("same master password - no backup password needed: {outcome:?}");
+    };
+    assert_eq!(result["ok"], true);
+
+    let mut lost = Vec::new();
+    let restored = dst.get_key("k-linked").unwrap().expect("key restored");
+    if restored.bitwarden_id.as_deref() != Some("cipher-1") || !restored.bitwarden_sync {
+        lost.push(format!(
+            "bitwarden link: {:?} / {}",
+            restored.bitwarden_id, restored.bitwarden_sync
+        ));
+    }
+    if restored.bitwarden_revision_ts != Some(1_717_000_000_123) {
+        lost.push(format!(
+            "bitwarden_revision_ts: {:?}",
+            restored.bitwarden_revision_ts
+        ));
+    }
+    if restored.bitwarden_updated_at != Some(1_717_000_000_456) {
+        lost.push(format!(
+            "bitwarden_updated_at: {:?}",
+            restored.bitwarden_updated_at
+        ));
+    }
+    if sshspan::crypto::vault::unseal(pw, &restored.private_key_encrypted).ok()
+        != Some(b"fake-private-key".to_vec())
+    {
+        lost.push("private key no longer unseals".into());
+    }
+    let restored_bookmarks = dst
+        .get_config("sftp.bookmarks.srv-1")
+        .unwrap()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    if restored_bookmarks.as_ref() != Some(&bookmarks) {
+        lost.push(format!("sftp bookmarks: {restored_bookmarks:?}"));
+    }
+    if !dst
+        .list_audit(50)
+        .unwrap()
+        .iter()
+        .any(|a| a.action == "vault.backup_restored")
+    {
+        lost.push("no vault.backup_restored audit row".into());
+    }
+    assert!(
+        lost.is_empty(),
+        "the round trip lost:\n  {}",
+        lost.join("\n  ")
+    );
+}
+
+/// A7-25: names that are not valid Host tokens are sanitized on restore and
+/// each rename is audited. The audit row used to be written through a second
+/// pooled connection while the restore's own write transaction held the
+/// SQLite write lock - so every rename after the first write waited out the
+/// 5 s busy timeout and then lost its audit row.
+#[test]
+fn restore_with_invalid_key_names_audits_each_rename_without_stalling() {
+    let db = fresh_db("restore_rename");
+    let stamp = chrono::Utc::now().to_rfc3339();
+    let mut keys = Vec::new();
+    for (id, name) in [("k1", "old key one"), ("k2", "old key two")] {
+        let mut k = serde_json::to_value(backup_key(id, name, "x".into())).unwrap();
+        k["category_ids"] = serde_json::json!(["c1"]);
+        keys.push(k);
+    }
+    // The category is written first, so the transaction already holds the
+    // write lock when the first rename is audited.
+    let payload = serde_json::json!({
+        "categories": [{ "id": "c1", "name": "Prod", "scope": "key", "sort_index": 0,
+                         "created_at": stamp, "updated_at": stamp }],
+        "keys": keys,
+    });
+
+    let started = std::time::Instant::now();
+    let counts = db.restore_backup(&payload).expect("restore");
+    let elapsed = started.elapsed();
+
+    let mut problems = Vec::new();
+    if elapsed >= std::time::Duration::from_secs(3) {
+        problems.push(format!("restore stalled for {elapsed:?}"));
+    }
+    if counts["keys"] != 2 {
+        problems.push(format!("restored keys: {}", counts["keys"]));
+    }
+    let renames = db
+        .list_audit(50)
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.action == "keys.name_sanitized")
+        .count();
+    if renames != 2 {
+        problems.push(format!("keys.name_sanitized audit rows: {renames}, want 2"));
+    }
+    for (id, raw) in [("k1", "old key one"), ("k2", "old key two")] {
+        let name = db.get_key(id).unwrap().map(|k| k.name);
+        let want = keys::sanitize_key_name(raw);
+        if name.as_deref() != Some(want.as_str()) {
+            problems.push(format!("{id} name {name:?}, want {want:?}"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  SSH Config Deploy Workflow
 // ═════════════════════════════════════════════════════════════════════════════
 

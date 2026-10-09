@@ -783,10 +783,11 @@ pub async fn start_interactive(
         registry2.remove(&reg_session_id);
     });
 
-    // Mark the server as last-connected.
-    let mut server = params.server;
-    server.last_connected_at = Some(chrono::Utc::now());
-    let _ = db.update_server(&server);
+    // Mark the server as last-connected - that column only. Writing back the
+    // whole row read before the handshake could put an old-sealed
+    // saved_password over one a master-password change re-sealed meanwhile
+    // (C1).
+    let _ = db.touch_server_last_connected(&params.server.id, chrono::Utc::now());
 
     Ok(session_id)
 }

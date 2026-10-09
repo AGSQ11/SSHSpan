@@ -9,7 +9,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64ct::{Base64, Encoding};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::utils::generate_random_vec;
 
@@ -25,10 +25,13 @@ impl VaultKey {
         &self.0
     }
 
-    /// Derive vault key from master password using Argon2id
-    /// Matches Node.js crypto.scryptSync with N=65536, r=8, p=1
+    /// Derive the vault key from the master password with Argon2id: m = 64 MiB
+    /// (65536 KiB), t = 3, p = 4, 32-byte output. This is not compatible with
+    /// the Node.js-era vaults, which used `crypto.scryptSync` - the two KDFs
+    /// derive different keys from the same password and salt, so a blob that
+    /// app sealed cannot be opened here. (This comment used to claim the
+    /// opposite: "matches Node.js crypto.scryptSync with N=65536, r=8, p=1".)
     pub fn derive_from_password(password: &str, salt: &[u8]) -> anyhow::Result<Self> {
-        // Use Argon2id with parameters matching scrypt N=65536, r=8, p=1
         let params = Params::new(65536, 3, 4, Some(32)).map_err(|e| anyhow::anyhow!(e))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -40,11 +43,13 @@ impl VaultKey {
         Ok(Self(hash))
     }
 
-    /// Derive encryption key from vault key using HKDF
-    pub fn derive_encryption_key(&self, context: &[u8]) -> [u8; 32] {
+    /// Derive the AES-256 key from the vault key using HKDF. Returned as
+    /// `Zeroizing` so the key that actually encrypts the data is wiped when
+    /// the caller drops it, like the `VaultKey` it comes from (A6-11).
+    pub fn derive_encryption_key(&self, context: &[u8]) -> Zeroizing<[u8; 32]> {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
-        let mut okm = [0u8; 32];
-        hk.expand(context, &mut okm)
+        let mut okm = Zeroizing::new([0u8; 32]);
+        hk.expand(context, okm.as_mut_slice())
             .map_err(|e| anyhow::anyhow!(e))
             .expect("HKDF expand failed");
         okm
@@ -84,7 +89,7 @@ impl EncryptedVault {
         let vault_key = VaultKey::derive_from_password(password, &salt)?;
         let enc_key = vault_key.derive_encryption_key(b"vault-encryption");
 
-        let cipher = Aes256Gcm::new_from_slice(&enc_key)?;
+        let cipher = Aes256Gcm::new_from_slice(enc_key.as_slice())?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
             .encrypt(&nonce, data)
@@ -111,7 +116,7 @@ impl EncryptedVault {
 
         // Validate the fixed-size fields BEFORE handing them to the cipher.
         // `Nonce::from_slice` PANICS on anything that is not exactly 12
-        // bytes, and this blob can come from a file: vault_backup_restore
+        // bytes, and this blob can come from a file: vault_backup_restore_from_file
         // unseals whatever string a chosen backup carries, so a crafted (or
         // merely corrupted) file crashed the command instead of reporting a
         // bad backup. The Bitwarden parser next door validates every length
@@ -141,7 +146,7 @@ impl EncryptedVault {
         let vault_key = VaultKey::derive_from_password(password, &salt)?;
         let enc_key = vault_key.derive_encryption_key(b"vault-encryption");
 
-        let cipher = Aes256Gcm::new_from_slice(&enc_key)?;
+        let cipher = Aes256Gcm::new_from_slice(enc_key.as_slice())?;
         let nonce = Nonce::from_slice(&nonce);
 
         let plaintext = cipher.decrypt(nonce, combined.as_ref()).map_err(|_| {
@@ -161,8 +166,9 @@ impl EncryptedVault {
 /// to a self-contained JSON string, ready for a TEXT database column.
 /// This is what actually protects private key material at rest — every
 /// call to `seal` re-derives the key via Argon2id with a fresh random
-/// salt, so it's deliberately not cheap; only call it for single-key
-/// operations (generate/import/export/deploy), never in a list/loop.
+/// salt, so it's deliberately not cheap. The bulk callers - the master
+/// password change and backup restore, one seal (and unseal) per record -
+/// therefore run on a blocking worker, never on the main thread.
 pub fn seal(password: &str, data: &[u8]) -> anyhow::Result<String> {
     let enc = EncryptedVault::encrypt(data, password)?;
     Ok(serde_json::to_string(&enc)?)
@@ -180,7 +186,7 @@ mod tests {
     use super::*;
 
     /// A blob whose fixed-size fields are the wrong length must come back as
-    /// an error, not a panic. `vault_backup_restore` unseals whatever a
+    /// an error, not a panic. `vault_backup_restore_from_file` unseals whatever a
     /// user-chosen backup file contains, so this is reachable from outside.
     #[test]
     fn malformed_blob_lengths_are_rejected_not_panicked_on() {
@@ -208,6 +214,16 @@ mod tests {
                 "{what}: unexpected error {err}"
             );
         }
+    }
+
+    /// A6-11: the HKDF-derived AES key is wiped when it goes out of scope, like
+    /// the Argon2id output it is derived from.
+    #[test]
+    fn derived_aes_key_is_zeroizing() {
+        let vault_key = VaultKey::new([7u8; 32]);
+        let enc: zeroize::Zeroizing<[u8; 32]> =
+            vault_key.derive_encryption_key(b"vault-encryption");
+        assert_ne!(*enc, [0u8; 32]);
     }
 
     /// The happy path still round-trips, so the new checks are not rejecting

@@ -439,13 +439,23 @@ pub fn terminal_keepalive(app: AppHandle, session_id: String) -> CmdResult<serde
 
 #[tauri::command]
 pub fn known_hosts_forget(app: AppHandle, host: String) -> CmdResult<serde_json::Value> {
-    app.state::<AppState>()
-        .db
-        .delete_known_host(&host)
-        .map_err(|e| e.to_string())?;
-    let _ = app
-        .state::<AppState>()
-        .db
-        .add_audit("known_hosts.forget", None, &host);
+    known_hosts_forget_in(
+        &app.state::<AppState>().db,
+        &app.state::<super::VaultPasswordStore>(),
+        &host,
+    )
+}
+
+/// [`known_hosts_forget`] without the `AppHandle`, so its lock gate is
+/// testable. Refused while locked (A6-08): forgetting a pin downgrades the
+/// next connection to that host to a first-use trust prompt.
+pub(super) fn known_hosts_forget_in(
+    db: &Database,
+    vault: &super::VaultPasswordStore,
+    host: &str,
+) -> CmdResult<serde_json::Value> {
+    super::require_unlocked(vault)?;
+    db.delete_known_host(host).map_err(|e| e.to_string())?;
+    let _ = db.add_audit("known_hosts.forget", None, host);
     Ok(serde_json::json!({ "ok": true }))
 }

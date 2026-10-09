@@ -114,6 +114,9 @@ pub fn assistant_save_config(
     // key impossible to remove.
     clear_api_key: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
+    // Seals the API key with the master password: not while that is being
+    // changed (C1).
+    let _rotation = crate::commands::rotation_shared(&app)?;
     let pw = vault_password(&app)?;
     if pw.is_empty() {
         return Err("Vault is locked.".into());

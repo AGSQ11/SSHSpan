@@ -61,6 +61,9 @@ pub fn server_save(
     category_id: Option<String>,
     color: Option<String>,
 ) -> CmdResult<serde_json::Value> {
+    // Seals the saved password and rewrites the whole row: not while a
+    // master-password change is re-encrypting the vault (C1).
+    let _rotation = super::rotation_shared(&app)?;
     let vault_pw = super::vault_password(&app)?;
     if vault_pw.is_empty() {
         return Err(CmdError("Vault is locked.".into()));
