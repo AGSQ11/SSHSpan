@@ -4,15 +4,17 @@
 //! The agent/tool loop lives in the renderer (src/renderer/assistant.js) -
 //! the conversation context it needs (terminal scrollback, server info) is
 //! renderer-side, so the backend stays a non-streaming proxy plus policy gate:
-//! it owns the sealed API key, all provider HTTPS traffic, the access level,
-//! and the only path that lets an AI-issued command reach an SSH channel.
+//! it owns the sealed API key, all provider traffic, the access level, and
+//! the only two paths that let AI-issued text reach an SSH channel.
 //!
 //! Access levels: "read" (advise only), "draft" (may type into the prompt,
 //! never submits), "execute" (runs commands, renderer confirms each), "yolo"
 //! (runs without asking). The renderer exposes tools to the model according to
-//! the level; `assistant_exec` re-checks the level here before writing to the
-//! session, so a confused or prompt-injected model cannot escalate itself by
-//! emitting tool calls the UI never offered.
+//! the level; `assistant_exec` (runs a command: Enter appended, Execute or
+//! higher) and `assistant_type_text` (types a single line: never Enter, no
+//! control characters, Draft or higher) re-check the level here before
+//! writing to the session, so a confused or prompt-injected model cannot
+//! escalate itself by emitting tool calls the UI never offered.
 //!
 //! Known boundary: the renderer can still call `terminal_send` directly (user
 //! typing needs it), so this gate constrains the AI's sanctioned path, not a
@@ -82,6 +84,85 @@ fn level_permits_exec(level: &str) -> bool {
     matches!(level, "execute" | "yolo")
 }
 
+/// The typing gate: Draft is the lowest level that may type into the prompt.
+fn level_permits_typing(level: &str) -> bool {
+    matches!(level, "draft" | "execute" | "yolo")
+}
+
+/// Longest text the assistant may type in one go, in characters - a prompt
+/// line, not a file.
+const MAX_TYPED_CHARS: usize = 4096;
+
+/// Characters that are invisible or change the text direction, so a
+/// suggestion card could show the user something other than what gets
+/// typed: bidi embeddings/overrides/isolates and marks, zero-width spaces
+/// and joiners, line/paragraph separators, invisible operators, the BOM,
+/// interlinear annotation and tag characters ("ASCII smuggling").
+const DISGUISING_CHARS: [(char, char); 11] = [
+    ('\u{00AD}', '\u{00AD}'),
+    ('\u{061C}', '\u{061C}'),
+    ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{2028}', '\u{2029}'),
+    ('\u{202A}', '\u{202E}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{2069}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{E0000}', '\u{E007F}'),
+];
+
+fn is_disguising(c: char) -> bool {
+    DISGUISING_CHARS
+        .iter()
+        .any(|&(first, last)| (first..=last).contains(&c))
+}
+
+/// Whether the assistant may type `text` into a terminal at `level`
+/// (`assistant_type_text`), and if not, the refusal the model and the user
+/// see. Typing must never press Enter or a control key: LF/CR submit the
+/// line, Ctrl-C/D/Z interrupt or end the shell, ESC drives full-screen
+/// programs - so every control character except TAB (completion) is refused:
+/// Unicode's Cc set, i.e. C0, DEL and C1. Text that could look different
+/// from what it types ([`DISGUISING_CHARS`]) and text over
+/// [`MAX_TYPED_CHARS`] are refused too. Nothing is sent on a refusal. Pure
+/// so the rule is unit-testable without a session.
+fn check_typed_text(level: &str, text: &str) -> Result<(), String> {
+    if !level_permits_typing(level) {
+        return Err(format!(
+            "AI access level is '{level}' - raise it to Draft or higher in the assistant panel to let the assistant type into the terminal."
+        ));
+    }
+    if text.is_empty() {
+        return Err("Nothing to type - the text is empty.".into());
+    }
+    let length = text.chars().count();
+    if length > MAX_TYPED_CHARS {
+        return Err(format!(
+            "The text is too long to type ({length} characters; the limit is {MAX_TYPED_CHARS}). Nothing was typed."
+        ));
+    }
+    if text.contains(['\n', '\r']) {
+        return Err(
+            "The assistant may only type a single line: this text contains a line break, which would press Enter. Nothing was typed."
+                .into(),
+        );
+    }
+    if let Some(c) = text.chars().find(|c| c.is_control() && *c != '\t') {
+        return Err(format!(
+            "This text contains a control character (U+{:04X}) - the assistant may not send control keys. Nothing was typed.",
+            c as u32
+        ));
+    }
+    if let Some(c) = text.chars().find(|&c| is_disguising(c)) {
+        return Err(format!(
+            "This text contains an invisible or text-direction character (U+{:04X}) that could disguise what is typed. Nothing was typed.",
+            c as u32
+        ));
+    }
+    Ok(())
+}
+
 // ─── Config commands ────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -113,6 +194,9 @@ pub fn assistant_save_config(
     // privacy does not silently destroy it), which otherwise made a stored
     // key impossible to remove.
     clear_api_key: Option<bool>,
+    // The user's confirmation that the stored key may follow a changed
+    // provider or base-URL origin (see `check_key_reuse`).
+    reuse_key_at_new_origin: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     // Seals the API key with the master password: not while that is being
     // changed (C1).
@@ -132,37 +216,159 @@ pub fn assistant_save_config(
     // Blank base URL = provider default; stored as None so a changed default
     // reaches existing configs. Deliberately no SSRF guard (unlike
     // Bitwarden): user-configured localhost/LAN inference servers (Ollama,
-    // LM Studio) are a first-class use case for this feature.
+    // LM Studio) are a first-class use case for this feature - but plain
+    // http only to local addresses (normalize_base_url), since the key
+    // travels with every request.
     let base_url = base_url
         .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty());
-    if let Some(u) = &base_url {
-        if !u.starts_with("https://") && !u.starts_with("http://") {
-            return Err("Base URL must start with https:// (or http:// for local servers).".into());
-        }
-    }
+        .filter(|s| !s.is_empty())
+        .map(|u| normalize_base_url(&u))
+        .transpose()?;
 
     let db = &app.state::<crate::AppState>().db;
     let mut config = db.load_assistant_config().map_err(|e| e.to_string())?;
+    let api_key = api_key.filter(|s| !s.trim().is_empty());
+    let clear_api_key = clear_api_key.unwrap_or(false);
+    let key_moved = check_key_reuse(
+        &config,
+        &provider,
+        base_url.as_deref(),
+        api_key.is_some(),
+        clear_api_key,
+        reuse_key_at_new_origin.unwrap_or(false),
+    )?;
     config.provider = Some(provider);
     config.base_url = base_url;
     config.model = Some(model);
-    if let Some(key) = api_key.filter(|s| !s.trim().is_empty()) {
+    if let Some(key) = api_key {
         // Wrap immediately: the plaintext key must be wiped from this frame
         // once sealed, not left as freed heap (secret-wiping hardening).
         let key = Zeroizing::new(key);
         config.api_key = Some(
             crate::crypto::vault::seal(&pw, key.trim().as_bytes()).map_err(|e| e.to_string())?,
         );
-    } else if clear_api_key.unwrap_or(false) {
+    } else if clear_api_key {
         // save_assistant_config's None => DELETE removes the sealed row.
         config.api_key = None;
     }
     db.save_assistant_config(&config)
         .map_err(|e| e.to_string())?;
-    db.add_audit("assistant.config", None, "saved")
+    let detail = if key_moved {
+        "saved (stored API key reused at a new provider or base URL, as confirmed)"
+    } else {
+        "saved"
+    };
+    db.add_audit("assistant.config", None, detail)
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// The default base URL for a provider when none is stored.
+fn default_base_url(provider: &str) -> &'static str {
+    if provider == "anthropic" {
+        ANTHROPIC_DEFAULT_BASE
+    } else {
+        OPENAI_DEFAULT_BASE
+    }
+}
+
+/// Validate a user-entered provider base URL (already trimmed, without a
+/// trailing slash) and return it as stored. https reaches any host. Plain
+/// http only reaches this machine or the local network - a loopback name or
+/// address, an RFC 1918 private or link-local IPv4 address, or an IPv6
+/// loopback, link-local or unique-local address - because the API key rides
+/// on every request in cleartext (A6-10). Local inference servers (Ollama,
+/// LM Studio) on such addresses stay a first-class use case; a LAN host
+/// name is not resolved here, so such a server is entered by its address or
+/// served over https.
+fn normalize_base_url(raw: &str) -> Result<String, String> {
+    let url = url::Url::parse(raw).map_err(|_| "Base URL is not a valid URL.".to_string())?;
+    // Like the MCP server URL: credentials in it would be echoed back in
+    // provider errors and the test-connection detail, unsealed.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "Base URL must not contain a user name or password - enter the API key in its own field."
+                .into(),
+        );
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" if url.host().is_some_and(|h| is_local_network_host(&h)) => {}
+        "http" => {
+            return Err(
+                "Plain http:// is only allowed for local or private-network addresses (localhost, 127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, or IPv6 loopback/link-local/unique-local) - use https:// for any other host."
+                    .into(),
+            )
+        }
+        _ => {
+            return Err(
+                "Base URL must start with https:// (or http:// for local servers).".into(),
+            )
+        }
+    }
+    Ok(raw.to_string())
+}
+
+/// Whether a URL host is this machine or the local network (see
+/// [`normalize_base_url`]).
+fn is_local_network_host(host: &url::Host<&str>) -> bool {
+    let v4_local =
+        |ip: std::net::Ipv4Addr| ip.is_loopback() || ip.is_private() || ip.is_link_local();
+    match host {
+        url::Host::Domain(name) => {
+            let name = name.to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        url::Host::Ipv4(ip) => v4_local(*ip),
+        url::Host::Ipv6(ip) => {
+            ip.is_loopback()
+                || ip.is_unicast_link_local()
+                || ip.is_unique_local()
+                || ip.to_ipv4_mapped().is_some_and(v4_local)
+        }
+    }
+}
+
+/// The origin (scheme://host:port) a provider config sends its key to: the
+/// stored base URL, else the provider's default.
+fn key_origin(provider: Option<&str>, base_url: Option<&str>) -> Option<String> {
+    let base = match base_url {
+        Some(b) => b,
+        None => default_base_url(provider?),
+    };
+    url::Url::parse(base)
+        .ok()
+        .map(|u| u.origin().ascii_serialization())
+}
+
+/// Whether a save may keep the stored API key (A4-13). The key was stored
+/// for one provider at one origin; a save that changes either and supplies
+/// no new key would silently send it to the new endpoint, so it is refused
+/// unless the user confirmed reusing it there (`reuse_confirmed`, the
+/// command's `reuse_key_at_new_origin`). `Ok(true)` means the key does move
+/// (with that confirmation), for the audit row; a new key, removing the key,
+/// or no stored key means nothing moves. Pure so the rule is unit-testable.
+fn check_key_reuse(
+    old: &crate::db::AssistantConfig,
+    provider: &str,
+    base_url: Option<&str>,
+    new_key: bool,
+    clear_key: bool,
+    reuse_confirmed: bool,
+) -> Result<bool, String> {
+    if old.api_key.is_none() || new_key || clear_key {
+        return Ok(false);
+    }
+    let moved = old.provider.as_deref() != Some(provider)
+        || key_origin(old.provider.as_deref(), old.base_url.as_deref())
+            != key_origin(Some(provider), base_url);
+    if moved && !reuse_confirmed {
+        return Err(
+            "The provider or base URL changed but no new API key was entered - enter the key for the new endpoint, or confirm reusing the stored key there."
+                .into(),
+        );
+    }
+    Ok(moved)
 }
 
 // ─── Provider plumbing ──────────────────────────────────────────────────────
@@ -195,13 +401,9 @@ fn load_provider(app: &AppHandle) -> CmdResult<ResolvedProvider> {
         String::from_utf8(key_bytes)
             .map_err(|_| "Stored API key is not valid UTF-8.".to_string())?,
     );
-    let base_url = config.base_url.unwrap_or_else(|| {
-        if provider == "anthropic" {
-            ANTHROPIC_DEFAULT_BASE.to_string()
-        } else {
-            OPENAI_DEFAULT_BASE.to_string()
-        }
-    });
+    let base_url = config
+        .base_url
+        .unwrap_or_else(|| default_base_url(&provider).to_string());
     let model = config
         .model
         .ok_or_else(|| "No model configured.".to_string())?;
@@ -213,11 +415,51 @@ fn load_provider(app: &AppHandle) -> CmdResult<ResolvedProvider> {
     })
 }
 
+/// The provider client. It never follows a redirect (A6-10): on a
+/// cross-host hop reqwest strips only Authorization/Cookie-style headers, so
+/// Anthropic's `x-api-key` would travel to wherever a proxy or gateway
+/// pointed. With `Policy::none()` a 3xx comes back as a plain response, and
+/// [`send_provider`] turns it into an error.
 fn http_client(timeout: std::time::Duration) -> CmdResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| CmdError(e.to_string()))
+}
+
+/// Send one provider request. A redirect is an error naming the host it
+/// pointed at - the same rule as the MCP client: credentials never leave the
+/// configured base URL. `failure` prefixes a transport error.
+async fn send_provider(
+    request: reqwest::RequestBuilder,
+    failure: &str,
+) -> CmdResult<reqwest::Response> {
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| CmdError(format!("{failure}: {e}")))?;
+    if resp.status().is_redirection() {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok());
+        return Err(CmdError(format!(
+            "Provider returned a redirect ({}) to {} - redirects are not followed, so the API key never leaves the configured base URL. Set the base URL to the final address.",
+            resp.status().as_u16(),
+            redirect_target_host(resp.url(), location)
+        )));
+    }
+    Ok(resp)
+}
+
+/// The host a redirect points at, for the error message: the Location's
+/// host, resolved against the request URL when it is relative.
+fn redirect_target_host(request_url: &url::Url, location: Option<&str>) -> String {
+    location
+        .and_then(|loc| request_url.join(loc).ok())
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "an unnamed location".to_string())
 }
 
 /// Turn a provider error response into an actionable message. Reads the body
@@ -276,16 +518,111 @@ pub struct ToolSpec {
     parameters_json: String,
 }
 
-// ─── [OI]-compatible shaping ───────────────────────────────────────────────
+/// The result a tool call gets when its turn ended before it ran.
+const CANCELLED_TOOL_RESULT: &str = "cancelled";
+
+/// The conversation as it may be sent to a provider, whatever state the
+/// renderer's history is in (A7-44; defence in depth for A4-03 - the
+/// renderer repairs its own history too, this also covers older histories):
+/// - an assistant message with neither text nor tool calls is dropped: both
+///   providers reject it, so one empty model reply failed every later turn
+///   on the tab;
+/// - every tool call gets a result directly after its assistant message: a
+///   call left unanswered (Stop, the per-turn call cap, an error mid-loop)
+///   gets a synthetic "cancelled" result, because both providers reject an
+///   unanswered call;
+/// - a tool result that answers no call of the assistant message right
+///   before it (a duplicate, or one cut off from its call) is dropped, for
+///   the same reason.
+fn normalize_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(messages.len());
+    // Calls of the last assistant message still waiting for a result.
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for m in messages {
+        if let ChatMessage::Tool { tool_call_id, .. } = m {
+            if let Some(i) = pending.iter().position(|(id, _)| id == tool_call_id) {
+                pending.remove(i);
+                out.push(m.clone());
+            }
+            continue;
+        }
+        answer_pending_calls(&mut out, &mut pending);
+        if let ChatMessage::Assistant {
+            content,
+            tool_calls,
+        } = m
+        {
+            let calls = tool_calls.as_deref().unwrap_or_default();
+            let has_text = content.as_deref().is_some_and(|t| !t.trim().is_empty());
+            if calls.is_empty() && !has_text {
+                continue;
+            }
+            pending = calls
+                .iter()
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect();
+        }
+        out.push(m.clone());
+    }
+    answer_pending_calls(&mut out, &mut pending);
+    out
+}
+
+/// Close the open tool-call group: a "cancelled" result for every call still
+/// waiting for one.
+fn answer_pending_calls(out: &mut Vec<ChatMessage>, pending: &mut Vec<(String, String)>) {
+    for (tool_call_id, name) in pending.drain(..) {
+        out.push(ChatMessage::Tool {
+            tool_call_id,
+            name,
+            content: CANCELLED_TOOL_RESULT.into(),
+        });
+    }
+}
+
+// ─── OpenAI-compatible shaping ─────────────────────────────────────────────
+
+/// Which request field carries the output-token cap in an OpenAI-style
+/// request (A4-18). OpenAI's own API deprecated `max_tokens` and rejects it
+/// for its reasoning models, so requests to api.openai.com send
+/// `max_completion_tokens`; every other OpenAI-compatible server (Ollama,
+/// LM Studio, OpenRouter, Groq) still expects `max_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenCapField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl TokenCapField {
+    fn for_base_url(base_url: &str) -> Self {
+        let host = url::Url::parse(base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        if host.as_deref() == Some("api.openai.com") {
+            Self::MaxCompletionTokens
+        } else {
+            Self::MaxTokens
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
 
 fn openai_body(
     model: &str,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
     max_tokens: u32,
+    token_cap: TokenCapField,
 ) -> CmdResult<serde_json::Value> {
+    let messages = normalize_history(messages);
     let mut wire_msgs = Vec::with_capacity(messages.len());
-    for m in messages {
+    for m in &messages {
         let v = match m {
             ChatMessage::System { content } => serde_json::json!({
                 "role": "system", "content": content,
@@ -312,9 +649,9 @@ fn openai_body(
                 if calls.is_empty() {
                     serde_json::json!({ "role": "assistant", "content": content })
                 } else {
-                    // [OI] rejects an assistant message whose tool_calls are
-                    // not followed by matching tool results; the renderer's
-                    // loop guarantees the pairing.
+                    // OpenAI rejects an assistant message whose tool_calls are
+                    // not followed by matching tool results;
+                    // normalize_history guarantees the pairing.
                     serde_json::json!({
                         "role": "assistant", "content": content, "tool_calls": calls,
                     })
@@ -334,8 +671,8 @@ fn openai_body(
     let mut body = serde_json::json!({
         "model": model,
         "messages": wire_msgs,
-        "max_tokens": max_tokens,
     });
+    body[token_cap.key()] = serde_json::json!(max_tokens);
     if !tools.is_empty() {
         let mut wire_tools = Vec::with_capacity(tools.len());
         for t in tools {
@@ -404,9 +741,10 @@ fn anthropic_body(
     tools: &[ToolSpec],
     max_tokens: u32,
 ) -> CmdResult<serde_json::Value> {
+    let messages = normalize_history(messages);
     let mut system_parts: Vec<String> = Vec::new();
     let mut wire_msgs: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
+    for m in &messages {
         match m {
             // Anthropic takes system as a top-level field, not a message.
             ChatMessage::System { content } => system_parts.push(content.clone()),
@@ -418,7 +756,8 @@ fn anthropic_body(
                 tool_calls,
             } => {
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
-                if let Some(t) = content.as_ref().filter(|t| !t.is_empty()) {
+                // Anthropic rejects a text block that is only whitespace.
+                if let Some(t) = content.as_ref().filter(|t| !t.trim().is_empty()) {
                     blocks.push(serde_json::json!({ "type": "text", "text": t }));
                 }
                 for c in tool_calls.clone().unwrap_or_default() {
@@ -559,23 +898,31 @@ pub async fn assistant_chat(
 
     let resp = if p.provider == "anthropic" {
         let body = anthropic_body(&p.model, &messages, &tools, max_tokens)?;
-        client
-            .post(format!("{}/v1/messages", p.base_url))
-            .header("x-api-key", p.api_key.as_str())
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CmdError(format!("Provider request failed: {e}")))?
+        send_provider(
+            client
+                .post(format!("{}/v1/messages", p.base_url))
+                .header("x-api-key", p.api_key.as_str())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body),
+            "Provider request failed",
+        )
+        .await?
     } else {
-        let body = openai_body(&p.model, &messages, &tools, max_tokens)?;
-        client
-            .post(format!("{}/chat/completions", p.base_url))
-            .bearer_auth(p.api_key.as_str())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CmdError(format!("Provider request failed: {e}")))?
+        let body = openai_body(
+            &p.model,
+            &messages,
+            &tools,
+            max_tokens,
+            TokenCapField::for_base_url(&p.base_url),
+        )?;
+        send_provider(
+            client
+                .post(format!("{}/chat/completions", p.base_url))
+                .bearer_auth(p.api_key.as_str())
+                .json(&body),
+            "Provider request failed",
+        )
+        .await?
     };
 
     if !resp.status().is_success() {
@@ -605,21 +952,23 @@ pub async fn assistant_test_connection(app: AppHandle) -> CmdResult<serde_json::
             "max_tokens": 1,
             "messages": [{ "role": "user", "content": "ping" }],
         });
-        client
-            .post(format!("{}/v1/messages", p.base_url))
-            .header("x-api-key", p.api_key.as_str())
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CmdError(format!("Connection failed: {e}")))?
+        send_provider(
+            client
+                .post(format!("{}/v1/messages", p.base_url))
+                .header("x-api-key", p.api_key.as_str())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body),
+            "Connection failed",
+        )
+        .await?
     } else {
-        client
-            .get(format!("{}/models", p.base_url))
-            .bearer_auth(p.api_key.as_str())
-            .send()
-            .await
-            .map_err(|e| CmdError(format!("Connection failed: {e}")))?
+        send_provider(
+            client
+                .get(format!("{}/models", p.base_url))
+                .bearer_auth(p.api_key.as_str()),
+            "Connection failed",
+        )
+        .await?
     };
 
     if !resp.status().is_success() {
@@ -666,6 +1015,12 @@ pub fn assistant_exec(
         )
         .into());
     }
+    // The same gate as terminal_send (and assistant_type_text): a locked
+    // vault drives no session - and leaves no audit row for a command that
+    // could not run.
+    if vault_password(&app)?.is_empty() {
+        return Err("Vault is locked.".into());
+    }
     let db = &app.state::<crate::AppState>().db;
     let snippet: String = command.chars().take(200).collect();
     db.add_audit(
@@ -684,6 +1039,45 @@ pub fn assistant_exec(
     let mut bytes = command.into_bytes();
     bytes.push(b'\r');
     crate::ssh_client::session_send(&registry, &session_id, bytes).map_err(CmdError::from)?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Type `text` into the session's prompt for the assistant, never pressing
+/// Enter: the backend path for the `type_command` tool and a suggestion
+/// card's Insert (Ruling R7). The tab's level is re-checked here (Draft or
+/// higher) and line breaks and control keys are refused before anything is
+/// sent ([`check_typed_text`]), so a confused or prompt-injected model cannot
+/// run a command through typing; `assistant_exec` stays the only AI path that
+/// appends Enter. Every typing is audited (`assistant.type`, first 200
+/// characters, like `assistant.exec`).
+#[tauri::command]
+pub fn assistant_type_text(
+    app: AppHandle,
+    session_id: String,
+    tab_id: String,
+    text: String,
+) -> CmdResult<serde_json::Value> {
+    let level = app.state::<AssistantLevels>().get(&tab_id);
+    check_typed_text(&level, &text).map_err(CmdError)?;
+    // The same gate as terminal_send: a locked vault drives no session.
+    if vault_password(&app)?.is_empty() {
+        return Err("Vault is locked.".into());
+    }
+    let db = &app.state::<crate::AppState>().db;
+    let snippet: String = text.chars().take(200).collect();
+    db.add_audit(
+        "assistant.type",
+        None,
+        &format!("tab={tab_id} level={level} text={snippet}"),
+    )
+    .map_err(|e| e.to_string())?;
+    // Exactly what terminal_send does: the bytes go to the session's stdin.
+    let registry = app
+        .state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
+        .inner()
+        .clone();
+    crate::ssh_client::session_send(&registry, &session_id, text.into_bytes())
+        .map_err(CmdError::from)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -731,7 +1125,14 @@ mod tests {
 
     #[test]
     fn openai_shapes_all_message_kinds() {
-        let body = openai_body("gpt-4o-mini", &history(), &tools(), 1024).unwrap();
+        let body = openai_body(
+            "gpt-4o-mini",
+            &history(),
+            &tools(),
+            1024,
+            TokenCapField::MaxTokens,
+        )
+        .unwrap();
         assert_eq!(body["model"], "gpt-4o-mini");
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
@@ -753,7 +1154,7 @@ mod tests {
 
     #[test]
     fn openai_omits_tools_when_empty() {
-        let body = openai_body("m", &history(), &[], 1024).unwrap();
+        let body = openai_body("m", &history(), &[], 1024, TokenCapField::MaxTokens).unwrap();
         assert!(body.get("tools").is_none());
     }
 
@@ -764,7 +1165,7 @@ mod tests {
             description: "x".into(),
             parameters_json: "{not json".into(),
         }];
-        assert!(openai_body("m", &history(), &bad, 1024).is_err());
+        assert!(openai_body("m", &history(), &bad, 1024, TokenCapField::MaxTokens).is_err());
     }
 
     #[test]
@@ -776,7 +1177,7 @@ mod tests {
         assert_eq!(r["text"], "hi");
         assert_eq!(r["tool_calls"].as_array().unwrap().len(), 0);
 
-        // [OI] returns null content when the model only calls tools.
+        // OpenAI returns null content when the model only calls tools.
         let calls_only = serde_json::json!({
             "choices": [{ "message": {
                 "role": "assistant", "content": null,
@@ -875,8 +1276,8 @@ mod tests {
             },
         ];
 
-        // [OI]: system stays in-band, user content passes through verbatim.
-        let oi = openai_body("m", &msgs, &[], 1024).unwrap();
+        // OpenAI: system stays in-band, user content passes through verbatim.
+        let oi = openai_body("m", &msgs, &[], 1024, TokenCapField::MaxTokens).unwrap();
         let oi_msgs = oi["messages"].as_array().unwrap();
         assert_eq!(oi_msgs[0]["role"], "system");
         assert_eq!(oi_msgs[1]["role"], "user");
@@ -967,5 +1368,449 @@ mod tests {
         let sealed = crate::crypto::vault::seal(&pw, b"sk-test-123").unwrap();
         let back = crate::crypto::vault::unseal(&pw, &sealed).unwrap();
         assert_eq!(back, b"sk-test-123");
+    }
+
+    // ── AI typing never presses Enter (R7: A4-02, A6-01, A3-30) ─────────
+
+    #[test]
+    fn typing_needs_draft_or_higher() {
+        assert!(check_typed_text("read", "ls").is_err());
+        assert!(check_typed_text("", "ls").is_err());
+        for level in ["draft", "execute", "yolo"] {
+            assert!(check_typed_text(level, "ls -la").is_ok(), "{level}");
+        }
+        let err = check_typed_text("read", "ls").unwrap_err();
+        assert!(err.contains("Draft"), "{err}");
+    }
+
+    #[test]
+    fn typed_text_cannot_press_enter_or_send_control_keys() {
+        for bad in [
+            "ls\n",
+            "ls\r",
+            "echo harmless\nid",
+            "uname -a\r\n",
+            "\u{4}",       // Ctrl-D: ends the shell
+            "\u{3}",       // Ctrl-C
+            "\u{1a}",      // Ctrl-Z
+            "\u{1b}[A",    // ESC: drives full-screen programs
+            "rm x\u{7f}",  // DEL
+            "a\u{0}b",     // NUL
+            "a\u{9b}31mb", // C1 CSI
+            "",            // nothing to type
+        ] {
+            assert!(
+                check_typed_text("draft", bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        let err = check_typed_text("execute", "curl x | sh\n").unwrap_err();
+        assert!(err.contains("Enter"), "{err}");
+        // TAB (completion) and ordinary Unicode text are fine.
+        for ok in ["cd /var/log\t", "printf 'é ✓'", "ls -la && df -h"] {
+            assert!(check_typed_text("draft", ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    /// Text the user reviews on a card must type exactly what it shows:
+    /// bidi overrides/isolates, zero-width and other invisible characters
+    /// could disguise it. And a typed "line" has a sane length.
+    #[test]
+    fn typed_text_cannot_hide_what_it_says_or_run_on() {
+        for hidden in [
+            "ls \u{202E}txt.exe",   // right-to-left override
+            "rm \u{2066}x\u{2069}", // isolates
+            "a\u{200B}b",           // zero-width space
+            "a\u{200F}b",           // right-to-left mark
+            "\u{FEFF}ls",           // zero-width no-break space
+            "a\u{2028}b",           // line separator
+            "a\u{2060}b",           // word joiner
+            "a\u{061C}b",           // Arabic letter mark
+            "a\u{E0041}b",          // tag character
+        ] {
+            let err = check_typed_text("draft", hidden).unwrap_err();
+            assert!(
+                err.contains("invisible or text-direction"),
+                "{hidden:?}: {err}"
+            );
+        }
+        let longest = "x".repeat(4096);
+        assert!(check_typed_text("draft", &longest).is_ok());
+        let err = check_typed_text("draft", &format!("{longest}x")).unwrap_err();
+        assert!(err.contains("4096"), "{err}");
+    }
+
+    // ── Provider client hardening (A6-10) ───────────────────────────────
+
+    /// Credentials in the base URL would be echoed back in provider errors
+    /// and the test-connection detail; the key has its own sealed field.
+    #[test]
+    fn a_base_url_must_not_carry_credentials() {
+        for bad in [
+            "https://user:pass@api.openai.com/v1",
+            "https://sk-key@api.example.com/v1",
+            "http://u:p@localhost:11434/v1",
+        ] {
+            let err = normalize_base_url(bad).unwrap_err();
+            assert!(err.contains("user name or password"), "{bad}: {err}");
+        }
+    }
+
+    /// A provider (proxy, gateway) that answers with a redirect must not get
+    /// the request - and with it Anthropic's x-api-key header, which reqwest
+    /// does not strip on a cross-host hop - forwarded to the redirect target.
+    #[tokio::test]
+    async fn provider_client_does_not_follow_a_redirect_with_the_api_key() {
+        use std::io::{Read as _, Write as _};
+        let bystander = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bystander_addr = bystander.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = bystander.accept() {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let _ = seen_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let provider_addr = provider.local_addr().unwrap();
+        let location = format!("http://{bystander_addr}/steal");
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = provider.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let client = http_client(TEST_TIMEOUT).unwrap();
+        let resp = client
+            .post(format!("http://{provider_addr}/v1/messages"))
+            .header("x-api-key", "sk-ant-secret")
+            .body("{}")
+            .send()
+            .await;
+        assert!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "the redirect target must never receive the request (it would carry x-api-key)"
+        );
+        assert_eq!(
+            resp.expect("the 302 itself comes back").status().as_u16(),
+            302
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_redirect_is_an_error_naming_its_target_host() {
+        use std::io::{Read as _, Write as _};
+        let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = provider.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = provider.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://evil.example.com/harvest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let client = http_client(TEST_TIMEOUT).unwrap();
+        let err = send_provider(
+            client
+                .post(format!("http://{addr}/chat/completions"))
+                .bearer_auth("sk-secret")
+                .body("{}"),
+            "Provider request failed",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.0.contains("redirect (307)"), "{err}");
+        assert!(err.0.contains("evil.example.com"), "{err}");
+        assert!(!err.0.contains("sk-secret"), "{err}");
+    }
+
+    #[test]
+    fn a_redirect_target_is_named_by_its_host() {
+        let base = url::Url::parse("https://gateway.example.com/v1/messages").unwrap();
+        assert_eq!(
+            redirect_target_host(&base, Some("https://evil.example.com/steal")),
+            "evil.example.com"
+        );
+        // A relative Location stays on the request's host.
+        assert_eq!(
+            redirect_target_host(&base, Some("/elsewhere")),
+            "gateway.example.com"
+        );
+        assert_eq!(redirect_target_host(&base, None), "an unnamed location");
+    }
+
+    #[test]
+    fn plain_http_base_urls_only_reach_local_or_private_hosts() {
+        for ok in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://10.0.0.5:8080/v1",
+            "http://172.16.3.4/v1",
+            "http://172.31.255.1",
+            "http://192.168.1.10:11434/v1",
+            "http://169.254.10.20/v1",
+            "http://[::1]:8080/v1",
+            "http://[fe80::1]/v1",
+            "http://[fd12:3456::1]/v1",
+            "http://ollama.localhost/v1",
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            "https://10.0.0.5/v1",
+        ] {
+            assert!(normalize_base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://api.openai.com/v1",
+            "http://8.8.8.8/v1",
+            "http://172.32.0.1",
+            "http://192.169.1.1",
+            "http://[2001:db8::1]/v1",
+            "http://gpu-box.lan:11434/v1",
+            "ftp://example.com",
+            "localhost:11434",
+            "not a url",
+        ] {
+            assert!(normalize_base_url(bad).is_err(), "{bad} must be refused");
+        }
+        let err = normalize_base_url("http://api.openai.com/v1").unwrap_err();
+        assert!(err.contains("http://"), "{err}");
+    }
+
+    // ── A stored key does not follow a new endpoint (A4-13) ─────────────
+
+    fn stored_config(provider: &str, base: Option<&str>) -> crate::db::AssistantConfig {
+        crate::db::AssistantConfig {
+            provider: Some(provider.into()),
+            base_url: base.map(String::from),
+            model: Some("m".into()),
+            api_key: Some("sealed-blob".into()),
+        }
+    }
+
+    #[test]
+    fn a_stored_key_does_not_silently_follow_a_new_provider_or_origin() {
+        let old = stored_config("openai", None);
+        // Same endpoint - the default spelled out, another path, other case.
+        let same = [
+            Some("https://api.openai.com/v1"),
+            Some("https://API.openai.com/v2"),
+            None,
+        ];
+        for base in same {
+            assert_eq!(
+                check_key_reuse(&old, "openai", base, false, false, false),
+                Ok(false),
+                "{base:?}"
+            );
+        }
+        // A new origin or provider with no new key is refused...
+        let err = check_key_reuse(
+            &old,
+            "openai",
+            Some("http://localhost:11434/v1"),
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("API key"), "{err}");
+        assert!(check_key_reuse(&old, "anthropic", None, false, false, false).is_err());
+        // ...unless the user confirmed reusing it there (reported so the
+        // audit row says so), or a new key comes with the save, or the key is
+        // being removed.
+        assert_eq!(
+            check_key_reuse(&old, "anthropic", None, false, false, true),
+            Ok(true)
+        );
+        assert_eq!(
+            check_key_reuse(&old, "anthropic", None, true, false, false),
+            Ok(false)
+        );
+        assert_eq!(
+            check_key_reuse(&old, "anthropic", None, false, true, false),
+            Ok(false)
+        );
+        // Nothing stored: nothing can follow.
+        let mut empty = stored_config("openai", None);
+        empty.api_key = None;
+        assert_eq!(
+            check_key_reuse(
+                &empty,
+                "anthropic",
+                Some("https://x.example"),
+                false,
+                false,
+                false
+            ),
+            Ok(false)
+        );
+    }
+
+    // ── Conversation request shaping (A7-44, A4-03, A4-18) ──────────────
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments_json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn empty_assistant_messages_are_not_sent_to_either_provider() {
+        let msgs = vec![
+            ChatMessage::System {
+                content: "s".into(),
+            },
+            ChatMessage::User {
+                content: "first".into(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: None,
+            },
+            ChatMessage::User {
+                content: "second".into(),
+            },
+            ChatMessage::Assistant {
+                content: Some("  ".into()),
+                tool_calls: Some(vec![]),
+            },
+            ChatMessage::User {
+                content: "third".into(),
+            },
+        ];
+        let oi = openai_body("m", &msgs, &[], 64, TokenCapField::MaxTokens).unwrap();
+        let roles: Vec<&str> = oi["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["system", "user", "user", "user"]);
+        let an = anthropic_body("m", &msgs, &[], 64).unwrap();
+        let wire = an["messages"].as_array().unwrap();
+        assert!(
+            wire.iter().all(|m| m["role"] == "user"),
+            "no empty assistant turn may be sent: {wire:?}"
+        );
+    }
+
+    #[test]
+    fn every_tool_call_gets_a_result_before_the_next_message() {
+        // A turn stopped after the first of two calls: c2 never got a result.
+        let msgs = vec![
+            ChatMessage::User {
+                content: "go".into(),
+            },
+            ChatMessage::Assistant {
+                content: Some("Checking.".into()),
+                tool_calls: Some(vec![call("c1", "t1"), call("c2", "t2")]),
+            },
+            ChatMessage::Tool {
+                tool_call_id: "c1".into(),
+                name: "t1".into(),
+                content: "one".into(),
+            },
+            ChatMessage::User {
+                content: "next".into(),
+            },
+        ];
+        let oi = openai_body("m", &msgs, &[], 64, TokenCapField::MaxTokens).unwrap();
+        let wire = oi["messages"].as_array().unwrap();
+        // user, assistant(c1, c2), tool c1, tool c2 (synthesized), user
+        assert_eq!(wire.len(), 5, "{wire:?}");
+        assert_eq!(wire[2]["tool_call_id"], "c1");
+        assert_eq!(wire[3]["role"], "tool");
+        assert_eq!(wire[3]["tool_call_id"], "c2");
+        assert_eq!(wire[3]["content"], "cancelled");
+        assert_eq!(wire[4]["role"], "user");
+
+        let an = anthropic_body("m", &msgs, &[], 64).unwrap();
+        let wire = an["messages"].as_array().unwrap();
+        // user, assistant(text, tool_use c1, tool_use c2), user(two tool_result
+        // blocks), user(next) - consecutive user turns are combined by the API.
+        let results = wire[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "{wire:?}");
+        assert_eq!(results[1]["tool_use_id"], "c2");
+        assert_eq!(results[1]["content"], "cancelled");
+    }
+
+    #[test]
+    fn a_trailing_unanswered_call_and_a_stray_result_are_repaired() {
+        // The history ends on a call with no result, and carries a result
+        // whose call is not directly before it.
+        let msgs = vec![
+            ChatMessage::User {
+                content: "go".into(),
+            },
+            ChatMessage::Tool {
+                tool_call_id: "stray".into(),
+                name: "t".into(),
+                content: "x".into(),
+            },
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: Some(vec![call("c9", "t9")]),
+            },
+        ];
+        let oi = openai_body("m", &msgs, &[], 64, TokenCapField::MaxTokens).unwrap();
+        let wire = oi["messages"].as_array().unwrap();
+        assert_eq!(wire.len(), 3, "{wire:?}");
+        assert!(wire.iter().all(|m| m["tool_call_id"] != "stray"));
+        assert_eq!(wire[2]["tool_call_id"], "c9");
+        assert_eq!(wire[2]["content"], "cancelled");
+    }
+
+    #[test]
+    fn openai_com_gets_max_completion_tokens_and_other_servers_max_tokens() {
+        assert_eq!(
+            TokenCapField::for_base_url("https://api.openai.com/v1"),
+            TokenCapField::MaxCompletionTokens
+        );
+        assert_eq!(
+            TokenCapField::for_base_url("https://API.OPENAI.COM/v1"),
+            TokenCapField::MaxCompletionTokens
+        );
+        for other in [
+            "http://localhost:11434/v1",
+            "https://openrouter.ai/api/v1",
+            "https://api.groq.com/openai/v1",
+            "https://api.openai.com.evil.example/v1",
+            "not a url",
+        ] {
+            assert_eq!(
+                TokenCapField::for_base_url(other),
+                TokenCapField::MaxTokens,
+                "{other}"
+            );
+        }
+        let body = openai_body(
+            "gpt-5",
+            &history(),
+            &[],
+            512,
+            TokenCapField::MaxCompletionTokens,
+        )
+        .unwrap();
+        assert_eq!(body["max_completion_tokens"], 512);
+        assert!(body.get("max_tokens").is_none());
+        let body = openai_body("llama3", &history(), &[], 512, TokenCapField::MaxTokens).unwrap();
+        assert_eq!(body["max_tokens"], 512);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 }

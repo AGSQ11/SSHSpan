@@ -12,11 +12,13 @@
 //! - Sealed secrets (`crate::crypto::vault::seal`) never cross IPC and are
 //!   zeroized after use; env-var auth stores only the variable NAME and is
 //!   resolved from the process environment at request time.
-//! - Credential ORIGIN BINDING: a stored sealed secret is dropped whenever
-//!   the URL, auth type, or custom header name is edited, so an old secret
-//!   can never be replayed at a new origin or under different semantics
-//!   (`mcp_save_server`). The auth source is mutually exclusive: a record
-//!   holds a sealed secret or an env-var name, never both.
+//! - Credential ORIGIN BINDING: a stored sealed secret - and an env-var
+//!   binding the save does not name again - is dropped whenever the URL,
+//!   auth type, or custom header name is edited, so an old credential can
+//!   never be replayed at a new origin or under different semantics
+//!   (`mcp_save_server` / `plan_auth`). The auth source is mutually
+//!   exclusive: a record holds a sealed secret or an env-var name, never
+//!   both.
 //! - Vault generation: captured before the first await of every flow and
 //!   rechecked immediately before EVERY credential-bearing request (via
 //!   `ServerContext::checked`), so a lock mid-flow prevents the next
@@ -24,7 +26,11 @@
 //! - 3xx is a hard error (auth headers must never leave the configured
 //!   origin; reqwest's `Policy::none()` does NOT error on redirects).
 //! - Tools default to disabled; a tool only runs when enabled AND its
-//!   definition still hashes to the pinned value the user approved.
+//!   definition still hashes to the pinned value the user approved. A
+//!   changed definition disables the tool, clears its Auto-approve and is
+//!   reported as `definition_changed` until the user re-approves it.
+//! - Streamable HTTP only: a legacy HTTP+SSE server gets an explicit
+//!   "does not speak MCP Streamable HTTP" error, not a bare status code.
 //! - The per-tab access-level gate mirrors `assistant_exec`: enforced in
 //!   Rust, independent of which tools the renderer offered the model.
 //! - Vault lock tears down every MCP session (HTTP DELETE with
@@ -44,6 +50,7 @@ use zeroize::Zeroizing;
 
 use crate::commands::{
     capture_vault_generation, require_generation_current, vault_password, CmdError,
+    VaultPasswordStore,
 };
 
 pub type CmdResult<T> = Result<T, CmdError>;
@@ -335,33 +342,45 @@ pub fn exposed_tool_name(server: &str, tool: &str) -> String {
 /// servers, rejecting every kind of collision BEFORE anything is exposed:
 /// - two tools of ONE server mapping to the same exposed name (e.g. "a b"
 ///   and "a_b" sanitize identically);
-/// - two SERVERS whose names sanitize identically (the renderer could no
-///   longer resolve an exposed name back to one server);
+/// - two SERVERS whose names sanitize identically - including two servers
+///   with the very same name (the renderer could no longer resolve an
+///   exposed name back to one server);
 /// - a name colliding with a built-in assistant tool (never allowed, even
 ///   though the renderer also refuses these).
 ///
-/// `exposed -> (server_id, tool)` is then a well-defined map: one approval
-/// can never silently cover another tool.
+/// Servers are told apart by their id, never by their name (A4-12): two
+/// entries that share a name are two servers, not one. `exposed ->
+/// (server_id, tool)` is then a well-defined map: one approval can never
+/// silently cover another tool.
 pub fn build_name_map(
-    servers: &[(String, Vec<String>)], // (server name, tool names)
+    servers: &[(String, String, Vec<String>)], // (server id, server name, tool names)
 ) -> Result<HashMap<String, (String, String)>, String> {
     let mut map = HashMap::new();
-    let mut server_seen: HashMap<String, String> = HashMap::new();
-    for (server, tools) in servers {
+    // Sanitized prefix -> (id, name) of the server that claimed it.
+    let mut prefix_owner: HashMap<String, (String, String)> = HashMap::new();
+    for (id, server, tools) in servers {
         // A server with no enabled tools exposes nothing: it cannot create
         // ambiguity, so its name never blocks another server's enables.
         if tools.is_empty() {
             continue;
         }
         let server_san = sanitize_tool_name_part(server);
-        if let Some(prev) = server_seen.get(&server_san) {
-            if prev != server {
-                return Err(format!(
-                    "MCP server names '{prev}' and '{server}' produce the same model-facing prefix '{server_san}'; rename one of them before enabling tools."
-                ));
+        match prefix_owner.get(&server_san) {
+            Some((prev_id, prev)) if prev_id != id => {
+                return Err(if prev == server {
+                    format!(
+                        "Two MCP servers are both named '{server}'; rename one of them before enabling tools."
+                    )
+                } else {
+                    format!(
+                        "MCP server names '{prev}' and '{server}' produce the same model-facing prefix '{server_san}'; rename one of them before enabling tools."
+                    )
+                });
             }
-        } else {
-            server_seen.insert(server_san.clone(), server.clone());
+            Some(_) => {}
+            None => {
+                prefix_owner.insert(server_san.clone(), (id.clone(), server.clone()));
+            }
         }
         let mut tool_seen: HashMap<String, String> = HashMap::new();
         for real in tools {
@@ -382,13 +401,13 @@ pub fn build_name_map(
                 }
             }
             match map.get(&exposed) {
-                Some((prev_server, prev_tool)) if prev_server != server || prev_tool != real => {
+                Some((prev_id, prev_tool)) if prev_id != id || prev_tool != real => {
                     return Err(format!(
                         "MCP tools from different servers produce the same model-facing name '{exposed}'; refusing to expose ambiguous tools."
                     ));
                 }
                 _ => {
-                    map.insert(exposed, (server.clone(), real.clone()));
+                    map.insert(exposed, (id.clone(), real.clone()));
                 }
             }
         }
@@ -680,14 +699,131 @@ async fn read_capped(resp: &mut reqwest::Response) -> CmdResult<String> {
     String::from_utf8(buf).map_err(|_| CmdError("MCP response is not valid UTF-8.".into()))
 }
 
-/// Read the JSON-RPC response for `want_id` from a completed HTTP
-/// response, handling both content types:
+/// The error for a server that does not speak Streamable HTTP, the only MCP
+/// transport this client implements (A4-22). A legacy HTTP+SSE (2024-11-05)
+/// server typically answers the initialize POST with 405 - its SSE endpoint
+/// takes GET only - or opens an event stream whose first event is
+/// `endpoint`.
+fn unsupported_transport(detail: &str) -> CmdError {
+    CmdError(format!(
+        "This server does not speak MCP Streamable HTTP ({detail}) - SSHSpan supports Streamable HTTP only."
+    ))
+}
+
+/// One server-sent event: its `event:` name, if any, and its `data:` lines
+/// joined with LF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SseEvent {
+    event: Option<String>,
+    data: String,
+}
+
+/// An incremental `text/event-stream` decoder (A7-50): fed the body chunk by
+/// chunk, it hands back each event as soon as its closing blank line has
+/// arrived, so a reply can be used while the server keeps the stream open.
+/// Lines may end in LF, CRLF or a lone CR, and a chunk may end anywhere -
+/// inside a line, between a CR and its LF, or inside a multi-byte UTF-8
+/// character (a line is decoded only once complete). Comment lines and
+/// unknown fields are skipped, as the SSE format says.
+#[derive(Default)]
+struct SseDecoder {
+    /// Bytes of the line in progress.
+    line: Vec<u8>,
+    /// The previous byte was a CR, so a LF right after it ends nothing.
+    after_cr: bool,
+    event: Option<String>,
+    data: Vec<String>,
+}
+
+impl SseDecoder {
+    /// Decode one chunk; returns the events it completed.
+    fn push(&mut self, chunk: &[u8]) -> CmdResult<Vec<SseEvent>> {
+        let mut events = Vec::new();
+        for &byte in chunk {
+            if std::mem::take(&mut self.after_cr) && byte == b'\n' {
+                continue;
+            }
+            match byte {
+                b'\r' => {
+                    self.after_cr = true;
+                    self.end_line(&mut events)?;
+                }
+                b'\n' => self.end_line(&mut events)?,
+                _ => self.line.push(byte),
+            }
+        }
+        Ok(events)
+    }
+
+    /// The end of the body. A last line without its line break still counts,
+    /// and an event the server never closed with a blank line is delivered
+    /// too (the whole-body parser this replaces accepted both).
+    fn finish(&mut self) -> CmdResult<Vec<SseEvent>> {
+        let mut events = Vec::new();
+        if !self.line.is_empty() {
+            self.end_line(&mut events)?;
+        }
+        self.dispatch(&mut events);
+        Ok(events)
+    }
+
+    fn end_line(&mut self, events: &mut Vec<SseEvent>) -> CmdResult<()> {
+        let line = String::from_utf8(std::mem::take(&mut self.line))
+            .map_err(|_| CmdError("MCP response is not valid UTF-8.".into()))?;
+        if line.is_empty() {
+            self.dispatch(events);
+            return Ok(());
+        }
+        if line.starts_with(':') {
+            return Ok(());
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line.as_str(), ""),
+        };
+        match field {
+            "data" => self.data.push(value.to_string()),
+            "event" => self.event = Some(value.to_string()),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, events: &mut Vec<SseEvent>) {
+        let event = self.event.take();
+        if self.data.is_empty() {
+            return;
+        }
+        events.push(SseEvent {
+            event,
+            data: std::mem::take(&mut self.data).join("\n"),
+        });
+    }
+}
+
+/// Most server-to-client requests one response may make the client answer.
+/// Each -32601 answer is a request carrying the auth header; a server
+/// streaming more of them than this is cut off.
+const MAX_SERVER_REQUESTS_PER_RESPONSE: usize = 8;
+
+/// Read the JSON-RPC response for `want_id` from an HTTP response, handling
+/// both content types:
 /// - application/json: the body IS the response.
-/// - text/event-stream: read events until the response with `want_id`
-///   arrives. Server-to-client REQUESTS (id + method) are answered with
-///   JSON-RPC error -32601 on the same session and never surfaced;
-///   notifications (no id) such as notifications/tools/list_changed are
-///   noted, not answered.
+/// - text/event-stream: decode events AS THEY ARRIVE and return as soon as
+///   the response with `want_id` is in - a server may keep the stream open
+///   for later notifications (the spec only says it SHOULD close it), and
+///   waiting for the end made every such call wait out the 60 s timeout
+///   (A7-50). Whatever the server sends after the answer is not read: a
+///   tools/list_changed that arrives later is picked up by the next connect
+///   or by a later call's stream. The 2 MB cap applies to the bytes read.
+///   Server-to-client REQUESTS (id + method) are answered with JSON-RPC
+///   error -32601 on the same session and never surfaced - at most
+///   [`MAX_SERVER_REQUESTS_PER_RESPONSE`] of them, and only while `guard`
+///   (the vault-generation check in production) still passes, because each
+///   answer carries the auth header. Notifications (no id) such as
+///   notifications/tools/list_changed are noted, not answered. A legacy
+///   HTTP+SSE `endpoint` event is the unsupported-transport error.
+#[allow(clippy::too_many_arguments)] // the wire context comes piecewise so tests can drive it
 pub async fn read_response(
     client: &reqwest::Client,
     url: &str,
@@ -695,6 +831,7 @@ pub async fn read_response(
     session: Option<&str>,
     protocol_version: Option<&str>,
     want_id: &Value,
+    guard: &(dyn Fn() -> CmdResult<()> + Sync),
     mut resp: reqwest::Response,
 ) -> CmdResult<JsonRpcOutcome> {
     if !resp.status().is_success() {
@@ -726,39 +863,80 @@ pub async fn read_response(
         });
     }
 
-    let body = read_capped(&mut resp).await?;
+    let mut decoder = SseDecoder::default();
+    let mut bytes_read = 0usize;
     let mut answered = 0usize;
     let mut list_changed = false;
-    for event in parse_sse(&body) {
-        match classify_stream_message(&event, want_id) {
-            StreamMessage::Answer => {
-                return Ok(JsonRpcOutcome {
-                    result: event,
-                    answered_requests: answered,
-                    list_changed,
-                });
+    loop {
+        let chunk = resp
+            .chunk()
+            .await
+            .map_err(|e| CmdError(format!("Error reading MCP response: {e}")))?;
+        let at_end = chunk.is_none();
+        let events = match chunk {
+            Some(bytes) => {
+                bytes_read += bytes.len();
+                if bytes_read > MAX_BODY_BYTES {
+                    return Err(CmdError("MCP response exceeds the 2 MB limit.".into()));
+                }
+                decoder.push(&bytes)?
             }
-            StreamMessage::ServerRequest => {
-                // Phase 1 supports no client capabilities (empty in
-                // initialize), so nothing is a valid request target:
-                // answer -32601 (method not found) and NEVER pass it to the
-                // LLM. A failure to send the answer is non-fatal - the main
-                // response still counts.
-                let error = json!({
-                    "jsonrpc": "2.0",
-                    "id": event.get("id").cloned().unwrap_or(Value::Null),
-                    "error": { "code": -32601, "message": "Method not found" },
-                });
-                let _ = post_jsonrpc(client, url, &error, auth, session, protocol_version).await;
-                answered += 1;
+            None => decoder.finish()?,
+        };
+        for event in events {
+            // A legacy HTTP+SSE server opens with an `endpoint` event naming
+            // the URL to POST to - not a JSON-RPC message.
+            if event.event.as_deref() == Some("endpoint")
+                && serde_json::from_str::<Value>(&event.data).is_err()
+            {
+                return Err(unsupported_transport(
+                    "it opened a legacy HTTP+SSE event stream",
+                ));
             }
-            StreamMessage::ListChanged => list_changed = true,
-            StreamMessage::Ignored => {}
+            let Ok(message) = serde_json::from_str::<Value>(&event.data) else {
+                continue;
+            };
+            match classify_stream_message(&message, want_id) {
+                StreamMessage::Answer => {
+                    return Ok(JsonRpcOutcome {
+                        result: message,
+                        answered_requests: answered,
+                        list_changed,
+                    });
+                }
+                StreamMessage::ServerRequest => {
+                    // Phase 1 supports no client capabilities (empty in
+                    // initialize), so nothing is a valid request target:
+                    // answer -32601 (method not found) and NEVER pass it to
+                    // the LLM. A failure to send the answer is non-fatal -
+                    // the main response still counts. The answer carries
+                    // the auth header: bounded per response, and not once
+                    // the vault has locked.
+                    if answered >= MAX_SERVER_REQUESTS_PER_RESPONSE {
+                        return Err(CmdError(format!(
+                            "MCP server sent more than {MAX_SERVER_REQUESTS_PER_RESPONSE} requests of its own while answering - the request was abandoned."
+                        )));
+                    }
+                    guard()?;
+                    let error = json!({
+                        "jsonrpc": "2.0",
+                        "id": message.get("id").cloned().unwrap_or(Value::Null),
+                        "error": { "code": -32601, "message": "Method not found" },
+                    });
+                    let _ =
+                        post_jsonrpc(client, url, &error, auth, session, protocol_version).await;
+                    answered += 1;
+                }
+                StreamMessage::ListChanged => list_changed = true,
+                StreamMessage::Ignored => {}
+            }
+        }
+        if at_end {
+            return Err(CmdError(
+                "MCP server closed the SSE stream without answering the request.".into(),
+            ));
         }
     }
-    Err(CmdError(
-        "MCP server closed the SSE stream without answering the request.".into(),
-    ))
 }
 
 enum StreamMessage {
@@ -789,26 +967,18 @@ fn classify_stream_message(event: &Value, want_id: &Value) -> StreamMessage {
     StreamMessage::Ignored
 }
 
-/// Parse an SSE body into the JSON `data:` payloads, in order. Handles both
-/// LF and CRLF line/block endings.
+/// Parse a complete SSE body into the JSON `data:` payloads, in order
+/// (non-JSON events are skipped) - the same decoder `read_response` runs
+/// incrementally.
 pub fn parse_sse(body: &str) -> Vec<Value> {
-    let normalized = body.replace("\r\n", "\n");
-    let mut out = Vec::new();
-    for block in normalized.split("\n\n") {
-        let data: String = block
-            .lines()
-            .filter_map(|l| l.strip_prefix("data:"))
-            .map(|d| d.trim_start())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str(&data) {
-            out.push(v);
-        }
-    }
-    out
+    let mut decoder = SseDecoder::default();
+    // A &str is valid UTF-8, so neither call can fail.
+    let mut events = decoder.push(body.as_bytes()).unwrap_or_default();
+    events.extend(decoder.finish().unwrap_or_default());
+    events
+        .iter()
+        .filter_map(|e| serde_json::from_str(&e.data).ok())
+        .collect()
 }
 
 /// Extract the `result` or raise the JSON-RPC `error` as a CmdError.
@@ -832,13 +1002,13 @@ pub fn rpc_result(response: Value) -> CmdResult<Value> {
 /// Integration-test exposure of `request_once` (the internal name stays
 /// private; tests exercise the 404 / re-init flow through this alias).
 /// `generation = u64::MAX` and an unlocked vault keep the generation check
-/// inert for direct transport-level calls.
+/// inert for direct transport-level calls; the guard is a no-op.
 #[doc(hidden)]
 pub async fn request_once_test(
     ctx: &ServerContext,
     body: &Value,
 ) -> CmdResult<Option<JsonRpcOutcome>> {
-    request_once_unchecked(ctx, body).await
+    request_once_unchecked(ctx, body, &|| Ok(())).await
 }
 
 // ─── Session lifecycle ──────────────────────────────────────────────────────
@@ -907,17 +1077,23 @@ pub async fn initialize(
     ctx: &ServerContext,
 ) -> CmdResult<(McpSession, JsonRpcOutcome)> {
     ctx.checked(app)?;
-    initialize_unchecked(ctx).await
+    initialize_unchecked(ctx, &|| ctx.checked(app)).await
 }
 
 #[doc(hidden)]
 pub async fn initialize_test(ctx: &ServerContext) -> CmdResult<(McpSession, JsonRpcOutcome)> {
-    initialize_unchecked(ctx).await
+    initialize_unchecked(ctx, &|| Ok(())).await
 }
 
-async fn initialize_unchecked(ctx: &ServerContext) -> CmdResult<(McpSession, JsonRpcOutcome)> {
+/// `guard` runs before every further request this exchange sends on its own
+/// (the -32601 answers in `read_response`).
+async fn initialize_unchecked(
+    ctx: &ServerContext,
+    guard: &(dyn Fn() -> CmdResult<()> + Sync),
+) -> CmdResult<(McpSession, JsonRpcOutcome)> {
     // Production callers check the vault generation immediately before
-    // entering this helper; test callers use the unchecked transport seam.
+    // entering this helper and pass the same check as `guard`; test callers
+    // use the unchecked transport seam with a no-op guard.
     let id = Value::String(uuid::Uuid::new_v4().to_string());
     let body = json!({
         "jsonrpc": "2.0",
@@ -933,14 +1109,28 @@ async fn initialize_unchecked(ctx: &ServerContext) -> CmdResult<(McpSession, Jso
         },
     });
     let resp = post_jsonrpc(&ctx.client, &ctx.url, &body, auth_ref(ctx), None, None).await?;
+    // A legacy HTTP+SSE endpoint takes GET only: 405 on the initialize POST
+    // is the old transport, not a broken server.
+    if resp.status().as_u16() == 405 {
+        return Err(unsupported_transport("HTTP 405"));
+    }
     let session_header = resp
         .headers()
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let outcome =
-        read_response(&ctx.client, &ctx.url, auth_ref(ctx), None, None, &id, resp).await?;
+    let outcome = read_response(
+        &ctx.client,
+        &ctx.url,
+        auth_ref(ctx),
+        None,
+        None,
+        &id,
+        guard,
+        resp,
+    )
+    .await?;
     let result = rpc_result(outcome.result.clone())?;
     let negotiated = result
         .get("protocolVersion")
@@ -1004,12 +1194,15 @@ async fn request_once(
     body: &Value,
 ) -> CmdResult<Option<JsonRpcOutcome>> {
     ctx.checked(app)?;
-    request_once_unchecked(ctx, body).await
+    request_once_unchecked(ctx, body, &|| ctx.checked(app)).await
 }
 
+/// `guard` runs before every further request this exchange sends on its own
+/// (the -32601 answers in `read_response`).
 async fn request_once_unchecked(
     ctx: &ServerContext,
     body: &Value,
+    guard: &(dyn Fn() -> CmdResult<()> + Sync),
 ) -> CmdResult<Option<JsonRpcOutcome>> {
     let session = ctx
         .session
@@ -1035,6 +1228,7 @@ async fn request_once_unchecked(
         session.session_id.as_deref(),
         Some(&session.protocol_version),
         body.get("id").unwrap_or(&Value::Null),
+        guard,
         resp,
     )
     .await?;
@@ -1095,18 +1289,34 @@ async fn fetch_tools(ctx: &mut ServerContext, app: &AppHandle) -> CmdResult<Vec<
 /// Most tools/list pages one pass reads - far beyond what the tool cap needs.
 const MAX_TOOL_PAGES: usize = 100;
 
-/// The cursor for the next tools/list page once `pages_read` pages are in,
-/// or `None` when the listing is complete. A cursor the server already sent
-/// (an endless loop - including empty pages that never grow the tool count
-/// past the cap check) or a page beyond [`MAX_TOOL_PAGES`] fails the fetch:
-/// such a server must not hold a connect, and the vault guard it holds,
-/// forever. Failing rather than stopping short, because tools missing from a
-/// truncated list would be dropped from the stored record by `merge_tools`.
+/// The cursor for the next tools/list page once `pages_read` pages holding
+/// `tools_so_far` tools are in, or `None` when the listing is complete (no
+/// cursor, or an empty one). A server past the [`MAX_EXPOSED_TOOLS`] cap is
+/// refused as soon as it gets there - it would be refused at the end anyway,
+/// and reading on only grows memory. A cursor the server already sent (an
+/// endless loop - including empty pages that never grow the tool count) or a
+/// page beyond [`MAX_TOOL_PAGES`] fails the fetch too: such a server must
+/// not hold a connect, and the vault guard it holds, forever. Failing rather
+/// than stopping short, because tools missing from a truncated list would be
+/// dropped from the stored record by `merge_tools`.
 fn next_tools_page(
     seen: &mut std::collections::HashSet<String>,
     pages_read: usize,
+    tools_so_far: usize,
     next_cursor: Option<String>,
 ) -> CmdResult<Option<String>> {
+    let next_cursor = next_cursor.filter(|c| !c.is_empty());
+    if tools_so_far > MAX_EXPOSED_TOOLS {
+        return Err(CmdError(if next_cursor.is_some() {
+            format!(
+                "MCP server exposes more than {MAX_EXPOSED_TOOLS} tools ({tools_so_far} listed before SSHSpan stopped reading), above the {MAX_EXPOSED_TOOLS}-tool limit."
+            )
+        } else {
+            format!(
+                "MCP server exposes {tools_so_far} tools, above the {MAX_EXPOSED_TOOLS}-tool limit."
+            )
+        }));
+    }
     let Some(cursor) = next_cursor else {
         return Ok(None);
     };
@@ -1159,14 +1369,13 @@ async fn fetch_tools_once(
         cursor = next_tools_page(
             &mut seen_cursors,
             pages_read,
+            tools.len(),
             result
                 .get("nextCursor")
                 .and_then(|c| c.as_str())
                 .map(String::from),
         )?;
-        // A runaway pagination loop (server always returns a cursor) stops
-        // well above the tool cap; fetch_tools' caller enforces the cap.
-        if cursor.is_none() || tools.len() > 1000 {
+        if cursor.is_none() {
             break;
         }
     }
@@ -1185,11 +1394,13 @@ async fn fetch_tools_once(
 /// before persisting, so a lock mid-connect can neither send the unsealed
 /// auth header nor write session/DB state afterward.
 ///
-/// It writes back the whole `record` its caller read, after the network
-/// round trips, so the CALLER must hold read access to the
-/// `VaultRotationLock` from before it read `record` until this returns (C1):
-/// a master-password change committing in between would otherwise get the
-/// record's old-sealed secret written back over the re-sealed one.
+/// After the network round trips it re-reads the record and writes the
+/// whole row back with the fetched tools merged in ([`merge_into_stored`]),
+/// so the CALLER must hold read access to the `VaultRotationLock` from
+/// before it read `record` until this returns (C1): a master-password change
+/// committing in between would otherwise get an old-sealed secret written
+/// back over the re-sealed one (or unseal `record`'s secret with the wrong
+/// password).
 async fn connect_server(
     app: &AppHandle,
     record: crate::db::McpServerRecord,
@@ -1222,11 +1433,15 @@ async fn connect_server(
     // write session-derived state into the DB.
     require_generation_current(app, generation)?;
 
-    let changed = changed_enabled_tools(&record.tools, &tool_defs);
-    let mut updated = record.clone();
-    updated.tools = merge_tools(&record.tools, &tool_defs);
-    updated.updated_at = chrono::Utc::now();
+    // Re-read the record now, after the round trips, and merge into that
+    // (A7-49). The caller's rotation guard still covers read and write.
     let db = &app.state::<crate::AppState>().db;
+    let stored_now = db.get_mcp_server(&record.id).map_err(|e| e.to_string())?;
+    let (updated, changed) =
+        merge_into_stored(&record, stored_now, &tool_defs).inspect_err(|_| {
+            // The session belongs to settings that are gone: never reuse it.
+            app.state::<McpState>().remove_session(&record.id);
+        })?;
     db.save_mcp_server(&updated).map_err(|e| e.to_string())?;
     for tool in &changed {
         let _ = db.add_audit(
@@ -1238,11 +1453,65 @@ async fn connect_server(
     Ok((updated, changed))
 }
 
+/// The record a connect (or a call's tool-list refresh) saves after its
+/// network round trips, and the enabled tools whose definition changed. The
+/// fetched tools are merged into the record AS STORED NOW - re-read right
+/// before this - not into the snapshot the connect started from, so a tool
+/// toggled or a name edited during a slow connect is not reverted (A7-49).
+/// Nothing is saved when the server was removed meanwhile, or its URL or
+/// auth settings changed: the tools came from the old configuration.
+fn merge_into_stored(
+    started_from: &crate::db::McpServerRecord,
+    stored_now: Option<crate::db::McpServerRecord>,
+    fetched: &[Value],
+) -> CmdResult<(crate::db::McpServerRecord, Vec<String>)> {
+    let Some(mut now) = stored_now else {
+        return Err(CmdError("This MCP server was removed meanwhile.".into()));
+    };
+    if !same_connection(started_from, &now) {
+        return Err(CmdError(
+            "This MCP server's URL or auth settings changed meanwhile - test the connection again."
+                .into(),
+        ));
+    }
+    let changed = changed_enabled_tools(&now.tools, fetched);
+    now.tools = merge_tools(&now.tools, fetched);
+    now.updated_at = chrono::Utc::now();
+    Ok((now, changed))
+}
+
+/// Whether two snapshots of a server record send the same requests: the
+/// same URL and the same auth configuration.
+fn same_connection(a: &crate::db::McpServerRecord, b: &crate::db::McpServerRecord) -> bool {
+    a.url == b.url
+        && a.auth_type == b.auth_type
+        && a.auth_header_name == b.auth_header_name
+        && a.auth_secret == b.auth_secret
+        && a.auth_env_var == b.auth_env_var
+}
+
+/// Whether a stored tool's live definition differs from the one the user
+/// approved: it has a pin, and the latest fetched definition no longer
+/// hashes to it. `merge_tools` keeps the old pin when a definition changes,
+/// so this stays true - and the settings show "definition changed,
+/// re-approve" - until the user re-approves the tool (which pins the new
+/// definition) or disables it (which drops the pin). The pin and the current
+/// hash are both stored, so the flag is as persistent as the record (R6).
+/// If the server later reverts to the approved definition the flag clears
+/// but the tool stays disabled - it fails closed, and the user enables it
+/// again.
+pub fn definition_changed(tool: &crate::db::McpToolRecord) -> bool {
+    tool.pin_hash.is_some() && tool.pin_hash != tool.current_hash
+}
+
 /// Merge freshly-fetched tool definitions into the stored per-tool state.
 /// - New tools: disabled, no pin (default-deny).
-/// - Known tools: current_hash updated; an enabled tool whose definition no
-///   longer matches its pin is DISABLED (definition rug-pull - the caller
-///   audits it via `changed_enabled_tools`).
+/// - Known tools: current_hash updated; a tool whose definition no longer
+///   matches its pin is DISABLED and loses Auto-approve, and keeps its old
+///   pin so [`definition_changed`] reports it (definition rug-pull, A4-05 /
+///   A7-29 - the caller audits it via `changed_enabled_tools`). Re-enabling
+///   must be a fresh approval of the NEW definition, never the old
+///   Auto-approve carried over to it.
 /// - Tools the server no longer lists are dropped.
 /// - `input_schema` is the clamped canonical JSON of the definition's
 ///   inputSchema (object-only, byte-capped). The pin hash still hashes the
@@ -1262,9 +1531,9 @@ pub fn merge_tools(
                 Some(p) if p.pin_hash.as_deref() == Some(hash.as_str()) => {
                     (p.enabled, p.auto_approve, p.pin_hash.clone())
                 }
-                // Definition changed (or never pinned): a previously-enabled
-                // tool is disabled pending re-approval.
-                Some(p) => (false, p.auto_approve, p.pin_hash.clone()),
+                // Definition changed (or never pinned): disabled, without
+                // Auto-approve, pending re-approval; the old pin stays.
+                Some(p) => (false, false, p.pin_hash.clone()),
                 None => (false, false, None),
             };
             Some(crate::db::McpToolRecord {
@@ -1309,18 +1578,15 @@ pub fn changed_enabled_tools(
 
 // ─── Teardown on vault lock ─────────────────────────────────────────────────
 
-/// Resolve the auth header for a record WITHOUT touching app state beyond
-/// the vault password (safe to call mid-lock, after the generation bump but
-/// before the password store clears). Errors are the caller's to ignore or
-/// report; the value is Zeroizing either way.
-fn resolve_auth_for_teardown(
-    app: &AppHandle,
+/// Resolve the auth header for a record from the vault password alone (safe
+/// to call mid-lock, after the generation bump but before the password store
+/// clears). `None` when the vault is locked or the header cannot be
+/// resolved: a teardown then goes out without it. The value is Zeroizing.
+fn resolve_auth_with_password(
+    pw: Option<Zeroizing<String>>,
     record: &crate::db::McpServerRecord,
 ) -> Option<(String, Zeroizing<String>)> {
-    let pw = vault_password(app).ok()?;
-    if pw.is_empty() {
-        return None;
-    }
+    let pw = pw.filter(|p| !p.is_empty())?;
     resolve_auth_header(
         &record.auth_type,
         record.auth_header_name.as_deref(),
@@ -1410,7 +1676,7 @@ pub fn teardown_all(app: &AppHandle) {
             continue;
         };
         // BEFORE the store clear; the resolved value is Zeroizing.
-        let auth = resolve_auth_for_teardown(app, &rec);
+        let auth = resolve_auth_with_password(vault_password(app).ok(), &rec);
         jobs.push(TeardownJob {
             url,
             session_id: sid,
@@ -1436,11 +1702,15 @@ pub fn teardown_all(app: &AppHandle) {
             )
             .await
             {
-                let _ = app.state::<crate::AppState>().db.add_audit(
+                if let Err(audit_err) = app.state::<crate::AppState>().db.add_audit(
                     "mcp.session_teardown_failed",
                     None,
                     &e,
-                );
+                ) {
+                    log::warn!(
+                        "[sshspan-mcp] could not audit a failed MCP session teardown: {audit_err}"
+                    );
+                }
             }
         }
     });
@@ -1518,6 +1788,12 @@ fn tool_view(server_name: &str, tool: &crate::db::McpToolRecord) -> Value {
         "enabled": tool.enabled,
         "auto_approve": tool.auto_approve,
         "pinned": tool.pin_hash.is_some(),
+        // The server changed this tool after the user approved it: show the
+        // re-approve notice (R6). Cleared by re-approving or disabling it.
+        "definition_changed": definition_changed(tool),
+        // The definition this view shows; enabling sends it back as
+        // `expected_hash`, so only the reviewed definition is approved.
+        "definition_hash": tool.current_hash,
         // Bounded, object-only schema; never absent so renderer validation
         // cannot break on any stored tool.
         // Renderer-facing JSON follows MCP's camelCase schema field name.
@@ -1543,22 +1819,43 @@ pub fn mcp_list_servers(app: AppHandle) -> CmdResult<Value> {
     let servers: Vec<Value> = records
         .iter()
         .map(|r| {
-            let insecure = matches!(classify_url(&r.url), Ok((_, UrlClass::LoopbackInsecure)));
-            let enabled = r.tools.iter().filter(|t| t.enabled).count();
-            json!({
-                "id": r.id,
-                "name": r.name,
-                "url": r.url,
-                "auth_type": r.auth_type,
-                "confirmed": r.confirmed,
-                "loopback_insecure": insecure,
-                "status": state.status_of(&r.id),
-                "tool_count": enabled,
-                "tools": r.tools.iter().map(|t| tool_view(&r.name, t)).collect::<Vec<_>>(),
-            })
+            server_view(
+                r,
+                state.status_of(&r.id),
+                state.get_session(&r.id).map(|s| s.protocol_version),
+            )
         })
         .collect();
     Ok(Value::Array(servers))
+}
+
+/// One row of `mcp_list_servers`: everything the edit form needs to
+/// round-trip a server's settings (A4-07 / A7-30) - the custom header name,
+/// the environment variable's NAME (never its value) and whether a sealed
+/// secret is stored (never the secret) - plus the protocol version the live
+/// session negotiated (`null` when not connected).
+fn server_view(
+    r: &crate::db::McpServerRecord,
+    status: String,
+    protocol_version: Option<String>,
+) -> Value {
+    let insecure = matches!(classify_url(&r.url), Ok((_, UrlClass::LoopbackInsecure)));
+    let enabled = r.tools.iter().filter(|t| t.enabled).count();
+    json!({
+        "id": r.id,
+        "name": r.name,
+        "url": r.url,
+        "auth_type": r.auth_type,
+        "auth_header_name": r.auth_header_name,
+        "auth_env_var": r.auth_env_var,
+        "has_secret": r.auth_secret.is_some(),
+        "protocol_version": protocol_version,
+        "confirmed": r.confirmed,
+        "loopback_insecure": insecure,
+        "status": status,
+        "tool_count": enabled,
+        "tools": r.tools.iter().map(|t| tool_view(&r.name, t)).collect::<Vec<_>>(),
+    })
 }
 
 /// The enable-time collision check: given the FULL registry with the
@@ -1567,11 +1864,12 @@ pub fn mcp_list_servers(app: AppHandle) -> CmdResult<Value> {
 /// model-facing name set would be ambiguous (two tools behind one name
 /// means one approval could cover the other). Pure over records.
 pub fn enable_collision_error(records: &[crate::db::McpServerRecord]) -> Option<String> {
-    let registry: Vec<(String, Vec<String>)> = records
+    let registry: Vec<(String, String, Vec<String>)> = records
         .iter()
         .filter(|r| r.tools.iter().any(|t| t.enabled))
         .map(|r| {
             (
+                r.id.clone(),
                 r.name.clone(),
                 r.tools
                     .iter()
@@ -1598,14 +1896,233 @@ pub fn mcp_save_server(
     // Seals the auth secret and rewrites the whole record: not while a
     // master-password change is re-encrypting the vault (C1).
     let _rotation = crate::commands::rotation_shared(&app)?;
-    let pw = vault_password(&app)?;
+    save_server(
+        &app.state::<crate::AppState>().db,
+        app.state::<VaultPasswordStore>().inner(),
+        SaveServerArgs {
+            id,
+            name,
+            url,
+            auth_type,
+            auth_header_name,
+            auth_secret,
+            auth_env_var,
+        },
+    )
+}
+
+/// The arguments of [`mcp_save_server`]. For `auth_header_name`,
+/// `auth_secret` and `auth_env_var`, absent (or null) keeps what is stored,
+/// an empty string clears it, and anything else replaces it (see
+/// [`plan_auth`]).
+struct SaveServerArgs {
+    id: Option<String>,
+    name: String,
+    url: String,
+    auth_type: String,
+    auth_header_name: Option<String>,
+    auth_secret: Option<String>,
+    auth_env_var: Option<String>,
+}
+
+/// How an optional text argument of `mcp_save_server` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TextArg {
+    /// Absent or null: keep what is stored.
+    Absent,
+    /// An empty string: clear it.
+    Clear,
+    Set(String),
+}
+
+impl TextArg {
+    fn from_arg(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None => Self::Absent,
+            Some("") => Self::Clear,
+            Some(v) => Self::Set(v.to_string()),
+        }
+    }
+}
+
+/// The `auth_secret` argument, read like a [`TextArg`] but without holding
+/// on to the plaintext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretArg {
+    Absent,
+    Clear,
+    New,
+}
+
+impl SecretArg {
+    fn from_arg(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None => Self::Absent,
+            Some("") => Self::Clear,
+            Some(_) => Self::New,
+        }
+    }
+}
+
+/// What a save does with the record's sealed secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretPlan {
+    Keep,
+    Drop,
+    /// Seal the newly entered secret.
+    Seal,
+}
+
+/// The auth fields a save leaves on the record.
+#[derive(Debug, PartialEq, Eq)]
+struct AuthPlan {
+    header_name: Option<String>,
+    secret: SecretPlan,
+    env_var: Option<String>,
+}
+
+/// Decide the auth fields `mcp_save_server` stores, from the stored record
+/// (`None` for a new server) and the arguments (A4-07 / A7-30). Pure, so the
+/// rules are unit-testable:
+/// - An absent header name or env-var name keeps the stored one, so an edit
+///   that does not touch auth (a rename) keeps it; an empty string clears
+///   it. A header name exists only for custom_header (bearer formats
+///   Authorization itself); auth "none" clears every source.
+/// - Credential ORIGIN BINDING: a credential set up for one origin under one
+///   auth semantic never silently survives a change of either. When the
+///   URL, the auth type or the custom header name changes, the stored sealed
+///   secret is dropped, and so is an env-var binding the save does not name
+///   again - its value would otherwise be sent to the new origin unasked.
+/// - The source stays exclusive: a new secret replaces an env-var binding,
+///   a newly named env var replaces a stored secret.
+/// - bearer and custom_header must end up with a source: a server saved
+///   without one used to fail only at its first connect.
+fn plan_auth(
+    stored: Option<&crate::db::McpServerRecord>,
+    url: &str,
+    auth_type: &str,
+    header: TextArg,
+    secret: SecretArg,
+    env: TextArg,
+) -> Result<AuthPlan, String> {
+    if auth_type == "none" {
+        if matches!(header, TextArg::Set(_))
+            || secret == SecretArg::New
+            || matches!(env, TextArg::Set(_))
+        {
+            return Err("Auth type 'none' cannot carry a header, secret or env var.".into());
+        }
+        return Ok(AuthPlan {
+            header_name: None,
+            secret: SecretPlan::Drop,
+            env_var: None,
+        });
+    }
+    let header_name = if auth_type == "custom_header" {
+        let name = match header {
+            TextArg::Absent => stored.and_then(|r| r.auth_header_name.clone()),
+            TextArg::Clear => None,
+            TextArg::Set(name) => Some(name),
+        }
+        .ok_or_else(|| "Custom header auth requires a header name.".to_string())?;
+        validate_header_name(&name)?;
+        Some(name)
+    } else {
+        None
+    };
+    let rebound = stored.is_some_and(|r| {
+        r.url != url
+            || r.auth_type != auth_type
+            || (auth_type == "custom_header" && r.auth_header_name != header_name)
+    });
+    let kept_env = || {
+        stored
+            .filter(|_| !rebound)
+            .and_then(|r| r.auth_env_var.clone())
+    };
+    let kept_secret = if rebound {
+        SecretPlan::Drop
+    } else {
+        SecretPlan::Keep
+    };
+    let (secret, env_var) = match (secret, env) {
+        (SecretArg::New, _) => (SecretPlan::Seal, None),
+        (_, TextArg::Set(var)) => (SecretPlan::Drop, Some(var)),
+        (SecretArg::Clear, TextArg::Absent) => (SecretPlan::Drop, kept_env()),
+        (SecretArg::Clear, TextArg::Clear) => (SecretPlan::Drop, None),
+        (SecretArg::Absent, TextArg::Clear) => (kept_secret, None),
+        (SecretArg::Absent, TextArg::Absent) => (kept_secret, kept_env()),
+    };
+    let has_secret = match secret {
+        SecretPlan::Seal => true,
+        SecretPlan::Keep => stored.is_some_and(|r| r.auth_secret.is_some()),
+        SecretPlan::Drop => false,
+    };
+    if !has_secret && env_var.is_none() {
+        let had_source =
+            stored.is_some_and(|r| r.auth_secret.is_some() || r.auth_env_var.is_some());
+        return Err(if rebound && had_source {
+            "Changing the URL or the auth settings discards the stored secret or environment variable - enter it again for the new settings."
+                .to_string()
+        } else {
+            let kind = if auth_type == "bearer" {
+                "Bearer"
+            } else {
+                "Custom header"
+            };
+            format!("{kind} auth needs a secret or an environment variable name.")
+        });
+    }
+    Ok(AuthPlan {
+        header_name,
+        secret,
+        env_var,
+    })
+}
+
+/// The other stored server whose name gives the same model-facing tool
+/// prefix as `name`, compared case-insensitively (A4-12): two such servers
+/// could not be told apart on an Approve card or by the model.
+fn name_collision<'a>(
+    records: &'a [crate::db::McpServerRecord],
+    self_id: Option<&str>,
+    name: &str,
+) -> Option<&'a crate::db::McpServerRecord> {
+    let prefix = sanitize_tool_name_part(name).to_ascii_lowercase();
+    records.iter().find(|r| {
+        Some(r.id.as_str()) != self_id
+            && sanitize_tool_name_part(&r.name).to_ascii_lowercase() == prefix
+    })
+}
+
+/// [`mcp_save_server`] without the `AppHandle`, so its rules run against a
+/// real database in tests. The caller holds the rotation guard.
+fn save_server(
+    db: &crate::db::Database,
+    vault: &VaultPasswordStore,
+    args: SaveServerArgs,
+) -> CmdResult<Value> {
+    let SaveServerArgs {
+        id,
+        name,
+        url,
+        auth_type,
+        auth_header_name,
+        auth_secret,
+        auth_env_var,
+    } = args;
+    // The secret's plaintext is wiped when this frame ends.
+    let auth_secret = auth_secret.map(Zeroizing::new);
+    let pw = vault.get().unwrap_or_default();
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
     let name = name.trim().to_string();
+    // The rule is RFC 7230 token syntax (`is_token`), so say exactly that.
     if !is_token(&name) {
         return Err(
-            "Server name must be non-empty and contain only letters, digits, - and _.".into(),
+            "Server name must be non-empty and use only letters, digits and ! # $ % & ' * + - . ^ _ ` | ~ (no spaces)."
+                .into(),
         );
     }
     let (normalized_url, _class) = classify_url(&url)?;
@@ -1613,95 +2130,67 @@ pub fn mcp_save_server(
     if !matches!(auth_type.as_str(), "none" | "bearer" | "custom_header") {
         return Err("Auth type must be 'none', 'bearer' or 'custom_header'.".into());
     }
-    let auth_header_name = auth_header_name
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    match auth_type.as_str() {
-        "custom_header" => {
-            let n = auth_header_name
-                .as_deref()
-                .ok_or_else(|| CmdError("Custom header auth requires a header name.".into()))?;
-            validate_header_name(n).map_err(CmdError)?;
-        }
-        "none" if auth_header_name.is_some() || auth_secret.is_some() || auth_env_var.is_some() => {
-            return Err("Auth type 'none' cannot carry a header, secret or env var.".into());
-        }
-        _ => {}
-    }
-    let auth_env_var = auth_env_var
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let db = &app.state::<crate::AppState>().db;
-    let now = chrono::Utc::now();
-    let is_new = id.as_deref().filter(|s| !s.is_empty()).is_none();
-    let (record_id, mut record) = match id.as_deref().filter(|s| !s.is_empty()) {
+    let existing_id = id.filter(|s| !s.is_empty());
+    let stored = match existing_id.as_deref() {
         Some(existing) => {
             let mut r = db
                 .get_mcp_server(existing)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| CmdError("MCP server not found.".into()))?;
             r.id = existing.to_string();
-            (existing.to_string(), r)
+            Some(r)
         }
-        None => {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            (
-                new_id.clone(),
-                crate::db::McpServerRecord {
-                    id: new_id,
-                    name: String::new(),
-                    url: String::new(),
-                    auth_type: String::new(),
-                    auth_header_name: None,
-                    auth_secret: None,
-                    auth_env_var: None,
-                    confirmed: false,
-                    tools: Vec::new(),
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-        }
+        None => None,
     };
-    // ── Static credential ORIGIN BINDING ────────────────────────────────
-    // A sealed secret was entered for ONE origin under ONE auth semantic.
-    // Editing the URL, the auth type, or the custom header name changes the
-    // destination or the meaning, so the OLD secret must never survive the
-    // save: it is dropped here and a NEW secret must be entered for the new
-    // configuration. The auth SOURCE stays mutually exclusive: a record
-    // holds a sealed secret or an env-var name, never both.
-    let origin_changed = record.url != normalized_url;
-    let auth_semantics_changed =
-        record.auth_type != auth_type || record.auth_header_name != auth_header_name;
-    if !is_new && (origin_changed || auth_semantics_changed) {
-        record.auth_secret = None;
+    let plan = plan_auth(
+        stored.as_ref(),
+        &normalized_url,
+        &auth_type,
+        TextArg::from_arg(auth_header_name.as_deref()),
+        SecretArg::from_arg(auth_secret.as_deref().map(String::as_str)),
+        TextArg::from_arg(auth_env_var.as_deref()),
+    )
+    .map_err(CmdError)?;
+    let all = db.list_mcp_servers().map_err(|e| e.to_string())?;
+    if let Some(other) = name_collision(&all, existing_id.as_deref(), &name) {
+        return Err(CmdError(format!(
+            "An MCP server named '{}' already exists and '{name}' would share its model-facing tool names - choose a different name.",
+            other.name
+        )));
     }
+
+    let now = chrono::Utc::now();
+    let is_new = stored.is_none();
+    let mut record = stored.unwrap_or_else(|| crate::db::McpServerRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: String::new(),
+        url: String::new(),
+        auth_type: String::new(),
+        auth_header_name: None,
+        auth_secret: None,
+        auth_env_var: None,
+        confirmed: false,
+        tools: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    });
+    let record_id = record.id.clone();
     record.name = name;
     record.url = normalized_url;
     record.auth_type = auth_type;
-    record.auth_header_name = auth_header_name;
+    record.auth_header_name = plan.header_name;
+    record.auth_secret = match plan.secret {
+        SecretPlan::Keep => record.auth_secret.take(),
+        SecretPlan::Drop => None,
+        SecretPlan::Seal => {
+            let secret = auth_secret.as_deref().map_or("", |s| s.trim());
+            Some(crate::crypto::vault::seal(&pw, secret.as_bytes()).map_err(|e| e.to_string())?)
+        }
+    };
+    record.auth_env_var = plan.env_var;
     // Saving from the UI IS the user's re-confirmation of URL + auth source
     // (backup-restored entries become connectable only through here).
     record.confirmed = true;
-    if let Some(secret) = auth_secret.clone().filter(|s| !s.is_empty()) {
-        // A newly entered secret: the only source, replacing any env var.
-        let secret = Zeroizing::new(secret);
-        record.auth_secret = Some(
-            crate::crypto::vault::seal(&pw, secret.trim().as_bytes()).map_err(|e| e.to_string())?,
-        );
-        record.auth_env_var = None;
-    } else {
-        if auth_secret.is_some() {
-            // Explicit empty string = clear the stored secret.
-            record.auth_secret = None;
-        }
-        if auth_env_var.is_some() {
-            // An env-var name (re-)bound: the only source.
-            record.auth_secret = None;
-        }
-        record.auth_env_var = auth_env_var;
-    }
     // Belt-and-suspenders on the exclusive-source invariant.
     debug_assert!(
         record.auth_secret.is_none() || record.auth_env_var.is_none(),
@@ -1724,40 +2213,86 @@ pub async fn mcp_remove_server(app: AppHandle, id: String) -> CmdResult<Value> {
     // Not while a master-password change is re-encrypting the vault (C1):
     // the change re-seals this record's secret in place.
     let _rotation = crate::commands::rotation_shared(&app)?;
-    let db = &app.state::<crate::AppState>().db;
+    remove_server(
+        &app.state::<crate::AppState>().db,
+        app.state::<McpState>().inner(),
+        app.state::<VaultPasswordStore>().inner(),
+        &id,
+        REMOVE_TEARDOWN_TIMEOUT,
+    )
+    .await
+}
+
+/// How long removing a server waits for its session DELETE.
+pub const REMOVE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`mcp_remove_server`] without the `AppHandle`, so the integration tests
+/// can drive it against a mock server. The caller holds the rotation guard.
+///
+/// The live session is torn down first, best effort: the DELETE carries the
+/// static auth header (resolved while the vault is unlocked) and gets
+/// `teardown_timeout`. A refused, failed or timed-out teardown is audited
+/// (`mcp.session_teardown_failed`) and returned as `warning`, and the entry
+/// is removed all the same - the usual reason to remove a server is that it
+/// is gone, and it used to take a 60 s wait and a second click (A4-27 /
+/// A7-51). Refused while the vault is locked (A6-08).
+#[doc(hidden)]
+pub async fn remove_server(
+    db: &crate::db::Database,
+    state: &McpState,
+    vault: &VaultPasswordStore,
+    id: &str,
+    teardown_timeout: Duration,
+) -> CmdResult<Value> {
+    if !vault.is_set() {
+        return Err("Vault is locked.".into());
+    }
     let record = db
-        .get_mcp_server(&id)
+        .get_mcp_server(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| CmdError("MCP server not found.".into()))?;
-    // Session teardown BEFORE the entry disappears: the DELETE carries the
-    // static auth header (resolved while the vault is still unlocked), is
-    // actually awaited (removal is a user-initiated action, not the lock
-    // path), and only 405 is ignored - a refused teardown fails the removal
-    // instead of silently leaking the session.
-    if let Some(session) = app.state::<McpState>().remove_session(&id) {
-        if let Some(sid) = session.session_id {
-            if let Ok((url, _)) = classify_url(&record.url) {
-                let client = origin_client()?;
-                // Resolve the header BEFORE the record (and its sealed
-                // secret) is deleted; the value is Zeroizing.
-                let auth = resolve_auth_for_teardown(&app, &record);
-                delete_session(
-                    &client,
-                    &url,
-                    &sid,
-                    &session.protocol_version,
-                    auth.as_ref().map(|(n, v)| (n.as_str(), v)),
-                    &record.name,
-                )
-                .await
-                .map_err(CmdError)?;
+    let mut warning = None;
+    if let Some(session) = state.remove_session(id) {
+        if let (Some(sid), Ok((url, _))) = (session.session_id, classify_url(&record.url)) {
+            // Resolved BEFORE the record (and its sealed secret) is deleted;
+            // the value is Zeroizing.
+            let auth = resolve_auth_with_password(vault.get(), &record);
+            let failure = match origin_client() {
+                Err(e) => Some(e.0),
+                Ok(client) => {
+                    let teardown = delete_session(
+                        &client,
+                        &url,
+                        &sid,
+                        &session.protocol_version,
+                        auth.as_ref().map(|(n, v)| (n.as_str(), v)),
+                        &record.name,
+                    );
+                    match tokio::time::timeout(teardown_timeout, teardown).await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(e),
+                        Err(_) => Some(format!(
+                            "MCP session teardown for '{}' timed out after {} s.",
+                            record.name,
+                            teardown_timeout.as_secs()
+                        )),
+                    }
+                }
+            };
+            if let Some(e) = failure {
+                if let Err(audit_err) = db.add_audit("mcp.session_teardown_failed", Some(id), &e) {
+                    log::warn!(
+                        "[sshspan-mcp] could not audit a failed MCP session teardown: {audit_err}"
+                    );
+                }
+                warning = Some(e);
             }
         }
     }
-    db.delete_mcp_server(&id).map_err(|e| e.to_string())?;
-    db.add_audit("mcp.server_removed", Some(&id), &record.name)
+    db.delete_mcp_server(id).map_err(|e| e.to_string())?;
+    db.add_audit("mcp.server_removed", Some(id), &record.name)
         .map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true }))
+    Ok(json!({ "ok": true, "warning": warning }))
 }
 
 #[tauri::command]
@@ -1771,13 +2306,16 @@ pub async fn mcp_test_connection(app: AppHandle, id: String) -> CmdResult<Value>
         .map_err(|e| e.to_string())?
         .ok_or_else(|| CmdError("MCP server not found.".into()))?;
     let state = app.state::<McpState>();
-    let (updated, _changed) = connect_server(&app, record)
+    let (updated, changed) = connect_server(&app, record)
         .await
         .inspect_err(|e| state.record_status(&id, "error", Some(e.0.clone()), 0))?;
     state.record_status(&id, "connected", None, updated.tools.len());
     Ok(json!({
         "ok": true,
         "tools": updated.tools.iter().map(|t| tool_view(&updated.name, t)).collect::<Vec<_>>(),
+        // Enabled tools this connect found changed - now disabled, awaiting
+        // re-approval (A7-29); each tool's `definition_changed` says the same.
+        "changed": changed,
     }))
 }
 
@@ -1788,13 +2326,56 @@ pub fn mcp_set_tool_state(
     tool: String,
     enabled: bool,
     auto_approve: bool,
+    expected_hash: Option<String>,
 ) -> CmdResult<Value> {
     // Rewrites the whole record: not while a master-password change could
     // re-seal its secret in between (C1).
     let _rotation = crate::commands::rotation_shared(&app)?;
-    let db = &app.state::<crate::AppState>().db;
+    set_tool_state(
+        &app.state::<crate::AppState>().db,
+        app.state::<VaultPasswordStore>().inner(),
+        &id,
+        &tool,
+        enabled,
+        auto_approve,
+        expected_hash.as_deref(),
+    )
+}
+
+/// What enabling a tool says when the definition the user reviewed is no
+/// longer the one stored (see [`set_tool_state`]).
+const DEFINITION_MOVED: &str = "This tool's definition changed - review it and approve again.";
+
+/// What enabling a tool says when the request does not name the definition
+/// the user reviewed (see [`set_tool_state`]).
+const DEFINITION_NOT_NAMED: &str = "This approval does not say which tool definition you reviewed - reload the MCP server's tools, review the tool and approve it again.";
+
+/// [`mcp_set_tool_state`] without the `AppHandle`, so its gates run against a
+/// real database in tests. The caller holds the rotation guard.
+///
+/// Enabling is a compare-and-swap on the definition: `expected_hash` is the
+/// `definition_hash` of the tool view the user approved, it is required for
+/// every enable (a first approval as much as a re-approval), and the enable
+/// is refused unless it is still the stored current hash - otherwise a
+/// refresh that replaced the definition while the settings panel showed the
+/// old one would let a click (with Auto-approve ticked) approve a definition
+/// the user never saw. Disabling needs no hash.
+fn set_tool_state(
+    db: &crate::db::Database,
+    vault: &VaultPasswordStore,
+    id: &str,
+    tool: &str,
+    enabled: bool,
+    auto_approve: bool,
+    expected_hash: Option<&str>,
+) -> CmdResult<Value> {
+    // Approving or revoking a tool is a policy change: not while the vault
+    // is locked (A6-08).
+    if !vault.is_set() {
+        return Err("Vault is locked.".into());
+    }
     let mut record = db
-        .get_mcp_server(&id)
+        .get_mcp_server(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| CmdError("MCP server not found.".into()))?;
     let entry = record
@@ -1804,12 +2385,19 @@ pub fn mcp_set_tool_state(
         .ok_or_else(|| CmdError(format!("Tool '{tool}' not found on this MCP server.")))?;
     if enabled {
         // Enabling (re-)pins the CURRENT definition hash: that is the
-        // definition the user is approving.
+        // definition the user is approving - which also clears a pending
+        // "definition changed" notice (`definition_changed`).
         let Some(hash) = entry.current_hash.clone() else {
             return Err(CmdError(
                 "Tool definition unknown - connect to the server first.".into(),
             ));
         };
+        let Some(expected) = expected_hash else {
+            return Err(DEFINITION_NOT_NAMED.into());
+        };
+        if expected != hash {
+            return Err(DEFINITION_MOVED.into());
+        }
         entry.pin_hash = Some(hash);
     } else {
         // Disabling clears the pin: re-enabling re-approves the
@@ -1817,6 +2405,8 @@ pub fn mcp_set_tool_state(
         entry.pin_hash = None;
     }
     entry.enabled = enabled;
+    // Exactly as passed (masked by `enabled`): a re-approval never inherits
+    // an Auto-approve granted to an older definition.
     entry.auto_approve = auto_approve && enabled;
     record.updated_at = chrono::Utc::now();
     if enabled {
@@ -1854,7 +2444,7 @@ pub fn mcp_set_tool_state(
         db.save_mcp_server(&record).map_err(|e| e.to_string())?;
     }
     if enabled {
-        db.add_audit("mcp.tool_approved", Some(&id), &format!("tool={tool}"))
+        db.add_audit("mcp.tool_approved", Some(id), &format!("tool={tool}"))
             .map_err(|e| e.to_string())?;
     }
     Ok(json!({ "ok": true }))
@@ -1869,14 +2459,10 @@ pub async fn mcp_call_tool(
     arguments_json: String,
     approved: bool,
 ) -> CmdResult<Value> {
-    // THE GATE. Everything is enforced here, in Rust, independent of what
-    // the renderer offered the model:
-    //   1. the per-tab access level permits the call (yolo/execute run;
-    //      read/draft need the human's approval, attested by `approved`),
-    //   2. the server entry is confirmed,
-    //   3. the tool is enabled,
-    //   4. the tool's current definition still matches its pin,
-    //   5. auto_approve OR approved OR yolo.
+    // THE GATE ([`call_gate`]) is enforced here, in Rust, independent of
+    // what the renderer offered the model: the per-tab access level, the
+    // user's approval (`approved` - the renderer attests the clicked card),
+    // the confirmed entry, the enabled tool and its unchanged definition.
     let level = app
         .state::<crate::assistant::AssistantLevels>()
         .get(&tab_id);
@@ -1895,43 +2481,20 @@ pub async fn mcp_call_tool(
         .map_err(|_| CmdError("Tool arguments are not valid JSON.".into()))?;
     let fingerprint = arguments_fingerprint(&arguments_json);
 
-    let denied = |reason: String| -> CmdResult<Value> {
-        let _ = db.add_audit(
-            "mcp.tool_call",
-            Some(&id),
-            &format!(
-                "server={} tool={} args_sha256={} level={} outcome=denied reason={}",
-                record.name, tool, fingerprint, level, reason
-            ),
-        );
-        Err(CmdError(reason))
-    };
-
-    if !record.confirmed {
-        return denied("This MCP server entry has not been confirmed.".into());
-    }
-    if matches!(level.as_str(), "read" | "draft") && !approved {
-        return denied(format!(
-            "AI access level is '{level}' - tool calls need your approval."
-        ));
-    }
-    if !entry.enabled {
-        return denied(format!(
-            "Tool '{tool}' is not enabled - enable it in the MCP server settings."
-        ));
-    }
-    if !entry.auto_approve && !approved && level != "yolo" {
-        return denied(format!(
-            "Tool '{tool}' requires approval before it can run."
-        ));
-    }
-    if let (Some(pin), Some(current)) = (entry.pin_hash.as_deref(), entry.current_hash.as_deref()) {
-        if pin != current {
-            return denied(format!(
-                "Tool '{tool}' changed on the server since it was approved - re-approve it in the MCP settings."
-            ));
+    let approval = match call_gate(&level, approved, record.confirmed, entry) {
+        Ok(approval) => approval,
+        Err(reason) => {
+            let _ = db.add_audit(
+                "mcp.tool_call",
+                Some(&id),
+                &format!(
+                    "server={} tool={} args_sha256={} level={} outcome=denied reason={}",
+                    record.name, tool, fingerprint, level, reason
+                ),
+            );
+            return Err(CmdError(reason));
         }
-    }
+    };
 
     // A tools/list_changed refresh after the call rewrites the whole record:
     // a master-password change must not commit in between (C1).
@@ -1965,48 +2528,185 @@ pub async fn mcp_call_tool(
             "arguments": args_value,
         },
     });
-    let outcome = request_with_session(&app, &mut ctx, &body).await?;
-    require_generation_current(&app, generation)?;
-    let result = rpc_result(outcome.result)?;
-
-    // A tools/list_changed that arrived with this call (or with a mid-call
-    // re-initialize): re-fetch and re-run pinning so the NEXT call is
-    // already gated against fresh definitions.
-    if outcome.list_changed {
-        let refreshed = fetch_tools(&mut ctx, &app).await?;
+    // From here on the call may reach the server, so every outcome is
+    // audited (see finish_tool_call).
+    let called = async {
+        let outcome = request_with_session(&app, &mut ctx, &body).await?;
         require_generation_current(&app, generation)?;
-        if let Some(stored) = db.get_mcp_server(&id).map_err(|e| e.to_string())? {
-            let changed = changed_enabled_tools(&stored.tools, &refreshed);
-            let mut next = stored.clone();
-            next.tools = merge_tools(&stored.tools, &refreshed);
-            next.updated_at = chrono::Utc::now();
-            db.save_mcp_server(&next).map_err(|e| e.to_string())?;
-            for t in changed {
-                let _ = db.add_audit(
-                    "mcp.tool_definition_changed",
-                    Some(&id),
-                    &format!("server={} tool={}", record.name, t),
-                );
-            }
-        }
+        let list_changed = outcome.list_changed;
+        Ok::<_, CmdError>((rpc_result(outcome.result)?, list_changed))
     }
+    .await;
+    let audit = CallAudit {
+        server_id: &id,
+        server_name: &record.name,
+        tool: &tool,
+        args_sha256: &fingerprint,
+        level: &level,
+        approval,
+    };
+    finish_tool_call(db, &audit, called, || {
+        refresh_tools_after_call(&app, &mut ctx, db, &record, generation)
+    })
+    .await
+}
 
-    let (content, is_error) = shape_tool_result(&result);
-    let outcome_label = if entry.auto_approve {
+/// THE GATE for one MCP tool call (R6), pure over the stored tool so every
+/// rule is unit-testable. Enforced here, independent of what the renderer
+/// offered the model:
+///   1. the server entry is confirmed;
+///   2. at read/draft the user's approval of the card (`approved`) is
+///      required - a tool's Auto-approve applies only from execute up;
+///   3. the tool is enabled;
+///   4. at execute, the card's approval or the tool's own Auto-approve; YOLO
+///      needs neither;
+///   5. the tool has an approved definition and still matches it.
+///
+/// Returns who let the call run, for the audit row: "approved" (the card),
+/// "auto" (Auto-approve) or "yolo".
+fn call_gate(
+    level: &str,
+    approved: bool,
+    confirmed: bool,
+    entry: &crate::db::McpToolRecord,
+) -> Result<&'static str, String> {
+    let tool = &entry.name;
+    if !confirmed {
+        return Err("This MCP server entry has not been confirmed.".into());
+    }
+    if matches!(level, "read" | "draft") && !approved {
+        return Err(format!(
+            "AI access level is '{level}' - tool calls need your approval."
+        ));
+    }
+    if !entry.enabled {
+        return Err(format!(
+            "Tool '{tool}' is not enabled - enable it in the MCP server settings."
+        ));
+    }
+    if !entry.auto_approve && !approved && level != "yolo" {
+        return Err(format!(
+            "Tool '{tool}' requires approval before it can run."
+        ));
+    }
+    if entry.pin_hash.is_none() {
+        return Err(format!(
+            "Tool '{tool}' has no approved definition - enable it again in the MCP server settings."
+        ));
+    }
+    if definition_changed(entry) {
+        return Err(format!(
+            "Tool '{tool}' changed on the server since it was approved - re-approve it in the MCP settings."
+        ));
+    }
+    Ok(if approved {
+        "approved"
+    } else if entry.auto_approve {
         "auto"
     } else {
-        "approved"
+        "yolo"
+    })
+}
+
+/// What an `mcp.tool_call` audit row records about a call that passed the
+/// gate. The arguments themselves are never audited, only their SHA-256.
+struct CallAudit<'a> {
+    server_id: &'a str,
+    server_name: &'a str,
+    tool: &'a str,
+    args_sha256: &'a str,
+    level: &'a str,
+    /// Who let the call run: "approved" (the user's card), "auto" (the
+    /// tool's own Auto-approve) or "yolo".
+    approval: &'static str,
+}
+
+impl CallAudit<'_> {
+    /// `result`: "ok", "error" (the tool reported isError) or "failed" (no
+    /// usable answer - the call may or may not have run).
+    fn write(&self, db: &crate::db::Database, result: &str) -> anyhow::Result<()> {
+        db.add_audit(
+            "mcp.tool_call",
+            Some(self.server_id),
+            &format!(
+                "server={} tool={} args_sha256={} level={} outcome={} result={}",
+                self.server_name, self.tool, self.args_sha256, self.level, self.approval, result
+            ),
+        )
+    }
+}
+
+/// The tail of [`mcp_call_tool`] once the request has gone out: `called` is
+/// the tools/call result and whether a tools/list_changed came with it,
+/// `refresh` re-fetches and re-pins the server's tools.
+///
+/// Every outcome writes the `mcp.tool_call` audit row - a call that failed
+/// may still have run on the server. And once the tool HAS run, nothing
+/// after it turns the call into an error: a failed refresh (or audit write)
+/// comes back as `warning` next to the result, because the model, told
+/// "error", would retry a side effect that already happened.
+async fn finish_tool_call<F, Fut>(
+    db: &crate::db::Database,
+    audit: &CallAudit<'_>,
+    called: CmdResult<(Value, bool)>,
+    refresh: F,
+) -> CmdResult<Value>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = CmdResult<()>>,
+{
+    let (result, list_changed) = match called {
+        Ok(called) => called,
+        Err(e) => {
+            if let Err(audit_err) = audit.write(db, "failed") {
+                log::warn!("[sshspan-mcp] could not audit a failed MCP tool call: {audit_err}");
+            }
+            return Err(e);
+        }
     };
-    db.add_audit(
-        "mcp.tool_call",
-        Some(&id),
-        &format!(
-            "server={} tool={} args_sha256={} level={} outcome={}",
-            record.name, tool, fingerprint, level, outcome_label
-        ),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true, "content": content, "is_error": is_error }))
+    let mut warnings: Vec<String> = Vec::new();
+    // Re-pin so the NEXT call is gated against the fresh definitions.
+    if list_changed {
+        if let Err(e) = refresh().await {
+            warnings.push(format!(
+                "The tool ran, but refreshing this server's tool list afterwards failed: {e}"
+            ));
+        }
+    }
+    let (content, is_error) = shape_tool_result(&result);
+    if let Err(e) = audit.write(db, if is_error { "error" } else { "ok" }) {
+        log::warn!("[sshspan-mcp] could not audit an MCP tool call: {e}");
+        warnings.push(format!(
+            "The tool ran, but its audit row could not be written: {e}"
+        ));
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
+    Ok(json!({ "ok": true, "content": content, "is_error": is_error, "warning": warning }))
+}
+
+/// A tools/list_changed that arrived with a call (or with a mid-call
+/// re-initialize): re-fetch and re-run pinning so the NEXT call is already
+/// gated against fresh definitions. The caller holds the rotation guard.
+async fn refresh_tools_after_call(
+    app: &AppHandle,
+    ctx: &mut ServerContext,
+    db: &crate::db::Database,
+    record: &crate::db::McpServerRecord,
+    generation: u64,
+) -> CmdResult<()> {
+    let refreshed = fetch_tools(ctx, app).await?;
+    require_generation_current(app, generation)?;
+    let stored_now = db.get_mcp_server(&record.id).map_err(|e| e.to_string())?;
+    let (next, changed) = merge_into_stored(record, stored_now, &refreshed)?;
+    db.save_mcp_server(&next).map_err(|e| e.to_string())?;
+    for t in changed {
+        let _ = db.add_audit(
+            "mcp.tool_definition_changed",
+            Some(&record.id),
+            &format!("server={} tool={}", record.name, t),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2021,21 +2721,21 @@ mod tests {
     #[test]
     fn tools_list_pagination_stops_on_a_repeated_cursor_and_at_the_page_cap() {
         let mut seen = std::collections::HashSet::new();
-        assert_eq!(next_tools_page(&mut seen, 1, None).unwrap(), None);
+        assert_eq!(next_tools_page(&mut seen, 1, 0, None).unwrap(), None);
         assert_eq!(
-            next_tools_page(&mut seen, 1, Some("c1".into())).unwrap(),
+            next_tools_page(&mut seen, 1, 0, Some("c1".into())).unwrap(),
             Some("c1".into())
         );
         assert_eq!(
-            next_tools_page(&mut seen, 2, Some("c2".into())).unwrap(),
+            next_tools_page(&mut seen, 2, 0, Some("c2".into())).unwrap(),
             Some("c2".into())
         );
-        let looped = next_tools_page(&mut seen, 3, Some("c1".into())).unwrap_err();
+        let looped = next_tools_page(&mut seen, 3, 0, Some("c1".into())).unwrap_err();
         assert!(looped.0.contains("repeated"), "{}", looped.0);
 
         let mut fresh = std::collections::HashSet::new();
-        assert!(next_tools_page(&mut fresh, MAX_TOOL_PAGES - 1, Some("a".into())).is_ok());
-        let capped = next_tools_page(&mut fresh, MAX_TOOL_PAGES, Some("b".into())).unwrap_err();
+        assert!(next_tools_page(&mut fresh, MAX_TOOL_PAGES - 1, 0, Some("a".into())).is_ok());
+        let capped = next_tools_page(&mut fresh, MAX_TOOL_PAGES, 0, Some("b".into())).unwrap_err();
         assert!(capped.0.contains("pages"), "{}", capped.0);
     }
 
@@ -2145,31 +2845,46 @@ mod tests {
         assert_eq!(name_a, exposed_tool_name("srv", &long_a));
     }
 
+    /// One registry entry for `build_name_map`: (server id, name, tools).
+    fn entry(id: &str, name: &str, tools: &[&str]) -> (String, String, Vec<String>) {
+        (
+            id.into(),
+            name.into(),
+            tools.iter().map(|t| (*t).to_string()).collect(),
+        )
+    }
+
     #[test]
     fn name_map_rejects_collisions_within_and_across_servers() {
         // Within one server: "a b" and "a_b" sanitize identically.
-        let err = build_name_map(&[("srv".into(), vec!["a b".into(), "a_b".into()])])
-            .err()
-            .expect("same-server collision must be rejected");
+        let err = build_name_map(&[entry("s1", "srv", &["a b", "a_b"])])
+            .expect_err("same-server collision must be rejected");
         assert!(err.contains("same model-facing name"), "{err}");
-        assert!(build_name_map(&[("srv".into(), vec!["a b".into(), "c".into()])]).is_ok());
+        assert!(build_name_map(&[entry("s1", "srv", &["a b", "c"])]).is_ok());
         // Across servers: two servers with names that sanitize identically.
         let err = build_name_map(&[
-            ("my srv".into(), vec!["t1".into()]),
-            ("my_srv".into(), vec!["t2".into()]),
+            entry("s1", "my srv", &["t1"]),
+            entry("s2", "my_srv", &["t2"]),
         ])
-        .err()
-        .expect("server-name collision must be rejected");
+        .expect_err("server-name collision must be rejected");
         assert!(err.contains("same model-facing prefix"), "{err}");
+        // Two servers with the SAME name are two servers (keyed by id), not
+        // one: refused as well.
+        let err = build_name_map(&[entry("s1", "srv", &["t"]), entry("s2", "srv", &["t"])])
+            .expect_err("equal names on two servers must be rejected");
+        assert!(err.contains("both named 'srv'"), "{err}");
+        // The exposed name maps back to the server's id.
+        let map = build_name_map(&[entry("s1", "srv", &["t"])]).unwrap();
+        assert_eq!(map["mcp__srv__t"], ("s1".to_string(), "t".to_string()));
         // Built-in names are structurally out of reach (every exposed name
         // starts with "mcp__"); the belt-and-suspenders check must not
         // false-positive on a tool that merely shares a suffix.
-        assert!(build_name_map(&[("mcp".into(), vec!["run_command".into()])]).is_ok());
+        assert!(build_name_map(&[entry("s1", "mcp", &["run_command"])]).is_ok());
         // The identical tool name on two DIFFERENT (distinctly named)
         // servers produces two distinct exposed names and is fine.
         assert!(build_name_map(&[
-            ("alpha".into(), vec!["search".into()]),
-            ("beta".into(), vec!["search".into()]),
+            entry("s1", "alpha", &["search"]),
+            entry("s2", "beta", &["search"])
         ])
         .is_ok());
     }
@@ -2739,5 +3454,740 @@ mod tests {
         assert_eq!(exposed_tool_name("alpha", "search"), "mcp__alpha__search");
         assert_eq!(exposed_tool_name("beta", "search"), "mcp__beta__search");
         assert!(enable_collision_error(&records).is_none());
+    }
+
+    // ── RU2 helpers ─────────────────────────────────────────────────────
+
+    fn temp_db() -> crate::db::Database {
+        crate::db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-mcp-ru2-{}.sqlite", uuid::Uuid::new_v4())),
+        )
+        .unwrap()
+    }
+
+    fn unlocked_vault() -> VaultPasswordStore {
+        let vault = VaultPasswordStore::new();
+        vault.set("test-master-pw".into());
+        vault
+    }
+
+    /// A stored tool pinned to `def` (the state approval writes).
+    fn tool_pinned_to(def: &Value, enabled: bool) -> crate::db::McpToolRecord {
+        let mut tool = merge_tools(&[], std::slice::from_ref(def)).remove(0);
+        tool.enabled = enabled;
+        tool.pin_hash = tool.current_hash.clone();
+        tool
+    }
+
+    fn save_args(id: Option<&str>, name: &str, url: &str, auth_type: &str) -> SaveServerArgs {
+        SaveServerArgs {
+            id: id.map(String::from),
+            name: name.into(),
+            url: url.into(),
+            auth_type: auth_type.into(),
+            auth_header_name: None,
+            auth_secret: None,
+            auth_env_var: None,
+        }
+    }
+
+    fn saved_id(out: Value) -> String {
+        out["id"].as_str().expect("save returns the id").to_string()
+    }
+
+    // ── Rug-pull guard the UI can show (R6: A4-05, A7-29, A8-15) ────────
+
+    #[test]
+    fn a_changed_definition_is_disabled_loses_auto_approve_and_is_flagged() {
+        let mut rug = stored_tool("rug", "old description", true, true);
+        rug.auto_approve = true;
+        let stored = vec![rug, stored_tool("same", "unchanged", true, true)];
+        let fetched = vec![
+            json!({ "name": "rug", "description": "NEW malicious description" }),
+            json!({ "name": "same", "description": "unchanged" }),
+            json!({ "name": "new", "description": "brand new tool" }),
+        ];
+        let merged = merge_tools(&stored, &fetched);
+        let rug = merged.iter().find(|t| t.name == "rug").unwrap();
+        assert!(!rug.enabled);
+        assert!(
+            !rug.auto_approve,
+            "a changed definition must not keep the old Auto-approve"
+        );
+        assert_eq!(
+            rug.pin_hash, stored[0].pin_hash,
+            "the old pin is kept, so the change stays detectable"
+        );
+        assert_eq!(tool_view("srv", rug)["definition_changed"], true);
+        for name in ["same", "new"] {
+            let t = merged.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(tool_view("srv", t)["definition_changed"], false, "{name}");
+        }
+    }
+
+    #[test]
+    fn re_enabling_a_changed_tool_pins_the_new_definition_and_clears_the_flag() {
+        let db = temp_db();
+        // A rug-pulled tool as a connect leaves it: disabled, old pin kept.
+        let old = json!({ "name": "rug", "description": "old" });
+        let new = json!({ "name": "rug", "description": "new" });
+        let mut record = record_with_tools("s1", "srv", &[]);
+        let mut tool = tool_pinned_to(&old, false);
+        tool.current_hash = Some(tool_definition_hash(&new));
+        record.tools = vec![tool];
+        db.save_mcp_server(&record).unwrap();
+        assert_eq!(
+            tool_view("srv", &record.tools[0])["definition_changed"],
+            true
+        );
+
+        let shown = tool_definition_hash(&new);
+        set_tool_state(
+            &db,
+            &unlocked_vault(),
+            "s1",
+            "rug",
+            true,
+            false,
+            Some(&shown),
+        )
+        .unwrap();
+        let t = db.get_mcp_server("s1").unwrap().unwrap().tools.remove(0);
+        assert!(
+            t.enabled && !t.auto_approve,
+            "Auto-approve is stored only as passed"
+        );
+        assert_eq!(
+            t.pin_hash, t.current_hash,
+            "re-approval pins the definition the user sees now"
+        );
+        assert_eq!(tool_view("srv", &t)["definition_changed"], false);
+    }
+
+    // ── Lock gates (A6-08) ──────────────────────────────────────────────
+
+    #[test]
+    fn tool_toggles_are_refused_while_the_vault_is_locked() {
+        let db = temp_db();
+        let mut record = record_with_tools("s1", "srv", &[("t", false)]);
+        record.tools[0].current_hash = Some("h".into());
+        db.save_mcp_server(&record).unwrap();
+        let err = set_tool_state(
+            &db,
+            &VaultPasswordStore::new(),
+            "s1",
+            "t",
+            true,
+            false,
+            Some("h"),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "Vault is locked.");
+        assert!(!db.get_mcp_server("s1").unwrap().unwrap().tools[0].enabled);
+        set_tool_state(&db, &unlocked_vault(), "s1", "t", true, false, Some("h")).unwrap();
+    }
+
+    // ── Approval bound to the reviewed definition (review round 1) ─────
+
+    /// A stored server `s1` with tool `t` whose stored definition moved from
+    /// `old` to `new`; `pinned_old` says whether the user had approved `old`.
+    fn tool_whose_definition_moved(
+        db: &crate::db::Database,
+        old: &Value,
+        new: &Value,
+        pinned_old: bool,
+    ) {
+        let mut record = record_with_tools("s1", "srv", &[]);
+        let mut tool = tool_pinned_to(old, false);
+        if !pinned_old {
+            tool.pin_hash = None;
+        }
+        tool.current_hash = Some(tool_definition_hash(new));
+        record.tools = vec![tool];
+        db.save_mcp_server(&record).unwrap();
+    }
+
+    fn stored_tool_t(db: &crate::db::Database) -> crate::db::McpToolRecord {
+        db.get_mcp_server("s1").unwrap().unwrap().tools.remove(0)
+    }
+
+    const REAPPROVE: &str = "This tool's definition changed - review it and approve again.";
+
+    /// The TOCTOU the review found: a refresh replaced (and flagged) a tool's
+    /// definition while the settings panel still showed the old one. Enabling
+    /// it, Auto-approve ticked or not, must not approve the definition the
+    /// user never saw.
+    #[test]
+    fn enabling_with_a_stale_definition_hash_is_refused() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let old = json!({ "name": "t", "description": "old" });
+        let new = json!({ "name": "t", "description": "new" });
+        tool_whose_definition_moved(&db, &old, &new, true);
+        let shown = tool_definition_hash(&old);
+        let err = set_tool_state(&db, &vault, "s1", "t", true, true, Some(&shown)).unwrap_err();
+        assert_eq!(err.0, REAPPROVE);
+        let t = stored_tool_t(&db);
+        assert!(!t.enabled && !t.auto_approve, "nothing was approved");
+        assert!(definition_changed(&t), "the notice stays up");
+        // The same check binds a first approval: the panel showed `old`, the
+        // server meanwhile serves `new`.
+        let db = temp_db();
+        tool_whose_definition_moved(&db, &old, &new, false);
+        let err = set_tool_state(&db, &vault, "s1", "t", true, false, Some(&shown)).unwrap_err();
+        assert_eq!(err.0, REAPPROVE);
+        assert!(!stored_tool_t(&db).enabled);
+    }
+
+    /// Every enable names the definition the user reviewed (fix round 1b):
+    /// without `expected_hash` it is refused - a first approval as much as a
+    /// re-approval - and the message sends the user to reload and review.
+    #[test]
+    fn enabling_without_a_definition_hash_is_refused() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let def = json!({ "name": "t", "description": "d" });
+        // Never approved and unchanged: still needs the hash.
+        tool_whose_definition_moved(&db, &def, &def, false);
+        let err = set_tool_state(&db, &vault, "s1", "t", true, false, None).unwrap_err();
+        assert!(
+            err.0.contains("reload") && err.0.contains("review"),
+            "{}",
+            err.0
+        );
+        assert!(!stored_tool_t(&db).enabled);
+        // A flagged tool likewise, Auto-approve or not.
+        let db = temp_db();
+        let new = json!({ "name": "t", "description": "new" });
+        tool_whose_definition_moved(&db, &def, &new, true);
+        let err = set_tool_state(&db, &vault, "s1", "t", true, true, None).unwrap_err();
+        assert!(
+            err.0.contains("reload") && err.0.contains("review"),
+            "{}",
+            err.0
+        );
+        let t = stored_tool_t(&db);
+        assert!(!t.enabled && !t.auto_approve, "nothing was approved");
+        assert!(definition_changed(&t), "the notice stays up");
+    }
+
+    #[test]
+    fn enabling_with_the_shown_definition_hash_pins_it_and_clears_the_flag() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let old = json!({ "name": "t", "description": "old" });
+        let new = json!({ "name": "t", "description": "new" });
+        tool_whose_definition_moved(&db, &old, &new, true);
+        let shown = tool_definition_hash(&new);
+        set_tool_state(&db, &vault, "s1", "t", true, true, Some(&shown)).unwrap();
+        let t = stored_tool_t(&db);
+        assert!(t.enabled && t.auto_approve);
+        assert_eq!(t.pin_hash.as_deref(), Some(shown.as_str()));
+        assert!(!definition_changed(&t));
+    }
+
+    #[test]
+    fn disabling_a_tool_needs_no_definition_hash() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let old = json!({ "name": "t", "description": "old" });
+        let new = json!({ "name": "t", "description": "new" });
+        tool_whose_definition_moved(&db, &old, &new, true);
+        set_tool_state(&db, &vault, "s1", "t", false, false, None).unwrap();
+        set_tool_state(&db, &vault, "s1", "t", false, true, Some("stale")).unwrap();
+        let t = stored_tool_t(&db);
+        assert!(!t.enabled && !t.auto_approve && t.pin_hash.is_none());
+    }
+
+    /// The over-cap error tells the truth about whether the listing was
+    /// complete (review round 1).
+    #[test]
+    fn the_tool_cap_error_says_whether_the_listing_was_complete() {
+        let mut seen = std::collections::HashSet::new();
+        let complete = next_tools_page(&mut seen, 1, 70, None).unwrap_err();
+        assert_eq!(
+            complete.0,
+            "MCP server exposes 70 tools, above the 64-tool limit."
+        );
+        let complete = next_tools_page(&mut seen, 1, 70, Some(String::new())).unwrap_err();
+        assert!(!complete.0.contains("stopped reading"), "{}", complete.0);
+        let partial = next_tools_page(&mut seen, 1, 70, Some("more".into())).unwrap_err();
+        assert!(
+            partial.0.contains("more than 64") && partial.0.contains("stopped reading"),
+            "{}",
+            partial.0
+        );
+    }
+
+    /// The server-name rule is described as it is checked: RFC 7230 token
+    /// characters, not only letters, digits, - and _ (review round 1).
+    #[test]
+    fn the_server_name_rule_is_described_as_it_is_checked() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let err = save_server(
+            &db,
+            &vault,
+            save_args(None, "my server", "https://a.example.com", "none"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            "Server name must be non-empty and use only letters, digits and ! # $ % & ' * + - . ^ _ ` | ~ (no spaces)."
+        );
+        // Characters the message lists are accepted.
+        save_server(
+            &db,
+            &vault,
+            save_args(None, "a.b~c!", "https://a.example.com", "none"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_tool_view_carries_the_definition_hash_to_send_back() {
+        let def = json!({ "name": "t", "description": "d" });
+        let tool = tool_pinned_to(&def, true);
+        let view = tool_view("srv", &tool);
+        assert_eq!(view["definition_hash"], tool_definition_hash(&def).as_str());
+    }
+
+    // ── Settings round-trip (A4-07, A7-30, A4-12) ───────────────────────
+
+    #[test]
+    fn the_server_list_round_trips_auth_settings_without_the_secret() {
+        let mut r = record_with_tools("s1", "srv", &[]);
+        r.auth_type = "custom_header".into();
+        r.auth_header_name = Some("X-Api-Key".into());
+        r.auth_secret = Some("SEALED-BLOB".into());
+        let v = server_view(&r, "connected".into(), Some("2025-06-18".into()));
+        assert_eq!(v["auth_header_name"], "X-Api-Key");
+        assert_eq!(v["has_secret"], true);
+        assert_eq!(v["auth_env_var"], Value::Null);
+        assert_eq!(v["protocol_version"], "2025-06-18");
+        assert!(
+            !v.to_string().contains("SEALED-BLOB"),
+            "the sealed secret never crosses IPC"
+        );
+        let mut e = record_with_tools("s2", "env", &[]);
+        e.auth_type = "bearer".into();
+        e.auth_env_var = Some("GITHUB_TOKEN".into());
+        let v = server_view(&e, "unknown".into(), None);
+        assert_eq!(v["auth_env_var"], "GITHUB_TOKEN");
+        assert_eq!(v["has_secret"], false);
+        assert_eq!(v["protocol_version"], Value::Null);
+    }
+
+    #[test]
+    fn an_absent_env_var_keeps_the_stored_binding() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let mut args = save_args(None, "gh", "https://mcp.example.com/mcp", "bearer");
+        args.auth_env_var = Some("GITHUB_TOKEN".into());
+        let id = saved_id(save_server(&db, &vault, args).unwrap());
+        // Rename only: the form sends no env var (absent) - the binding stays.
+        save_server(
+            &db,
+            &vault,
+            save_args(Some(&id), "github", "https://mcp.example.com/mcp", "bearer"),
+        )
+        .unwrap();
+        let r = db.get_mcp_server(&id).unwrap().unwrap();
+        assert_eq!(r.name, "github");
+        assert_eq!(r.auth_env_var.as_deref(), Some("GITHUB_TOKEN"));
+        // An explicit empty string clears it - and a bearer server left with
+        // no auth source is refused.
+        let mut clear = save_args(Some(&id), "github", "https://mcp.example.com/mcp", "bearer");
+        clear.auth_env_var = Some(String::new());
+        let err = save_server(&db, &vault, clear).unwrap_err();
+        assert!(err.0.contains("environment variable"), "{}", err.0);
+        // Switching to auth "none" drops it legitimately.
+        save_server(
+            &db,
+            &vault,
+            save_args(Some(&id), "github", "https://mcp.example.com/mcp", "none"),
+        )
+        .unwrap();
+        assert_eq!(db.get_mcp_server(&id).unwrap().unwrap().auth_env_var, None);
+    }
+
+    #[test]
+    fn an_absent_header_name_keeps_the_stored_custom_header() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let mut args = save_args(None, "kb", "https://kb.example.com/mcp", "custom_header");
+        args.auth_header_name = Some("X-Api-Key".into());
+        args.auth_env_var = Some("KB_TOKEN".into());
+        let id = saved_id(save_server(&db, &vault, args).unwrap());
+        save_server(
+            &db,
+            &vault,
+            save_args(
+                Some(&id),
+                "kb2",
+                "https://kb.example.com/mcp",
+                "custom_header",
+            ),
+        )
+        .unwrap();
+        let r = db.get_mcp_server(&id).unwrap().unwrap();
+        assert_eq!(r.auth_header_name.as_deref(), Some("X-Api-Key"));
+        assert_eq!(r.auth_env_var.as_deref(), Some("KB_TOKEN"));
+    }
+
+    #[test]
+    fn a_bearer_or_custom_header_server_needs_an_auth_source() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let err = save_server(
+            &db,
+            &vault,
+            save_args(None, "a", "https://a.example.com", "bearer"),
+        )
+        .unwrap_err();
+        assert!(
+            err.0.contains("secret or an environment variable"),
+            "{}",
+            err.0
+        );
+        let mut custom = save_args(None, "b", "https://b.example.com", "custom_header");
+        custom.auth_header_name = Some("X-Key".into());
+        assert!(save_server(&db, &vault, custom).is_err());
+        assert!(
+            db.list_mcp_servers().unwrap().is_empty(),
+            "nothing was saved"
+        );
+        // A URL change discards the stored credential binding; with nothing
+        // new entered the save is refused and changes nothing.
+        let mut env = save_args(None, "c", "https://c.example.com", "bearer");
+        env.auth_env_var = Some("TOKEN".into());
+        let id = saved_id(save_server(&db, &vault, env).unwrap());
+        let err = save_server(
+            &db,
+            &vault,
+            save_args(Some(&id), "c", "https://elsewhere.example.com", "bearer"),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("discards"), "{}", err.0);
+        assert_eq!(
+            db.get_mcp_server(&id).unwrap().unwrap().url,
+            "https://c.example.com"
+        );
+    }
+
+    #[test]
+    fn server_names_that_collide_as_tool_prefixes_are_refused() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let id = saved_id(
+            save_server(
+                &db,
+                &vault,
+                save_args(None, "my-srv", "https://a.example.com", "none"),
+            )
+            .unwrap(),
+        );
+        for clash in ["my_srv", "My.Srv", "MY-SRV"] {
+            let err = save_server(
+                &db,
+                &vault,
+                save_args(None, clash, "https://b.example.com", "none"),
+            )
+            .unwrap_err();
+            assert!(err.0.contains("my-srv"), "{clash}: {}", err.0);
+        }
+        // The same server re-saved under its own name is fine, and so is a
+        // distinct name.
+        save_server(
+            &db,
+            &vault,
+            save_args(Some(&id), "my-srv", "https://a.example.com", "none"),
+        )
+        .unwrap();
+        save_server(
+            &db,
+            &vault,
+            save_args(None, "other", "https://b.example.com", "none"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn two_servers_with_the_same_name_cannot_both_expose_tools() {
+        let records = vec![
+            record_with_tools("s1", "srv", &[("t", true)]),
+            record_with_tools("s2", "srv", &[("t", true)]),
+        ];
+        let err = enable_collision_error(&records).expect("equal names must not alias");
+        assert!(err.contains("srv"), "{err}");
+        // Different tools behind one name are just as ambiguous: the Approve
+        // card and the model cannot tell the two servers apart.
+        let records = vec![
+            record_with_tools("s1", "srv", &[("a", true)]),
+            record_with_tools("s2", "srv", &[("b", true)]),
+        ];
+        assert!(enable_collision_error(&records).is_some());
+    }
+
+    // ── A connect does not revert concurrent edits (A7-49) ──────────────
+
+    #[test]
+    fn a_connect_keeps_toggles_and_edits_made_while_it_ran() {
+        let def = json!({ "name": "t", "description": "d" });
+        let mut at_start = record_with_tools("s1", "srv", &[]);
+        at_start.tools = vec![tool_pinned_to(&def, true)];
+        // While the connect was on the network the user disabled the tool
+        // and renamed the server.
+        let mut now = at_start.clone();
+        now.name = "renamed".into();
+        now.tools[0].enabled = false;
+        now.tools[0].pin_hash = None;
+        let (saved, changed) =
+            merge_into_stored(&at_start, Some(now), std::slice::from_ref(&def)).unwrap();
+        assert!(
+            !saved.tools[0].enabled,
+            "a tool disabled meanwhile stays disabled"
+        );
+        assert_eq!(saved.name, "renamed");
+        assert!(changed.is_empty());
+        // Removed meanwhile, or re-pointed at another URL: nothing is saved.
+        assert!(merge_into_stored(&at_start, None, std::slice::from_ref(&def)).is_err());
+        let mut moved = at_start.clone();
+        moved.url = "https://other.example.com".into();
+        assert!(merge_into_stored(&at_start, Some(moved), &[def]).is_err());
+    }
+
+    // ── tools/list bounds (RU1 review: empty cursor, stop at the cap) ───
+
+    #[test]
+    fn an_empty_cursor_ends_the_list_and_the_tool_cap_stops_reading() {
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(
+            next_tools_page(&mut seen, 1, 3, Some(String::new())).unwrap(),
+            None
+        );
+        let err =
+            next_tools_page(&mut seen, 1, MAX_EXPOSED_TOOLS + 1, Some("more".into())).unwrap_err();
+        assert!(err.0.contains(&MAX_EXPOSED_TOOLS.to_string()), "{}", err.0);
+        assert!(next_tools_page(&mut seen, 1, MAX_EXPOSED_TOOLS, Some("more".into())).is_ok());
+    }
+
+    // ── The call gate (R6) and the call's audit trail (RU1 review) ──────
+
+    #[test]
+    fn the_call_gate_needs_approval_below_execute_and_names_who_approved() {
+        let mut t = tool_pinned_to(&json!({ "name": "t", "description": "d" }), true);
+        // Read/Draft: only the user's approval (the card) lets a call through,
+        // even for an Auto-approve tool.
+        t.auto_approve = true;
+        assert!(call_gate("read", false, true, &t).is_err());
+        assert_eq!(call_gate("draft", true, true, &t), Ok("approved"));
+        // Execute: the card, or the tool's own Auto-approve.
+        assert_eq!(call_gate("execute", false, true, &t), Ok("auto"));
+        t.auto_approve = false;
+        assert!(call_gate("execute", false, true, &t).is_err());
+        assert_eq!(call_gate("execute", true, true, &t), Ok("approved"));
+        // YOLO runs without either - and the audit row says so.
+        assert_eq!(call_gate("yolo", false, true, &t), Ok("yolo"));
+        // Never: an unconfirmed server, a disabled tool, a changed or a
+        // never-approved definition.
+        assert!(call_gate("yolo", true, false, &t).is_err());
+        let mut off = t.clone();
+        off.enabled = false;
+        assert!(call_gate("yolo", true, true, &off).is_err());
+        let mut changed = t.clone();
+        changed.current_hash = Some("another definition".into());
+        assert!(call_gate("yolo", true, true, &changed).is_err());
+        let mut unpinned = t.clone();
+        unpinned.pin_hash = None;
+        assert!(call_gate("yolo", true, true, &unpinned).is_err());
+    }
+
+    fn sample_audit() -> CallAudit<'static> {
+        CallAudit {
+            server_id: "s1",
+            server_name: "srv",
+            tool: "t",
+            args_sha256: "abc",
+            level: "execute",
+            approval: "approved",
+        }
+    }
+
+    fn tool_call_rows(db: &crate::db::Database) -> Vec<String> {
+        db.list_audit(50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.action == "mcp.tool_call")
+            .map(|r| r.details)
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_that_ran_is_reported_and_audited_even_if_the_refresh_fails() {
+        let db = temp_db();
+        let result = json!({ "content": [{ "type": "text", "text": "done" }] });
+        let out = finish_tool_call(&db, &sample_audit(), Ok((result, true)), || async {
+            Err(CmdError("tools/list failed".into()))
+        })
+        .await
+        .expect("the tool ran - its result must reach the model");
+        assert_eq!(out["content"], "done");
+        assert!(
+            out["warning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tools/list failed"),
+            "{out}"
+        );
+        let rows = tool_call_rows(&db);
+        assert!(rows.iter().any(|d| d.contains("result=ok")), "{rows:?}");
+    }
+
+    // ── Incremental SSE decoding (A7-50) ────────────────────────────────
+
+    fn decode_all(chunks: &[&[u8]]) -> Vec<SseEvent> {
+        let mut decoder = SseDecoder::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(decoder.push(chunk).unwrap());
+        }
+        out.extend(decoder.finish().unwrap());
+        out
+    }
+
+    #[test]
+    fn sse_events_decode_the_same_across_any_chunk_boundary() {
+        // CRLF, LF and lone-CR line ends, a comment, a multi-line data field
+        // and a multi-byte character.
+        let body = "event: message\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n: keep-alive\n\nevent: endpoint\rdata: /messages?x=\u{e9}\r\r";
+        let whole = decode_all(&[body.as_bytes()]);
+        assert_eq!(
+            whole,
+            vec![
+                SseEvent {
+                    event: Some("message".into()),
+                    data: "{\"a\":\n1}".into(),
+                },
+                SseEvent {
+                    event: Some("endpoint".into()),
+                    data: "/messages?x=\u{e9}".into(),
+                },
+            ]
+        );
+        // Split at every byte - inside a CRLF pair and inside the é too.
+        let bytes = body.as_bytes();
+        for split in 1..bytes.len() {
+            assert_eq!(
+                decode_all(&[&bytes[..split], &bytes[split..]]),
+                whole,
+                "split at {split}"
+            );
+        }
+        let one_by_one: Vec<&[u8]> = bytes.chunks(1).collect();
+        assert_eq!(decode_all(&one_by_one), whole);
+    }
+
+    #[test]
+    fn an_unterminated_last_event_still_counts_and_bad_utf8_is_an_error() {
+        assert_eq!(
+            decode_all(&[b"data: {\"x\":1}"]),
+            vec![SseEvent {
+                event: None,
+                data: "{\"x\":1}".into(),
+            }]
+        );
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push(b"data: \xff\xfe\n").is_err());
+    }
+
+    // ── Saving: which auth source survives (pure rules) ─────────────────
+
+    #[test]
+    fn saving_keeps_or_drops_the_auth_source_by_the_documented_rules() {
+        let mut stored = record_with_tools("s1", "srv", &[]);
+        stored.url = "https://a.example.com".into();
+        stored.auth_type = "custom_header".into();
+        stored.auth_header_name = Some("X-Key".into());
+        stored.auth_secret = Some("sealed".into());
+        let url = "https://a.example.com";
+        let plan = |header: TextArg, secret: SecretArg, env: TextArg| {
+            plan_auth(Some(&stored), url, "custom_header", header, secret, env)
+        };
+        // Nothing about auth touched: the header and the secret stay.
+        assert_eq!(
+            plan(TextArg::Absent, SecretArg::Absent, TextArg::Absent),
+            Ok(AuthPlan {
+                header_name: Some("X-Key".into()),
+                secret: SecretPlan::Keep,
+                env_var: None,
+            })
+        );
+        // Another header name changes what the secret means: it must be
+        // entered again - and with a new secret the save goes through.
+        let other = || TextArg::Set("X-Other".into());
+        assert!(plan(other(), SecretArg::Absent, TextArg::Absent)
+            .unwrap_err()
+            .contains("discards"));
+        assert_eq!(
+            plan(other(), SecretArg::New, TextArg::Absent)
+                .unwrap()
+                .secret,
+            SecretPlan::Seal
+        );
+        // A named env var replaces the stored secret.
+        assert_eq!(
+            plan(
+                TextArg::Absent,
+                SecretArg::Absent,
+                TextArg::Set("TOKEN".into())
+            ),
+            Ok(AuthPlan {
+                header_name: Some("X-Key".into()),
+                secret: SecretPlan::Drop,
+                env_var: Some("TOKEN".into()),
+            })
+        );
+        // Auth "none" carries nothing and keeps nothing.
+        assert!(plan_auth(
+            Some(&stored),
+            url,
+            "none",
+            TextArg::Absent,
+            SecretArg::New,
+            TextArg::Absent
+        )
+        .is_err());
+        assert_eq!(
+            plan_auth(
+                Some(&stored),
+                url,
+                "none",
+                TextArg::Clear,
+                SecretArg::Clear,
+                TextArg::Absent
+            ),
+            Ok(AuthPlan {
+                header_name: None,
+                secret: SecretPlan::Drop,
+                env_var: None,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_call_is_still_audited() {
+        let db = temp_db();
+        let err = finish_tool_call(
+            &db,
+            &sample_audit(),
+            Err(CmdError("MCP request failed: timed out".into())),
+            || async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.0.contains("timed out"));
+        let rows = tool_call_rows(&db);
+        assert!(rows.iter().any(|d| d.contains("result=failed")), "{rows:?}");
     }
 }

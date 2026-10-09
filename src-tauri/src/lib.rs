@@ -209,6 +209,7 @@ pub fn run() {
             assistant::assistant_set_level,
             assistant::assistant_get_level,
             assistant::assistant_exec,
+            assistant::assistant_type_text,
             // MCP (Model Context Protocol) commands
             assistant::mcp::mcp_list_servers,
             assistant::mcp::mcp_save_server,
