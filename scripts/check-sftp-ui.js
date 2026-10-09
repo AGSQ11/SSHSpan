@@ -32,7 +32,7 @@
 
 const {
   failures, check, yes, loadChromium, rendererDir, serve, part,
-  withApp, waitVisible, focusIs, openLiveTab,
+  withApp, waitVisible, focusIs, openLiveTab, toasts,
 } = require('./lib/renderer-harness');
 
 const chromium = loadChromium();
@@ -144,8 +144,6 @@ const tabField = (page, field, tabId) => page.evaluate(({ f, t }) => {
   const v = state.sessions.get(t)[f];
   return v instanceof Set ? [...v].sort() : v;
 }, { f: field, t: tabId || 't1' });
-const toasts = (page) => page.evaluate(() =>
-  [...document.querySelectorAll('#toast .toast-item')].map((n) => n.querySelector('.toast-text').textContent));
 const menuItems = (page) => page.evaluate(() => {
   const m = document.getElementById('keyConnectMenu');
   return m ? [...m.querySelectorAll('.ctx-item')].map((b) => b.textContent.trim()) : null;
@@ -536,7 +534,10 @@ async function scenarioLocalPane(browser, server) {
     yes('a remote delete asks', await waitVisible(page, '#deleteModal'));
     yes('A3-29 the opt-out names the remote side', /remote/i.test(await page.textContent('#deleteModal label')),
       await page.textContent('#deleteModal label'));
-    await page.check('#deleteSkipSession');
+    // The option is the app's toggle chip (A1-33): the box itself is hidden,
+    // the chip is what is clicked.
+    await page.click('#deleteModal .toggle-chip');
+    yes('the opt-out is ticked', await page.isChecked('#deleteSkipSession'));
     await page.click('#deleteYesBtn');
     await settle(page, 200);
     check('the remote file is deleted', (await app.calls('sftp_remove')).map((c) => c.args.path), ['/home/u/a.txt']);

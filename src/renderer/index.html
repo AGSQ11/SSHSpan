@@ -88,10 +88,13 @@
           <!-- The category filter used to live here as well as in the sidebar
                tree AND in a modal picker: three controls over one piece of
                state. The tree is now the only place you filter; the breadcrumb
-               in the topbar says what is filtered and clears it. -->
+               in the topbar says what is filtered and clears it. Below 900px
+               the sidebar is a narrow rail with no room for the tree, so this
+               button opens the same tree as a drawer (A1-06). -->
+          <button id="catDrawerBtn" class="ghost-btn cat-drawer-btn" type="button" aria-controls="catPanel" aria-expanded="false" title="Show the category tree"><span data-ico="folder"></span>Categories</button>
           <span class="spacer"></span>
           <span class="count-chip" id="keyCount" hidden></span>
-          <button id="newKeyBtn" class="primary-btn"><span data-ico="plus"></span>New key</button>
+          <button id="newKeyBtn" class="primary-btn" title="New key (Ctrl+N)"><span data-ico="plus"></span><span class="btn-label">New key</span></button>
         </div>
         <div class="keys-layout">
           <div class="key-list-col">
@@ -125,21 +128,23 @@
                  out of the vault. It used to sit below "Copy public key" at the
                  same weight, with a passphrase box permanently on screen even
                  for the formats that ignore it. It gets its own tab. -->
-            <div class="detail-tabs" role="tablist">
-              <button class="detail-tab active" data-detail-tab="overview" role="tab" aria-selected="true">Overview</button>
-              <button class="detail-tab" data-detail-tab="export" role="tab" aria-selected="false"><span data-ico="download"></span>Export</button>
+            <!-- A full tab pattern (A1-36): one tab stop, arrow keys, and each tab
+                 names the panel it shows. -->
+            <div class="detail-tabs" role="tablist" aria-label="Key details">
+              <button class="detail-tab active" id="detailTab-overview" data-detail-tab="overview" role="tab" aria-selected="true" aria-controls="detailPanel-overview" tabindex="0">Overview</button>
+              <button class="detail-tab" id="detailTab-export" data-detail-tab="export" role="tab" aria-selected="false" aria-controls="detailPanel-export" tabindex="-1"><span data-ico="download"></span>Export</button>
             </div>
 
-            <div class="detail-panel" id="detailPanel-overview">
+            <div class="detail-panel" id="detailPanel-overview" role="tabpanel" aria-labelledby="detailTab-overview">
               <dl class="detail-meta" id="detailMeta"></dl>
-              <label class="detail-label">Categories</label>
+              <h3 class="detail-label">Categories</h3>
               <div class="cat-chips" id="detailCategories"></div>
-              <label class="detail-label">Fingerprint</label>
+              <h3 class="detail-label">Fingerprint</h3>
               <div class="copy-row">
                 <code class="mono" id="detailFingerprint">-</code>
                 <button class="icon-btn" id="detailCopyFprBtn" title="Copy fingerprint"></button>
               </div>
-              <label class="detail-label">Public key (authorized_keys)</label>
+              <h3 class="detail-label">Public key (authorized_keys)</h3>
               <div class="copy-row block">
                 <textarea class="mono" id="detailAuthorized" rows="3" readonly spellcheck="false" aria-label="authorized_keys line for this key"></textarea>
                 <button class="ghost-btn copy-float" id="detailCopyPublicBtn"><span data-ico="copy"></span>Copy</button>
@@ -151,12 +156,12 @@
               </div>
             </div>
 
-            <div class="detail-panel" id="detailPanel-export" hidden>
+            <div class="detail-panel" id="detailPanel-export" role="tabpanel" aria-labelledby="detailTab-export" hidden>
               <div class="warn-note">
                 <span data-ico="triangle-alert"></span>
                 <span>Exporting writes key material outside the vault. Anyone who can read the file can use the key. The export is recorded in the audit log.</span>
               </div>
-              <label class="detail-label">Format</label>
+              <h3 class="detail-label">Format</h3>
               <div class="format-list" id="exportFormatList" role="radiogroup" aria-label="Export format"></div>
               <!-- Kept for the existing export path, which reads .value off both.
                    They mirror the radio list rather than being a second control. -->
@@ -168,8 +173,8 @@
                 <option value="public-pem">Public key PEM (SPKI)</option>
                 <option value="authorized_keys">authorized_keys line</option>
               </select>
-              <label class="detail-label" id="exportPassLabel" hidden>Passphrase for the exported file</label>
-              <input type="password" id="detailExportPass" placeholder="Required for an encrypted export" hidden />
+              <label class="detail-label" id="exportPassLabel" for="detailExportPass" hidden>Passphrase for the exported file</label>
+              <input type="password" id="detailExportPass" placeholder="Required for an encrypted export" autocomplete="off" hidden />
               <button id="detailExportBtn" class="primary-btn wide"><span data-ico="download"></span><span id="detailExportBtnLabel">Choose where to save...</span></button>
               <p class="hint" id="exportHint">Private material is serialised in the Rust process and written straight to the file you pick - it never crosses into this window.</p>
             </div>
@@ -185,8 +190,9 @@
                 <span class="search-ico" data-ico="search"></span>
                 <input type="search" id="serverSearch" placeholder="Search servers..." />
               </div>
-              <button id="serverImportBtn" class="ghost-btn" title="Import a Host block from ~/.ssh/config"><span data-ico="file-text"></span>Config</button>
+              <button id="serverImportBtn" class="ghost-btn" title="Import a Host block from ~/.ssh/config" aria-haspopup="menu" aria-expanded="false"><span data-ico="file-text"></span>Config</button>
               <button id="serverNewBtn" class="primary-btn" title="New server"><span data-ico="plus"></span>New</button>
+              <button id="serverCatDrawerBtn" class="ghost-btn cat-drawer-btn" type="button" aria-controls="catPanel" aria-expanded="false" aria-label="Categories" title="Server categories"><span data-ico="folder"></span></button>
             </div>
             <div class="server-list" id="serverList"></div>
             <div class="empty-state small" id="serverEmpty" hidden>
@@ -208,9 +214,9 @@
                      exists because editing a file and running a command is one
                      task, not two modes. -->
                 <div class="seg mode-seg" id="termModeSeg" hidden role="tablist" aria-label="Session surface">
-                  <button type="button" class="seg-btn active" data-mode="ssh" role="tab" title="Terminal only (Ctrl+Shift+1)"><span data-ico="terminal"></span>Shell</button>
-                  <button type="button" class="seg-btn" data-mode="sftp" role="tab" title="File browser only (Ctrl+Shift+2)"><span data-ico="folder-tree"></span>Files</button>
-                  <button type="button" class="seg-btn" data-mode="split" role="tab" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span>Split</button>
+                  <button type="button" class="seg-btn active" data-mode="ssh" role="tab" aria-selected="true" aria-controls="sessionSurface" tabindex="0" title="Terminal only (Ctrl+Shift+1)"><span data-ico="terminal"></span>Shell</button>
+                  <button type="button" class="seg-btn" data-mode="sftp" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="File browser only (Ctrl+Shift+2)"><span data-ico="folder-tree"></span>Files</button>
+                  <button type="button" class="seg-btn" data-mode="split" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span>Split</button>
                 </div>
                 <button id="termTestBtn" class="ghost-btn" hidden><span data-ico="plug-zap"></span>Test</button>
                 <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)"><span data-ico="message-square"></span>Assistant</button>
@@ -219,7 +225,7 @@
               </div>
             </div>
             <div class="term-tabs" id="termTabs">
-              <div class="term-tab-add" id="termTabAdd" title="New connection - pick a server from the list"><span data-ico="plus"></span></div>
+              <button type="button" class="term-tab-add" id="termTabAdd" title="New connection - pick a server from the list" aria-label="New session - pick a server from the list"><span data-ico="plus"></span></button>
             </div>
             <!-- Wrapper so the two surfaces can sit side by side in split mode;
                  the column itself stacks, so they could only ever swap before. -->
@@ -488,11 +494,27 @@
                 <button id="auditClearBtn" class="ghost-btn"><span data-ico="trash-2"></span>Clear log</button>
               </div>
               <p class="hint" id="auditCapHint"></p>
+              <!-- Find one event without exporting the whole log (A5-16): both
+                   filters work on the entries loaded so far; "Load older"
+                   loads more. -->
+              <div class="audit-filters">
+                <select id="auditEventFilter" aria-label="Show events of type">
+                  <option value="">All events</option>
+                </select>
+                <div class="search-wrap">
+                  <span class="search-ico" data-ico="search"></span>
+                  <input type="search" id="auditTextFilter" placeholder="Filter by event, key or detail..." aria-label="Filter the audit log" spellcheck="false" autocomplete="off" />
+                </div>
+                <span class="hint" id="auditFilterHint"></span>
+              </div>
               <div class="table-wrap">
                 <table class="audit-table">
                   <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
                   <tbody id="auditBody"></tbody>
                 </table>
+              </div>
+              <div class="audit-more">
+                <button id="auditMoreBtn" class="ghost-btn" hidden><span data-ico="history"></span>Load older entries</button>
               </div>
             </section>
           </div>
@@ -551,12 +573,12 @@
         <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
-        <div class="tabs">
-          <button data-tab="generate" class="tab active"><span data-ico="key-round"></span>Generate</button>
-          <button data-tab="import" class="tab"><span data-ico="file-up"></span>Import</button>
+        <div class="tabs" role="tablist" aria-label="New key">
+          <button data-tab="generate" class="tab active" id="tabBtn-generate" role="tab" aria-selected="true" aria-controls="tab-generate" tabindex="0"><span data-ico="key-round"></span>Generate</button>
+          <button data-tab="import" class="tab" id="tabBtn-import" role="tab" aria-selected="false" aria-controls="tab-import" tabindex="-1"><span data-ico="file-up"></span>Import</button>
         </div>
-        <div class="tab-panel" id="tab-generate">
-          <label>Name <input type="text" id="genName" placeholder="my-laptop" /></label>
+        <div class="tab-panel" id="tab-generate" role="tabpanel" aria-labelledby="tabBtn-generate">
+          <label>Name <input type="text" id="genName" placeholder="my-laptop" spellcheck="false" autocomplete="off" /></label>
           <label>Type
             <select id="genType">
               <option value="ed25519" selected>Ed25519 (recommended)</option>
@@ -578,15 +600,15 @@
               <option value="nistp521">nistp521</option>
             </select>
           </label>
-          <label>Comment <input type="text" id="genComment" placeholder="user@host" /></label>
+          <label>Comment <input type="text" id="genComment" placeholder="user@host" spellcheck="false" autocomplete="off" /></label>
           <div class="cat-field">
             <span class="cat-field-label">Categories</span>
             <div class="cat-chips" id="genCategories"></div>
             <button type="button" id="genBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories...</button>
           </div>
         </div>
-        <div class="tab-panel" id="tab-import" hidden>
-          <label>Name <input type="text" id="importName" placeholder="work-server" /></label>
+        <div class="tab-panel" id="tab-import" role="tabpanel" aria-labelledby="tabBtn-import" hidden>
+          <label>Name <input type="text" id="importName" placeholder="work-server" spellcheck="false" autocomplete="off" /></label>
           <div class="import-source">
             <button type="button" id="importBrowseBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse for key file...</button>
             <span class="hint" id="importFileHint">or paste the key material below</span>
@@ -594,7 +616,7 @@
           <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, PuTTY .ppk v3, SPKI public PEM, or authorized_keys line)
             <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."></textarea>
           </label>
-          <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" /></label>
+          <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" autocomplete="off" /></label>
           <div class="cat-field">
             <span class="cat-field-label">Categories</span>
             <div class="cat-chips" id="importCategories"></div>
@@ -675,8 +697,8 @@
         <div class="deploy-form">
           <div class="cat-chips" id="deployKeyChips"></div>
           <div class="deploy-grid">
-            <label class="span-2">Host alias <input type="text" id="cfgHost" placeholder="myserver" /></label>
-            <label>User <input type="text" id="cfgUser" placeholder="deploy" /></label>
+            <label class="span-2">Host alias <input type="text" id="cfgHost" placeholder="myserver" spellcheck="false" autocomplete="off" /></label>
+            <label>User <input type="text" id="cfgUser" placeholder="deploy" spellcheck="false" autocomplete="off" /></label>
             <label>Port <input type="number" id="cfgPort" placeholder="22" min="1" max="65535" /></label>
           </div>
           <div class="opt-list">
@@ -694,7 +716,7 @@
                 <span class="opt-sub">You will be asked for it on every connection.</span>
               </span>
             </label>
-            <input type="password" id="keyPassphraseInput" placeholder="Deployed-key passphrase" hidden />
+            <input type="password" id="keyPassphraseInput" placeholder="Deployed-key passphrase" autocomplete="off" hidden />
             <label class="opt-row">
               <input type="checkbox" id="deployRegisterToggle" /><span class="toggle-box"></span>
               <span class="opt-text">
@@ -788,17 +810,21 @@
       </header>
       <div class="modal-body">
         <div class="server-grid">
-          <label class="span-2">Name <input type="text" id="srvName" placeholder="prod-web-1" /></label>
-          <label>Host <input type="text" id="srvHost" placeholder="192.0.2.10 or host.example.com" /></label>
-          <label>Port <input type="number" id="srvPort" placeholder="22" min="1" max="65535" /></label>
-          <label>Username <input type="text" id="srvUser" placeholder="deploy" /></label>
-          <label class="span-2 auth-method-row">Auth method
+          <label class="span-2">Name <input type="text" id="srvName" placeholder="prod-web-1" spellcheck="false" autocomplete="off" /></label>
+          <label>Host <input type="text" id="srvHost" placeholder="192.0.2.10 or host.example.com" spellcheck="false" autocomplete="off" /></label>
+          <label>Port <input type="number" id="srvPort" placeholder="22" min="1" max="65535" autocomplete="off" /></label>
+          <label>Username <input type="text" id="srvUser" placeholder="deploy" spellcheck="false" autocomplete="off" /></label>
+          <!-- A radio group, not a <label>: a label forwarded every click on its
+               blank space to the first button inside (Key), so a stray click
+               beside the segments changed the server's auth method (A1-05). -->
+          <div class="span-2 auth-method-row" role="radiogroup" aria-labelledby="srvAuthLabel">
+            <span class="field-label" id="srvAuthLabel">Auth method</span>
             <div class="seg">
-              <button type="button" data-auth="publickey" class="seg-btn active">Key</button>
-              <button type="button" data-auth="password" class="seg-btn">Password</button>
-              <button type="button" data-auth="keyboard-interactive" class="seg-btn">Kbd-int</button>
+              <button type="button" data-auth="publickey" class="seg-btn active" role="radio" aria-checked="true" tabindex="0">Key</button>
+              <button type="button" data-auth="password" class="seg-btn" role="radio" aria-checked="false" tabindex="-1">Password</button>
+              <button type="button" data-auth="keyboard-interactive" class="seg-btn" role="radio" aria-checked="false" tabindex="-1">Keyboard-interactive</button>
             </div>
-          </label>
+          </div>
           <div class="span-2 key-row" id="srvKeyRow">
             <label>Vault key
               <select id="srvKeyId">
@@ -806,7 +832,7 @@
               </select>
             </label>
             <div class="pem-row">
-              <input type="text" id="srvPemPath" placeholder="...or pick a .pem file on disk" />
+              <input type="text" id="srvPemPath" placeholder="...or pick a .pem file on disk" spellcheck="false" autocomplete="off" />
               <button type="button" id="srvBrowsePemBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse</button>
             </div>
           </div>
@@ -842,7 +868,7 @@
       </header>
       <div class="modal-body">
         <p id="promptMessage" class="hint"></p>
-        <input type="text" id="promptInput" aria-labelledby="promptMessage" />
+        <input type="text" id="promptInput" aria-labelledby="promptMessage" spellcheck="false" autocomplete="off" />
       </div>
       <footer class="modal-footer">
         <button id="promptCancelBtn" class="ghost-btn">Cancel</button>
@@ -881,8 +907,11 @@
       </header>
       <div class="modal-body">
         <p id="deleteMessage" class="hint"></p>
-        <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;">
-          <input type="checkbox" id="deleteSkipSession" />
+        <!-- The toggle every other dialog option uses (A1-33): the inline-styled
+             row lost to the global label column rule and drew a white native
+             box above its caption. -->
+        <label class="toggle-chip">
+          <input type="checkbox" id="deleteSkipSession" /><span class="toggle-box"></span>
           <span id="deleteSkipLabel">Don't ask again for remote deletes this session.</span>
         </label>
       </div>
@@ -923,7 +952,7 @@
               <td><input type="checkbox" id="chmod-other-x" aria-label="Other execute" /></td></tr>
           </tbody>
         </table>
-        <label>Numeric value <input type="text" id="chmodOctal" maxlength="4" placeholder="644" /></label>
+        <label>Numeric value <input type="text" id="chmodOctal" maxlength="4" placeholder="644" spellcheck="false" autocomplete="off" /></label>
         <p class="hint">A leading fourth digit is setuid/setgid/sticky (2775 = setgid); typing three digits clears them.</p>
         <p class="hint" id="chmodHint" role="alert" hidden></p>
         <label class="toggle-chip"><input type="checkbox" id="chmodRecurse" /><span class="toggle-box"></span>Recurse into subdirectories</label>

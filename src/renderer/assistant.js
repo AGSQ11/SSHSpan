@@ -29,7 +29,6 @@ const AI_LEVELS = {
   execute: { caption: 'AI runs commands after you approve each one.' },
   yolo:    { caption: 'AI runs commands without asking. DANGER: full autonomous control of the session.' },
 };
-const AI_LEVEL_ORDER = ['read', 'draft', 'execute', 'yolo'];
 const AI_LEVEL_INDEX = { read: 0, draft: 1, execute: 2, yolo: 3 };
 
 const AI_MAX_TOOL_CALLS = 25;

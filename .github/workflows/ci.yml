@@ -129,6 +129,9 @@ jobs:
           # The SFTP file browser: navigation, selection, the transfer queue,
           # conflicts, chmod, shortcuts and drops, against a fake file system.
           npm run test:sftp
+          # Accessibility, keyboard, menus, palette, audit log and settings
+          # polish, plus static checks for the dead CSS/JS the audit removed.
+          npm run test:polish
 
   cargo-audit:
     name: Dependency advisories

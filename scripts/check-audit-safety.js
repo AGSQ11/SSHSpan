@@ -63,7 +63,7 @@ const path = require('path');
 const {
   failures, check, yes, loadChromium, rendererDir, serve, part,
   PASSWORD, KEY, SERVER, withApp, settled, waitVisible, focusIs, answerConfirm,
-  openLiveTab, bytesOf, sends,
+  openLiveTab, bytesOf, sends, toasts, hold, letGo,
 } = require('./lib/renderer-harness');
 
 // ─── static guard: no native confirm() left in the renderer ────────────────
@@ -1145,20 +1145,7 @@ async function scenarioYolo(browser, server) {
 }
 
 // ─── unit JU2: backups, settings, lock-aware controls, boot ─────────────────
-
-const toasts = (page) => page.evaluate(() =>
-  [...document.querySelectorAll('#toast .toast-item')].map((n) => n.querySelector('.toast-text').textContent));
-
-/// Hold a command at the stub until letGo(): what the page shows while it runs.
-const hold = (page, cmd) => page.evaluate((c) => {
-  let release;
-  window.__gates[c] = { promise: new Promise((r) => { release = r; }), release };
-}, cmd);
-const letGo = (page, cmd) => page.evaluate((c) => {
-  const g = window.__gates[c];
-  delete window.__gates[c];
-  if (g) g.release();
-}, cmd);
+// (toasts, hold and letGo come from scripts/lib/renderer-harness.js.)
 
 const buttonState = (page, id) => page.evaluate((i) => {
   const b = document.getElementById(i);
@@ -1741,6 +1728,36 @@ async function scenarioBoot(browser, server) {
     const beats = await app.count('heartbeat');
     await page.keyboard.press('a');
     yes('A2-20 and real input is still watched (heartbeat)', (await app.count('heartbeat')) > beats);
+    check('no page errors', app.errors, []);
+  });
+
+  // The guard around main()'s first refreshVaultStatus(): vault_status itself
+  // failing at boot must not stop the wiring after it (JU2 review).
+  const down = {
+    clock: true, bootCmd: 'vault_status',
+    settings: { autoLockMinutes: '0' },
+    replies: { vault_status: { $reject: 'Vault service unavailable.' } },
+  };
+  await withApp(browser, server, down, 'boot with vault_status failing', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(300);
+    yes('A2-20 a failing first vault_status is reported', (await toasts(page)).some((t) => t.includes('Vault service unavailable.')),
+      JSON.stringify(await toasts(page)));
+    yes('A2-20 and logged for diagnosis', await page.evaluate(() =>
+      (window.__bootErrors || []).some((m) => /first vault refresh failed/.test(m))));
+    check('A2-20 boot goes on to read the stored settings', await app.count('settings_get'), 1);
+    const polls = await app.count('vault_status');
+    await app.tick(10 * 1000 + 200);
+    yes('A2-20 the 10 s status poll is running', (await app.count('vault_status')) > polls);
+    const beats = await app.count('heartbeat');
+    await page.keyboard.press('a');
+    yes('A2-20 real input is watched (heartbeat)', (await app.count('heartbeat')) > beats);
+    // The backend comes back: the next poll picks the vault state up.
+    await page.evaluate(() => { delete window.__replies.vault_status; });
+    await app.tick(10 * 1000 + 200);
+    await page.waitForTimeout(200);
+    check('A2-20 once vault_status answers, the next poll applies it', await page.evaluate(() =>
+      [state.unlocked, document.querySelectorAll('#keyList .key-row').length]), [true, 2]);
     check('no page errors', app.errors, []);
   });
 

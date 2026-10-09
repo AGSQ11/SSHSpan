@@ -360,6 +360,21 @@ async function openLiveTab(app, auth) {
 const bytesOf = (c) => String.fromCharCode(...(c.args.bytes || []));
 const sends = async (app) => (await app.calls('terminal_send')).map(bytesOf);
 
+/// The texts of the toasts on screen, oldest first.
+const toasts = (page) => page.evaluate(() =>
+  [...document.querySelectorAll('#toast .toast-item')].map((n) => n.querySelector('.toast-text').textContent));
+
+/// Hold a command at the stub until letGo(): what the page shows while it runs.
+const hold = (page, cmd) => page.evaluate((c) => {
+  let release;
+  window.__gates[c] = { promise: new Promise((r) => { release = r; }), release };
+}, cmd);
+const letGo = (page, cmd) => page.evaluate((c) => {
+  const g = window.__gates[c];
+  delete window.__gates[c];
+  if (g) g.release();
+}, cmd);
+
 module.exports = {
   failures, check, yes,
   loadChromium,
@@ -368,4 +383,5 @@ module.exports = {
   openPage,
   stubInit, PASSWORD, T0, KEY, SERVER, CATEGORY,
   openApp, withApp, settled, waitVisible, focusIs, answerConfirm, openLiveTab, bytesOf, sends,
+  toasts, hold, letGo,
 };

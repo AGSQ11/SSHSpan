@@ -21,8 +21,9 @@
  * alone cannot see that, so the handler list is read too.
  *
  * Exits non-zero on: an unknown or unregistered command, a misnamed/unexpected
- * argument, or a required (non-Option) argument the renderer never passes -
- * and if the handler-list parser fails its own self-check below.
+ * argument, or a required (non-Option) argument the renderer never passes, a
+ * KNOWN_TWINS entry that no longer matches anything - and if the handler-list
+ * parser fails its own self-check below.
  */
 'use strict';
 const fs = require('fs');
@@ -91,33 +92,86 @@ function parseRustCommands() {
   return cmds;
 }
 
-/**
- * The command names in `generate_handler![...]`: the last path segment of
- * each entry (`assistant::mcp::mcp_list_servers` registers mcp_list_servers),
- * with // and block comments skipped - the list comments out the commands it
- * deliberately leaves unregistered, and a comment may contain a `]`. Returns
- * null when the source has no complete handler list.
- */
-function parseRegisteredCommands(src) {
-  const at = src.search(/generate_handler!\s*\[/);
-  if (at < 0) return null;
-  let i = src.indexOf('[', at) + 1;
-  let body = '';
-  let depth = 0;
+/// Rust source with every comment blanked to spaces (newlines kept) and string
+/// literals left alone, so a comment cannot be mistaken for code - the doc
+/// comments mention `generate_handler![...]` - and a `//` inside a string is
+/// not taken for a comment.
+function blankRustComments(src) {
+  let out = '';
+  let i = 0;
   while (i < src.length) {
     const c = src[i];
     const n = src[i + 1];
-    if (c === '/' && n === '/') { while (i < src.length && src[i] !== '\n') i++; continue; }
-    if (c === '/' && n === '*') {
-      const end = src.indexOf('*/', i + 2);
-      i = end < 0 ? src.length : end + 2;
+    if (c === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== '"') j += src[j] === '\\' ? 2 : 1;
+      out += src.slice(i, j + 1);
+      i = j + 1;
       continue;
     }
+    if (c === '/' && n === '/') {
+      while (i < src.length && src[i] !== '\n') { out += ' '; i++; }
+      continue;
+    }
+    if (c === '/' && n === '*') {
+      const end = src.indexOf('*/', i + 2);
+      const stop = end < 0 ? src.length : end + 2;
+      out += src.slice(i, stop).replace(/[^\n]/g, ' ');
+      i = stop;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+/// `body` without its `#[...]` attributes (brackets balanced), so a
+/// `#[cfg(...)]` in front of an entry neither hides the entry nor - with a
+/// comma inside it - splits it in two.
+function stripRustAttributes(body) {
+  let out = '';
+  let i = 0;
+  while (i < body.length) {
+    if (body[i] === '#' && body[i + 1] === '[') {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < body.length; j++) {
+        if (body[j] === '[') depth++;
+        else if (body[j] === ']' && --depth === 0) break;
+      }
+      i = j + 1;
+      continue;
+    }
+    out += body[i];
+    i++;
+  }
+  return out;
+}
+
+/**
+ * The command names in `generate_handler![...]`: the last path segment of
+ * each entry (`assistant::mcp::mcp_list_servers` registers mcp_list_servers).
+ * Comments are skipped everywhere: the list comments out the commands it
+ * deliberately leaves unregistered, a comment may contain a `]`, and a doc
+ * comment ABOVE the macro may mention it. An entry behind `#[cfg(...)]` counts
+ * as registered - it is, on the platforms it is built for. Returns null when
+ * the source has no complete handler list.
+ */
+function parseRegisteredCommands(src) {
+  const code = blankRustComments(src);
+  const at = code.search(/generate_handler!\s*\[/);
+  if (at < 0) return null;
+  let i = code.indexOf('[', at) + 1;
+  let body = '';
+  let depth = 0;
+  while (i < code.length) {
+    const c = code[i];
     if (c === '[') depth++;
     if (c === ']') {
       if (depth === 0) {
         const names = new Set();
-        for (const entry of body.split(',')) {
+        for (const entry of stripRustAttributes(body).split(',')) {
           const name = entry.trim().split('::').pop().trim();
           if (/^[a-z_][a-z0-9_]*$/.test(name)) names.add(name);
         }
@@ -139,8 +193,9 @@ function parseJsCallSites() {
     if (!fs.existsSync(file)) continue;
     const src = fs.readFileSync(file, 'utf8');
     // sftpCall is sftp.js's own wrapper around invoke(); without it here most
-    // of that file's IPC calls were never checked at all.
-    const re = /(?:\bcall|sftpCall|mcpCall|\.invoke|\binvoke)\(\s*(['"`])([a-z_0-9]+)\1\s*(,|\))/g;
+    // of that file's IPC calls were never checked at all. aiCall is
+    // assistant.js's, and was missing the same way (A8-17).
+    const re = /(?:\bcall|sftpCall|mcpCall|aiCall|\.invoke|\binvoke)\(\s*(['"`])([a-z_0-9]+)\1\s*(,|\))/g;
     let m;
     while ((m = re.exec(src))) {
       const line = src.slice(0, m.index).split('\n').length;
@@ -181,8 +236,28 @@ function parseJsCallSites() {
   return sites;
 }
 
-/** Every problem with these call sites, given the commands and the registered set. */
-function findProblems(sites, cmds, registered) {
+/// Known and owned: the snake_case twins assistant.js still sends NEXT TO the
+/// camelCase keys Rust reads (`{ tab_id: tabId, tabId }`). Harmless while the
+/// camelCase twin is there - Tauri reads it and drops the other - but they are
+/// the silently-dropped class this check exists for, found once aiCall sites
+/// were checked at all (A8-17). Unit JU3 removes them from assistant.js. Each
+/// is reported, not failed, ONLY while its camelCase twin is in the same call;
+/// an entry that no longer matches anything fails the run, so this list cannot
+/// outlive the fix.
+const KNOWN_TWINS = [
+  ['src/renderer/assistant.js', 'assistant_get_level', 'tab_id'],
+  ['src/renderer/assistant.js', 'assistant_set_level', 'tab_id'],
+  ['src/renderer/assistant.js', 'assistant_exec', 'session_id'],
+  ['src/renderer/assistant.js', 'assistant_exec', 'tab_id'],
+  ['src/renderer/assistant.js', 'assistant_chat', 'max_tokens'],
+  ['src/renderer/assistant.js', 'assistant_save_config', 'base_url'],
+  ['src/renderer/assistant.js', 'assistant_save_config', 'api_key'],
+];
+const knownTwin = (file, cmd, arg) => KNOWN_TWINS.findIndex(([f, c, a]) => f === file && c === cmd && a === arg);
+
+/** Every problem with these call sites, given the commands and the registered
+ *  set. Known twins (above) go to `known` (an array of KNOWN_TWINS indexes) when given. */
+function findProblems(sites, cmds, registered, known) {
   const problems = [];
   for (const s of sites) {
     const def = cmds[s.cmd];
@@ -198,6 +273,11 @@ function findProblems(sites, cmds, registered) {
     const expected = new Set(def.args.map((a) => a.key));
     for (const k of s.keys) {
       if (!expected.has(k)) {
+        const twin = known ? knownTwin(s.file, s.cmd, k) : -1;
+        if (twin !== -1 && expected.has(toCamel(k)) && s.keys.includes(toCamel(k))) {
+          known.push(twin);
+          continue;
+        }
         const hint = expected.has(toCamel(k)) ? ` (did you mean '${toCamel(k)}'? Tauri camelCases parameters)` : '';
         problems.push(
           `${s.file}:${s.line}  '${s.cmd}' got unexpected arg '${k}'${hint}\n` +
@@ -242,6 +322,31 @@ function selfCheck() {
   }
   if (parseRegisteredCommands('fn main() {}') !== null) failed.push('a source with no handler list must parse as null');
   if (parseRegisteredCommands('generate_handler![ a, b') !== null) failed.push('an unterminated handler list must parse as null');
+  // A comment that mentions the macro (the doc comments do) is not the list.
+  const mentioned = parseRegisteredCommands([
+    '/// A command can be taken out of `tauri::generate_handler![...]` on purpose.',
+    '// see generate_handler![old_cmd] above',
+    '/* generate_handler![ commented_out ] */',
+    '.invoke_handler(tauri::generate_handler![ real_cmd ])',
+  ].join('\n'));
+  if (!mentioned || JSON.stringify([...mentioned]) !== JSON.stringify(['real_cmd'])) {
+    failed.push(`a macro mentioned in a comment must not be taken for the list, got ${JSON.stringify(mentioned && [...mentioned])}`);
+  }
+  // A cfg-gated entry is a registered command (on the platforms it is built
+  // for); a comma inside its attribute does not split it.
+  const gated = parseRegisteredCommands([
+    'tauri::generate_handler![',
+    '    always_cmd,',
+    '    #[cfg(windows)] win_only_cmd,',
+    '    #[cfg(any(target_os = "linux", target_os = "macos"))]',
+    '    unix_cmd,',
+    '    after_cmd',
+    ']',
+  ].join('\n'));
+  const gatedWant = ['always_cmd', 'win_only_cmd', 'unix_cmd', 'after_cmd'];
+  if (!gated || JSON.stringify([...gated]) !== JSON.stringify(gatedWant)) {
+    failed.push(`cfg-gated entries must count, got ${JSON.stringify(gated && [...gated])}, want ${JSON.stringify(gatedWant)}`);
+  }
   const def = { args: [], file: 'probe.rs', line: 1 };
   const flagged = findProblems(
     [{ cmd: 'vault_backup_create', file: 'probe.js', line: 1, keys: [], dynamic: false },
@@ -269,7 +374,17 @@ if (!registered) {
   process.exit(1);
 }
 const sites = parseJsCallSites();
-const problems = findProblems(sites, cmds, registered);
+const known = [];
+const problems = findProblems(sites, cmds, registered, known);
+for (const i of new Set(known)) {
+  const [file, cmd, arg] = KNOWN_TWINS[i];
+  console.log(`  known  ${file}  '${cmd}' also sends '${arg}' next to '${toCamel(arg)}' - removed by unit JU3 (A8-17)`);
+}
+KNOWN_TWINS.forEach(([file, cmd, arg], i) => {
+  if (!known.includes(i)) {
+    problems.push(`${file}  the known '${cmd}' twin '${arg}' is gone (or lost its camelCase twin) - remove it from KNOWN_TWINS in this script`);
+  }
+});
 
 console.log(`Checked ${sites.length} call sites against ${Object.keys(cmds).length} commands (${registered.size} registered).`);
 if (problems.length) {

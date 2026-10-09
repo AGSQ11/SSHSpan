@@ -121,16 +121,36 @@ async function withBusy(button, busyLabel, fn) {
   if (!button) return fn();
   if (button.getAttribute('aria-busy') === 'true') return undefined;
   const content = [...button.childNodes];
-  const wasDisabled = button.disabled;
   button.setAttribute('aria-busy', 'true');
-  button.disabled = true;
+  setDisabledFor(button, 'busy', true);
   if (busyLabel) button.textContent = busyLabel;
   try {
     return await fn();
   } finally {
     button.removeAttribute('aria-busy');
     if (busyLabel) button.replaceChildren(...content);
-    button.disabled = wasDisabled;
+    setDisabledFor(button, 'busy', false);
+  }
+}
+
+/// A control can be disabled for more than one reason at once - the vault is
+/// locked (lockGate) and its action is running (withBusy) - and each reason is
+/// lifted on its own schedule. Each is recorded on the control
+/// (data-disabled-for), the control is disabled while any is set, and it gets
+/// back the state it had before the first: a status refresh no longer
+/// re-enables a button that is still running, nor does the end of a run
+/// re-enable one the lock disabled meanwhile.
+function setDisabledFor(control, reason, on) {
+  const reasons = new Set((control.dataset.disabledFor || '').split(' ').filter(Boolean));
+  if (on && !reasons.size) control.dataset.disabledBase = control.disabled ? '1' : '';
+  if (on) reasons.add(reason); else reasons.delete(reason);
+  if (reasons.size) {
+    control.dataset.disabledFor = [...reasons].join(' ');
+    control.disabled = true;
+  } else if (control.dataset.disabledFor !== undefined) {
+    control.disabled = control.dataset.disabledBase === '1';
+    delete control.dataset.disabledFor;
+    delete control.dataset.disabledBase;
   }
 }
 
@@ -157,6 +177,28 @@ function renderLoadError(host, title, message, retry) {
   again.addEventListener('click', () => withBusy(again, 'Retrying…', () => retry()));
   card.append(icon, heading, text, again);
   host.replaceChildren(card);
+}
+
+/// A tablist or radiogroup is ONE tab stop (A1-36): the selected item takes
+/// Tab (its owner keeps tabindex 0 on it and -1 on the rest), and the arrow
+/// keys, Home and End move along the group. By default the item reached is
+/// pressed too (selection follows focus), so the group's own click handlers
+/// do the switching; `manual` groups - where switching starts a connection -
+/// only move the focus, and Enter or Space press the button.
+function wireRovingGroup(container, itemSelector, manual) {
+  if (!container) return;
+  container.addEventListener('keydown', (ev) => {
+    if (!['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'].includes(ev.key)) return;
+    const items = [...container.querySelectorAll(itemSelector)].filter((b) => !b.disabled && b.offsetParent !== null);
+    const i = items.indexOf(document.activeElement);
+    if (i === -1) return;
+    const n = items.length;
+    const step = ev.key === 'ArrowRight' || ev.key === 'ArrowDown' ? 1 : -1;
+    const next = ev.key === 'Home' ? items[0] : ev.key === 'End' ? items[n - 1] : items[(i + step + n) % n];
+    ev.preventDefault();
+    next.focus();
+    if (!manual) next.click();
+  });
 }
 
 // \u2500\u2500\u2500 modal focus management \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -276,6 +318,8 @@ function modalDidClose(node) {
   const [entry] = modalStack.splice(i, 1);
   node.style.zIndex = '';
   layerModals();
+  // A password shown in this dialog is masked again for next time (A5-35).
+  remaskSecrets(node);
   // Restore focus to the control that opened the dialog, so keyboard users
   // are not dropped at the top of the document. Skipped when something else
   // has already claimed focus inside a dialog still on the stack.
@@ -421,9 +465,13 @@ function injectIcons() {
   }
 }
 
-/** Guard: render an icon value only if it exists; never leak "undefined" text. */
+/** An icon's markup; never "undefined" text. A name ICONS does not have still
+ *  takes an icon's place - an empty svg, sized by the same rules as a real one
+ *  - so the row's text lines up with its neighbours instead of starting an
+ *  icon's width further left (A1-28). */
 function ico(name) {
-  return ICONS[name] || '';
+  if (!name) return '';
+  return ICONS[name] || '<svg aria-hidden="true" viewBox="0 0 24 24"></svg>';
 }
 
 /** 32-36px rounded key-type tile used by key rows and the detail pane. */
@@ -512,7 +560,6 @@ function directHostCount(catId) {
 
 function activeCategoryId() { return state.activeCategoryByScope[state.categoryScope] || 'all'; }
 
-function categoryIdsForScope(scope) { return state.categories.filter(c => c.scope === scope).map(c => c.id); }
 function categoryCount(catId) { return state.categoryScope === 'host' ? directHostCount(catId) : directKeyCount(catId); }
 
 function totalKeyCountFor(catId) {
@@ -531,10 +578,6 @@ function uncategorizedKeyCount() {
   let n = 0;
   for (const k of state.keys) if ((state.keyCategories[k.id] || []).length === 0) n++;
   return n;
-}
-
-function keysInCategory(catId) {
-  return state.keys.filter(k => (state.keyCategories[k.id] || []).includes(catId));
 }
 
 function keysInCategoryRecursive(catId) {
@@ -589,14 +632,32 @@ function catNodeEl(cat, depth) {
   // is locked (A6-08); applyLockGates() keeps this in step afterwards.
   row.draggable = state.unlocked;
   if (activeCategoryId() === cat.id) row.classList.add('active');
+  // Keyboard-operable (A1-11): a tab stop, Enter/Space filter by it. It is a
+  // toggle - selecting the active category clears the filter - so it says
+  // whether it is pressed.
+  row.tabIndex = 0;
+  row.setAttribute('role', 'button');
+  row.setAttribute('aria-pressed', activeCategoryId() === cat.id ? 'true' : 'false');
+  row.setAttribute('aria-label', cat.name);
+  row.addEventListener('keydown', (ev) => {
+    if (ev.target !== row || (ev.key !== 'Enter' && ev.key !== ' ')) return;
+    ev.preventDefault();
+    setActiveCategory(cat.id);
+  });
 
   const kids = childrenOf(cat.id);
-  const chev = document.createElement('span');
+  // A real button when there is something to expand, so it is reachable and
+  // named for the keyboard; a leaf keeps an empty spacer.
+  const chev = document.createElement(kids.length ? 'button' : 'span');
   chev.className = 'cat-chevron';
   if (kids.length === 0) chev.classList.add('leaf');
   else {
+    const open = state.expandedCatIds.has(cat.id);
+    chev.type = 'button';
+    chev.setAttribute('aria-expanded', open ? 'true' : 'false');
+    chev.setAttribute('aria-label', (open ? 'Collapse ' : 'Expand ') + cat.name);
     chev.innerHTML = ico('chevron-right');
-    if (state.expandedCatIds.has(cat.id)) chev.classList.add('expanded');
+    if (open) chev.classList.add('expanded');
     chev.addEventListener('click', (e) => { e.stopPropagation(); toggleCatExpanded(cat.id); });
   }
   row.appendChild(chev);
@@ -620,6 +681,8 @@ function catNodeEl(cat, depth) {
   const menuBtn = document.createElement('button');
   menuBtn.className = 'cat-actions-btn';
   menuBtn.title = 'Category actions';
+  menuBtn.setAttribute('aria-haspopup', 'menu');
+  menuBtn.setAttribute('aria-expanded', 'false');
   menuBtn.innerHTML = ico('ellipsis');
   menuBtn.addEventListener('click', (e) => { e.stopPropagation(); openCatMenu(cat, menuBtn); });
   // Every item in that menu changes categories (A6-08).
@@ -644,6 +707,15 @@ function catNodeEl(cat, depth) {
 function renderCategoryTree() {
   const tree = el('catTree');
   if (!tree) return;
+  // The tree is rebuilt on every change. Whatever in it had the focus - a row,
+  // its chevron, its "..." button - gets it back afterwards, or a keyboard user
+  // is dropped at the top of the page after every expand or filter (A1-26).
+  const had = tree.contains(document.activeElement) ? document.activeElement : null;
+  const hadNode = had && had.closest('.cat-node');
+  const refocus = hadNode && {
+    id: hadNode.dataset.id,
+    part: had.classList.contains('cat-chevron') ? '.cat-chevron' : (had.classList.contains('cat-actions-btn') ? '.cat-actions-btn' : null),
+  };
   tree.innerHTML = '';
   const panel = el('catPanel');
   /// The tree filters the list you are looking at, so it belongs to Keys and
@@ -651,10 +723,19 @@ function renderCategoryTree() {
   /// filter a view with nothing in it to filter.
   const relevant = state.view === 'keys' || state.view === 'connect';
   const title = el('catPanelTitle');
-  if (title) title.textContent = state.categoryScope === 'host' ? 'Host categories' : 'Key categories';
+  if (title) title.textContent = state.categoryScope === 'host' ? 'Server categories' : 'Key categories';
   if (panel) {
     panel.hidden = !relevant
       || (state.categories.filter(c => c.scope === state.categoryScope).length === 0 && !state.orphans);
+    // The narrow-window drawer shows this same panel: with nothing in it, its
+    // buttons are disabled and say why, and an open drawer closes.
+    for (const b of document.querySelectorAll('.cat-drawer-btn')) {
+      if (b.dataset.drawerTitle === undefined) b.dataset.drawerTitle = b.title;
+      b.disabled = panel.hidden;
+      b.title = !panel.hidden ? b.dataset.drawerTitle
+        : 'No categories yet - add a ' + (state.categoryScope === 'host' ? 'server' : 'key') + ' first';
+    }
+    if (panel.hidden && catDrawerOpen()) setCatDrawer(false);
   }
   if (state.orphans) {
     const u = document.createElement('div');
@@ -664,12 +745,61 @@ function renderCategoryTree() {
     if (activeCategoryId() === 'uncategorized') u.classList.add('active');
     const chev = document.createElement('span'); chev.className = 'cat-chevron leaf'; u.appendChild(chev);
     const catIco = document.createElement('span'); catIco.className = 'cat-ico'; catIco.innerHTML = ico('folder'); u.appendChild(catIco);
-    const lbl = document.createElement('span'); lbl.className = 'cat-label'; lbl.textContent = state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized keys'; u.appendChild(lbl);
+    const lbl = document.createElement('span'); lbl.className = 'cat-label'; lbl.textContent = state.categoryScope === 'host' ? 'Uncategorized servers' : 'Uncategorized keys'; u.appendChild(lbl);
     const cnt = document.createElement('span'); cnt.className = 'cat-count'; cnt.textContent = state.categoryScope === 'host' ? state.servers.filter(s => !s.categoryId).length : uncategorizedKeyCount(); u.appendChild(cnt);
     u.addEventListener('click', () => setActiveCategory('uncategorized'));
+    u.tabIndex = 0;
+    u.setAttribute('role', 'button');
+    u.setAttribute('aria-pressed', activeCategoryId() === 'uncategorized' ? 'true' : 'false');
+    u.setAttribute('aria-label', lbl.textContent);
+    u.addEventListener('keydown', (ev) => {
+      if (ev.target !== u || (ev.key !== 'Enter' && ev.key !== ' ')) return;
+      ev.preventDefault();
+      setActiveCategory('uncategorized');
+    });
     tree.appendChild(u);
   }
   for (const c of childrenOf(null)) tree.appendChild(catNodeEl(c, 0));
+  if (refocus) {
+    const node = [...tree.querySelectorAll('.cat-node')].find((n) => n.dataset.id === refocus.id);
+    const target = node && (refocus.part ? node.querySelector(refocus.part) : node);
+    if (target && target.offsetParent !== null) target.focus();
+  }
+}
+
+/// Below 900px the category tree opens as a drawer over the page, from the
+/// Keys toolbar or the server list (A1-06 / A5-13). Hiding it there took
+/// filtering, creating, renaming, moving and deleting categories away at the
+/// minimum window size - and at the default size with Interface scale 125%+.
+function catDrawerOpen() { return el('app').classList.contains('cat-drawer-open'); }
+
+function setCatDrawer(open, o) {
+  if (open === catDrawerOpen()) return;
+  // Nothing to show (renderCategoryTree hides the panel and disables the
+  // buttons then): no empty drawer, no listener, no focus on a hidden node.
+  if (open && el('catPanel').hidden) return;
+  el('app').classList.toggle('cat-drawer-open', open);
+  for (const b of document.querySelectorAll('.cat-drawer-btn')) b.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) {
+    document.addEventListener('mousedown', onCatDrawerOutside, true);
+    const panel = el('catPanel');
+    const first = panel.querySelector('.cat-node.active') || panel.querySelector('.cat-node') || el('catAddRootBtn');
+    if (first) first.focus();
+    return;
+  }
+  document.removeEventListener('mousedown', onCatDrawerOutside, true);
+  if (o && o.focusButton) {
+    const btn = el(state.view === 'connect' ? 'serverCatDrawerBtn' : 'catDrawerBtn');
+    if (btn) btn.focus();
+  }
+}
+
+/// A click outside the drawer closes it - but not one on its own toggle, on a
+/// menu it opened or on a dialog one of its actions opened.
+function onCatDrawerOutside(ev) {
+  const t = ev.target;
+  if (el('catPanel').contains(t) || (t.closest && t.closest('.cat-drawer-btn, .ctx-menu, .modal-backdrop'))) return;
+  setCatDrawer(false);
 }
 
 function toggleCatExpanded(id) {
@@ -775,50 +905,136 @@ async function addCategoryPrompt(parentId) {
   });
 }
 
+// ─── menus ────────────────────────────────────────────────────────────────
+//
+// The vault, category "...", key-connect, server and terminal right-click
+// menus and the ssh-config import menu are built by openMenu(): role=menu of
+// menuitems, the focus on the first item, ArrowUp/ArrowDown/Home/End, Escape
+// and a click outside close it, the focus goes back where it came from, the
+// opener's aria-expanded is reset, and the menu is kept on screen
+// (positionCtxMenuAt). They used to be ad-hoc builders that ignored the
+// keyboard, opened at the raw pointer position off the window's edge and left
+// aria-expanded="true" behind (A2-50 / A1-26 / A2-21 / A1-04). The cascading
+// host picker below and the sftp.js menus still build their own. All of them
+// use the one #keyConnectMenu, so closeKeyConnectMenu() closes whichever is
+// open, and only one menu is ever open.
+
+/// The open menu's bookkeeping: { anchor, opener, onClose, cleanup }, or null.
+let activeMenu = null;
+
+/// items: { label, icon, sub, danger, disabled, onSelect } or 'sep'.
+/// at: the anchor element (the menu opens below it; above with opts.above,
+/// right-aligned with opts.alignRight) or a { x, y } point.
+/// opts.label names the menu for assistive tech; opts.onClose runs once when
+/// it closes, however it closes. Activating the same anchor again closes it.
+function openMenu(at, items, opts) {
+  opts = opts || {};
+  const anchor = at instanceof Element ? at : null;
+  if (anchor && activeMenu && activeMenu.anchor === anchor) { closeKeyConnectMenu(); return null; }
+  closeKeyConnectMenu();
+  const active = document.activeElement;
+  const opener = active && active !== document.body ? active : null;
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.id = 'keyConnectMenu';
+  menu.setAttribute('role', 'menu');
+  if (opts.label) menu.setAttribute('aria-label', opts.label);
+  for (const it of items) {
+    if (it === 'sep') {
+      const sep = document.createElement('div');
+      sep.className = 'ctx-sep';
+      sep.setAttribute('role', 'separator');
+      menu.appendChild(sep);
+      continue;
+    }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ctx-item' + (it.danger ? ' danger' : '');
+    b.setAttribute('role', 'menuitem');
+    b.tabIndex = -1;
+    b.disabled = !!it.disabled;
+    b.innerHTML = ico(it.icon);
+    const text = document.createElement('span');
+    text.textContent = it.label;
+    if (it.sub) {
+      const small = document.createElement('small');
+      small.textContent = it.sub;
+      text.append(' ', small);
+    }
+    b.appendChild(text);
+    b.addEventListener('click', () => {
+      // Closed first, with the focus back where it was, so an action that
+      // opens a dialog hands the focus on from there (and gets it back).
+      closeKeyConnectMenu({ restoreFocus: true });
+      it.onSelect();
+    });
+    menu.appendChild(b);
+  }
+  document.body.appendChild(menu);
+  if (anchor) {
+    const r = anchor.getBoundingClientRect();
+    const x = opts.alignRight ? r.right - menu.offsetWidth : r.left;
+    const y = opts.above ? r.top - menu.offsetHeight - 6 : r.bottom + 4;
+    positionCtxMenuAt(menu, x, y);
+    if (anchor.hasAttribute('aria-expanded')) anchor.setAttribute('aria-expanded', 'true');
+  } else {
+    positionCtxMenuAt(menu, at.x, at.y);
+  }
+  const enabledItems = () => [...menu.querySelectorAll('.ctx-item:not(:disabled)')];
+  // Window, capture phase: ahead of the dialog Escape handler and the page
+  // shortcuts, so Escape closes the menu and nothing under it.
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      closeKeyConnectMenu({ restoreFocus: true });
+      return;
+    }
+    if (!menu.contains(document.activeElement)) return;
+    if (ev.key === 'Tab') {
+      ev.preventDefault();
+      closeKeyConnectMenu({ restoreFocus: true });
+      return;
+    }
+    const list = enabledItems();
+    const i = list.indexOf(document.activeElement);
+    const next = { ArrowDown: list[(i + 1) % list.length], ArrowUp: list[(i - 1 + list.length) % list.length],
+      Home: list[0], End: list[list.length - 1] }[ev.key];
+    if (!next) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    next.focus();
+  };
+  const onDown = (ev) => {
+    if (menu.contains(ev.target)) return;
+    // The opener's own click toggles the menu shut (see above); closing it
+    // here on mousedown would make that click open it again.
+    if (anchor && anchor.contains(ev.target)) return;
+    closeKeyConnectMenu();
+  };
+  window.addEventListener('keydown', onKey, true);
+  document.addEventListener('mousedown', onDown, true);
+  activeMenu = {
+    anchor, opener, onClose: opts.onClose,
+    cleanup: () => {
+      window.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('mousedown', onDown, true);
+    },
+  };
+  const first = enabledItems()[0];
+  if (first) first.focus();
+  return menu;
+}
+
 // ─── cat row menu ─────────────────────────────────────────────────────────
 
-let openMenu = null;
-function closeCatMenu() {
-  if (openMenu) { openMenu.remove(); openMenu = null; }
-  document.removeEventListener('mousedown', onMenuOutside, true);
-}
-function onMenuOutside(e) {
-  if (openMenu && !openMenu.contains(e.target)) closeCatMenu();
-}
 function openCatMenu(cat, anchor) {
-  closeCatMenu();
-  const m = document.createElement('div');
-  m.className = 'cat-menu';
-  m.innerHTML =
-    `<button data-act="rename"><span data-ico="pencil"></span>Rename</button>` +
-    `<button data-act="addChild"><span data-ico="folder-plus"></span>New subcategory</button>` +
-    `<button data-act="move"><span data-ico="move"></span>Move to...</button>` +
-    `<button data-act="delete" class="danger"><span data-ico="x"></span>Delete</button>`;
-  // position absolutely under the anchor; the sidebar isn't a positioning ancestor, so use fixed.
-  const r = anchor.getBoundingClientRect();
-  m.style.position = 'fixed';
-  m.style.top = (r.bottom + 2) + 'px';
-  m.style.left = Math.max(4, r.right - 170) + 'px';
-  // The stylesheet (.cat-menu) sets right:4px for its position:absolute variant.
-  // With position:fixed + left set inline and width:auto, keeping right:4px would
-  // stretch the box from `left` to the viewport's right edge (full-width menu).
-  m.style.right = 'auto';
-  document.body.appendChild(m);
-  // Keep the dropdown inside the viewport horizontally (shrink-to-fit width).
-  const vr = m.getBoundingClientRect();
-  const overflow = vr.right - (window.innerWidth - 4);
-  if (overflow > 0) m.style.left = Math.max(4, vr.left - overflow) + 'px';
-  openMenu = m;
-  setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
-  m.addEventListener('click', async (e) => {
-    const btn = e.target.closest('button'); if (!btn) return;
-    closeCatMenu();
-    const act = btn.dataset.act;
-    if (act === 'rename') renameCategory(cat.id);
-    else if (act === 'addChild') addCategoryPrompt(cat.id);
-    else if (act === 'move') moveCategoryPrompt(cat.id);
-    else if (act === 'delete') deleteCategory(cat.id);
-  });
+  openMenu(anchor, [
+    { label: 'Rename', icon: 'pencil', onSelect: () => renameCategory(cat.id) },
+    { label: 'New subcategory', icon: 'folder-plus', onSelect: () => addCategoryPrompt(cat.id) },
+    { label: 'Move to...', icon: 'move', onSelect: () => moveCategoryPrompt(cat.id) },
+    { label: 'Delete', icon: 'x', danger: true, onSelect: () => deleteCategory(cat.id) },
+  ], { alignRight: true, label: 'Category actions' });
 }
 
 // ─── HTML5 drag-and-drop for the sidebar tree ─────────────────────────────
@@ -885,7 +1101,7 @@ function updateBreadcrumb() {
   if (state.view !== 'keys' && state.view !== 'connect') { bc.hidden = true; return; }
   let path = [];
   const activeCat = activeCategoryId();
-  if (activeCat === 'uncategorized') path = [state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized keys'];
+  if (activeCat === 'uncategorized') path = [state.categoryScope === 'host' ? 'Uncategorized servers' : 'Uncategorized keys'];
   else if (activeCat !== 'all') {
     const segs = catPath(activeCat);
     path = segs;
@@ -894,13 +1110,14 @@ function updateBreadcrumb() {
   bc.hidden = false;
   bc.innerHTML = '';
   const rootLink = document.createElement('a');
-  rootLink.href = '#'; rootLink.textContent = state.categoryScope === 'host' ? 'Hosts' : 'Keys';
+  // "Servers", the name the nav and the view use (A5-31).
+  rootLink.href = '#'; rootLink.textContent = state.categoryScope === 'host' ? 'Servers' : 'Keys';
   rootLink.addEventListener('click', (e) => { e.preventDefault(); setActiveCategory('all'); });
   bc.appendChild(rootLink);
   // for normal category path, walk segments and add clickable ancestors
   if (activeCat === 'uncategorized') {
     const sep = document.createElement('span'); sep.className = 'crumb-sep'; sep.textContent = '/'; bc.appendChild(sep);
-    const cur = document.createElement('span'); cur.className = 'crumb-current'; cur.textContent = state.categoryScope === 'host' ? 'Uncategorized hosts' : 'Uncategorized keys'; bc.appendChild(cur);
+    const cur = document.createElement('span'); cur.className = 'crumb-current'; cur.textContent = state.categoryScope === 'host' ? 'Uncategorized servers' : 'Uncategorized keys'; bc.appendChild(cur);
   } else {
     const segs = catPath(activeCat);
     const ids = []; let cur = catById(activeCat);
@@ -1013,12 +1230,11 @@ function renderPickerTree(filter) {
     for (const c of childrenOf(cat.id)) walk(c, depth + 1);
   };
   for (const c of childrenOf(null)) walk(c, 0);
-  if (scopedCategories.length === 0) {
-    tree.innerHTML = '<div class="picker-empty">No categories yet. Create one in the sidebar.</div>';
-    renderPickerSelection(); return;
-  }
-  if (!rows.length) {
-    tree.innerHTML = '<div class="picker-empty">No matching categories.</div>';
+  if (scopedCategories.length === 0 || !rows.length) {
+    tree.innerHTML = scopedCategories.length === 0
+      ? '<div class="picker-empty">No categories yet. Create one in the sidebar.</div>'
+      : '<div class="picker-empty">No matching categories.</div>';
+    el('pickerSearch').setAttribute('aria-expanded', 'false'); // nothing listed (A1-36)
     renderPickerSelection(); return;
   }
   rows.forEach(({ cat, depth }, index) => {
@@ -1040,6 +1256,7 @@ function renderPickerTree(filter) {
   if (state.pickerActive >= rows.length) state.pickerActive = rows.length - 1;
   const active = tree.querySelector('.picker-row.active');
   el('pickerSearch').setAttribute('aria-activedescendant', active?.id || '');
+  el('pickerSearch').setAttribute('aria-expanded', 'true'); // rows are listed (A1-36)
 }
 
 function treeHasMatchingDescendant(catId, lower) {
@@ -1061,8 +1278,13 @@ function promptModal(title, message, initial, onOk, opts) {
   const input = el('promptInput');
   el('promptTitle').textContent = title;
   el('promptMessage').textContent = message || '';
+  // Autofill and spellcheck are off in the markup for every use of the field
+  // (names, and this password) (A1-34). The eye button shows only for a
+  // password (A5-35).
   input.type = secret ? 'password' : 'text';
-  if (secret) input.setAttribute('autocomplete', 'off'); else input.removeAttribute('autocomplete');
+  if (secret) input.dataset.secret = '1'; else delete input.dataset.secret;
+  const reveal = revealButtonFor(input);
+  if (reveal) { reveal.hidden = !secret; paintRevealButton(reveal, false); }
   input.value = initial || '';
   state.promptCallback = onOk;
   state.promptSecret = secret;
@@ -1073,7 +1295,9 @@ function closePrompt() {
   const input = el('promptInput');
   input.value = '';
   input.type = 'text';
-  input.removeAttribute('autocomplete');
+  delete input.dataset.secret;
+  const reveal = revealButtonFor(input);
+  if (reveal) { reveal.hidden = true; paintRevealButton(reveal, false); }
   state.promptCallback = null;
   state.promptSecret = false;
   el('promptModal').hidden = true;
@@ -1384,6 +1608,7 @@ async function refreshVaultStatus(silent) {
   if (vaultIcon) vaultIcon.innerHTML = info.icon;
   const lbl = el('vaultLabel');
   if (lbl) lbl.textContent = info.label;
+  paintVaultChipName();
   const caret = el('vaultCaret');
   if (caret) caret.innerHTML = s.unlocked || s.hasVault ? ico('chevron-down') : '';
   el('newKeyBtn').disabled = !s.unlocked;
@@ -1396,8 +1621,9 @@ async function refreshVaultStatus(silent) {
   // doing, so letting it re-arm the timer (as this used to) pushed the deadline
   // out forever and the vault never auto-locked. And because the transition is
   // seen exactly once - the next poll finds the vault already unlocked - it must
-  // not sit behind the key load: loadKeys() can reject (loadCategories() is
-  // unguarded), and arming after it left auto-lock off until Settings was opened.
+  // not wait for the key load, which can take a while. When that load could
+  // still reject (before loadCategories() caught its own failures), arming after
+  // it left auto-lock off until Settings was opened.
   if (!s.unlocked) cancelAutoLockTimer();
   else if (!wasUnlocked) {
     noteUserActivity();   // unlocking is the user acting
@@ -1452,48 +1678,22 @@ window.updateNavCounts = updateNavCounts;
 
 /// The vault menu: state, countdown and both vault actions in one control.
 function openVaultMenu(anchor) {
-  closeKeyConnectMenu();
-  const menu = document.createElement('div');
-  menu.className = 'ctx-menu';
-  menu.id = 'keyConnectMenu';
-  const mk = (label, icon, fn, disabled) => {
-    const b = document.createElement('button');
-    b.className = 'ctx-item';
-    b.disabled = !!disabled;
-    b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
-    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
-    menu.appendChild(b);
-    return b;
-  };
+  let items;
   if (!state.hasVault) {
-    mk('Create a vault...', 'lock', () => requestVaultModal('create'));
+    items = [{ label: 'Create a vault...', icon: 'lock', onSelect: () => requestVaultModal('create') }];
   } else if (!state.unlocked) {
-    mk('Unlock vault...', 'lock-open', () => requestVaultModal('unlock'));
+    items = [{ label: 'Unlock vault...', icon: 'lock-open', onSelect: () => requestVaultModal('unlock') }];
   } else {
-    mk('Lock now  (Ctrl+L)', 'lock', lockNow);
-    mk('Change master password...', 'key-round', () => requestVaultModal('change'));
-    const sep = document.createElement('div');
-    sep.className = 'ctx-sep';
-    menu.appendChild(sep);
-    mk('Auto-lock settings...', 'settings', () => { switchView('settings'); showSettingsSection('general'); });
+    items = [
+      { label: 'Lock now  (Ctrl+L)', icon: 'lock', onSelect: lockNow },
+      { label: 'Change master password...', icon: 'key-round', onSelect: () => requestVaultModal('change') },
+      'sep',
+      { label: 'Auto-lock settings...', icon: 'settings', onSelect: () => { switchView('settings'); showSettingsSection('general'); } },
+    ];
   }
-  document.body.appendChild(menu);
   // Anchored above the control: it sits at the bottom of the sidebar, so a
   // menu dropped below it would open off-screen.
-  const r = anchor.getBoundingClientRect();
-  menu.style.left = r.left + 'px';
-  menu.style.top = Math.max(8, r.top - menu.offsetHeight - 6) + 'px';
-  anchor.setAttribute('aria-expanded', 'true');
-  setTimeout(() => document.addEventListener('mousedown', onVaultMenuOutside), 0);
-}
-
-function onVaultMenuOutside(e) {
-  const menu = el('keyConnectMenu');
-  if (menu && menu.contains(e.target)) return;
-  closeKeyConnectMenu();
-  const anchor = el('vaultStatus');
-  if (anchor) anchor.setAttribute('aria-expanded', 'false');
-  document.removeEventListener('mousedown', onVaultMenuOutside);
+  openMenu(anchor, items, { above: true, label: 'Vault' });
 }
 
 // Lock/unlock the nav buttons that require an unlocked vault (Servers).
@@ -1501,6 +1701,9 @@ function applyNavLockState() {
   for (const b of document.querySelectorAll('.nav-item[data-requires-unlock]')) {
     b.classList.toggle('locked', !state.unlocked);
     b.disabled = !state.unlocked;
+    // A disabled item says why, not just its shortcut (A5-31).
+    if (b.dataset.unlockedTitle === undefined) b.dataset.unlockedTitle = b.title;
+    b.title = state.unlocked ? b.dataset.unlockedTitle : 'Unlock the vault to use ' + (b.getAttribute('aria-label') || 'this');
     if (!state.unlocked && b.classList.contains('active')) {
       switchView('keys');
     }
@@ -1532,7 +1735,10 @@ function lockGate(control, kind) {
 
 function applyLockGate(control) {
   const locked = !state.unlocked;
-  control.disabled = locked;
+  // One reason among others (setDisabledFor): unlocking lifts the lock's
+  // reason only, so a control that is busy, or disabled for a reason of its
+  // own, stays disabled.
+  setDisabledFor(control, 'lock', locked);
   control.title = locked ? (LOCK_GATE_HINTS[control.dataset.lockGate] || '') : control.dataset.unlockedTitle;
 }
 
@@ -1592,8 +1798,9 @@ function clearConnectView() {
   renderTermTabs();
 }
 
-/// The backend's answer when a lock lands while a master-password change is
-/// running and aborts it before anything is committed.
+/// The backend's answer when a lock lands while a master-password change, a
+/// backup export or a restore is running and aborts it before anything is
+/// committed or written.
 const VAULT_LOCKED_MIDWAY = 'Vault was locked while the operation was in progress.';
 
 async function submitVaultModal() {
@@ -1685,46 +1892,27 @@ function openTerminalContextMenu(x, y, tabId) {
   closeKeyConnectMenu();
   const tab = state.sessions.get(tabId);
   if (!tab) return;
-  const menu = document.createElement('div');
-  menu.className = 'ctx-menu';
-  menu.id = 'keyConnectMenu';
-  const mk = (label, icon, fn) => {
-    const b = document.createElement('button');
-    b.className = 'ctx-item';
-    b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
-    b.addEventListener('click', () => {
-      closeKeyConnectMenu();
-      fn();
-      // Menu clicks strand focus on <body>; hand it back to the terminal so
-      // the user can keep typing without re-clicking the surface.
-      try { window.tabRecord(tabId)?.term.focus(); } catch (e) {}
-    });
-    menu.appendChild(b);
-    return b;
+  // After the action, hand the focus back to the terminal so the user can keep
+  // typing without re-clicking the surface.
+  const act = (fn) => () => {
+    fn();
+    try { window.tabRecord(tabId)?.term.focus(); } catch (e) {}
   };
-  mk('Copy', 'copy', () => window.terminalCopySelection(tabId));
-  mk('Copy all to clipboard', 'copy', () => window.terminalCopyAll(tabId));
-  mk('Paste', 'clipboard', async () => window.terminalPaste(tabId, await window.terminalReadClipboard()));
-  menu.appendChild(document.createElement('hr')).className = 'ctx-sep';
-  mk('Clear scrollback', 'eraser', () => window.terminalClearScrollback(tabId));
-  mk('Reset terminal', 'rotate-ccw', () => window.terminalReset(tabId));
-  menu.appendChild(document.createElement('hr')).className = 'ctx-sep';
-  mk('New session', 'plus', () => { const srv = state.servers.find(s => s.id === tab.serverId); if (srv) openSessionTab(srv); });
-  mk('Duplicate session', 'copy', () => { const srv = state.servers.find(s => s.id === tab.serverId); if (srv) openSessionTab(srv); });
-  const restart = mk('Restart session', 'refresh-cw', () => reconnectActiveTab());
-  const sftpAction = mk(tab.mode === 'sftp' ? 'Switch to terminal' : 'Switch to SFTP', 'folder-tree', () => window.toggleSshSftpMode());
-  if (!window.tabSessionLive(tabId)) {
-    sftpAction.disabled = true;
-    if (tab.ended) restart.disabled = false;
-  }
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  document.body.appendChild(menu);
-  const onAway = (ev) => {
-    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
-    closeKeyConnectMenu();
-  };
-  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  const server = () => state.servers.find(s => s.id === tab.serverId);
+  openMenu({ x, y }, [
+    { label: 'Copy', icon: 'copy', onSelect: act(() => window.terminalCopySelection(tabId)) },
+    { label: 'Copy all to clipboard', icon: 'copy', onSelect: act(() => window.terminalCopyAll(tabId)) },
+    { label: 'Paste', icon: 'clipboard', onSelect: act(async () => window.terminalPaste(tabId, await window.terminalReadClipboard())) },
+    'sep',
+    { label: 'Clear scrollback', icon: 'eraser', onSelect: act(() => window.terminalClearScrollback(tabId)) },
+    { label: 'Reset terminal', icon: 'rotate-ccw', onSelect: act(() => window.terminalReset(tabId)) },
+    'sep',
+    { label: 'New session', icon: 'plus', onSelect: act(() => { const srv = server(); if (srv) openSessionTab(srv); }) },
+    { label: 'Duplicate session', icon: 'copy', onSelect: act(() => { const srv = server(); if (srv) openSessionTab(srv); }) },
+    { label: 'Restart session', icon: 'refresh-cw', onSelect: act(() => reconnectActiveTab()) },
+    { label: tab.mode === 'sftp' ? 'Switch to terminal' : 'Switch to SFTP', icon: 'folder-tree',
+      disabled: !window.tabSessionLive(tabId), onSelect: act(() => window.toggleSshSftpMode()) },
+  ], { label: 'Terminal' });
 }
 
 function markTerminalBell(tabId) {
@@ -1757,6 +1945,21 @@ function updateSelectionHint() {
 
 function renderKeyList() {
   const list = el('keyList');
+  // Every row is rebuilt. The row that had the focus - or its checkbox or
+  // Connect button - gets it back at the end, or a keyboard user lands at the
+  // top of the page after every selection (A1-26).
+  const had = list.contains(document.activeElement) ? document.activeElement : null;
+  const hadRow = had && had.closest('.key-row');
+  const refocus = hadRow && {
+    id: hadRow.dataset.id,
+    part: had.classList.contains('deploy-check') ? '.deploy-check' : (had.classList.contains('row-btn') ? '.row-btn' : null),
+  };
+  const restoreFocus = () => {
+    if (!refocus) return;
+    const row = [...list.querySelectorAll('.key-row')].find((r) => r.dataset.id === refocus.id);
+    const target = row && (refocus.part ? row.querySelector(refocus.part) : row);
+    if (target) target.focus();
+  };
   list.innerHTML = '';
   if (state.keysLoadError) {
     // Not "No keys yet": the keys could not be read (A5-21).
@@ -1786,6 +1989,7 @@ function renderKeyList() {
     flat.className = 'key-group';
     for (const k of rows) flat.appendChild(keyRowEl(k));
     list.appendChild(flat);
+    restoreFocus();
     return;
   }
 
@@ -1881,12 +2085,24 @@ function renderKeyList() {
     for (const k of g.keys) grp.appendChild(keyRowEl(k, g.keys));
     list.appendChild(grp);
   }
+  restoreFocus();
 }
 
 function keyRowEl(k, groupKeys) {
   const row = document.createElement('div');
   row.className = 'key-row' + (k.id === state.selectedId ? ' selected' : '');
   row.dataset.id = k.id;
+  // Keyboard-operable (A1-11): a tab stop that opens the key on Enter/Space,
+  // like the click - a public-only key has no other control on its row.
+  row.tabIndex = 0;
+  row.setAttribute('role', 'button');
+  row.setAttribute('aria-label', (k.name || '(unnamed)') + ' - ' + k.key_type);
+  if (k.id === state.selectedId) row.setAttribute('aria-current', 'true');
+  row.addEventListener('keydown', (ev) => {
+    if (ev.target !== row || (ev.key !== 'Enter' && ev.key !== ' ')) return;
+    ev.preventDefault();
+    selectKey(k.id);
+  });
 
   const cb = document.createElement('input');
   cb.type = 'checkbox';
@@ -1934,6 +2150,7 @@ function keyRowEl(k, groupKeys) {
   const sub = document.createElement('div');
   sub.className = 'key-row-sub';
   sub.textContent = k.comment || '';
+  sub.title = k.comment || ''; // the line ends in "..." when it is long (A1-35)
   sub.hidden = !k.comment;
   main.appendChild(name);
   main.appendChild(sub);
@@ -1977,40 +2194,40 @@ function keyRowEl(k, groupKeys) {
 
 // Tiny right-click menu: "Use this key to connect...".
 function openKeyConnectMenu(x, y, key) {
-  closeKeyConnectMenu();
-  const menu = document.createElement('div');
-  menu.className = 'ctx-menu';
-  menu.id = 'keyConnectMenu';
-  const btn = document.createElement('button');
-  btn.className = 'ctx-item';
-  btn.innerHTML = `${ico('plug-zap')}<span>Use this key to connect...</span>`;
-  btn.addEventListener('click', async () => {
-    closeKeyConnectMenu();
-    if (!state.unlocked) {
-      toast('Unlock the vault to connect.', 'err');
-      return;
-    }
-    // Pick one of the existing servers; the chosen server's saved username is
-    // kept but its key is overridden with this one at connect time. The picker
-    // loads the server list if the Connect view has never been opened, and
-    // falls back to the new-server modal when there genuinely are none - the
-    // emptiness check cannot happen out here, because state.servers is only
-    // populated by switchView('connect').
-    await openServerPickerForKey(key, x, y);
-  });
-  menu.appendChild(btn);
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  document.body.appendChild(menu);
-  const onAway = (ev) => {
-    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
-    closeKeyConnectMenu();
-  };
-  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  openMenu({ x, y }, [{
+    label: 'Use this key to connect...', icon: 'plug-zap',
+    onSelect: async () => {
+      if (!state.unlocked) {
+        toast('Unlock the vault to connect.', 'err');
+        return;
+      }
+      // Pick one of the existing servers; the chosen server's saved username is
+      // kept but its key is overridden with this one at connect time. The picker
+      // loads the server list if the Connect view has never been opened, and
+      // falls back to the new-server modal when there genuinely are none - the
+      // emptiness check cannot happen out here, because state.servers is only
+      // populated by switchView('connect').
+      await openServerPickerForKey(key, x, y);
+    },
+  }], { label: 'Key' });
 }
-function closeKeyConnectMenu() {
+/// Close whatever menu is open. o.restoreFocus (Escape, a chosen item) puts
+/// the focus back on what had it when the menu opened; a click elsewhere
+/// leaves it where that click put it.
+function closeKeyConnectMenu(o) {
+  const menuState = activeMenu;
+  activeMenu = null;
+  if (menuState) {
+    menuState.cleanup();
+    if (menuState.anchor && menuState.anchor.hasAttribute('aria-expanded')) menuState.anchor.setAttribute('aria-expanded', 'false');
+  }
   const m = document.getElementById('keyConnectMenu');
   if (m && m.parentNode) m.parentNode.removeChild(m);
+  if (menuState) {
+    const back = menuState.anchor || menuState.opener;
+    if (o && o.restoreFocus && back && document.contains(back)) back.focus();
+    if (typeof menuState.onClose === 'function') menuState.onClose();
+  }
   // Host-picker flyouts are body-level elements rather than children of the
   // row that opened them, so removing the root menu alone would leave them
   // floating over the page.
@@ -2275,6 +2492,7 @@ function showDetailTab(tab) {
     const on = b.dataset.detailTab === tab;
     b.classList.toggle('active', on);
     b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
   }
   el('detailPanel-overview').hidden = tab !== 'overview';
   el('detailPanel-export').hidden = tab !== 'export';
@@ -2348,7 +2566,10 @@ function paletteCandidates() {
       run: () => {
         switchView('connect');
         selectServer(s.id);
-        const open = [...state.sessions.values()].find(t => t.serverId === s.id);
+        // A LIVE tab of this server, else a new session. Any tab used to do -
+        // the oldest first - so the entry that said "Switch to session" could
+        // land on a dead terminal, and "Connect" never connected (A3-35).
+        const open = [...state.sessions.values()].find(t => t.serverId === s.id && window.tabSessionLive(t.tabId));
         if (open) activateSessionTab(open.tabId); else openSessionTab(s);
       },
       runAlt: () => { switchView('connect'); selectServer(s.id); openSessionTab(s); },
@@ -2379,30 +2600,93 @@ function paletteCandidates() {
     { group: 'Actions', icon: 'server', name: 'New server...', terms: ['new', 'server', 'host'], run: () => { switchView('connect'); openServerModal({}); } },
     { group: 'Actions', icon: 'shield-check', name: n ? `Deploy ${n} selected key(s)...` : 'Deploy keys (select some first)',
       terms: ['deploy', 'ssh config'], run: () => { switchView('keys'); openDeploySheet(); } },
-    { group: 'Actions', icon: 'scroll-text', name: 'Open the audit log', terms: ['audit', 'log', 'history'],
-      run: () => { switchView('settings').then(() => showSettingsSection('audit')); } },
-    { group: 'Actions', icon: 'settings', name: 'Settings', terms: ['settings', 'preferences', 'options'], run: () => switchView('settings') },
     { group: 'Actions', icon: 'lock', name: 'Lock the vault', terms: ['lock'], run: lockNow },
+    { group: 'Actions', icon: 'key-round', name: 'Change master password...', terms: ['password', 'master password', 'vault'],
+      run: () => requestVaultModal('change') },
+    { group: 'Actions', icon: 'refresh-cw', name: 'Check for updates', terms: ['update', 'updates', 'version', 'release'],
+      run: manualUpdateCheck },
   );
+  // Every Settings section is a destination of its own (A5-17): the palette
+  // used to reach only the first one and the audit log.
+  for (const [section, title, icon, terms] of PALETTE_SETTINGS_SECTIONS) {
+    out.push({ group: 'Actions', icon, name: 'Settings: ' + title, terms: ['settings', ...terms],
+      run: () => { switchView('settings').then(() => showSettingsSection(section)); } });
+  }
   return out;
 }
 
-function renderPalette(query) {
+/// [section, title, icon, words someone would type for it].
+const PALETTE_SETTINGS_SECTIONS = [
+  ['general', 'General', 'settings', ['preferences', 'options', 'auto-lock', 'idle', 'interface scale', 'transfers', 'bandwidth', 'terminal']],
+  ['vault', 'Vault & password', 'lock', ['vault', 'master password', 'lock']],
+  ['hosts', 'Known hosts', 'shield-check', ['known hosts', 'host keys', 'fingerprints', 'pinned']],
+  ['backup', 'Backup & restore', 'download', ['backup', 'restore']],
+  ['sync', 'Bitwarden sync', 'cloud-cog', ['bitwarden', 'vaultwarden', 'sync']],
+  ['assistant', 'AI assistant', 'message-square', ['assistant', 'ai', 'mcp', 'model']],
+  ['audit', 'Audit log', 'scroll-text', ['audit', 'log', 'history']],
+];
+
+/// The lower-case words of a string: spaces and - . _ / @ : , & all separate
+/// words, so "prod web" finds prod-web and "eu1 web" finds web-00.eu1.
+function paletteWords(s) {
+  return String(s == null ? '' : s).toLowerCase().split(/[\s\-._/@:,&()]+/).filter(Boolean);
+}
+
+/// How well an item matches the query's words, 0 for no match. Every word
+/// must match somewhere (A5-17): best in the name - its start (3), the start
+/// of one of its words (2), anywhere in it (1) - else in the subtext or the
+/// search terms (0.5). An action one of whose terms IS the query comes first.
+function paletteScore(item, words, query) {
+  const name = String(item.name || '').toLowerCase();
+  const nameWords = paletteWords(item.name);
+  const others = [item.sub, ...(item.terms || [])].filter(Boolean).map((t) => String(t).toLowerCase());
+  let score = 0;
+  for (const w of words) {
+    const s = name.startsWith(w) ? 3
+      : nameWords.some((x) => x.startsWith(w)) ? 2
+        : name.includes(w) ? 1
+          : others.some((o) => o.includes(w)) ? 0.5 : 0;
+    if (!s) return 0;
+    score += s;
+  }
   const q = query.trim().toLowerCase();
+  if (item.group === 'Actions' && (name === q || (item.terms || []).some((t) => String(t).toLowerCase() === q))) score += 100;
+  return score;
+}
+
+function renderPalette(query) {
+  const words = paletteWords(query);
   const all = state.unlocked ? paletteCandidates()
     : [{ group: 'Actions', icon: 'lock-open', name: 'Unlock the vault...', terms: ['unlock'], run: () => requestVaultModal(state.hasVault ? 'unlock' : 'create') }];
-  paletteItems = !q ? all : all.filter(it =>
-    [it.name, it.sub, ...(it.terms || [])].filter(Boolean).some(t => String(t).toLowerCase().includes(q)));
+  if (!words.length) {
+    paletteItems = all;
+  } else {
+    // Every word must match, best matches first (paletteScore); each group
+    // stays together, the groups in the order of their best match (A5-17).
+    const ranked = all.map((it, i) => ({ it, i, s: paletteScore(it, words, query) }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s || a.i - b.i)
+      .map((x) => x.it);
+    const groups = [...new Set(ranked.map((it) => it.group))];
+    paletteItems = groups.flatMap((g) => ranked.filter((it) => it.group === g));
+  }
   if (paletteActive >= paletteItems.length) paletteActive = 0;
 
   const results = el('paletteResults');
   results.innerHTML = '';
   el('paletteCount').textContent = paletteItems.length
     ? paletteItems.length + (paletteItems.length === 1 ? ' result' : ' results') : '';
+  // The combobox says whether its listbox has anything, and which row the
+  // arrow keys have highlighted (focus stays in the input) (A1-36).
+  const input = el('paletteInput');
+  input.setAttribute('aria-expanded', paletteItems.length ? 'true' : 'false');
+  input.removeAttribute('aria-activedescendant');
   if (!paletteItems.length) {
     const none = document.createElement('div');
     none.className = 'palette-empty';
-    none.textContent = 'Nothing matches "' + query.trim() + '".';
+    // Says what to do next (A5-17): every word has to match something.
+    none.textContent = 'Nothing matches "' + query.trim() + '". Try fewer or shorter words - '
+      + 'names, hosts, users, comments, categories and actions are all searched.';
     results.appendChild(none);
     return;
   }
@@ -2417,12 +2701,14 @@ function renderPalette(query) {
     }
     const row = document.createElement('button');
     row.className = 'palette-row' + (i === paletteActive ? ' active' : '');
+    row.id = 'palette-opt-' + i;
     row.setAttribute('role', 'option');
     row.setAttribute('aria-selected', i === paletteActive ? 'true' : 'false');
     row.innerHTML =
       (it.live ? '<span class="live-dot"></span>' : `<span class="palette-ico">${ico(it.icon)}</span>`) +
-      `<span class="palette-text"><span class="palette-name">${escapeHtml(it.name)}</span>` +
-      (it.sub ? `<span class="palette-sub">${escapeHtml(it.sub)}</span>` : '') + '</span>' +
+      // Both lines are ellipsised when long; the title shows the rest (A1-35).
+      `<span class="palette-text"><span class="palette-name" title="${escapeHtml(it.name)}">${escapeHtml(it.name)}</span>` +
+      (it.sub ? `<span class="palette-sub" title="${escapeHtml(it.sub)}">${escapeHtml(it.sub)}</span>` : '') + '</span>' +
       (it.hint ? `<span class="palette-hint">${escapeHtml(it.hint)}</span>` : '');
     row.addEventListener('click', () => runPaletteItem(i, false));
     row.addEventListener('mousemove', () => {
@@ -2433,7 +2719,10 @@ function renderPalette(query) {
     results.appendChild(row);
   });
   const active = results.querySelector('.palette-row.active');
-  if (active) active.scrollIntoView({ block: 'nearest' });
+  if (active) {
+    active.scrollIntoView({ block: 'nearest' });
+    input.setAttribute('aria-activedescendant', active.id);
+  }
 }
 
 function runPaletteItem(i, alt) {
@@ -2471,7 +2760,10 @@ function closeKeyModal() {
 
 function switchTab(tab) {
   for (const b of document.querySelectorAll('.tab')) {
-    b.classList.toggle('active', b.dataset.tab === tab);
+    const on = b.dataset.tab === tab;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
   }
   el('tab-generate').hidden = tab !== 'generate';
   el('tab-import').hidden = tab !== 'import';
@@ -2698,17 +2990,9 @@ async function importFromSshConfig(anchorEl) {
     const res = await call('ssh_config_list_hosts');
     const hosts = res.hosts || [];
     if (hosts.length === 0) { toast('No Host blocks found in ' + (await systemPaths()).sshConfig + '.', 'info'); return; }
-    closeKeyConnectMenu();
-    const menu = document.createElement('div');
-    menu.className = 'ctx-menu';
-    menu.id = 'keyConnectMenu';
-    for (const h of hosts) {
-      const b = document.createElement('button');
-      b.className = 'ctx-item';
-      const label = `${escapeHtml(h.host)} <small>(${escapeHtml(h.user || '?')}@${escapeHtml(h.hostname || h.host)}:${h.port || 22})</small>`;
-      b.innerHTML = `${ico('server')}<span>${label}</span>`;
-      b.addEventListener('click', () => {
-        closeKeyConnectMenu();
+    const items = hosts.map((h) => ({
+      label: h.host, sub: `(${h.user || '?'}@${h.hostname || h.host}:${h.port || 22})`, icon: 'server',
+      onSelect: () => {
         openServerModal({
           prefill: {
             name: h.host,
@@ -2733,18 +3017,9 @@ async function importFromSshConfig(anchorEl) {
         if (ignored.length) {
           toast(`${ignored.join(' and ')} from your SSH config ${ignored.length > 1 ? 'are' : 'is'} not supported - this connection goes direct.`, 'info');
         }
-      });
-      menu.appendChild(b);
-    }
-    const rect = anchorEl.getBoundingClientRect();
-    menu.style.left = rect.left + 'px';
-    menu.style.top = (rect.bottom + 4) + 'px';
-    document.body.appendChild(menu);
-    const onAway = (ev) => {
-      if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
-      closeKeyConnectMenu();
-    };
-    setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+      },
+    }));
+    openMenu(anchorEl, items, { label: 'Hosts in your SSH config' });
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
@@ -2791,12 +3066,17 @@ async function loadBitwardenConfig() {
     inp.type = f.type;
     inp.id = 'bw_' + f.key;
     inp.placeholder = f.placeholder;
+    // A URL, an address, folder names and a password: no spellcheck, no
+    // autofill offering some other site's saved login (A1-34).
+    inp.spellcheck = false;
+    inp.setAttribute('autocomplete', 'off');
     if (config[f.key]) inp.value = config[f.key];
     if (f.key === 'master_password') inp.value = ''; // never pre-fill password
     label.appendChild(span);
     label.appendChild(inp);
     grid.appendChild(label);
   }
+  wireRevealToggles(grid); // the master password's eye button (A5-35)
 
   // Sync status
   if (config.last_sync) {
@@ -2825,10 +3105,6 @@ async function saveBitwardenConfig() {
   } catch (e) {
     toast(e.message || String(e), 'err');
   }
-}
-
-async function loadBitwardenSync() {
-  // status is now loaded by loadBitwardenConfig
 }
 
 async function bwTest() {
@@ -2955,19 +3231,38 @@ async function loadSettings() {
   /// opts.lockGated marks the four settings the backend refuses to change
   /// while the vault is locked (A6-08): the control is disabled then and the
   /// row says why, until the vault is unlocked (applyLockGates).
+  ///
+  /// The row is a <div>; its caption is a <label for> bound to the row's own
+  /// field (opts.labelFor, else the control when it is a form field), so a
+  /// click on the caption focuses - or, for a toggle, flips - that field and
+  /// nothing else. The whole row used to be one <label>, and a click anywhere
+  /// in it was forwarded to the first labelable thing inside: the bandwidth
+  /// row's hidden "Unlimited" box (one pill click toggled it twice, a caption
+  /// click set a limit) or the "Check now" button (A1-05 / A2-16). A row whose
+  /// control is a button or plain text gets a caption that labels nothing.
+  let fieldSeq = 0;
   const mkRow = (labelText, control, description, opts) => {
-    const row = document.createElement('label');
+    const row = document.createElement('div');
     row.className = 'settings-row';
     const text = document.createElement('span');
     text.className = 'settings-row-text';
-    const title = document.createElement('span');
+    const field = (opts && opts.labelFor) || (control.matches('input, select, textarea') ? control : null);
+    const title = document.createElement(field ? 'label' : 'span');
     title.className = 'settings-row-title';
     title.textContent = labelText;
+    if (field) {
+      if (!field.id) field.id = 'settingsField' + (++fieldSeq);
+      title.htmlFor = field.id;
+    }
     text.appendChild(title);
     if (description) {
       const sub = document.createElement('span');
       sub.className = 'settings-row-sub';
       sub.textContent = description;
+      if (field) {
+        sub.id = field.id + 'Desc';
+        field.setAttribute('aria-describedby', sub.id);
+      }
       text.appendChild(sub);
     }
     if (opts && opts.lockGated) {
@@ -2984,10 +3279,14 @@ async function loadSettings() {
     ctl.className = 'settings-row-control';
     if (control.tagName === 'INPUT' && control.type === 'checkbox') {
       control.classList.add('toggle-input');
+      // The switch is a <label> around just this box: a click on it flips the
+      // box once (it no longer rides on a row-wide label).
+      const sw = document.createElement('label');
+      sw.className = 'settings-toggle';
       const box = document.createElement('span');
       box.className = 'toggle-box';
-      ctl.appendChild(control);
-      ctl.appendChild(box);
+      sw.append(control, box);
+      ctl.appendChild(sw);
     } else {
       ctl.appendChild(control);
     }
@@ -3158,14 +3457,20 @@ async function loadSettings() {
   bpsWrap.className = 'settings-combo';
   const bpsUnlimited = document.createElement('input');
   bpsUnlimited.type = 'checkbox';
+  bpsUnlimited.id = 'settingsBpsUnlimited';
   const bpsNum = document.createElement('input');
   bpsNum.type = 'number';
   bpsNum.min = '1';
   bpsNum.max = '1000000';
   const bpsUnit = document.createElement('select');
   bpsUnit.innerHTML = '<option value="1024">KB/s</option><option value="1048576">MB/s</option>';
-  const bpsUnlimitedTag = document.createElement('span');
+  bpsUnit.setAttribute('aria-label', 'Bandwidth limit unit');
+  // The pill is the box's own <label>: its activation flips the box exactly
+  // once. It used to be a span with a click handler that flipped the box AND
+  // sat inside the row's <label>, which flipped it back (A2-16).
+  const bpsUnlimitedTag = document.createElement('label');
   bpsUnlimitedTag.className = 'settings-combo-tag';
+  bpsUnlimitedTag.htmlFor = bpsUnlimited.id;
   bpsUnlimitedTag.textContent = 'Unlimited';
   /// The three controls for the stored limit: at first render, and to put
   /// them back when a save is refused.
@@ -3184,10 +3489,6 @@ async function loadSettings() {
     bpsUnlimitedTag.classList.toggle('active', bpsUnlimited.checked);
   };
   showThrottle();
-  bpsUnlimitedTag.addEventListener('click', () => {
-    bpsUnlimited.checked = !bpsUnlimited.checked;
-    bpsUnlimited.dispatchEvent(new Event('change'));
-  });
   const applyThrottle = async () => {
     bpsNum.disabled = bpsUnlimited.checked;
     bpsUnit.disabled = bpsUnlimited.checked;
@@ -3219,8 +3520,10 @@ async function loadSettings() {
   bpsWrap.appendChild(bpsUnlimitedTag);
   bpsWrap.appendChild(bpsNum);
   bpsWrap.appendChild(bpsUnit);
+  // The caption names the number field (a click on it focuses the number,
+  // and does nothing while Unlimited has the field disabled).
   mkRow('Bandwidth limit', bpsWrap,
-    'Shared across every transfer, not per file.');
+    'Shared across every transfer, not per file.', { labelFor: bpsNum });
 
   // Verify toggle (Task 4): off by default - the label states the actual
   // cost up front rather than burying it in a tooltip, since re-reading
@@ -3373,18 +3676,21 @@ async function backupRestore() {
   // A lock while the question was open answers it no; this also covers a lock
   // that landed right after the answer.
   if (!go || !state.unlocked) return;
-  await runRestore({});
+  await runRestore();
 }
 
-/// One restore call. `{}` lets Rust open the file dialog; `{path,
-/// backupPassword}` is the retry for a backup sealed under a different master
+/// One restore call. No arguments lets Rust open the file dialog; `path` and
+/// `backupPassword` are the retry for a backup sealed under a different master
 /// password, which Rust accepts only for the path it offered back - once,
-/// within a few minutes.
-async function runRestore(args) {
+/// within a few minutes. Both calls pass object literals, so check-ipc-args.js
+/// checks their keys against the Rust signature (a variable hid them).
+async function runRestore(path, backupPassword) {
   await withBusy(el('backupImportBtn'), 'Restoring…', async () => {
     let r;
     try {
-      r = await call('vault_backup_restore_from_file', args);
+      r = path === undefined
+        ? await call('vault_backup_restore_from_file', {})
+        : await call('vault_backup_restore_from_file', { path, backupPassword });
     } catch (e) {
       const msg = e.message || String(e);
       // A wrong password uses up the retry Rust granted for that file, so the
@@ -3412,7 +3718,7 @@ async function runRestore(args) {
 function askBackupPassword(path) {
   promptModal('Backup password',
     'This backup was sealed with a different master password. Enter the one that was current when it was taken:',
-    '', (pw) => { if (pw) runRestore({ path, backupPassword: pw }); }, { secret: true });
+    '', (pw) => { if (pw) runRestore(path, pw); }, { secret: true });
 }
 
 async function finishRestore(r) {
@@ -3449,17 +3755,27 @@ async function reloadAfterRestore() {
   // Neither rejects: a failure shows in its own list (A5-21).
   await loadKeys();
   await loadServers();
+  let stored;
   try {
-    state.settings = await call('settings_get');
+    stored = await call('settings_get');
   } catch (e) {
     toast('Restored, but the settings could not be read back: ' + (e.message || String(e)), 'err');
     return;
   }
+  applyStoredSettings(stored);
+  if (state.view === 'settings') await loadSettings();
+}
+
+/// Put stored settings into effect: the SFTP dual-pane default, the interface
+/// scale, the idle timer (measured from the last real input, so this never
+/// extends it) and the open terminals. Boot and a restore both do this, here,
+/// so the two cannot drift apart.
+function applyStoredSettings(stored) {
+  state.settings = stored || {};
   state.sftpDualPane = state.settings.sftpDualPane === '1';
   applyUiScale(currentUiScale());
   armAutoLockTimer();
   if (typeof window.terminalApplySettings === 'function') window.terminalApplySettings();
-  if (state.view === 'settings') await loadSettings();
 }
 
 // ─── known hosts (Settings panel) ──────────────────────────────────────────
@@ -3518,53 +3834,113 @@ async function loadKnownHosts() {
 
 // ─── audit view ────────────────────────────────────────────────────────────
 
-async function loadAudit() {
-  const body = el('auditBody');
-  body.innerHTML = '';
+/// The audit table: a page of AUDIT_PAGE rows at first, AUDIT_PAGE more per
+/// "Load older" (audit_list takes a limit only, so a bigger limit is the next
+/// page), up to the retention cap. The event-type and text filters work on
+/// the rows loaded so far, without asking the backend again (A5-16).
+const AUDIT_PAGE = 200;
+const AUDIT_RETENTION = 10000;
+let auditLimit = AUDIT_PAGE;
+let auditRows = [];
+let auditTotal = 0;
+
+/// `fromStart` goes back to the first page (opening Settings, after a clear).
+async function loadAudit(fromStart) {
+  if (fromStart === true) auditLimit = AUDIT_PAGE;
+  let res;
   try {
-    const res = await call('audit_list', { limit: 200 });
-    const rows = res.rows || [];
-    // The table is capped in the backend (AUDIT_RETENTION_ROWS) and this call
-    // asks for a page of 200, so say how many exist rather than letting the
-    // visible page imply it is everything.
-    const total = typeof res.total === 'number' ? res.total : rows.length;
-    const countChip = el('auditCount');
-    if (countChip) {
-      countChip.hidden = total === 0;
-      countChip.textContent = total > rows.length
-        ? `newest ${rows.length} of ${total}`
-        : `${total} ${total === 1 ? 'entry' : 'entries'}`;
-    }
-    const capHint = el('auditCapHint');
-    if (capHint) {
-      capHint.textContent = total >= 10000
-        ? 'The log keeps the newest 10,000 entries; older ones are discarded automatically.'
-        : '';
-    }
-    if (rows.length === 0) {
-      const tr = document.createElement('tr');
-      const td = document.createElement('td');
-      td.colSpan = 3;
-      td.textContent = 'No audit events yet.';
-      tr.appendChild(td);
-      body.appendChild(tr);
-      return;
-    }
-    for (const r of rows) {
-      const tr = document.createElement('tr');
-      const cells = [fmtTime(r.ts), r.event, r.detail].map((v, i) => {
-        const td = document.createElement('td');
-        td.textContent = v === undefined || v === null ? '' : String(v);
-        if (i === 0) td.className = 'ts';
-        if (i === 1) td.className = 'ev';
-        return td;
-      });
-      cells.forEach(td => tr.appendChild(td));
-      body.appendChild(tr);
-    }
+    res = await call('audit_list', { limit: auditLimit });
   } catch (e) {
-    toast(e.message || String(e), 'err');
+    // Say so in the table, with a Retry; it used to be an empty table and a
+    // toast that faded.
+    const msg = e.message || String(e);
+    auditRows = [];
+    const tr = document.createElement('tr');
+    tr.className = 'audit-error';
+    const td = document.createElement('td');
+    td.colSpan = 3;
+    const text = document.createElement('span');
+    text.setAttribute('role', 'alert');
+    text.textContent = 'Could not load the audit log: ' + msg;
+    const again = document.createElement('button');
+    again.type = 'button';
+    again.className = 'ghost-btn';
+    again.innerHTML = `${ico('refresh-cw')}<span>Retry</span>`;
+    again.addEventListener('click', () => withBusy(again, 'Retrying…', () => loadAudit()));
+    td.append(text, again);
+    tr.appendChild(td);
+    el('auditBody').replaceChildren(tr);
+    el('auditMoreBtn').hidden = true;
+    toast(msg, 'err');
+    return;
   }
+  auditRows = res.rows || [];
+  // The table is capped in the backend (AUDIT_RETENTION_ROWS) and this call
+  // asks for one page at a time, so say how many exist rather than letting the
+  // visible page imply it is everything.
+  auditTotal = typeof res.total === 'number' ? res.total : auditRows.length;
+  const countChip = el('auditCount');
+  if (countChip) {
+    countChip.hidden = auditTotal === 0;
+    countChip.textContent = auditTotal > auditRows.length
+      ? `newest ${auditRows.length} of ${auditTotal}`
+      : `${auditTotal} ${auditTotal === 1 ? 'entry' : 'entries'}`;
+  }
+  const capHint = el('auditCapHint');
+  if (capHint) {
+    capHint.textContent = auditTotal >= AUDIT_RETENTION
+      ? 'The log keeps the newest 10,000 entries; older ones are discarded automatically.'
+      : '';
+  }
+  // The event types of the rows loaded, keeping the one chosen if it is
+  // still among them.
+  const sel = el('auditEventFilter');
+  const chosen = sel.value;
+  const events = [...new Set(auditRows.map((r) => r.event).filter(Boolean))].sort();
+  sel.replaceChildren(new Option('All events', ''), ...events.map((ev) => new Option(ev, ev)));
+  sel.value = events.includes(chosen) ? chosen : '';
+  el('auditMoreBtn').hidden = auditRows.length >= auditTotal || auditLimit >= AUDIT_RETENTION;
+  renderAuditRows();
+}
+
+/// The loaded rows that pass both filters.
+function renderAuditRows() {
+  const body = el('auditBody');
+  const event = el('auditEventFilter').value;
+  const words = el('auditTextFilter').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const rows = auditRows.filter((r) => {
+    if (event && r.event !== event) return false;
+    if (!words.length) return true;
+    const hay = [fmtTime(r.ts), r.event, r.keyId, r.detail].filter((v) => v != null).join(' ').toLowerCase();
+    return words.every((w) => hay.includes(w));
+  });
+  const filtering = !!event || words.length > 0;
+  el('auditFilterHint').textContent = filtering
+    ? `${rows.length} of the ${auditRows.length} loaded ${auditRows.length === 1 ? 'entry matches' : 'entries match'}`
+    : '';
+  const out = [];
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    [fmtTime(r.ts), r.event, r.detail].forEach((v, i) => {
+      const td = document.createElement('td');
+      td.textContent = v === undefined || v === null ? '' : String(v);
+      if (i === 0) td.className = 'ts';
+      if (i === 1) td.className = 'ev';
+      tr.appendChild(td);
+    });
+    out.push(tr);
+  }
+  if (!out.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 3;
+    td.textContent = filtering
+      ? (auditRows.length < auditTotal ? 'No loaded entry matches - load older entries to search further back.' : 'No entry matches.')
+      : 'No audit events yet.';
+    tr.appendChild(td);
+    out.push(tr);
+  }
+  body.replaceChildren(...out);
 }
 
 /// RFC 4180 field escaping: wrap in quotes and double any embedded quote.
@@ -3619,7 +3995,7 @@ async function auditClear() {
     );
     if (!confirmed) return;
     const out = await call('audit_clear');
-    await loadAudit();
+    await loadAudit(true);
     toast(`Cleared ${out.removed} entrie(s).`, 'ok');
   } catch (e) { toast((e && (e.message || e.error)) || String(e), 'err'); }
 }
@@ -3635,6 +4011,8 @@ const VIEW_SUBS = {
 };
 
 async function switchView(view) {
+  setCatDrawer(false);
+  remaskSecrets(document); // a password shown in Settings is not left shown (A5-35)
   state.view = view;
   state.categoryScope = currentCategoryScope();
   // Terminal-maximized is a state of the Connect surface, not of the app:
@@ -3648,6 +4026,9 @@ async function switchView(view) {
   rebuildCategoryIndex();
   state.orphans = state.categoryScope === 'host' ? state.servers.some(s => !s.categoryId) : uncategorizedKeyCount() > 0;
   renderCategoryTree();
+  // The breadcrumb lives in the shared top bar: redraw it for this view's
+  // scope, or the Keys filter lingered in Settings and on Servers (A2-17).
+  updateBreadcrumb();
   for (const b of document.querySelectorAll('.nav-item')) {
     b.classList.toggle('active', b.dataset.view === view);
   }
@@ -3660,7 +4041,7 @@ async function switchView(view) {
     await loadSettings();
     await loadBitwardenConfig();
     await loadKnownHosts();
-    await loadAudit();
+    await loadAudit(true);
   }
   if (view === 'keys') {
     state.categoryScope = 'key'; rebuildCategoryIndex(); renderCategoryTree();
@@ -3742,6 +4123,29 @@ function wire() {
   el('typeFilter').addEventListener('change', renderKeyList);
   el('catAddRootBtn').addEventListener('click', () => addCategoryPrompt(null));
   lockGate(el('catAddRootBtn'), 'categories');
+  // The category drawer (narrow window): its toggles, and a category chosen in
+  // it closes it - the list it filters is what the user wants to see next.
+  for (const b of document.querySelectorAll('.cat-drawer-btn')) {
+    b.addEventListener('click', () => setCatDrawer(!catDrawerOpen()));
+  }
+  el('catTree').addEventListener('click', (ev) => {
+    if (!catDrawerOpen() || !ev.target.closest('.cat-node') || ev.target.closest('.cat-chevron, .cat-actions-btn')) return;
+    setCatDrawer(false, { focusButton: true });
+  });
+  el('catTree').addEventListener('keydown', (ev) => {
+    if (!catDrawerOpen() || (ev.key !== 'Enter' && ev.key !== ' ')) return;
+    if (ev.target.classList && ev.target.classList.contains('cat-node')) setCatDrawer(false, { focusButton: true });
+  });
+  // Focus leaving the drawer closes it: whatever took the focus would
+  // otherwise sit under it (WCAG 2.4.11). Not focus moving into a menu or a
+  // dialog the drawer opened, onto its own toggle, or out of the window (no
+  // relatedTarget).
+  el('catPanel').addEventListener('focusout', (ev) => {
+    const to = ev.relatedTarget;
+    if (!catDrawerOpen() || !to || el('catPanel').contains(to)) return;
+    if (to.closest && to.closest('.cat-drawer-btn, .ctx-menu, .modal-backdrop')) return;
+    setCatDrawer(false);
+  });
 
   // selection actions (what used to be the Deploy view's entry point)
   el('selDeployBtn').addEventListener('click', openDeploySheet);
@@ -3776,6 +4180,13 @@ function wire() {
   for (const b of document.querySelectorAll('.detail-tab')) {
     b.addEventListener('click', () => showDetailTab(b.dataset.detailTab));
   }
+  // Tab groups and radio groups are one tab stop each; arrows move within
+  // them (A1-36). Shell/Files/Split only moves the focus: opening Files
+  // starts the SFTP subsystem, so Enter/Space decide.
+  wireRovingGroup(document.querySelector('.detail-tabs'), '.detail-tab');
+  wireRovingGroup(document.querySelector('#modalBackdrop .tabs'), '.tab');
+  wireRovingGroup(document.querySelector('#serverModal .auth-method-row'), '.seg-btn');
+  wireRovingGroup(el('termModeSeg'), '.seg-btn', true);
   el('detailCopyFprBtn').innerHTML = ico('copy');
   el('detailCopyFprBtn').addEventListener('click', async () => {
     const ok = await copyText(el('detailFingerprint').textContent || '');
@@ -3872,6 +4283,16 @@ function wire() {
     b.addEventListener('click', () => switchTab(b.dataset.tab));
   }
   el('modalPrimary').addEventListener('click', submitKeyModal);
+  // Enter in a single-line field creates/imports, like the server form and
+  // every other dialog here (A5-15). Not in the pasted key (a textarea, where
+  // Enter is a new line), a checkbox or a select.
+  el('modalBackdrop').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.isComposing) return;
+    const t = e.target;
+    if (!(t instanceof HTMLInputElement) || t.type === 'checkbox') return;
+    e.preventDefault();
+    submitKeyModal();
+  });
   el('genType').addEventListener('change', onGenTypeChange);
   el('importBrowseBtn').addEventListener('click', browseForImport);
 
@@ -3908,6 +4329,12 @@ function wire() {
   el('auditExportBtn').addEventListener('click', auditExport);
   el('auditClearBtn').addEventListener('click', auditClear);
   lockGate(el('auditClearBtn'), 'audit');
+  el('auditEventFilter').addEventListener('change', renderAuditRows);
+  el('auditTextFilter').addEventListener('input', renderAuditRows);
+  el('auditMoreBtn').addEventListener('click', (ev) => withBusy(ev.currentTarget, 'Loading…', () => {
+    auditLimit = Math.min(AUDIT_RETENTION, auditLimit + AUDIT_PAGE);
+    return loadAudit();
+  }));
 
   // picker modal
   el('pickerCloseBtn').addEventListener('click', closeCategoryPicker);
@@ -3967,7 +4394,9 @@ function wire() {
   // is open on top of it.
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
-      if (!modalStack.length && el('app').classList.contains('term-max')) toggleTermMax();
+      if (modalStack.length) return;
+      if (catDrawerOpen()) { setCatDrawer(false, { focusButton: true }); return; }
+      if (el('app').classList.contains('term-max')) toggleTermMax();
       return;
     }
     // With a dialog open, the chords below would act on the page behind it:
@@ -3978,13 +4407,15 @@ function wire() {
     // Ctrl+Shift+1/2/3 switch the session surface (Shell/Files/Split) - the
     // mode buttons' tooltips advertise these. Must be handled BEFORE the
     // Ctrl+Shift-rejecting branch below, and only when a session surface is
-    // actually active.
-    if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && !ev.altKey
-        && ['1', '2', '3'].includes(ev.key)) {
+    // actually active. Matched on the PHYSICAL key (ev.code): with Shift held,
+    // ev.key is the shifted character - ! @ # on a US keyboard, other
+    // symbols elsewhere - so comparing it with digits never fired (A8-18).
+    const surfaceMode = { Digit1: 'ssh', Digit2: 'sftp', Digit3: 'split' }[ev.code];
+    if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && !ev.altKey && surfaceMode) {
       if (dialogOpen) return;
       const view = el('view-connect');
       if (view && !view.hidden && state.activeTabId) {
-        const mode = { '1': 'ssh', '2': 'sftp', '3': 'split' }[ev.key];
+        const mode = surfaceMode;
         if (typeof window.setSessionMode === 'function') {
           window.setSessionMode(mode);
           ev.preventDefault();
@@ -4121,8 +4552,6 @@ function wire() {
   el('connectPwModal').addEventListener('click', (e) => {
     if (e.target === el('connectPwModal')) closeConnectPwModal(null);
   });
-
-  if (typeof initTerminal === 'function') initTerminal();
 }
 
 /// Lock now, immediately: no confirmation, whatever is open.
@@ -4181,12 +4610,96 @@ function closeDialogsForLock() {
 /// at runtime, like the Bitwarden master password), the pasted private key,
 /// the deploy preview and the prompt field.
 function clearSensitiveInputs() {
-  for (const input of document.querySelectorAll('input[type="password"]')) input.value = '';
+  // data-secret: a password field shown with its eye button is type=text
+  // right now, and must be wiped (and masked again) all the same.
+  for (const input of document.querySelectorAll('input[type="password"], input[data-secret]')) input.value = '';
+  remaskSecrets(document);
   for (const id of ['importPem', 'configPreview', 'promptInput']) {
     const n = el(id);
     if (n) n.value = '';
   }
   resetImportFileHint();
+}
+
+// ─── show / hide for password fields ──────────────────────────────────────
+//
+// Every password field has an eye button that shows what was typed (A5-35):
+// a master password with no recovery was otherwise chosen blind. Nothing about
+// it is kept - a field is masked again when its dialog closes, the view
+// changes or the vault locks - and data-secret marks it as a secret field
+// whichever type it has at that moment.
+
+function revealButtonFor(input) {
+  const wrap = input && input.parentElement;
+  return wrap && wrap.classList.contains('secret-field') ? wrap.querySelector('.reveal-btn') : null;
+}
+
+function paintRevealButton(btn, shown) {
+  btn.setAttribute('aria-pressed', shown ? 'true' : 'false');
+  btn.setAttribute('aria-label', shown ? 'Hide password' : 'Show password');
+  btn.title = shown ? 'Hide' : 'Show';
+  btn.innerHTML = ico(shown ? 'eye-off' : 'eye');
+}
+
+function setRevealed(input, shown) {
+  input.type = shown ? 'text' : 'password';
+  const btn = revealButtonFor(input);
+  if (btn) paintRevealButton(btn, shown);
+}
+
+/// Put the eye button beside `input` (wrapping both in .secret-field). Once.
+function addRevealToggle(input) {
+  if (!input || !input.id || revealButtonFor(input)) return revealButtonFor(input);
+  const wrap = document.createElement('span');
+  wrap.className = 'secret-field';
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'reveal-btn';
+  btn.setAttribute('aria-controls', input.id);
+  btn.addEventListener('click', () => setRevealed(input, input.type === 'password'));
+  wrap.appendChild(btn);
+  paintRevealButton(btn, false);
+  nameFieldFromCaption(input, wrap);
+  return btn;
+}
+
+/// A field inside a wrapping <label> is named by that label's whole content -
+/// which, with the eye button inside it too, ended in "Show password" (or
+/// "Hide password"). Name the field from its caption alone - the label's
+/// content before the field, wrapped in a span for the purpose - with
+/// aria-labelledby. The label still focuses the field when clicked.
+function nameFieldFromCaption(input, wrap) {
+  const label = wrap.parentElement && wrap.parentElement.closest('label');
+  if (!label || input.hasAttribute('aria-labelledby') || input.hasAttribute('aria-label')) return;
+  const caption = [];
+  for (const n of [...label.childNodes]) {
+    if (n === wrap || (n.nodeType === Node.ELEMENT_NODE && n.contains(wrap))) break;
+    caption.push(n);
+  }
+  if (!caption.some((n) => n.textContent.trim())) return;
+  const span = document.createElement('span');
+  span.className = 'field-caption';
+  span.id = input.id + 'Caption';
+  label.insertBefore(span, caption[0]);
+  span.append(...caption);
+  input.setAttribute('aria-labelledby', span.id);
+}
+
+/// Every password field under `root` gets its eye button.
+function wireRevealToggles(root) {
+  for (const input of root.querySelectorAll('input[type="password"]')) {
+    input.dataset.secret = '1';
+    addRevealToggle(input);
+  }
+}
+
+/// Mask every shown secret field under `root` again.
+function remaskSecrets(root) {
+  for (const input of root.querySelectorAll('input[data-secret]')) {
+    if (input.type !== 'password') setRevealed(input, false);
+  }
 }
 
 // ─── Auto-lock (idle timer, honors the autoLockMinutes setting) ────────────
@@ -4286,13 +4799,29 @@ function onHumanInput(ev) {
 function renderVaultCountdown() {
   const sub = el('vaultSub');
   if (!sub) return;
-  if (!state.unlocked) { sub.hidden = true; sub.textContent = ''; return; }
-  if (!autoLockDeadline) { sub.hidden = false; sub.textContent = 'auto-lock off'; return; }
-  const left = Math.max(0, autoLockDeadline - Date.now());
-  const m = Math.floor(left / 60000);
-  const s = Math.floor((left % 60000) / 1000);
-  sub.hidden = false;
-  sub.textContent = 'locks in ' + m + ':' + String(s).padStart(2, '0');
+  if (!state.unlocked) { sub.hidden = true; sub.textContent = ''; }
+  else if (!autoLockDeadline) { sub.hidden = false; sub.textContent = 'auto-lock off'; }
+  else {
+    const left = Math.max(0, autoLockDeadline - Date.now());
+    const m = Math.floor(left / 60000);
+    const s = Math.floor((left % 60000) / 1000);
+    sub.hidden = false;
+    sub.textContent = 'locks in ' + m + ':' + String(s).padStart(2, '0');
+  }
+  paintVaultChipName();
+}
+
+/// The vault control's name and tooltip carry the state and the countdown, so
+/// they are still there when the narrow layout shows the icon alone (A1-19).
+function paintVaultChipName() {
+  const chip = el('vaultStatus');
+  const label = el('vaultLabel');
+  const sub = el('vaultSub');
+  if (!chip || !label) return;
+  const name = 'Vault: ' + label.textContent.toLowerCase()
+    + (sub && !sub.hidden && sub.textContent ? ' - ' + sub.textContent : '');
+  chip.setAttribute('aria-label', name);
+  chip.title = name + '. Click for lock and password actions.';
 }
 
 if (!autoLockTicker) autoLockTicker = setInterval(renderVaultCountdown, 1000);
@@ -4464,6 +4993,7 @@ function renderServerList() {
     const name = document.createElement('span');
     name.className = 'server-name';
     name.textContent = s.name || '(unnamed)';
+    name.title = name.textContent; // ellipsised when long (A1-35)
     head.appendChild(name);
     if (s.keyMissing) {
       const m = document.createElement('span');
@@ -4484,7 +5014,7 @@ function renderServerList() {
                     : s.authMethod === 'keyboard-interactive' ? 'message-square'
                     : 'key-round';
     const authLabel = s.authMethod === 'password' ? 'Password'
-                     : s.authMethod === 'keyboard-interactive' ? 'Kbd-int'
+                     : s.authMethod === 'keyboard-interactive' ? 'Keyboard-interactive'
                      : (s.keyName ? `${s.keyName} (${s.keyType || '?'})` : 'Key');
     auth.innerHTML = `${ico(authIcon)}<span>${escapeHtml(authLabel)}</span>`;
     row.appendChild(auth);
@@ -4528,37 +5058,19 @@ function selectServer(id) {
 }
 
 function openServerContextMenu(x, y, srv) {
-  closeKeyConnectMenu();
-  const menu = document.createElement('div');
-  menu.className = 'ctx-menu';
-  menu.id = 'keyConnectMenu';
-  const mk = (label, icon, fn) => {
-    const b = document.createElement('button');
-    b.className = 'ctx-item';
-    b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
-    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
-    menu.appendChild(b);
-    return b;
-  };
-  mk('Connect', 'plug-zap', () => openSessionTab(srv));
-  mk('Edit', 'pencil', () => openServerModal({ id: srv.id }));
-  mk('Delete', 'trash-2', async () => {
-    if (!(await confirmModal('Delete server', `Delete server "${srv.name}"?`, 'Delete'))) return;
-    try {
-      await call('server_delete', { id: srv.id });
-      if (state.connectSelectedId === srv.id) selectServer(null);
-      await loadServers();
-      toast('Server deleted.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  document.body.appendChild(menu);
-  const onAway = (ev) => {
-    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
-    closeKeyConnectMenu();
-  };
-  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  openMenu({ x, y }, [
+    { label: 'Connect', icon: 'plug-zap', onSelect: () => openSessionTab(srv) },
+    { label: 'Edit', icon: 'pencil', onSelect: () => openServerModal({ id: srv.id }) },
+    { label: 'Delete', icon: 'trash-2', onSelect: async () => {
+      if (!(await confirmModal('Delete server', `Delete server "${srv.name}"?`, 'Delete'))) return;
+      try {
+        await call('server_delete', { id: srv.id });
+        if (state.connectSelectedId === srv.id) selectServer(null);
+        await loadServers();
+        toast('Server deleted.', 'ok');
+      } catch (e) { toast(e.message || String(e), 'err'); }
+    } },
+  ], { label: 'Server' });
 }
 
 // ─── Server modal ───────────────────────────────────────────────────────────
@@ -4617,10 +5129,13 @@ function closeServerModal() {
 
 function setConnectAuthMethod(method) {
   state.connectAuthMethod = method;
-  // Only the modal's Key / Password / Kbd-int buttons - the terminal's
+  // Only the modal's Key / Password / Keyboard-interactive buttons - the terminal's
   // Shell / Files / Split switch shares the .seg-btn class.
   for (const b of document.querySelectorAll('#serverModal .seg-btn')) {
-    b.classList.toggle('active', b.dataset.auth === method);
+    const on = b.dataset.auth === method;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
   }
   el('srvKeyRow').hidden = method !== 'publickey';
   el('srvPwRow').hidden = method === 'publickey';
@@ -5080,21 +5595,37 @@ function activateSessionTab(tabId) {
 function renderTermTabs() {
   const strip = el('termTabs');
   if (!strip) return;
+  // The chips are rebuilt; a focused chip (or its close button) gets the focus
+  // back on its replacement (A1-26).
+  const had = strip.contains(document.activeElement) ? document.activeElement.closest('.term-tab') : null;
+  const refocus = had && { id: had.dataset.tabId, close: document.activeElement.classList.contains('term-tab-close') };
   strip.querySelectorAll('.term-tab').forEach(n => n.remove());
   const addBtn = el('termTabAdd');
   for (const [tabId, tab] of state.sessions) {
     const chip = document.createElement('div');
     chip.className = 'term-tab' + (tabId === state.activeTabId ? ' active' : '') + (tab.ended ? ' ended' : '') + (tab.bell ? ' bell' : '');
+    chip.dataset.tabId = tabId;
+    // Keyboard-operable (A1-11): a tab stop, Enter/Space switch to it.
+    chip.tabIndex = 0;
+    chip.setAttribute('role', 'button');
+    if (tabId === state.activeTabId) chip.setAttribute('aria-current', 'true');
+    chip.addEventListener('keydown', (ev) => {
+      if (ev.target !== chip || (ev.key !== 'Enter' && ev.key !== ' ')) return;
+      ev.preventDefault();
+      activateSessionTab(tabId);
+    });
     const dot = document.createElement('span');
     dot.className = 'term-tab-dot' + (window.tabSessionLive(tabId) ? ' live' : '');
     const name = document.createElement('span');
     name.className = 'term-tab-name';
     name.textContent = tab.serverName;
     name.title = `${tab.serverName} (${tab.host}:${tab.port})`;
-    const close = document.createElement('span');
+    const close = document.createElement('button');
+    close.type = 'button';
     close.className = 'term-tab-close';
     close.textContent = '×';
     close.title = 'Close session';
+    close.setAttribute('aria-label', 'Close the session to ' + tab.serverName);
     close.addEventListener('click', (ev) => { ev.stopPropagation(); closeSessionTab(tabId); });
     chip.appendChild(dot);
     chip.appendChild(name);
@@ -5106,6 +5637,10 @@ function renderTermTabs() {
       openTerminalContextMenu(ev.clientX, ev.clientY, tabId);
     });
     strip.insertBefore(chip, addBtn);
+  }
+  if (refocus) {
+    const chip = [...strip.querySelectorAll('.term-tab')].find((c) => c.dataset.tabId === refocus.id);
+    if (chip) (refocus.close ? chip.querySelector('.term-tab-close') : chip).focus();
   }
   // The server list carries the same live/idle state on its rows, so it has to
   // be redrawn whenever the set of sessions changes.
@@ -5152,8 +5687,10 @@ function setModeSeg(visible, mode) {
   seg.hidden = !visible;
   if (!visible) return;
   for (const b of seg.querySelectorAll('.seg-btn')) {
-    b.classList.toggle('active', b.dataset.mode === (mode || 'ssh'));
-    b.setAttribute('aria-selected', b.dataset.mode === (mode || 'ssh') ? 'true' : 'false');
+    const on = b.dataset.mode === (mode || 'ssh');
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
   }
 }
 
@@ -5182,12 +5719,8 @@ function onSessionClosed(tabId) {
 window.onSessionClosed = onSessionClosed;
 window.activateSessionSurface = activateSessionSurface;
 
-// ─── tiny escaper used by context menus// ─── tiny escaper used by context menus ────────────────────────────────────
-// Escapes for both text and attribute context. The apostrophe is included
-// even though every interpolated attribute in this codebase currently uses
-// double quotes: that is a property nothing enforces, and the first
-// single-quoted attribute added later would silently become an injection
-// point. Cheap here, invisible to catch there.
+// ─── on-disk paths, HTML escaping ─────────────────────────────────────────
+
 // Real on-disk locations, fetched once. Three UI strings used to hard-code
 // these and all three were wrong; deriving them from the backend is what stops
 // them drifting again. Falls back to honest placeholders rather than to a
@@ -5203,6 +5736,12 @@ async function systemPaths() {
   return _systemPaths;
 }
 
+// The escaper for markup built from strings (menus, palette rows). It escapes
+// for both text and attribute context. The apostrophe is included even though
+// every interpolated attribute in this codebase currently uses double quotes:
+// that is a property nothing enforces, and the first single-quoted attribute
+// added later would silently become an injection point. Cheap here, invisible
+// to catch there.
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -5229,6 +5768,11 @@ function escapeHtml(s) {
   document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();
+  // Show/hide on every password field (A5-35); the prompt's only shows while
+  // it asks for a password.
+  wireRevealToggles(document);
+  const promptReveal = addRevealToggle(el('promptInput'));
+  if (promptReveal) promptReveal.hidden = true;
   // Before wire(): the observer must be watching every .modal-backdrop before
   // anything can open one.
   initModalFocusManagement();
@@ -5285,18 +5829,17 @@ function escapeHtml(s) {
     toast(msg, 'err');
   }
 
-  // Auto-lock needs the persisted settings at boot (loadSettings only runs
-  // when the Settings view is opened).
-  try { state.settings = await call('settings_get'); } catch (e) { state.settings = {}; }
-  state.sftpDualPane = state.settings.sftpDualPane === '1';
-  applyUiScale(currentUiScale());
-
   // Auto-lock idle clock: real input resets it (see onHumanInput); expiry
-  // calls lockNow(). Settings are in now, so arm for the stored minutes.
+  // calls lockNow().
   for (const ev of HUMAN_INPUT_EVENTS) {
     window.addEventListener(ev, onHumanInput, { capture: true, passive: true });
   }
-  armAutoLockTimer();
+  // The persisted settings, in effect from boot (loadSettings only runs when
+  // the Settings view is opened); this also arms the idle timer for the
+  // stored minutes.
+  let stored = {};
+  try { stored = await call('settings_get'); } catch (e) { /* defaults */ }
+  applyStoredSettings(stored);
 
   // Optional update check (only when the setting is ticked; never auto-installs).
   autoUpdateCheckOnBoot();

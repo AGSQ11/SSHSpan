@@ -31,9 +31,9 @@ const { failures, check, loadChromium, serve, openPage } = require('./lib/render
 // Tauri v2 converts a command's snake_case parameters to camelCase by default
 // and looks up EXACTLY that one key in the payload at runtime; a differently
 // spelled key is not an error for Option<T> parameters - it silently becomes
-// None. That is the bug class scripts/check-ipc-args.js was written for, but
-// its JS_FILES list never covered mcp.js, so every MCP call site was
-// unchecked. This block fails the run if any `mcpCall('<cmd>', {...})`
+// None. That is the bug class scripts/check-ipc-args.js was written for; its
+// JS_FILES list did not cover mcp.js when this block was written (it does
+// now, mcpCall sites included). This block fails the run if any `mcpCall('<cmd>', {...})`
 // payload in src/renderer/mcp.js carries a top-level key the Rust
 // #[tauri::command] does not declare, or omits a required argument. It also
   // checks the schema-forwarding half of the contract: the MCP wire field is

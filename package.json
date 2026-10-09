@@ -40,6 +40,7 @@
     "test:ui": "node scripts/check-renderer-ui.js",
     "test:safety": "node scripts/check-audit-safety.js",
     "test:sftp": "node scripts/check-sftp-ui.js",
+    "test:polish": "node scripts/check-ui-polish.js",
     "check:vendor": "node scripts/check-vendor.js"
   },
   "engines": {
