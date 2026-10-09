@@ -290,6 +290,16 @@ macro_rules! server_columns {
     };
 }
 
+/// The `known_hosts` columns `row_to_known_host` reads - see [`key_columns`].
+/// With `SELECT *` a pooled connection opened before the upgrade added
+/// `source` never saw that column, and its reader's fallback made an
+/// unconfirmed backup pin look like a confirmed one.
+macro_rules! known_host_columns {
+    () => {
+        "host, host_key, fingerprint_sha256, first_seen, source"
+    };
+}
+
 /// How many audit rows to keep. Enforced on every insert (see `add_audit`),
 /// which is the only place rows are created, so the table cannot outgrow this
 /// regardless of how long the app runs. Sized well above the renderer's
@@ -671,6 +681,12 @@ impl Database {
                 .execute(&self.pool)
                 .await?;
             }
+
+            // Migration (A7-46): one fingerprint form, `SHA256:<unpadded
+            // base64>` as `ssh-keygen -lf` prints it, computed from each
+            // pinned key. Older rows hold the bare padded form (or, from a
+            // backup, whatever text the file carried).
+            self.migrate_known_host_fingerprints().await?;
 
             // Transfer queue: survives a restart/crash so a 5,000-file batch
             // isn't silently lost mid-way and its `.part` files left orphaned.
@@ -2043,18 +2059,46 @@ impl Database {
     // ── Known hosts (host-key TOFU) ────────────────────────────────────────
 
     fn row_to_known_host(row: SqliteRow) -> KnownHost {
+        let host_key: String = row.get("host_key");
+        let stored: String = row.get("fingerprint_sha256");
         KnownHost {
             host: row.get("host"),
-            host_key: row.get("host_key"),
-            fingerprint_sha256: row.get("fingerprint_sha256"),
+            // Always the current form, also for a row the migration has not
+            // rewritten (yet).
+            fingerprint_sha256: crate::ssh_client::known_host_fingerprint(&host_key, &stored),
+            host_key,
             first_seen: DateTime::parse_from_rfc3339(row.get::<String, _>("first_seen").as_str())
                 .ok()
                 .map(|d| d.with_timezone(&Utc))
                 .unwrap_or_else(|| Utc::now()),
+            // A pin whose origin cannot be read is treated as unconfirmed:
+            // the user re-confirms it, it is never silently trusted.
             source: row
                 .try_get::<String, _>("source")
-                .unwrap_or_else(|_| "connection".to_string()),
+                .unwrap_or_else(|_| "imported".to_string()),
         }
+    }
+
+    /// Rewrite every stored host-key fingerprint to the current form (see the
+    /// call in `migrate()`). Idempotent: a second run finds nothing to change.
+    async fn migrate_known_host_fingerprints(&self) -> Result<()> {
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT host, host_key, fingerprint_sha256 FROM known_hosts")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut tx = self.pool.begin().await?;
+        for (host, host_key, stored) in rows {
+            let current = crate::ssh_client::known_host_fingerprint(&host_key, &stored);
+            if current != stored {
+                sqlx::query("UPDATE known_hosts SET fingerprint_sha256 = ? WHERE host = ?")
+                    .bind(&current)
+                    .bind(&host)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Port-qualify legacy bare-host `known_hosts` rows to "host:22".
@@ -2150,19 +2194,27 @@ impl Database {
     /// Returns the stored host-key blob for a host, if any.
     pub fn get_known_host(&self, host: &str) -> Result<Option<KnownHost>> {
         block(async {
-            let row = sqlx::query("SELECT * FROM known_hosts WHERE host = ?")
-                .bind(host)
-                .fetch_optional(&self.pool)
-                .await?;
+            let row = sqlx::query(concat!(
+                "SELECT ",
+                known_host_columns!(),
+                " FROM known_hosts WHERE host = ?"
+            ))
+            .bind(host)
+            .fetch_optional(&self.pool)
+            .await?;
             Ok(row.map(|r| Self::row_to_known_host(r)))
         })
     }
 
     pub fn list_known_hosts(&self) -> Result<Vec<KnownHost>> {
         block(async {
-            let rows = sqlx::query("SELECT * FROM known_hosts ORDER BY host COLLATE NOCASE ASC")
-                .fetch_all(&self.pool)
-                .await?;
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                known_host_columns!(),
+                " FROM known_hosts ORDER BY host COLLATE NOCASE ASC"
+            ))
+            .fetch_all(&self.pool)
+            .await?;
             Ok(rows
                 .into_iter()
                 .map(|r| Self::row_to_known_host(r))
@@ -2564,7 +2616,11 @@ impl Database {
                                 "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen, source) \
                                  VALUES (?, ?, ?, ?, 'imported')",
                             )
-                            .bind(host).bind(host_key).bind(fp).bind(seen)
+                            // The fingerprint comes from the key, never
+                            // from the backup's text (A7-46).
+                            .bind(host).bind(host_key)
+                            .bind(crate::ssh_client::known_host_fingerprint(host_key, fp))
+                            .bind(seen)
                             .execute(&mut *tx).await?;
                             hosts_n += 1;
                             known_hosts_imported += 1;
@@ -2872,6 +2928,217 @@ mod tests {
             .expect("lookup")
             .expect("pin present");
         assert_eq!(kept.host_key, "current-blob");
+    }
+
+    // ── RU4 (A7-46): one fingerprint form; named known_hosts columns ────────
+
+    fn seed_known_host(db: &Database, host: &str, key: &str, fp: &str, source: &str) {
+        block(async {
+            sqlx::query(
+                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen, source) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(host)
+            .bind(key)
+            .bind(fp)
+            .bind(Utc::now().to_rfc3339())
+            .bind(source)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+    }
+
+    fn stored_fingerprints(db: &Database) -> Vec<(String, String)> {
+        block(async {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT host, fingerprint_sha256 FROM known_hosts ORDER BY host",
+            )
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+        })
+    }
+
+    fn b64(s: &str) -> String {
+        use base64ct::Encoding;
+        base64ct::Base64::encode_string(s.as_bytes())
+    }
+
+    fn keygen_fp(s: &str) -> String {
+        crate::crypto::utils::ssh_fingerprint_sha256(s.as_bytes())
+    }
+
+    fn pre_ru4_fp(s: &str) -> String {
+        format!("{}=", &keygen_fp(s)["SHA256:".len()..])
+    }
+
+    #[test]
+    fn ru4_known_host_fingerprints_migrate_once_to_the_ssh_keygen_form() {
+        let db = migration_db("ru4-fingerprints");
+        seed_known_host(&db, "a:22", &b64("a"), &pre_ru4_fp("a"), "connection");
+        seed_known_host(
+            &db,
+            "b:22",
+            &b64("b"),
+            &format!("SHA256:{}", pre_ru4_fp("b")),
+            "imported",
+        );
+        seed_known_host(
+            &db,
+            "c:22",
+            &b64("c"),
+            "SHA256:forged-by-a-backup",
+            "imported",
+        );
+        seed_known_host(
+            &db,
+            "d:22",
+            "%%% not base64",
+            &pre_ru4_fp("d"),
+            "connection",
+        );
+        seed_known_host(&db, "e:22", "%%% not base64", "aa:bb:cc", "connection");
+        db.migrate().unwrap();
+        let want: Vec<(String, String)> = [
+            ("a:22", keygen_fp("a")),
+            ("b:22", keygen_fp("b")),
+            ("c:22", keygen_fp("c")),
+            ("d:22", keygen_fp("d")),
+            ("e:22", "aa:bb:cc".to_string()),
+        ]
+        .into_iter()
+        .map(|(h, f)| (h.to_string(), f))
+        .collect();
+        assert_eq!(stored_fingerprints(&db), want);
+        db.migrate().unwrap();
+        assert_eq!(
+            stored_fingerprints(&db),
+            want,
+            "a second run changes nothing"
+        );
+        let listed: Vec<(String, String)> = db
+            .list_known_hosts()
+            .unwrap()
+            .into_iter()
+            .map(|k| (k.host, k.fingerprint_sha256))
+            .collect();
+        assert_eq!(listed, want);
+        // A row in the old form that appears after the migration is read in
+        // the new form all the same.
+        seed_known_host(&db, "f:22", &b64("f"), &pre_ru4_fp("f"), "connection");
+        assert_eq!(
+            db.get_known_host("f:22")
+                .unwrap()
+                .unwrap()
+                .fingerprint_sha256,
+            keygen_fp("f")
+        );
+    }
+
+    /// A backup is untrusted input: the fingerprint stored for a restored pin
+    /// is computed from its key, not copied from the file.
+    #[test]
+    fn ru4_restored_known_host_fingerprint_is_computed_from_the_key() {
+        let db = migration_db("ru4-restore-fp");
+        db.restore_backup(&serde_json::json!({
+            "known_hosts": [{
+                "host": "r:22",
+                "host_key": b64("r"),
+                "fingerprint_sha256": "SHA256:forged",
+                "first_seen": Utc::now().to_rfc3339(),
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            stored_fingerprints(&db),
+            vec![("r:22".to_string(), keygen_fp("r"))]
+        );
+    }
+
+    /// RU1 handoff for known_hosts: a pooled connection that loaded the
+    /// schema before the upgrade added `source` must still read it. With
+    /// `SELECT *` such a connection never saw the column, and the reader's
+    /// fallback made an unconfirmed backup pin look like a confirmed one.
+    #[test]
+    fn ru4_known_host_rows_read_on_every_pooled_connection_after_an_upgrade() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        const CONNECTIONS: u32 = 4;
+        let db_path = std::env::temp_dir().join(format!(
+            "sshspan-ru4-stale-known-hosts-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let stamp = Utc::now().to_rfc3339();
+        let (pool, stale) = block(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(CONNECTIONS)
+                .connect(&url)
+                .await
+                .unwrap();
+            // The table an older release created: no `source` column.
+            sqlx::query(
+                "CREATE TABLE known_hosts (host TEXT PRIMARY KEY, host_key TEXT NOT NULL, \
+                 fingerprint_sha256 TEXT NOT NULL, first_seen TEXT NOT NULL)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO known_hosts VALUES ('old.example:22', 'AAAA', 'x', ?)")
+                .bind(&stamp)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mut held = Vec::new();
+            for _ in 0..CONNECTIONS {
+                let mut conn = pool.acquire().await.unwrap();
+                sqlx::query("SELECT COUNT(*) FROM known_hosts")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+                held.push(conn);
+            }
+            drop(held.pop());
+            while pool.num_idle() < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            (pool, held)
+        });
+        let db = Database { pool, db_path };
+        db.migrate().expect("upgrade the old database");
+        db.restore_backup(&serde_json::json!({
+            "known_hosts": [{
+                "host": "restored.example:22",
+                "host_key": "BBBB",
+                "fingerprint_sha256": "x",
+                "first_seen": stamp,
+            }]
+        }))
+        .unwrap();
+        block(async {
+            drop(stale);
+            while db.pool.num_idle() < CONNECTIONS as usize {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        for _ in 0..CONNECTIONS * 2 {
+            let restored = db.get_known_host("restored.example:22").unwrap().unwrap();
+            assert_eq!(
+                restored.source, "imported",
+                "an unconfirmed pin read as confirmed"
+            );
+            let old = db.get_known_host("old.example:22").unwrap().unwrap();
+            assert_eq!(old.source, "connection");
+            let all = db.list_known_hosts().unwrap();
+            let listed = all
+                .iter()
+                .find(|k| k.host == "restored.example:22")
+                .unwrap();
+            assert_eq!(listed.source, "imported");
+        }
+        block(async { db.pool.close().await });
+        let _ = std::fs::remove_file(&db.db_path);
     }
 
     #[test]

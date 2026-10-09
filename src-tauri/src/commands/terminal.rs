@@ -189,6 +189,9 @@ pub async fn terminal_connect(
     // Host-key consent is backend-owned: when the host is unpinned (or a
     // backup-imported pin is unconfirmed), the russh handler raises a native
     // dialog with the fingerprint. The renderer has no consent flag to forge.
+    // A refused key, a declined dialog and a timeout already come back as
+    // the message to show (A7-14, A7-15): nothing is guessed from russh's
+    // error text here.
     let session_id = ssh_client::start_interactive(
         app.clone(),
         resolved.clone(),
@@ -196,19 +199,9 @@ pub async fn terminal_connect(
         registry.clone(),
         on_data,
         Some(generation),
-    ).await.map_err(|e| {
-        let msg = e.to_string();
-        let friendly = if msg.contains("Key exchange failed") || msg.contains("key exchange") {
-            "The host rejected the connection during key exchange. If this host's fingerprint changed, forget it in the known_hosts list and retry.".to_string()
-        } else if msg.to_lowercase().contains("host key") {
-            "Host key mismatch. The server presented a different key than the one stored for this host - possible MITM, or the host was rebuilt. Forget it in known_hosts and retry.".to_string()
-        } else if msg.to_lowercase().contains("unknown key") || msg.to_lowercase().contains("not trusted") {
-            "This host is not trusted yet and the trust prompt was not accepted. Reconnect and accept the host-key prompt, or add it via Known Hosts.".to_string()
-        } else {
-            msg
-        };
-        anyhow_cmd(anyhow::anyhow!(friendly))
-    })?;
+    )
+    .await
+    .map_err(anyhow_cmd)?;
 
     // Push initial PTY size to the remote so the shell matches the renderer.
     if cols > 0 && rows > 0 {
@@ -330,44 +323,23 @@ pub async fn server_test(
     .map_err(CmdError)?;
 
     let started = std::time::Instant::now();
-    // Open + authenticate using the same russh glue as start_interactive,
-    // then drop the channel immediately. We don't want this to land in the
-    // SessionRegistry or persist. Host-key trust behaves identically to a
-    // real connect: the native first-trust dialog comes from the handler.
-    let db_for_handler = db.clone();
-    let host_for_handler = resolved.server.host.clone();
-    let result: anyhow::Result<()> = async {
-        let config = Arc::new(ssh_client::base_client_config_pub());
-        let handler = ssh_client::TerminalHandler {
-            host: host_for_handler,
-            db: db_for_handler,
-            port: resolved.server.port,
-            app: app.clone(),
-        };
-        let mut session = russh::client::connect(
-            config,
-            (resolved.server.host.as_str(), resolved.server.port),
-            handler,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Connect failed: {e}"))?;
-
-        // Mirror the auth path used by start_interactive so the user gets the
-        // same verdict here that they would get on a real connect.
-        ssh_client::authenticate(
-            &mut session,
-            &ssh_client::ConnectParams {
-                server: resolved.server.clone(),
-                username: resolved.username.clone(),
-                auth_method: resolved.auth_method.clone(),
-                key_pem: resolved.key_pem.clone(),
-                password: resolved.password.clone(),
-            },
-        )
-        .await?;
-        Ok(())
-    }
-    .await;
+    // Open + authenticate exactly as a real connect does (same host-key
+    // trust, deadlines and messages), then drop the connection: it never
+    // lands in the SessionRegistry.
+    let result = ssh_client::open_authenticated(
+        &ssh_client::ConnectParams {
+            server: resolved.server.clone(),
+            username: resolved.username.clone(),
+            auth_method: resolved.auth_method.clone(),
+            key_pem: resolved.key_pem.clone(),
+            password: resolved.password.clone(),
+        },
+        &db,
+        ssh_client::native_host_trust_prompt(&app),
+        ssh_client::Deadlines::INTERACTIVE,
+    )
+    .await
+    .map(drop);
 
     let elapsed = started.elapsed().as_millis() as u64;
     match result {
@@ -379,24 +351,9 @@ pub async fn server_test(
             );
             Ok(serde_json::json!({ "ok": true, "latencyMs": elapsed }))
         }
-        Err(e) => {
-            let raw = e.to_string();
-            let friendly = if raw.to_lowercase().contains("host key") {
-                "Host key mismatch. Forget it in known_hosts and retry.".to_string()
-            } else if raw.to_lowercase().contains("unknown key")
-                || raw.to_lowercase().contains("not trusted")
-            {
-                "This host is not trusted yet and the trust prompt was not accepted. Retry and accept the host-key prompt.".to_string()
-            } else if raw.contains("Key exchange") || raw.contains("key exchange") {
-                "Key exchange failed.".to_string()
-            } else if raw.starts_with("Connect failed: ") {
-                // Strip our own wrapper prefix for a cleaner surface.
-                raw.trim_start_matches("Connect failed: ").to_string()
-            } else {
-                raw.clone()
-            };
-            let _ = db.add_audit("server.test_fail", None, &raw);
-            Ok(serde_json::json!({ "ok": false, "error": friendly, "latencyMs": elapsed }))
+        Err(error) => {
+            let _ = db.add_audit("server.test_fail", None, &error);
+            Ok(serde_json::json!({ "ok": false, "error": error, "latencyMs": elapsed }))
         }
     }
 }
@@ -408,25 +365,28 @@ pub fn known_hosts_list(app: AppHandle) -> CmdResult<serde_json::Value> {
         .db
         .list_known_hosts()
         .map_err(|e| e.to_string())?;
-    let arr: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "host": r.host,
-                "fingerprintSha256": r.fingerprint_sha256,
-                "firstSeen": r.first_seen.to_rfc3339(),
-            })
-        })
-        .collect();
+    let arr: Vec<serde_json::Value> = rows.iter().map(known_host_json).collect();
     Ok(serde_json::json!({ "hosts": arr }))
 }
 
-/// Kept as a no-op for IPC compatibility: keepalives are handled at the SSH
-/// protocol level (russh sends `keepalive@openssh.com` global requests every
-/// 30 s via `base_client_config().keepalive_interval`). This command used to
-/// write a NUL byte into the PTY data stream, which interactive programs
-/// received as Ctrl-@ - it must never do that again. The renderer's
-/// `terminalKeepaliveSeconds` setting is retained but has no effect.
+/// One Known hosts row for the renderer. `fingerprintSha256` is
+/// `SHA256:<unpadded base64>`, what `ssh-keygen -lf` prints (A7-46).
+fn known_host_json(r: &db::KnownHost) -> serde_json::Value {
+    serde_json::json!({
+        "host": r.host,
+        "fingerprintSha256": ssh_client::known_host_fingerprint(&r.host_key, &r.fingerprint_sha256),
+        "firstSeen": r.first_seen.to_rfc3339(),
+    })
+}
+
+/// NOT REGISTERED in `generate_handler!`, deliberately (A8-16): nothing in
+/// the renderer calls it, and an unused command is IPC surface only a
+/// compromised renderer could reach. Keepalives are sent at the SSH protocol
+/// level (russh's `keepalive@openssh.com` every 30 s,
+/// `base_client_config().keepalive_interval`). This command used to write a
+/// NUL byte into the PTY data stream, which interactive programs received as
+/// Ctrl-@ - it must never do that again. There is no keepalive setting: the
+/// old `terminalKeepaliveSeconds` key is no longer accepted by `settings_set`.
 #[tauri::command]
 pub fn terminal_keepalive(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
     // Verify the session still exists so the call stays honest.
@@ -458,4 +418,54 @@ pub(super) fn known_hosts_forget_in(
     db.delete_known_host(host).map_err(|e| e.to_string())?;
     let _ = db.add_audit("known_hosts.forget", None, host);
     Ok(serde_json::json!({ "ok": true }))
+}
+
+#[cfg(test)]
+mod ru4_tests {
+    use super::*;
+
+    #[test]
+    fn ru4_known_hosts_renderer_json_is_labelled_and_unpadded_even_for_legacy_rows() {
+        use base64ct::Encoding;
+        let blob = b"fixture public key blob";
+        let host_key = base64ct::Base64::encode_string(blob);
+        let want = crate::crypto::utils::ssh_fingerprint_sha256(blob);
+        let old = format!("{}=", &want["SHA256:".len()..]);
+        let row = db::KnownHost {
+            host: "fixture.example:2222".into(),
+            host_key,
+            fingerprint_sha256: old,
+            first_seen: chrono::Utc::now(),
+            source: "connection".into(),
+        };
+        let out = known_host_json(&row);
+        assert_eq!(out["host"], "fixture.example:2222");
+        assert_eq!(out["fingerprintSha256"], want);
+        assert_eq!(out["firstSeen"], row.first_seen.to_rfc3339());
+        assert!(out.get("host_key").is_none());
+    }
+
+    #[test]
+    fn ru4_terminal_keepalive_is_not_registered_in_the_ipc_handler() {
+        let handlers = include_str!("../lib.rs");
+        assert!(handlers.contains("terminal_disconnect,"));
+        assert!(
+            !handlers
+                .lines()
+                .any(|line| line.trim() == "terminal_keepalive,"),
+            "no renderer caller at HEAD: do not expose a dead command"
+        );
+    }
+
+    #[test]
+    fn ru4_both_connect_callers_leave_host_key_and_timeout_errors_intact() {
+        let source = include_str!("terminal.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !production.contains("contains(\"host key\")"),
+            "russh Display must not decide which host-key outcome the user sees"
+        );
+        assert!(!production.contains("contains(\"unknown key\")"));
+        assert!(!production.contains("contains(\"key exchange\")"));
+    }
 }

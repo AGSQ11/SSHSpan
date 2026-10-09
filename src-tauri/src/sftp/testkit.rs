@@ -49,6 +49,12 @@ pub struct Knobs {
     /// `rename <from> <to>`, `remove <path>`, `mkdir <path>`,
     /// `setstat <path>`), so a test can assert HOW a file was replaced.
     pub ops: Vec<String>,
+    /// Report permission bits WITHOUT the file-type bits in every attribute
+    /// set (READDIR, STAT, LSTAT, FSTAT) - a server that does not say what an
+    /// entry is.
+    pub untyped_modes: bool,
+    /// Server paths whose LSTAT is refused ("permission denied").
+    pub lstat_refused: Vec<String>,
 }
 
 /// What a test holds on to besides the client session.
@@ -170,10 +176,19 @@ impl FsHandler {
         self.knobs.lock().unwrap().ops.push(op);
     }
 
-    fn entry(path: &Path, name: &str) -> Option<File> {
+    fn entry(&self, path: &Path, name: &str) -> Option<File> {
         // lstat: the entry itself, never a link's target.
         let md = std::fs::symlink_metadata(path).ok()?;
-        Some(File::new(name, FileAttributes::from(&md)))
+        Some(File::new(name, self.attrs(&md)))
+    }
+
+    /// Attributes as this server reports them (see `Knobs::untyped_modes`).
+    fn attrs(&self, md: &std::fs::Metadata) -> FileAttributes {
+        let mut attrs = FileAttributes::from(md);
+        if self.knobs.lock().unwrap().untyped_modes {
+            attrs.permissions = attrs.permissions.map(|mode| mode & 0o7777);
+        }
+        attrs
     }
 }
 
@@ -277,10 +292,13 @@ impl russh_sftp::server::Handler for FsHandler {
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        if self.knobs.lock().unwrap().lstat_refused.contains(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
         let md = std::fs::symlink_metadata(self.real(&path)).map_err(|e| io_status(&e))?;
         Ok(Attrs {
             id,
-            attrs: FileAttributes::from(&md),
+            attrs: self.attrs(&md),
         })
     }
 
@@ -288,7 +306,7 @@ impl russh_sftp::server::Handler for FsHandler {
         let md = std::fs::metadata(self.real(&path)).map_err(|e| io_status(&e))?;
         Ok(Attrs {
             id,
-            attrs: FileAttributes::from(&md),
+            attrs: self.attrs(&md),
         })
     }
 
@@ -299,7 +317,7 @@ impl russh_sftp::server::Handler for FsHandler {
         let md = file.metadata().map_err(|e| io_status(&e))?;
         Ok(Attrs {
             id,
-            attrs: FileAttributes::from(&md),
+            attrs: self.attrs(&md),
         })
     }
 
@@ -333,7 +351,7 @@ impl russh_sftp::server::Handler for FsHandler {
             .map_err(|e| io_status(&e))?
             .flatten()
         {
-            if let Some(f) = Self::entry(&e.path(), &e.file_name().to_string_lossy()) {
+            if let Some(f) = self.entry(&e.path(), &e.file_name().to_string_lossy()) {
                 entries.push(f);
             }
         }
@@ -360,6 +378,20 @@ impl russh_sftp::server::Handler for FsHandler {
             }
             _ => Err(StatusCode::Eof),
         }
+    }
+
+    /// READLINK, as OpenSSH's sftp-server answers it: the link's target, or
+    /// for anything that is not a link readlink(2)'s EINVAL, which
+    /// `errno_to_portable` maps to SSH_FX_BAD_MESSAGE.
+    async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        let target = std::fs::read_link(self.real(&path)).map_err(|e| match e.kind() {
+            std::io::ErrorKind::InvalidInput => StatusCode::BadMessage,
+            _ => io_status(&e),
+        })?;
+        Ok(Name {
+            id,
+            files: vec![File::dummy(target.to_string_lossy())],
+        })
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {

@@ -151,7 +151,8 @@ pub fn run() {
             terminal_send,
             terminal_resize,
             terminal_disconnect,
-            terminal_keepalive,
+            // `terminal_keepalive` is deliberately NOT registered: no renderer
+            // caller (A8-16); see its doc comment.
             terminal_list,
             server_test,
             known_hosts_list,

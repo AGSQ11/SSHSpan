@@ -46,6 +46,14 @@ pub fn server_list(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "servers": arr }))
 }
 
+/// Create or update a saved server.
+///
+/// Saved password (A2-04 / A7-07 / A5-03): on an existing server
+/// `savedPassword` null or empty KEEPS the stored sealed password - the dialog
+/// can never show it, so an edit that does not retype it used to erase it. A
+/// non-empty value replaces it. `clearSavedPassword: true` removes it (and wins
+/// over a value sent with it), and a server saved as `publickey` never keeps
+/// one.
 #[tauri::command]
 pub fn server_save(
     app: AppHandle,
@@ -58,13 +66,75 @@ pub fn server_save(
     key_id: Option<String>,
     pem_path: Option<String>,
     saved_password: Option<String>,
+    clear_saved_password: Option<bool>,
     category_id: Option<String>,
     color: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    // Seals the saved password and rewrites the whole row: not while a
-    // master-password change is re-encrypting the vault (C1).
-    let _rotation = super::rotation_shared(&app)?;
-    let vault_pw = super::vault_password(&app)?;
+    server_save_in(
+        &app.state::<AppState>().db,
+        &app.state::<super::VaultPasswordStore>(),
+        &app.state::<super::VaultRotationLock>(),
+        SaveServerRequest {
+            id,
+            name,
+            host,
+            port,
+            username,
+            auth_method,
+            key_id,
+            pem_path,
+            // Wrapped at once: every return below, early ones included,
+            // wipes it.
+            saved_password: saved_password.map(zeroize::Zeroizing::new),
+            clear_saved_password,
+            category_id,
+            color,
+        },
+    )
+}
+
+/// The IPC values as one request, so tests exercise the same save operation
+/// against an isolated database and password store instead of needing an app.
+struct SaveServerRequest {
+    id: Option<String>,
+    name: String,
+    host: String,
+    port: Option<u16>,
+    username: String,
+    auth_method: Option<String>,
+    key_id: Option<String>,
+    pem_path: Option<String>,
+    saved_password: Option<zeroize::Zeroizing<String>>,
+    clear_saved_password: Option<bool>,
+    category_id: Option<String>,
+    color: Option<String>,
+}
+
+fn server_save_in(
+    db: &db::Database,
+    vault: &super::VaultPasswordStore,
+    rotation: &super::VaultRotationLock,
+    request: SaveServerRequest,
+) -> CmdResult<serde_json::Value> {
+    // Seals the saved password and rewrites the whole row: take the guard
+    // BEFORE reading the master password or any sealed row, and hold it
+    // through the write (RU1 C1).
+    let _rotation = rotation.try_shared()?;
+    let vault_pw = vault.get().unwrap_or_default();
+    let SaveServerRequest {
+        id,
+        name,
+        host,
+        port,
+        username,
+        auth_method,
+        key_id,
+        pem_path,
+        saved_password,
+        clear_saved_password,
+        category_id,
+        color,
+    } = request;
     if vault_pw.is_empty() {
         return Err(CmdError("Vault is locked.".into()));
     }
@@ -76,6 +146,10 @@ pub fn server_save(
     }
     if username.trim().is_empty() {
         return Err(CmdError("Username is required.".into()));
+    }
+    let port = port.unwrap_or(22);
+    if port == 0 {
+        return Err(CmdError("Port must be between 1 and 65535.".into()));
     }
 
     let method = auth_method.unwrap_or_else(|| "publickey".to_string());
@@ -94,7 +168,6 @@ pub fn server_save(
         ));
     }
 
-    let db = &app.state::<AppState>().db;
     if let Some(cid) = category_id.as_deref() {
         let valid = db
             .list_categories()
@@ -107,9 +180,11 @@ pub fn server_save(
     }
     let now = chrono::Utc::now();
 
-    // Seal the saved password with the vault password if provided.
-    let saved_sealed: Option<String> = match saved_password {
-        Some(p) if !p.is_empty() => Some(
+    // What happens to the saved password (see `server_save`): dropped, kept
+    // (`None` here), or replaced by a value sealed with the vault password.
+    let drop_password = method == "publickey" || clear_saved_password == Some(true);
+    let replacement: Option<String> = match saved_password.as_deref() {
+        Some(p) if !p.is_empty() && !drop_password => Some(
             crate::crypto::vault::seal(&vault_pw, p.as_bytes())
                 .map_err(|e| CmdError(e.to_string()))?,
         ),
@@ -134,12 +209,16 @@ pub fn server_save(
                 .ok_or_else(|| CmdError("Server not found.".into()))?;
             existing.name = trimmed_name;
             existing.host = trimmed_host;
-            existing.port = port.unwrap_or(22);
+            existing.port = port;
             existing.username = trimmed_user;
             existing.auth_method = method;
             existing.key_id = key_clean;
             existing.pem_path = pem_clean;
-            existing.saved_password = saved_sealed;
+            if drop_password {
+                existing.saved_password = None;
+            } else if replacement.is_some() {
+                existing.saved_password = replacement;
+            }
             existing.category_id = category_id
                 .map(|c| c.trim().to_string())
                 .filter(|c| !c.is_empty());
@@ -153,12 +232,12 @@ pub fn server_save(
                 id: Uuid::new_v4().to_string(),
                 name: trimmed_name,
                 host: trimmed_host,
-                port: port.unwrap_or(22),
+                port,
                 username: trimmed_user,
                 auth_method: method,
                 key_id: key_clean,
                 pem_path: pem_clean,
-                saved_password: saved_sealed,
+                saved_password: replacement,
                 category_id: category_id
                     .map(|c| c.trim().to_string())
                     .filter(|c| !c.is_empty()),
@@ -196,4 +275,223 @@ pub fn server_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value>
     db.delete_server(&id).map_err(|e| e.to_string())?;
     let _ = db.add_audit("server.delete", None, &name);
     Ok(serde_json::json!({ "ok": true }))
+}
+
+#[cfg(test)]
+mod ru4_tests {
+    use super::*;
+    use crate::commands::{VaultPasswordStore, VaultRotationLock};
+
+    struct Fixture {
+        db: db::Database,
+        vault: VaultPasswordStore,
+        rotation: VaultRotationLock,
+        path: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("sshspan-ru4-server-{}.db", Uuid::new_v4()));
+            let db = db::Database::open_at(path.clone()).unwrap();
+            let vault = VaultPasswordStore::new();
+            vault.set("ru4-fixture-master".into());
+            Self {
+                db,
+                vault,
+                rotation: VaultRotationLock::new(),
+                path,
+            }
+        }
+
+        fn save(&self, request: SaveServerRequest) -> CmdResult<serde_json::Value> {
+            server_save_in(&self.db, &self.vault, &self.rotation, request)
+        }
+
+        fn record(&self, id: &str) -> ServerRecord {
+            self.db.get_server(id).unwrap().unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn request(
+        id: Option<&str>,
+        password: Option<&str>,
+        clear: Option<bool>,
+        method: &str,
+    ) -> SaveServerRequest {
+        SaveServerRequest {
+            id: id.map(str::to_string),
+            name: "Renamed é€😀 ' OR 1=1 --".into(),
+            host: "fixture.example".into(),
+            port: Some(2222),
+            username: "fixture-user".into(),
+            auth_method: Some(method.into()),
+            key_id: (method == "publickey").then(|| "fixture-key".into()),
+            pem_path: None,
+            saved_password: password.map(|p| zeroize::Zeroizing::new(p.to_string())),
+            clear_saved_password: clear,
+            category_id: None,
+            color: Some("blue".into()),
+        }
+    }
+
+    fn saved_id(f: &Fixture) -> String {
+        f.save(request(None, Some("fixture-password"), None, "password"))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn ru4_password_none_and_empty_keep_the_same_sealed_value() {
+        let f = Fixture::new();
+        let id = saved_id(&f);
+        let before = f.record(&id);
+        for input in [None, Some("")] {
+            f.save(request(Some(&id), input, Some(false), "password"))
+                .unwrap();
+            let after = f.record(&id);
+            assert_eq!(
+                after.saved_password, before.saved_password,
+                "a blank edit must not erase or reseal the password"
+            );
+            assert_eq!(after.name, "Renamed é€😀 ' OR 1=1 --");
+            assert_eq!(after.port, 2222);
+        }
+    }
+
+    #[test]
+    fn ru4_password_explicit_clear_and_publickey_take_precedence_over_replacement() {
+        for method in ["password", "keyboard-interactive", "publickey"] {
+            let f = Fixture::new();
+            let id = saved_id(&f);
+            f.save(request(
+                Some(&id),
+                Some("must-not-be-stored"),
+                Some(true),
+                method,
+            ))
+            .unwrap();
+            assert_eq!(f.record(&id).saved_password, None);
+        }
+        let f = Fixture::new();
+        let id = saved_id(&f);
+        f.save(request(
+            Some(&id),
+            Some("must-not-be-stored"),
+            None,
+            "publickey",
+        ))
+        .unwrap();
+        assert_eq!(f.record(&id).saved_password, None);
+    }
+
+    #[test]
+    fn ru4_password_replacement_is_sealed_and_keyboard_interactive_keeps_it() {
+        let f = Fixture::new();
+        let id = saved_id(&f);
+        let before = f.record(&id).saved_password;
+        f.save(request(
+            Some(&id),
+            Some("é€😀 new fixture password"),
+            None,
+            "password",
+        ))
+        .unwrap();
+        let after = f.record(&id).saved_password.unwrap();
+        assert_ne!(Some(after.clone()), before);
+        assert!(!after.contains("fixture password"));
+        assert_eq!(
+            crate::crypto::vault::unseal("ru4-fixture-master", &after).unwrap(),
+            "é€😀 new fixture password".as_bytes()
+        );
+        f.save(request(Some(&id), None, None, "keyboard-interactive"))
+            .unwrap();
+        assert_eq!(
+            f.record(&id).saved_password.as_deref(),
+            Some(after.as_str())
+        );
+    }
+
+    #[test]
+    fn ru4_new_servers_do_not_inherit_or_store_publickey_passwords() {
+        let f = Fixture::new();
+        for (password, clear, method) in [
+            (None, None, "password"),
+            (Some(""), None, "keyboard-interactive"),
+            (Some("discard"), None, "publickey"),
+            (Some("discard"), Some(true), "password"),
+        ] {
+            let id = f.save(request(None, password, clear, method)).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(f.record(&id).saved_password, None);
+        }
+    }
+
+    #[test]
+    fn ru4_server_save_respects_rotation_before_reading_or_writing_secrets() {
+        let f = Fixture::new();
+        let id = saved_id(&f);
+        let before = f.record(&id);
+        let exclusive = f
+            .rotation
+            .exclusive_within(std::time::Duration::from_secs(1))
+            .unwrap();
+        let err = f
+            .save(request(Some(&id), Some("replacement"), None, "password"))
+            .unwrap_err();
+        drop(exclusive);
+        assert_eq!(err.0, crate::commands::VAULT_REENCRYPTING);
+        assert_eq!(f.record(&id).saved_password, before.saved_password);
+        assert_eq!(f.db.list_servers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ru4_server_save_locked_missing_and_invalid_inputs_do_not_write() {
+        let f = Fixture::new();
+        f.vault.clear();
+        assert_eq!(
+            f.save(request(None, Some("discard"), None, "password"))
+                .unwrap_err()
+                .0,
+            "Vault is locked."
+        );
+        f.vault.set("ru4-fixture-master".into());
+        assert_eq!(
+            f.save(request(Some("missing"), None, None, "password"))
+                .unwrap_err()
+                .0,
+            "Server not found."
+        );
+        for field in [
+            "name",
+            "host",
+            "username",
+            "auth_method",
+            "port",
+            "category_id",
+        ] {
+            let mut bad = request(None, None, None, "password");
+            match field {
+                "name" => bad.name = " ".into(),
+                "host" => bad.host = "".into(),
+                "username" => bad.username = "\t".into(),
+                "auth_method" => bad.auth_method = Some("invalid".into()),
+                "port" => bad.port = Some(0),
+                "category_id" => bad.category_id = Some("not-a-category".into()),
+                _ => unreachable!(),
+            }
+            assert!(f.save(bad).is_err(), "{field}");
+        }
+        assert!(f.db.list_servers().unwrap().is_empty());
+    }
 }

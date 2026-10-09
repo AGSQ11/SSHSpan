@@ -1573,9 +1573,13 @@ enum EntryKind {
     /// A symbolic link. Walks never follow one: it can point at an ancestor
     /// (an endless loop), outside the tree, or at nothing.
     Symlink,
-    /// A FIFO, socket or device (or an entry that vanished mid-walk).
-    /// Reading one can block forever, so downloads leave it alone.
+    /// A FIFO, socket or device. Reading one can block forever, so
+    /// downloads leave it alone.
     Other,
+    /// The server did not say what this is and asking could not settle it
+    /// (see [`classify_untyped`]). Never guessed: walks leave it alone and
+    /// say so.
+    Unknown,
 }
 
 /// One entry of a remote directory listing, reduced to what the walks need.
@@ -1588,19 +1592,19 @@ struct ListedEntry {
 }
 
 /// Classify an entry from the attributes its directory listing carried.
-/// `None` means the listing did not say (the server sent no mode at all), so
-/// the caller has to ask. SFTP's READDIR reports `lstat`-derived attributes
-/// (see [`SftpEntry`]), so a symlink is a symlink here - no per-entry stat
-/// needed, and a dangling one cannot fail the walk the way the old
-/// STAT-based classification did.
+/// `None` means the listing did not say, so the caller has to ask. SFTP's
+/// READDIR reports `lstat`-derived attributes (see [`SftpEntry`]), so a
+/// symlink is a symlink here - no per-entry stat needed, and a dangling one
+/// cannot fail the walk the way the old STAT-based classification did.
 fn classify_attrs(md: &russh_sftp::protocol::FileAttributes) -> Option<EntryKind> {
     use russh_sftp::protocol::FileType;
     let mode = md.permissions?;
     // 0o170000 is S_IFMT, the file-type bits. Permission bits WITHOUT any
-    // type bits (a bare 0o644) mean the server does not report types at all;
-    // the Send-to walk treats those entries as plain files and so does this.
+    // type bits (a bare 0o644) say nothing about what the entry is: it used
+    // to be taken for a file, which gave folders a file's mode in a
+    // recursive chmod and made a link look like something to change.
     if mode & 0o170000 == 0 {
-        return Some(EntryKind::File);
+        return None;
     }
     Some(match md.file_type() {
         FileType::Dir => EntryKind::Dir,
@@ -1611,9 +1615,9 @@ fn classify_attrs(md: &russh_sftp::protocol::FileAttributes) -> Option<EntryKind
 }
 
 /// List one remote directory for a walk, classified from the listing itself.
-/// Only an entry whose listing carried no mode costs an extra `lstat` round
-/// trip (servers that list bare names); if even that fails the entry is
-/// `Other` and skipped.
+/// Only an entry whose listing carried no file type costs extra round trips
+/// (see [`classify_untyped`]); if the LSTAT fails the entry is `Other` and
+/// skipped.
 async fn list_remote_dir(
     sftp: &russh_sftp::client::SftpSession,
     dir: &str,
@@ -1628,10 +1632,7 @@ async fn list_remote_dir(
         let md = entry.metadata();
         let kind = match classify_attrs(&md) {
             Some(kind) => kind,
-            None => match sftp.symlink_metadata(join_remote(dir, &name)).await {
-                Ok(lstat) => classify_attrs(&lstat).unwrap_or(EntryKind::File),
-                Err(_) => EntryKind::Other,
-            },
+            None => classify_untyped(sftp, &join_remote(dir, &name)).await,
         };
         out.push(ListedEntry {
             name,
@@ -1641,6 +1642,75 @@ async fn list_remote_dir(
         });
     }
     Ok(out)
+}
+
+/// The kind of an entry whose listing carried no file type: LSTAT first; if
+/// the server leaves the type out there as well, READLINK tells a link apart
+/// (walks never follow one) and opening it as a folder tells a folder from a
+/// file. Whatever cannot be settled - LSTAT refused or the entry gone,
+/// READLINK unsupported, the folder probe refused - is `Unknown`: left alone,
+/// never guessed.
+async fn classify_untyped(sftp: &russh_sftp::client::SftpSession, path: &str) -> EntryKind {
+    match sftp.symlink_metadata(path).await {
+        Ok(lstat) => {
+            if let Some(kind) = classify_attrs(&lstat) {
+                return kind;
+            }
+        }
+        Err(_) => return EntryKind::Unknown,
+    }
+    match sftp.read_link(path).await {
+        Ok(_) => return EntryKind::Symlink,
+        Err(e) if readlink_says_not_a_link(&e) => {}
+        Err(_) => return EntryKind::Unknown,
+    }
+    probe_folder(sftp, path).await
+}
+
+/// Whether a READLINK error means "this is not a link". OpenSSH's
+/// sftp-server answers readlink(2)'s EINVAL with SSH_FX_BAD_MESSAGE (its
+/// `errno_to_portable`); other servers say "failure" or "no such file".
+fn readlink_says_not_a_link(e: &russh_sftp::client::error::Error) -> bool {
+    use russh_sftp::protocol::StatusCode;
+    sftp_status(
+        e,
+        &[
+            StatusCode::BadMessage,
+            StatusCode::Failure,
+            StatusCode::NoSuchFile,
+        ],
+    )
+}
+
+/// Whether `path` opens as a folder (following a link, like STAT); see
+/// [`folder_probe_kind`].
+async fn probe_folder(sftp: &russh_sftp::client::SftpSession, path: &str) -> EntryKind {
+    folder_probe_kind(sftp.read_dir(path).await.map(drop))
+}
+
+/// What opening an entry as a folder showed: `Dir`; `File` only when the
+/// server answered that it is not a folder (OpenSSH's sftp-server maps
+/// opendir(3)'s ENOTDIR to SSH_FX_NO_SUCH_FILE, other servers say
+/// "failure"); anything else - refused, unsupported, a lost connection - is
+/// `Unknown`, so a recursive change of that root is refused and such an
+/// entry is left alone.
+fn folder_probe_kind(outcome: Result<(), russh_sftp::client::error::Error>) -> EntryKind {
+    use russh_sftp::protocol::StatusCode;
+    match outcome {
+        Ok(()) => EntryKind::Dir,
+        Err(e) if sftp_status(&e, &[StatusCode::NoSuchFile, StatusCode::Failure]) => {
+            EntryKind::File
+        }
+        Err(_) => EntryKind::Unknown,
+    }
+}
+
+/// Whether an SFTP error is a status reply with one of `codes`.
+fn sftp_status(
+    e: &russh_sftp::client::error::Error,
+    codes: &[russh_sftp::protocol::StatusCode],
+) -> bool {
+    matches!(e, russh_sftp::client::error::Error::Status(status) if codes.contains(&status.status_code))
 }
 
 /// `dir` + `/` + `name` as the server spells paths.
@@ -1779,6 +1849,12 @@ where
                 EntryKind::Other => {
                     plan.notes
                         .push(format!("skipped {remote}: not a regular file or folder"));
+                    continue;
+                }
+                EntryKind::Unknown => {
+                    plan.notes.push(format!(
+                        "skipped {remote}: the server does not say whether it is a file or a folder"
+                    ));
                     continue;
                 }
                 EntryKind::File | EntryKind::Dir => {}
@@ -2026,7 +2102,8 @@ const CHMOD_MAX_ENTRIES: usize = 200_000;
 /// (GNU `chmod -R` skips them for the same reason.) A refused entry or an
 /// unlistable folder is recorded and the walk goes on, instead of stopping at
 /// the first error and leaving a half-applied tree with no account of what
-/// changed. `root` itself is the caller's business.
+/// changed. `apply` gets each entry's kind (see [`chmod_path`] for what it
+/// does with it). `root` itself is the caller's business.
 async fn chmod_walk<L, LF, A, AF>(
     root: &str,
     mut list: L,
@@ -2037,7 +2114,7 @@ async fn chmod_walk<L, LF, A, AF>(
 where
     L: FnMut(String) -> LF,
     LF: Future<Output = Result<Vec<ListedEntry>, String>>,
-    A: FnMut(String) -> AF,
+    A: FnMut(String, EntryKind) -> AF,
     AF: Future<Output = Result<(), String>>,
 {
     let mut out = ChmodOutcome::default();
@@ -2065,6 +2142,12 @@ where
                     out.skipped_links += 1;
                     continue;
                 }
+                EntryKind::Unknown => {
+                    out.failed.push(format!(
+                        "{child}: not changed (the server does not say whether it is a file or a folder)"
+                    ));
+                    continue;
+                }
                 EntryKind::Dir => apply_dirs,
                 EntryKind::File | EntryKind::Other => apply_files,
             };
@@ -2075,7 +2158,7 @@ where
                 continue;
             }
             if wanted {
-                match apply(child.clone()).await {
+                match apply(child.clone(), entry.kind).await {
                     Ok(()) => out.changed += 1,
                     Err(e) => out.failed.push(e),
                 }
@@ -3075,12 +3158,36 @@ async fn chmod_one(
         .map_err(|e| format!("{path}: {}", sftp_error_detail(e)))
 }
 
+/// What the root of a recursive chmod is: STAT's type (a link is followed,
+/// like `chmod -R` on a command-line link), else LSTAT's, else whether it
+/// opens as a folder. A server whose STAT omits the type bits used to get a
+/// silent root-only change that ignored the files/dirs scope (JU1 review).
+async fn chmod_root_kind(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    stat: &russh_sftp::protocol::FileAttributes,
+) -> EntryKind {
+    if let Some(kind) = classify_attrs(stat) {
+        return kind;
+    }
+    if let Ok(lstat) = sftp.symlink_metadata(path).await {
+        match classify_attrs(&lstat) {
+            Some(EntryKind::Symlink) | None => {}
+            Some(kind) => return kind,
+        }
+    }
+    probe_folder(sftp, path).await
+}
+
 /// Change permission bits on a remote file/directory, optionally recursively.
 ///
 /// A recursive run (A7-20) skips symbolic links, keeps going past entries the
 /// server refuses, and reports what happened: `{ok, changed, failed: [...],
 /// failedCount, skippedLinks}`. It is an error only when NOTHING was changed
 /// and something failed (so a single refused path still reads as a failure).
+/// Setuid/setgid/sticky bits in `mode` reach the path itself and the folders
+/// a recursive run walks, never the files (or other non-folders) below it:
+/// those get `mode & 0o777` (see [`chmod_path`]).
 #[tauri::command]
 pub async fn sftp_chmod(
     app: AppHandle,
@@ -3096,36 +3203,75 @@ pub async fn sftp_chmod(
         Some("dirs") => (false, true),
         _ => (true, true),
     };
-    let md = sftp
-        .metadata(&path)
+    chmod_path(&sftp, &path, mode, recursive, apply_files, apply_dirs)
         .await
-        .map_err(|e| CmdError(format!("stat failed: {e}")))?;
+        .map_err(CmdError)
+}
+
+/// [`sftp_chmod`] on an open SFTP session.
+async fn chmod_path(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    mode: u32,
+    recursive: bool,
+    apply_files: bool,
+    apply_dirs: bool,
+) -> Result<serde_json::Value, String> {
+    let md = sftp
+        .metadata(path)
+        .await
+        .map_err(|e| format!("stat failed: {e}"))?;
+    let root = if recursive {
+        chmod_root_kind(sftp, path, &md).await
+    } else {
+        EntryKind::File
+    };
+    if root == EntryKind::Unknown {
+        // The renderer shows this as "<path>: <message>".
+        return Err(
+            "The server does not say whether this is a folder, so the change \
+             cannot recurse into subdirectories here. Apply it without \"Recurse into \
+             subdirectories\" to change this item only."
+                .to_string(),
+        );
+    }
 
     let mut changed = 0u32;
     let mut outcome = ChmodOutcome::default();
-    if md.is_dir() && recursive {
+    if root == EntryKind::Dir {
         // Apply to the root path itself according to the dirs rule, then walk.
         if apply_dirs {
-            chmod_one(&sftp, &path, mode).await.map_err(CmdError)?;
+            chmod_one(sftp, path, mode).await?;
             changed += 1;
         }
-        let sftp_ref: &russh_sftp::client::SftpSession = &sftp;
+        // Special bits go to folders only (JU1's policy, now the backend's
+        // own): a 2775 shared folder must not make every file below it
+        // setgid, nor a 4755 one every file setuid. The renderer splits such
+        // a mode only when the root's STAT reports a folder; this holds for a
+        // server that leaves the type out as well.
+        let file_mode = mode & 0o777;
         outcome = chmod_walk(
-            &path,
-            |dir| async move { list_remote_dir(sftp_ref, &dir).await },
-            |entry| async move { chmod_one(sftp_ref, &entry, mode).await },
+            path,
+            |dir| async move { list_remote_dir(sftp, &dir).await },
+            |entry, kind| async move {
+                let mode = if kind == EntryKind::Dir {
+                    mode
+                } else {
+                    file_mode
+                };
+                chmod_one(sftp, &entry, mode).await
+            },
             apply_files,
             apply_dirs,
         )
         .await;
         changed += outcome.changed;
     } else {
-        chmod_one(&sftp, &path, mode).await.map_err(CmdError)?;
+        chmod_one(sftp, path, mode).await?;
         changed += 1;
     }
     if changed == 0 && outcome.failed.total > 0 {
-        let first = outcome.failed.items.first().cloned().unwrap_or_default();
-        return Err(CmdError(first));
+        return Err(outcome.failed.items.first().cloned().unwrap_or_default());
     }
     Ok(serde_json::json!({
         "ok": true,
@@ -3561,9 +3707,9 @@ mod tests {
             classify_attrs(&attrs(Some(0o140755))),
             Some(EntryKind::Other)
         );
-        // Permission bits without any type bits: a server that does not report
-        // types at all - treated as plain files, like the Send-to walk does.
-        assert_eq!(classify_attrs(&attrs(Some(0o644))), Some(EntryKind::File));
+        // Permission bits without any type bits say nothing: the walk asks
+        // (RU4; they used to be taken for files).
+        assert_eq!(classify_attrs(&attrs(Some(0o644))), None);
         // No mode at all: the listing did not say, the caller must ask.
         assert_eq!(classify_attrs(&attrs(None)), None);
     }
@@ -4175,7 +4321,7 @@ mod tests {
                 log.borrow_mut().push(format!("list {dir}"));
                 std::future::ready(tree.get(&dir).cloned().unwrap_or_else(|| Ok(Vec::new())))
             },
-            |path: String| {
+            |path: String, _kind: EntryKind| {
                 log.borrow_mut().push(format!("apply {path}"));
                 std::future::ready(if refuse.contains(&path.as_str()) {
                     Err(format!("{path}: Permission denied"))
@@ -4309,7 +4455,7 @@ mod tests {
         let outcome = chmod_walk(
             "/t",
             |dir| async move { list_remote_dir(sftp_ref, &dir).await },
-            |p| async move { chmod_one(sftp_ref, &p, 0o600).await },
+            |p, _| async move { chmod_one(sftp_ref, &p, 0o600).await },
             true,
             true,
         )
@@ -4324,6 +4470,231 @@ mod tests {
         assert_eq!(fx.mode("/t/d"), 0o600);
         assert_eq!(outcome.skipped_links, 1);
         assert_eq!(outcome.failed.total, 0);
+    }
+
+    // ─── RU4: chmod on a server that does not report file types ─────────────
+
+    #[cfg(unix)]
+    fn set_mode(fx: &crate::sftp::testkit::Fixture, virt: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fx.path(virt), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `/t` (0755) holds `f` (0644), `d` (0755) with `d/g` (0644), and `ln`, a
+    /// link to `/outside` (0755), on a server that leaves the type bits out.
+    #[cfg(unix)]
+    async fn untyped_tree() -> (
+        russh_sftp::client::SftpSession,
+        crate::sftp::testkit::Fixture,
+    ) {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/t/f", b"x");
+        fx.write("/t/d/g", b"y");
+        fx.mkdir("/outside");
+        fx.symlink("../outside", "/t/ln");
+        for (virt, mode) in [
+            ("/t", 0o755),
+            ("/t/d", 0o755),
+            ("/outside", 0o755),
+            ("/t/f", 0o644),
+            ("/t/d/g", 0o644),
+        ] {
+            set_mode(&fx, virt, mode);
+        }
+        fx.knobs.lock().unwrap().untyped_modes = true;
+        (sftp, fx)
+    }
+
+    /// JU1 follow-up: the root's STAT has no type bits, so the old code saw
+    /// "not a folder", changed `/t` alone with a FILE mode and reported
+    /// `changed: 1`. The root and every entry are now told apart (LSTAT,
+    /// READLINK, opening as a folder) and the files-only scope is honoured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru4_recursive_chmod_walks_with_its_scope_when_types_are_missing() {
+        let (sftp, fx) = untyped_tree().await;
+        let out = chmod_path(&sftp, "/t", 0o600, true, true, false)
+            .await
+            .unwrap();
+        assert_eq!(fx.mode("/t/f"), 0o600);
+        assert_eq!(fx.mode("/t/d/g"), 0o600);
+        assert_eq!(
+            fx.mode("/t"),
+            0o755,
+            "files-only: the folder keeps its mode"
+        );
+        assert_eq!(
+            fx.mode("/t/d"),
+            0o755,
+            "files-only: the folder keeps its mode"
+        );
+        assert_eq!(fx.mode("/outside"), 0o755, "a link is never followed");
+        assert_eq!(out["changed"], 2, "{out}");
+        assert_eq!(out["skippedLinks"], 1, "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru4_untyped_listing_entries_are_classified_not_assumed_files() {
+        let (sftp, _fx) = untyped_tree().await;
+        let mut got: Vec<(String, EntryKind)> = list_remote_dir(&sftp, "/t")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.kind))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("d".to_string(), EntryKind::Dir),
+                ("f".to_string(), EntryKind::File),
+                ("ln".to_string(), EntryKind::Symlink),
+            ]
+        );
+    }
+
+    /// When even opening it as a folder cannot settle what the root is, a
+    /// recursive request is refused with the reason instead of quietly
+    /// changing the root alone; a plain change still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru4_recursive_chmod_refuses_a_root_of_unknown_type() {
+        let (sftp, fx) = untyped_tree().await;
+        fx.knobs.lock().unwrap().unlistable.push("/t/d".to_string());
+        let err = chmod_path(&sftp, "/t/d", 0o700, true, true, true)
+            .await
+            .unwrap_err();
+        // The renderer shows "<path>: <message>" and labels the option
+        // "Recurse into subdirectories" (review fix 9).
+        assert!(!err.starts_with("/t/d"), "{err}");
+        assert!(err.contains("Recurse into subdirectories"), "{err}");
+        assert_eq!(fx.mode("/t/d"), 0o755, "nothing was changed");
+        let out = chmod_path(&sftp, "/t/d", 0o700, false, true, true)
+            .await
+            .unwrap();
+        assert_eq!(out["changed"], 1);
+        assert_eq!(fx.mode("/t/d"), 0o700);
+    }
+
+    /// Review fix 1: a recursive change never puts setuid/setgid/sticky on a
+    /// walked file or other non-folder - folders get the full mode, the rest
+    /// `mode & 0o777` - whether or not the server reports types. (The
+    /// renderer splits such a mode only when the root's STAT says "folder";
+    /// a 2775 folder used to make every file below it setgid.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru4_recursive_chmod_never_spreads_special_bits_to_files() {
+        for untyped in [true, false] {
+            let (sftp, fx) = untyped_tree().await;
+            fx.knobs.lock().unwrap().untyped_modes = untyped;
+            let out = chmod_path(&sftp, "/t", 0o2775, true, true, true)
+                .await
+                .unwrap();
+            for dir in ["/t", "/t/d"] {
+                assert_eq!(fx.mode(dir), 0o2775, "{dir} untyped={untyped}");
+            }
+            for file in ["/t/f", "/t/d/g"] {
+                assert_eq!(fx.mode(file), 0o775, "{file} untyped={untyped}");
+            }
+            assert_eq!(fx.mode("/outside"), 0o755, "the link target is untouched");
+            assert_eq!(out["changed"], 4, "{out}");
+            // A file the user picked keeps exactly the mode asked for.
+            let out = chmod_path(&sftp, "/t/f", 0o4755, true, true, true)
+                .await
+                .unwrap();
+            assert_eq!(fx.mode("/t/f"), 0o4755, "untyped={untyped}");
+            assert_eq!(out["changed"], 1);
+        }
+    }
+
+    /// Review fixes 2 and 3: what a READLINK or a folder probe answer means
+    /// is never guessed. OpenSSH's sftp-server answers READLINK on a non-link
+    /// with SSH_FX_BAD_MESSAGE (EINVAL) and OPENDIR on a file with
+    /// SSH_FX_NO_SUCH_FILE (ENOTDIR); anything else unexplained is Unknown.
+    #[test]
+    fn ru4_probe_answers_are_never_guessed() {
+        use russh_sftp::protocol::StatusCode as S;
+        for code in [S::BadMessage, S::Failure, S::NoSuchFile] {
+            assert!(readlink_says_not_a_link(&status_err(code, "")), "{code:?}");
+        }
+        for code in [
+            S::OpUnsupported,
+            S::PermissionDenied,
+            S::ConnectionLost,
+            S::NoConnection,
+        ] {
+            assert!(!readlink_says_not_a_link(&status_err(code, "")), "{code:?}");
+        }
+        assert_eq!(folder_probe_kind(Ok(())), EntryKind::Dir);
+        for code in [S::NoSuchFile, S::Failure] {
+            assert_eq!(
+                folder_probe_kind(Err(status_err(code, ""))),
+                EntryKind::File,
+                "{code:?}"
+            );
+        }
+        for code in [
+            S::PermissionDenied,
+            S::OpUnsupported,
+            S::BadMessage,
+            S::ConnectionLost,
+            S::NoConnection,
+            S::Eof,
+        ] {
+            assert_eq!(
+                folder_probe_kind(Err(status_err(code, ""))),
+                EntryKind::Unknown,
+                "{code:?}"
+            );
+        }
+        let timeout = russh_sftp::client::error::Error::Timeout;
+        assert_eq!(folder_probe_kind(Err(timeout)), EntryKind::Unknown);
+    }
+
+    /// Review fix 3: an untyped entry whose LSTAT fails is left alone like
+    /// any other entry of unknown type (it used to be `Other`, which a
+    /// recursive chmod changes with the files' mode).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru4_untyped_entry_whose_lstat_fails_is_left_alone() {
+        let (sftp, fx) = untyped_tree().await;
+        fx.knobs
+            .lock()
+            .unwrap()
+            .lstat_refused
+            .push("/t/d".to_string());
+        let kinds: Vec<(String, EntryKind)> = list_remote_dir(&sftp, "/t")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.kind))
+            .collect();
+        assert!(
+            kinds.contains(&("d".to_string(), EntryKind::Unknown)),
+            "{kinds:?}"
+        );
+        let out = chmod_path(&sftp, "/t", 0o700, true, true, true)
+            .await
+            .unwrap();
+        assert_eq!(fx.mode("/t/d"), 0o755, "{out}");
+        assert!(out["failed"].to_string().contains("/t/d"), "{out}");
+    }
+
+    /// An entry the walk cannot classify is left alone and reported, never
+    /// given a file's mode on a guess.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru4_recursive_chmod_leaves_entries_of_unknown_type_alone() {
+        let (sftp, fx) = untyped_tree().await;
+        fx.knobs.lock().unwrap().unlistable.push("/t/d".to_string());
+        let out = chmod_path(&sftp, "/t", 0o640, true, true, false)
+            .await
+            .unwrap();
+        assert_eq!(fx.mode("/t/f"), 0o640);
+        assert_eq!(fx.mode("/t/d"), 0o755, "unknown type: unchanged");
+        assert_eq!(out["changed"], 1, "{out}");
+        assert!(out["failed"].to_string().contains("/t/d"), "{out}");
     }
 
     // ─── edit and sync back (A7-19) ──────────────────────────────────────────

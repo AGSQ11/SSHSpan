@@ -5062,11 +5062,144 @@ pub fn ssh_config_write(content: String) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Hosts for the server dialog's "Config" import (R4). `source`:
+/// - `"user"` (the default): the user's own `~/.ssh/config`, read-only -
+///   `Include` followed one level, `Match` blocks and wildcard or negated
+///   `Host` patterns skipped (see `config::read_user_ssh_config`);
+/// - `"managed"`: the file SSHSpan's deploy writes (the old behaviour).
+///
+/// Returns `{hosts, path}` - the file that was read; a missing file is an
+/// empty list. Refused while the vault is locked: the user's config is an
+/// inventory of hosts, accounts and key paths. The files are read on the
+/// blocking pool, never on the main thread.
 #[tauri::command]
-pub fn ssh_config_list_hosts() -> CmdResult<serde_json::Value> {
-    let config_service = SshConfigService::new().map_err(|e| e.to_string())?;
-    let config = config_service.read().map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "hosts": config.hosts }))
+pub async fn ssh_config_list_hosts(
+    app: AppHandle,
+    source: Option<String>,
+) -> CmdResult<serde_json::Value> {
+    let user = crate::config::user_ssh_config_path().map_err(|e| e.to_string())?;
+    let managed = crate::config::ssh_config_path().map_err(|e| e.to_string())?;
+    run_blocking(move || {
+        ssh_config_hosts_in(
+            &app.state::<VaultPasswordStore>(),
+            source.as_deref(),
+            &user,
+            &managed,
+        )
+    })
+    .await
+}
+
+/// [`ssh_config_list_hosts`] with the two candidate files given.
+fn ssh_config_hosts_in(
+    vault: &VaultPasswordStore,
+    source: Option<&str>,
+    user: &std::path::Path,
+    managed: &std::path::Path,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
+    let unreadable = |path: &std::path::Path, e: anyhow::Error| {
+        CmdError(format!("Could not read {}: {e}", path.display()))
+    };
+    let (hosts, path) = match source.unwrap_or("user") {
+        "user" => (
+            crate::config::read_user_ssh_config(user).map_err(|e| unreadable(user, e))?,
+            user,
+        ),
+        "managed" => (
+            SshConfigService::at(managed.to_path_buf())
+                .read()
+                .map_err(|e| unreadable(managed, e))?
+                .hosts,
+            managed,
+        ),
+        other => {
+            return Err(CmdError(format!(
+                "Unknown ssh config source {other:?} - expected \"user\" or \"managed\"."
+            )))
+        }
+    };
+    Ok(serde_json::json!({ "hosts": hosts, "path": path.display().to_string() }))
+}
+
+#[cfg(test)]
+mod ssh_config_list_hosts_tests {
+    use super::*;
+
+    struct Dir(std::path::PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (Dir, std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            Dir(std::env::temp_dir().join(format!("sshspan-ru4-list-hosts-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let user = dir.0.join("user-config");
+        let managed = dir.0.join("managed-config");
+        std::fs::write(
+            &user,
+            "Host personal\n  HostName personal.example\n  User me\nHost *\n  Port 2222\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &managed,
+            "Host sshspan-deployed\n  IdentityFile /fixture/sshspan_key\n",
+        )
+        .unwrap();
+        (dir, user, managed)
+    }
+
+    fn unlocked() -> VaultPasswordStore {
+        let vault = VaultPasswordStore::new();
+        vault.set("fixture-master".into());
+        vault
+    }
+
+    #[test]
+    fn ru4_default_source_is_the_users_own_config() {
+        let (_dir, user, managed) = fixture();
+        for source in [None, Some("user")] {
+            let out = ssh_config_hosts_in(&unlocked(), source, &user, &managed).unwrap();
+            assert_eq!(out["path"], user.display().to_string());
+            assert_eq!(out["hosts"].as_array().unwrap().len(), 1, "{out}");
+            assert_eq!(out["hosts"][0]["host"], "personal");
+            assert_eq!(out["hosts"][0]["hostname"], "personal.example");
+            assert_eq!(out["hosts"][0]["user"], "me");
+            assert_eq!(out["hosts"][0]["port"], 2222);
+        }
+    }
+
+    #[test]
+    fn ru4_managed_source_keeps_todays_behaviour() {
+        let (_dir, user, managed) = fixture();
+        let out = ssh_config_hosts_in(&unlocked(), Some("managed"), &user, &managed).unwrap();
+        assert_eq!(out["path"], managed.display().to_string());
+        assert_eq!(out["hosts"][0]["host"], "sshspan-deployed");
+        assert_eq!(out["hosts"][0]["identity_file"], "/fixture/sshspan_key");
+    }
+
+    #[test]
+    fn ru4_missing_file_is_empty_and_bad_requests_are_refused() {
+        let (dir, user, managed) = fixture();
+        let missing = dir.0.join("absent");
+        let out = ssh_config_hosts_in(&unlocked(), None, &missing, &managed).unwrap();
+        assert_eq!(out["hosts"], serde_json::json!([]));
+        assert_eq!(out["path"], missing.display().to_string());
+        let err =
+            ssh_config_hosts_in(&unlocked(), Some("../etc/passwd"), &user, &managed).unwrap_err();
+        assert!(err.0.contains("Unknown ssh config source"), "{}", err.0);
+        let locked = VaultPasswordStore::new();
+        assert_eq!(
+            ssh_config_hosts_in(&locked, None, &user, &managed)
+                .unwrap_err()
+                .0,
+            "Vault is locked."
+        );
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

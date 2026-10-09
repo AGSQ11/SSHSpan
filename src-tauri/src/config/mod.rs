@@ -4,7 +4,7 @@
 use anyhow::Result;
 use directories::ProjectDirs;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SshHostConfig {
@@ -347,6 +347,504 @@ pub fn get_ssh_dir() -> Result<PathBuf> {
     }
 }
 
+// ─── The user's own ssh config, read-only (R4) ──────────────────────────────
+
+/// A config file is never read past this many bytes.
+const USER_CONFIG_MAX_BYTES: u64 = 1 << 20;
+/// `Include` brings in at most this many files in total.
+const USER_CONFIG_MAX_INCLUDES: usize = 64;
+/// All the wildcards of all the `Include` lines of one read look at no more
+/// than this many directory entries together.
+const USER_CONFIG_MAX_SCANNED: usize = 10_000;
+/// At most this many hosts are offered.
+const USER_CONFIG_MAX_HOSTS: usize = 1000;
+
+/// The user's own ssh config, `~/.ssh/config` (where OpenSSH looks on
+/// Windows too) - not SSHSpan's managed file ([`ssh_config_path`]).
+pub fn user_ssh_config_path() -> Result<PathBuf> {
+    Ok(get_ssh_dir()?.join("config"))
+}
+
+/// The hosts the user's ssh config at `path` defines, for the server
+/// dialog's import (R4, A2-43 / A7-26). Read-only, and nothing in it is run
+/// or looked up:
+/// - one entry per literal `Host` name; a pattern with `*`, `?` or `!` names
+///   no host and is skipped, and so are `Match` blocks - their criteria
+///   (`exec` among them) are never evaluated, so their settings apply to
+///   nothing here (`Match all`, which matches everything, is the exception);
+/// - an entry's values are the ones `ssh <name>` would use: the first value
+///   obtained wins, taken from every block whose patterns match the name;
+/// - `Include` is followed one level - from this file only, and only where it
+///   is unconditional (before any Host/Match block, under `Host *` or
+///   `Match all`). Relative paths are under `~/.ssh`, `~` is the home
+///   directory, wildcards are expanded in lexical order;
+/// - bounded by the `USER_CONFIG_MAX_*` limits.
+///
+/// A missing file is an empty list, not an error.
+pub fn read_user_ssh_config(path: &Path) -> Result<Vec<SshHostConfig>> {
+    let home = dirs::home_dir();
+    let ssh_dir = match &home {
+        Some(home) => home.join(".ssh"),
+        None => path.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    read_user_ssh_config_in(path, &ssh_dir, home.as_deref())
+}
+
+/// [`read_user_ssh_config`] with `~/.ssh` and `~` given, so tests can use a
+/// temp dir.
+fn read_user_ssh_config_in(
+    path: &Path,
+    ssh_dir: &Path,
+    home: Option<&Path>,
+) -> Result<Vec<SshHostConfig>> {
+    read_user_ssh_config_with(path, ssh_dir, home, USER_CONFIG_MAX_SCANNED)
+}
+
+/// [`read_user_ssh_config_in`] with the directory-entry budget given.
+fn read_user_ssh_config_with(
+    path: &Path,
+    ssh_dir: &Path,
+    home: Option<&Path>,
+    scan_budget: usize,
+) -> Result<Vec<SshHostConfig>> {
+    let Some(text) = read_config_text(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut reader = UserConfigReader {
+        ssh_dir,
+        home,
+        blocks: Vec::new(),
+        included: 0,
+        scan_budget,
+    };
+    reader.parse(&text, true, Scope::All);
+    Ok(reader.hosts())
+}
+
+/// The text of a config file, refused past `USER_CONFIG_MAX_BYTES`: at most
+/// one byte more than the cap is ever read, whatever size the file claimed
+/// or grows to while it is read.
+fn read_capped(reader: impl std::io::Read) -> Result<String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader
+        .take(USER_CONFIG_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > USER_CONFIG_MAX_BYTES {
+        anyhow::bail!("larger than {USER_CONFIG_MAX_BYTES} bytes");
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// One config file's text (bytes that are not UTF-8 become U+FFFD); `None`
+/// when the file does not exist.
+fn read_config_text(path: &Path) -> Result<Option<String>> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.is_file() {
+        anyhow::bail!("{} is not a file", path.display());
+    }
+    if meta.len() > USER_CONFIG_MAX_BYTES {
+        anyhow::bail!(
+            "{} is larger than {USER_CONFIG_MAX_BYTES} bytes",
+            path.display()
+        );
+    }
+    let text = read_capped(fs::File::open(path)?)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    Ok(Some(text))
+}
+
+/// Which hosts a block of the config applies to.
+#[derive(Clone)]
+enum Scope {
+    /// Every host: the lines before the first Host/Match, or `Match all`.
+    All,
+    /// A `Host` line's patterns, as written.
+    Hosts(Vec<String>),
+    /// A `Match` block other than `Match all`: never evaluated.
+    Skipped,
+}
+
+impl Scope {
+    /// An `Include` here would be read for every host.
+    fn unconditional(&self) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Hosts(patterns) => patterns.len() == 1 && patterns[0] == "*",
+            Scope::Skipped => false,
+        }
+    }
+
+    /// OpenSSH's Host matching: some pattern matches and no negated one does.
+    fn applies_to(&self, alias: &str) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Skipped => false,
+            Scope::Hosts(patterns) => {
+                let mut matched = false;
+                for pattern in patterns {
+                    match pattern.strip_prefix('!') {
+                        Some(negated) if wildcard_match(negated, alias, false) => return false,
+                        Some(_) => {}
+                        None => matched |= wildcard_match(pattern, alias, false),
+                    }
+                }
+                matched
+            }
+        }
+    }
+}
+
+/// A run of directives with the scope they apply to.
+struct Block {
+    scope: Scope,
+    directives: Vec<(String, Vec<String>)>,
+}
+
+struct UserConfigReader<'a> {
+    ssh_dir: &'a Path,
+    home: Option<&'a Path>,
+    blocks: Vec<Block>,
+    included: usize,
+    /// Directory entries the `Include` wildcards may still look at.
+    scan_budget: usize,
+}
+
+impl UserConfigReader<'_> {
+    /// Parse one file into blocks, starting in `scope` (an included file
+    /// starts where its `Include` line was).
+    fn parse(&mut self, text: &str, main_file: bool, scope: Scope) {
+        self.blocks.push(Block {
+            scope,
+            directives: Vec::new(),
+        });
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((keyword, rest)) = split_keyword(line) else {
+                continue;
+            };
+            // ProxyCommand is a shell command line, not ssh_config words.
+            let args = if keyword == "proxycommand" {
+                vec![rest.to_string()]
+            } else {
+                match split_config_args(rest) {
+                    Some(args) if !args.is_empty() => args,
+                    // A Host or Match line that cannot be parsed still starts
+                    // a block - one that applies to nothing - so the
+                    // directives under it go with it instead of landing in
+                    // the block before (after `Host *`: every host).
+                    _ if keyword == "host" || keyword == "match" => {
+                        self.blocks.push(Block {
+                            scope: Scope::Skipped,
+                            directives: Vec::new(),
+                        });
+                        continue;
+                    }
+                    _ => continue,
+                }
+            };
+            match keyword.as_str() {
+                "host" => self.blocks.push(Block {
+                    scope: Scope::Hosts(args),
+                    directives: Vec::new(),
+                }),
+                "match" => {
+                    let all = args.len() == 1 && args[0].eq_ignore_ascii_case("all");
+                    self.blocks.push(Block {
+                        scope: if all { Scope::All } else { Scope::Skipped },
+                        directives: Vec::new(),
+                    });
+                }
+                "include" => {
+                    let scope = self.current_scope();
+                    if main_file && scope.unconditional() {
+                        for pattern in &args {
+                            self.include(pattern, &scope);
+                        }
+                        // The including file goes on where it was.
+                        self.blocks.push(Block {
+                            scope,
+                            directives: Vec::new(),
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(block) = self.blocks.last_mut() {
+                        block.directives.push((keyword, args));
+                    }
+                }
+            }
+        }
+    }
+
+    fn current_scope(&self) -> Scope {
+        self.blocks
+            .last()
+            .map(|b| b.scope.clone())
+            .unwrap_or(Scope::All)
+    }
+
+    fn include(&mut self, pattern: &str, scope: &Scope) {
+        let path = match self.expand_home(pattern) {
+            path if path.is_absolute() => path,
+            relative => self.ssh_dir.join(relative),
+        };
+        for file in expand_include_glob(&path, &mut self.scan_budget) {
+            if self.included >= USER_CONFIG_MAX_INCLUDES {
+                return;
+            }
+            // An unreadable or oversized include is skipped, not fatal.
+            if let Ok(Some(text)) = read_config_text(&file) {
+                self.included += 1;
+                self.parse(&text, false, scope.clone());
+            }
+        }
+    }
+
+    /// `~` and `~/...` under the home directory; anything else as written.
+    fn expand_home(&self, value: &str) -> PathBuf {
+        match (value.strip_prefix('~'), self.home) {
+            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with(['/', '\\']) => rest
+                .split(['/', '\\'])
+                .filter(|part| !part.is_empty())
+                .fold(home.to_path_buf(), |path, part| path.join(part)),
+            _ => PathBuf::from(value),
+        }
+    }
+
+    /// One entry per literal Host name, in order of first appearance.
+    fn hosts(&self) -> Vec<SshHostConfig> {
+        let mut aliases: Vec<&str> = Vec::new();
+        for block in &self.blocks {
+            let Scope::Hosts(patterns) = &block.scope else {
+                continue;
+            };
+            for pattern in patterns {
+                let literal = !pattern.is_empty() && !pattern.contains(['*', '?', '!']);
+                if literal && !aliases.contains(&pattern.as_str()) {
+                    aliases.push(pattern.as_str());
+                }
+            }
+        }
+        aliases.truncate(USER_CONFIG_MAX_HOSTS);
+        aliases
+            .into_iter()
+            .map(|alias| self.resolve(alias))
+            .collect()
+    }
+
+    /// What `ssh <alias>` would use: the first value obtained wins.
+    fn resolve(&self, alias: &str) -> SshHostConfig {
+        fn first<T>(slot: &mut Option<T>, value: impl FnOnce() -> T) {
+            if slot.is_none() {
+                *slot = Some(value());
+            }
+        }
+        let not_none = |v: &str| (!v.eq_ignore_ascii_case("none")).then(|| v.to_string());
+        let (mut hostname, mut user, mut port, mut identity_file) = (None, None, None, None);
+        let (mut identities_only, mut forward_agent) = (None, None);
+        let (mut proxy_jump, mut proxy_command) = (None, None);
+        for block in self.blocks.iter().filter(|b| b.scope.applies_to(alias)) {
+            for (keyword, args) in &block.directives {
+                let value = args[0].as_str();
+                match keyword.as_str() {
+                    "hostname" => first(&mut hostname, || expand_hostname(value, alias)),
+                    "user" => first(&mut user, || value.to_string()),
+                    "port" => first(&mut port, || value.parse::<u16>().ok().filter(|p| *p > 0)),
+                    "identityfile" => first(&mut identity_file, || {
+                        self.expand_home(value).to_string_lossy().into_owned()
+                    }),
+                    "identitiesonly" => first(&mut identities_only, || {
+                        value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("true")
+                    }),
+                    "forwardagent" => first(&mut forward_agent, || {
+                        !(value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("false"))
+                    }),
+                    "proxyjump" => first(&mut proxy_jump, || not_none(value)),
+                    "proxycommand" => first(&mut proxy_command, || not_none(value)),
+                    _ => {}
+                }
+            }
+        }
+        let mut extra = std::collections::HashMap::new();
+        if let Some(command) = proxy_command.flatten() {
+            extra.insert("proxycommand".to_string(), command);
+        }
+        SshHostConfig {
+            host: alias.to_string(),
+            hostname,
+            user,
+            port: port.flatten(),
+            identity_file,
+            identities_only,
+            forward_agent,
+            proxy_jump: proxy_jump.flatten(),
+            extra,
+        }
+    }
+}
+
+/// A directive line split like OpenSSH's `strdelim`: the keyword (lower
+/// case) ends at whitespace or `=`, then one `=` may follow. A keyword with
+/// nothing after it is no directive.
+fn split_keyword(line: &str) -> Option<(String, &str)> {
+    let end = line.find(|c: char| c.is_whitespace() || c == '=')?;
+    let rest = line[end..].trim_start();
+    let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((line[..end].to_ascii_lowercase(), rest))
+}
+
+/// `HostName`'s two tokens: `%h` is the alias, `%%` a percent sign.
+fn expand_hostname(value: &str, alias: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('h') => out.push_str(alias),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// The files an `Include` argument names, expanded as `glob(3)` would:
+/// wildcards (`*`, `?`, `[...]`) in any component, a leading dot matched only
+/// by a pattern that starts with one, results in lexical order. Every
+/// directory entry looked at is taken from `budget`, shared by the whole read
+/// (`USER_CONFIG_MAX_SCANNED`); at most `USER_CONFIG_MAX_INCLUDES` files.
+fn expand_include_glob(path: &Path, budget: &mut usize) -> Vec<PathBuf> {
+    let mut found = vec![PathBuf::new()];
+    for component in path.components() {
+        let part = component.as_os_str();
+        let pattern = part.to_string_lossy();
+        let wild = matches!(component, Component::Normal(_)) && pattern.contains(['*', '?', '[']);
+        if !wild {
+            for path in &mut found {
+                path.push(part);
+            }
+            continue;
+        }
+        let mut next = Vec::new();
+        for dir in &found {
+            if *budget == 0 {
+                break;
+            }
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries {
+                if *budget == 0 {
+                    break;
+                }
+                *budget -= 1;
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let text = name.to_string_lossy();
+                if text.starts_with('.') && !pattern.starts_with('.') {
+                    continue;
+                }
+                if wildcard_match(&pattern, &text, true) {
+                    next.push(dir.join(&name));
+                }
+            }
+        }
+        found = next;
+    }
+    let mut files: Vec<PathBuf> = found.into_iter().filter(|p| p.is_file()).collect();
+    files.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    files.truncate(USER_CONFIG_MAX_INCLUDES);
+    files
+}
+
+/// `*` (any run), `?` (one character) and - when `classes` - `[...]` sets
+/// with ranges and `!`/`^` negation. Host patterns use only `*` and `?`, as
+/// in OpenSSH's `match_pattern`; Include paths use the `glob(3)` sets too.
+fn wildcard_match(pattern: &str, text: &str, classes: bool) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    // Where the last `*` was, and how much text it has taken so far.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        let step = match p.get(pi) {
+            Some('*') => {
+                star = Some((pi, ti));
+                pi += 1;
+                continue;
+            }
+            Some('?') => Some(pi + 1),
+            Some('[') if classes => match class_match(&p[pi..], t[ti]) {
+                Some((true, len)) => Some(pi + len),
+                Some((false, _)) => None,
+                // No closing bracket: a literal `[`.
+                None => (t[ti] == '[').then_some(pi + 1),
+            },
+            Some(&c) => (c == t[ti]).then_some(pi + 1),
+            None => None,
+        };
+        match (step, star) {
+            (Some(next), _) => {
+                pi = next;
+                ti += 1;
+            }
+            (None, Some((star_pi, star_ti))) => {
+                pi = star_pi + 1;
+                ti = star_ti + 1;
+                star = Some((star_pi, star_ti + 1));
+            }
+            (None, None) => return false,
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// A `[...]` set at the start of `p` against `c`: whether it matched and how
+/// many pattern characters it used; `None` when the set is not closed.
+fn class_match(p: &[char], c: char) -> Option<(bool, usize)> {
+    let mut i = 1;
+    let negated = matches!(p.get(i), Some('!' | '^'));
+    if negated {
+        i += 1;
+    }
+    let mut matched = false;
+    let start = i;
+    while i < p.len() {
+        if p[i] == ']' && i > start {
+            return Some((matched != negated, i + 1));
+        }
+        if p.get(i + 1) == Some(&'-') && p.get(i + 2).is_some_and(|&end| end != ']') {
+            matched |= p[i] <= c && c <= p[i + 2];
+            i += 3;
+        } else {
+            matched |= p[i] == c;
+            i += 1;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +992,377 @@ mod tests {
         assert_eq!(sanitize_config_value("clean"), "clean");
         assert_eq!(sanitize_config_value("a\u{0}b"), "a_b");
         assert_eq!(sanitize_config_value("a\tb\rc\nd"), "a_b_c_d");
+    }
+}
+
+/// RU4 / R4: the import reads the user's own ssh config - fixture files in a
+/// temp dir stand in for `~` and `~/.ssh`.
+#[cfg(test)]
+mod ru4_user_config_tests {
+    use super::*;
+    use std::path::Path;
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("sshspan-ru4-config-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(root.join(".ssh")).unwrap();
+            Self { root }
+        }
+
+        fn ssh_dir(&self) -> PathBuf {
+            self.root.join(".ssh")
+        }
+
+        fn write(&self, rel: &str, text: &str) -> PathBuf {
+            let path = self.ssh_dir().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            path
+        }
+
+        fn read(&self) -> Vec<SshHostConfig> {
+            read_user_ssh_config_in(
+                &self.ssh_dir().join("config"),
+                &self.ssh_dir(),
+                Some(&self.root),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn names(hosts: &[SshHostConfig]) -> Vec<&str> {
+        hosts.iter().map(|h| h.host.as_str()).collect()
+    }
+
+    fn host<'a>(hosts: &'a [SshHostConfig], alias: &str) -> &'a SshHostConfig {
+        hosts
+            .iter()
+            .find(|h| h.host == alias)
+            .unwrap_or_else(|| panic!("{alias} missing from {:?}", names(hosts)))
+    }
+
+    const MAIN: &str = "\u{feff}# A comment, then a byte-order mark the editor left\n\
+        Include conf.d/*.conf extra.conf ~/.ssh/home.conf /does/not/exist.conf\n\
+        Host a\n\
+        \x20   HostName a.example.com\n\
+        \x20   Port=2201\n\
+        \x20   IdentityFile \"~/.ssh/id a\"\n\
+        \x20   IdentityFile ~/.ssh/second\n\
+        Host web*.example.com ?x !neg\n\
+        \x20   HostName never\n\
+        Match host a exec \"touch /tmp/sshspan-ru4-must-not-run\"\n\
+        \x20   User match-user\n\
+        \x20   Include match.conf\n\
+        Host b c\n\
+        \x20   HostName %h.corp.example\n\
+        \x20   Include host-only.conf\n\
+        Host a\n\
+        \x20   User late-a\n\
+        \x20   HostName ignored-later\n\
+        Host * !c\n\
+        \x20   User star-user\n\
+        \x20   Port 2299\n";
+
+    fn main_fixture() -> Fixture {
+        let f = Fixture::new();
+        f.write("config", MAIN);
+        f.write(
+            "conf.d/10-first.conf",
+            "Host inc1\n  HostName inc1.example\n  Include nested.conf\n",
+        );
+        f.write("conf.d/20-second.conf", "Host inc2\n  User second\n");
+        f.write("conf.d/.hidden.conf", "Host hidden\n");
+        f.write("conf.d/notes.txt", "Host txt\n");
+        f.write("extra.conf", "Host extra\n");
+        f.write("home.conf", "Host home\n");
+        f.write("nested.conf", "Host nested\n");
+        f.write("match.conf", "Host from-match\n");
+        f.write("host-only.conf", "Host from-host-block\n");
+        f
+    }
+
+    #[test]
+    fn ru4_missing_user_config_is_an_empty_list_not_an_error() {
+        let f = Fixture::new();
+        assert!(f.read().is_empty());
+    }
+
+    /// Literal hosts only, in order of appearance: wildcard and negated
+    /// patterns and `Match` blocks are skipped, `Include` is followed one
+    /// level (relative to `~/.ssh`, `~` expanded, globs in lexical order,
+    /// hidden files only when asked for), never from inside a Host or Match
+    /// block, never from an included file.
+    #[test]
+    fn ru4_imports_literal_hosts_and_follows_include_one_level() {
+        let f = main_fixture();
+        let hosts = f.read();
+        assert_eq!(
+            names(&hosts),
+            ["inc1", "inc2", "extra", "home", "a", "b", "c"]
+        );
+        assert!(!Path::new("/tmp/sshspan-ru4-must-not-run").exists());
+    }
+
+    /// Values as `ssh <alias>` would use them: the first value obtained wins,
+    /// from every Host block whose patterns match (`*`, `?`, `!`), `%h` in
+    /// HostName is the alias, `~` in IdentityFile is the home directory.
+    #[test]
+    fn ru4_resolves_values_like_openssh_first_match_wins() {
+        let f = main_fixture();
+        let hosts = f.read();
+        let a = host(&hosts, "a");
+        assert_eq!(a.hostname.as_deref(), Some("a.example.com"));
+        assert_eq!(a.port, Some(2201));
+        assert_eq!(a.user.as_deref(), Some("late-a"));
+        let id_a = f.root.join(".ssh").join("id a");
+        assert_eq!(a.identity_file.as_deref(), Some(id_a.to_str().unwrap()));
+        assert_eq!(
+            host(&hosts, "b").hostname.as_deref(),
+            Some("b.corp.example")
+        );
+        assert_eq!(host(&hosts, "b").user.as_deref(), Some("star-user"));
+        assert_eq!(host(&hosts, "b").port, Some(2299));
+        let c = host(&hosts, "c");
+        assert_eq!(c.hostname.as_deref(), Some("c.corp.example"));
+        assert_eq!(
+            (c.user.as_deref(), c.port),
+            (None, None),
+            "`Host * !c` excludes c"
+        );
+        assert_eq!(
+            host(&hosts, "inc1").hostname.as_deref(),
+            Some("inc1.example")
+        );
+        assert_eq!(host(&hosts, "inc2").user.as_deref(), Some("second"));
+        assert_eq!(host(&hosts, "extra").user.as_deref(), Some("star-user"));
+    }
+
+    /// The renderer warns about directives SSHSpan does not implement, so
+    /// they must survive the import, including a ProxyCommand whose shell
+    /// quoting is not ssh_config quoting.
+    #[test]
+    fn ru4_keeps_markers_for_unsupported_proxy_and_agent_directives() {
+        let f = Fixture::new();
+        f.write(
+            "config",
+            "Host jump\n  ProxyJump bastion\n  ForwardAgent yes\n\
+             Host cmd\n  ProxyCommand sh -c 'nc %h %p\n\
+             Host none\n  ProxyJump none\n  ForwardAgent no\n  ProxyCommand none\n",
+        );
+        let hosts = f.read();
+        let jump = host(&hosts, "jump");
+        assert_eq!(jump.proxy_jump.as_deref(), Some("bastion"));
+        assert_eq!(jump.forward_agent, Some(true));
+        assert_eq!(
+            host(&hosts, "cmd")
+                .extra
+                .get("proxycommand")
+                .map(String::as_str),
+            Some("sh -c 'nc %h %p")
+        );
+        let none = host(&hosts, "none");
+        assert_eq!(none.proxy_jump, None);
+        assert_eq!(none.forward_agent, Some(false));
+        assert!(none.extra.is_empty());
+    }
+
+    /// `Match all` matches everything, so an `Include` after it is followed;
+    /// any other `Match` block is skipped.
+    #[test]
+    fn ru4_match_all_is_unconditional() {
+        let f = Fixture::new();
+        f.write(
+            "config",
+            "Host x\n  User x-user\nMatch all\nInclude late.conf\nUser everyone\n",
+        );
+        f.write("late.conf", "Host late\n");
+        let hosts = f.read();
+        assert_eq!(names(&hosts), ["x", "late"]);
+        assert_eq!(host(&hosts, "late").user.as_deref(), Some("everyone"));
+    }
+
+    /// Bounded: a glob brings in at most the cap of files, oversized files
+    /// are skipped, and bytes that are not UTF-8 do not stop the read.
+    #[test]
+    fn ru4_include_is_bounded_and_tolerates_odd_files() {
+        let f = Fixture::new();
+        f.write(
+            "config",
+            "Include latin1.conf\nInclude big.conf\nInclude many/*\n",
+        );
+        for i in 0..(USER_CONFIG_MAX_INCLUDES + 10) {
+            f.write(&format!("many/{i:03}.conf"), &format!("Host many{i:03}\n"));
+        }
+        let mut big = String::from("Host big\n");
+        big.push_str(&"# padding\n".repeat((USER_CONFIG_MAX_BYTES as usize / 10) + 10));
+        f.write("big.conf", &big);
+        fs::write(
+            f.ssh_dir().join("latin1.conf"),
+            b"Host latin1\n  User caf\xe9\n",
+        )
+        .unwrap();
+        let hosts = f.read();
+        let many = hosts.iter().filter(|h| h.host.starts_with("many")).count();
+        assert!(many <= USER_CONFIG_MAX_INCLUDES, "{many} files included");
+        assert!(!names(&hosts).contains(&"big"));
+        assert_eq!(host(&hosts, "latin1").user.as_deref(), Some("caf\u{FFFD}"));
+    }
+
+    /// Review fix 7: the size cap holds for what is actually read, not for
+    /// what the file's metadata claimed a moment earlier.
+    #[test]
+    fn ru4_config_reads_stop_at_the_size_cap() {
+        struct Counting<R>(R, std::rc::Rc<std::cell::Cell<u64>>);
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                self.1.set(self.1.get() + n as u64);
+                Ok(n)
+            }
+        }
+        use std::io::Read as _;
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let huge = std::io::repeat(b'#').take(USER_CONFIG_MAX_BYTES * 4);
+        assert!(read_capped(Counting(huge, read.clone())).is_err());
+        assert!(
+            read.get() <= USER_CONFIG_MAX_BYTES + 1,
+            "read {} bytes",
+            read.get()
+        );
+        let small = Counting(&b"Host a\n"[..], read.clone());
+        assert_eq!(read_capped(small).unwrap(), "Host a\n");
+    }
+
+    /// Review fix 6: every wildcard in every `Include` draws on one budget
+    /// of directory entries for the whole read, not a fresh one per folder.
+    #[test]
+    fn ru4_include_globs_share_one_scan_budget() {
+        let f = Fixture::new();
+        f.write("config", "Include */x*.conf\n");
+        for dir in ["a", "b"] {
+            for i in 0..5 {
+                f.write(&format!("{dir}/x{i}.conf"), &format!("Host {dir}{i}\n"));
+            }
+        }
+        let all = f.read();
+        assert_eq!(all.len(), 10, "{:?}", names(&all));
+        let budget = 6;
+        let hosts = read_user_ssh_config_with(
+            &f.ssh_dir().join("config"),
+            &f.ssh_dir(),
+            Some(&f.root),
+            budget,
+        )
+        .unwrap();
+        assert!(hosts.len() <= budget, "{:?}", names(&hosts));
+        assert!(hosts.len() < all.len(), "{:?}", names(&hosts));
+    }
+
+    /// Review fix 8: a `Host` (or `Match`) line ssh_config cannot parse
+    /// starts a block that applies to nothing - its directives used to land
+    /// in the block before it (after `Host *`: every imported host).
+    #[test]
+    fn ru4_an_unparseable_host_line_takes_its_directives_with_it() {
+        let f = Fixture::new();
+        f.write(
+            "config",
+            "Host ok\n  User ok-user\nHost *\n  Port 2222\n\
+             Host \"broken\n  HostName evil.example\n  User injected\n\
+             Match host \"broken\n  IdentityFile /evil/key\n\
+             Host later\n",
+        );
+        let hosts = f.read();
+        assert_eq!(names(&hosts), ["ok", "later"]);
+        for h in &hosts {
+            assert_eq!(h.hostname, None, "{}", h.host);
+            assert_eq!(h.identity_file, None, "{}", h.host);
+            assert_eq!(h.port, Some(2222), "{}", h.host);
+        }
+        assert_eq!(host(&hosts, "ok").user.as_deref(), Some("ok-user"));
+        assert_eq!(host(&hosts, "later").user, None);
+    }
+
+    /// The parser agrees with OpenSSH itself (`ssh -G`) on every imported
+    /// host. Skipped when no ssh client is installed; Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn ru4_resolved_values_agree_with_ssh_g() {
+        if std::process::Command::new("ssh")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no ssh client on PATH");
+            return;
+        }
+        let f = Fixture::new();
+        let dir = f.ssh_dir();
+        let d = dir.display();
+        // Absolute include paths: `ssh -F` resolves relative ones against the
+        // running user's real ~/.ssh. No `Match exec`: ssh would run it.
+        let text = MAIN
+            .replace('\u{feff}', "")
+            .replace(
+                "Include conf.d/*.conf extra.conf ~/.ssh/home.conf /does/not/exist.conf",
+                &format!("Include \"{d}/conf.d/*.conf\""),
+            )
+            .replace("\"~/.ssh/id a\"", &format!("\"{d}/id a\""))
+            .replace("~/.ssh/second", &format!("{d}/second"))
+            .replace(
+                "Match host a exec \"touch /tmp/sshspan-ru4-must-not-run\"",
+                "Match host never.invalid",
+            )
+            .replace("    Include match.conf\n", "")
+            .replace("    Include host-only.conf\n", "");
+        let main = f.write("config", &text);
+        f.write(
+            "conf.d/10-first.conf",
+            "Host inc1\n  HostName inc1.example\n",
+        );
+        f.write("conf.d/20-second.conf", "Host inc2\n  User second\n");
+        let hosts = f.read();
+        assert_eq!(names(&hosts), ["inc1", "inc2", "a", "b", "c"]);
+        let mut problems = Vec::new();
+        for h in &hosts {
+            let out = std::process::Command::new("ssh")
+                .arg("-G")
+                .arg("-F")
+                .arg(&main)
+                .arg(&h.host)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut wanted = vec![
+                format!("hostname {}", h.hostname.as_deref().unwrap_or(&h.host)),
+                format!("port {}", h.port.unwrap_or(22)),
+            ];
+            if let Some(user) = &h.user {
+                wanted.push(format!("user {user}"));
+            }
+            if let Some(id) = &h.identity_file {
+                wanted.push(format!("identityfile {id}"));
+            }
+            for w in wanted {
+                if !out.status.success() || !stdout.lines().any(|l| l == w) {
+                    problems.push(format!(
+                        "{}: ssh -G lacks {w:?} ({})",
+                        h.host,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+            }
+        }
+        assert!(problems.is_empty(), "{}\n{text}", problems.join("\n"));
     }
 }
