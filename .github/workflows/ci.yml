@@ -132,6 +132,10 @@ jobs:
           # Accessibility, keyboard, menus, palette, audit log and settings
           # polish, plus static checks for the dead CSS/JS the audit removed.
           npm run test:polish
+          # The AI assistant panel and MCP settings: approval attestation,
+          # backend-gated typing, per-tab lifecycle, bounded history and the
+          # MCP/provider settings round-trip, against stubbed IPC only.
+          npm run test:assistant
 
   cargo-audit:
     name: Dependency advisories

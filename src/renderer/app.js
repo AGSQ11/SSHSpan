@@ -1783,6 +1783,8 @@ function clearConnectView() {
     if (tab && tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
     window.destroyTabTerminal(tabId);
     state.sessions.delete(tabId);
+    // Its assistant conversation, pending approval and access level go too.
+    window.assistantClearTab?.(tabId);
   }
   state.activeTabId = null;
   const sbody = document.getElementById('sftpBody');
@@ -5565,6 +5567,8 @@ async function closeSessionTab(tabId, { skipConfirm = false } = {}) {
   const panel = document.getElementById('sftpPanel-' + tabId);
   if (panel) panel.remove();
   state.sessions.delete(tabId);
+  // Its assistant conversation, pending approval and access level go too.
+  window.assistantClearTab?.(tabId);
   if (state.activeTabId === tabId) {
     const nextId = state.sessions.keys().next().value || null;
     if (nextId) activateSessionSurface(nextId);

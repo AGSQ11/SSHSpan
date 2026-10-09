@@ -2383,14 +2383,34 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
    Docks at the right of the session surface; the surface is a column by
    default and a row when .split, so .assistant-open flips it to a row in
    either case and the terminal/SFTP share what is left. */
-.session-surface.assistant-open { flex-direction: row; }
+.session-surface.assistant-open { flex-direction: row; position: relative; }
 .assistant-open .terminal-body { flex: 1; min-width: 0; }
 
+/* A1-03: docked at a fixed 380px the panel left the terminal 9-17 columns at
+   the default window, and in Split it was pushed out of the clipping column
+   (Execute/YOLO and Send unreachable even at 1600px). It now OVERLAYS the
+   session surface - the terminal keeps its columns - and docks beside it only
+   when the window is wide enough for both, shrinking before the terminal
+   does. In Split the panel always overlays: the split surface keeps its own
+   layout (owned by the SFTP layout work) and the panel never adds to it. */
 .assistant-panel {
-  flex: 0 0 380px;
+  position: absolute; top: 0; right: 0; bottom: 0; z-index: 20;
+  width: min(380px, calc(100% - 24px));
   display: flex; flex-direction: column; min-width: 0;
   border-left: 1px solid var(--line);
   background: var(--bg-elev);
+  box-shadow: -10px 0 28px rgba(0, 0, 0, 0.38);
+}
+@media (min-width: 1500px) {
+  .session-surface.assistant-open:not(.split) .assistant-panel {
+    position: static; width: auto; flex: 0 1 380px; min-width: 260px; box-shadow: none;
+  }
+  .session-surface.assistant-open:not(.split) .terminal-body { min-width: 320px; }
+}
+/* A4-04: the floating maximize button sat on the panel's Send button; it
+   moves to the panel's left edge while the panel is shown. */
+#app:not(.term-max) .session-surface.assistant-open ~ .term-max-btn {
+  right: calc(min(380px, 100% - 24px) + 8px);
 }
 
 .ai-head {
@@ -2408,7 +2428,46 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   /* Dark on the light red: white on it was 2.80:1 (A1-14). */
   color: #0a1120; background: var(--danger);
 }
-.ai-close { margin-left: auto; }
+/* New chat takes the free space, so it and Close sit at the right edge. */
+.ai-new-chat { margin-left: auto; font-size: 11px; padding: 3px 9px; }
+
+/* First-open setup card (A5-36). */
+.ai-setup {
+  margin: 10px 10px 0; padding: 10px 12px; border-radius: var(--r-sm);
+  border: 1px solid rgba(var(--accent-rgb), 0.45); background: var(--panel);
+  display: flex; flex-direction: column; gap: 6px; font-size: 12px;
+}
+.ai-setup p { margin: 0; }
+.ai-setup-title { font-weight: 700; color: var(--text); }
+.ai-setup-text { color: var(--text-dim); }
+.ai-setup button { align-self: flex-start; font-size: 12px; padding: 5px 11px; }
+
+/* One row per tool call, for every approval path (A4-17): what ran, where,
+   who approved it, and how it ended. Read-only - no controls. */
+.ai-tool-event {
+  font-size: 11.5px; line-height: 1.4; padding: 5px 8px;
+  border-left: 3px solid var(--line-strong); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--panel); color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.ai-tool-event.ok { border-left-color: var(--accent); }
+.ai-tool-event.error { border-left-color: var(--danger); }
+.ai-tool-event.denied, .ai-tool-event.cancelled { border-left-color: var(--warn); }
+.ai-tool-event-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+.ai-tool-event-name { color: var(--text); font-weight: 600; font-family: var(--mono); }
+.ai-tool-event-src { font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; }
+.ai-tool-event-src.yolo { color: var(--danger); }
+.ai-tool-event-src.auto { color: var(--warn); }
+.ai-tool-event pre {
+  margin: 4px 0 0; padding: 4px 6px; max-height: 160px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font-family: var(--mono); font-size: 11px; color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+}
+.ai-tool-event-warn { margin-top: 3px; color: var(--warn); }
+.ai-card-error { margin-top: 4px; color: var(--danger); font-size: 11.5px; overflow-wrap: anywhere; }
+.ai-msg-actions { margin-top: 4px; }
+.ai-msg-actions button { font-size: 11px; padding: 3px 10px; }
 
 .ai-levels { padding: 8px 10px 6px; border-bottom: 1px solid var(--line-soft); }
 .ai-level-seg { width: 100%; }
@@ -2482,6 +2541,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .ai-card-actions { display: flex; gap: 6px; }
 .ai-card-actions button { font-size: 11px; padding: 3px 10px; }
 .ai-card.confirm { border-color: var(--warn); }
+/* A pending card takes the focus itself (not its Approve button): show it. */
+.ai-card.confirm:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ai-args-all summary { cursor: pointer; color: var(--accent); font-size: 11px; margin: -2px 0 6px; }
 .ai-card.approved { border-color: var(--accent); opacity: 0.75; }
 .ai-card.denied { opacity: 0.55; }
 
@@ -2537,7 +2599,10 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   background: #f6858f; border-color: #f6858f;
 }
 
-/* Settings section bits. */
+/* Settings section bits. .ai-field lays out like the settings labels: the
+   Base URL caption is its own <label> so the preset keeps its own name. */
+.ai-field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-dim); font-weight: 500; }
+.ai-field:focus-within > label { color: var(--text); }
 .ai-urlrow { display: flex; gap: 6px; }
 .ai-urlrow input { flex: 1; }
 .ai-urlrow select { flex: 0 0 130px; }
@@ -2626,6 +2691,23 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 }
 .mcp-tool-changed { font-size: 11.5px; color: var(--warn); font-weight: 600; }
 .mcp-tool-toggles { display: flex; gap: 8px; flex-wrap: wrap; }
+/* A4-08: a toggle that cannot be used looks it. */
+.mcp-tool-toggles .toggle-chip:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.mcp-tool-schema {
+  margin: 0; padding: 5px 7px; max-height: 140px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  white-space: pre-wrap; word-break: break-word;
+}
+.mcp-status-text { flex: none; font-size: 11px; color: var(--text-dim); }
+.mcp-badge {
+  flex: none; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 1px 7px; border-radius: 999px;
+  border: 1px solid rgba(var(--warn-rgb), 0.5); color: var(--warn);
+}
+.mcp-server-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--text-faint); }
+.mcp-server-error { font-size: 11.5px; color: var(--danger); overflow-wrap: anywhere; }
+.mcp-rebind-warn { color: var(--warn); font-size: 11.5px; margin: 0; }
 
 /* ==========================================================================
    Reduced motion: every animation and transition here is decoration, so when

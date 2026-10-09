@@ -21,9 +21,9 @@
  * alone cannot see that, so the handler list is read too.
  *
  * Exits non-zero on: an unknown or unregistered command, a misnamed/unexpected
- * argument, or a required (non-Option) argument the renderer never passes, a
- * KNOWN_TWINS entry that no longer matches anything - and if the handler-list
- * parser fails its own self-check below.
+ * argument (a snake_case twin sent next to its camelCase key included), or a
+ * required (non-Option) argument the renderer never passes - and if the
+ * handler-list parser fails its own self-check below.
  */
 'use strict';
 const fs = require('fs');
@@ -65,29 +65,38 @@ const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
 function parseRustCommands() {
   const cmds = {};
   for (const file of walk(RUST_DIR)) {
-    const src = fs.readFileSync(file, 'utf8');
-    const re = /#\[tauri::command([^\]]*)\][\s\S]{0,400}?(?:pub\s+)?(?:async\s+)?fn\s+([a-z_0-9]+)\s*\(([\s\S]*?)\)\s*(?:->|\{)/g;
-    let m;
-    while ((m = re.exec(src))) {
-      const snake = /rename_all\s*=\s*"snake_case"/.test(m[1] || '');
-      const name = m[2];
-      const args = [];
-      for (let part of splitTopLevel(m[3], ',')) {
-        // Strip comment lines; they sit between parameters.
-        part = part.split('\n').filter((l) => !/^\s*(\/\/|#\[)/.test(l)).join('\n').trim();
-        if (!part) continue;
-        const pm = part.match(/^(?:mut\s+)?([a-z_0-9]+)\s*:\s*([\s\S]+)$/);
-        if (!pm) continue;
-        const [, pname, ptypeRaw] = pm;
-        const ptype = ptypeRaw.trim();
-        if (INJECTED.test(ptype)) continue;
-        args.push({
-          key: snake ? pname : toCamel(pname),
-          optional: /^Option</.test(ptype),
-        });
-      }
-      cmds[name] = { args, file: path.relative(ROOT, file), line: src.slice(0, m.index).split('\n').length };
+    Object.assign(cmds, parseCommandsIn(fs.readFileSync(file, 'utf8'), path.relative(ROOT, file)));
+  }
+  return cmds;
+}
+
+/** The #[tauri::command]s in one Rust source text. */
+function parseCommandsIn(src, rel) {
+  const cmds = {};
+  const re = /#\[tauri::command([^\]]*)\][\s\S]{0,400}?(?:pub\s+)?(?:async\s+)?fn\s+([a-z_0-9]+)\s*\(([\s\S]*?)\)\s*(?:->|\{)/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const snake = /rename_all\s*=\s*"snake_case"/.test(m[1] || '');
+    const name = m[2];
+    const args = [];
+    // Comments are blanked BEFORE the list is split: a comma or a bracket in
+    // a comment between two parameters used to split it there, and the
+    // parameter after it was lost.
+    for (let part of splitTopLevel(blankRustComments(m[3]), ',')) {
+      // Drop attribute lines (#[...]) in front of a parameter.
+      part = part.split('\n').filter((l) => !/^\s*(\/\/|#\[)/.test(l)).join('\n').trim();
+      if (!part) continue;
+      const pm = part.match(/^(?:mut\s+)?([a-z_0-9]+)\s*:\s*([\s\S]+)$/);
+      if (!pm) continue;
+      const [, pname, ptypeRaw] = pm;
+      const ptype = ptypeRaw.trim();
+      if (INJECTED.test(ptype)) continue;
+      args.push({
+        key: snake ? pname : toCamel(pname),
+        optional: /^Option</.test(ptype),
+      });
     }
+    cmds[name] = { args, file: rel, line: src.slice(0, m.index).split('\n').length };
   }
   return cmds;
 }
@@ -236,28 +245,11 @@ function parseJsCallSites() {
   return sites;
 }
 
-/// Known and owned: the snake_case twins assistant.js still sends NEXT TO the
-/// camelCase keys Rust reads (`{ tab_id: tabId, tabId }`). Harmless while the
-/// camelCase twin is there - Tauri reads it and drops the other - but they are
-/// the silently-dropped class this check exists for, found once aiCall sites
-/// were checked at all (A8-17). Unit JU3 removes them from assistant.js. Each
-/// is reported, not failed, ONLY while its camelCase twin is in the same call;
-/// an entry that no longer matches anything fails the run, so this list cannot
-/// outlive the fix.
-const KNOWN_TWINS = [
-  ['src/renderer/assistant.js', 'assistant_get_level', 'tab_id'],
-  ['src/renderer/assistant.js', 'assistant_set_level', 'tab_id'],
-  ['src/renderer/assistant.js', 'assistant_exec', 'session_id'],
-  ['src/renderer/assistant.js', 'assistant_exec', 'tab_id'],
-  ['src/renderer/assistant.js', 'assistant_chat', 'max_tokens'],
-  ['src/renderer/assistant.js', 'assistant_save_config', 'base_url'],
-  ['src/renderer/assistant.js', 'assistant_save_config', 'api_key'],
-];
-const knownTwin = (file, cmd, arg) => KNOWN_TWINS.findIndex(([f, c, a]) => f === file && c === cmd && a === arg);
-
 /** Every problem with these call sites, given the commands and the registered
- *  set. Known twins (above) go to `known` (an array of KNOWN_TWINS indexes) when given. */
-function findProblems(sites, cmds, registered, known) {
+ *  set. No exemptions: a snake_case twin sent next to its camelCase key (the
+ *  seven assistant.js used to send, A8-17) is an unexpected argument like any
+ *  other - Tauri drops it silently. */
+function findProblems(sites, cmds, registered) {
   const problems = [];
   for (const s of sites) {
     const def = cmds[s.cmd];
@@ -273,11 +265,6 @@ function findProblems(sites, cmds, registered, known) {
     const expected = new Set(def.args.map((a) => a.key));
     for (const k of s.keys) {
       if (!expected.has(k)) {
-        const twin = known ? knownTwin(s.file, s.cmd, k) : -1;
-        if (twin !== -1 && expected.has(toCamel(k)) && s.keys.includes(toCamel(k))) {
-          known.push(twin);
-          continue;
-        }
         const hint = expected.has(toCamel(k)) ? ` (did you mean '${toCamel(k)}'? Tauri camelCases parameters)` : '';
         problems.push(
           `${s.file}:${s.line}  '${s.cmd}' got unexpected arg '${k}'${hint}\n` +
@@ -347,6 +334,24 @@ function selfCheck() {
   if (!gated || JSON.stringify([...gated]) !== JSON.stringify(gatedWant)) {
     failed.push(`cfg-gated entries must count, got ${JSON.stringify(gated && [...gated])}, want ${JSON.stringify(gatedWant)}`);
   }
+  // A comment between two parameters may hold a comma (the one above
+  // assistant_save_config's clear_api_key does): the parameter after it
+  // must still be read, or a call that sends it is flagged as unexpected.
+  const probeCmd = parseCommandsIn([
+    '#[tauri::command]',
+    'pub fn probe_cmd(',
+    '    app: AppHandle,',
+    '    api_key: Option<String>,',
+    '    // A note (with parentheses), and a comma - then one more line',
+    '    // of the same comment.',
+    '    clear_api_key: Option<bool>,',
+    '    level: String,',
+    ') -> CmdResult<Value> {',
+  ].join('\n'), 'probe.rs').probe_cmd;
+  const probeKeys = probeCmd ? probeCmd.args.map((a) => a.key + (a.optional ? '?' : '')) : null;
+  if (JSON.stringify(probeKeys) !== JSON.stringify(['apiKey?', 'clearApiKey?', 'level'])) {
+    failed.push(`parameters around a comment with a comma parsed as ${JSON.stringify(probeKeys)}, want ["apiKey?","clearApiKey?","level"]`);
+  }
   const def = { args: [], file: 'probe.rs', line: 1 };
   const flagged = findProblems(
     [{ cmd: 'vault_backup_create', file: 'probe.js', line: 1, keys: [], dynamic: false },
@@ -374,17 +379,7 @@ if (!registered) {
   process.exit(1);
 }
 const sites = parseJsCallSites();
-const known = [];
-const problems = findProblems(sites, cmds, registered, known);
-for (const i of new Set(known)) {
-  const [file, cmd, arg] = KNOWN_TWINS[i];
-  console.log(`  known  ${file}  '${cmd}' also sends '${arg}' next to '${toCamel(arg)}' - removed by unit JU3 (A8-17)`);
-}
-KNOWN_TWINS.forEach(([file, cmd, arg], i) => {
-  if (!known.includes(i)) {
-    problems.push(`${file}  the known '${cmd}' twin '${arg}' is gone (or lost its camelCase twin) - remove it from KNOWN_TWINS in this script`);
-  }
-});
+const problems = findProblems(sites, cmds, registered);
 
 console.log(`Checked ${sites.length} call sites against ${Object.keys(cmds).length} commands (${registered.size} registered).`);
 if (problems.length) {

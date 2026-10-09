@@ -11,7 +11,10 @@
  *      turn's nonce untrusted block before it enters the conversation.
  *   2. The Settings -> AI assistant -> MCP servers section: server list with
  *      status, add/edit form with per-auth-type value source, test connection,
- *      and a per-tool approval list (Enable / Auto-approve toggles).
+ *      and a per-tool approval list (Enable / Auto-approve toggles). Every
+ *      approval names the definition the user reviewed (`expected_hash` =
+ *      the shown `definition_hash`), so a definition that changed meanwhile
+ *      is refused by the backend and shown again, never approved unseen.
  *
  * SECURITY: names, URLs, descriptions and annotations come from MCP servers -
  * fully untrusted. Every one of them is rendered with textContent /
@@ -28,14 +31,9 @@
 // gives mcpGetTools() only the leftover slots, so MCP never displaces them.
 const MCP_DESC_LIMIT = 1024;
 
-// Sanitize a server/tool name for the model-facing tool name. Only
-// [A-Za-z0-9_] survives, and runs of underscores collapse to one - so the
-// model-facing name can never itself contain "__", and the
-// mcp__<server>__<tool> split is structurally unambiguous: a name the model
-// saw always maps back to exactly the {server, tool} pair it was built from.
-function mcpSanitizeName(s) {
-  return String(s == null ? '' : s).replace(/[^A-Za-z0-9_]+/g, '_').replace(/_+/g, '_');
-}
+// Model-facing tool names are the backend's `exposed_name` (mcpExposedName
+// below): sanitized server and tool parts, capped at 64 characters with a
+// hash suffix - computed once, in Rust, by the function its gates use.
 
 // ─── registry ───────────────────────────────────────────────────────────────
 
@@ -43,20 +41,34 @@ function mcpSanitizeName(s) {
 // the backend - treat every field in it as untrusted data).
 let mcpServers = [];
 let mcpAvailable = true; // false once the backend command is found missing
+let mcpRefreshSeq = 0;   // only the newest list request may replace the registry
 
 const mcpCall = (cmd, args) => (window.call || call)(cmd, args);
+
+function mcpErrText(e) { return (e && (e.message || e.error)) || String(e); }
+
+/// Tauri's own answer for a command that is not registered (tauri 2.11.5,
+/// src/webview/mod.rs, on_message: `Command {command} not found`). Only THAT means "this
+/// backend has no MCP support": a corrupt record ("missing field ...") or a
+/// database error ("no such table") used to match a broad regex and turned
+/// MCP off for the session with a wrong explanation (A4-25).
+function mcpIsUnknownCommand(msg) {
+  return /^Command mcp_[a-z_]+ not found$/i.test(String(msg).trim());
+}
 
 // Pull the registry from the backend. Missing command (old backend) degrades
 // to a one-time notice; other errors surface but keep the previous snapshot.
 async function mcpRefresh() {
   if (!mcpAvailable) return null;
+  const seq = ++mcpRefreshSeq;
   try {
     const list = await mcpCall('mcp_list_servers');
-    mcpServers = Array.isArray(list) ? list : [];
+    // An older request answering last must not overwrite a fresher list
+    // (a toggle's reload racing the panel's refresh).
+    if (seq === mcpRefreshSeq) mcpServers = Array.isArray(list) ? list : [];
     return mcpServers;
   } catch (e) {
-    const msg = (e && (e.message || e.error)) || String(e);
-    if (/not a valid|unknown|no such|not found|missing/i.test(msg)) {
+    if (mcpIsUnknownCommand(mcpErrText(e))) {
       mcpAvailable = false; // old backend without MCP: degrade, stop asking
       mcpServers = [];
       return null;
@@ -71,11 +83,20 @@ function mcpServerById(id) {
 
 // ─── agent-loop bridge ──────────────────────────────────────────────────────
 
+/// The model-facing name of a tool: the backend's `exposed_name`, computed by
+/// the same function its enable gate uses (64-character cap plus a hash
+/// suffix - A4-11 / A8-20). A tool without one is not offered at all.
+function mcpExposedName(t) {
+  const n = t && t.exposed_name;
+  return typeof n === 'string' && n.startsWith('mcp__') && n.length <= 64 ? n : null;
+}
+
 // Model-facing tool specs for every enabled+pinned MCP tool, in a stable
 // order (registry order, tool order within a server). Same shape as
 // assistant.js's AI_TOOL_SPECS entries so the backend forwards them
-// unchanged. Description is truncated hard: descriptions are untrusted
-// server text and would otherwise ride into the model's tool list.
+// unchanged. The server's own description is NOT forwarded (it is untrusted
+// text): the model gets the server name, the tool name and its title, capped
+// at MCP_DESC_LIMIT, plus the input schema.
 function mcpGetTools() {
   const out = [];
   if (!mcpAvailable) return out;
@@ -88,12 +109,12 @@ function mcpGetTools() {
   for (const sv of mcpServers) {
     if (!sv || !Array.isArray(sv.tools)) continue;
     for (const t of sv.tools) {
-      if (!t || !t.enabled || !t.pinned) continue;
-      const name = 'mcp__' + mcpSanitizeName(sv.name) + '__' + mcpSanitizeName(t.name);
-      // Refuse built-in collisions and sanitized-name duplicates (two servers
-      // with names that sanitize identically): the first one wins, the model
-      // never sees an ambiguous tool name.
-      if (builtins.indexOf(name) !== -1 || seen[name]) continue;
+      if (!t || !t.enabled || !t.pinned || t.definition_changed) continue;
+      const name = mcpExposedName(t);
+      // Refuse built-in collisions and duplicates (two servers whose names
+      // sanitize identically): the first one wins, the model never sees an
+      // ambiguous tool name.
+      if (!name || builtins.indexOf(name) !== -1 || seen[name]) continue;
       seen[name] = true;
       const rawDesc = t.display_name && t.display_name !== t.name
         ? t.display_name + ' (MCP server "' + sv.name + '", tool "' + t.name + '")'
@@ -111,16 +132,16 @@ function mcpIsMcpTool(name) {
   return typeof name === 'string' && name.startsWith('mcp__');
 }
 
-// Reverse the sanitized model-facing name back to {serverId, toolName}. Every
-// registered tool's sanitized name is computed and compared in full - a name
-// the model merely MADE UP starting with "mcp__" maps to nothing and is
-// rejected, so it cannot select a server or tool it was never shown.
+// Reverse the model-facing name back to {serverId, toolName}. It is compared
+// in full against every offered tool's exposed_name - a name the model merely
+// MADE UP starting with "mcp__" maps to nothing and is rejected, so it cannot
+// select a server or tool it was never shown.
 function mcpResolveTool(name) {
   for (const sv of mcpServers) {
     if (!sv || !Array.isArray(sv.tools)) continue;
     for (const t of sv.tools) {
-      if (!t || !t.enabled || !t.pinned) continue;
-      if (name === 'mcp__' + mcpSanitizeName(sv.name) + '__' + mcpSanitizeName(t.name)) {
+      if (!t || !t.enabled || !t.pinned || t.definition_changed) continue;
+      if (name === mcpExposedName(t)) {
         return { serverId: sv.id, serverName: sv.name, toolName: t.name,
                  autoApprove: !!t.auto_approve, annotations: t.annotations || null };
       }
@@ -135,9 +156,12 @@ function mcpToolInfo(name) {
   return mcpResolveTool(name);
 }
 
-// Invoke an MCP tool on the backend. approved: true means the user approved
-// the card (or the level is yolo / the tool is auto_approve) - the backend
-// still re-checks the level server-side and owns the audit log.
+// Invoke an MCP tool on the backend. approved: true ONLY when the user
+// clicked Approve on this call's card (R6) - Auto-approve and YOLO pass
+// false, and the backend's gate decides (it names the source in the audit
+// row: approved / auto / yolo). Returns {content, isError, warning}; all
+// three are server-supplied text for the caller to render with textContent
+// and to wrap as untrusted before the model sees them.
 async function mcpCallTool(tabId, name, args, approved) {
   const r = mcpResolveTool(name);
   if (!r) throw new Error('unknown MCP tool: ' + name);
@@ -148,8 +172,11 @@ async function mcpCallTool(tabId, name, args, approved) {
     argumentsJson: JSON.stringify(args == null ? {} : args),
     approved: approved === true,
   });
-  if (res && res.is_error) throw new Error(String(res.content == null ? 'MCP tool error' : res.content));
-  return res ? String(res.content == null ? '' : res.content) : '';
+  return {
+    content: res && res.content != null ? String(res.content) : '',
+    isError: !!(res && res.is_error),
+    warning: res && res.warning ? String(res.warning) : null,
+  };
 }
 
 // Validate that a tool schema coming from the backend is usable JSON and not
@@ -190,15 +217,73 @@ function mcpValidateToolSchema(t, serverName, toolName) {
 function mcpListHost() { return document.getElementById('mcpServerList'); }
 function mcpFormHost() { return document.getElementById('mcpFormHost'); }
 
+const MCP_STATUS_TEXT = { connected: 'Connected', error: 'Error', unknown: 'Not connected' };
+
+// The dot is colour; the text next to it says the same in words (A4-24).
 function mcpStatusDot(status) {
   const dot = document.createElement('span');
   dot.className = 'server-dot mcp-dot ' + (status === 'connected' ? 'live' : status === 'error' ? 'err' : '');
-  dot.title = status || 'unknown';
+  const label = MCP_STATUS_TEXT[status] || MCP_STATUS_TEXT.unknown;
+  dot.title = label;
+  dot.setAttribute('role', 'img');
+  dot.setAttribute('aria-label', 'Status: ' + label);
   return dot;
 }
 
-// One row per server: status dot, name, url, tool count, and the actions
-// (edit, test, remove). Every string from the server goes through textContent.
+// Servers with an operation in flight (Test, Remove): one at a time per
+// server, and the row's buttons stay disabled until it ends - a double click
+// used to start a second 60-second test or a second removal (A4-12).
+const mcpBusyServers = new Set();
+// The last Test failure per server id. mcp_list_servers reports a status
+// but not the error, so the message the Test returned is kept here and shown
+// beside the row until the next successful Test (A4-15).
+const mcpLastErrors = new Map();
+
+function mcpRowEl(id) {
+  const host = mcpListHost();
+  return host ? [...host.querySelectorAll('.mcp-server-row')].find((r) => r.dataset.id === String(id)) || null : null;
+}
+
+function mcpPaintRowBusy(id) {
+  const row = mcpRowEl(id);
+  if (!row) return;
+  const on = mcpBusyServers.has(id);
+  row.setAttribute('aria-busy', on ? 'true' : 'false');
+  // One reason among others (setDisabledFor): the end of a run does not
+  // re-enable a button the vault lock disabled meanwhile.
+  for (const b of row.querySelectorAll('.mcp-server-actions button')) setDisabledFor(b, 'busy', on);
+}
+
+/// Run `fn` as the one operation of server `id`; a second call while it runs
+/// is ignored.
+async function mcpRowAction(id, fn) {
+  if (mcpBusyServers.has(id)) return undefined;
+  mcpBusyServers.add(id);
+  mcpPaintRowBusy(id);
+  try {
+    return await fn();
+  } finally {
+    mcpBusyServers.delete(id);
+    mcpPaintRowBusy(id);
+  }
+}
+
+/// The MCP section's status strip: notices that must outlive a reload (a
+/// removal's teardown warning, a definition that changed under a click).
+function mcpSetStatus(text, kind) {
+  const strip = mcpF('mcpStatus');
+  if (!strip) return;
+  strip.className = 'status-strip' + (kind ? ' ' + kind : '');
+  strip.textContent = text;
+}
+
+function mcpEnabledCount(sv) {
+  return Array.isArray(sv.tools) ? sv.tools.filter((t) => t && t.enabled).length : 0;
+}
+
+// One row per server: status, name, url, enabled/total tools, protocol, the
+// last Test error, and the actions (edit, review tools, test, remove). Every
+// string from the server goes through textContent.
 function mcpServerRow(sv) {
   const row = document.createElement('div');
   row.className = 'mcp-server-row';
@@ -207,6 +292,10 @@ function mcpServerRow(sv) {
   const head = document.createElement('div');
   head.className = 'mcp-server-head';
   head.appendChild(mcpStatusDot(sv.status));
+  const status = document.createElement('span');
+  status.className = 'mcp-status-text';
+  status.textContent = MCP_STATUS_TEXT[sv.status] || MCP_STATUS_TEXT.unknown;
+  head.appendChild(status);
   const name = document.createElement('span');
   name.className = 'mcp-server-name';
   name.textContent = sv.name || '(unnamed)';
@@ -214,12 +303,37 @@ function mcpServerRow(sv) {
   const url = document.createElement('span');
   url.className = 'mcp-server-url mono';
   url.textContent = sv.url || '';
+  url.title = sv.url || '';
   head.appendChild(url);
+  if (sv.confirmed === false) {
+    // A restored entry is inert until the user re-saves it (SECURITY.md).
+    const badge = document.createElement('span');
+    badge.className = 'mcp-badge';
+    badge.textContent = 'Unconfirmed - review and re-save';
+    badge.title = 'Restored from a backup: open Edit, check the URL and auth, and save to use it.';
+    head.appendChild(badge);
+  }
+  const total = Array.isArray(sv.tools) ? sv.tools.length : 0;
   const count = document.createElement('span');
   count.className = 'mcp-server-count';
-  count.textContent = (sv.tool_count != null ? sv.tool_count : (sv.tools ? sv.tools.length : 0)) + ' tools';
+  count.textContent = mcpEnabledCount(sv) + '/' + total + ' tools enabled';
   head.appendChild(count);
   row.appendChild(head);
+
+  if (sv.protocol_version) {
+    const meta = document.createElement('div');
+    meta.className = 'mcp-server-meta';
+    meta.textContent = 'MCP protocol ' + sv.protocol_version;
+    row.appendChild(meta);
+  }
+
+  const lastError = mcpLastErrors.get(sv.id);
+  if (lastError) {
+    const err = document.createElement('div');
+    err.className = 'mcp-server-error';
+    err.textContent = 'Last test failed: ' + lastError;
+    row.appendChild(err);
+  }
 
   if (sv.loopback_insecure) {
     const warn = document.createElement('div');
@@ -240,23 +354,44 @@ function mcpServerRow(sv) {
     return b;
   };
   mkBtn('Edit', 'ghost-btn', () => mcpOpenForm(sv));
-  mkBtn('Test connection', 'ghost-btn', () => mcpTestConnection(sv.id));
-  mkBtn('Remove', 'danger-btn', async () => {
-    // The app's own dialog: the native confirm() is not usable here (see
-    // confirmModal in app.js), and Cancel / Escape must really mean no.
-    const ok = await confirmModal('Remove MCP server', 'Remove MCP server "' + (sv.name || '') + '"?', 'Remove');
-    if (!ok) return;
+  // The stored tools and their approvals, without reconnecting (A4-15).
+  mkBtn('Review tools', 'ghost-btn', () => mcpShowToolsFor(sv.id));
+  // Connecting unseals the credential and removing rewrites the vault: both
+  // wait for an unlocked vault (the backend refuses anyway).
+  lockGate(mkBtn('Test connection', 'ghost-btn', () => mcpTestConnection(sv.id)), 'settings');
+  lockGate(mkBtn('Remove', 'danger-btn', () => mcpRemoveServer(sv)), 'settings');
+  row.appendChild(actions);
+  if (mcpBusyServers.has(sv.id)) {
+    row.setAttribute('aria-busy', 'true');
+    for (const b of actions.querySelectorAll('button')) setDisabledFor(b, 'busy', true);
+  }
+  return row;
+}
+
+async function mcpRemoveServer(sv) {
+  if (mcpBusyServers.has(sv.id)) return;
+  // The app's own dialog: the native confirm() is not usable here (see
+  // confirmModal in app.js), and Cancel / Escape must really mean no.
+  const ok = await confirmModal('Remove MCP server', 'Remove MCP server "' + (sv.name || '') + '"?', 'Remove');
+  if (!ok) return;
+  await mcpRowAction(sv.id, async () => {
     try {
-      await mcpCall('mcp_remove_server', { id: sv.id });
+      const r = await mcpCall('mcp_remove_server', { id: sv.id });
+      mcpLastErrors.delete(sv.id);
+      if (mcpToolsShownFor === sv.id) mcpToolsShownFor = null;
       await mcpLoadSettings();
-      mcpRenderTools();
-      toast('MCP server removed.', 'ok');
+      // The entry is gone either way; a failed session teardown is said
+      // where it stays readable (A4-27), as text.
+      if (r && r.warning) {
+        mcpSetStatus('MCP server removed, but: ' + r.warning, 'err');
+        toast('MCP server removed - the session teardown failed.', 'warn');
+      } else {
+        toast('MCP server removed.', 'ok');
+      }
     } catch (e) {
-      toast((e && (e.message || e.error)) || String(e), 'err');
+      toast(mcpErrText(e), 'err');
     }
   });
-  row.appendChild(actions);
-  return row;
 }
 
 function mcpRenderList() {
@@ -300,14 +435,49 @@ function mcpSyncAuthRows() {
   mcpUrlCheck();
 }
 
+/// The MCP rule, mirrored from the backend's classify_url (assistant/mcp.rs):
+/// plain http only to localhost, ::1 or 127.x - NOT the provider base URL's
+/// broader local/private-network rule. 127.x must be a real IPv4 literal
+/// here; the backend's text-prefix test would also pass a DNS name like
+/// "127.example.com", which the form refuses (fail closed).
+function mcpIsLoopbackHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
 // Plain-http loopback gets a visible warning; plain-http anywhere else is
 // refused in the UI before it ever reaches the backend (which also enforces).
 function mcpIsLoopbackUrl(u) {
   let p;
   try { p = new URL(u); } catch (e) { return false; }
-  const h = (p.hostname || '').toLowerCase();
-  return p.protocol === 'http:'
-    && (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]' || h.endsWith('.localhost'));
+  return p.protocol === 'http:' && mcpIsLoopbackHost(p.hostname);
+}
+
+/// Why `raw` cannot be saved as an MCP server URL, or '' if it can.
+function mcpUrlProblem(raw) {
+  let p;
+  try { p = new URL(raw); } catch (e) { return 'Not a valid URL.'; }
+  if (p.protocol !== 'http:' && p.protocol !== 'https:') return 'Only http:// and https:// URLs are supported.';
+  if (p.username || p.password) return 'Server URL must not contain credentials.';
+  // The backend keeps scheme, host, port and path only; a query (often a
+  // token or a route) or a fragment would vanish silently (A4-23).
+  if (/[?#]/.test(raw)) {
+    return 'MCP server URLs cannot carry a ?query or #fragment - SSHSpan would connect without it. Remove everything from the ? or # on; put a token in the auth settings below.';
+  }
+  if (p.protocol === 'http:' && !mcpIsLoopbackHost(p.hostname)) {
+    return 'Plain http:// is only allowed for localhost, 127.x or ::1 - use https:// for anything else.';
+  }
+  return '';
+}
+
+/// The URL as the backend stores it (classify_url: scheme://host[:port]path,
+/// no trailing slash), to tell a real change from a re-typed equal URL.
+function mcpNormalizedUrl(raw) {
+  let p;
+  try { p = new URL(String(raw || '').trim()); } catch (e) { return String(raw || '').trim(); }
+  const host = p.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const path = p.pathname.replace(/\/+$/, '');
+  return p.protocol + '//' + host + (p.port ? ':' + p.port : '') + (path === '/' ? '' : path);
 }
 
 function mcpUrlCheck() {
@@ -315,30 +485,55 @@ function mcpUrlCheck() {
   const warn = mcpF('mcpUrlWarn');
   const err = mcpF('mcpUrlError');
   const save = mcpF('mcpSaveBtn');
-  if (warn) warn.hidden = true;
-  if (err) { err.hidden = true; err.textContent = ''; }
-  if (save) save.disabled = false;
-  if (!input || !input.value.trim()) return;
-  let p;
-  try { p = new URL(input.value.trim()); } catch (e) {
-    if (err) { err.textContent = 'Not a valid URL.'; err.hidden = false; }
-    if (save) save.disabled = true;
-    return;
-  }
-  if (p.protocol !== 'http:' && p.protocol !== 'https:') {
-    if (err) { err.textContent = 'Only http:// and https:// URLs are supported.'; err.hidden = false; }
-    if (save) save.disabled = true;
-    return;
-  }
-  if (p.protocol === 'http:' && !mcpIsLoopbackUrl(input.value.trim())) {
-    if (err) {
-      err.textContent = 'Plain http:// is only allowed on loopback addresses (localhost / 127.0.0.1 / ::1) - use https:// for anything else.';
-      err.hidden = false;
+  const raw = input ? input.value.trim() : '';
+  const problem = raw ? mcpUrlProblem(raw) : '';
+  if (warn) warn.hidden = !raw || !!problem || !mcpIsLoopbackUrl(raw);
+  if (err) { err.textContent = problem; err.hidden = !problem; }
+  if (input) input.setAttribute('aria-invalid', problem ? 'true' : 'false');
+  // One reason among others: a Save that is running stays disabled.
+  if (save) setDisabledFor(save, 'url', !!problem);
+  mcpRebindCheck();
+}
+
+/// Would this edit drop the server's stored credential? The backend binds a
+/// stored secret to the URL, auth type and header name it was entered for
+/// (A4-07): changing any of them discards it unless a new one is entered.
+function mcpRebound() {
+  const sv = mcpEditing;
+  if (!sv) return false;
+  const kind = mcpAuthKind();
+  const header = (mcpF('mcpHeaderName') || {}).value || '';
+  return mcpNormalizedUrl((mcpF('mcpUrl') || {}).value) !== String(sv.url || '')
+    || kind !== (sv.auth_type || 'none')
+    || (kind === 'custom_header' && header.trim() !== String(sv.auth_header_name || ''));
+}
+
+/// Say before Save what an edit does to the stored credential, and keep the
+/// "a secret is stored" hint true.
+function mcpRebindCheck() {
+  const sv = mcpEditing;
+  const warn = mcpF('mcpRebindWarn');
+  const hint = mcpF('mcpSecretHint');
+  const secretInput = mcpF('mcpAuthSecret');
+  const kind = mcpAuthKind();
+  const withSecret = kind === 'bearer' || kind === 'custom_header';
+  const rebound = mcpRebound();
+  const keepsSecret = !!(sv && sv.has_secret) && !rebound && withSecret;
+  if (hint) hint.textContent = keepsSecret ? 'A secret is stored - leave this blank to keep it.' : '';
+  if (secretInput) secretInput.placeholder = keepsSecret ? 'Leave blank to keep the stored secret' : 'Enter the token';
+  let text = '';
+  if (sv && rebound && withSecret) {
+    if (sv.has_secret) {
+      text = 'Changing the URL or the auth settings discards the stored secret - enter it again below before saving.';
+    } else if (sv.auth_env_var && mcpSecretKind() === 'env') {
+      text = 'Changing the URL or the auth settings sends the token from environment variable '
+        + sv.auth_env_var + ' to the new settings - change the variable name if that is not intended.';
     }
-    if (save) save.disabled = true;
-  } else if (p.protocol === 'http:') {
-    if (warn) warn.hidden = false;
+  } else if (mcpEnvVarStays()) {
+    text = 'No secret entered: the environment variable ' + sv.auth_env_var
+      + ' stays in effect. Type a secret to replace it with a stored one.';
   }
+  if (warn) { warn.textContent = text; warn.hidden = !text; }
 }
 
 function mcpOpenForm(sv) {
@@ -350,7 +545,10 @@ function mcpOpenForm(sv) {
   set('mcpUrl', sv ? sv.url : '');
   set('mcpAuthType', sv ? (sv.auth_type || 'none') : 'none');
   set('mcpSecretSource', 'stored');
-  set('mcpHeaderName', '');
+  // The stored settings round-trip (A4-07): the header NAME and the
+  // environment variable NAME come back from mcp_list_servers; a sealed
+  // secret never does (has_secret only says there is one).
+  set('mcpHeaderName', sv && sv.auth_header_name ? sv.auth_header_name : '');
   set('mcpAuthSecret', '');
   set('mcpAuthEnvVar', '');
   // Which secret source the server actually uses: a stored env-var name means
@@ -361,8 +559,6 @@ function mcpOpenForm(sv) {
   }
   const title = mcpF('mcpFormTitle');
   if (title) title.textContent = sv ? 'Edit MCP server' : 'Add MCP server';
-  const hint = mcpF('mcpSecretHint');
-  if (hint) hint.textContent = sv ? 'Stored secret: leave blank to keep the current one.' : '';
   host.hidden = false;
   mcpSyncAuthRows();
   const name = mcpF('mcpName');
@@ -373,56 +569,113 @@ function mcpCloseForm() {
   const host = mcpFormHost();
   if (host) host.hidden = true;
   mcpEditing = null;
+  mcpRebindCheck();
+}
+
+/// An env-var server switched to "Stored secret" with no secret typed and no
+/// URL/auth change: plan_auth keeps an absent source, so the variable stays
+/// in effect - the form says so rather than refusing (JU3 review item 7).
+function mcpEnvVarStays() {
+  const sv = mcpEditing;
+  const kind = mcpAuthKind();
+  const secretInput = mcpF('mcpAuthSecret');
+  return !!(sv && sv.auth_env_var && (kind === 'bearer' || kind === 'custom_header')
+    && mcpSecretKind() === 'stored' && !(secretInput && secretInput.value.trim()) && !mcpRebound());
+}
+
+/// What is wrong with the auth part of the form, or '' - the same rules the
+/// backend applies (plan_auth in src-tauri/src/assistant/mcp.rs; the
+/// messages are its own), said before anything is sent.
+function mcpAuthProblem(kind, source, header, secret, envVar) {
+  if (kind === 'custom_header' && !header) return 'Custom header auth requires a header name.';
+  if (kind !== 'bearer' && kind !== 'custom_header') return '';
+  if (source === 'env') return envVar ? '' : 'Enter the name of the environment variable that holds the token.';
+  if (secret) return '';
+  const sv = mcpEditing;
+  if (sv && sv.has_secret && !mcpRebound()) return '';
+  if (mcpEnvVarStays()) return '';
+  if (sv && mcpRebound() && (sv.has_secret || sv.auth_env_var)) {
+    return 'Changing the URL or the auth settings discards the stored secret or environment variable - enter it again for the new settings.';
+  }
+  return (kind === 'bearer' ? 'Bearer' : 'Custom header') + ' auth needs a secret or an environment variable name.';
 }
 
 async function mcpSaveServer() {
-  const val = (id) => { const e = mcpF(id); return e ? e.value.trim() : ''; };
-  const name = val('mcpName');
-  const url = val('mcpUrl');
-  if (!name) { toast('Give the server a name.', 'err'); return; }
-  if (!url) { toast('Give the server a URL.', 'err'); return; }
-  mcpUrlCheck();
-  const errEl = mcpF('mcpUrlError');
-  if (errEl && !errEl.hidden) { toast(errEl.textContent, 'err'); return; }
-  const kind = mcpAuthKind();
-  const secret = mcpSecretKind();
-  const payload = {
-    id: mcpEditing ? mcpEditing.id : null,
-    name,
-    url,
-    auth_type: kind,
-    auth_header_name: kind === 'custom_header' ? (val('mcpHeaderName') || null) : null,
-    auth_secret: (kind === 'bearer' || kind === 'custom_header') && secret === 'stored'
-      ? (val('mcpAuthSecret') || null) : null,
-    auth_env_var: (kind === 'bearer' || kind === 'custom_header') && secret === 'env'
-      ? (val('mcpAuthEnvVar') || null) : null,
-  };
-  try {
-    await mcpCall('mcp_save_server', payload);
-    mcpCloseForm();
-    await mcpLoadSettings();
-    mcpRenderTools();
-    toast('MCP server saved.', 'ok');
-  } catch (e) {
-    toast((e && (e.message || e.error)) || String(e), 'err');
-  }
+  const btn = mcpF('mcpSaveBtn');
+  // withBusy: a second click (or call) while the save runs is ignored - a
+  // double click used to create two servers (A4-12).
+  return withBusy(btn, 'Saving...', async () => {
+    const val = (id) => { const e = mcpF(id); return e ? e.value.trim() : ''; };
+    const name = val('mcpName');
+    const url = val('mcpUrl');
+    if (!name) { toast('Give the server a name.', 'err'); return; }
+    if (!url) { toast('Give the server a URL.', 'err'); return; }
+    mcpUrlCheck();
+    const urlProblem = mcpUrlProblem(url);
+    if (urlProblem) { toast(urlProblem, 'err'); return; }
+    const kind = mcpAuthKind();
+    const source = mcpSecretKind();
+    const withSecret = kind === 'bearer' || kind === 'custom_header';
+    const secretInput = mcpF('mcpAuthSecret');
+    const secretValue = secretInput ? secretInput.value.trim() : '';
+    const authProblem = mcpAuthProblem(kind, source, val('mcpHeaderName'), secretValue, val('mcpAuthEnvVar'));
+    if (authProblem) { toast(authProblem, 'err'); return; }
+    const keptEnv = mcpEnvVarStays() ? mcpEditing.auth_env_var : null;
+    // null keeps what is stored; a value replaces it (mcp_save_server).
+    const payload = {
+      id: mcpEditing ? mcpEditing.id : null,
+      name,
+      url,
+      auth_type: kind,
+      auth_header_name: kind === 'custom_header' ? val('mcpHeaderName') : null,
+      auth_secret: withSecret && source === 'stored' && secretValue ? secretValue : null,
+      auth_env_var: withSecret && source === 'env' ? val('mcpAuthEnvVar') : null,
+    };
+    try {
+      await mcpCall('mcp_save_server', payload);
+      if (secretInput) secretInput.value = '';
+      mcpCloseForm();
+      await mcpLoadSettings();
+      if (keptEnv) {
+        mcpSetStatus('Saved. No secret was entered, so the environment variable ' + keptEnv + ' stays in effect.');
+        toast('MCP server saved - the environment variable ' + keptEnv + ' stays in effect.', 'ok');
+      } else {
+        toast('MCP server saved.', 'ok');
+      }
+    } catch (e) {
+      toast(mcpErrText(e), 'err');
+    }
+  });
 }
 
 // ─── settings: test connection + tool approval list ─────────────────────────
 
 async function mcpTestConnection(id) {
-  try {
-    const r = await mcpCall('mcp_test_connection', { id });
-    const tools = (r && r.tools) || [];
-    toast('MCP: ' + tools.length + ' tool' + (tools.length === 1 ? '' : 's') + ' returned.', 'ok');
-    // Refresh first so the list reflects the pin state the test just set,
-    // then show this server's tools (enabled defaults to off - new and
-    // re-appeared definitions stay dark until the user approves them).
-    await mcpLoadSettings();
-    mcpShowToolsFor(id);
-  } catch (e) {
-    toast((e && (e.message || e.error)) || String(e), 'err');
-  }
+  return mcpRowAction(id, async () => {
+    try {
+      const r = await mcpCall('mcp_test_connection', { id });
+      mcpLastErrors.delete(id);
+      const tools = (r && r.tools) || [];
+      toast('MCP: ' + tools.length + ' tool' + (tools.length === 1 ? '' : 's') + ' returned.', 'ok');
+      // Refresh first so the list reflects the pin state the test just set,
+      // then show this server's tools (enabled defaults to off - new and
+      // re-appeared definitions stay dark until the user approves them).
+      await mcpLoadSettings();
+      mcpShowToolsFor(id);
+      const changed = Array.isArray(r && r.changed) ? r.changed : [];
+      if (changed.length) {
+        mcpSetStatus('These tools changed on the server and were turned off until you review them again: '
+          + changed.map(String).join(', ') + '.', 'err');
+      }
+    } catch (e) {
+      const msg = mcpErrText(e);
+      // Shown beside the row (the list has the status, not the reason) and
+      // the row is redrawn from the backend, which now says "error".
+      mcpLastErrors.set(id, msg);
+      toast(msg, 'err');
+      try { await mcpLoadSettings(); } catch (e2) { mcpRenderList(); }
+    }
+  });
 }
 
 // Human labels for the MCP annotation hints. The values come from the server,
@@ -437,20 +690,62 @@ function mcpAnnotationLabels(ann) {
   return out;
 }
 
+// Tools with an approval request in flight ("<server id>\n<tool>").
+const mcpToolBusy = new Set();
+
+/// The backend's two refusals of an approval that does not match the stored
+/// definition (mcp_set_tool_state compare-and-swap): a missing expected_hash
+/// or one that is not the current definition any more - DEFINITION_MOVED and
+/// DEFINITION_NOT_NAMED in src-tauri/src/assistant/mcp.rs (set_tool_state).
+function mcpIsDefinitionRefusal(msg) {
+  return /definition changed - review it and approve again|does not say which tool definition you reviewed/i.test(String(msg));
+}
+
+/// Change one tool's approval. Every enable - the Enable toggle and both
+/// Auto-approve directions - names the definition this row SHOWS
+/// (`expected_hash`), so the backend refuses it if the server changed the
+/// tool meanwhile; the refusal reloads the list and shows the new definition
+/// for a fresh review instead of retrying (no silent re-approval). After any
+/// answer the list is reloaded, so pins and Auto-approve stay in step with
+/// what the backend enforces (A4-08).
+async function mcpSetToolState(serverId, t, enabled, autoApprove) {
+  const key = serverId + '\n' + t.name;
+  if (mcpToolBusy.has(key)) return;
+  mcpToolBusy.add(key);
+  const args = { id: serverId, tool: t.name, enabled, auto_approve: enabled && autoApprove };
+  if (enabled) args.expected_hash = t.definition_hash == null ? null : String(t.definition_hash);
+  let refusal = null;
+  try {
+    await mcpCall('mcp_set_tool_state', args);
+  } catch (e) {
+    refusal = mcpErrText(e);
+  } finally {
+    mcpToolBusy.delete(key); // before the redraw, or its toggles stay disabled
+  }
+  await mcpLoadSettings();
+  if (refusal === null) return;
+  if (mcpIsDefinitionRefusal(refusal)) {
+    mcpSetStatus('Tool "' + t.name + '" was not approved: ' + refusal
+      + ' Its current definition is shown below - review it, then enable it again.', 'err');
+  } else {
+    toast(refusal, 'err');
+  }
+}
+
 // One tool row in the approval list: name (untrusted), annotations as plain
-// labels, the (untrusted) description, and Enable / Auto-approve toggles.
-// Toggling Enable calls mcp_set_tool_state immediately; Auto-approve only
-// persists when the tool is enabled.
+// labels, the (untrusted) description and input schema - the definition the
+// user approves - and Enable / Auto-approve toggles. Toggling calls
+// mcp_set_tool_state immediately; Auto-approve only exists for an enabled tool.
 function mcpToolRow(serverId, t) {
+  const changed = !!t.definition_changed;
   const row = document.createElement('div');
-  row.className = 'mcp-tool-row' + (t.enabled && !t.pinned ? ' changed' : '');
-  const needsReapprove = t.enabled && !t.pinned;
+  row.className = 'mcp-tool-row' + (changed ? ' changed' : '');
 
   const head = document.createElement('div');
   head.className = 'mcp-tool-head';
   const name = document.createElement('code');
   name.className = 'mcp-tool-name';
-  name.textContent = t.display_name || t.name;
+  name.textContent = t.display_name && t.display_name !== t.name ? t.display_name + ' (' + t.name + ')' : t.name;
   head.appendChild(name);
   for (const label of mcpAnnotationLabels(t.annotations)) {
     const chip = document.createElement('span');
@@ -467,10 +762,24 @@ function mcpToolRow(serverId, t) {
     row.appendChild(d);
   }
 
-  if (needsReapprove) {
+  const schema = document.createElement('pre');
+  schema.className = 'mcp-tool-schema';
+  let schemaText = t.inputSchema;
+  if (typeof schemaText === 'string') {
+    try { schemaText = JSON.stringify(JSON.parse(schemaText), null, 2); } catch (e) { /* show as sent */ }
+  } else {
+    try { schemaText = JSON.stringify(schemaText == null ? {} : schemaText, null, 2); } catch (e) { schemaText = String(schemaText); }
+  }
+  schema.textContent = 'Input schema: ' + schemaText;
+  row.appendChild(schema);
+
+  if (changed) {
+    // The server changed this tool after it was approved: the backend turned
+    // it off and dropped its Auto-approve (R6). The text above is the NEW
+    // definition; enabling approves exactly that one.
     const w = document.createElement('div');
     w.className = 'mcp-tool-changed';
-    w.textContent = 'Definition changed - re-approve (toggle Enable off and on) to use this tool again.';
+    w.textContent = 'Definition changed - re-approve: review the new definition above, then turn Enable on to approve it.';
     row.appendChild(w);
   }
 
@@ -497,30 +806,30 @@ function mcpToolRow(serverId, t) {
     return input;
   };
 
-  const setToolState = async (enabled, autoApprove) => {
-    try {
-      await mcpCall('mcp_set_tool_state', { id: serverId, tool: t.name, enabled, auto_approve: autoApprove });
-      t.enabled = enabled;
-      t.auto_approve = enabled ? autoApprove : false;
-    } catch (e) {
-      toast((e && (e.message || e.error)) || String(e), 'err');
-      await mcpLoadSettings();
-      mcpRenderTools();
-    }
-  };
-
+  const busy = mcpToolBusy.has(serverId + '\n' + t.name);
+  // Enabling is a fresh approval of the definition shown: never with an
+  // Auto-approve granted earlier (A4-05) - that is a second, explicit click.
+  // The row is redrawn from the reloaded list when the request ends; until
+  // then its toggles take no second click.
+  const lock = () => { setDisabledFor(enableInput, 'busy', true); setDisabledFor(autoInput, 'busy', true); };
   const enableInput = mkToggle(
-    'mcp_en_' + serverId + '_' + t.name, 'Enable', t.enabled && !needsReapprove,
-    (on) => setToolState(on, on ? t.auto_approve : false));
+    'mcp_en_' + serverId + '_' + t.name, 'Enable', t.enabled,
+    (on) => { lock(); mcpSetToolState(serverId, t, on, false); });
 
   const autoInput = mkToggle(
-    'mcp_aa_' + serverId + '_' + t.name, 'Auto-approve', t.auto_approve && t.enabled && !needsReapprove,
+    'mcp_aa_' + serverId + '_' + t.name, 'Auto-approve', t.enabled && t.auto_approve,
     (on) => {
       if (!enableInput.checked) { toast('Enable the tool first.', 'warn'); autoInput.checked = false; return; }
-      setToolState(true, on);
+      lock();
+      mcpSetToolState(serverId, t, true, on);
     });
-  autoInput.disabled = !t.enabled || needsReapprove;
-  if (needsReapprove) enableInput.title = 'Definition changed - turn off and on again to re-approve';
+  autoInput.title = t.enabled ? 'Run this tool at Execute without a card (never at Read or Draft)' : 'Enable the tool first';
+  if (changed) enableInput.title = 'Approve the changed definition shown above';
+  setDisabledFor(autoInput, 'off', !t.enabled);
+  if (busy) { setDisabledFor(enableInput, 'busy', true); setDisabledFor(autoInput, 'busy', true); }
+  // Approvals are vault writes: not while it is locked (fail closed).
+  lockGate(enableInput, 'settings');
+  lockGate(autoInput, 'settings');
 
   row.appendChild(toggles);
   return row;
@@ -542,7 +851,8 @@ function mcpRenderToolsFor(id) {
   }
   const title = document.createElement('div');
   title.className = 'mcp-tools-title';
-  title.textContent = 'Tools from "' + (sv.name || '') + '" - review each before enabling:';
+  title.textContent = 'Tools from "' + (sv.name || '') + '" (' + mcpEnabledCount(sv) + '/' + sv.tools.length
+    + ' enabled) - review each before enabling:';
   host.appendChild(title);
   for (const t of sv.tools) host.appendChild(mcpToolRow(sv.id, t));
 }
@@ -554,27 +864,26 @@ function mcpRenderTools() { if (mcpToolsShownFor != null) mcpRenderToolsFor(mcpT
 
 let mcpToolsShownFor = null;
 
+const MCP_STATUS_DEFAULT = 'MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.';
+
+// Reload the registry and redraw the list AND the shown tools from it, so no
+// row keeps acting on an older snapshot (A4-15).
 async function mcpLoadSettings() {
+  let failed = null;
   try {
     await mcpRefresh();
   } catch (e) {
-    toast((e && (e.message || e.error)) || String(e), 'err');
+    failed = mcpErrText(e);
+    toast(failed, 'err');
   }
   if (!mcpAvailable) {
-    const strip = mcpF('mcpStatus');
-    if (strip) {
-      strip.className = 'status-strip';
-      strip.textContent = 'This build of the backend has no MCP support - update SSHSpan to configure MCP servers.';
-    }
+    mcpSetStatus('This build of the backend has no MCP support - update SSHSpan to configure MCP servers.');
     mcpRenderList();
     return;
   }
-  const strip = mcpF('mcpStatus');
-  if (strip) {
-    strip.className = 'status-strip';
-    strip.textContent = 'MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.';
-  }
+  mcpSetStatus(failed ? 'Could not load the MCP servers: ' + failed : MCP_STATUS_DEFAULT, failed ? 'err' : '');
   mcpRenderList();
+  mcpRenderTools();
 }
 
 function mcpWire() {
@@ -585,10 +894,18 @@ function mcpWire() {
   on('mcpUrl', 'input', mcpUrlCheck);
   on('mcpAuthType', 'change', mcpSyncAuthRows);
   on('mcpSecretSource', 'change', mcpSyncAuthRows);
-  // Load the server list when the assistant settings section is opened -
-  // a second listener on the same nav buttons aiLoadConfig already uses.
-  for (const b of document.querySelectorAll('.settings-nav-item[data-section="assistant"]')) {
-    b.addEventListener('click', () => mcpLoadSettings());
+  on('mcpHeaderName', 'input', mcpRebindCheck);
+  on('mcpAuthSecret', 'input', mcpRebindCheck);
+  // Adding and saving servers write the vault: not while it is locked.
+  lockGate(mcpF('mcpAddBtn'), 'settings');
+  lockGate(mcpF('mcpSaveBtn'), 'settings');
+  // Load the server list whenever the assistant settings section becomes
+  // visible - from its nav item, the palette or assistantOpenSettings alike
+  // (showSettingsSection only toggles `hidden`, A4-25).
+  const section = document.querySelector('.settings-section[data-section="assistant"]');
+  if (section) {
+    new MutationObserver(() => { if (!section.hidden) mcpLoadSettings(); })
+      .observe(section, { attributes: true, attributeFilter: ['hidden'] });
   }
 }
 
@@ -597,6 +914,7 @@ window.mcpIsMcpTool = mcpIsMcpTool;
 window.mcpCallTool = mcpCallTool;
 window.mcpToolInfo = mcpToolInfo;
 window.mcpRefresh = mcpRefresh;
+window.mcpLoadSettings = mcpLoadSettings;
 
 window.__SSHPAN_MCP_JS__ = true;
 

@@ -219,7 +219,7 @@
                   <button type="button" class="seg-btn" data-mode="split" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span>Split</button>
                 </div>
                 <button id="termTestBtn" class="ghost-btn" hidden><span data-ico="plug-zap"></span>Test</button>
-                <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)"><span data-ico="message-square"></span>Assistant</button>
+                <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)" aria-pressed="false" aria-controls="assistantPanel"><span data-ico="message-square"></span>Assistant</button>
                 <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span>Reconnect</button>
                 <button id="termDisconnectBtn" class="danger-btn" hidden><span data-ico="x"></span>Disconnect</button>
               </div>
@@ -233,29 +233,41 @@
               <div class="terminal-body" id="terminalBody"></div>
               <div class="surface-splitter" id="surfaceSplitter" hidden></div>
               <div class="sftp-body" id="sftpBody"></div>
-              <aside class="assistant-panel" id="assistantPanel" hidden>
+              <aside class="assistant-panel" id="assistantPanel" aria-label="AI assistant" hidden>
                 <header class="ai-head">
                   <span class="ai-title"><span data-ico="message-square"></span>AI assistant</span>
                   <span class="ai-yolo-badge" id="assistantYoloBadge" hidden>YOLO</span>
-                  <button class="icon-btn ai-close" id="assistantCloseBtn" title="Close assistant" data-ico="x"></button>
+                  <!-- Clears this tab's conversation and the context resent to
+                       the model; the access level stays (A4-16). -->
+                  <button type="button" class="ghost-btn ai-new-chat" id="assistantNewChatBtn" title="Start a new conversation in this tab (the access level stays)">New chat</button>
+                  <button type="button" class="icon-btn ai-close" id="assistantCloseBtn" title="Close assistant" aria-label="Close assistant" data-ico="x"></button>
                 </header>
                 <div class="ai-levels">
-                  <div class="seg ai-level-seg" id="assistantLevelSeg" role="tablist" aria-label="Assistant access level">
-                    <button type="button" class="seg-btn level-read active" data-level="read" role="tab" title="Advise only">Read</button>
-                    <button type="button" class="seg-btn level-draft" data-level="draft" role="tab" title="Type, never submit">Draft</button>
-                    <button type="button" class="seg-btn level-execute" data-level="execute" role="tab" title="Run with approval">Execute</button>
-                    <button type="button" class="seg-btn level-yolo" data-level="yolo" role="tab" title="Full autonomy - dangerous">YOLO</button>
+                  <!-- Radio semantics (A1-36): one tab stop, arrows move the
+                       focus, Enter/Space choose - manual, since YOLO opens a
+                       confirmation dialog. -->
+                  <div class="seg ai-level-seg" id="assistantLevelSeg" role="radiogroup" aria-label="Assistant access level" aria-describedby="assistantLevelCaption">
+                    <button type="button" class="seg-btn level-read active" data-level="read" role="radio" aria-checked="true" tabindex="0" title="Advise only">Read</button>
+                    <button type="button" class="seg-btn level-draft" data-level="draft" role="radio" aria-checked="false" tabindex="-1" title="Type, never submit">Draft</button>
+                    <button type="button" class="seg-btn level-execute" data-level="execute" role="radio" aria-checked="false" tabindex="-1" title="Run with approval">Execute</button>
+                    <button type="button" class="seg-btn level-yolo" data-level="yolo" role="radio" aria-checked="false" tabindex="-1" title="Full autonomy - dangerous">YOLO</button>
                   </div>
                   <div class="ai-level-caption level-read" id="assistantLevelCaption">Advise only - AI can read the terminal, never touch it.</div>
                 </div>
-                <div class="ai-messages" id="assistantMessages"></div>
-                <div class="ai-thinking" id="assistantThinking" hidden>
-                  <span class="ai-thinking-dot"></span><span>thinking...</span>
-                  <button class="ghost-btn" id="assistantStopBtn">Stop</button>
+                <!-- First open without a provider (A5-36). -->
+                <div class="ai-setup" id="assistantSetup" hidden>
+                  <p class="ai-setup-title">Set up the assistant</p>
+                  <p class="ai-setup-text">Choose a provider, a model and an API key in Settings &gt; AI assistant. Nothing is sent to a provider until then.</p>
+                  <button type="button" class="primary-btn" id="assistantSetupBtn">Open assistant settings</button>
+                </div>
+                <div class="ai-messages" id="assistantMessages" role="log" aria-live="polite" aria-label="Assistant conversation"></div>
+                <div class="ai-thinking" id="assistantThinking" role="status" hidden>
+                  <span class="ai-thinking-dot" aria-hidden="true"></span><span>thinking...</span>
+                  <button type="button" class="ghost-btn" id="assistantStopBtn">Stop</button>
                 </div>
                 <footer class="ai-foot">
-                  <textarea id="assistantInput" rows="2" placeholder="Ask about this session... (Enter sends, Shift+Enter for a newline)"></textarea>
-                  <button class="primary-btn ai-send" id="assistantSendBtn" title="Send"><span data-ico="send"></span></button>
+                  <textarea id="assistantInput" rows="2" aria-label="Message to the assistant" placeholder="Ask about this session... (Enter sends, Shift+Enter for a newline)"></textarea>
+                  <button type="button" class="primary-btn ai-send" id="assistantSendBtn" title="Send" aria-label="Send"><span data-ico="send"></span></button>
                 </footer>
               </aside>
             </div>
@@ -373,37 +385,43 @@
               <div class="settings-grid">
                 <label>Provider
                   <select id="aiProvider">
-                    <option value="openai" selected>[OI]-compatible (chat/completions)</option>
+                    <option value="openai" selected>OpenAI-compatible (chat/completions)</option>
                     <option value="anthropic">Anthropic-compatible (messages)</option>
                   </select>
                 </label>
-                <label>Base URL
+                <!-- The preset select has its own name: inside the Base URL
+                     label it became part of the field's name (A4-24). A
+                     preset sets the provider too (A4-14). -->
+                <div class="ai-field">
+                  <label for="aiBaseUrl">Base URL</label>
                   <div class="ai-urlrow">
-                    <input type="text" id="aiBaseUrl" placeholder="https://api.openai.com/v1" spellcheck="false" />
-                    <select id="aiBaseUrlPreset" title="Preset base URLs">
+                    <input type="text" id="aiBaseUrl" placeholder="https://api.openai.com/v1" spellcheck="false" autocomplete="off" />
+                    <select id="aiBaseUrlPreset" title="Fill in a known provider" aria-label="Preset: fill in a known provider and base URL">
                       <option value="" selected>Preset...</option>
-                      <option value="https://api.openai.com/v1">[OI]</option>
-                      <option value="https://openrouter.ai/api/v1">OpenRouter</option>
-                      <option value="https://api.groq.com/openai/v1">Groq</option>
-                      <option value="http://localhost:11434/v1">Ollama (local)</option>
-                      <option value="http://localhost:1234/v1">LM Studio (local)</option>
-                      <option value="https://api.anthropic.com">Anthropic</option>
+                      <option value="https://api.openai.com/v1" data-provider="openai">OpenAI</option>
+                      <option value="https://openrouter.ai/api/v1" data-provider="openai">OpenRouter</option>
+                      <option value="https://api.groq.com/openai/v1" data-provider="openai">Groq</option>
+                      <option value="http://localhost:11434/v1" data-provider="openai">Ollama (local)</option>
+                      <option value="http://localhost:1234/v1" data-provider="openai">LM Studio (local)</option>
+                      <option value="https://api.anthropic.com" data-provider="anthropic">Anthropic</option>
                     </select>
                   </div>
-                </label>
+                </div>
                 <label>Model
-                  <input type="text" id="aiModel" placeholder="gpt-4o-mini / " spellcheck="false" />
+                  <input type="text" id="aiModel" placeholder="e.g. gpt-4o-mini or claude-sonnet-4-5" spellcheck="false" autocomplete="off" />
                 </label>
                 <label>API key
-                  <input type="password" id="aiApiKey" placeholder="Leave blank to keep the stored key" autocomplete="off" />
+                  <input type="password" id="aiApiKey" placeholder="Leave blank to keep the stored key" autocomplete="off" aria-describedby="aiKeyHint" />
                   <span class="hint ai-key-hint" id="aiKeyHint"></span>
                 </label>
               </div>
               <div class="bw-actions">
-                <button id="aiSaveBtn" class="primary-btn">Save</button>
-                <button id="aiTestBtn" class="ghost-btn"><span data-ico="plug-zap"></span>Test connection</button>
+                <button type="button" id="aiSaveBtn" class="primary-btn">Save</button>
+                <!-- Tests what is on screen: it saves first (A4-14). -->
+                <button type="button" id="aiTestBtn" class="ghost-btn"><span data-ico="plug-zap"></span>Save &amp; test</button>
+                <button type="button" id="aiRemoveKeyBtn" class="ghost-btn" hidden><span data-ico="trash-2"></span>Remove stored key</button>
               </div>
-              <div class="status-strip" id="aiStatus">Works with [OI], OpenRouter, Groq, Anthropic, and local servers like Ollama / LM Studio.</div>
+              <div class="status-strip" id="aiStatus" role="status">Works with OpenAI, OpenRouter, Groq, Anthropic, and local servers like Ollama / LM Studio.</div>
 
               <!-- MCP servers: the assistant's tool belt beyond this app. Each
                    server is added by you, every tool is off until you approve
@@ -435,12 +453,15 @@
                       <input type="text" id="mcpName" placeholder="github" spellcheck="false" />
                     </label>
                     <label>URL
-                      <input type="text" id="mcpUrl" placeholder="https://mcp.example.com/sse" spellcheck="false" />
+                      <input type="text" id="mcpUrl" placeholder="https://mcp.example.com/mcp" spellcheck="false" autocomplete="off" aria-describedby="mcpUrlError mcpUrlWarn" aria-invalid="false" />
                     </label>
                     <p class="mcp-url-warn" id="mcpUrlWarn" hidden>
                       Plain HTTP on a loopback address - traffic to this server is not encrypted or authenticated. Fine for a local proxy, not for anything remote.
                     </p>
-                    <p class="mcp-url-error" id="mcpUrlError" hidden></p>
+                    <p class="mcp-url-error" id="mcpUrlError" role="alert" hidden></p>
+                    <!-- Editing the URL or the auth settings drops a stored
+                         secret (origin binding); said before Save (A4-07). -->
+                    <p class="mcp-rebind-warn" id="mcpRebindWarn" hidden></p>
                     <label>Auth type
                       <select id="mcpAuthType">
                         <option value="none" selected>None</option>
@@ -458,7 +479,7 @@
                       <input type="text" id="mcpHeaderName" placeholder="X-Api-Key" spellcheck="false" />
                     </label>
                     <label id="mcpSecretRow" hidden>Secret
-                      <input type="password" id="mcpAuthSecret" placeholder="Leave blank to keep the stored one" autocomplete="off" />
+                      <input type="password" id="mcpAuthSecret" placeholder="Enter the token" autocomplete="off" aria-describedby="mcpSecretHint" />
                       <span class="hint" id="mcpSecretHint"></span>
                     </label>
                     <label id="mcpEnvRow" hidden>Environment variable name
@@ -471,13 +492,13 @@
                     </label>
                   </div>
                   <div class="bw-actions">
-                    <button id="mcpSaveBtn" class="primary-btn">Save server</button>
-                    <button id="mcpCancelBtn" class="ghost-btn">Cancel</button>
+                    <button type="button" id="mcpSaveBtn" class="primary-btn">Save server</button>
+                    <button type="button" id="mcpCancelBtn" class="ghost-btn">Cancel</button>
                   </div>
                 </div>
 
                 <div id="mcpToolsHost" class="mcp-tools"></div>
-                <div class="status-strip" id="mcpStatus">MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.</div>
+                <div class="status-strip" id="mcpStatus" role="status">MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.</div>
               </div>
             </section>
 
@@ -525,7 +546,7 @@
 
   <!-- Modal: enable YOLO access level (deliberately hard to miss) -->
   <div class="modal-backdrop" id="yoloModal" hidden>
-    <div class="modal modal-sm assistant-yolo-modal" role="alertdialog" aria-modal="true" aria-labelledby="yoloTitle">
+    <div class="modal modal-sm assistant-yolo-modal" role="alertdialog" aria-modal="true" aria-labelledby="yoloTitle" aria-describedby="yoloTarget yoloDesc">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico yolo-ico" data-ico="triangle-alert"></span>
@@ -533,7 +554,9 @@
         </div>
       </header>
       <div class="modal-body">
-        <p>
+        <!-- Which session this arms - filled in when the dialog opens (A4-21). -->
+        <p class="yolo-target" id="yoloTarget"></p>
+        <p id="yoloDesc">
           At YOLO the assistant runs commands <strong>without asking you each
           time</strong>. It has full autonomous control of the live SSH session: it
           can read and change anything the account you connected with can reach,
