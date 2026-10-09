@@ -89,7 +89,9 @@ function parseJsCallSites() {
     const file = path.join(ROOT, rel);
     if (!fs.existsSync(file)) continue;
     const src = fs.readFileSync(file, 'utf8');
-    const re = /(?:\bcall|mcpCall|\.invoke|\binvoke)\(\s*(['"`])([a-z_0-9]+)\1\s*(,|\))/g;
+    // sftpCall is sftp.js's own wrapper around invoke(); without it here most
+    // of that file's IPC calls were never checked at all.
+    const re = /(?:\bcall|sftpCall|mcpCall|\.invoke|\binvoke)\(\s*(['"`])([a-z_0-9]+)\1\s*(,|\))/g;
     let m;
     while ((m = re.exec(src))) {
       const line = src.slice(0, m.index).split('\n').length;

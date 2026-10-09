@@ -126,6 +126,9 @@ jobs:
           # Safety and lifecycle behaviour (confirmations, idle auto-lock,
           # vault dialogs, paste review), on a fake clock in the same browser.
           npm run test:safety
+          # The SFTP file browser: navigation, selection, the transfer queue,
+          # conflicts, chmod, shortcuts and drops, against a fake file system.
+          npm run test:sftp
 
   cargo-audit:
     name: Dependency advisories

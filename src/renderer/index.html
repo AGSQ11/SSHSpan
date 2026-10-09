@@ -883,7 +883,7 @@
         <p id="deleteMessage" class="hint"></p>
         <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;">
           <input type="checkbox" id="deleteSkipSession" />
-          <span>Don't prompt me for this session anymore.</span>
+          <span id="deleteSkipLabel">Don't ask again for remote deletes this session.</span>
         </label>
       </div>
       <footer class="modal-footer">
@@ -923,7 +923,9 @@
               <td><input type="checkbox" id="chmod-other-x" aria-label="Other execute" /></td></tr>
           </tbody>
         </table>
-        <label>Numeric value <input type="text" id="chmodOctal" maxlength="3" placeholder="644" /></label>
+        <label>Numeric value <input type="text" id="chmodOctal" maxlength="4" placeholder="644" /></label>
+        <p class="hint">A leading fourth digit is setuid/setgid/sticky (2775 = setgid); typing three digits clears them.</p>
+        <p class="hint" id="chmodHint" role="alert" hidden></p>
         <label class="toggle-chip"><input type="checkbox" id="chmodRecurse" /><span class="toggle-box"></span>Recurse into subdirectories</label>
         <label>Apply to
           <select id="chmodApplyTo">

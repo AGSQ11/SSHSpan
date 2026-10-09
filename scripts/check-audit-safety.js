@@ -32,41 +32,32 @@
  *
  *     npm install --no-save playwright@1.56.1 && npx playwright install chromium
  *
- * Without it this skips (exit 0) so a checkout that has not set it up still
- * runs every other check. Optional: `--only <text>` runs the scenarios whose
+ * Without it the browser checks are skipped, but the static checks below need
+ * no browser and always run first: the exit code is then 1 if any static check
+ * failed, else 0. Optional: `--only <text>` runs the scenarios whose
  * title contains <text>; SSHSPAN_RENDERER_DIR points the run at another copy of
  * the renderer (for example a pristine `git archive` of an older commit, to
  * watch these checks fail where they should).
  */
 'use strict';
 
-const http = require('http');
 const fs = require('fs');
 const path = require('path');
-
-const failures = [];
-function check(name, got, want) {
-  const ok = JSON.stringify(got) === JSON.stringify(want);
-  console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${name}`);
-  if (!ok) {
-    console.log(`          got:  ${JSON.stringify(got)}`);
-    console.log(`          want: ${JSON.stringify(want)}`);
-    failures.push(name);
-  }
-}
-function yes(name, cond, detail) {
-  check(name, !!cond, true);
-  if (!cond && detail !== undefined) console.log(`          note: ${detail}`);
-}
+// The reporter, the Playwright lookup, the static server, the in-page stub
+// backend and the app helpers live in scripts/lib/renderer-harness.js, shared
+// with the other renderer suites.
+const {
+  failures, check, yes, loadChromium, rendererDir, serve, part,
+  PASSWORD, KEY, SERVER, withApp, settled, waitVisible, focusIs, answerConfirm,
+  openLiveTab, bytesOf, sends,
+} = require('./lib/renderer-harness');
 
 // ─── static guard: no native confirm() left in the renderer ────────────────
 //
 // Runs first and needs no browser, so it still runs where Playwright is not
 // installed (like the MCP contract block in check-renderer-ui.js).
 
-const RENDERER = process.env.SSHSPAN_RENDERER_DIR
-  ? path.resolve(process.env.SSHSPAN_RENDERER_DIR)
-  : path.join(__dirname, '..', 'src', 'renderer');
+const RENDERER = rendererDir();
 const RENDERER_JS = ['app.js', 'terminal.js', 'sftp.js', 'mcp.js', 'assistant.js'];
 
 /**
@@ -179,271 +170,12 @@ runStaticChecks();
 
 // ─── playwright ─────────────────────────────────────────────────────────────
 
-let chromium;
-try {
-  ({ chromium } = require('playwright'));
-} catch {
-  try {
-    ({ chromium } = require(path.join(
-      require('child_process').execSync('npm root -g', { encoding: 'utf8' }).trim(), 'playwright')));
-  } catch {
-    console.log('playwright not installed - skipping the browser checks.');
-    if (failures.length) console.error(`\n${failures.length} audit safety check(s) failed.`);
-    process.exit(failures.length ? 1 : 0);
-  }
+const chromium = loadChromium();
+if (!chromium) {
+  console.log('playwright not installed - skipping the browser checks.');
+  if (failures.length) console.error(`\n${failures.length} audit safety check(s) failed.`);
+  process.exit(failures.length ? 1 : 0);
 }
-
-const TYPES = {
-  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2',
-};
-
-const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
-
-/// A block that may throw (a selector that never appears, a timeout) must fail
-/// its own checks, not take the rest of the scenario down with it.
-async function part(title, fn) {
-  try {
-    await fn();
-  } catch (e) {
-    console.log(`  FAIL  ${title} - aborted: ${firstLine(e)}`);
-    failures.push(`${title} (aborted)`);
-  }
-}
-
-/// Serve src/renderer over http: file:// would block the module loads.
-function serve() {
-  const server = http.createServer((req, res) => {
-    const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\/+/, '') || 'index.html';
-    const file = path.join(RENDERER, rel);
-    if (!file.startsWith(RENDERER) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-      res.writeHead(404); res.end('not found'); return;
-    }
-    res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
-    res.end(fs.readFileSync(file));
-  });
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
-}
-
-// ─── the stub backend (runs inside the page) ────────────────────────────────
-
-/// Installed before any page script. It answers the commands the renderer
-/// sends, records every call in window.__calls, and exposes just enough control
-/// for a test: window.__backend (vault/session state), window.__replies
-/// (per-command override: a value or a function(args)), window.__gates (hold a
-/// command until released), window.__emit (fire a Tauri event).
-function stubInit(cfg) {
-  const calls = [];
-  const listeners = {};
-  const backend = {
-    hasVault: cfg.hasVault, unlocked: cfg.unlocked,
-    settings: Object.assign({}, cfg.settings),
-    sessions: [], channels: [],
-  };
-  const clone = (v) => {
-    try { return JSON.parse(JSON.stringify(v === undefined ? null : v)); } catch (e) { return String(v); }
-  };
-  window.__calls = calls;
-  window.__backend = backend;
-  window.__gates = {};
-  window.__replies = Object.assign({}, cfg.replies);
-  window.__nativeDialogCalls = 0;
-
-  // What tauri-plugin-dialog installs, under this app's ACL (no dialog:*
-  // permission): an async function, so callers get a Promise - always truthy -
-  // that then rejects because the command is not allowed.
-  window.confirm = () => {
-    window.__nativeDialogCalls += 1;
-    return Promise.reject(new Error('plugin:dialog|confirm not allowed by ACL'));
-  };
-  window.alert = () => {
-    window.__nativeDialogCalls += 1;
-    return Promise.reject(new Error('plugin:dialog|message not allowed by ACL'));
-  };
-
-  const H = {
-    vault_status: () => ({ hasVault: backend.hasVault, unlocked: backend.unlocked }),
-    vault_lock: () => { backend.unlocked = false; return { ok: true }; },
-    vault_unlock: (a) => {
-      if (a.password !== cfg.password) throw 'Incorrect master password.';
-      backend.unlocked = true; return { ok: true };
-    },
-    vault_create: () => { backend.hasVault = true; backend.unlocked = true; return { ok: true }; },
-    vault_change_password: () => ({ ok: true }),
-    settings_get: () => Object.assign({}, backend.settings),
-    settings_set: (a) => { backend.settings[a.key] = a.value; return { ok: true }; },
-    key_list: () => ({ keys: cfg.keys }),
-    key_get: (a) => cfg.keys.find((k) => k.id === a.id) || cfg.keys[0],
-    category_list: () => ({ categories: cfg.categories, allKeyCategories: {}, orphans: false, hostOrphans: false }),
-    server_list: () => ({ servers: cfg.servers }),
-    system_paths: () => ({ database: '/data/sshspan.db', sshConfig: '/cfg/ssh_config', deployDir: '/home/u/.ssh' }),
-    key_deploy: () => ({ keys: [{ name: 'alpha', file: '/home/u/.ssh/sshspan_alpha' }] }),
-    update_check: () => ({ available: false, current: '1.9.1' }),
-    known_hosts_list: () => ({ hosts: [] }),
-    audit_list: () => ({ rows: [], total: 0 }),
-    bitwarden_get_config: () => ({}),
-    mcp_list_servers: () => [],
-    terminal_connect: (a) => {
-      const id = 'sess-' + (backend.sessions.length + 1);
-      backend.sessions.push(id);
-      backend.channels.push(a.onData);
-      return { ok: true, sessionId: id };
-    },
-    terminal_list: () => ({ active: backend.sessions.map((sessionId) => ({ sessionId })) }),
-    terminal_disconnect: (a) => { backend.sessions = backend.sessions.filter((s) => s !== a.sessionId); return {}; },
-    sftp_list_dir: () => ({ entries: [], path: '/' }),
-  };
-
-  async function invoke(cmd, args) {
-    calls.push({ cmd, args: clone(args) });
-    const gate = window.__gates[cmd];
-    if (gate) await gate.promise;
-    const r = window.__replies[cmd];
-    if (typeof r === 'function') return r(args || {});
-    if (r !== undefined) return r;
-    const h = H[cmd];
-    return h ? h(args || {}) : {};
-  }
-
-  window.__TAURI__ = {
-    core: { invoke, Channel: class { constructor() { this.onmessage = null; } } },
-    event: {
-      listen: async (name, cb) => {
-        (listeners[name] = listeners[name] || []).push(cb);
-        return () => { listeners[name] = (listeners[name] || []).filter((f) => f !== cb); };
-      },
-    },
-  };
-  window.__emit = (name, payload) => { for (const cb of (listeners[name] || [])) cb({ payload }); };
-
-  // Count outstanding long timers (the auto-lock timer is minutes long; every
-  // other timer in the app is seconds), so "exactly one timer" is observable.
-  if (cfg.countTimers) {
-    const live = new Map();
-    const st = window.setTimeout;
-    const ct = window.clearTimeout;
-    window.setTimeout = function (fn, ms, ...rest) {
-      const id = st.call(this, function (...a) { live.delete(id); return fn.apply(this, a); }, ms, ...rest);
-      if (typeof ms === 'number' && ms >= 30000) live.set(id, ms);
-      return id;
-    };
-    window.clearTimeout = function (id) { live.delete(id); return ct.call(this, id); };
-    window.__longTimers = () => live.size;
-  }
-}
-
-// ─── fixtures and helpers ───────────────────────────────────────────────────
-
-const PASSWORD = 'correct horse battery';
-const T0 = Date.parse('2026-06-01T12:00:00Z');
-const KEY = (id, name) => ({
-  id, name, key_type: 'ed25519', has_private: true, public_key: 'ssh-ed25519 AAAA' + id,
-  fingerprint_sha256: 'SHA256:' + id, comment: name + '@host', created_at: '2026-09-01T10:00:00Z',
-  deployed: false, bitwarden_sync: false, category_ids: [],
-});
-const SERVER = (id, name, auth) => ({
-  id, name, host: '10.0.0.' + id.replace(/\D/g, ''), port: 22, username: 'root',
-  authMethod: auth || 'publickey', hasSavedPassword: false, categoryId: null, keyId: null, pemPath: null,
-});
-const CATEGORY = { id: 'c1', name: 'Prod', parent_id: null, scope: 'key', sort_index: 0, color: null };
-
-/// Open the real app against the stub. `clock: true` installs Playwright's fake
-/// clock and pauses it after boot, so time only moves through app.tick().
-async function openApp(browser, server, o = {}) {
-  const context = await browser.newContext({ viewport: { width: 1400, height: 900 } });
-  // The paste checks put real text on the clipboard and press a real key.
-  await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://127.0.0.1:${server.address().port}` });
-  const page = await context.newPage();
-  page.setDefaultTimeout(3500);
-  const errors = [];
-  page.on('pageerror', (e) => errors.push(String((e && e.message) || e)));
-  const warnings = [];
-  page.on('console', (m) => { if (m.type() === 'warning') warnings.push(m.text()); });
-  if (o.clock) await page.clock.install({ time: T0 });
-  await page.addInitScript(stubInit, {
-    hasVault: o.hasVault !== false,
-    unlocked: o.unlocked !== false,
-    settings: o.settings || {},
-    keys: o.keys || [KEY('k1', 'alpha'), KEY('k2', 'beta')],
-    servers: o.servers || [SERVER('s1', 'web-1')],
-    categories: o.categories || [CATEGORY],
-    replies: o.replies || {},
-    password: PASSWORD,
-    countTimers: !!o.countTimers,
-  });
-  await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
-  // main() reads settings only after every script has loaded and the first
-  // vault_status has been applied, so this means "booted".
-  await page.waitForFunction(() => window.__calls.some((c) => c.cmd === 'settings_get'));
-  await page.waitForTimeout(60);
-  if (o.clock) {
-    const now = await page.evaluate(() => Date.now());
-    await page.clock.pauseAt(now + 20);
-  }
-  const app = {
-    page, context, errors, warnings,
-    calls: (cmd) => page.evaluate((c) => window.__calls.filter((x) => !c || x.cmd === c), cmd || null),
-    count: async (cmd) => (await app.calls(cmd)).length,
-    // runFor fires every timer in between (polls, tickers); jump fires each due
-    // timer once, like a laptop lid closing for a while - cheap for long spans.
-    tick: (ms) => page.clock.runFor(ms),
-    jump: (ms) => page.clock.fastForward(ms),
-    open: (id) => page.evaluate((i) => { const n = document.getElementById(i); return !!n && !n.hidden; }, id),
-    focused: () => page.evaluate(() => (document.activeElement && (document.activeElement.id || document.activeElement.className)) || ''),
-    openIds: () => page.evaluate(() => [...document.querySelectorAll('.modal-backdrop')].filter((n) => !n.hidden).map((n) => n.id)),
-    close: () => context.close(),
-  };
-  return app;
-}
-
-/// Run `fn(app)` on a fresh app; always close it, and contain any throw.
-async function withApp(browser, server, opts, title, fn) {
-  await part(title, async () => {
-    const app = await openApp(browser, server, opts);
-    try { await fn(app); } finally { await app.close().catch(() => {}); }
-  });
-}
-
-/// Value of an in-page promise, or 'PENDING' if it does not settle: a dialog
-/// that never answers must fail a check, not hang the whole run.
-async function settled(page, fn, arg, ms) {
-  const p = page.evaluate(fn, arg).catch((e) => ({ error: firstLine(e) }));
-  return Promise.race([p, delay(ms || 1500).then(() => 'PENDING')]);
-}
-
-async function waitVisible(page, sel, ms) {
-  try { await page.waitForSelector(sel, { state: 'visible', timeout: ms || 1500 }); return true; } catch { return false; }
-}
-
-async function focusIs(page, id, ms) {
-  try {
-    await page.waitForFunction((i) => document.activeElement && document.activeElement.id === i, id, { timeout: ms || 1500, polling: 25 });
-    return true;
-  } catch { return false; }
-}
-
-/// Answer the app's confirmation dialog if it appears; says whether it did.
-async function answerConfirm(page, how) {
-  if (!(await waitVisible(page, '#confirmModal', 1200))) return false;
-  if (how === 'ok') await page.click('#confirmOkBtn');
-  else if (how === 'escape') await page.keyboard.press('Escape');
-  else await page.click('#confirmCancelBtn');
-  return true;
-}
-
-/// Start a live shell tab through the production entry point.
-async function openLiveTab(app, auth) {
-  const { page } = app;
-  const srv = Object.assign(SERVER('s1', 'web-1', auth || 'publickey'), { hasSavedPassword: false });
-  await page.evaluate((s) => { window.__tabStart = openSessionTab(s); }, srv);
-  if ((auth || 'publickey') !== 'publickey') return null;
-  await page.waitForFunction(() => Array.from(state.sessions.keys()).some((id) => window.tabSessionLive(id)), null, { polling: 25 });
-  return page.evaluate(() => [...state.sessions.keys()][0]);
-}
-
-const bytesOf = (c) => String.fromCharCode(...(c.args.bytes || []));
-const sends = async (app) => (await app.calls('terminal_send')).map(bytesOf);
 
 // ─── scenarios ──────────────────────────────────────────────────────────────
 
@@ -515,14 +247,12 @@ async function scenarioGuards(browser, server) {
     await page.evaluate(() => loadKnownHosts());
     await openLiveTab(app);
     // A plain tab record with an SFTP panel for the move guard (no shell).
-    // buildSftpPanel() wires the pane's drop listeners before the panel is in
-    // the document (getElementById finds nothing yet), so wire it again once it
-    // is attached - that is the state the listeners are meant to run in.
+    // buildSftpPanel() wires the pane's drop listeners on the panel itself
+    // (A3-01), so nothing has to be re-wired once it is attached.
     await page.evaluate(() => {
       state.sessions.set('tm', { tabId: 'tm', sessionId: 'sess-move', serverId: 's1', serverName: 'files', host: '10.0.0.1', port: 22, mode: 'sftp', sftpReady: true, sftpPath: '/srv', ended: false });
       const panel = buildSftpPanel('tm');
       document.getElementById('sftpBody').appendChild(panel);
-      wireSftpPaneDnd('tm');
       const row = document.createElement('tr');
       row.className = 'sftp-entry'; row.dataset.isdir = '1'; row.dataset.name = 'dest';
       document.getElementById('sftpTbody-tm').appendChild(row);
@@ -1417,7 +1147,7 @@ const SCENARIOS = [
 
 (async () => {
   const only = process.argv.includes('--only') ? process.argv[process.argv.indexOf('--only') + 1] : null;
-  const server = await serve();
+  const server = await serve(RENDERER);
   const browser = await chromium.launch();
   try {
     for (const [title, fn] of SCENARIOS) {

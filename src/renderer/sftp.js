@@ -62,6 +62,24 @@ function sftpPanelVisible(tab) {
   return !!tab && tab.mode !== 'ssh';
 }
 
+/// Is a dialog open? The same test app.js's own shortcuts use (modalStack).
+function sftpDialogOpen() {
+  return typeof modalStack !== 'undefined' && modalStack.length > 0;
+}
+
+/// Is this tab's file panel actually in front of the user: its tab active on
+/// a file surface, the Servers view showing (switching to Keys hides the
+/// panel but leaves the tab active) and no dialog over it? Window-wide input -
+/// an OS file drop, the SFTP shortcuts - acts only on a panel that passes:
+/// a key file dropped on the Keys view used to be uploaded to the active
+/// tab's server, and Ctrl+A/Ctrl+Y were taken from every text field in the app.
+function sftpPanelOnScreen(tab) {
+  if (!sftpPanelVisible(tab) || tab.tabId !== state.activeTabId) return false;
+  if (state.view !== 'connect' || sftpDialogOpen()) return false;
+  const panel = document.getElementById('sftpPanel-' + tab.tabId);
+  return !!panel && panel.getClientRects().length > 0;
+}
+
 /// Ensure the tab record has all the SFTP fields this module uses.
 function sftpTabState(tab) {
   if (!tab.sftpSelected) tab.sftpSelected = new Set();
@@ -203,10 +221,18 @@ function showSftpForTab(tabId) {
   if (!queuePanel && sbody) {
     queuePanel = buildQueuePanel();
     sbody.appendChild(queuePanel);
+    renderQueuePanel(); // whatever the queue already knows, without asking again
   }
   if (queuePanel) queuePanel.style.display = 'flex';
   const rec = window.tabRecord ? window.tabRecord(tabId) : null;
   if (rec && rec.hostEl) rec.hostEl.style.display = 'none';
+  // A transfer that finished while this tab was in the background changed
+  // its folder: list it again now that it is shown.
+  const tab = sftpTab(tabId);
+  if (tab && tab._listingDirty && tab.sftpReady) {
+    tab._listingDirty = false;
+    refreshSftpPanel(tabId, { forceFresh: true });
+  }
 }
 
 function showSshForTab(tabId) {
@@ -261,6 +287,9 @@ function buildSftpPanel(tabId) {
   const refreshBtn = mkBtn('refresh-cw', 'Refresh', () => refreshSftpPanel(tabId, { forceFresh: true }), 'Refresh');
   const mkdirBtn = mkBtn('folder-plus', 'New folder', () => sftpMkdirPrompt(tabId), 'Folder');
   const newFileBtn = mkBtn('file-text', 'New empty file', () => sftpTouchPrompt(tabId), 'File');
+  const uploadBtn = mkBtn('upload-cloud',
+    'Upload the files selected in the local pane to this folder (or drop files from your file manager onto the list)',
+    () => sftpUploadSelected(tabId), 'Upload');
   const bookmarkBtn = mkBtn('star', 'Bookmarks', (ev) => openBookmarkMenu(ev, tabId), 'Bookmarks');
   const searchBtn = mkBtn('search', 'Search recursively (in current tree)', () => toggleSearchBar(tabId), 'Search');
   const hiddenBtn = mkBtn('eye', 'Show/hide dotfiles', () => {
@@ -303,6 +332,7 @@ function buildSftpPanel(tabId) {
   toolbar.appendChild(refreshBtn);
   toolbar.appendChild(mkdirBtn);
   toolbar.appendChild(newFileBtn);
+  toolbar.appendChild(uploadBtn);
   toolbar.appendChild(bookmarkBtn);
   toolbar.appendChild(searchBtn);
   toolbar.appendChild(hiddenBtn);
@@ -404,7 +434,17 @@ function buildSftpPanel(tabId) {
   table.appendChild(tbody);
   const tableWrap = document.createElement('div');
   tableWrap.className = 'sftp-tablewrap';
+  // Focusable by script only (not a Tab stop): the list holds the focus when
+  // a quick-find leaves no row to stand on (see sftpRestoreRowFocus).
+  tableWrap.tabIndex = -1;
   tableWrap.appendChild(table);
+  // Right-click on the list's empty space: the folder's own menu (Upload, New
+  // folder, New file, Refresh). Rows have theirs (the tbody delegation).
+  tableWrap.addEventListener('contextmenu', (ev) => {
+    if (ev.target.closest('tr.sftp-entry')) return;
+    ev.preventDefault();
+    openSftpDirMenu(ev.clientX, ev.clientY, tabId);
+  });
   remotePane.appendChild(remoteHead);
   remotePane.appendChild(tableWrap);
 
@@ -433,11 +473,7 @@ function buildSftpPanel(tabId) {
   localTitle.className = 'sftp-panetitle';
   localTitle.textContent = 'Local site';
   const localUp = mkBtn('arrow-up', 'Parent directory', () => localNavigateUp(tabId), 'Up');
-  const localHome = mkBtn('folder', 'Home', () => {
-    const tab = sftpTab(tabId);
-    tab.localPath = '';
-    refreshLocalPane(tabId);
-  }, 'Home');
+  const localHome = mkBtn('folder', 'Home', () => sftpLocalNavigate(tabId, ''), 'Home');
   const localPath = document.createElement('input');
   localPath.className = 'sftp-path';
   localPath.id = 'sftpLocalPath-' + tabId;
@@ -557,8 +593,11 @@ function buildSftpPanel(tabId) {
   panel.appendChild(statusBar);
 
   wireSftpDrop(panel, tabId, hint);
-  wireSftpPaneDnd(tabId);
-  ensureSftpPreserveTsToggle(tabId);
+  // Both take the panel itself: it is not in the document yet (the caller
+  // appends it), so looking their elements up by id found nothing - no drop
+  // target was ever wired and the timestamps toggle never appeared.
+  wireSftpPaneDnd(tabId, panel);
+  ensureSftpPreserveTsToggle(tabId, panel);
   return panel;
 }
 
@@ -567,9 +606,10 @@ function buildSftpPanel(tabId) {
 
 /// Idempotent: append the toggle next to the hidden-files button if absent
 /// (never restructure the toolbar - G owns that block; this appends only).
-function ensureSftpPreserveTsToggle(tabId) {
-  const panel = document.getElementById('sftpPanel-' + tabId);
-  if (!panel || document.getElementById('sftpPreserveTsBtn-' + tabId)) return;
+/// `root` is the panel when it is not in the document yet.
+function ensureSftpPreserveTsToggle(tabId, root) {
+  const panel = root || document.getElementById('sftpPanel-' + tabId);
+  if (!panel || panel.querySelector('#' + CSS.escape('sftpPreserveTsBtn-' + tabId))) return;
   const toolbar = panel.querySelector('.sftp-toolbar');
   if (!toolbar) return;
   const hiddenBtn = [...toolbar.querySelectorAll('button')].find(b => b.title === 'Show/hide dotfiles');
@@ -577,8 +617,8 @@ function ensureSftpPreserveTsToggle(tabId) {
   const btn = document.createElement('button');
   btn.className = 'ghost-btn';
   btn.id = 'sftpPreserveTsBtn-' + tabId;
-  btn.title = 'Preserve timestamps of transferred files';
-  btn.innerHTML = ico('history');
+  btn.title = 'Preserve timestamps of transferred files (keep each file\'s modified time)';
+  btn.innerHTML = `${ico('history')}<span>Keep times</span>`;
   btn.classList.toggle('active', !!tab.sftpPreserveTs);
   btn.addEventListener('click', () => window.sftpPreserveTsToggle(tabId));
   toolbar.insertBefore(btn, hiddenBtn ? hiddenBtn.nextSibling : null);
@@ -613,15 +653,22 @@ function sftpEntryIcon(isDir, isLink) {
   return span;
 }
 
-/// Validate a remote path candidate: '/'-prefixed, no empty segments.
+/// Validate and resolve a typed remote path: it must start with '/'; empty and
+/// '.' segments drop out and '..' removes the segment before it, never going
+/// above the root. sftp_list_dir echoes whatever path it was asked for, so an
+/// unresolved '/var/www/..' used to become the tab's folder verbatim: Up then
+/// went one level DEEPER and the dots leaked into every path built from it.
 function sftpUiNormalizeRemotePath(input) {
   if (!input || !input.startsWith('/')) return null;
-  const parts = input.split('/').filter(Boolean);
-  const rebuilt = '/' + parts.join('/');
-  return { path: rebuilt === '/' ? '/' : rebuilt, parts };
+  const parts = [];
+  for (const seg of input.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  return { path: '/' + parts.join('/'), parts };
 }
 
-/// Enter in the remote path box: navigate; on failure toast and revert.
 /// Draw the current remote path as clickable segments.
 function renderRemoteCrumbs(tabId) {
   const crumbs = document.getElementById('sftpCrumbs-' + tabId);
@@ -679,6 +726,10 @@ function showRemoteCrumbs(tabId) {
   renderRemoteCrumbs(tabId);
 }
 
+/// Enter in the remote path box, or a click on a breadcrumb segment: navigate
+/// through the same transactional listing as every other move (see
+/// refreshSftpPanel), so the breadcrumb, rows and path all follow - or, when
+/// the listing fails, all stay where they were.
 async function sftpUiNavigateRemote(tabId, input) {
   const tab = sftpTab(tabId);
   const box = document.getElementById('sftpPath-' + tabId);
@@ -693,33 +744,7 @@ async function sftpUiNavigateRemote(tabId, input) {
   // breadcrumb - the field is a detour, not the resting state.
   showRemoteCrumbs(tabId);
   if (norm.path === tab.sftpPath) { box.value = tab.sftpPath; return; }
-  const prev = tab.sftpPath;
-  tab.sftpPath = norm.path;
-  try {
-    // Cache-aware: a short-TTL hit skips the round trip entirely (Task 6).
-    const cached = sftpCacheGet(tab, norm.path);
-    let entries, canonicalPath;
-    if (cached) {
-      entries = cached.entries;
-      canonicalPath = cached.path;
-    } else {
-      const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path: norm.path });
-      entries = r.entries || [];
-      canonicalPath = r.path || norm.path;
-      sftpCacheSet(tab, norm.path, entries, canonicalPath);
-    }
-    tab.sftpPath = canonicalPath;
-    sftpSetEntries(tab, entries);
-    tab._quickFind = ''; // navigating away drops an in-progress quick-find
-    box.value = tab.sftpPath;
-    renderEntries(tabId);
-    if (tab.dualPane) refreshLocalPane(tabId);
-    updateFsInfo(tabId);
-  } catch (e) {
-    tab.sftpPath = prev;
-    box.value = prev;
-    toast(e.message || String(e), 'err');
-  }
+  if (!(await refreshSftpPanel(tabId, { path: norm.path }))) box.value = tab.sftpPath || '/';
 }
 
 /// Enter in the local path box: navigate; on failure toast and revert.
@@ -728,15 +753,7 @@ async function sftpUiNavigateLocal(tabId, input) {
   const box = document.getElementById('sftpLocalPath-' + tabId);
   if (!tab || !box || !input) return;
   if (input === tab.localPath) { box.value = tab.localPath; return; }
-  const prev = tab.localPath;
-  tab.localPath = input;
-  try {
-    await sftpUiLocalLoad(tabId); // adopts the canonical path + renders
-  } catch (e) {
-    tab.localPath = prev;
-    box.value = prev || '';
-    toast(e.message || String(e), 'err');
-  }
+  if (!(await sftpLocalNavigate(tabId, input))) box.value = tab.localPath || '';
 }
 
 /// Recompute the status-bar text (counts / selection / local count) for a tab.
@@ -869,7 +886,11 @@ function sftpWireQueueCacheInvalidation() {
       if (sftpCacheInvalidatedJobIds.size > 5000) sftpCacheInvalidatedJobIds.clear();
       sftpCacheInvalidatedJobIds.add(j.id);
       for (const t of state.sessions.values()) {
-        if (t.sessionId === j.sessionId || t.sessionId === j.targetSessionId) sftpCacheInvalidateAll(t);
+        if (t.sessionId !== j.sessionId && t.sessionId !== j.targetSessionId) continue;
+        sftpCacheInvalidateAll(t);
+        // Its rows are stale too: redrawn by the transfer-done ticker while
+        // on screen, or when the tab is shown again (showSftpForTab).
+        t._listingDirty = true;
       }
     }
   }).catch(() => {});
@@ -898,44 +919,128 @@ const sftpPrevOnSessionClosed = window.onSessionClosed;
 window.onSessionClosed = function sftpOnSessionClosedWithCacheDrop(tabId) {
   const tab = sftpTab(tabId);
   if (tab) sftpCacheInvalidateAll(tab);
+  if (tab) tab._edits = null; // sftp_close stopped every edit watch of the session
+  if (tab) sftpForgetPendingListings(tab);
   sftpDisposeSearch(tabId); // an in-flight recursive search dies with its session
   if (typeof sftpPrevOnSessionClosed === 'function') sftpPrevOnSessionClosed(tabId);
 };
 
+/// The session of a tab closed: its listings still in flight are about nothing
+/// any more. Make them stale (their answers and errors are dropped) and drop
+/// the "navigation pending" state, or the reconnected tab's first refresh
+/// would wait behind the dead request - up to its timeout - and its error
+/// would still be shown. The local pane is reset the same way; it is listed
+/// again when the files surface is shown again.
+function sftpForgetPendingListings(tab) {
+  tab._listSeq = (tab._listSeq || 0) + 1;
+  tab._navSeq = 0;
+  tab._refreshSeq = 0;
+  tab._refreshAfterNav = false;
+  tab._localSeq = (tab._localSeq || 0) + 1;
+  tab._localNavSeq = 0;
+  tab._localRefreshSeq = 0;
+  tab._localRefreshAfterNav = false;
+}
+
+/// List a remote folder and show it: the tab's current one, or `opts.path` to
+/// navigate. `opts.localPath` also moves the local pane once the remote side
+/// has succeeded (bookmarks, synchronized browsing). Resolves true when the
+/// listing was applied.
+///
+/// Every remote navigation goes through here, and it is a transaction: the
+/// tab's folder changes only once the new listing has ARRIVED, and only the
+/// newest request of the tab may apply its answer. Assigning the path first
+/// left a failed open on the unreadable folder while the rows still showed the
+/// old one, so the next download, rename or delete was built from a folder the
+/// user was not looking at; and a slow listing that came back after a quicker,
+/// newer one overwrote it.
+///
+/// A plain refresh (no `opts.path`: a finished transfer, a mkdir, the tab shown
+/// again) never overtakes a navigation that is still waiting for its listing -
+/// being newer, it would have the navigation's answer thrown away as stale and
+/// undo the user's double-click. It is held and runs once the navigation has
+/// settled; likewise a refresh a navigation overtakes runs again after it.
 async function refreshSftpPanel(tabId, opts = {}) {
   const tab = sftpTab(tabId);
-  if (!tab) return;
+  if (!tab) return false;
+  if (!opts.path && tab._navSeq) {
+    tab._refreshAfterNav = true;
+    return false;
+  }
+  const seq = tab._listSeq = (tab._listSeq || 0) + 1;
+  if (opts.path) {
+    if (tab._refreshSeq) tab._refreshAfterNav = true; // that refresh is about to be dropped
+    tab._navSeq = seq;
+  } else {
+    tab._refreshSeq = seq;
+  }
+  try {
+    return await sftpShowListing(tabId, tab, opts, seq);
+  } finally {
+    if (tab._refreshSeq === seq) tab._refreshSeq = 0;
+    if (tab._navSeq === seq) {
+      tab._navSeq = 0;
+      if (tab._refreshAfterNav) {
+        tab._refreshAfterNav = false;
+        refreshSftpPanel(tabId, { forceFresh: true });
+      }
+    }
+  }
+}
+
+/// One listing request of refreshSftpPanel (request number `seq`): list, then
+/// show it only if it is still the tab's newest request.
+async function sftpShowListing(tabId, tab, opts, seq) {
   sftpTabState(tab);
   const tbody = document.getElementById('sftpTbody-' + tabId);
-  if (!tbody) return;
-  const path = tab.sftpPath;
+  if (!tbody) return false;
+  const path = opts.path || tab.sftpPath;
+  const sessionId = tab.sessionId;
+  let entries, canonicalPath;
   try {
     const cached = !opts.forceFresh && sftpCacheGet(tab, path);
-    let entries, canonicalPath;
     if (cached) {
       entries = cached.entries;
       canonicalPath = cached.path;
     } else {
-      const r = await sftpCall('sftp_list_dir', { sessionId: tab.sessionId, path });
+      const r = await sftpCall('sftp_list_dir', { sessionId, path });
       entries = r.entries || [];
       canonicalPath = r.path || path;
       sftpCacheSet(tab, path, entries, canonicalPath);
     }
-    tab.sftpPath = canonicalPath;
-    sftpSetEntries(tab, entries);
-    tab._quickFind = ''; // a fresh listing drops an in-progress quick-find
-    const pathBox = document.getElementById('sftpPath-' + tabId);
-    if (pathBox && document.activeElement !== pathBox) pathBox.value = tab.sftpPath;
-    renderRemoteCrumbs(tabId);
-    renderEntries(tabId);
-    applySftpDualChrome(tabId);
-    if (tab.dualPane) refreshLocalPane(tabId);
-    if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
-    if (typeof sftpCmpEnsureButtons === 'function') sftpCmpEnsureButtons(tabId);
-    updateFsInfo(tabId);
   } catch (e) {
-    toast(e.message || String(e), 'err');
+    // An overtaken request has nothing left to say about what is on screen.
+    if (seq === tab._listSeq) toast(e.message || String(e), 'err');
+    return false;
   }
+  if (seq !== tab._listSeq || sftpTab(tabId) !== tab || tab.sessionId !== sessionId) return false;
+  if (canonicalPath !== tab.sftpPath) {
+    // The selection is a set of NAMES: carried into another folder it selects
+    // whatever happens to share a name there.
+    tab.sftpSelected.clear();
+    tab._focusedName = null;
+  }
+  tab.sftpPath = canonicalPath;
+  sftpSetEntries(tab, entries);
+  tab._quickFind = ''; // a fresh listing drops an in-progress quick-find
+  const pathBox = document.getElementById('sftpPath-' + tabId);
+  if (pathBox && document.activeElement !== pathBox) pathBox.value = tab.sftpPath;
+  renderRemoteCrumbs(tabId);
+  renderEntries(tabId);
+  applySftpDualChrome(tabId);
+  if (tab.dualPane) {
+    if (opts.localPath !== undefined) sftpLocalNavigate(tabId, opts.localPath);
+    else refreshLocalPane(tabId);
+  } else if (opts.localPath !== undefined) {
+    // Listed when the local pane opens - as a first load, so a folder that
+    // is gone by then falls back to home with a message (refreshLocalPane).
+    tab.localPath = opts.localPath;
+    tab._localLoaded = false;
+  }
+  if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
+  if (typeof sftpCmpEnsureButtons === 'function') sftpCmpEnsureButtons(tabId);
+  updateFsInfo(tabId);
+  return true;
 }
 
 /// Hidden-filtered + sorted view of a tab's full entry list. Stashed on
@@ -996,16 +1101,26 @@ function sftpRefreshSelectionClasses(tabId) {
 /// Re-focus the row the user was on after a re-render tears down and rebuilds
 /// the DOM (rows are replaced wholesale, never patched in place - see
 /// sftpRenderRows). Without this, removing a focused row drops focus to
-/// <body>, and every handler above - being delegated to the tbody - would
+/// <body>, and every handler above - being delegated to the list - would
 /// stop receiving keystrokes after a single keypress. While quick-find is
 /// active this doubles as "jump to the first match" (classic type-ahead).
+///
+/// Only called when the focus was in the list before the re-render
+/// (renderEntries): a background refresh - a transfer finishing - used to pull
+/// it out of the terminal, the path field or an open dialog, and the next
+/// keystrokes started a quick-find instead. When no row is left to land on (a
+/// quick-find matching nothing) the list itself keeps the focus, so Backspace
+/// and Escape still reach the filter.
 function sftpRestoreRowFocus(tabId, tbody, visible) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   const targetName = tab._quickFind ? (visible[0] && visible[0].name) : tab._focusedName;
-  if (!targetName) return;
-  const row = tbody.querySelector(`tr[data-name="${CSS.escape(targetName)}"]`);
-  if (!row) return;
+  const row = targetName && tbody.querySelector(`tr[data-name="${CSS.escape(targetName)}"]`);
+  if (!row) {
+    const wrap = tbody.closest('.sftp-tablewrap');
+    if (wrap && !wrap.contains(document.activeElement)) wrap.focus({ preventScroll: true });
+    return;
+  }
   tab._focusedName = targetName;
   row.focus({ preventScroll: !tab._quickFind });
   if (tab._quickFind) row.scrollIntoView({ block: 'nearest' });
@@ -1216,18 +1331,24 @@ function renderEntries(tabId) {
     }
   }
   tab.sftpSelected = tab.sftpSelected || new Set();
-  // Keep only selections still present (against the FULL entry list, not
-  // just what's hidden-filtered/quick-found/currently mounted).
-  for (const n of [...tab.sftpSelected]) if (!tab._entryMap || !tab._entryMap.has(n)) tab.sftpSelected.delete(n);
 
   const sorted = sftpComputeSortedEntries(tab);
   const visible = sftpApplyQuickFind(tab, sorted);
   tab._visibleEntries = visible; // authoritative "all rows" for select-all/shift-range, not just what's mounted
   tab._lastClicked = null; // shift-click anchor doesn't survive a re-render (sort/filter/hidden/quick-find change)
+  // The selection is what is on screen. Pruning against the full listing kept
+  // rows the dotfile toggle or quick-find had hidden, and Delete then reached
+  // a .ssh folder the user could no longer see. (Windowing only limits what is
+  // MOUNTED; `visible` is every row the list shows.)
+  const shown = new Set(visible.map((e) => e.name));
+  for (const n of [...tab.sftpSelected]) if (!shown.has(n)) tab.sftpSelected.delete(n);
 
+  // Captured before the rows are replaced: whether the user was in the list.
+  const wrap = tbody.closest('.sftp-tablewrap');
+  const hadFocus = !!wrap && wrap.contains(document.activeElement);
   sftpUpdateQuickFindIndicator(tabId, sorted.length, visible.length);
   sftpRenderRows(tbody, visible, (e) => sftpBuildRemoteRow(tab, e), 5);
-  sftpRestoreRowFocus(tabId, tbody, visible);
+  if (hadFocus) sftpRestoreRowFocus(tabId, tbody, visible);
   sftpUpdateStatusBar(tabId);
 }
 
@@ -1322,7 +1443,9 @@ function sftpWireTbodyDelegation(tabId) {
     ev.dataTransfer.effectAllowed = 'copyMove';
   });
 
-  tbody.addEventListener('keydown', (ev) => {
+  // On the wrapper rather than the tbody, so the keys still arrive while the
+  // list itself has the focus (a quick-find that matches nothing).
+  (tbody.closest('.sftp-tablewrap') || tbody).addEventListener('keydown', (ev) => {
     const tab = sftpTab(tabId);
     if (!tab) return;
     const tr = ev.target.closest('tr.sftp-entry');
@@ -1354,6 +1477,14 @@ function sftpWireTbodyDelegation(tabId) {
     }
     if (ev.key === 'Escape') {
       if (tab._quickFind) { ev.preventDefault(); tab._quickFind = ''; renderEntries(tabId); }
+      return;
+    }
+    // Backspace takes the last character back off the filter: without it a
+    // typo filtered the list to nothing and only Escape recovered.
+    if (ev.key === 'Backspace' && tab._quickFind) {
+      ev.preventDefault();
+      tab._quickFind = tab._quickFind.slice(0, -1);
+      renderEntries(tabId);
       return;
     }
     // Type-to-filter (Task 8): a single printable character with no modifier
@@ -1394,8 +1525,7 @@ function sftpActivateEntry(tabId, entry) {
       }
       if (r.isDir) {
         if (typeof sftpSyncRemoteNav === 'function' && sftpSyncRemoteNav(tabId, entry.name)) return;
-        tab.sftpPath = full;
-        refreshSftpPanel(tabId);
+        refreshSftpPanel(tabId, { path: full });
       } else {
         queueDownloads(tabId, [full]);
       }
@@ -1404,8 +1534,7 @@ function sftpActivateEntry(tabId, entry) {
   }
   if (entry.isDir) {
     if (typeof sftpSyncRemoteNav === 'function' && sftpSyncRemoteNav(tabId, entry.name)) return;
-    tab.sftpPath = full;
-    refreshSftpPanel(tabId);
+    refreshSftpPanel(tabId, { path: full });
   } else {
     // Queue the download to the last-used local dir (or temp dir).
     queueDownloads(tabId, [full]);
@@ -1441,20 +1570,39 @@ function sftpMarkLinkRow(tabId, name, broken) {
   if (icon) icon.classList.toggle('broken', !!broken);
 }
 
-// Ctrl+A within the panel selects all rows - the full filtered list (Task 4:
+/// The tab an SFTP keyboard shortcut may act on, or null. Only while its file
+/// panel is in front of the user (sftpPanelOnScreen: no dialog over it, the
+/// Servers view showing) and never for a key typed into a text field, where
+/// Ctrl+A is "select all" and Ctrl+Y "redo": both used to be taken from every
+/// input in the app - the rename prompt, the path field, the Keys search -
+/// while a Files tab was active, changing the file selection behind them.
+function sftpShortcutTab(ev) {
+  const tab = sftpTab(state.activeTabId);
+  if (!tab || !sftpPanelOnScreen(tab)) return null;
+  const t = ev.target;
+  if (t && t.closest && t.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return null;
+  return tab;
+}
+
+// Ctrl+A in the file list selects all rows - the full filtered list (Task 4:
 // hidden-file toggling and quick-find already narrowed tab._visibleEntries),
-// not just whatever the windowed renderer currently has mounted. With the
-// local pane open it selects in whichever pane was last clicked, so the
-// shortcut follows the user's focus instead of always hitting the remote side.
+// not just whatever the windowed renderer currently has mounted. It belongs
+// to the list: it acts on a key from a pane's rows (or the list itself), or
+// from no element in particular (the page body - a click on a local row,
+// which takes no focus, leaves it there; then the pane last clicked wins).
 document.addEventListener('keydown', (ev) => {
-  if (!(ev.ctrlKey || ev.metaKey) || ev.key.toLowerCase() !== 'a') return;
-  const active = sftpTab(state.activeTabId);
-  if (!sftpPanelVisible(active)) return;
-  const panel = document.getElementById('sftpPanel-' + active.tabId);
-  if (!panel) return;
+  if (!(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'a') return;
+  const active = sftpShortcutTab(ev);
+  if (!active) return;
+  const t = ev.target;
+  const within = (sel) => !!(t && t.closest && t.closest(sel));
+  const inLocal = within(`#sftpLocalPane-${CSS.escape(active.tabId)} .sftp-tablewrap`);
+  const inRemote = within(`#sftpPanel-${CSS.escape(active.tabId)} .sftp-remote .sftp-tablewrap`);
+  const nowhere = !t || t === document || t === document.body || t === document.documentElement;
+  if (!inLocal && !inRemote && !nowhere) return;
   ev.preventDefault();
   sftpTabState(active);
-  if (active._lastPane === 'local' && !document.getElementById('sftpLocalPane-' + active.tabId)?.hidden) {
+  if ((inLocal || (nowhere && active._lastPane === 'local')) && !document.getElementById('sftpLocalPane-' + active.tabId)?.hidden) {
     const localVisible = active._localEntries || [];
     active.localSelected.clear();
     for (const e of localVisible) active.localSelected.add(e.name);
@@ -1510,8 +1658,7 @@ function sftpNavigateUp(tabId) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   if (typeof sftpSyncRemoteUp === 'function' && sftpSyncRemoteUp(tabId)) return;
-  tab.sftpPath = sftpParent(tab.sftpPath);
-  refreshSftpPanel(tabId);
+  refreshSftpPanel(tabId, { path: sftpParent(tab.sftpPath) });
 }
 
 async function sftpMkdirPrompt(tabId) {
@@ -1561,17 +1708,28 @@ async function updateFsInfo(tabId) {
 // ─── context menu ───────────────────────────────────────────────────────────
 
 // Session-scoped delete-confirmation state (classic scripts share the global
-// lexical scope, so the names are sftp-prefixed on purpose).
-let sftpDeleteConfirmSuppressed = false;
+// lexical scope, so the names are sftp-prefixed on purpose). "Don't ask again"
+// is kept per side: one flag meant ticking it while clearing out remote files
+// also switched off the prompt for permanent, recursive LOCAL deletes.
+const sftpDeleteConfirmSuppressed = { remote: false, local: false };
 let sftpDeleteInFlight = false;
 
+/// `"a.txt", "b.txt", "c.txt" and 2 more` - what a confirmation is about, so
+/// it can never be agreed to without seeing what it deletes.
+function sftpNameList(names, max = 3) {
+  const shown = names.slice(0, max).map((n) => `"${n}"`).join(', ');
+  return names.length > max ? `${shown} and ${names.length - max} more` : shown;
+}
+
 /// In-app delete confirmation: names the item(s), Yes / Cancel, and a
-/// session-scoped "don't ask again" checkbox (never persisted - a restart
-/// restores the safety prompt). Runs onYes only on Yes.
-function sftpConfirmDelete(message, onYes) {
-  if (sftpDeleteConfirmSuppressed) { onYes(); return; }
+/// session-scoped "don't ask again" checkbox for this `side` ('remote' or
+/// 'local') only (never persisted - a restart restores the safety prompt).
+/// Runs onYes only on Yes.
+function sftpConfirmDelete(message, onYes, side = 'remote') {
+  if (sftpDeleteConfirmSuppressed[side]) { onYes(); return; }
   el('deleteTitle').textContent = 'Delete';
   el('deleteMessage').textContent = message;
+  el('deleteSkipLabel').textContent = `Don't ask again for ${side} deletes this session.`;
   el('deleteSkipSession').checked = false;
   el('deleteModal').hidden = false;
   const finish = (yes) => {
@@ -1581,7 +1739,7 @@ function sftpConfirmDelete(message, onYes) {
     // every exit meant ticking it and then backing out via Cancel still
     // switched the safety prompt off for the session, so the NEXT delete -
     // one the user never agreed to skip confirming - went through silently.
-    if (yes && el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed = true;
+    if (yes && el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed[side] = true;
     el('deleteModal').removeEventListener('click', onBackdrop);
     if (yes) onYes();
   };
@@ -1654,6 +1812,60 @@ function sftpPatchSizeCell(tabId, name, entry) {
   if (td) sftpFillSizeCell(td, entry);
 }
 
+/// Put a context menu on the page at (x, y) kept fully on screen
+/// (positionCtxMenuAt, app.js) - placed at the raw pointer position, a menu
+/// opened near the right or bottom edge ran off the window with its last
+/// items unreachable - and close it on the next press elsewhere.
+function sftpShowMenu(menu, x, y) {
+  document.body.appendChild(menu);
+  positionCtxMenuAt(menu, x, y);
+  const onAway = (ev) => {
+    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
+    closeKeyConnectMenu();
+  };
+  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+}
+
+/// Right-click on the remote list's empty space: what can be done in this
+/// folder - the file menu only ever existed on a row.
+function openSftpDirMenu(x, y, tabId) {
+  closeKeyConnectMenu();
+  if (!sftpTab(tabId)) return;
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.id = 'keyConnectMenu';
+  const mk = (label, icon, fn) => {
+    const b = document.createElement('button');
+    b.className = 'ctx-item';
+    b.innerHTML = `${ico(icon)}<span>${escapeHtml(label)}</span>`;
+    b.addEventListener('click', () => { closeKeyConnectMenu(); fn(); });
+    menu.appendChild(b);
+  };
+  mk('Upload...', 'upload-cloud', () => sftpUploadSelected(tabId));
+  mk('New folder...', 'folder-plus', () => sftpMkdirPrompt(tabId));
+  mk('New file...', 'file-text', () => sftpTouchPrompt(tabId));
+  mk('Refresh', 'refresh-cw', () => refreshSftpPanel(tabId, { forceFresh: true }));
+  sftpShowMenu(menu, x, y);
+}
+
+/// Upload, from the toolbar or the folder menu. No native "open files" picker
+/// is available to the renderer (file dialogs are opened by Rust, and no
+/// command offers a multi-file pick), so this uploads what is selected in the
+/// local pane to the folder on screen - and when the pane is closed or nothing
+/// is selected there, opens it and says how.
+function sftpUploadSelected(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  sftpTabState(tab);
+  const names = tab.dualPane ? [...tab.localSelected] : [];
+  if (!tab.dualPane) toggleDualPane(tabId, { persist: false });
+  if (!names.length || !tab.localPath) {
+    toast('Select files in the local pane on the left, then Upload - or drop files from your file manager onto the remote list.', 'info');
+    return;
+  }
+  queueUploads(tabId, names.map((n) => ({ local: joinLocal(tab.localPath, n), remote: sftpJoin(tab.sftpPath, n) })));
+}
+
 /// Right-click menu for a remote file/dir (selection-aware).
 function openSftpFileMenu(x, y, tabId, entry) {
   closeKeyConnectMenu();
@@ -1681,6 +1893,7 @@ function openSftpFileMenu(x, y, tabId, entry) {
   if (!multi && !entry.isDir) {
     mk('Download as...', 'download', () => sftpDownloadTo(tabId, fullPath, entry.name));
     mk('Open with system app', 'pencil', () => sftpOpenForEdit(tabId, fullPath, entry.name));
+    if (tab._edits && tab._edits.has(fullPath)) mk('Stop editing', 'x', () => sftpStopEdit(tabId, fullPath));
   }
   // Directory-only (Task 9): sftpCalcDirSize does the round trip and patches
   // the row's size cell in place - grouped with the other info/properties
@@ -1711,7 +1924,7 @@ function openSftpFileMenu(x, y, tabId, entry) {
       ? (firstIsDir
         ? `Are you sure you want to delete the folder "${firstName}" and everything inside it?`
         : `Are you sure you want to delete "${firstName}"?`)
-      : `Are you sure you want to delete these ${paths.length} items?`;
+      : `Are you sure you want to delete these ${paths.length} items: ${sftpNameList(paths.map((p) => p.split('/').filter(Boolean).pop()))}?`;
     sftpConfirmDelete(message, async () => {
       if (sftpDeleteInFlight) { toast('A delete is already in progress - one moment.', 'info'); return; }
       sftpDeleteInFlight = true;
@@ -1777,18 +1990,64 @@ function openSftpFileMenu(x, y, tabId, entry) {
     }
   }
 
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  document.body.appendChild(menu);
-  const onAway = (ev) => {
-    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
-    closeKeyConnectMenu();
-  };
-  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  sftpShowMenu(menu, x, y);
 }
 
 // ─── chmod dialog ───────────────────────────────────────────────────────────
 
+/// The nine permission boxes and the bit each one stands for.
+const SFTP_CHMOD_BITS = [
+  ['owner', 'r', 0o400], ['owner', 'w', 0o200], ['owner', 'x', 0o100],
+  ['group', 'r', 0o040], ['group', 'w', 0o020], ['group', 'x', 0o010],
+  ['other', 'r', 0o004], ['other', 'w', 0o002], ['other', 'x', 0o001],
+];
+let sftpChmodOpenSeq = 0;
+
+/// "644", or "2775" when setuid/setgid/sticky are set.
+function sftpModeDigits(mode) {
+  const digits = (mode & 0o777).toString(8).padStart(3, '0');
+  return mode & 0o7000 ? ((mode & 0o7000) >> 9).toString(8) + digits : digits;
+}
+
+/// The sftp_chmod calls for one path. A recursive run applies ONE mode to the
+/// folder and to everything it walks, so setuid/setgid/sticky - a shared
+/// folder's setgid, typically - must never go out with files in scope: that
+/// made every file in the tree setgid. The folders get the full mode first
+/// (that call is what restores traversal of a tree the owner cannot enter,
+/// e.g. a 2664 folder), then the files the plain bits in a call of their own.
+/// A file, or a mode without special bits, is one call.
+function sftpChmodRequests(mode, kind, recursive, scope) {
+  if (!recursive || kind === 'file' || !(mode & 0o7000) || scope === 'dirs') return [{ mode, applyTo: scope }];
+  const requests = scope === 'all' ? [{ mode, applyTo: 'dirs' }] : [];
+  requests.push({ mode: mode & 0o777, applyTo: 'files' });
+  return requests;
+}
+
+/// A path's type as the listing on screen knows it, for a server that leaves
+/// the type bits out of the mode: 'dir' | 'file', or 'unknown' when the path
+/// is not in the folder shown or is a symlink (the listing describes the link,
+/// the stat its target).
+function sftpListedKind(tabId, path) {
+  const tab = sftpTab(tabId);
+  if (!tab || !tab._entryMap || sftpParent(path) !== tab.sftpPath) return 'unknown';
+  const entry = tab._entryMap.get(path.split('/').filter(Boolean).pop());
+  if (!entry || entry.isLink) return 'unknown';
+  return entry.isDir ? 'dir' : 'file';
+}
+
+/// Permissions dialog for one or more remote paths. It starts from what is
+/// really there - every path is stat'ed - and changes only what the user
+/// changes:
+///   - setuid/setgid/sticky show as a fourth digit and are kept; typing the
+///     numeric value sets exactly what was typed (masking the stat to 0o777
+///     used to drop them silently from a setgid shared folder);
+///   - with several paths, a box whose bit differs between them is
+///     indeterminate and leaves that bit as it is on each path (the first
+///     path's mode used to be applied to all of them);
+///   - Recurse and Apply-to start fresh every time (a tick left over from the
+///     last use made the next chmod recursive without being asked);
+///   - when a mode cannot be read, Apply stays disabled and says why, instead
+///     of offering 644, which strips a folder's x bit.
 function openChmodDialog(tabId, paths, entry) {
   const tab = sftpTab(tabId);
   if (!tab || !paths.length) return;
@@ -1799,54 +2058,76 @@ function openChmodDialog(tabId, paths, entry) {
     ? `Permissions - ${paths[0].split('/').filter(Boolean).pop()}`
     : `Permissions - ${paths.length} items`;
 
-  const boxes = {}; // rwx × owner/group/other
-  for (const who of ['owner', 'group', 'other']) {
-    for (const bit of ['r', 'w', 'x']) {
-      boxes[who + bit] = document.getElementById('chmod-' + who + '-' + bit);
-    }
-  }
+  const boxes = SFTP_CHMOD_BITS.map(([who, bit, mask]) => ({ mask, cb: document.getElementById(`chmod-${who}-${bit}`) }));
   const octal = document.getElementById('chmodOctal');
   const recurse = document.getElementById('chmodRecurse');
   const applyTo = document.getElementById('chmodApplyTo');
   const applyBtn = document.getElementById('chmodApplyBtn');
   const cancelBtn = document.getElementById('chmodCancelBtn');
+  const hint = document.getElementById('chmodHint');
+  const sessionId = tab.sessionId;
+  const openId = ++sftpChmodOpenSeq;
+  let modes = null;   // each path's current mode & 0o7777, once read
+  let kinds = null;   // each path's type ('dir' | 'file' | 'unknown'): the stat's type bits, else the listing
+  let special = null; // setuid/setgid/sticky as typed; null keeps each path's own
 
-  const toOctal = () => {
-    let s = '';
-    for (const who of ['owner', 'group', 'other']) {
-      let n = 0;
-      if (boxes[who + 'r'].checked) n += 4;
-      if (boxes[who + 'w'].checked) n += 2;
-      if (boxes[who + 'x'].checked) n += 1;
-      s += n;
+  recurse.checked = false;
+  applyTo.value = 'all';
+  hint.hidden = true;
+  hint.textContent = '';
+  applyBtn.disabled = true; // until the current modes are known
+  octal.value = '';
+  octal.placeholder = '...';
+  for (const { cb } of boxes) { cb.checked = false; cb.indeterminate = false; }
+
+  const rwx = () => boxes.reduce((m, { mask, cb }) => (cb.checked ? m | mask : m), 0);
+  const showOctal = () => {
+    const specials = special !== null ? [special] : (modes || []).map((m) => m & 0o7000);
+    if (boxes.some(({ cb }) => cb.indeterminate) || new Set(specials).size > 1) {
+      octal.value = '';
+      octal.placeholder = 'mixed';
+      return;
     }
-    return s;
+    octal.value = sftpModeDigits((specials[0] || 0) | rwx());
+    octal.placeholder = '644';
   };
-  const fromOctal = (mode) => {
-    const str = (mode & 0o777).toString(8).padStart(3, '0');
-    const bits = [['owner', 0], ['group', 1], ['other', 2]];
-    for (const [who, i] of bits) {
-      const n = parseInt(str[i], 10);
-      boxes[who + 'r'].checked = !!(n & 4);
-      boxes[who + 'w'].checked = !!(n & 2);
-      boxes[who + 'x'].checked = !!(n & 1);
-    }
-    octal.value = str;
-  };
-  for (const cb of Object.values(boxes)) {
-    cb.onchange = () => { octal.value = toOctal(); };
+  for (const { cb } of boxes) {
+    cb.onchange = () => { cb.indeterminate = false; showOctal(); };
   }
   octal.oninput = () => {
-    if (/^[0-7]{3}$/.test(octal.value)) fromOctal(parseInt(octal.value, 8));
+    const v = octal.value.trim();
+    if (!/^[0-7]{3,4}$/.test(v)) return;
+    const n = parseInt(v, 8);
+    for (const { mask, cb } of boxes) { cb.checked = !!(n & mask); cb.indeterminate = false; }
+    special = v.length === 4 ? n & 0o7000 : 0;
   };
 
-  // Prefill from the first path (stat).
   (async () => {
-    try {
-      const r = await sftpCall('sftp_get_permissions', { sessionId: tab.sessionId, path: paths[0] });
-      if (r && r.mode != null) fromOctal(r.mode);
-      else fromOctal(0o644);
-    } catch { fromOctal(0o644); }
+    const results = await Promise.all(paths.map((p) =>
+      sftpCall('sftp_get_permissions', { sessionId, path: p })
+        .then((r) => (r && r.mode != null
+          ? {
+            mode: r.mode & 0o7777,
+            kind: (r.mode & 0o170000) === 0o040000 ? 'dir' : (r.mode & 0o170000) ? 'file' : 'unknown',
+          }
+          : { error: 'the server did not report them' }))
+        .catch((e) => ({ error: (e && e.message) || String(e) }))));
+    if (openId !== sftpChmodOpenSeq || modal.hidden) return; // closed or reopened meanwhile
+    const bad = results.findIndex((r) => r.error);
+    if (bad >= 0) {
+      hint.textContent = `Could not read the current permissions of ${paths[bad]}: ${results[bad].error}`;
+      hint.hidden = false;
+      return;
+    }
+    modes = results.map((r) => r.mode);
+    kinds = results.map((r, i) => (r.kind === 'unknown' ? sftpListedKind(tabId, paths[i]) : r.kind));
+    for (const { mask, cb } of boxes) {
+      const n = modes.filter((m) => m & mask).length;
+      cb.checked = n === modes.length;
+      cb.indeterminate = n > 0 && n < modes.length;
+    }
+    showOctal();
+    applyBtn.disabled = false;
   })();
 
   const close = () => {
@@ -1862,21 +2143,38 @@ function openChmodDialog(tabId, paths, entry) {
   modal.onclick = (ev) => { if (ev.target === modal) close(); };
 
   applyBtn.onclick = async () => {
-    const mode = parseInt(toOctal(), 8);
-    if (Number.isNaN(mode)) { toast('Invalid permission value.', 'err'); return; }
-    let changed = 0, fail = 0;
-    for (const p of paths) {
-      try {
-        const r = await sftpCall('sftp_chmod', {
-          sessionId: tab.sessionId, path: p, mode,
-          recursive: recurse.checked, applyTo: applyTo.value,
-        });
-        changed += r.changed || 1;
-      } catch { fail++; }
-    }
-    sftpLog(tabId, `chmod ${toOctal()} on ${paths.length} path(s) - ${changed} changed${fail ? `, ${fail} failed` : ''}`);
-    toast(fail ? `${changed} updated, ${fail} failed.` : `Permissions set (${toOctal()}).`, fail ? 'err' : 'ok');
+    if (!modes) return;
+    const recursive = recurse.checked;
+    const scope = applyTo.value;
+    const targets = paths.map((p, i) => {
+      let mode = modes[i];
+      for (const { mask, cb } of boxes) if (!cb.indeterminate) mode = cb.checked ? (mode | mask) : (mode & ~mask);
+      if (special !== null) mode = (mode & 0o777) | special;
+      return [p, mode, kinds[i]];
+    });
     close();
+    let changed = 0, failed = 0;
+    const errors = [];
+    for (const [p, mode, kind] of targets) {
+      for (const req of sftpChmodRequests(mode, kind, recursive, scope)) {
+        try {
+          // A recursive run reports the entries it could not change (Task 10)
+          // instead of failing outright; those count as failures too.
+          const r = await sftpCall('sftp_chmod', { sessionId, path: p, mode: req.mode, recursive, applyTo: req.applyTo });
+          changed += r.changed || 0;
+          failed += r.failedCount || 0;
+          errors.push(...(r.failed || []));
+        } catch (e) {
+          failed++;
+          errors.push(`${p}: ${(e && e.message) || e}`);
+        }
+      }
+    }
+    const same = new Set(targets.map(([, m]) => m)).size === 1;
+    const shown = same ? sftpModeDigits(targets[0][1]) : '(per item)';
+    sftpLog(tabId, `chmod ${shown} on ${paths.length} path(s) - ${changed} changed${failed ? `, ${failed} failed` : ''}`);
+    if (failed) toast(`${changed} updated, ${failed} failed: ${errors[0] || 'unknown error'}`, 'err');
+    else toast(same ? `Permissions set (${shown}).` : `Permissions set on ${paths.length} items.`, 'ok');
     // forceFresh (Task 6): the Permissions column of a cached listing would
     // otherwise show the pre-chmod mode until the TTL expires.
     refreshSftpPanel(tabId, { forceFresh: true });
@@ -1888,16 +2186,51 @@ function openChmodDialog(tabId, paths, entry) {
 
 // ─── search ─────────────────────────────────────────────────────────────────
 
-// One listener per TAB (not one global): a single module-global meant
-// starting a search in tab B unlistened tab A's in-flight search, stranding
-// its status at "Searching..." and dropping its results. Disposed on session
-// close via sftpDisposeSearch.
-const searchUnlisteners = new Map();
+// Every `sftp-search` event carries the id of the search it belongs to (Task
+// 10), so ONE listener routes them all: a tab's current search owns its
+// results and anything else - a superseded walk, whose {done, cancelled}
+// summary now arrives at once - is ignored. The per-search listener this
+// replaces was registered after an await, so a double Enter registered two of
+// them and every result showed twice for the rest of the tab's life; and with
+// no id, a superseded walk's summary overwrote the live one.
+const sftpSearches = new Map(); // tabId -> the tab's current search
+let sftpSearchSeq = 0;
 
+/// Stop a tab's search, if one is running: the backend walk is cancelled and
+/// its events are ignored from here on. Also run when its session closes.
 function sftpDisposeSearch(tabId) {
-  const un = searchUnlisteners.get(tabId);
-  if (un) { try { un(); } catch (e) {} searchUnlisteners.delete(tabId); }
+  const search = sftpSearches.get(tabId);
+  if (!search) return;
+  sftpSearches.delete(tabId);
+  call('sftp_search_cancel', { sessionId: search.sessionId, searchId: search.id }).catch(() => {});
 }
+
+function sftpOnSearchEvent(ev) {
+  const p = (ev && ev.payload) || {};
+  const search = [...sftpSearches.values()].find((x) => x.id === p.searchId);
+  if (!search || p.sessionId !== search.sessionId) return;
+  if (p.done) {
+    sftpSearches.delete(search.tabId); // finished: nothing left to cancel
+    search.status.textContent = p.cancelled
+      ? 'Search stopped.'
+      : `${p.matched} match(es)${p.capped ? ' (capped at 500)' : ''} · ${p.scanned} scanned`;
+    return;
+  }
+  search.count++;
+  if (search.count > 50) return; // render only first 50
+  const item = document.createElement('div');
+  item.className = 'sftp-searchitem';
+  item.innerHTML = `<span class="sftp-eicon${p.isDir ? ' is-dir' : ''}">${ico(p.isDir ? 'folder' : 'file-text')}</span>${escapeHtml(p.path)}`;
+  item.title = 'Navigate to containing folder';
+  const tabId = search.tabId;
+  item.addEventListener('click', () => {
+    const parent = p.path.slice(0, p.path.lastIndexOf('/')) || '/';
+    refreshSftpPanel(tabId, { path: parent });
+    toggleSearchBar(tabId);
+  });
+  search.results.appendChild(item);
+}
+sftpListen('sftp-search', sftpOnSearchEvent).catch(() => {});
 
 function toggleSearchBar(tabId) {
   const bar = document.getElementById('sftpSearchBar-' + tabId);
@@ -1913,43 +2246,21 @@ async function runSearch(tabId, query) {
   const results = document.getElementById('sftpSearchResults-' + tabId);
   const status = document.getElementById('sftpSearchStatus-' + tabId);
   if (!results || !status) return;
+  sftpDisposeSearch(tabId); // a new search replaces the tab's previous walk
+  const search = {
+    id: `${tabId}-${Date.now().toString(36)}-${++sftpSearchSeq}`,
+    tabId, sessionId: tab.sessionId, count: 0, results, status,
+  };
+  sftpSearches.set(tabId, search);
   results.innerHTML = '';
   status.textContent = 'Searching...';
   sftpLog(tabId, `search "${query}" under ${tab.sftpPath}`);
-  let count = 0;
-
-  sftpDisposeSearch(tabId);
-  const un = await sftpListen('sftp-search', (ev) => {
-    const p = ev.payload;
-    if (p.sessionId !== tab.sessionId) return;
-    if (p.done) {
-      sftpDisposeSearch(tabId); // done: no more events for this tab
-      status.textContent = `${p.matched} match(es)${p.capped ? ' (capped at 500)' : ''} · ${p.scanned} scanned`;
-      return;
-    }
-    count++;
-    if (count > 50) return; // render only first 50
-    const item = document.createElement('div');
-    item.className = 'sftp-searchitem';
-    item.innerHTML = `<span class="sftp-eicon${p.isDir ? ' is-dir' : ''}">${ico(p.isDir ? 'folder' : 'file-text')}</span>${escapeHtml(p.path)}`;
-    item.title = 'Navigate to containing folder';
-    item.addEventListener('click', () => {
-      const parent = p.path.slice(0, p.path.lastIndexOf('/')) || '/';
-      tab.sftpPath = parent;
-      refreshSftpPanel(tabId);
-      toggleSearchBar(tabId);
-    });
-    results.appendChild(item);
-  });
-  searchUnlisteners.set(tabId, un);
-
   try {
-    await sftpCall('sftp_search', {
-      sessionId: tab.sessionId, rootPath: tab.sftpPath, query,
-    });
+    await call('sftp_search', { sessionId: tab.sessionId, rootPath: tab.sftpPath, query, searchId: search.id });
   } catch (e) {
+    if (sftpSearches.get(tabId) !== search) return;
+    sftpSearches.delete(tabId);
     status.textContent = 'Search failed: ' + (e.message || e);
-    sftpDisposeSearch(tabId);
   }
 }
 
@@ -1984,9 +2295,7 @@ async function openBookmarkMenu(ev, tabId) {
     item.innerHTML = `${ico('star')}<span>${escapeHtml(b.name)}</span>`;
     item.addEventListener('click', () => {
       closeKeyConnectMenu();
-      tab.sftpPath = b.remotePath;
-      if (b.localPath) tab.localPath = b.localPath;
-      refreshSftpPanel(tabId);
+      refreshSftpPanel(tabId, { path: b.remotePath, localPath: b.localPath || undefined });
     });
     item.addEventListener('contextmenu', async (e) => {
       e.preventDefault();
@@ -2018,14 +2327,7 @@ async function openBookmarkMenu(ev, tabId) {
   });
   menu.appendChild(addBtn);
 
-  menu.style.left = anchorRect.left + 'px';
-  menu.style.top = (anchorRect.bottom + 4) + 'px';
-  document.body.appendChild(menu);
-  const onAway = (e2) => {
-    if (e2.target.closest && e2.target.closest('#keyConnectMenu')) return;
-    closeKeyConnectMenu();
-  };
-  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  sftpShowMenu(menu, anchorRect.left, anchorRect.bottom + 4);
 }
 
 // ─── local pane (dual mode) ─────────────────────────────────────────────────
@@ -2050,14 +2352,20 @@ function applySftpDualChrome(tabId) {
   if (dualBtn) dualBtn.classList.toggle('active', !!tab.dualPane);
 }
 
-function toggleDualPane(tabId) {
-  const tab = sftpTabState(sftpTab(tabId));
+/// `opts.persist: false` opens or closes the pane without saving a layout
+/// preference: a download opens it to show where the file goes, which is not
+/// the user choosing the dual layout for every future session (it used to be
+/// saved as exactly that). The Dual button saves.
+function toggleDualPane(tabId, opts = {}) {
+  const tab = sftpTab(tabId);
   if (!tab) return;
+  sftpTabState(tab);
   tab.dualPane = !tab.dualPane;
   applySftpDualChrome(tabId);
   if (tab.dualPane) refreshLocalPane(tabId);
   // ── agent-e: apply persisted comparison mode + recompute when dual opens ──
   if (typeof sftpCmpApplyPersisted === 'function') sftpCmpApplyPersisted(tabId);
+  if (opts.persist === false) return;
   // Persist the preference globally. Mirror only on success: a failed write
   // used to update state anyway, so the session ran ahead of what the next
   // launch would restore.
@@ -2066,16 +2374,70 @@ function toggleDualPane(tabId) {
     .catch((e) => toast((e && (e.message || e.error)) || String(e), 'err'));
 }
 
-/// Core local-pane refresh: lists, renders rows, updates path + status bar.
-/// Throws on failure (callers decide whether to toast/revert).
-async function sftpUiLocalLoad(tabId) {
-  const tab = sftpTabState(sftpTab(tabId));
-  if (!tab) return;
+/// Core local-pane listing: lists `path` ('' = home; default: the pane's
+/// current folder) and only once that worked makes it the pane's folder and
+/// renders it - the same transaction as the remote side (refreshSftpPanel).
+/// Resolves true when applied, false when a newer listing of this pane
+/// overtook it; throws when it failed, with nothing changed (callers decide
+/// what to say).
+///
+/// As on the remote side, a plain refresh (no `path`) never overtakes a local
+/// navigation still waiting for its listing - a remote refresh in dual mode
+/// re-lists this pane and used to undo the double-click that way. It is held
+/// and runs once the navigation has settled.
+async function sftpUiLocalLoad(tabId, path) {
+  const tab = sftpTab(tabId);
+  if (!tab) return false;
+  const navigating = path !== undefined;
+  if (!navigating && tab._localNavSeq) {
+    tab._localRefreshAfterNav = true;
+    return false;
+  }
+  const seq = tab._localSeq = (tab._localSeq || 0) + 1;
+  if (navigating) {
+    if (tab._localRefreshSeq) tab._localRefreshAfterNav = true; // that refresh is about to be dropped
+    tab._localNavSeq = seq;
+  } else {
+    tab._localRefreshSeq = seq;
+  }
+  try {
+    return await sftpLocalShowListing(tabId, tab, path, seq);
+  } finally {
+    if (tab._localRefreshSeq === seq) tab._localRefreshSeq = 0;
+    if (tab._localNavSeq === seq) {
+      tab._localNavSeq = 0;
+      if (tab._localRefreshAfterNav) {
+        tab._localRefreshAfterNav = false;
+        refreshLocalPane(tabId);
+      }
+    }
+  }
+}
+
+/// One listing request of sftpUiLocalLoad (request number `seq`).
+async function sftpLocalShowListing(tabId, tab, path, seq) {
+  sftpTabState(tab);
   const tbody = document.getElementById('sftpLocalTbody-' + tabId);
   const pathEl = document.getElementById('sftpLocalPath-' + tabId);
-  if (!tbody) return;
-  const r = await sftpCall('sftp_local_list', { path: tab.localPath || '' });
-  tab.localPath = r.path || tab.localPath;
+  if (!tbody) return false;
+  const target = path === undefined ? (tab.localPath || '') : path;
+  let r;
+  try {
+    r = await sftpCall('sftp_local_list', { path: target });
+  } catch (e) {
+    if (seq !== tab._localSeq) return false;
+    throw e;
+  }
+  if (seq !== tab._localSeq || sftpTab(tabId) !== tab) return false;
+  const resolved = r.path || target;
+  if (resolved !== tab.localPath) {
+    // Like the remote pane: a selection of names must not follow the user
+    // into a folder where the same names are other files.
+    tab.localSelected.clear();
+    tab._localLastClicked = null;
+  }
+  tab.localPath = resolved;
+  tab._localLoaded = true;
   tab._localHome = r.home;
   // _localEntries is the cached ARRAY of local entries (Agent E's comparison
   // consumes it; the status bar derives the count via .length).
@@ -2110,9 +2472,9 @@ async function sftpUiLocalLoad(tabId) {
     tr.addEventListener('dblclick', () => {
       if (entry.isDir) {
         if (typeof sftpSyncLocalNav === 'function' && sftpSyncLocalNav(tabId, entry.name)) return;
-        const sep = tab.localPath.endsWith('\\') || tab.localPath.endsWith('/') ? '' : '/';
-        tab.localPath = tab.localPath + sep + entry.name;
-        refreshLocalPane(tabId);
+        // joinLocal keeps the path's own separator; a hard-coded '/' made
+        // `C:\Users\u/Documents`, which Up could no longer take apart.
+        sftpLocalNavigate(tabId, joinLocal(tab.localPath, entry.name));
       } else {
         // Upload this local file to the current remote dir via the queue.
         queueUploads(tabId, [{ local: joinLocal(tab.localPath, entry.name), remote: sftpJoin(tab.sftpPath, entry.name) }]);
@@ -2137,6 +2499,21 @@ async function sftpUiLocalLoad(tabId) {
   // Re-run directory comparison with the fresh local entries (no-op when the
   // pane is closed or comparison is off).
   if (typeof sftpCmpAfterRefresh === 'function') sftpCmpAfterRefresh(tabId);
+  return true;
+}
+
+/// Move the local pane to `path` ('' = home) if it can be listed; otherwise
+/// keep the folder on screen and say why. Every local navigation (double-click,
+/// Open, Up, Home, a typed path, synchronized browsing) goes through here: the
+/// old refresh silently fell back to the home folder on ANY error, so a click
+/// on an unreadable folder looked ignored and lost the user's place.
+async function sftpLocalNavigate(tabId, path) {
+  try {
+    return await sftpUiLocalLoad(tabId, path);
+  } catch (e) {
+    toast(e.message || String(e), 'err');
+    return false;
+  }
 }
 
 /// Public local-pane refresh: swallows errors with a toast (existing callers).
@@ -2249,13 +2626,12 @@ function openSftpLocalMenu(x, y, tabId, entry) {
     if (!multi && entry.isDir) {
       mk('Open', 'folder-open', () => {
         if (typeof sftpSyncLocalNav === 'function' && sftpSyncLocalNav(tabId, entry.name)) return;
-        tab.localPath = joinLocal(tab.localPath, entry.name);
-        refreshLocalPane(tabId);
+        sftpLocalNavigate(tabId, joinLocal(tab.localPath, entry.name));
       });
     }
-    // sftp_upload walks a directory itself (upload_directory), so this is the
-    // same entry for files and folders rather than two that differ only in
-    // wording.
+    // The queue expands a folder into one transfer per file (sftp_queue_add),
+    // so this is the same entry for files and folders rather than two that
+    // differ only in wording.
     mk(multi ? `Upload ${names.length} items` : (entry.isDir ? 'Upload folder' : 'Upload'), 'upload-cloud', () => {
       if (!sftpPanelVisible(tab) || !tab.sessionId) { toast('Not connected.', 'err'); return; }
       queueUploads(tabId, names.map(n => ({
@@ -2296,14 +2672,7 @@ function openSftpLocalMenu(x, y, tabId, entry) {
   }
   mk('Refresh', 'refresh-cw', () => refreshLocalPane(tabId));
 
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-  document.body.appendChild(menu);
-  const onAway = (ev) => {
-    if (ev.target.closest && ev.target.closest('#keyConnectMenu')) return;
-    closeKeyConnectMenu();
-  };
-  setTimeout(() => document.addEventListener('mousedown', onAway, { once: true }), 0);
+  sftpShowMenu(menu, x, y);
 }
 
 /// Prompt for and create a folder in the local pane (the dual-pane counterpart
@@ -2342,8 +2711,8 @@ function sftpLocalRenamePrompt(tabId, entry) {
 }
 
 /// Delete the selected local entries, after a confirmation that names them.
-/// Unlike the remote pane's delete there is no in-flight guard flag: local
-/// removal is synchronous on the backend and cannot interleave.
+/// The folder and each entry's kind are taken when the question is asked, so
+/// a "yes" removes exactly what it named even if the pane moved meanwhile.
 async function sftpLocalDelete(tabId, names, entry) {
   const tab = sftpTab(tabId);
   if (!tab || !names.length) return;
@@ -2355,15 +2724,17 @@ async function sftpLocalDelete(tabId, names, entry) {
     ? (anyDir
       ? `Delete the local folder "${names[0]}" and everything inside it? This cannot be undone.`
       : `Delete the local file "${names[0]}"? This cannot be undone.`)
-    : `Delete these ${names.length} local items? This cannot be undone.`;
+    : `Delete these ${names.length} local items (${sftpNameList(names)})? This cannot be undone.`;
+  // The folder the question is about: the pane may move while it is open.
+  const dir = tab.localPath;
+  const kinds = new Map((tab._localEntries || []).map((x) => [x.name, !!x.isDir]));
   sftpConfirmDelete(message, async () => {
     let ok = 0, fail = 0, lastErr = null;
     for (const name of names) {
-      const e = (tab._localEntries || []).find(x => x.name === name);
       try {
         await call('sftp_local_remove', {
-          path: joinLocal(tab.localPath, name),
-          isDir: !!(e && e.isDir),
+          path: joinLocal(dir, name),
+          isDir: !!kinds.get(name),
         });
         tab.localSelected.delete(name);
         ok++;
@@ -2372,21 +2743,28 @@ async function sftpLocalDelete(tabId, names, entry) {
     await refreshLocalPane(tabId);
     if (fail) toast(`${ok} deleted, ${fail} failed${lastErr ? `: ${lastErr}` : ''}`, 'err');
     else toast(ok === 1 ? 'Deleted.' : `${ok} items deleted.`, 'ok');
-  });
+  }, 'local');
 }
 
+/// Re-list the local pane's current folder (the pane opening, a mutation, a
+/// remote navigation in dual mode). A failure keeps the folder and says why,
+/// with one exception: the pane's FIRST load of a remembered folder (a
+/// per-server default, Task 6, or a bookmark's) can find it gone - deleted
+/// since, or remembered on another machine sharing the vault - and then opens
+/// the home folder instead, once, saying which folder was missing.
 async function refreshLocalPane(tabId) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  const firstLoad = !tab._localLoaded;
+  const wanted = tab.localPath;
   try {
     await sftpUiLocalLoad(tabId);
   } catch (e) {
-    // A per-server default directory (Task 6) can go stale - deleted since,
-    // or remembered from a different machine sharing the same vault. Fall
-    // back to the OS home directory once rather than leaving the pane stuck
-    // on a path that no longer resolves on this one.
-    const tab = sftpTab(tabId);
-    if (tab && tab.localPath) {
-      tab.localPath = '';
-      try { await sftpUiLocalLoad(tabId); return; } catch (e2) { toast(e2.message || String(e2), 'err'); return; }
+    if (firstLoad && wanted) {
+      if (await sftpLocalNavigate(tabId, '')) {
+        toast(`Local folder "${wanted}" is not available - showing your home folder instead.`, 'warn');
+      }
+      return;
     }
     toast(e.message || String(e), 'err');
   }
@@ -2418,21 +2796,46 @@ function joinLocal(dir, name) {
   return dir.endsWith(sep) ? dir + name : dir + sep + name;
 }
 
+/// Parent folder of a local path, for Up. Both separators count (Windows takes
+/// either, and a typed path can mix them), a drive letter or UNC share is
+/// kept, and the parent of a first-level folder is the drive ROOT `C:\` -
+/// never the bare `C:`, which Windows reads as "the current directory on drive
+/// C". A root is its own parent. Splitting on one guessed separator turned
+/// `C:\Users\u/Documents` into `/C:\Users\u`, and `/home` into '' (home).
+function sftpLocalParent(p) {
+  if (!p) return p;
+  const unc = /^(\\\\|\/\/)[^\\/]+[\\/][^\\/]+/.exec(p);
+  const drive = !unc && /^[A-Za-z]:/.exec(p);
+  const prefix = unc ? unc[0] : drive ? drive[0] : '';
+  const root = unc ? prefix.replace(/\//g, '\\') + '\\' : drive ? prefix + '\\' : '/';
+  const parts = p.slice(prefix.length).split(/[\\/]+/).filter(Boolean);
+  parts.pop();
+  return parts.length ? root + parts.join(root === '/' ? '/' : '\\') : root;
+}
+
 function localNavigateUp(tabId) {
   const tab = sftpTab(tabId);
   if (!tab || !tab.localPath) return;
   if (typeof sftpSyncLocalUp === 'function' && sftpSyncLocalUp(tabId)) return;
-  const sep = tab.localPath.includes('\\') && !tab.localPath.includes('/') ? '\\' : '/';
-  const parts = tab.localPath.split(sep).filter(Boolean);
-  parts.pop();
-  if (!parts.length) { tab.localPath = ''; refreshLocalPane(tabId); return; }
-  let up = parts.join(sep);
-  if (sep === '/') up = '/' + up;
-  tab.localPath = up;
-  refreshLocalPane(tabId);
+  const up = sftpLocalParent(tab.localPath);
+  if (up === tab.localPath) return; // a drive or file-system root has no parent
+  sftpLocalNavigate(tabId, up);
 }
 
 // ─── downloads / uploads via the queue ──────────────────────────────────────
+
+/// What sftp_queue_add left out or changed while expanding a request (Task 10:
+/// symbolic links and special files skipped, unreadable folders, unusable
+/// names, colliding downloads renamed): every line goes to the activity log
+/// and the first to a toast, so nothing drops out of a transfer unseen.
+function sftpReportQueueWarnings(tabId, r) {
+  const warnings = (r && r.warnings) || [];
+  if (!warnings.length) return;
+  for (const w of warnings) sftpLog(tabId, `queue: ${w}`);
+  toast(warnings.length === 1
+    ? warnings[0]
+    : `${warnings[0]} (and ${warnings.length - 1} more - see the activity log)`, 'warn');
+}
 
 /// Download remote paths into an EXPLICIT local dir (drag onto a folder),
 /// bypassing queueDownloads' local-pane-cwd default. Falls back to it when
@@ -2441,7 +2844,7 @@ async function queueDownloadsInto(tabId, remotePaths, dir) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   sftpTabState(tab);
-  if (!tab.dualPane) toggleDualPane(tabId);
+  if (!tab.dualPane) toggleDualPane(tabId, { persist: false });
   const target = dir || tab.localPath;
   if (!target) {
     queueDownloads(tabId, remotePaths);
@@ -2456,6 +2859,7 @@ async function queueDownloadsInto(tabId, remotePaths, dir) {
       preserveTs: !!tab.sftpPreserveTs,
     });
     sftpLog(tabId, `queued ${r.added} download(s) → ${target}`);
+    sftpReportQueueWarnings(tabId, r);
     if (r.added > 0) toast(`${r.added} download(s) → ${target}`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
@@ -2467,7 +2871,7 @@ async function queueDownloads(tabId, remotePaths) {
   // local pane isn't open, open it so the destination is always visible -
   // never a hidden temp folder. Explicit placement stays on "Download as...".
   sftpTabState(tab);
-  if (!tab.dualPane) toggleDualPane(tabId);
+  if (!tab.dualPane) toggleDualPane(tabId, { persist: false });
   if (!tab.localPath) {
     // Local listing hasn't loaded yet (toggle just opened it) - wait briefly.
     await new Promise(r => setTimeout(r, 600));
@@ -2480,14 +2884,20 @@ async function queueDownloads(tabId, remotePaths) {
   try {
     // Conflict check: does <dir>/<name> already exist locally? Directory
     // sources are expanded server-side later, so only plain files are
-    // pre-checked (FileZilla does the same for its existence dialog).
-    const localEntries = await sftpLocalEntryMap(dir);
+    // pre-checked (FileZilla does the same for its existence dialog). A
+    // Windows folder matches names without regard to case, as NTFS does:
+    // otherwise Readme.md replaced README.md without a prompt.
+    const caseless = sftpIsWindowsPath(dir);
+    const fold = (n) => (caseless ? n.toLowerCase() : n);
+    const localEntries = await sftpLocalEntryMap(dir, caseless);
+    const names = remotePaths.map((p) => p.split('/').filter(Boolean).pop()).filter(Boolean);
+    const taken = sftpTakenNames([...localEntries.values()].map((e) => e.name).concat(names), caseless);
     const conflicts = [];
     for (const p of remotePaths) {
       const name = p.split('/').filter(Boolean).pop();
       if (!name) continue;
-      const dest = localEntries.get(name);
-      if (dest) conflicts.push({ remote: p, name, destDir: dir, destEntry: dest });
+      const dest = localEntries.get(fold(name));
+      if (dest) conflicts.push({ remote: p, name, destDir: dir, destEntry: dest, taken });
     }
     const decided = await resolveBatchConflicts(tabId, 'download', conflicts);
     if (!decided) return; // user cancelled the whole batch
@@ -2516,6 +2926,7 @@ async function queueDownloads(tabId, remotePaths) {
       preserveTs: !!tab.sftpPreserveTs,
     });
     sftpLog(tabId, `queued ${r.added} download(s) → ${dir}`);
+    sftpReportQueueWarnings(tabId, r);
     if (r.added > 0) toast(`${r.added} download(s) → ${dir}`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
@@ -2545,10 +2956,14 @@ async function queueUploads(tabId, pairs) {
         // backend will surface the real error if the upload can't proceed.
         continue;
       }
+      // Every name this folder will hold once the batch lands - its listing
+      // plus each upload's own target - shared by the conflicts aimed at it,
+      // so a Rename picks a name that is still free (see applyConflictAction).
+      const baseName = (p) => p.split('/').filter(Boolean).pop();
+      const taken = sftpTakenNames([...remoteEntries.get(dir).keys(), ...group.map((g) => baseName(g.remote))], false);
       for (const { local, remote } of group) {
-        const name = remote.split('/').filter(Boolean).pop();
-        const dest = remoteEntries.get(dir).get(name);
-        if (dest) conflicts.push({ local, remote, destDir: dir, destEntry: dest });
+        const dest = remoteEntries.get(dir).get(baseName(remote));
+        if (dest) conflicts.push({ local, remote, destDir: dir, destEntry: dest, taken });
       }
     }
     const decided = await resolveBatchConflicts(tabId, 'upload', conflicts);
@@ -2574,6 +2989,7 @@ async function queueUploads(tabId, pairs) {
       preserveTs: !!tab.sftpPreserveTs,
     });
     sftpLog(tabId, `queued ${r.added} upload(s)`);
+    sftpReportQueueWarnings(tabId, r);
     if (r.added > 0) toast(`${r.added} upload(s) queued.`, 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
@@ -2582,12 +2998,27 @@ async function queueUploads(tabId, pairs) {
 
 const CONFLICT_ACTIONS = ['overwrite', 'skip', 'rename', 'resume'];
 
-/// Read a local directory once and index it by file name.
-async function sftpLocalEntryMap(dir) {
+/// Read a local directory once and index it by file name - lower-cased when
+/// `caseless` (a Windows folder), so lookups must fold the same way.
+async function sftpLocalEntryMap(dir, caseless) {
   const r = await sftpCall('sftp_local_list', { path: dir });
   const map = new Map();
-  for (const e of r.entries || []) map.set(e.name, e);
+  for (const e of r.entries || []) map.set(caseless ? e.name.toLowerCase() : e.name, e);
   return map;
+}
+
+/// A Windows local path: a drive letter, a UNC share, or backslashes only.
+/// Such folders treat names without regard to case.
+function sftpIsWindowsPath(p) {
+  return /^[A-Za-z]:([\\/]|$)/.test(p || '') || /^\\\\/.test(p || '') || (/\\/.test(p || '') && !/\//.test(p || ''));
+}
+
+/// The names a destination folder will hold, for picking a free "name (n)":
+/// compared without case where the folder ignores it.
+function sftpTakenNames(names, caseless) {
+  const fold = (n) => (caseless ? n.toLowerCase() : n);
+  const set = new Set(names.map(fold));
+  return { has: (n) => set.has(fold(n)), add: (n) => { set.add(fold(n)); } };
 }
 
 /// Load the persisted default action for a direction. NOTE: settings_get
@@ -2635,8 +3066,9 @@ function fmtSftpTime(ms) {
 
 /// Decide the action for every conflict in a batch. Returns an array of
 /// { ..., action, renameRemote?/localName? } for the conflicted items only,
-/// or null when the user cancels the whole batch. Non-conflicting items are
-/// never blocked - they enqueue as overwrite.
+/// or null when the whole batch is cancelled - by the user, or because there
+/// is no dialog to ask with. Non-conflicting items are never blocked - they
+/// enqueue as overwrite (their targets do not exist).
 async function resolveBatchConflicts(tabId, direction, conflicts) {
   if (!conflicts.length) return [];
   const tab = sftpTab(tabId);
@@ -2647,11 +3079,17 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
     sftpLog(tabId, `${conflicts.length} conflict(s) auto-${defaults} (setting)`);
     return applied;
   }
-  if (!tab) return conflicts.map(() => ({ action: 'overwrite' }));
+  // Fail closed: with no tab or no dialog there is nobody to ask, and the
+  // answer this used to assume - overwrite - is the one that destroys files.
+  if (!tab) return null;
 
   return await new Promise(resolve => {
     const modal = document.getElementById('conflictModal');
-    if (!modal) { resolve(conflicts.map(c => applyConflictAction(c, 'overwrite', direction))); return; }
+    if (!modal) {
+      toast('Transfer cancelled: some targets already exist and the dialog to choose what happens to them is missing.', 'err');
+      resolve(null);
+      return;
+    }
     const title = document.getElementById('conflictTitle');
     const summary = document.getElementById('conflictSummary');
     const listEl = document.getElementById('conflictList');
@@ -2740,7 +3178,9 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
         rb.name = `conflict-action-${idx}`;
         rb.id = id;
         rb.value = act;
-        rb.checked = act === 'overwrite';
+        // Every file starts on Skip: an overwrite is as irreversible as a
+        // delete, so it has to be chosen, never fallen into.
+        rb.checked = act === 'skip';
         const lab = document.createElement('label');
         lab.className = 'conflict-action';
         lab.htmlFor = id;
@@ -2771,13 +3211,13 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
       const out = [];
       for (const { c, actions } of rows) {
         const sel = actions.querySelector('input[type="radio"]:checked');
-        const act = sel ? sel.value : 'overwrite';
+        const act = sel ? sel.value : 'skip';
         out.push(applyConflictAction(c, act, direction));
       }
       if (always.checked) {
         // The "always" action is the first row's choice (all rows start at
         // the same default and FileZilla applies one action to the rest).
-        const first = out[0] ? out[0].action : 'overwrite';
+        const first = out[0] ? out[0].action : 'skip';
         const key = direction === 'upload' ? 'sftpConflictUpload' : 'sftpConflictDownload';
         call('settings_set', { key, value: first }).then(() => {
           sftpConflictDefaults[key] = first;
@@ -2794,7 +3234,10 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
     modal.onclick = (ev) => { if (ev.target === modal) { close(); resolve(null); } };
 
     modal.hidden = false;
-    applyBtn.focus();
+    // Cancel has the focus, as on the delete prompt: a reflexive Enter must
+    // not be what overwrites. Deferred like confirmModal's, so the modal
+    // manager first records the control focus returns to.
+    setTimeout(() => cancelBtn.focus(), 0);
   });
 }
 
@@ -2815,21 +3258,26 @@ function renderConflictCmp(srcCell, dstCell, srcEntry, dstEntry, isUp) {
   }
 }
 
-/// Attach the chosen action to a conflict record. Rename computes the free
-/// name against the destination listing (plus names already claimed by this
-/// batch) and reports the adjusted destination:
-///   upload → renameRemote (new remote path, applied today)
-///   download → localName (honored by the backend once Agent B's update
-///              lands; today the remote basename wins = overwrite)
-function applyConflictAction(c, action, direction, extraTaken) {
-  const out = { ...c, action };
+/// Attach the chosen action to a conflict record. Rename picks the first free
+/// "name (n)" against `c.taken` - every name the destination folder will hold
+/// once the batch lands (its listing plus the batch's own targets, built by
+/// queueUploads / queueDownloads and shared by the batch's conflicts) - and
+/// claims it there, so the next rename cannot pick it too. Checking only the
+/// conflicting file's own name chose an existing "a (1).txt" and the transfer
+/// then replaced it. Reports the adjusted destination:
+///   upload → renameRemote (new remote path)
+///   download → localName (the backend's expand_download writes it)
+function applyConflictAction(c, action, direction) {
+  const { taken: sharedTaken, ...rest } = c;
+  const out = { ...rest, action };
   if (action !== 'rename') return out;
   const name = direction === 'upload'
     ? c.remote.split('/').filter(Boolean).pop()
     : (c.destEntry && c.destEntry.name) || c.remote.split('/').filter(Boolean).pop();
-  const taken = new Set(extraTaken || []);
+  const taken = sharedTaken || sftpTakenNames([], false);
   if (c.destEntry && c.destEntry.name) taken.add(c.destEntry.name);
   const free = sftpFreeName(name, taken);
+  taken.add(free);
   if (direction === 'upload') {
     const dir = c.remote.slice(0, c.remote.lastIndexOf('/')) || '/';
     out.renameRemote = sftpJoin(dir, free);
@@ -2855,11 +3303,53 @@ async function sftpOpenForEdit(tabId, fullPath, name) {
   if (!tab) return;
   try {
     const r = await sftpCall('sftp_open_for_edit', { sessionId: tab.sessionId, remote: fullPath });
+    // The save watch exists from here on (even if no editor opens), so the
+    // file's menu offers to stop it (sftpStopEdit).
+    (tab._edits || (tab._edits = new Set())).add(fullPath);
     await call('system_open_external', { url: r.localPath });
     sftpLog(tabId, `editing ${name} (auto-sync on save)`);
     toast(`Editing ${name} - saves upload automatically.`, 'info');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
+
+/// "Stop editing": end the save-back of a file opened in an external editor
+/// (sftp_close_edit also removes the local copy). Saves made after this stay
+/// on this computer.
+async function sftpStopEdit(tabId, fullPath) {
+  const tab = sftpTab(tabId);
+  if (!tab) return;
+  try {
+    await call('sftp_close_edit', { sessionId: tab.sessionId, remote: fullPath });
+    if (tab._edits) tab._edits.delete(fullPath);
+    sftpLog(tabId, `stopped syncing ${fullPath}`);
+    toast(`Stopped syncing "${fullPath.split('/').filter(Boolean).pop() || fullPath}".`, 'info');
+  } catch (e) { toast(e.message || String(e), 'err'); }
+}
+
+/// Every save-back of a file open in an external editor is reported (Task 10:
+/// `sftp-edit-sync {sessionId, remote, ok, error?}`). A failed upload used to
+/// be silent, so a user could close the editor believing the change was live
+/// on the server.
+function sftpOnEditSync(ev) {
+  const p = (ev && ev.payload) || {};
+  const tab = [...state.sessions.values()].find((t) => t.sessionId && t.sessionId === p.sessionId);
+  const remote = String(p.remote || '');
+  const name = remote.split('/').filter(Boolean).pop() || remote || 'file';
+  if (p.ok) {
+    if (tab) {
+      sftpLog(tab.tabId, `saved ${remote} to the server`);
+      // The file changed on the server: so did its folder's listing.
+      sftpCacheInvalidate(tab, sftpParent(remote));
+      tab._listingDirty = true;
+    }
+    toast(`Saved "${name}" to ${(tab && tab.serverName) || 'the server'}.`, 'ok');
+  } else {
+    const why = p.error || 'unknown error';
+    if (tab) sftpLog(tab.tabId, `save of ${remote} FAILED: ${why}`);
+    toast(`Could not save "${name}" to the server: ${why}. The edit is only on this computer.`, 'err');
+  }
+}
+sftpListen('sftp-edit-sync', sftpOnEditSync).catch(() => {});
 
 // Server-to-server "Send to": enqueues a queue job that downloads from the
 // source and uploads to the target on fresh SFTP channels (the interactive
@@ -2883,14 +3373,19 @@ async function sftpSendTo(fromTabId, fullPath, targetTab) {
 // ─── transfer queue panel ───────────────────────────────────────────────────
 
 const queueJobs = new Map(); // id -> job
-let queueUnlisten = null;
+let queueWired = false;
 // Which tab is visible. Paused jobs (user-paused, or restored from a
 // previous run - see sftpQueueJobResumable) fold into "queued" rather than
 // getting a 4th tab: they're still "waiting their turn", just deliberately
 // held, and the row rendering (paused fill color, Resume action, the
 // restored-jobs banner) already carries the distinction that matters.
+// Cancelled jobs fold into "failed": that is where their Retry button is.
 let queueTab = 'queued'; // which tab is visible: queued | failed | done
 let sftpUiQueueH = null; // persisted queue-panel height (px) set by the drag handle
+
+/// Most rows the list draws at once. Running jobs are never cut; past the cap
+/// a line says how many were left out.
+const SFTP_QUEUE_ROW_CAP = 100;
 
 // Pause/resume glyphs aren't in the shared ICONS table (icons.js is out of
 // scope for this pass) - inline the same feather-style stroke icons locally
@@ -2898,49 +3393,76 @@ let sftpUiQueueH = null; // persisted queue-panel height (px) set by the drag ha
 const Q_ICON_PAUSE = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>';
 const Q_ICON_RESUME = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 4 20 12 6 20 6 4"/></svg>';
 
-/// True when some tab holds a live session matching this id - i.e. resuming
-/// this job can actually reach a server rather than failing immediately.
-/// Restored jobs point at a sessionId from the previous run, which no longer
-/// exists once the app has restarted.
+/// "12.5 MB/s" - a transfer rate in the unit that fits (it was always KB/s,
+/// so 10 MB/s read "10240.0 KB/s").
+function sftpFormatRate(bytesPerSec) {
+  return formatSftpSize(Math.round(bytesPerSec || 0)) + '/s';
+}
+
+/// True when some tab holds a live session matching this id. Only used for
+/// jobs that carry no server id (queued before the queue recorded one).
 function sftpQueueLiveSession(sessionId) {
   if (!sessionId) return false;
   return [...state.sessions.values()].some(t => t.sessionId === sessionId);
 }
 
-/// A paused job is only safely resumable when every session it touches is
-/// still live - for a serverCopy that means both the source AND the target.
-/// resume_job (Rust) doesn't check this itself; it just flips the state to
-/// Queued and lets the job fail on its next attempt, which would blow away
-/// the helpful "needs reconnect" error a restored job carries. So the
-/// renderer checks first and refuses to offer a Resume that can't work.
+/// Is a connected tab open on this saved server? The backend resumes or
+/// retries a job whose session is gone on the newest live session of the
+/// SAME SERVER (Task 10), so that - not the job's original session id - is
+/// what decides whether Resume can work. Matching the session id meant a job
+/// restored after a restart could never be resumed: a reconnect always makes
+/// a new session id, while the UI told the user to reconnect.
+function sftpQueueServerLive(serverId) {
+  if (!serverId) return false;
+  return [...state.sessions.values()].some(t =>
+    t.serverId === serverId && t.sessionId && window.tabSessionLive(t.tabId));
+}
+
+/// A paused job can resume when every server it touches is connected - for a
+/// serverCopy that is the source AND the target. A job with no server id
+/// (from before ids were recorded) falls back to its session id. The
+/// renderer checks first so it never offers a Resume that cannot work.
 function sftpQueueJobResumable(j) {
-  if (!sftpQueueLiveSession(j.sessionId)) return false;
-  if (j.kind === 'serverCopy' && j.targetSessionId && !sftpQueueLiveSession(j.targetSessionId)) return false;
+  const live = (serverId, sessionId) => (serverId ? sftpQueueServerLive(serverId) : sftpQueueLiveSession(sessionId));
+  if (!live(j.serverId, j.sessionId)) return false;
+  if (j.kind === 'serverCopy' && (j.targetServerId || j.targetSessionId) && !live(j.targetServerId, j.targetSessionId)) return false;
   return true;
 }
 
+/// Failed jobs already mirrored into a tab's activity log. A flag on the job
+/// object did not work: every snapshot replaces the object, so each one
+/// logged every failure again and pushed real history out of the log.
+const sftpQueueLoggedFailures = new Set();
+
 function wireQueueEvents() {
-  if (queueUnlisten) return;
+  if (queueWired) return;
+  queueWired = true;
   sftpListen('sftp-queue', (ev) => {
     for (const j of ev.payload.jobs || []) {
       queueJobs.set(j.id, j);
-      // Mirror failures into the active tab's log + status strip.
-      if (j.state === 'failed' && !j._logged) {
-        j._logged = true;
-        const tab = [...state.sessions.values()].find(t => t.sessionId === j.sessionId);
-        if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath || j.localPath} - ${j.error || 'error'}`);
-      }
+      // Mirror failures into the tab's log + status strip, once per failure
+      // (a retried job that fails again is logged again).
+      if (j.state !== 'failed') { sftpQueueLoggedFailures.delete(j.id); continue; }
+      if (sftpQueueLoggedFailures.has(j.id)) continue;
+      sftpQueueLoggedFailures.add(j.id);
+      const tab = [...state.sessions.values()].find(t => t.sessionId === j.sessionId);
+      if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath || j.localPath} - ${j.error || 'error'}`);
     }
     renderQueuePanel();
-  }).then(un => { queueUnlisten = un; });
+  }).then(() => {
+    // The starting state, asked for ONCE, now that its answer (an sftp-queue
+    // event carrying the snapshot) has a listener. renderQueuePanel used to
+    // ask whenever the list was empty - and the answer re-rendered the still
+    // empty list, which asked again: an endless IPC loop from one click.
+    call('sftp_queue_list').catch(() => {});
+  }).catch(() => { queueWired = false; });
 }
 
 /// Countdown ticker for auto-retry backoffs (Task 2). A single shared
 /// interval for the module's whole lifetime - never one per row - so there
-/// is nothing to leak as rows are rebuilt on every render or the panel is
-/// hidden: it just checks whether any job currently needs a tick and no-ops
-/// otherwise. renderQueuePanel() is idempotent (it always redraws the full
-/// list from queueJobs), so re-invoking it here is exactly as safe as the
+/// is nothing to leak as the panel is hidden: it just checks whether any job
+/// currently needs a tick and no-ops otherwise. renderQueuePanel() patches
+/// the rows in place, so re-invoking it here is exactly as safe as the
 /// backend pushing another sftp-queue event.
 setInterval(() => {
   if (!document.getElementById('sftpQueueList')) return;
@@ -3015,6 +3537,7 @@ function buildQueuePanel() {
     b.className = 'sftp-queuetab';
     b.dataset.tab = t;
     b.textContent = t[0].toUpperCase() + t.slice(1);
+    if (t === 'failed') b.title = 'Failed and cancelled transfers - Retry starts one again';
     b.addEventListener('click', () => {
       queueTab = t;
       renderQueuePanel();
@@ -3033,7 +3556,7 @@ function buildQueuePanel() {
   const resumeAllBtn = document.createElement('button');
   resumeAllBtn.className = 'ghost-btn';
   resumeAllBtn.textContent = 'Resume all';
-  resumeAllBtn.title = 'Resume every paused transfer whose session is still connected';
+  resumeAllBtn.title = 'Resume every paused transfer whose server is connected';
   resumeAllBtn.addEventListener('click', () => sftpQueueResumeAllResumable());
   const clearBtn = document.createElement('button');
   clearBtn.className = 'ghost-btn';
@@ -3054,8 +3577,8 @@ function buildQueuePanel() {
   head.appendChild(headActions);
 
   // Restored-transfer banner (Task 5): hidden until renderQueuePanel finds a
-  // paused job whose session died with the previous run (see
-  // sftpQueueJobResumable). Plain textContent below - only ever a count.
+  // paused job whose server is not connected (see sftpQueueJobResumable).
+  // Plain textContent below - only ever a count.
   const restoredBanner = document.createElement('div');
   restoredBanner.className = 'sftp-queuebanner';
   restoredBanner.id = 'sftpQueueRestoredBanner';
@@ -3086,32 +3609,27 @@ function buildQueuePanel() {
   return panel;
 }
 
-/// "Resume all" (Task 1/5): sftp_queue_resume_all (Rust) resumes every
-/// Paused job unconditionally, with no idea which sessions are actually
-/// still connected. Calling it directly here would blow past the whole
-/// point of Task 5 - a restored job with a dead session would get bounced
-/// straight to Failed, losing its helpful "reconnect to X" message. So this
-/// resumes jobs one at a time, only the ones sftpQueueJobResumable() says
-/// can actually reach a server, and reports how many were left behind.
+/// "Resume all": one sftp_queue_resume_all. Since Task 10 the backend resumes
+/// what it can rebind to a connected session of the job's server and leaves
+/// the rest paused with a "reconnect" note, so it is safe to call blindly and
+/// the per-job loop that worked around it is gone. Which jobs will stay
+/// paused is still worked out here, to say so.
 async function sftpQueueResumeAllResumable() {
   const paused = [...queueJobs.values()].filter(j => j.state === 'paused');
-  const resumable = paused.filter(sftpQueueJobResumable);
-  const skipped = paused.length - resumable.length;
-  if (!resumable.length) {
-    toast(skipped ? 'Those paused transfers need a reconnect first.' : 'Nothing paused to resume.', 'info');
-    return;
-  }
-  await Promise.all(resumable.map(j =>
-    call('sftp_queue_resume', { jobId: j.id }).catch(e => toast(e.message || String(e), 'err'))
-  ));
-  if (skipped) toast(`Resumed ${resumable.length} - ${skipped} more need a reconnect first.`, 'info');
+  if (!paused.length) { toast('Nothing paused to resume.', 'info'); return; }
+  const skipped = paused.filter(j => !sftpQueueJobResumable(j)).length;
+  try {
+    await call('sftp_queue_resume_all');
+  } catch (e) { toast(e.message || String(e), 'err'); return; }
+  if (skipped === paused.length) toast('Those paused transfers need a reconnect first.', 'info');
+  else if (skipped) toast(`Resumed ${paused.length - skipped} - ${skipped} more need a reconnect first.`, 'info');
 }
 
 // ─── transfer queue: grouping ───────────────────────────────────────────────
 
 /// Group headers the user has collapsed, keyed by server + directory path.
-/// renderQueuePanel redraws the whole list once a second while anything is
-/// moving, so this cannot live in the DOM.
+/// The list is redrawn from queueJobs on every change, so this cannot live
+/// in the DOM.
 const sftpQueueCollapsed = new Set();
 
 function sftpQueueGroupKey(server, dirPath) { return server + '\u0000' + dirPath; }
@@ -3186,44 +3704,112 @@ function sftpQueueGroupEl(kind, label, key, depth, count) {
   return row;
 }
 
-function sftpQueueRenderGroups(list, jobs) {
+/// The list as a plan, in display order: group headers and job rows, with
+/// their depth. Nothing is drawn here - renderQueuePanel compares plans to
+/// decide whether anything but the numbers changed.
+function sftpQueuePlan(jobs) {
+  const plan = [];
   const byName = (a, b) => a.name.localeCompare(b.name);
-  const renderNode = (server, node, dirPath, depth) => {
+  const addNode = (server, node, dirPath, depth) => {
     for (const child of [...node.dirs.values()].sort(byName)) {
       const flat = sftpQueueFlattenChain(child);
       const path = dirPath + '/' + flat.name;
       const key = sftpQueueGroupKey(server, path);
-      list.appendChild(sftpQueueGroupEl('dir', flat.name, key, depth, sftpQueueCountJobs(flat.node)));
-      if (!sftpQueueCollapsed.has(key)) renderNode(server, flat.node, path, depth + 1);
+      plan.push({ group: 'dir', label: flat.name, key, depth, count: sftpQueueCountJobs(flat.node) });
+      if (!sftpQueueCollapsed.has(key)) addNode(server, flat.node, path, depth + 1);
     }
     // Files sit alongside the subfolders at their own level, not after all of
     // them, which is what "maybe a file here" in a directory listing means.
     for (const j of node.jobs.slice().sort((a, b) =>
       sftpQueueJobName(a).localeCompare(sftpQueueJobName(b)))) {
-      list.appendChild(sftpQueueRowEl(j, depth));
+      plan.push({ job: j, depth });
     }
   };
   for (const s of sftpQueueTree(jobs)) {
     const key = sftpQueueGroupKey(s.name, '');
-    list.appendChild(sftpQueueGroupEl('server', s.name, key, 0, s.total));
-    if (!sftpQueueCollapsed.has(key)) renderNode(s.name, s.root, '', 1);
+    plan.push({ group: 'server', label: s.name, key, depth: 0, count: s.total });
+    if (!sftpQueueCollapsed.has(key)) addNode(s.name, s.root, '', 1);
   }
+  return plan;
 }
 
 function sftpQueueJobName(j) {
   return (j.remotePath || '').split('/').filter(Boolean).pop() || '?';
 }
 
-/// One transfer row, indented to `depth` so it lines up under its directory.
-function sftpQueueRowEl(j, depth) {
+// ─── transfer queue: rows, patched in place ─────────────────────────────────
+//
+// Progress arrives as an sftp-queue event per running job several times a
+// second. The list used to be rebuilt from scratch for every one of them, so
+// the Pause or Cancel button under the pointer was replaced between mousedown
+// and mouseup and the click never happened - stopping a running transfer was
+// unreliable exactly while it ran. Each job now keeps ONE row element for as
+// long as it is listed: an event updates its text and bar in place, its
+// buttons are rebuilt only when its state changes, and the list is re-ordered
+// only when its structure (which rows, which groups) changes.
+
+/// jobId -> the row element showing it.
+const sftpQueueRows = new Map();
+/// Structure the list was last drawn with (see renderQueuePanel).
+let sftpQueueLayout = '';
+
+/// Build the fixed skeleton of one transfer row; sftpQueueFillRow puts the
+/// job's current numbers in. Dynamic text goes in through textContent only.
+function sftpQueueBuildRow(j) {
   const row = document.createElement('div');
-  row.className = 'sftp-queueitem q-state-' + j.state;
-  const name = sftpQueueJobName(j);
-  const dirIcon = j.kind === 'upload'
+  const cell = (cls) => {
+    const s = document.createElement('span');
+    s.className = 'q-cell ' + cls;
+    row.appendChild(s);
+    return s;
+  };
+  const dir = cell('q-dir');
+  dir.innerHTML = j.kind === 'upload'
     ? `<span class="q-dirarrow up" title="Upload">${ico('file-up')}</span>`
     : j.kind === 'serverCopy'
       ? `<span class="q-dirarrow copy" title="Server to server">${ico('send')}</span>`
       : `<span class="q-dirarrow down" title="Download">${ico('download')}</span>`;
+  const name = cell('q-name');
+  const nameText = sftpQueueJobName(j);
+  name.title = nameText;
+  // Verify badge (Task 4): a small marker on jobs that ran (or will run)
+  // with post-transfer SHA-256 verification, so the extra traffic/time it
+  // costs isn't a silent surprise when watching the queue.
+  if (j.verify) {
+    const badge = document.createElement('span');
+    badge.className = 'q-verify';
+    badge.title = 'Verifying with SHA-256 after transfer';
+    badge.innerHTML = ico('shield-check');
+    name.appendChild(badge);
+  }
+  name.appendChild(document.createTextNode(nameText));
+  const route = cell('q-route');
+  route.textContent = j.kind === 'serverCopy' && j.targetServerName
+    ? `${j.serverName || ''} → ${j.targetServerName}`
+    : (j.serverName || '');
+  route.title = route.textContent;
+  const prog = cell('q-prog');
+  const bar = document.createElement('span');
+  bar.className = 'sftp-queuebar';
+  const fill = document.createElement('span');
+  bar.appendChild(fill);
+  const progText = document.createElement('span');
+  progText.className = 'q-progtext';
+  prog.appendChild(bar);
+  prog.appendChild(progText);
+  const speed = cell('q-speed');
+  const eta = cell('q-eta');
+  const err = cell('q-err');
+  const actions = cell('q-act sftp-queueactions');
+  row._q = { fill, progText, speed, eta, err, actions, actionsKey: null };
+  return row;
+}
+
+/// Put a job's current state into its row, touching only what changed.
+function sftpQueueFillRow(row, j, depth) {
+  const q = row._q;
+  row.className = 'sftp-queueitem q-state-' + j.state;
+  row.style.setProperty('--q-depth', String(depth));
   // serverCopy: bytesDone is overall (download half + upload half), so the
   // progress bar maps 0..2×size onto 0..100%.
   const totalUnits = j.kind === 'serverCopy' ? (j.size || 0) * 2 : (j.size || 0);
@@ -3236,21 +3822,13 @@ function sftpQueueRowEl(j, depth) {
   const shownDone = j.kind === 'serverCopy'
     ? Math.min(j.bytesDone || 0, j.size || 0)
     : (j.bytesDone || 0);
-
-  const route = j.kind === 'serverCopy' && j.targetServerName
-    ? `${escapeHtml(j.serverName || '')} → ${escapeHtml(j.targetServerName)}`
-    : escapeHtml(j.serverName || '');
-  const progress = j.size
+  q.fill.className = 'sftp-queuefill' + (j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : j.state === 'paused' ? ' paused' : '');
+  q.fill.style.width = pct + '%';
+  q.progText.textContent = j.size
     ? `${formatSftpSize(shownDone || 0)} / ${formatSftpSize(j.size)}`
     : formatSftpSize(shownDone || 0);
-  const speed = j.speed ? (j.speed / 1024).toFixed(1) + ' KB/s' : '-';
-  const eta = sftpUiQueueEta(j, shownDone);
-  // Verify badge (Task 4): a small marker on jobs that ran (or will run)
-  // with post-transfer SHA-256 verification, so the extra traffic/time
-  // it costs isn't a silent surprise when watching the queue.
-  const verifyBadge = j.verify
-    ? `<span class="q-verify" title="Verifying with SHA-256 after transfer">${ico('shield-check')}</span>`
-    : '';
+  q.speed.textContent = j.speed ? sftpFormatRate(j.speed) : '-';
+  q.eta.textContent = sftpUiQueueEta(j, shownDone);
   // Auto-retry countdown (Task 2): a backoff-queued job carries
   // attempts > 0 and a future retryAt, plus a human error like
   // "connection reset - retrying (2/3)". Pull just the "(2/3)" back out
@@ -3261,79 +3839,63 @@ function sftpQueueRowEl(j, depth) {
   const retrySecs = (j.state === 'queued' && j.retryAt)
     ? Math.max(0, Math.ceil((j.retryAt - Date.now()) / 1000))
     : null;
-  let errDisplay = j.error || '';
+  let errDisplay = j.error || (j.state === 'cancelled' ? 'Cancelled' : '');
   let errClass = '';
   if (retrySecs !== null) {
     const m = errDisplay.match(/\((\d+\/\d+)\)\s*$/);
     errDisplay = `retrying in ${retrySecs}s${m ? ' (' + m[1] + ')' : ''}`;
     errClass = ' retrying';
-  } else if (j.state === 'paused' && j.error) {
-    errClass = ' info'; // restored/paused note, not a failure - don't paint it red
+  } else if ((j.state === 'paused' && j.error) || j.state === 'cancelled') {
+    errClass = ' info'; // a paused note or a cancel, not a failure - don't paint it red
   }
+  q.err.className = 'q-cell q-err' + errClass;
+  q.err.title = j.error || '';
+  q.err.textContent = errDisplay;
+  // The buttons are rebuilt only when what they OFFER changes - not on every
+  // state change: queued -> active offers the same Pause/Cancel, and
+  // replacing them under a pressed pointer ate the click.
+  const resumable = j.state === 'paused' ? sftpQueueJobResumable(j) : null;
+  const actionsKey = j.state === 'active' || j.state === 'queued' ? 'pause'
+    : j.state === 'paused' ? (resumable ? 'resume' : `reconnect:${j.serverName || ''}`)
+      : j.state === 'failed' || j.state === 'cancelled' ? 'retry' : 'none';
+  if (q.actionsKey !== actionsKey) {
+    q.actionsKey = actionsKey;
+    q.actions.replaceChildren(...sftpQueueActionButtons(j, resumable));
+  }
+}
 
-  row.innerHTML = `
-    <span class="q-cell q-dir">${dirIcon}</span>
-    <span class="q-cell q-name" title="${escapeHtml(name || '')}">${verifyBadge}${escapeHtml(name || '?')}</span>
-    <span class="q-cell q-route" title="${route}">${route}</span>
-    <span class="q-cell q-prog">
-      <span class="sftp-queuebar"><span class="sftp-queuefill${j.state === 'failed' ? ' failed' : j.state === 'done' ? ' done' : j.state === 'paused' ? ' paused' : ''}" style="width:${pct}%"></span></span>
-      <span class="q-progtext">${progress}</span>
-    </span>
-    <span class="q-cell q-speed">${speed}</span>
-    <span class="q-cell q-eta">${eta}</span>
-    <span class="q-cell q-err${errClass}" title="${escapeHtml(j.error || '')}">${escapeHtml(errDisplay)}</span>`;
-
-  const actions = document.createElement('span');
-  actions.className = 'q-cell q-act sftp-queueactions';
+function sftpQueueActionButtons(j, resumable) {
+  const btn = (title, iconHtml, cmd) => {
+    const b = document.createElement('button');
+    b.className = 'icon-btn';
+    b.title = title;
+    b.innerHTML = iconHtml;
+    if (cmd) b.addEventListener('click', () => call(cmd, { jobId: j.id }).catch((e) => toast(e.message || String(e), 'err')));
+    return b;
+  };
   if (j.state === 'active' || j.state === 'queued') {
-    const pause = document.createElement('button');
-    pause.className = 'icon-btn';
-    pause.title = 'Pause';
-    pause.innerHTML = Q_ICON_PAUSE;
-    pause.addEventListener('click', () => call('sftp_queue_pause', { jobId: j.id }));
-    actions.appendChild(pause);
-    const cancel = document.createElement('button');
-    cancel.className = 'icon-btn';
-    cancel.title = 'Cancel';
-    cancel.innerHTML = ico('x');
-    cancel.addEventListener('click', () => call('sftp_queue_cancel', { jobId: j.id }));
-    actions.appendChild(cancel);
-  } else if (j.state === 'paused') {
-    const resumable = sftpQueueJobResumable(j);
-    const resume = document.createElement('button');
-    resume.className = resumable ? 'icon-btn' : 'icon-btn disabled';
-    resume.innerHTML = Q_ICON_RESUME;
+    return [btn('Pause', Q_ICON_PAUSE, 'sftp_queue_pause'), btn('Cancel', ico('x'), 'sftp_queue_cancel')];
+  }
+  if (j.state === 'paused') {
+    let resume;
     if (resumable) {
-      resume.title = 'Resume';
-      resume.addEventListener('click', () => call('sftp_queue_resume', { jobId: j.id }));
+      resume = btn('Resume', Q_ICON_RESUME, 'sftp_queue_resume');
     } else {
-      // Session from the previous run (or a since-closed tab) is gone -
-      // resume_job would just fail the job. Disabled, not wired.
-      resume.title = `Reconnect to "${j.serverName || 'the server'}" to resume`;
+      // No connected tab on the job's server - resume_job would leave it
+      // paused anyway. Disabled, not wired.
+      resume = btn(`Reconnect to "${j.serverName || 'the server'}" to resume`, Q_ICON_RESUME, null);
+      resume.className = 'icon-btn disabled';
       resume.disabled = true;
     }
-    actions.appendChild(resume);
     // Cancel is the way off a paused row that can never resume - a job
-    // restored from a previous run whose session is gone. cancel_job
+    // restored from a previous run whose server is gone. cancel_job
     // transitions Paused as well as Queued, so this is not a no-op.
-    const cancel = document.createElement('button');
-    cancel.className = 'icon-btn';
-    cancel.title = 'Cancel';
-    cancel.innerHTML = ico('x');
-    cancel.addEventListener('click', () => call('sftp_queue_cancel', { jobId: j.id }));
-    actions.appendChild(cancel);
+    return [resume, btn('Cancel', ico('x'), 'sftp_queue_cancel')];
   }
   if (j.state === 'failed' || j.state === 'cancelled') {
-    const retry = document.createElement('button');
-    retry.className = 'icon-btn';
-    retry.title = 'Retry';
-    retry.innerHTML = ico('refresh-cw');
-    retry.addEventListener('click', () => call('sftp_queue_retry', { jobId: j.id }));
-    actions.appendChild(retry);
+    return [btn('Retry', ico('refresh-cw'), 'sftp_queue_retry')];
   }
-  row.appendChild(actions);
-  row.style.setProperty('--q-depth', String(depth));
-  return row;
+  return [];
 }
 
 function renderQueuePanel() {
@@ -3352,48 +3914,104 @@ function renderQueuePanel() {
   const queued = jobs.filter(j => j.state === 'queued');
   const paused = jobs.filter(j => j.state === 'paused');
   const failed = jobs.filter(j => j.state === 'failed');
+  const cancelled = jobs.filter(j => j.state === 'cancelled');
   const done = jobs.filter(j => j.state === 'done');
 
   const aggSpeed = active.reduce((s, j) => s + (j.speed || 0), 0);
   const summaryParts = [];
-  if (active.length) summaryParts.push(`${active.length} active · ${(aggSpeed / 1024).toFixed(1)} KB/s`);
+  if (active.length) summaryParts.push(`${active.length} active · ${sftpFormatRate(aggSpeed)}`);
   if (queued.length) summaryParts.push(`${queued.length} queued`);
   if (paused.length) summaryParts.push(`${paused.length} paused`);
-  if (!summaryParts.length && failed.length) summaryParts.push(`${failed.length} failed`);
+  if (!summaryParts.length) {
+    if (failed.length) summaryParts.push(`${failed.length} failed`);
+    if (cancelled.length) summaryParts.push(`${cancelled.length} cancelled`);
+  }
   summary.textContent = summaryParts.join(' · ');
 
   // Restored-transfer banner (Task 5): only the jobs a Resume click would
-  // actually fail on - see sftpQueueJobResumable.
+  // actually leave paused - see sftpQueueJobResumable.
   const staleRestored = paused.filter(j => !sftpQueueJobResumable(j));
   const banner = document.getElementById('sftpQueueRestoredBanner');
   if (banner) {
     banner.hidden = staleRestored.length === 0;
     banner.textContent = staleRestored.length === 1
-      ? '1 transfer from a previous session is paused - reconnect to that server to resume it.'
-      : `${staleRestored.length} transfers from a previous session are paused - reconnect to those servers to resume them.`;
+      ? '1 paused transfer belongs to a server that is not connected - reconnect to it to resume.'
+      : `${staleRestored.length} paused transfers belong to servers that are not connected - reconnect to them to resume.`;
   }
 
-  const shown = queueTab === 'queued'
-    ? [...active, ...queued, ...paused]
-    : queueTab === 'failed' ? failed : done;
+  // Never cut the running jobs (their Pause/Cancel are the only way to stop
+  // them); the waiting ones share the room that is left - queued first, in
+  // the order they run (the next job must stay visible and cancellable before
+  // it starts), then the paused ones, which only run after a Resume and so
+  // are the tail. Cutting the LAST 100 of [active, queued, paused] dropped
+  // exactly the running jobs as soon as a folder transfer queued more than
+  // 100 files; exempting paused jobs drew thousands of rows after "Pause all"
+  // or a restart.
+  let shown;
+  let left = 0;
+  if (queueTab === 'queued') {
+    const waiting = [...queued, ...paused];
+    const room = Math.max(0, SFTP_QUEUE_ROW_CAP - active.length);
+    shown = [...active, ...waiting.slice(0, room)];
+    left = waiting.length - Math.min(waiting.length, room);
+  } else {
+    const all = queueTab === 'failed' ? jobs.filter(j => j.state === 'failed' || j.state === 'cancelled') : done;
+    shown = all.slice(-SFTP_QUEUE_ROW_CAP); // the most recent
+    left = all.length - shown.length;
+  }
 
-  list.innerHTML = '';
   // Grouped rather than flat: server, then the remote directory tree the
   // transfers land in. See sftpQueueTree for why the ordering is what it is.
-  sftpQueueRenderGroups(list, shown.slice(-100));
-  // Ask backend for authoritative state on first render.
-  if (!queueJobs.size) call('sftp_queue_list').catch(() => {});
+  const plan = sftpQueuePlan(shown);
+  for (const p of plan) {
+    if (!p.job) continue;
+    let row = sftpQueueRows.get(p.job.id);
+    if (!row) { row = sftpQueueBuildRow(p.job); sftpQueueRows.set(p.job.id, row); }
+    sftpQueueFillRow(row, p.job, p.depth);
+  }
+  const layout = queueTab + '|' + left + '\n' + plan.map(p => (p.job
+    ? `j${p.job.id}`
+    : `g${p.key}|${p.count}|${sftpQueueCollapsed.has(p.key) ? 1 : 0}`) + '@' + p.depth).join('\n');
+  const expected = plan.length + (left ? 1 : 0);
+  if (layout === sftpQueueLayout && list.childElementCount === expected) return;
+  // The structure changed: lay the list out again, reusing every job's row.
+  sftpQueueLayout = layout;
+  const nodes = plan.map(p => (p.job
+    ? sftpQueueRows.get(p.job.id)
+    : sftpQueueGroupEl(p.group, p.label, p.key, p.depth, p.count)));
+  if (left) {
+    const more = document.createElement('div');
+    more.className = 'sftp-queuemore hint';
+    more.textContent = queueTab === 'queued'
+      ? `+ ${left} more paused or queued transfer${left === 1 ? '' : 's'} not shown.`
+      : `+ ${left} earlier transfer${left === 1 ? '' : 's'} not shown.`;
+    nodes.push(more);
+  }
+  // Drop what goes, then insert what is new: a row that stays where it was
+  // relative to the others is never detached, so a click on it survives even
+  // another job arriving or finishing.
+  const keep = new Set(nodes);
+  for (const child of [...list.children]) if (!keep.has(child)) child.remove();
+  let cursor = list.firstChild;
+  for (const node of nodes) {
+    if (node === cursor) { cursor = cursor.nextSibling; continue; }
+    list.insertBefore(node, cursor);
+  }
+  const listed = new Set(shown.map(j => j.id));
+  for (const id of [...sftpQueueRows.keys()]) if (!listed.has(id)) sftpQueueRows.delete(id);
 }
 
-// Refresh remote listing when a job for this session finishes.
-let lastDoneCount = 0;
+// Refresh the listings a finished transfer changed: the tab on screen within
+// 1.5 s (so a folder of a thousand small files costs one listing, not a
+// thousand), a tab in the background as soon as it is shown again
+// (showSftpForTab). The old ticker looked at the ACTIVE tab only and used the
+// completion up, so a tab whose upload finished while the user was elsewhere
+// showed the folder without the new file when they came back.
 setInterval(() => {
-  const done = [...queueJobs.values()].filter(j => j.state === 'done').length;
-  if (done > lastDoneCount) {
-    const tab = sftpTab(state.activeTabId);
-    if (sftpPanelVisible(tab) && tab.sftpReady) refreshSftpPanel(tab.tabId);
-  }
-  lastDoneCount = done;
+  const tab = sftpTab(state.activeTabId);
+  if (!tab || !tab._listingDirty || !tab.sftpReady || !sftpPanelOnScreen(tab)) return;
+  tab._listingDirty = false;
+  refreshSftpPanel(tab.tabId, { forceFresh: true });
 }, 1500);
 
 // ─── OS drag-and-drop upload ────────────────────────────────────────────────
@@ -3409,7 +4027,13 @@ function wireSftpDrop(_panel, _tabId, _hint) {
   // meant the drop overlay only ever appeared in the first tab ever built.
   win.onDragDropEvent(async (event) => {
     const tab = state.sessions.get(state.activeTabId);
-    if (!sftpPanelVisible(tab)) return;
+    // Only onto a file panel the user can see: dropped while Keys/Settings or
+    // a dialog was in front, a file (a private key, say) used to be uploaded
+    // to the active tab's server without a cue.
+    if (!sftpPanelOnScreen(tab)) {
+      for (const h of document.querySelectorAll('.sftp-drop-hint.dragover')) h.classList.remove('dragover');
+      return;
+    }
     const hint = document.querySelector(`#sftpPanel-${tab.tabId} .sftp-drop-hint`);
     if (!hint) return;
     if (event.payload.type === 'enter' || event.payload.type === 'over') {
@@ -3502,11 +4126,15 @@ function highlightSftpDropTarget(ev) {
 }
 
 /// Local row double-click already uploads; this handles the local tbody as a
-/// DROP TARGET for text/sftp-remote (remote → local download). Event
-/// delegation on the tbody, added once per panel via wireSftpPaneDnd.
-function wireSftpPaneDnd(tabId) {
-  const localBody = document.getElementById('sftpLocalTbody-' + tabId);
-  const remoteBody = document.getElementById('sftpTbody-' + tabId);
+/// DROP TARGET for text/sftp-remote (remote → local download) and the remote
+/// tbody for local → remote uploads and remote moves. Event delegation on the
+/// tbodies, added once per panel. `root` is the panel while it is still being
+/// built (not in the document yet); without it the ids are looked up in the
+/// document.
+function wireSftpPaneDnd(tabId, root) {
+  const find = (id) => (root ? root.querySelector('#' + CSS.escape(id)) : document.getElementById(id));
+  const localBody = find('sftpLocalTbody-' + tabId);
+  const remoteBody = find('sftpTbody-' + tabId);
   if (localBody && !localBody._sftpDndWired) {
     localBody._sftpDndWired = true;
     localBody.addEventListener('dragover', (ev) => {
@@ -3808,13 +4436,12 @@ function sftpCmpUpdateButton(tabId) {
     : 'Compare directories (Ctrl+Y): off → by size → by mtime';
 }
 
-// Keyboard shortcut: Ctrl+Y cycles comparison in the active SFTP tab.
+// Keyboard shortcut: Ctrl+Y cycles comparison in the active SFTP tab - while
+// its panel is in front and the key is not for a text field (sftpShortcutTab).
 document.addEventListener('keydown', (ev) => {
   if (!(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'y') return;
-  const tab = sftpTab(state.activeTabId);
-  if (!sftpPanelVisible(tab)) return;
-  const panel = document.getElementById('sftpPanel-' + tab.tabId);
-  if (!panel) return;
+  const tab = sftpShortcutTab(ev);
+  if (!tab) return;
   ev.preventDefault();
   sftpCmpToggle(tab.tabId);
 });
@@ -3881,10 +4508,10 @@ function sftpSyncSuspend(tabId, side, name) {
 }
 
 /// Remote dblclick into subdir `name`. Returns true when sync handled the
-/// navigation. The local target is verified first; the remote side always
-/// navigates (it's where the dblclick happened), the local side mirrors only
-/// if sync is still on. tab.localPath is set BEFORE any refresh so the
-/// refreshLocalPane nested in refreshSftpPanel lists the new directory.
+/// navigation. The local target is checked first; the remote side always
+/// navigates (it is where the double-click happened) and the local side
+/// follows only while sync is still on - and neither moves unless the remote
+/// listing arrives (refreshSftpPanel's localPath option).
 function sftpSyncRemoteNav(tabId, name) {
   if (!sftpSyncActive(tabId)) return false;
   const tab = sftpTab(tabId);
@@ -3893,14 +4520,11 @@ function sftpSyncRemoteNav(tabId, name) {
   sftpCall('sftp_local_list', { path: targetLocal })
     .then(() => {
       const mirror = sftpSyncIsOn(tabId); // may have been toggled off mid-flight
-      tab.sftpPath = targetRemote;        // remote always navigates (origin of the dblclick)
-      if (mirror) tab.localPath = targetLocal;
-      refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+      refreshSftpPanel(tabId, { path: targetRemote, localPath: mirror ? targetLocal : undefined });
     })
     .catch(() => {
       // Local mirror missing: remote still navigates, sync suspends.
-      tab.sftpPath = targetRemote;
-      refreshSftpPanel(tabId);
+      refreshSftpPanel(tabId, { path: targetRemote });
       sftpSyncSuspend(tabId, 'local', name);
     });
   return true;
@@ -3913,27 +4537,22 @@ function sftpSyncLocalNav(tabId, name) {
   if (!sftpSyncActive(tabId)) return false;
   const tab = sftpTab(tabId);
   const remoteHasDir = (tab._entries || []).some(e => e.isDir && e.name === name);
-  tab.localPath = joinLocal(tab.localPath, name);
+  const targetLocal = joinLocal(tab.localPath, name);
   if (!remoteHasDir) {
-    refreshLocalPane(tabId);
+    sftpLocalNavigate(tabId, targetLocal);
     sftpSyncSuspend(tabId, 'remote', name);
     return true;
   }
-  tab.sftpPath = sftpJoin(tab.sftpPath, name);
-  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  refreshSftpPanel(tabId, { path: sftpJoin(tab.sftpPath, name), localPath: targetLocal });
   return true;
 }
 
-/// Remote "Up" with sync. Returns true when handled. Both paths are updated
-/// before any refresh (avoids an old-listing race between the two panes).
+/// Remote "Up" with sync. Returns true when handled. One request moves both
+/// panes, so there is no old-listing race between them.
 function sftpSyncRemoteUp(tabId) {
   if (!sftpSyncActive(tabId)) return false;
   const tab = sftpTab(tabId);
-  const upRemote = sftpParent(tab.sftpPath);
-  const upLocal = sftpSyncParentLocal(tab.localPath);
-  tab.sftpPath = upRemote;
-  tab.localPath = upLocal;
-  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  refreshSftpPanel(tabId, { path: sftpParent(tab.sftpPath), localPath: sftpLocalParent(tab.localPath) });
   return true;
 }
 
@@ -3942,33 +4561,16 @@ function sftpSyncLocalUp(tabId) {
   if (!sftpSyncActive(tabId)) return false;
   const tab = sftpTab(tabId);
   if (!tab.localPath) { refreshLocalPane(tabId); return true; } // nothing above local root
-  const upLocal = sftpSyncParentLocal(tab.localPath);
-  const upRemote = sftpParent(tab.sftpPath);
-  tab.localPath = upLocal;
-  tab.sftpPath = upRemote;
-  refreshSftpPanel(tabId); // dual mode → also refreshes the local pane
+  refreshSftpPanel(tabId, { path: sftpParent(tab.sftpPath), localPath: sftpLocalParent(tab.localPath) });
   return true;
 }
 
-/// Parent of a local path, mirroring localNavigateUp's separator handling.
-/// Returns '' at/above the local root (home).
-function sftpSyncParentLocal(p) {
-  const sep = p.includes('\\') && !p.includes('/') ? '\\' : '/';
-  const parts = p.split(sep).filter(Boolean);
-  parts.pop();
-  if (!parts.length) return '';
-  let up = parts.join(sep);
-  if (sep === '/') up = '/' + up;
-  return up;
-}
-
-// Keyboard shortcut: Ctrl+Shift+B toggles synchronized browsing.
+// Keyboard shortcut: Ctrl+Shift+B toggles synchronized browsing - under the
+// same conditions as Ctrl+Y (sftpShortcutTab).
 document.addEventListener('keydown', (ev) => {
   if (!(ev.ctrlKey || ev.metaKey) || !ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== 'b') return;
-  const tab = sftpTab(state.activeTabId);
-  if (!sftpPanelVisible(tab)) return;
-  const panel = document.getElementById('sftpPanel-' + tab.tabId);
-  if (!panel) return;
+  const tab = sftpShortcutTab(ev);
+  if (!tab) return;
   ev.preventDefault();
   sftpSyncToggle(tab.tabId);
 });

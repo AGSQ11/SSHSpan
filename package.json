@@ -39,6 +39,7 @@
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:ui": "node scripts/check-renderer-ui.js",
     "test:safety": "node scripts/check-audit-safety.js",
+    "test:sftp": "node scripts/check-sftp-ui.js",
     "check:vendor": "node scripts/check-vendor.js"
   },
   "engines": {

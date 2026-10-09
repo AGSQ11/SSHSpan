@@ -16,14 +16,15 @@
  *
  *     npm install --no-save playwright@1.56.1 && npx playwright install chromium
  *
- * Without it this skips (exit 0) rather than failing, so a checkout that has
- * not set it up still runs every other check.
+ * Without it the browser checks are skipped rather than failing, so a checkout
+ * that has not set it up still runs every other check; the static MCP contract
+ * block below needs no browser and still decides the exit code.
  */
 'use strict';
 
-const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { failures, check, loadChromium, serve, openPage } = require('./lib/renderer-harness');
 
 // ─── static MCP IPC contract check (no browser, no live provider) ───────────
 //
@@ -168,66 +169,12 @@ if (mcpNew.length) {
 }
 const MCP_FAILED = mcpNew.length > 0;
 
-let chromium;
-try {
-  ({ chromium } = require('playwright'));
-} catch {
-  try {
-    ({ chromium } = require(path.join(
-      require('child_process').execSync('npm root -g', { encoding: 'utf8' }).trim(), 'playwright')));
-  } catch {
-    console.log('playwright not installed - skipping renderer UI checks.');
-    process.exit(MCP_FAILED ? 1 : 0);
-  }
-}
-
-const ROOT = path.join(__dirname, '..', 'src', 'renderer');
-const TYPES = {
-  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2',
-};
-
-const failures = [];
-function check(name, got, want) {
-  const ok = JSON.stringify(got) === JSON.stringify(want);
-  console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${name}`);
-  if (!ok) {
-    console.log(`          got:  ${JSON.stringify(got)}`);
-    console.log(`          want: ${JSON.stringify(want)}`);
-    failures.push(name);
-  }
-}
-
-/// Serve src/renderer over http: file:// would block the module loads.
-function serve() {
-  const server = http.createServer((req, res) => {
-    const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\/+/, '') || 'index.html';
-    const file = path.join(ROOT, rel);
-    if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-      res.writeHead(404); res.end('not found'); return;
-    }
-    res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
-    res.end(fs.readFileSync(file));
-  });
-  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server)));
-}
-
-/// app.js reads window.__TAURI__ at module scope; without this stub it throws
-/// there and every later top-level const is stuck in the temporal dead zone,
-/// so the page half-initialises and the checks below measure nothing.
-async function openPage(browser, server, replies) {
-  const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
-  await page.addInitScript(({ r }) => {
-    window.__TAURI__ = {
-      core: { invoke: async (cmd) => r[cmd] ?? {} },
-      event: { listen: async () => () => {} },
-    };
-  }, { r: replies });
-  const errors = [];
-  page.on('pageerror', e => errors.push(String(e.message || e)));
-  await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
-  await page.waitForSelector('#keyList .key-row', { timeout: 15000 });
-  return { page, errors };
+// The static server, the Playwright lookup, check() and openPage() live in
+// scripts/lib/renderer-harness.js, shared with the other renderer suites.
+const chromium = loadChromium();
+if (!chromium) {
+  console.log('playwright not installed - skipping renderer UI checks.');
+  process.exit(MCP_FAILED ? 1 : 0);
 }
 
 const KEY = (id, name, cats) => ({
@@ -442,6 +389,9 @@ async function checkSftpLocalPane(browser, server) {
 
   const built = await page.evaluate(async () => {
     const tabId = 't1';
+    // The SFTP shortcuts only act on a panel that is on screen, so show the
+    // Servers view the panel lives in, as the app does.
+    await switchView('connect');
     // Pane-scoped shortcuts (Ctrl+A) resolve the active tab, so the harness has
     // to name one - the same thing activateSessionTab does in the real app.
     state.activeTabId = tabId;
