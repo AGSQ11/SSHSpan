@@ -123,6 +123,9 @@ jobs:
           npm install --no-save --no-audit --no-fund playwright@1.56.1
           npx playwright install --with-deps chromium
           npm run test:ui
+          # Safety and lifecycle behaviour (confirmations, idle auto-lock,
+          # vault dialogs, paste review), on a fake clock in the same browser.
+          npm run test:safety
 
   cargo-audit:
     name: Dependency advisories

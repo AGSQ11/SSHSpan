@@ -38,6 +38,21 @@ function terminalSetting(name, fallback) {
   return value === undefined || value === null || value === '' ? fallback : value;
 }
 
+/// Deferred focus must not leave a dialog. showTabTerminal, a connect and a
+/// maximize all schedule term.focus() a few tens of milliseconds ahead; when a
+/// dialog opened in between (the connect password prompt opens at the same
+/// moment as the tab), the terminal won, typed characters went nowhere, and
+/// Escape was dead. Anything that wants the terminal to have the focus goes
+/// through here, and it stands down while any dialog is up.
+function terminalDialogOpen() {
+  return !!document.querySelector('.modal-backdrop:not([hidden])');
+}
+
+function terminalFocus(rec) {
+  if (!rec || terminalDialogOpen()) return;
+  try { rec.term.focus(); } catch (e) {}
+}
+
 function terminalScrollback() {
   const value = parseInt(terminalSetting('terminalScrollback', '5000'), 10);
   if (!Number.isFinite(value)) return 5000;
@@ -272,6 +287,26 @@ function wireTerminalClipboard(t) {
         });
       }
     });
+    // A native paste (Shift+Insert, middle-click on Linux, the Edit menu, IME and
+    // voice input; a plain Ctrl+V is ^V to a terminal, xterm sends it as such) is
+    // a browser paste event on the helper textarea, and xterm turns it straight
+    // into input - it never reached the multi-line review that only the explicit
+    // paths (Ctrl+Shift+V, the context menu) had.
+    // Take the event over in the capture phase on xterm's own element, ahead of
+    // every xterm listener, and hand the text to terminalPaste: one review for
+    // every way of pasting. terminalPaste sends through term.paste(), which is
+    // not a DOM event - so nothing is sent twice and nothing re-enters here -
+    // and which keeps bracketed paste, exactly as the native path did.
+    t.element.addEventListener('paste', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+      const tabId = t.__sshspanTabId;
+      if (!text || !tabId) return;
+      if (typeof window.terminalPaste === 'function') window.terminalPaste(tabId, text);
+      else t.paste(text);
+    }, true);
   } catch (e) {}
 }
 
@@ -396,7 +431,7 @@ function showTabTerminal(tabId) {
   if (rec) {
     setTimeout(() => {
       try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {}
-      try { rec.term.focus(); } catch (e) {}
+      terminalFocus(rec);
     }, 60);
   }
 }
@@ -459,8 +494,7 @@ function fitActiveTerminal() {
 
 function fitActiveTerminalAndFocus() {
   fitActiveTerminal();
-  const rec = activeTab();
-  if (rec) { try { rec.term.focus(); } catch (e) {} }
+  terminalFocus(activeTab());
 }
 
 function terminalResetActive() {
@@ -508,7 +542,7 @@ function terminalConnectInTab(tabId, server, opts) {
 
     try { t.reset(); } catch (e) {}
     trace(tabId, `[sshspan] xterm ready (${t.cols}x${t.rows}) - connecting to ${server.host}:${server.port} (auth=${server.authMethod || 'publickey'})`);
-    setTimeout(() => { try { t.focus(); } catch (e) {} }, 50);
+    setTimeout(() => terminalFocus(rec), 50);
 
     const onData = new tcore.Channel();
     onData.onmessage = (text) => {
@@ -653,21 +687,37 @@ window.terminalReset = (tabId) => {
   rec._mouseCarry = '';
   setTimeout(() => { try { rec.fitAddon && rec.fitAddon.fit(); } catch (e) {} }, 30);
 };
+/// The one way text gets pasted into a session: the context menu, Ctrl+Shift+V
+/// and a native paste (Shift+Insert, middle-click, ...) all end up here. Multi-line text
+/// is reviewed first - a pasted newline runs the line - in the app's own
+/// dialog (the native confirm() is not usable, see confirmModal in app.js).
+/// Resolves true when the text was sent.
 window.terminalPaste = async (tabId, text) => {
-  // Paste paths that leave the terminal (context menu click, confirm()
-  // dialog) drop focus to <body>; the next keystroke goes nowhere and the
-  // terminal looks dead until clicked. Hand focus back first so typing
-  // works whether or not the paste lands.
   const rec = tabRecord(tabId);
-  try { rec && rec.term.focus(); } catch (e) {}
   if (typeof text !== 'string' || !text) return false;
+  if (!rec || !rec.sessionId) return false;
+  // Paste paths that leave the terminal (the context menu, the review dialog)
+  // drop focus to <body>; the next keystroke goes nowhere and the terminal
+  // looks dead until clicked. Hand focus back so typing works whether or not
+  // the paste lands.
+  terminalFocus(rec);
   const needsConfirm = terminalSetting('confirmMultiLinePaste', '1') !== '0';
   if (needsConfirm && (text.includes('\n') || text.includes('\r'))) {
     const lines = text.split(/\r\n|\r|\n/).length;
-    if (!window.confirm(`Paste ${lines} lines into this SSH session? Review clipboard content before running commands.`)) return false;
-    try { rec && rec.term.focus(); } catch (e) {}
+    const ok = await confirmModal('Paste several lines?',
+      `Paste ${lines} lines into this SSH session? Review clipboard content before running commands.`,
+      'Paste', { danger: false });
+    if (!ok) { terminalFocus(rec); return false; }
+    // The dialog is modal, not frozen: the session can end, be replaced by a
+    // reconnect, or be torn down by a vault lock while it is open.
+    if (tabRecord(tabId) !== rec || !rec.sessionId) return false;
+    terminalFocus(rec);
   }
-  return sendTerminalBytes(rec, text);
+  // xterm's own paste: newlines become CR and bracketed paste mode is honoured
+  // when the remote asked for it, exactly like a native paste. The text reaches
+  // the session through the onData subscription (terminal_send), once.
+  rec.term.paste(text);
+  return true;
 };
 window.terminalReadClipboard = readClipboard;
 window.terminalApplySettings = () => {

@@ -166,18 +166,36 @@ async function aiCommitLevel(tabId, level, prev) {
 
 function aiOpenYoloModal(tabId, prev) {
   const modal = document.getElementById('yoloModal');
-  if (!modal) { aiCommitLevel(tabId, 'yolo', prev); return; }
-  modal.hidden = false;
   const cancel = document.getElementById('yoloCancelBtn');
   const enable = document.getElementById('yoloEnableBtn');
+  // Fail CLOSED. This used to commit YOLO when the dialog could not be found:
+  // the one-time opt-in that exists to make "no commands without asking" a
+  // deliberate act was skipped exactly when something was already wrong.
+  if (!modal || !cancel || !enable) {
+    toast('Could not show the YOLO confirmation, so YOLO mode was not enabled.', 'err');
+    aiPaintLevel(tabId); // keep the seg on the previous level
+    return;
+  }
+  let done = false;
   const close = (ok) => {
+    if (done) return;
+    done = true;
+    unregisterModalCloser(modal);
     modal.hidden = true;
+    cancel.onclick = null; enable.onclick = null; modal.onmousedown = null;
     if (ok) aiCommitLevel(tabId, 'yolo', prev);
     else aiPaintLevel(tabId); // revert the seg to the previous level
   };
   cancel.onclick = () => close(false);
   enable.onclick = () => close(true);
   modal.onmousedown = (e) => { if (e.target === modal) close(false); };
+  // Escape (topmost layer only) and a vault lock answer it "no": the lock also
+  // clears every access level on the backend, so a late "Enable" has nothing to
+  // act on (registerModalCloser, app.js).
+  registerModalCloser(modal, () => close(false));
+  modal.hidden = false;
+  // Cancel, not Enable, takes the focus: a reflexive Enter must not arm YOLO.
+  setTimeout(() => { if (!done) cancel.focus(); }, 0);
 }
 
 // ─── message rendering ──────────────────────────────────────────────────────
@@ -846,6 +864,9 @@ function aiWire() {
   document.addEventListener('keydown', (e) => {
     if (!(e.ctrlKey || e.metaKey) || !e.shiftKey || e.altKey) return;
     if (e.key.toLowerCase() !== 'a') return;
+    // Not behind or over a dialog: opening the panel moves the focus into its
+    // own input, out of the dialog the user is answering.
+    if (document.querySelector('.modal-backdrop:not([hidden])')) return;
     const view = document.getElementById('view-connect');
     if (!view || view.hidden) return;
     assistantToggle();

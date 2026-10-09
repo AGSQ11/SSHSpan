@@ -620,9 +620,12 @@
       </header>
       <div class="modal-body">
         <p id="vaultModalText">Set a master password to encrypt your private keys at rest.</p>
+        <!-- Document order is the tab order and the reading order. The current
+             password only shows when changing the master password, and there it
+             comes FIRST (new, then confirm); create and unlock never show it. -->
+        <input type="password" id="vaultPasswordCurrent" placeholder="Current password" autocomplete="off" hidden />
         <input type="password" id="vaultPassword" placeholder="Master password" autocomplete="off" />
         <input type="password" id="vaultPasswordConfirm" placeholder="Confirm password" autocomplete="off" hidden />
-        <input type="password" id="vaultPasswordCurrent" placeholder="Current password" autocomplete="off" hidden />
       </div>
       <footer class="modal-footer">
         <button data-close class="ghost-btn" id="vaultCancelBtn">Cancel</button>

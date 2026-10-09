@@ -104,6 +104,51 @@ function toast(msg, kind) {
 
 const modalStack = [];
 
+// Every dialog that can be dismissed registers HOW, so two things can settle
+// it without knowing what it holds: Escape (topmost layer only) and a vault
+// lock. A closer must leave nothing pending - it resolves the dialog's promise
+// or callback with the "no" answer and blanks any secret field. A dialog that
+// has no closer is left to handle its own Escape.
+const modalClosers = new Map();
+
+function registerModalCloser(node, fn) {
+  if (node && typeof fn === 'function') modalClosers.set(node, fn);
+}
+
+function unregisterModalCloser(node) {
+  modalClosers.delete(node);
+}
+
+/// Stacking follows open order, not document order. Every .modal-backdrop used
+/// to share z-index 50, so whichever was declared last in index.html painted on
+/// top: a vault gate or palette opened over the server form rendered BEHIND it
+/// while still taking the keyboard focus. Renumbered after every open and
+/// close, so a layer opened after a lower one closed can never tie with one
+/// that is still up.
+function layerModals() {
+  modalStack.forEach((m, i) => { m.node.style.zIndex = String(50 + i); });
+}
+
+/// Escape closes the topmost dialog and nothing else, wherever focus is inside
+/// it. Capture phase on the document so it runs before a dialog's own handlers
+/// and before the page-level shortcuts; a layer without a closer is left alone.
+function onModalEscapeKey(ev) {
+  if (ev.key !== 'Escape' || ev.isComposing || !modalStack.length) return;
+  const top = modalStack[modalStack.length - 1].node;
+  const close = modalClosers.get(top);
+  if (!close) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  ev.stopImmediatePropagation();
+  try {
+    close();
+  } catch (e) {
+    // Never trap the user in a dialog because its closer is broken - but say so.
+    console.warn('[sshspan] a dialog closer threw; hiding the dialog instead:', e);
+    top.hidden = true;
+  }
+}
+
 const FOCUSABLE = [
   'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
   'select:not([disabled])', 'textarea:not([disabled])', '[tabindex]:not([tabindex="-1"])',
@@ -141,6 +186,7 @@ function modalDidOpen(node) {
   if (modalStack.some((m) => m.node === node)) return;
   const opener = document.activeElement;
   modalStack.push({ node, opener: opener && opener !== document.body ? opener : null });
+  layerModals();
   // Only take focus if the dialog's own open path has not already placed it
   // somewhere deliberate (the picker focuses its search box, the delete
   // prompt focuses Cancel) \u2014 a rAF lets those run first.
@@ -155,6 +201,8 @@ function modalDidClose(node) {
   const i = modalStack.findIndex((m) => m.node === node);
   if (i === -1) return;
   const [entry] = modalStack.splice(i, 1);
+  node.style.zIndex = '';
+  layerModals();
   // Restore focus to the control that opened the dialog, so keyboard users
   // are not dropped at the top of the document. Skipped when something else
   // has already claimed focus inside a dialog still on the stack.
@@ -165,6 +213,7 @@ function modalDidClose(node) {
 
 function initModalFocusManagement() {
   document.addEventListener('keydown', onModalTabKey, true);
+  document.addEventListener('keydown', onModalEscapeKey, true);
   const obs = new MutationObserver((records) => {
     for (const r of records) {
       const node = r.target;
@@ -585,7 +634,9 @@ async function createCategory(name, parentId, color) {
 async function deleteCategory(id) {
   const cat = catById(id);
   if (!cat) return;
-  const ok = window.confirm(`Delete category "${cat.name}"? Children will be reassigned to its parent, and any keys using this category will become Uncategorized.`);
+  const ok = await confirmModal('Delete category',
+    `Delete category "${cat.name}"? Children will be reassigned to its parent, and any keys using this category will become Uncategorized.`,
+    'Delete');
   if (!ok) return;
   try {
     const res = await call('category_delete', { id });
@@ -903,50 +954,101 @@ function treeHasMatchingDescendant(catId, lower) {
 
 // ─── prompt modal (rename / new category) ──────────────────────────────────
 
-function promptModal(title, message, initial, onOk) {
+/// opts.secret marks the answer as a password (the backup restore). The field is
+/// masked, the value is handed over exactly as typed - edge whitespace is part
+/// of a password, so it is not trimmed - and the field is emptied and put back
+/// to plain text whenever the prompt closes, however it closes.
+function promptModal(title, message, initial, onOk, opts) {
+  const secret = !!(opts && opts.secret);
+  const input = el('promptInput');
   el('promptTitle').textContent = title;
   el('promptMessage').textContent = message || '';
-  el('promptInput').value = initial || '';
+  input.type = secret ? 'password' : 'text';
+  if (secret) input.setAttribute('autocomplete', 'off'); else input.removeAttribute('autocomplete');
+  input.value = initial || '';
   state.promptCallback = onOk;
+  state.promptSecret = secret;
   el('promptModal').hidden = false;
-  setTimeout(() => el('promptInput').focus(), 0);
+  setTimeout(() => input.focus(), 0);
 }
-function closePrompt() { el('promptModal').hidden = true; state.promptCallback = null; }
+function closePrompt() {
+  const input = el('promptInput');
+  input.value = '';
+  input.type = 'text';
+  input.removeAttribute('autocomplete');
+  state.promptCallback = null;
+  state.promptSecret = false;
+  el('promptModal').hidden = true;
+}
 
 // ─── generic confirm modal (promise-based) ─────────────────────────────────
 
-/// Ask a yes/no question and resolve to the answer. Promise-based rather than
-/// callback-based because its callers (audit clear) are async and want to
+// While the single shared confirmation dialog is up: the function that answers
+// it. null otherwise.
+let confirmPending = null;
+
+/// Ask a yes/no question and resolve to the answer. This is THE confirmation
+/// for the whole app: the native confirm() is not usable here. tauri-plugin-
+/// dialog replaces window.confirm with an async function, so `confirm(...)`
+/// returns a Promise - always truthy - and an `if (!confirm(...)) return;` guard
+/// can never return; the dialog command is not granted either, so no dialog was
+/// ever drawn and every guarded action simply ran. Always `await` this one.
+///
+/// Promise-based rather than callback-based because its callers are async and
 /// branch on the answer inline. The SFTP delete dialog keeps its own modal:
 /// that one carries a session-scoped "don't ask again" checkbox that this
 /// deliberately does not offer.
-function confirmModal(title, message, okLabel) {
+///
+/// Rules, all of them the safe way round:
+///   - one question at a time. There is a single dialog element, so a second
+///     question while one is open is refused (answered "no") instead of
+///     rewriting the text under the user's cursor - or, as before, having one
+///     click answer both.
+///   - Cancel has the focus, so a reflexive Enter or Space is a "no".
+///   - Cancel, Escape, a backdrop click and a vault lock all answer "no", and
+///     the answer is given exactly once.
+/// opts.danger: false for a confirmation that is not destructive (the button is
+/// then the primary colour instead of red).
+function confirmModal(title, message, okLabel, opts) {
+  if (confirmPending) {
+    if (!el('confirmModal').hidden) return Promise.resolve(false);
+    // Something hid the dialog without answering it. Answer it "no" now, so
+    // its caller is not left waiting and this question is not refused forever.
+    confirmPending(false);
+  }
   return new Promise((resolve) => {
+    const modal = el('confirmModal');
+    const okBtn = el('confirmOkBtn');
+    const cancelBtn = el('confirmCancelBtn');
     el('confirmTitle').textContent = title;
     el('confirmMessage').textContent = message || '';
-    el('confirmOkBtn').textContent = okLabel || 'Confirm';
-    const modal = el('confirmModal');
-    modal.hidden = false;
-    const finish = (answer) => {
+    okBtn.textContent = okLabel || 'Confirm';
+    okBtn.className = opts && opts.danger === false ? 'primary-btn' : 'danger-btn';
+    let settled = false;
+    const settle = (answer) => {
+      if (settled) return;
+      settled = true;
+      if (confirmPending === settle) confirmPending = null;
+      unregisterModalCloser(modal);
       modal.hidden = true;
-      el('confirmOkBtn').removeEventListener('click', onOk);
-      el('confirmCancelBtn').removeEventListener('click', onCancel);
-      document.removeEventListener('keydown', onKey, true);
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('click', onBackdrop);
       resolve(answer);
     };
-    const onOk = () => finish(true);
-    const onCancel = () => finish(false);
-    const onKey = (ev) => {
-      if (ev.key !== 'Escape') return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      finish(false);
-    };
-    el('confirmOkBtn').addEventListener('click', onOk);
-    el('confirmCancelBtn').addEventListener('click', onCancel);
-    // Capture phase so Escape closes this modal rather than the one below it.
-    document.addEventListener('keydown', onKey, true);
-    setTimeout(() => el('confirmOkBtn').focus(), 0);
+    const onOk = () => settle(true);
+    const onCancel = () => settle(false);
+    const onBackdrop = (ev) => { if (ev.target === modal) settle(false); };
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('click', onBackdrop);
+    confirmPending = settle;
+    // Escape (topmost layer only) and the vault lock go through here.
+    registerModalCloser(modal, () => settle(false));
+    modal.hidden = false;
+    // After the modal manager has noted what had the focus (it is the control
+    // focus returns to), then onto the safe button.
+    setTimeout(() => { if (!settled) cancelBtn.focus(); }, 0);
   });
 }
 
@@ -980,6 +1082,12 @@ const state = window.state = {
   hasVault: false,
   unlocked: false,
   vaultMode: 'unlock',
+  // Which gate dialog the last status refresh asked for: 'create', 'unlock', or
+  // null while unlocked (undefined until the first refresh). vaultDismissed is
+  // set when the user cancels that gate and holds until they ask for it again
+  // or the vault state changes - the 10 s poll must not re-open it.
+  vaultGate: undefined,
+  vaultDismissed: false,
   keys: [],
   selectedId: null,
   deploySelected: new Set(),
@@ -1005,6 +1113,7 @@ const state = window.state = {
   draggingCatId: null,
   // prompt
   promptCallback: null,
+  promptSecret: false,
   // connect / saved servers
   servers: [],
   connectSelectedId: null,
@@ -1031,15 +1140,29 @@ function showVaultModal(mode) {
   const title = el('vaultModalTitle');
   const text = el('vaultModalText');
   const pw = el('vaultPassword');
-  const confirm = el('vaultPasswordConfirm');
+  const confirmPw = el('vaultPasswordConfirm');
   const current = el('vaultPasswordCurrent');
   const primary = el('vaultPrimary');
-  if (reopening) { pw.value = ''; confirm.value = ''; current.value = ''; }
+  if (reopening) clearVaultFields();
   pw.hidden = false;
-  confirm.hidden = mode !== 'create' && mode !== 'change';
+  confirmPw.hidden = mode !== 'create' && mode !== 'change';
   // The current password is re-typed instead of being cached in state, so the
   // master password is never retained in renderer memory after unlock.
   current.hidden = mode !== 'change';
+  // In change mode the boxes run current, new, confirm (index.html keeps them
+  // in that order) and say what they are. The first box used to be the NEW
+  // password labelled "Master password", with "Current password" last - an easy
+  // way to type the password you know into the wrong box, where a wrong guess
+  // counts toward the unlock throttle.
+  if (mode === 'change') {
+    current.placeholder = 'Current master password';
+    pw.placeholder = 'New master password';
+    confirmPw.placeholder = 'Confirm new password';
+  } else {
+    current.placeholder = 'Current password';
+    pw.placeholder = 'Master password';
+    confirmPw.placeholder = 'Confirm password';
+  }
   if (mode === 'create') {
     title.textContent = 'Create your vault';
     text.textContent = 'Choose a master password. It encrypts every private key at rest (scrypt + AES-256-GCM). There is no recovery \u2014 if you lose it, the keys are gone.';
@@ -1056,15 +1179,47 @@ function showVaultModal(mode) {
   backdrop.hidden = false;
   // Same reason as the field reset above: focusing on every poll would yank
   // the caret out of the confirm field back into the password field every
-  // 10 seconds while the user is still filling the form in.
-  if (reopening) pw.focus();
+  // 10 seconds while the user is still filling the form in. In change mode the
+  // first thing to type is the current password.
+  if (reopening) (mode === 'change' ? current : pw).focus();
 }
 
-function hideVaultModal() { el('vaultModal').hidden = true; }
+function clearVaultFields() {
+  for (const id of ['vaultPassword', 'vaultPasswordConfirm', 'vaultPasswordCurrent']) el(id).value = '';
+}
+
+/// Close the vault dialog. Whatever was typed goes with it: a half-typed
+/// master password must not sit in a hidden input.
+function hideVaultModal() {
+  clearVaultFields();
+  el('vaultModal').hidden = true;
+}
+
+/// Cancel / Escape on the vault dialog. For the create and unlock gate this is
+/// remembered (state.vaultDismissed): the status poll used to re-open the
+/// dialog every 10 s and take the focus back, which made the app unusable
+/// while locked and made the "Vault stays locked" toast a lie. The change-
+/// password dialog is a deliberate request, not a gate, and just closes.
+function dismissVaultModal() {
+  const wasGate = state.vaultMode !== 'change';
+  hideVaultModal();
+  if (!wasGate) return;
+  state.vaultDismissed = true;
+  if (!state.unlocked) toast('Vault stays locked — unlock it any time.', 'info');
+}
+
+/// An explicit request to see the vault dialog (menu item, Ctrl+N, palette,
+/// the Settings button). Unlike the automatic gate it always opens, and it
+/// clears a dismissal: the user has asked again.
+function requestVaultModal(mode) {
+  state.vaultDismissed = false;
+  showVaultModal(mode);
+}
 
 async function refreshVaultStatus(silent) {
   const s = await call('vault_status');
   const wasUnlocked = state.unlocked;
+  const prevGate = state.vaultGate;
   state.hasVault = s.hasVault;
   state.unlocked = s.unlocked;
 
@@ -1082,17 +1237,40 @@ async function refreshVaultStatus(silent) {
   applyNavLockState();
   updateNavCounts();
 
-  if (!s.hasVault) {
-    showVaultModal('create');
-  } else if (!s.unlocked) {
+  // The idle clock, BEFORE anything below that can wait or fail. Only a
+  // TRANSITION touches it here: the poll runs every 10 s whatever the user is
+  // doing, so letting it re-arm the timer (as this used to) pushed the deadline
+  // out forever and the vault never auto-locked. And because the transition is
+  // seen exactly once - the next poll finds the vault already unlocked - it must
+  // not sit behind the key load: loadKeys() can reject (loadCategories() is
+  // unguarded), and arming after it left auto-lock off until Settings was opened.
+  if (!s.unlocked) cancelAutoLockTimer();
+  else if (!wasUnlocked) {
+    noteUserActivity();   // unlocking is the user acting
+    armAutoLockTimer();
+  }
+
+  // Which gate (if any) the vault state calls for. A CHANGE in that - the vault
+  // locking, being created, being unlocked elsewhere - re-arms the dialog; the
+  // same state seen again on the next poll must leave a dismissed one closed.
+  const gate = !s.hasVault ? 'create' : (!s.unlocked ? 'unlock' : null);
+  state.vaultGate = gate;
+  if (wasUnlocked && !s.unlocked) onVaultLocked();
+  if (gate !== prevGate) state.vaultDismissed = false;
+
+  if (gate === 'create') {
+    if (!state.vaultDismissed) showVaultModal('create');
+  } else if (gate === 'unlock') {
     clearKeysUI();
     clearConnectView();
-    showVaultModal('unlock');
+    if (!state.vaultDismissed) showVaultModal('unlock');
   } else {
-    hideVaultModal();
+    // Unlocked. The create/unlock gate has done its job and goes; the change-
+    // password dialog is open on purpose and must outlive every poll (it used
+    // to be closed under the user's hands within 10 s).
+    if (state.vaultMode !== 'change') hideVaultModal();
     if (!wasUnlocked || !silent) await loadKeys();
   }
-  resetAutoLockTimer();
 }
 
 /// Counts beside the two nav destinations. The Servers count is deliberately
@@ -1134,12 +1312,12 @@ function openVaultMenu(anchor) {
     return b;
   };
   if (!state.hasVault) {
-    mk('Create a vault...', 'lock', () => showVaultModal('create'));
+    mk('Create a vault...', 'lock', () => requestVaultModal('create'));
   } else if (!state.unlocked) {
-    mk('Unlock vault...', 'lock-open', () => showVaultModal('unlock'));
+    mk('Unlock vault...', 'lock-open', () => requestVaultModal('unlock'));
   } else {
     mk('Lock now  (Ctrl+L)', 'lock', lockNow);
-    mk('Change master password...', 'key-round', () => showVaultModal('change'));
+    mk('Change master password...', 'key-round', () => requestVaultModal('change'));
     const sep = document.createElement('div');
     sep.className = 'ctx-sep';
     menu.appendChild(sep);
@@ -1215,20 +1393,29 @@ function clearConnectView() {
 }
 
 async function submitVaultModal() {
+  // Re-entrancy guard. The button was not disabled while the request was in
+  // flight, so a double click - or Enter held down, which repeats - submitted
+  // twice; a second vault_create answers "A vault already exists" right after
+  // the success toast, and a second wrong guess counts toward the throttle.
+  if (submitVaultModal._busy) return;
   const mode = state.vaultMode;
   const pwEl = el('vaultPassword');
+  const currentEl = el('vaultPasswordCurrent');
   const pw = pwEl.value;
-  const confirm = el('vaultPasswordConfirm').value;
-  const current = el('vaultPasswordCurrent').value;
+  const confirmPw = el('vaultPasswordConfirm').value;
+  const current = currentEl.value;
+  submitVaultModal._busy = true;
+  const primary = el('vaultPrimary');
+  primary.disabled = true;
   try {
     if (mode === 'create') {
       if (pw.length < 8) throw new Error('Master password must be at least 8 characters.');
-      if (pw !== confirm) throw new Error('Passwords do not match.');
+      if (pw !== confirmPw) throw new Error('Passwords do not match.');
       await call('vault_create', { password: pw });
       toast('Vault created. Welcome to SSHSpan.', 'ok');
     } else if (mode === 'change') {
       if (pw.length < 8) throw new Error('New password must be at least 8 characters.');
-      if (pw !== confirm) throw new Error('Passwords do not match.');
+      if (pw !== confirmPw) throw new Error('Passwords do not match.');
       if (!current) throw new Error('Enter your current master password.');
       await call('vault_change_password', { currentPassword: current, newPassword: pw });
       toast('Master password changed; all keys re-encrypted.', 'ok');
@@ -1236,12 +1423,18 @@ async function submitVaultModal() {
       await call('vault_unlock', { password: pw });
       toast('Vault unlocked.', 'ok');
     }
-    // Never leave submitted passwords in the DOM inputs.
-    pwEl.value = ''; el('vaultPasswordConfirm').value = ''; el('vaultPasswordCurrent').value = '';
+    // Never leave submitted passwords in the DOM inputs; this also closes the
+    // dialog (the change-password dialog is not closed by the status refresh).
+    hideVaultModal();
     await refreshVaultStatus();
   } catch (e) {
     toast(e.message || String(e), 'err');
-    pwEl.select();
+    // Put the caret on the box that was wrong: a bad current password is the
+    // first box in change mode, everything else is the (new) password.
+    (mode === 'change' && /current/i.test(e.message || String(e)) ? currentEl : pwEl).select();
+  } finally {
+    submitVaultModal._busy = false;
+    primary.disabled = false;
   }
 }
 
@@ -1691,14 +1884,19 @@ async function selectKey(id) {
 
 async function deleteSelected() {
   if (!state.selectedId) return;
-  const k = state.keys.find(x => x.id === state.selectedId);
+  // The key the user is asked about is the key that gets deleted, whatever
+  // happens to the selection while the dialog is open.
+  const id = state.selectedId;
+  const k = state.keys.find(x => x.id === id);
   if (settingOn(state.settings.confirmDelete)) {
-    const ok = window.confirm('Delete key "' + (k ? k.name : state.selectedId) + '" from the vault?\nDeployed copies on disk are not removed.');
+    const ok = await confirmModal('Delete key',
+      'Delete key "' + (k ? k.name : id) + '" from the vault?\nDeployed copies on disk are not removed.',
+      'Delete');
     if (!ok) return;
   }
   try {
-    await call('key_delete', { id: state.selectedId });
-    state.deploySelected.delete(state.selectedId);
+    await call('key_delete', { id });
+    state.deploySelected.delete(id);
     state.selectedId = null;
     toast('Key deleted.', 'ok');
     await loadKeys();
@@ -1722,8 +1920,9 @@ async function deleteSelectedKeys() {
   const listed = names.slice(0, 8).join('\n  ');
   const more = names.length > 8 ? `\n  ...and ${names.length - 8} more` : '';
   if (settingOn(state.settings.confirmDelete)) {
-    const ok = window.confirm(
-      `Delete ${ids.length} key(s) from the vault?\n\n  ${listed}${more}\n\nDeployed copies on disk are not removed.`);
+    const ok = await confirmModal('Delete keys',
+      `Delete ${ids.length} key(s) from the vault?\n\n  ${listed}${more}\n\nDeployed copies on disk are not removed.`,
+      'Delete');
     if (!ok) return;
   }
   let failed = 0;
@@ -1952,7 +2151,7 @@ function paletteCandidates() {
 function renderPalette(query) {
   const q = query.trim().toLowerCase();
   const all = state.unlocked ? paletteCandidates()
-    : [{ group: 'Actions', icon: 'lock-open', name: 'Unlock the vault...', terms: ['unlock'], run: () => showVaultModal('unlock') }];
+    : [{ group: 'Actions', icon: 'lock-open', name: 'Unlock the vault...', terms: ['unlock'], run: () => requestVaultModal(state.hasVault ? 'unlock' : 'create') }];
   paletteItems = !q ? all : all.filter(it =>
     [it.name, it.sub, ...(it.terms || [])].filter(Boolean).some(t => String(t).toLowerCase().includes(q)));
   if (paletteActive >= paletteItems.length) paletteActive = 0;
@@ -2022,6 +2221,12 @@ function openKeyModal() {
 
 function closeKeyModal() {
   el('modalBackdrop').hidden = true;
+  // A pasted private key and its passphrase must not outlive the dialog - not
+  // after Cancel, Escape, a backdrop click or a vault lock. They used to be
+  // cleared only after a SUCCESSFUL create/import, so backing out of an import
+  // left the key sitting in the form for whoever opened it next.
+  el('importPem').value = '';
+  el('importPass').value = '';
   resetImportFileHint();
 }
 
@@ -2066,6 +2271,13 @@ function resetImportFileHint() {
 }
 
 async function submitKeyModal() {
+  // Re-entrancy guard, same as the host form: key generation can take seconds
+  // (RSA-4096), the button stayed live meanwhile, and a second click stored a
+  // second identical key.
+  if (submitKeyModal._busy) return;
+  submitKeyModal._busy = true;
+  const primary = el('modalPrimary');
+  primary.disabled = true;
   const activeTab = document.querySelector('.tab.active').dataset.tab;
   try {
     if (activeTab === 'generate') {
@@ -2098,10 +2310,13 @@ async function submitKeyModal() {
     }
     closeKeyModal();
     el('genName').value = ''; el('genComment').value = '';
-    el('importName').value = ''; el('importPem').value = ''; el('importPass').value = '';
+    el('importName').value = '';
     await loadKeys();
   } catch (e) {
     toast(e.message || String(e), 'err');
+  } finally {
+    submitKeyModal._busy = false;
+    primary.disabled = false;
   }
 }
 
@@ -2176,9 +2391,9 @@ async function deployConfig() {
   // "strict host key checking" here was told their system SSH was being
   // configured when it was not.
   const paths = await systemPaths();
-  const sure = window.confirm(
-    'Deploy ' + ids.length + ' key(s) to ' + paths.deployDir + '/ and update ' + paths.sshConfig + '?'
-  );
+  const sure = await confirmModal('Deploy keys',
+    'Deploy ' + ids.length + ' key(s) to ' + paths.deployDir + '/ and update ' + paths.sshConfig + '?',
+    'Deploy', { danger: false });
   if (!sure) return;
   try {
     const passphraseEnabled = el('keyPassphraseToggle')?.checked === true;
@@ -2407,7 +2622,10 @@ async function bwSyncNow(allowRemoteOverwrite) {
         s.skippedNew ? s.skippedNew + ' new remote item(s)' : null,
       ];
       const detail = msg.filter(Boolean).join(', ');
-      if (window.confirm(detail + '. Apply them now?')) {
+      const apply = await confirmModal('Apply remote changes', detail + '. Apply them now?', 'Apply');
+      // The vault can lock while the dialog is open; a lock answers it "no",
+      // and this keeps a late approval from reaching a vault that is sealed.
+      if (apply && state.unlocked) {
         return await bwSyncNow(true);
       }
     }
@@ -2464,6 +2682,9 @@ async function loadSettings() {
     toast(e.message || String(e), 'err');
     return;
   }
+  // The stored minutes may differ from what the timer was armed with. Arming
+  // measures from the last real input, so this cannot extend the idle time.
+  armAutoLockTimer();
   const grid = el('settingsRows');
   grid.innerHTML = '';
 
@@ -2506,18 +2727,30 @@ async function loadSettings() {
   const autoLock = document.createElement('input');
   autoLock.type = 'number';
   autoLock.min = '0';
-  autoLock.max = '1440';
-  autoLock.value = state.settings.autoLockMinutes || 15;
+  autoLock.max = String(AUTO_LOCK_MAX_MINUTES);
+  // What is shown is what is applied: absent means the default, and an explicit
+  // 0 stays 0 (the old `|| 15` showed 15 for a stored number 0).
+  autoLock.value = String(autoLockMinutes());
   autoLock.addEventListener('change', async () => {
+    // Whole minutes only. Anything else used to be saved as typed - the backend
+    // then fell back to 15 while the renderer used parseInt's reading of it.
+    const typed = String(autoLock.value).trim();
+    if (!/^\d+$/.test(typed)) {
+      autoLock.value = String(autoLockMinutes());
+      toast('Auto-lock needs a whole number of minutes (0 turns it off).', 'err');
+      return;
+    }
+    const mins = Math.min(AUTO_LOCK_MAX_MINUTES, parseInt(typed, 10));
+    autoLock.value = String(mins);
     try {
-      await call('settings_set', { key: 'autoLockMinutes', value: String(autoLock.value) });
-      state.settings.autoLockMinutes = autoLock.value;
-      resetAutoLockTimer();
+      await call('settings_set', { key: 'autoLockMinutes', value: String(mins) });
+      state.settings.autoLockMinutes = String(mins);
+      armAutoLockTimer();
       toast('Auto-lock updated.', 'ok');
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   mkRow('Lock the vault when idle', autoLock,
-    'Minutes of inactivity before the vault seals itself. 0 turns auto-lock off.');
+    'Minutes without keyboard or mouse input before the vault locks. Locking closes open SSH sessions and pauses file transfers. Typing in a terminal counts as activity; output from a server does not. 0 turns auto-lock off.');
 
   // Interface scale. The stylesheet is written in px throughout, so a root
   // font-size would only resize text and leave every control the same size.
@@ -2881,7 +3114,9 @@ async function backupRestore() {
     const pick = await call('system_select_file', { title: 'Select vault backup file' });
     if (pick.canceled) return;
     const payloadJson = pick.text;
-    if (!confirm('Restoring will add or overwrite entries with the ones from this backup. Continue?')) return;
+    const go = await confirmModal('Restore backup',
+      'Restoring will add or overwrite entries with the ones from this backup. Continue?', 'Restore');
+    if (!go) return;
     try {
       const r = await call('vault_backup_restore', { payloadJson, backupPassword: null });
       finishRestore(r);
@@ -2889,6 +3124,8 @@ async function backupRestore() {
       const msg = e.message || String(e);
       if (!msg.includes('different master password')) throw e;
       // The backup was created under a different master password - ask for it.
+      // A secret prompt: the field is masked, the password is sent exactly as
+      // typed (edge whitespace included) and the field is emptied on close.
       promptModal('Backup password',
         'This backup was created with a different master password. Enter the one that was active when the backup was taken:',
         '', async (pw) => {
@@ -2897,7 +3134,7 @@ async function backupRestore() {
             const r2 = await call('vault_backup_restore', { payloadJson, backupPassword: pw });
             finishRestore(r2);
           } catch (e2) { toast(e2.message || String(e2), 'err'); }
-        });
+        }, { secret: true });
     }
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
@@ -2954,7 +3191,10 @@ async function loadKnownHosts() {
       forget.className = 'ghost-btn';
       forget.innerHTML = `${ico('trash-2')}<span>Forget</span>`;
       forget.addEventListener('click', async () => {
-        if (!confirm(`Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`)) return;
+        const forgetIt = await confirmModal('Forget host key',
+          `Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`,
+          'Forget');
+        if (!forgetIt) return;
         try {
           await call('known_hosts_forget', { host: h.host });
           await loadKnownHosts();
@@ -3145,6 +3385,19 @@ function wire() {
     if (!editable) ev.preventDefault();
   }, true);
 
+  // How each dialog is dismissed, so Escape (topmost layer only) and a vault
+  // lock can settle it without knowing what it holds. The dialogs that exist
+  // only while a question is open (confirm, YOLO, the SFTP prompts) register
+  // themselves when they open.
+  registerModalCloser(el('vaultModal'), dismissVaultModal);
+  registerModalCloser(el('modalBackdrop'), closeKeyModal);
+  registerModalCloser(el('serverModal'), closeServerModal);
+  registerModalCloser(el('deployModal'), closeDeploySheet);
+  registerModalCloser(el('paletteModal'), closePalette);
+  registerModalCloser(el('pickerModal'), closeCategoryPicker);
+  registerModalCloser(el('promptModal'), closePrompt);
+  registerModalCloser(el('connectPwModal'), () => closeConnectPwModal(null));
+
   // nav
   for (const b of document.querySelectorAll('.nav-item')) {
     b.addEventListener('click', () => switchView(b.dataset.view));
@@ -3161,10 +3414,7 @@ function wire() {
 
   // vault modal
   el('vaultPrimary').addEventListener('click', submitVaultModal);
-  el('vaultCancelBtn').addEventListener('click', () => {
-    hideVaultModal();
-    if (!state.unlocked) toast('Vault stays locked \u2014 unlock it any time.', 'info');
-  });
+  el('vaultCancelBtn').addEventListener('click', dismissVaultModal);
   for (const id of ['vaultPassword', 'vaultPasswordConfirm', 'vaultPasswordCurrent']) {
     el(id).addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') submitVaultModal();
@@ -3317,7 +3567,10 @@ function wire() {
 
   // vault actions, now in Settings rather than the corner of every view
   el('lockBtn').addEventListener('click', lockNow);
-  el('changePasswordBtn').addEventListener('click', () => showVaultModal('change'));
+  // Changing the password needs an unlocked vault; otherwise the useful dialog
+  // is the one that unlocks (or creates) it.
+  el('changePasswordBtn').addEventListener('click', () =>
+    requestVaultModal(state.unlocked ? 'change' : (state.hasVault ? 'unlock' : 'create')));
 
   // bitwarden sync (settings view)
   el('bwSaveBtn').addEventListener('click', () => {
@@ -3356,10 +3609,8 @@ function wire() {
   });
   el('pickerSearch').addEventListener('keydown', (e) => {
     const rows = [...el('pickerTree').querySelectorAll('.picker-row[role="option"]')];
-    // stopPropagation: the picker can sit on top of the host/key modal, and the
-    // document-level Escape handler would otherwise go on to close THAT modal
-    // too, throwing away a half-filled form behind the picker.
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeCategoryPicker(); return; }
+    // Escape is not handled here: the central modal handler closes the picker
+    // (and only the picker, even when it sits on top of the host/key form).
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
       if (!rows.length) return;
@@ -3374,9 +3625,6 @@ function wire() {
       pickerToggle(rows[state.pickerActive].dataset.id);
     }
   });
-  el('pickerTree').addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeCategoryPicker(); }
-  });
   el('pickerModal').addEventListener('click', (e) => {
     if (e.target === el('pickerModal')) closeCategoryPicker();
   });
@@ -3384,44 +3632,41 @@ function wire() {
   // prompt modal
   el('promptCancelBtn').addEventListener('click', closePrompt);
   el('promptOkBtn').addEventListener('click', () => {
-    const v = el('promptInput').value.trim();
+    // A secret (the backup password) is handed over exactly as typed.
+    const raw = el('promptInput').value;
+    const v = state.promptSecret ? raw : raw.trim();
     const cb = state.promptCallback;
     closePrompt();
     if (cb) cb(v);
   });
   el('promptInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); el('promptOkBtn').click(); }
-    else if (e.key === 'Escape') { e.preventDefault(); closePrompt(); }
   });
   el('promptModal').addEventListener('click', (e) => {
     if (e.target === el('promptModal')) closePrompt();
   });
 
-  // keyboard: Escape closes modals; Ctrl/Cmd shortcuts
+  // keyboard: Ctrl/Cmd shortcuts. Escape on a DIALOG is the central modal
+  // handler's job (capture phase, topmost layer only, wherever focus is);
+  // what is left here is the terminal-maximize toggle, and only when nothing
+  // is open on top of it.
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
-      // Topmost first. The picker opens OVER the key/host modal, and its own
-      // handlers only cover the search box and the tree - with focus on Save
-      // or Cancel the keystroke arrives here instead, and closing the modal
-      // underneath would discard the form the user is still filling in.
-      // Topmost first. The palette opens over everything, and the deploy sheet
-      // opens over the key list, so both have to be checked before the modals
-      // they can appear on top of.
-      if (!el('paletteModal').hidden) closePalette();
-      else if (!el('pickerModal').hidden) closeCategoryPicker();
-      else if (!el('deployModal').hidden) closeDeploySheet();
-      else if (!el('modalBackdrop').hidden) closeKeyModal();
-      else if (!el('serverModal').hidden) closeServerModal();
-      else if (el('app').classList.contains('term-max')) toggleTermMax();
-      else if (!el('vaultModal').hidden && state.vaultMode === 'change') hideVaultModal();
+      if (!modalStack.length && el('app').classList.contains('term-max')) toggleTermMax();
       return;
     }
+    // With a dialog open, the chords below would act on the page behind it:
+    // Ctrl+N flipped the create-vault dialog to Unlock and wiped the typed
+    // password, Ctrl+2 switched views under it, Ctrl+K stacked a palette over
+    // it. Only Ctrl+L stays live (locking closes every dialog anyway).
+    const dialogOpen = modalStack.length > 0;
     // Ctrl+Shift+1/2/3 switch the session surface (Shell/Files/Split) - the
     // mode buttons' tooltips advertise these. Must be handled BEFORE the
     // Ctrl+Shift-rejecting branch below, and only when a session surface is
     // actually active.
     if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && !ev.altKey
         && ['1', '2', '3'].includes(ev.key)) {
+      if (dialogOpen) return;
       const view = el('view-connect');
       if (view && !view.hidden && state.activeTabId) {
         const mode = { '1': 'ssh', '2': 'sftp', '3': 'split' }[ev.key];
@@ -3434,6 +3679,8 @@ function wire() {
     }
     if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.shiftKey) return;
     const k = ev.key.toLowerCase();
+    if (k === 'l') { ev.preventDefault(); lockNow(); return; }
+    if (dialogOpen) return;
     if (k === '1') { switchView('keys'); ev.preventDefault(); }
     else if (k === '2') { switchView('connect'); ev.preventDefault(); }
     else if (k === '3') { switchView('settings'); ev.preventDefault(); }
@@ -3442,13 +3689,25 @@ function wire() {
     else if (k === 'n') {
       ev.preventDefault();
       if (state.unlocked) openKeyModal();
-      else { showVaultModal('unlock'); toast('Unlock the vault first.', 'info'); }
+      else {
+        // A first run has no vault to unlock: ask for the dialog that exists.
+        requestVaultModal(state.hasVault ? 'unlock' : 'create');
+        toast(state.hasVault ? 'Unlock the vault first.' : 'Create a vault first.', 'info');
+      }
     }
-    else if (k === 'l') { ev.preventDefault(); lockNow(); }
   });
 
   // Listen for vault-lock-requested from the tray menu
   listen('vault-lock-requested', () => { lockNow(); });
+
+  // The backend idle watchdog locked the vault without us (nothing arrived
+  // for autoLockMinutes). The renderer would otherwise find out at the next
+  // 10 s poll, leaving keys and sessions on screen for up to that long.
+  listen('vault-locked-by-watchdog', async () => {
+    const wasUnlocked = state.unlocked;
+    try { await refreshVaultStatus(); } catch (e) { return; }
+    if (wasUnlocked && !state.unlocked) toast('Vault auto-locked after inactivity.', 'info');
+  });
 
   // The "+" tab-strip chip: show the server list so the user can pick (or
   // add) the host for a new session. It previously had no handler at all -
@@ -3540,7 +3799,6 @@ function wire() {
   el('connectPwCancelBtn').addEventListener('click', () => closeConnectPwModal(null));
   el('connectPwInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); el('connectPwOkBtn').click(); }
-    else if (e.key === 'Escape') { e.preventDefault(); closeConnectPwModal(null); }
   });
   el('connectPwModal').addEventListener('click', (e) => {
     if (e.target === el('connectPwModal')) closeConnectPwModal(null);
@@ -3549,7 +3807,12 @@ function wire() {
   if (typeof initTerminal === 'function') initTerminal();
 }
 
+/// Lock now, immediately: no confirmation, whatever is open.
 async function lockNow() {
+  // Settle every open dialog BEFORE the round trip. Between the lock request
+  // and the status refresh a pending "Confirm" could otherwise still be
+  // clicked, and its action would run against a vault that is already locking.
+  if (state.unlocked) closeDialogsForLock();
   try {
     await call('vault_lock');
     await refreshVaultStatus();
@@ -3557,25 +3820,142 @@ async function lockNow() {
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
+/// Everything that has to happen to the UI when the vault locks, however it
+/// got locked (this window, the tray, the auto-lock timer, the backend
+/// watchdog): settle and close every dialog, blank every secret field, stop
+/// the idle timer.
+function onVaultLocked() {
+  closeDialogsForLock();
+  cancelAutoLockTimer();
+}
+
+/// Close every open dialog through its own closer (so a pending confirmation,
+/// connect-password prompt or YOLO opt-in is answered "no" rather than left
+/// waiting for a click that could now act on a sealed vault), topmost first,
+/// then wipe the places a secret can sit. The vault dialog itself is closed
+/// without being marked dismissed: the unlock gate that follows must show.
+function closeDialogsForLock() {
+  const rank = (n) => modalStack.findIndex((m) => m.node === n);
+  const open = [...document.querySelectorAll('.modal-backdrop')]
+    .filter((n) => !n.hidden && n !== el('vaultModal'))
+    .sort((a, b) => rank(b) - rank(a));
+  for (const node of open) {
+    const close = modalClosers.get(node);
+    try {
+      if (close) close();
+    } catch (e) {
+      // The dialog is hidden below regardless, so the lock is not held up - but
+      // whatever it was holding may not have been settled, so say so.
+      console.warn('[sshspan] a dialog closer threw during the vault lock:', e);
+    }
+    node.hidden = true;
+  }
+  hideVaultModal();
+  clearSensitiveInputs();
+}
+
+/// Every field that can hold a typed or pasted secret, whichever dialog or
+/// settings row it belongs to: all password inputs (including the ones built
+/// at runtime, like the Bitwarden master password), the pasted private key,
+/// the deploy preview and the prompt field.
+function clearSensitiveInputs() {
+  for (const input of document.querySelectorAll('input[type="password"]')) input.value = '';
+  for (const id of ['importPem', 'configPreview', 'promptInput']) {
+    const n = el(id);
+    if (n) n.value = '';
+  }
+  resetImportFileHint();
+}
+
 // ─── Auto-lock (idle timer, honors the autoLockMinutes setting) ────────────
+
+// The backend watchdog also falls back to 15 minutes when the setting is absent
+// or not an integer. It is NOT identical at the edges, and the two are not
+// guaranteed to agree there: the watchdog treats any value <= 0 as "off" (the
+// renderer treats a negative as invalid and uses this default) and it applies
+// no upper limit (the renderer caps at AUTO_LOCK_MAX_MINUTES). The Settings
+// field no longer writes a negative, but settings_set accepts any string, so a
+// restored backup or a hand-edited database can still carry one.
+const AUTO_LOCK_DEFAULT_MINUTES = 15;
+// The Settings field's own maximum (a day). It also keeps the timeout well
+// under setTimeout's 2^31 ms limit, past which a timer fires immediately.
+const AUTO_LOCK_MAX_MINUTES = 1440;
 
 let autoLockTimer = null;
 let autoLockDeadline = 0;
 let autoLockTicker = null;
+// When the HUMAN last did something: a key, a click, the wheel, a touch.
+// Remote output, polls and timers never move it.
+let lastUserActivityAt = Date.now();
 
-function resetAutoLockTimer() {
+/// Effective auto-lock timeout in minutes; 0 means off. An explicit 0 is the
+/// only way to switch it off. The setting is ABSENT on a fresh install
+/// (settings_get returns only keys that were saved), and absent - like
+/// anything that is not a whole non-negative number - means the default, which
+/// is also what the backend watchdog does for an absent or unparsable value
+/// (see AUTO_LOCK_DEFAULT_MINUTES for where the two differ). It used to mean
+/// "off" here, so a new install advertised a lock it never performed.
+function autoLockMinutes() {
+  const raw = state.settings ? state.settings.autoLockMinutes : undefined;
+  if (raw === undefined || raw === null) return AUTO_LOCK_DEFAULT_MINUTES;
+  const text = String(raw).trim();
+  if (!/^\d+$/.test(text)) return AUTO_LOCK_DEFAULT_MINUTES;
+  return Math.min(AUTO_LOCK_MAX_MINUTES, parseInt(text, 10));
+}
+
+/// Stop the idle timer. Safe to call at any time, any number of times.
+function cancelAutoLockTimer() {
   if (autoLockTimer) { clearTimeout(autoLockTimer); autoLockTimer = null; }
-  const mins = parseInt(state.settings.autoLockMinutes, 10);
-  if (!state.unlocked || !mins || mins <= 0) { autoLockDeadline = 0; renderVaultCountdown(); return; }
-  autoLockDeadline = Date.now() + mins * 60 * 1000;
+  autoLockDeadline = 0;
   renderVaultCountdown();
-  autoLockTimer = setTimeout(async () => {
-    autoLockTimer = null;
-    if (state.unlocked) {
-      toast('Vault auto-locked after inactivity.', 'info');
-      await lockNow();
-    }
-  }, mins * 60 * 1000);
+}
+
+/// Arm exactly one timer for the current settings. The deadline is measured
+/// from the last REAL input, never from "now": calling this from a status
+/// poll, a settings reload or a state transition cannot give the user extra
+/// idle time. (resetAutoLockTimer did measure from now, and the 10 s vault
+/// poll called it, so the deadline kept running away and the vault never
+/// auto-locked.)
+function armAutoLockTimer() {
+  if (autoLockTimer) { clearTimeout(autoLockTimer); autoLockTimer = null; }
+  const mins = autoLockMinutes();
+  if (!state.unlocked || mins <= 0) { autoLockDeadline = 0; renderVaultCountdown(); return; }
+  autoLockDeadline = lastUserActivityAt + mins * 60 * 1000;
+  renderVaultCountdown();
+  autoLockTimer = setTimeout(onAutoLockTimer, Math.max(0, autoLockDeadline - Date.now()));
+}
+
+function onAutoLockTimer() {
+  autoLockTimer = null;
+  if (!state.unlocked || !autoLockDeadline) return;
+  // Input since this timer was armed moved the deadline: sleep until the new one.
+  const left = autoLockDeadline - Date.now();
+  if (left > 0) { autoLockTimer = setTimeout(onAutoLockTimer, left); return; }
+  toast('Vault auto-locked after inactivity.', 'info');
+  lockNow();
+}
+
+/// The human did something. Restarts the idle clock and tells the backend
+/// watchdog. Remote output must never call this: a busy server is not a user.
+function noteUserActivity() {
+  lastUserActivityAt = Date.now();
+  const mins = autoLockMinutes();
+  if (autoLockDeadline && mins > 0) autoLockDeadline = lastUserActivityAt + mins * 60 * 1000;
+  queueActivityHeartbeat();
+}
+window.noteUserActivity = noteUserActivity;
+
+const HUMAN_INPUT_EVENTS = ['keydown', 'mousedown', 'pointerdown', 'wheel', 'touchstart'];
+
+/// Window-level listener for real input. Registered in the capture phase on
+/// the window, so it runs before anything that can stop the event: xterm
+/// cancels every key it handles, which hid terminal typing from the old
+/// document-level bubble listeners (a user typing in a shell would have been
+/// locked out, sessions and all, the moment the timer worked). Only trusted
+/// events count, so a script or remote content cannot hold the vault open.
+function onHumanInput(ev) {
+  if (ev.isTrusted === false) return;
+  noteUserActivity();
 }
 
 /// The countdown under the vault label. Auto-lock has always been a setting
@@ -3595,16 +3975,33 @@ function renderVaultCountdown() {
 
 if (!autoLockTicker) autoLockTicker = setInterval(renderVaultCountdown, 1000);
 
-// Renderer liveness heartbeat: the backend runs its own idle auto-lock
-// watchdog that locks the vault when no heartbeat has arrived for
-// autoLockMinutes. This covers a hung or crashed webview, where the
-// renderer-side timer above can never fire. 0/absent still disables
-// auto-lock (the backend reads the same setting).
-setInterval(() => {
-  if (window.__TAURI__ && window.__TAURI__.core) {
-    window.__TAURI__.core.invoke('heartbeat').catch(() => {});
-  }
-}, 30000);
+// Backend idle watchdog input. The Rust side locks the vault when no
+// heartbeat has arrived for autoLockMinutes, which covers a hung or crashed
+// webview where the timer above can never fire. It used to be fed on a fixed
+// 30 s timer, so a renderer that was alive but whose user had walked away
+// kept the watchdog quiet forever. It is now sent only when a human did
+// something: at most once per HEARTBEAT_MIN_GAP_MS, with a trailing send so
+// the last input of a burst is still reported.
+const HEARTBEAT_MIN_GAP_MS = 5000;
+let heartbeatLastSent = 0;
+let heartbeatTimer = null;
+let heartbeatPending = false;
+
+function sendActivityHeartbeat() {
+  heartbeatTimer = null;
+  if (!heartbeatPending) return;
+  heartbeatPending = false;
+  heartbeatLastSent = Date.now();
+  call('heartbeat').catch(() => {});
+}
+
+function queueActivityHeartbeat() {
+  heartbeatPending = true;
+  if (heartbeatTimer) return;
+  const wait = Math.min(HEARTBEAT_MIN_GAP_MS, heartbeatLastSent + HEARTBEAT_MIN_GAP_MS - Date.now());
+  if (wait <= 0) sendActivityHeartbeat();
+  else heartbeatTimer = setTimeout(sendActivityHeartbeat, wait);
+}
 
 // ─── Update check (GitHub releases; manual + auto per setting) ─────────────
 
@@ -3612,10 +4009,11 @@ async function manualUpdateCheck() {
   try {
     const r = await call('update_check');
     if (r.available) {
-      const install = confirm(
+      const install = await confirmModal('Update available',
         `A newer version is available: ${r.current} → ${r.version}\n\n` +
         `${r.notes ? r.notes.slice(0, 800) + '\n\n' : ''}` +
-        `Download and run the installer for this OS?`);
+        `Download and run the installer for this OS?`,
+        'Download and install', { danger: false });
       if (install) {
         toast('Downloading installer...', 'info');
         await call('update_download_and_run', { url: r.assetUrl, version: r.version, expectedSha256: r.assetDigest });
@@ -3646,16 +4044,23 @@ async function autoUpdateCheckOnBoot() {
 function askConnectPassword(server, callback) {
   const modal = document.getElementById('connectPwModal');
   if (!modal) return callback(null); // fallback
+  // One prompt at a time: a second request used to overwrite the first one's
+  // callback, leaving that connect waiting for an answer that could never come.
+  if (state._connectPwCallback) closeConnectPwModal(null);
   modal.hidden = false;
   const label = document.getElementById('connectPwLabel');
   if (label) label.textContent = `Password for ${server.username}@${server.host}:`;
   const inp = document.getElementById('connectPwInput');
-  if (inp) { inp.value = ''; setTimeout(() => inp.focus(), 50); }
+  if (inp) { inp.value = ''; setTimeout(() => inp.focus(), 0); }
   state._connectPwCallback = callback;
 }
 function closeConnectPwModal(value) {
   const modal = document.getElementById('connectPwModal');
   if (modal) modal.hidden = true;
+  // The password goes to the caller and nowhere else: empty the field however
+  // the dialog was closed (OK reads it before getting here).
+  const inp = document.getElementById('connectPwInput');
+  if (inp) inp.value = '';
   const cb = state._connectPwCallback;
   state._connectPwCallback = null;
   if (cb) cb(value);
@@ -3807,7 +4212,7 @@ function openServerContextMenu(x, y, srv) {
   mk('Connect', 'plug-zap', () => openSessionTab(srv));
   mk('Edit', 'pencil', () => openServerModal({ id: srv.id }));
   mk('Delete', 'trash-2', async () => {
-    if (!confirm(`Delete server "${srv.name}"?`)) return;
+    if (!(await confirmModal('Delete server', `Delete server "${srv.name}"?`, 'Delete'))) return;
     try {
       await call('server_delete', { id: srv.id });
       if (state.connectSelectedId === srv.id) selectServer(null);
@@ -3875,6 +4280,8 @@ function closeServerModal() {
   el('serverModal').hidden = true;
   state._editingServerId = null;
   state._pendingServerCategory = null;
+  // A typed server password does not stay behind in a hidden field.
+  el('srvPassword').value = '';
 }
 
 function setConnectAuthMethod(method) {
@@ -4292,11 +4699,20 @@ function activateSessionSurface(tabId) {
 }
 
 /// Close a tab: disconnect if live, dispose terminal, forget the session.
-function closeSessionTab(tabId, { skipConfirm = false } = {}) {
+async function closeSessionTab(tabId, { skipConfirm = false } = {}) {
   const tab = state.sessions.get(tabId);
   if (!tab) return;
-  const live = window.tabSessionLive(tabId);
-  if (live && !skipConfirm && !confirm(`Close the session to ${tab.serverName}?`)) return;
+  let live = window.tabSessionLive(tabId);
+  // Only a live shell is worth asking about. With nothing to ask (or skipConfirm)
+  // nothing is awaited, so the whole close still runs synchronously, as before.
+  if (live && !skipConfirm) {
+    const ok = await confirmModal('Close session', `Close the session to ${tab.serverName}?`, 'Close session');
+    if (!ok) return;
+    // The dialog is modal, not frozen: the session can end, or the vault lock
+    // and tear every tab down, while it is open. Act on what is true now.
+    if (state.sessions.get(tabId) !== tab) return;
+    live = window.tabSessionLive(tabId);
+  }
   if (live) call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
   if (tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
   window.destroyTabTerminal(tabId);
@@ -4533,11 +4949,12 @@ function escapeHtml(s) {
   state.sftpDualPane = state.settings.sftpDualPane === '1';
   applyUiScale(currentUiScale());
 
-  // Auto-lock idle timer: user activity resets it; expiry calls lockNow().
-  for (const ev of ['keydown', 'mousedown', 'wheel', 'touchstart']) {
-    document.addEventListener(ev, () => resetAutoLockTimer(), { passive: true });
+  // Auto-lock idle clock: real input resets it (see onHumanInput); expiry
+  // calls lockNow(). Settings are in now, so arm for the stored minutes.
+  for (const ev of HUMAN_INPUT_EVENTS) {
+    window.addEventListener(ev, onHumanInput, { capture: true, passive: true });
   }
-  resetAutoLockTimer();
+  armAutoLockTimer();
 
   // Optional update check (only when the setting is ticked; never auto-installs).
   autoUpdateCheckOnBoot();

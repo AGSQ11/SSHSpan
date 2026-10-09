@@ -242,16 +242,17 @@ function mcpServerRow(sv) {
   mkBtn('Edit', 'ghost-btn', () => mcpOpenForm(sv));
   mkBtn('Test connection', 'ghost-btn', () => mcpTestConnection(sv.id));
   mkBtn('Remove', 'danger-btn', async () => {
-    b: {
-      if (!window.confirm('Remove MCP server "' + (sv.name || '') + '"?')) break b;
-      try {
-        await mcpCall('mcp_remove_server', { id: sv.id });
-        await mcpLoadSettings();
-        mcpRenderTools();
-        toast('MCP server removed.', 'ok');
-      } catch (e) {
-        toast((e && (e.message || e.error)) || String(e), 'err');
-      }
+    // The app's own dialog: the native confirm() is not usable here (see
+    // confirmModal in app.js), and Cancel / Escape must really mean no.
+    const ok = await confirmModal('Remove MCP server', 'Remove MCP server "' + (sv.name || '') + '"?', 'Remove');
+    if (!ok) return;
+    try {
+      await mcpCall('mcp_remove_server', { id: sv.id });
+      await mcpLoadSettings();
+      mcpRenderTools();
+      toast('MCP server removed.', 'ok');
+    } catch (e) {
+      toast((e && (e.message || e.error)) || String(e), 'err');
     }
   });
   row.appendChild(actions);

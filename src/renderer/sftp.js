@@ -1575,31 +1575,27 @@ function sftpConfirmDelete(message, onYes) {
   el('deleteSkipSession').checked = false;
   el('deleteModal').hidden = false;
   const finish = (yes) => {
+    unregisterModalCloser(el('deleteModal'));
     el('deleteModal').hidden = true;
     // Only a confirmed delete may disarm the prompt. Reading the checkbox on
     // every exit meant ticking it and then backing out via Cancel still
     // switched the safety prompt off for the session, so the NEXT delete -
     // one the user never agreed to skip confirming - went through silently.
     if (yes && el('deleteSkipSession').checked) sftpDeleteConfirmSuppressed = true;
-    document.removeEventListener('keydown', onKey, true);
     el('deleteModal').removeEventListener('click', onBackdrop);
     if (yes) onYes();
   };
-  function onKey(ev) {
-    if (ev.key !== 'Escape') return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    finish(false);
-  }
   function onBackdrop(ev) {
     if (ev.target === el('deleteModal')) finish(false);
   }
   el('deleteYesBtn').onclick = () => finish(true);
   el('deleteCancelBtn').onclick = () => finish(false);
-  // Escape and a backdrop click both mean "no" - abandoning a destructive
-  // prompt must never be harder than confirming it, and both exits are the
-  // safe answer. Capture phase so the dialog wins over any handler behind it.
-  document.addEventListener('keydown', onKey, true);
+  // Escape, a vault lock and a backdrop click all mean "no" - abandoning a
+  // destructive prompt must never be harder than confirming it, and every exit
+  // is the safe answer. Escape and the lock arrive through this closer: the
+  // central modal handler runs it for the topmost layer, wherever focus is
+  // (see registerModalCloser in app.js).
+  registerModalCloser(el('deleteModal'), () => finish(false));
   el('deleteModal').addEventListener('click', onBackdrop);
   // Focus Cancel, not Yes: a reflexive Enter or Space on a delete prompt must
   // not be the thing that deletes.
@@ -1854,19 +1850,14 @@ function openChmodDialog(tabId, paths, entry) {
   })();
 
   const close = () => {
+    unregisterModalCloser(modal);
     modal.hidden = true;
-    document.removeEventListener('keydown', onKey, true);
   };
-  // Escape closes without applying, matching the backdrop click below. Capture
-  // phase and stopPropagation so the keystroke cannot also reach a handler for
-  // whatever is open behind this dialog.
-  function onKey(ev) {
-    if (ev.key !== 'Escape') return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    close();
-  }
-  document.addEventListener('keydown', onKey, true);
+  // Escape and a vault lock close it without applying, matching the backdrop
+  // click below. The central modal handler runs this for the topmost layer only,
+  // so the keystroke cannot also reach whatever is open behind the dialog (see
+  // registerModalCloser in app.js).
+  registerModalCloser(modal, close);
   cancelBtn.onclick = close;
   modal.onclick = (ev) => { if (ev.target === modal) close(); };
 
@@ -2766,21 +2757,16 @@ async function resolveBatchConflicts(tabId, direction, conflicts) {
     for (let i = 0; i < conflicts.length; i++) rows.push(mkRow(conflicts[i], i));
 
     const close = () => {
+      unregisterModalCloser(modal);
       modal.hidden = true;
       applyBtn.onclick = null; cancelBtn.onclick = null; closeBtn.onclick = null; modal.onclick = null;
-      document.removeEventListener('keydown', onKey, true);
     };
-    // Escape means "cancel the whole batch", the same as the X and Cancel
-    // buttons - it must resolve(null) too, or the transfer awaiting this
-    // promise would hang forever with the dialog gone.
-    function onKey(ev) {
-      if (ev.key !== 'Escape') return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      close();
-      resolve(null);
-    }
-    document.addEventListener('keydown', onKey, true);
+    // Escape and a vault lock mean "cancel the whole batch", the same as the X
+    // and Cancel buttons - and they must resolve(null) too, or the transfer
+    // awaiting this promise would hang forever with the dialog gone. The central
+    // modal handler runs this for the topmost layer only (see registerModalCloser
+    // in app.js).
+    registerModalCloser(modal, () => { close(); resolve(null); });
     const finish = () => {
       const out = [];
       for (const { c, actions } of rows) {
@@ -3577,7 +3563,15 @@ function wireSftpPaneDnd(tabId) {
         const from = payload.data.path;
         const to = sftpJoin(sftpJoin(tab.sftpPath, overDir), payload.data.name);
         if (from === to) return;
-        if (!confirm(`Move "${payload.data.name}" to "${sftpJoin(tab.sftpPath, overDir)}"?`)) return;
+        const sessionId = tab.sessionId;
+        const go = await confirmModal('Move item',
+          `Move "${payload.data.name}" to "${sftpJoin(tab.sftpPath, overDir)}"?`,
+          'Move', { danger: false });
+        if (!go) return;
+        // The dialog is modal, not frozen: the tab can close, reconnect or be
+        // torn down by a vault lock while it is open. Only move over the very
+        // session the question was asked about.
+        if (sftpTab(tabId) !== tab || tab.sessionId !== sessionId) return;
         try {
           await sftpCall('sftp_rename', { sessionId: tab.sessionId, from, to });
           sftpLog(tabId, `move ${payload.data.name} → ${to}`);

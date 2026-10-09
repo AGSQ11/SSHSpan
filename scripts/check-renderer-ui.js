@@ -716,7 +716,10 @@ async function checkUxRefactor(browser, server) {
       allKeyCategories: {}, orphans: true, hostOrphans: false,
     },
     server_list: { servers: [SRV('s1', 'web-1', '10.0.0.1', null), SRV('s2', 'db-1', '10.0.0.2', null)] },
-    settings_get: { autoLockMinutes: 15, confirmDelete: true },
+    // No autoLockMinutes on purpose: a fresh install has none saved (settings_get
+    // only returns keys that were written), and the countdown asserted below must
+    // still show the 15-minute default. Seeding 15 here hid that state.
+    settings_get: { confirmDelete: true },
     known_hosts_list: { hosts: [] },
     audit_list: { entries: [] },
     system_paths: { deployDir: '~/.sshspan/keys', sshConfig: '~/.ssh/config', dataDir: '~/.sshspan/sshspan.db' },
