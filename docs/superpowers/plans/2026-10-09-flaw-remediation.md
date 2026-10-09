@@ -6,7 +6,7 @@
 
 **Execution rules (binding; they override any task boilerplate below):**
 
-- The integration branch is `gsq/app-flaws-audit-subagents-c36b18` (the worktree the controller runs in). Streams A/B/C/E each get their own git worktree and branch (`fix/stream-a` … `fix/stream-e`) created by the controller from the integration branch; the controller merges them back and resolves conflicts. Implementers commit on their stream branch (commits are local; nothing is pushed, no PR is opened and no release is cut without the user's say-so). Changelog entries go under `[Unreleased]`; do not bump the version.
+- All work happens sequentially in the controller's worktree on branch `gsq/app-flaws-audit-subagents-c36b18`. The "streams" below are ownership groupings only — there are no stream branches or parallel implementers. Implementers do **not** commit; after each task's review passes, the controller commits that task's changes locally (nothing is pushed, no PR is opened and no release is cut without the user's say-so). Changelog entries go under `[Unreleased]`; do not bump the version.
 - Roles: the controller plans, rules, validates and merges; Sonnet/Opus agents implement and perform task reviews; Fable agents only review, critique, advise or perform the defensive security re-review. Implementers never dispatch subagents.
 - Treat the audit reports as candidate findings, not gospel: re-read the cited code before changing it; if a finding is wrong or already fixed, say so in the report with evidence instead of "fixing" it. Prefer focused repairs over broad refactors; do not add product features beyond what the finding needs; do not add security deny-lists that break legitimate SSH/SFTP workflows.
 - Order of work inside a task: confirmed security, data-loss and broken-feature defects first; UI/a11y/polish second.
@@ -14,7 +14,7 @@
 - The existing integration test `key_deploy_creates_files` writes into the running user's real `~/.ssh` and app config dir; inside WSL that is root's home in the Ubuntu-25.10 VM (no user data), which is tolerable until Task 4 fixes the test. Never point tests at real hosts, credentials, vaults or user data.
 - Per-task briefs, reports and review packages live under `.superpowers/sdd/2026-10-09-flaw-remediation/` in the controller's worktree (git-ignored); implementers read them by absolute path.
 
-**Architecture:** Four independent feature streams run in parallel, each in its own git worktree and branch, each owning a disjoint set of files/functions so merges are mechanical; a final docs/CI stream runs on the merged tree. Every task fixes a cluster of related findings, adds regression tests in the project's existing harnesses (Playwright assertions in `scripts/check-renderer-ui.js`, Rust unit/integration tests), and commits.
+**Architecture:** Sequential task groups on one branch, each implemented by a fresh subagent and gated by an independent review before the controller commits it; a docs/CI task runs last. Every task fixes a cluster of related findings and adds regression tests in the project's existing harnesses (Playwright assertions in `scripts/check-renderer-ui.js`, Rust unit/integration tests).
 
 **Tech Stack:** Tauri 2 (Rust 1.98.0), vanilla JS renderer (no build step), xterm.js 5.5.0, SQLite via sqlx, Playwright 1.56.1 (headless Chromium) for renderer behaviour checks.
 
