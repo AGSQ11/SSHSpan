@@ -27,6 +27,20 @@
  *     is ^V to a terminal) goes through the same multi-line review as the
  *     explicit paste, once, with bracketed paste preserved.
  *
+ * And for unit JU2 (the renderer half of the Rust-core fixes):
+ *   - backups are written and read by Rust (vault_backup_export_to_file /
+ *     vault_backup_restore_from_file): the restore confirms first, a backup
+ *     under another master password round-trips through the masked prompt,
+ *     and keys, servers AND settings are reloaded afterwards;
+ *   - the .pem browse asks for a path only; Settings shows the values in
+ *     effect and puts a control back when the backend refuses its save;
+ *   - controls whose command is refused while locked are disabled, with the
+ *     reason; the master-password change cannot be dismissed while it runs
+ *     and survives a lock in the middle;
+ *   - the audit CSV neutralises formulas; one failing call at boot no longer
+ *     stops the wiring; failed loads show a card with Retry, not an empty
+ *     state; a repeated toast is counted instead of stacked.
+ *
  * Run with `npm run test:safety`. Needs playwright, which is not a
  * devDependency (see check-renderer-ui.js):
  *
@@ -233,8 +247,8 @@ async function scenarioGuards(browser, server) {
     replies: {
       known_hosts_list: { hosts: [{ host: 'example.org', fingerprintSha256: 'SHA256:abc', firstSeen: '2026-01-01T00:00:00Z' }] },
       update_check: { available: true, current: '1.9.1', version: '9.9.9', notes: 'notes', assetUrl: 'https://example.invalid/x', assetDigest: 'abc' },
-      system_select_file: { canceled: false, text: '{"v":1}', path: '/tmp/b.json', name: 'b.json' },
-      vault_backup_restore: { counts: { keys: 0, categories: 0, servers: 0, knownHosts: 0 } },
+      // The restore reads its file in Rust, behind its own dialog (R5).
+      vault_backup_restore_from_file: { ok: true, counts: { keys: 0, categories: 0, servers: 0, knownHosts: 0 } },
       category_delete: { reassigned: [] },
     },
   };
@@ -276,7 +290,7 @@ async function scenarioGuards(browser, server) {
         effect: (c) => c.cmd === 'bitwarden_sync' && c.args.allowRemoteOverwrite === true,
         trigger: () => { window.__action = bwSyncNow(); } },
       { name: 'restore a backup', n: 1,
-        effect: (c) => c.cmd === 'vault_backup_restore',
+        effect: (c) => c.cmd === 'vault_backup_restore_from_file',
         trigger: () => { window.__action = backupRestore(); } },
       { name: 'forget a pinned host', n: 1,
         effect: (c) => c.cmd === 'known_hosts_forget',
@@ -739,13 +753,15 @@ async function scenarioKeyImportCancel(browser, server) {
 
 /// A2-13: the backup password prompt is a secret field and keeps its spaces.
 async function scenarioSecretPrompt(browser, server) {
-  const replies = { system_select_file: { canceled: false, text: '{"v":1}', path: '/tmp/b.json', name: 'b.json' } };
-  await withApp(browser, server, { replies }, 'backup password prompt', async (app) => {
+  await withApp(browser, server, {}, 'backup password prompt', async (app) => {
     const { page } = app;
     await page.evaluate(() => {
-      window.__replies.vault_backup_restore = (a) => {
-        if (a.backupPassword == null) throw 'This backup was created with a different master password.';
-        return { counts: { keys: 1, categories: 0, servers: 0, knownHosts: 0 } };
+      // vault_backup_restore_from_file (R5): the file is picked and read in
+      // Rust; a backup sealed under another master password comes back as
+      // needsPassword with the path granted for one retry.
+      window.__replies.vault_backup_restore_from_file = (a) => {
+        if (a.backupPassword == null) return { needsPassword: true, path: '/tmp/b.json' };
+        return { ok: true, counts: { keys: 1, categories: 0, servers: 0, knownHosts: 0 } };
       };
       window.__action = backupRestore();
     });
@@ -756,7 +772,7 @@ async function scenarioSecretPrompt(browser, server) {
     await page.click('#promptOkBtn');
     await page.waitForTimeout(100);
     check('the password is sent untrimmed',
-      (await app.calls('vault_backup_restore')).map((c) => c.args.backupPassword), [null, '  spaced pw  ']);
+      (await app.calls('vault_backup_restore_from_file')).map((c) => c.args.backupPassword), [undefined, '  spaced pw  ']);
     check('the field is emptied when the prompt closes', await page.inputValue('#promptInput'), '');
     check('and goes back to a plain text field', await page.getAttribute('#promptInput', 'type'), 'text');
     check('no page errors', app.errors, []);
@@ -1128,6 +1144,688 @@ async function scenarioYolo(browser, server) {
   });
 }
 
+// ─── unit JU2: backups, settings, lock-aware controls, boot ─────────────────
+
+const toasts = (page) => page.evaluate(() =>
+  [...document.querySelectorAll('#toast .toast-item')].map((n) => n.querySelector('.toast-text').textContent));
+
+/// Hold a command at the stub until letGo(): what the page shows while it runs.
+const hold = (page, cmd) => page.evaluate((c) => {
+  let release;
+  window.__gates[c] = { promise: new Promise((r) => { release = r; }), release };
+}, cmd);
+const letGo = (page, cmd) => page.evaluate((c) => {
+  const g = window.__gates[c];
+  delete window.__gates[c];
+  if (g) g.release();
+}, cmd);
+
+const buttonState = (page, id) => page.evaluate((i) => {
+  const b = document.getElementById(i);
+  return { disabled: b.disabled, ariaBusy: b.getAttribute('aria-busy'), label: b.textContent.trim() };
+}, id);
+
+/// A Settings row by its title, as the page renders it.
+const settingsRow = (page, title) => page.locator('#settingsRows .settings-row').filter({
+  has: page.locator('.settings-row-title', { hasText: title }),
+});
+
+/// A6-03 / A2-48 / R5 / A2-18: a backup is written by Rust; the page only
+/// asks for it, shows that it is working, and reports where it went.
+async function scenarioBackupCreate(browser, server) {
+  const counts = { keys: 2, categories: 1, servers: 1, knownHosts: 3, sftpBookmarks: 1 };
+  await withApp(browser, server, {}, 'backup create', async (app) => {
+    const { page } = app;
+    await page.evaluate((c) => {
+      window.__replies.vault_backup_export_to_file = {
+        ok: true, canceled: false, path: '/home/u/backups/sshspan-backup.json', counts: c,
+      };
+    }, counts);
+    await hold(page, 'vault_backup_export_to_file');
+    await page.evaluate(() => { window.__action = backupCreate(); });
+    await page.waitForTimeout(60);
+    const busy = await buttonState(page, 'backupExportBtn');
+    check('A2-18 the backup button is busy while the backup is written',
+      { disabled: busy.disabled, ariaBusy: busy.ariaBusy }, { disabled: true, ariaBusy: 'true' });
+    yes('A2-18 and says what it is doing', /saving/i.test(busy.label), busy.label);
+    await page.evaluate(() => { backupCreate(); document.getElementById('backupExportBtn').click(); });
+    await page.waitForTimeout(60);
+    check('A2-18 a second request while it runs starts nothing', await app.count('vault_backup_export_to_file'), 1);
+    await letGo(page, 'vault_backup_export_to_file');
+    await settled(page, () => window.__action, null, 1200);
+    await page.waitForTimeout(60);
+    check('R5 the vault never comes back to the page to be saved',
+      {
+        oldCreate: await app.count('vault_backup_create'),
+        pick: await app.count('system_pick_save_path'),
+        write: await app.count('system_write_text_file'),
+      }, { oldCreate: 0, pick: 0, write: 0 });
+    check('R5 Rust opens the save dialog itself (no arguments)',
+      (await app.calls('vault_backup_export_to_file')).map((c) => c.args), [{}]);
+    const said = (await toasts(page)).join(' | ');
+    yes('A6-03 the toast names the file', said.includes('/home/u/backups/sshspan-backup.json'), said);
+    yes('A6-03 and what went into it', /2 keys/.test(said) && /3 known hosts/.test(said), said);
+    yes('the status line names the file too',
+      (await page.textContent('#backupStatus')).includes('/home/u/backups/sshspan-backup.json'));
+    check('the button is itself again afterwards', await buttonState(page, 'backupExportBtn'),
+      { disabled: false, ariaBusy: null, label: 'Create backup...' });
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { replies: { vault_backup_export_to_file: { canceled: true } } }, 'backup create cancelled', async (app) => {
+    const { page } = app;
+    const status = await page.textContent('#backupStatus');
+    await page.evaluate(() => backupCreate());
+    await page.waitForTimeout(80);
+    check('a dismissed save dialog says nothing', (await toasts(page)).filter((t) => /backup/i.test(t)), []);
+    check('and leaves the status line alone', await page.textContent('#backupStatus'), status);
+  });
+
+  await withApp(browser, server, {
+    replies: { vault_backup_export_to_file: { $reject: 'Writing into a system directory is not allowed.' } },
+  }, 'backup create refused', async (app) => {
+    await app.page.evaluate(() => backupCreate());
+    await app.page.waitForTimeout(80);
+    yes('a refused write shows the backend\'s reason as it is',
+      (await toasts(app.page)).includes('Writing into a system directory is not allowed.'), JSON.stringify(await toasts(app.page)));
+    check('and the button is usable again', (await buttonState(app.page, 'backupExportBtn')).disabled, false);
+  });
+
+  await withApp(browser, server, {
+    replies: { vault_backup_export_to_file: { $reject: 'Vault was locked while the operation was in progress.' } },
+  }, 'backup create interrupted by a lock', async (app) => {
+    await app.page.evaluate(() => backupCreate());
+    await app.page.waitForTimeout(80);
+    yes('a lock before the backup was written is reported as no file saved',
+      (await toasts(app.page)).some((t) => /no file was saved/i.test(t)), JSON.stringify(await toasts(app.page)));
+  });
+
+  await withApp(browser, server, { unlocked: false }, 'backup create while locked', async (app) => {
+    const { page } = app;
+    await page.click('#vaultCancelBtn');
+    await page.evaluate(() => backupCreate());
+    await page.waitForTimeout(80);
+    check('a locked vault is not asked for a backup', await app.count('vault_backup_export_to_file'), 0);
+    yes('the user is told to unlock first', (await toasts(page)).some((t) => /unlock/i.test(t)));
+  });
+}
+
+/// R5 / A2-13 / A2-30 / C1: the restore confirms first, Rust picks and reads
+/// the file, a different master password round-trips through the masked
+/// prompt, and everything that reads settings is reloaded afterwards.
+async function scenarioBackupRestore(browser, server) {
+  const restored = {
+    ok: true, passwordReLinked: true, resealFailures: 0,
+    counts: {
+      keys: 3, categories: 1, keyCategoryLinks: 2, servers: 2, knownHosts: 1, knownHostsImported: 0,
+      knownHostsConflicts: 0, settings: 3, mcpServers: 1, sftpBookmarks: 1, settingsDropped: 0,
+    },
+  };
+  await withApp(browser, server, { settings: { autoLockMinutes: '30', confirmDelete: 'true' } }, 'backup restore', async (app) => {
+    const { page } = app;
+    await page.evaluate((r) => {
+      window.__replies.vault_backup_restore_from_file = (a) => {
+        if (!a.path) return { needsPassword: true, path: '/home/u/old-backup.json' };
+        if (a.backupPassword !== '  old pw  ') throw 'Backup password is incorrect.';
+        // What the restore wrote: the backup's settings replace these.
+        window.__backend.settings = { autoLockMinutes: '0', confirmDelete: 'false', uiScale: '125' };
+        return r;
+      };
+      window.__action = backupRestore();
+    }, restored);
+    yes('R5 restoring asks first', await waitVisible(page, '#confirmModal'));
+    check('R5 and nothing is picked or read before the answer',
+      {
+        restore: await app.count('vault_backup_restore_from_file'),
+        select: await app.count('system_select_file'),
+        old: await app.count('vault_backup_restore'),
+      }, { restore: 0, select: 0, old: 0 });
+    await answerConfirm(page, 'ok');
+    yes('A2-13 a backup sealed under another password asks for that password', await waitVisible(page, '#promptModal'));
+    check('A2-13 in a masked field', await page.getAttribute('#promptInput', 'type'), 'password');
+    check('R5 the first call lets Rust open the file dialog: no path, no password',
+      (await app.calls('vault_backup_restore_from_file')).map((c) => c.args), [{}]);
+    await settled(page, () => window.__action, null, 1200);
+    const settingsReads = await app.count('settings_get');
+    const keyReads = await app.count('key_list');
+    const serverReads = await app.count('server_list');
+    await page.fill('#promptInput', '  old pw  ');
+    await page.click('#promptOkBtn');
+    await page.waitForFunction((n) => window.__calls.filter((c) => c.cmd === 'settings_get').length > n, settingsReads)
+      .catch(() => {});
+    await page.waitForTimeout(150);
+    check('R5 the retry names the file Rust offered and carries the password untrimmed',
+      (await app.calls('vault_backup_restore_from_file')).slice(1).map((c) => c.args),
+      [{ path: '/home/u/old-backup.json', backupPassword: '  old pw  ' }]);
+    check('A2-13 the prompt is emptied and plain text again',
+      [await page.inputValue('#promptInput'), await page.getAttribute('#promptInput', 'type')], ['', 'text']);
+    check('A2-30 the restored settings are read back',
+      await page.evaluate(() => [state.settings.autoLockMinutes, state.settings.confirmDelete, state.settings.uiScale]),
+      ['0', 'false', '125']);
+    check('A2-30 auto-lock follows them at once (0 = off)', await page.textContent('#vaultSub'), 'auto-lock off');
+    yes('A2-30 keys and servers are reloaded too',
+      (await app.count('key_list')) > keyReads && (await app.count('server_list')) > serverReads);
+    yes('the restore is reported', (await toasts(page)).includes('Backup restored.'), JSON.stringify(await toasts(page)));
+    yes('with what came back', /3 keys/.test(await page.textContent('#backupStatus')));
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, {}, 'backup restore wrong password', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      window.__replies.vault_backup_restore_from_file = (a) => {
+        if (!a.path) return { needsPassword: true, path: '/home/u/old-backup.json' };
+        throw 'Backup password is incorrect.';
+      };
+      window.__action = backupRestore();
+    });
+    await answerConfirm(page, 'ok');
+    await waitVisible(page, '#promptModal');
+    await page.fill('#promptInput', 'not it');
+    await page.click('#promptOkBtn');
+    await page.waitForTimeout(150);
+    const said = (await toasts(page)).join(' | ');
+    yes('a wrong backup password is reported', said.includes('Backup password is incorrect'), said);
+    yes('with the way on: the grant is used up, so start the restore again', /again/i.test(said), said);
+    check('and nothing is retried behind the user\'s back', await app.count('vault_backup_restore_from_file'), 2);
+    yes('nor is the prompt reopened', !(await app.open('promptModal')));
+  });
+
+  await withApp(browser, server, {}, 'backup restore cancelled', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => { window.__action = backupRestore(); });
+    await answerConfirm(page, 'cancel');
+    await settled(page, () => window.__action, null, 1200);
+    check('Cancel on the question opens no file dialog', await app.count('vault_backup_restore_from_file'), 0);
+    await page.evaluate(() => { window.__replies.vault_backup_restore_from_file = { canceled: true }; window.__action = backupRestore(); });
+    await answerConfirm(page, 'ok');
+    await settled(page, () => window.__action, null, 1200);
+    const keyReads = await app.count('key_list');
+    await page.waitForTimeout(80);
+    check('a dismissed file dialog restores nothing and says nothing',
+      { toasts: (await toasts(page)).filter((t) => /restor/i.test(t)), reloads: (await app.count('key_list')) - keyReads },
+      { toasts: [], reloads: 0 });
+  });
+
+  await withApp(browser, server, {
+    replies: { vault_backup_restore_from_file: { $reject: 'The vault is being re-encrypted - try again when it finishes.' } },
+  }, 'backup restore during a password change', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => { window.__action = backupRestore(); });
+    await answerConfirm(page, 'ok');
+    await settled(page, () => window.__action, null, 1200);
+    await page.waitForTimeout(60);
+    yes('C1 the re-encryption refusal is shown as it is',
+      (await toasts(page)).includes('The vault is being re-encrypted - try again when it finishes.'), JSON.stringify(await toasts(page)));
+    check('and the restore button is usable again', (await buttonState(page, 'backupImportBtn')).disabled, false);
+
+    // A lock while Rust re-seals the backup's records aborts the restore.
+    await page.evaluate(() => {
+      window.__replies.vault_backup_restore_from_file = { $reject: 'Vault was locked while the operation was in progress.' };
+      window.__action = backupRestore();
+    });
+    await answerConfirm(page, 'ok');
+    await settled(page, () => window.__action, null, 1200);
+    await page.waitForTimeout(60);
+    yes('a lock during the restore is reported as nothing restored',
+      (await toasts(page)).some((t) => /nothing was restored/i.test(t)), JSON.stringify(await toasts(page)));
+  });
+
+  await withApp(browser, server, { unlocked: false }, 'backup restore while locked', async (app) => {
+    const { page } = app;
+    await page.click('#vaultCancelBtn');
+    await page.evaluate(() => { window.__action = backupRestore(); });
+    await page.waitForTimeout(150);
+    check('a locked vault is not offered a restore', [await app.open('confirmModal'), await app.count('vault_backup_restore_from_file')], [false, 0]);
+    yes('the user is told to unlock first', (await toasts(page)).some((t) => /unlock/i.test(t)));
+  });
+
+  await withApp(browser, server, {}, 'backup card copy', async (app) => {
+    const sub = await app.page.textContent('section[data-section="backup"] .card-sub');
+    yes('A7-41 the card lists what a backup holds, SFTP bookmarks and MCP servers included',
+      /SFTP bookmarks/.test(sub) && /MCP servers/.test(sub) && /known hosts/.test(sub), sub);
+    yes('A7-41 and what it does not: Bitwarden sync and AI-assistant settings',
+      /Not included/i.test(sub) && /Bitwarden/.test(sub) && /assistant/i.test(sub), sub);
+    yes('A7-41 it no longer claims to be the entire vault', !/entire vault/i.test(sub), sub);
+  });
+}
+
+/// A6-04 / A2-19: the server form's .pem browse asks for a path, never a read.
+async function scenarioPemPicker(browser, server) {
+  const replies = { system_pick_file_path: { canceled: false, path: '/home/u/.ssh/web.pem', name: 'web.pem' } };
+  await withApp(browser, server, { replies }, '.pem browse', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => openServerModal({}));
+    await page.click('#srvBrowsePemBtn');
+    await page.waitForTimeout(100);
+    check('A6-04 the .pem browse fills in the chosen path', await page.inputValue('#srvPemPath'), '/home/u/.ssh/web.pem');
+    check('A6-04 by asking for a path only: the key file is never read into this window',
+      { pathOnly: await app.count('system_pick_file_path'), read: await app.count('system_select_file') },
+      { pathOnly: 1, read: 0 });
+    check('no page errors', app.errors, []);
+  });
+}
+
+/// A8-14 / A2-14: the Settings rows show the values in effect.
+async function scenarioSettingsDefaults(browser, server) {
+  await withApp(browser, server, { settings: {} }, 'settings defaults', async (app) => {
+    const { page } = app;
+    const parallelShown = async (stored) => {
+      await page.evaluate((s) => { window.__backend.settings = s; }, stored);
+      await page.evaluate(() => switchView('settings'));
+      return settingsRow(page, 'Parallel file transfers').locator('input').inputValue();
+    };
+    check('A8-14 nothing stored: parallel transfers shows the 4 the queue runs', await parallelShown({}), '4');
+    check('A8-14 the backend\'s own default is shown as it is', await parallelShown({ sftpParallel: '4' }), '4');
+    check('A8-14 a stored value is shown', await parallelShown({ sftpParallel: '3' }), '3');
+    check('A8-14 junk reads as the queue reads it: 4', await parallelShown({ sftpParallel: 'junk' }), '4');
+    check('A8-14 out of range is clamped like the queue clamps it', await parallelShown({ sftpParallel: '9' }), '4');
+    check('A2-14 the auto-lock row shows the 15 minutes the backend applies',
+      await page.evaluate(() => { window.__backend.settings = { autoLockMinutes: '15' }; return switchView('settings'); })
+        .then(() => settingsRow(page, 'Lock the vault when idle').locator('input').inputValue()), '15');
+    check('no page errors', app.errors, []);
+  });
+}
+
+/// A5-32: a control whose save the backend refuses goes back to the value in
+/// effect, and the backend's message is shown.
+async function scenarioSettingsRevert(browser, server) {
+  const settings = {
+    confirmDelete: 'true', autoLockMinutes: '20', sftpParallel: '3', terminalBell: 'visual',
+    sftpConflictUpload: 'ask', uiScale: '100', sftpMaxBps: '1048576',
+  };
+  await withApp(browser, server, { settings }, 'settings revert', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => switchView('settings'));
+    await page.evaluate(() => { window.__replies.settings_set = () => { throw 'Disk is read-only.'; }; });
+    const attempts = async (key) => (await app.calls('settings_set')).filter((c) => c.args.key === key).map((c) => c.args.value);
+    const blur = async () => { await page.keyboard.press('Tab'); await page.waitForTimeout(80); };
+
+    await settingsRow(page, 'Confirm before deleting a key').locator('.toggle-box').click();
+    await page.waitForTimeout(80);
+    check('A5-32 the save was attempted', await attempts('confirmDelete'), ['false']);
+    check('A5-32 a refused toggle flips back', await settingsRow(page, 'Confirm before deleting a key').locator('input').isChecked(), true);
+    check('A5-32 and the setting in effect is unchanged', await page.evaluate(() => state.settings.confirmDelete), 'true');
+
+    await settingsRow(page, 'Lock the vault when idle').locator('input').fill('30');
+    await blur();
+    check('A5-32 the auto-lock save was attempted', await attempts('autoLockMinutes'), ['30']);
+    check('A5-32 a refused auto-lock value goes back', await settingsRow(page, 'Lock the vault when idle').locator('input').inputValue(), '20');
+    yes('A5-32 and the countdown keeps the minutes in effect', /^locks in (19|20):\d\d$/.test(await page.textContent('#vaultSub')),
+      await page.textContent('#vaultSub'));
+
+    await settingsRow(page, 'Parallel file transfers').locator('input').fill('2');
+    await blur();
+    check('A5-32 a refused number goes back', [await attempts('sftpParallel'), await settingsRow(page, 'Parallel file transfers').locator('input').inputValue()], [['2'], '3']);
+
+    await settingsRow(page, 'Terminal bell').locator('select').selectOption('sound');
+    await page.waitForTimeout(80);
+    check('A5-32 a refused choice goes back', [await attempts('terminalBell'), await settingsRow(page, 'Terminal bell').locator('select').inputValue()], [['sound'], 'visual']);
+
+    await settingsRow(page, 'When an upload would overwrite a file').locator('select').selectOption('overwrite');
+    await page.waitForTimeout(80);
+    check('A5-32 a refused conflict default goes back, and the transfer code keeps the old one',
+      [await settingsRow(page, 'When an upload would overwrite a file').locator('select').inputValue(),
+        await page.evaluate(() => window.sftpConflictDefaults.sftpConflictUpload)], ['ask', 'ask']);
+
+    await settingsRow(page, 'Interface scale').locator('select').selectOption('150');
+    await page.waitForTimeout(80);
+    check('A5-32 a refused scale goes back', [await attempts('uiScale'), await settingsRow(page, 'Interface scale').locator('select').inputValue()], [['150'], '100']);
+
+    const bw = settingsRow(page, 'Bandwidth limit');
+    await bw.locator('input[type="number"]').fill('2');
+    await blur();
+    check('A5-32 a refused bandwidth limit goes back to the limit in effect',
+      [await attempts('sftpMaxBps'), await bw.locator('input[type="number"]').inputValue(), await bw.locator('select').inputValue()],
+      [['2097152'], '1', '1048576']);
+    check('A5-32 and is not pushed to running transfers', await app.count('sftp_queue_set_rate_limit'), 0);
+
+    yes('A5-32 the backend\'s message is shown', (await toasts(page)).some((t) => t === 'Disk is read-only.'), JSON.stringify(await toasts(page)));
+
+    await page.evaluate(() => { delete window.__replies.settings_set; });
+    await settingsRow(page, 'Confirm before deleting a key').locator('.toggle-box').click();
+    await page.waitForTimeout(80);
+    check('a save that goes through sticks', [await settingsRow(page, 'Confirm before deleting a key').locator('input').isChecked(),
+      await page.evaluate(() => state.settings.confirmDelete)], [false, 'false']);
+    check('no page errors', app.errors, []);
+  });
+}
+
+/// A6-08 (renderer half) / A2-14: the controls whose command the backend
+/// refuses while locked are disabled, with the reason, and come back on unlock.
+async function scenarioLockGates(browser, server) {
+  const opts = {
+    settings: { autoLockMinutes: '0' },
+    replies: {
+      known_hosts_list: { hosts: [{ host: 'example.org', fingerprintSha256: 'SHA256:abc', firstSeen: '2026-01-01T00:00:00Z' }] },
+      audit_list: { rows: [{ ts: '2026-01-01T00:00:00Z', event: 'vault.unlock', detail: '' }], total: 1 },
+    },
+  };
+  await withApp(browser, server, opts, 'lock gates', async (app) => {
+    const { page } = app;
+    const GATED = ['Lock the vault when idle', 'Confirm before deleting a key', 'Confirm multi-line pastes into the terminal', 'Check GitHub for new releases'];
+    const gatedRows = async () => {
+      const out = [];
+      for (const t of GATED) {
+        const row = settingsRow(page, t);
+        const hint = row.locator('.settings-row-locked');
+        const shown = (await hint.count()) > 0 && await hint.isVisible()
+          && /Unlock the vault to change this/.test(await hint.textContent());
+        out.push({ disabled: await row.locator('input').isDisabled(), hint: shown });
+      }
+      return out;
+    };
+    const categoryControls = () => page.evaluate(() => ({
+      add: document.getElementById('catAddRootBtn').disabled,
+      addTitle: document.getElementById('catAddRootBtn').title,
+      menus: [...document.querySelectorAll('#catTree .cat-actions-btn')].map((b) => [b.disabled, b.title]),
+      drag: [...document.querySelectorAll('#catTree .cat-node:not(.uncategorized)')].map((n) => n.draggable),
+    }));
+    const otherControls = () => page.evaluate(() => ({
+      clear: [document.getElementById('auditClearBtn').disabled, document.getElementById('auditClearBtn').title],
+      forget: [...document.querySelectorAll('#knownHostsBody .ghost-btn')].map((b) => [b.disabled, b.title]),
+    }));
+
+    check('unlocked: the category controls work', await categoryControls(),
+      { add: false, addTitle: 'New top-level category', menus: [[false, 'Category actions']], drag: [true] });
+
+    await page.keyboard.press('Control+l');
+    await page.waitForTimeout(150);
+    await page.click('#vaultCancelBtn');
+    const locked = await categoryControls();
+    check('A6-08 locked: New category is disabled', locked.add, true);
+    yes('A6-08 with a tooltip that says why', /unlock the vault/i.test(locked.addTitle), locked.addTitle);
+    check('A6-08 every category menu is disabled, with the reason',
+      locked.menus.map(([d, t]) => d && /unlock the vault/i.test(t)), [true]);
+    check('A6-08 and categories cannot be dragged', locked.drag, [false]);
+
+    await page.evaluate(() => switchView('settings'));
+    const lockedOther = await otherControls();
+    check('A6-08 locked: Clear log is disabled', lockedOther.clear[0], true);
+    yes('A6-08 with the reason', /unlock the vault/i.test(lockedOther.clear[1]), lockedOther.clear[1]);
+    check('A6-08 every Forget is disabled, with the reason',
+      lockedOther.forget.map(([d, t]) => d && /unlock the vault/i.test(t)), [true]);
+    check('A2-14 locked: the four security settings are disabled and say why', await gatedRows(),
+      GATED.map(() => ({ disabled: true, hint: true })));
+    check('A2-14 the other settings stay usable',
+      [await settingsRow(page, 'Interface scale').locator('select').isDisabled(),
+        await settingsRow(page, 'Parallel file transfers').locator('input').isDisabled()], [false, false]);
+
+    // Nothing a locked user can reach turns into the backend's bare refusal.
+    await page.evaluate(() => {
+      document.getElementById('auditClearBtn').click();
+      document.querySelector('#knownHostsBody .ghost-btn').click();
+      window.__a = auditClear();
+      window.__b = deleteCategory('c1');
+      addCategoryPrompt(null);
+      renameCategory('c1');
+    });
+    await page.waitForTimeout(200);
+    const sent = [];
+    for (const c of ['audit_clear', 'known_hosts_forget', 'category_delete', 'category_create', 'category_rename']) {
+      sent.push(await app.count(c));
+    }
+    check('A6-08 locked: nothing is asked and nothing is sent',
+      { dialogs: await app.openIds(), sent }, { dialogs: [], sent: [0, 0, 0, 0, 0] });
+    check('A6-08 and no "Vault is locked." reaches the user', (await toasts(page)).filter((t) => /Vault is locked/.test(t)), []);
+
+    await page.evaluate(() => requestVaultModal('unlock'));
+    await page.fill('#vaultPassword', PASSWORD);
+    await page.click('#vaultPrimary');
+    await page.waitForTimeout(250);
+    check('unlocked again: the security settings work again', await gatedRows(),
+      GATED.map(() => ({ disabled: false, hint: false })));
+    check('and Clear log and Forget', await otherControls(),
+      { clear: [false, ''], forget: [[false, '']] });
+    await page.evaluate(() => switchView('keys'));
+    check('and the category controls, with their own tooltips back', await categoryControls(),
+      { add: false, addTitle: 'New top-level category', menus: [[false, 'Category actions']], drag: [true] });
+    check('no page errors', app.errors, []);
+  });
+}
+
+/// A2-18 / RU1 C1: changing the master password re-seals every record and can
+/// take seconds per key. The dialog shows it, cannot be closed under it, and
+/// a lock in the middle leaves a usable unlock gate and a true account of
+/// which password now opens the vault.
+async function scenarioPasswordChange(browser, server) {
+  const fillChange = async (page) => {
+    await page.evaluate(() => requestVaultModal('change'));
+    await page.fill('#vaultPasswordCurrent', 'old-password-1');
+    await page.fill('#vaultPassword', 'new-password-2');
+    await page.fill('#vaultPasswordConfirm', 'new-password-2');
+  };
+  const dialog = (page) => page.evaluate(() => ({
+    title: document.getElementById('vaultModalTitle').textContent,
+    text: document.getElementById('vaultModalText').textContent,
+    primary: document.getElementById('vaultPrimary').textContent,
+    primaryDisabled: document.getElementById('vaultPrimary').disabled,
+    cancelDisabled: document.getElementById('vaultCancelBtn').disabled,
+  }));
+
+  await withApp(browser, server, { clock: true, settings: { autoLockMinutes: '0' } }, 'password change runs', async (app) => {
+    const { page } = app;
+    await fillChange(page);
+    await hold(page, 'vault_change_password');
+    await page.click('#vaultPrimary');
+    await page.waitForTimeout(60);
+    const busy = await dialog(page);
+    yes('A2-18 the button shows the change is running', /re-encrypting/i.test(busy.primary) && busy.primaryDisabled, JSON.stringify(busy));
+    yes('C1 the dialog says the vault is being re-encrypted', /re-encrypting your vault/i.test(busy.text), busy.text);
+    check('C1 Cancel is disabled while it runs', busy.cancelDisabled, true);
+    await page.keyboard.press('Escape');
+    yes('C1 Escape does not close it mid-change', await app.open('vaultModal'));
+    await page.evaluate(() => document.getElementById('vaultModal').click());
+    yes('C1 nor a click on the backdrop', await app.open('vaultModal'));
+    await page.evaluate(() => document.getElementById('vaultCancelBtn').click());
+    yes('C1 nor Cancel', await app.open('vaultModal'));
+    await app.tick(35 * 1000);
+    yes('C1 nor the status polls', await app.open('vaultModal'));
+    await page.evaluate(() => { document.getElementById('vaultPrimary').click(); submitVaultModal(); });
+    check('A2-18 a second submit while it runs sends nothing', await app.count('vault_change_password'), 1);
+    await letGo(page, 'vault_change_password');
+    await page.waitForTimeout(150);
+    yes('it closes when the change is done', !(await app.open('vaultModal')));
+    yes('and says so', (await toasts(page)).some((t) => /master password changed/i.test(t)));
+    await page.evaluate(() => requestVaultModal('change'));
+    const again = await dialog(page);
+    check('reopened, the dialog is idle again',
+      [again.primary, again.primaryDisabled, again.cancelDisabled, /re-encrypting your vault/i.test(again.text)],
+      ['Change password', false, false, false]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { clock: true, settings: { autoLockMinutes: '0' } }, 'lock during a password change', async (app) => {
+    const { page } = app;
+    await fillChange(page);
+    await hold(page, 'vault_change_password');
+    await page.click('#vaultPrimary');
+    await page.waitForTimeout(60);
+    await page.keyboard.press('Control+l');
+    await page.waitForTimeout(150);
+    check('a lock still goes through mid-change', await app.count('vault_lock'), 1);
+    const gate = await dialog(page);
+    check('the unlock gate replaces the change dialog, idle and dismissable',
+      [gate.title, gate.primary, gate.primaryDisabled, gate.cancelDisabled], ['Unlock vault', 'Unlock', false, false]);
+    await page.fill('#vaultPassword', 'typed so far');
+    await page.evaluate(() => {
+      window.__replies.vault_change_password = () => { throw 'Vault was locked while the operation was in progress.'; };
+    });
+    await letGo(page, 'vault_change_password');
+    await page.waitForTimeout(150);
+    const said = (await toasts(page)).join(' | ');
+    yes('the user is told nothing was changed, so the current password still opens the vault',
+      /nothing was changed/i.test(said) && /current/i.test(said), said);
+    check('the late answer leaves the unlock gate alone',
+      [await app.open('vaultModal'), await page.inputValue('#vaultPassword'), (await dialog(page)).primary], [true, 'typed so far', 'Unlock']);
+    await page.fill('#vaultPassword', PASSWORD);
+    await page.click('#vaultPrimary');
+    await page.waitForTimeout(150);
+    check('and unlocking works', [await app.count('vault_unlock'), await page.evaluate(() => state.unlocked)], [1, true]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { clock: true, settings: { autoLockMinutes: '0' } }, 'lock after the change committed', async (app) => {
+    const { page } = app;
+    await fillChange(page);
+    await hold(page, 'vault_change_password');
+    await page.click('#vaultPrimary');
+    await page.waitForTimeout(60);
+    // The tray or the idle watchdog locks after the rotation committed: the
+    // backend keeps the vault locked, and only the NEW password opens it.
+    await page.evaluate(() => { window.__backend.unlocked = false; });
+    await letGo(page, 'vault_change_password');
+    await page.waitForTimeout(200);
+    yes('the vault is shown locked', await page.evaluate(() => !state.unlocked) && await app.open('vaultModal'));
+    yes('and the user is told the NEW password is the one that opens it',
+      (await toasts(page)).some((t) => /new master password/i.test(t)), JSON.stringify(await toasts(page)));
+  });
+}
+
+/// A2-32: the audit CSV cannot smuggle a formula into a spreadsheet.
+async function scenarioAuditCsv(browser, server) {
+  const replies = { system_pick_save_path: { canceled: false, path: '/home/u/audit.csv' } };
+  await withApp(browser, server, { replies }, 'audit csv', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      window.__replies.audit_list = {
+        total: 5,
+        rows: [
+          { ts: '2026-01-01T00:00:00Z', event: '=HYPERLINK("http://x","y")', keyId: null, detail: 'plain' },
+          { ts: '2026-01-01T00:00:00Z', event: 'key.created', keyId: '+cmd', detail: '-2+3' },
+          { ts: '2026-01-01T00:00:00Z', event: 'key.created', keyId: '@SUM(A1)', detail: '\tTAB' },
+          { ts: '2026-01-01T00:00:00Z', event: 'key.created', keyId: 'k1', detail: '\rCR' },
+          { ts: '2026-01-01T00:00:00Z', event: 'key.created', keyId: 'k2', detail: 'a=b, "quoted"' },
+        ],
+      };
+    });
+    await page.evaluate(() => auditExport());
+    await page.waitForTimeout(80);
+    const csv = ((await app.calls('system_write_text_file'))[0] || { args: {} }).args.contents || '';
+    check('A2-32 cells that start a formula are neutralised with a leading quote',
+      ['"\'=HYPERLINK(""http://x"",""y"")"', '"\'+cmd"', '"\'-2+3"', '"\'@SUM(A1)"', '"\'\tTAB"', '"\'\rCR"']
+        .map((cell) => csv.includes(cell)), [true, true, true, true, true, true]);
+    check('A2-32 other cells are unchanged', ['"plain"', '"a=b, ""quoted"""', '"key.created"'].map((cell) => csv.includes(cell)), [true, true, true]);
+    check('A2-32 csvField itself', await page.evaluate(() => [csvField('=1+2'), csvField('ok'), csvField(null), csvField('-')]),
+      ['"\'=1+2"', '"ok"', '""', '"\'-"']);
+  });
+}
+
+/// A8-11: the create dialog names the KDF the vault really uses.
+async function scenarioCreateCopy(browser, server) {
+  await withApp(browser, server, { hasVault: false, unlocked: false }, 'create copy', async (app) => {
+    const text = await app.page.textContent('#vaultModalText');
+    yes('A8-11 the create dialog says Argon2id', /Argon2id/.test(text), text);
+    yes('A8-11 and no longer says scrypt', !/scrypt/i.test(text), text);
+  });
+}
+
+/// A2-20: one failing call at boot must not leave the app half-initialised.
+async function scenarioBoot(browser, server) {
+  const opts = {
+    clock: true, bootCmd: 'vault_status',
+    settings: { autoLockMinutes: '0' },
+    replies: { category_list: { $reject: 'Category table is busy.' } },
+  };
+  await withApp(browser, server, opts, 'boot with a failing category load', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(300);
+    yes('A2-20 the failed category load is reported', (await toasts(page)).some((t) => t.includes('Category table is busy.')),
+      JSON.stringify(await toasts(page)));
+    check('A2-20 boot still reads the stored settings', await app.count('settings_get'), 1);
+    check('A2-20 and applies them (auto-lock 0 = off)', await page.textContent('#vaultSub'), 'auto-lock off');
+    check('A2-20 the keys still show', await page.evaluate(() => document.querySelectorAll('#keyList .key-row').length), 2);
+    const polls = await app.count('vault_status');
+    await app.tick(10 * 1000 + 200);
+    yes('A2-20 the 10 s status poll is running', (await app.count('vault_status')) > polls);
+    const beats = await app.count('heartbeat');
+    await page.keyboard.press('a');
+    yes('A2-20 and real input is still watched (heartbeat)', (await app.count('heartbeat')) > beats);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, {}, 'new category refused', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      window.__replies.category_create = () => { throw 'A category parent must use the same key/host scope.'; };
+      addCategoryPrompt(null);
+    });
+    await waitVisible(page, '#promptModal');
+    await page.fill('#promptInput', 'Ops');
+    await page.click('#promptOkBtn');
+    await page.waitForTimeout(120);
+    yes('A2-20 a refused new category is reported',
+      (await toasts(page)).includes('A category parent must use the same key/host scope.'), JSON.stringify(await toasts(page)));
+    check('A2-20 not left as an unhandled rejection',
+      await page.evaluate(() => (window.__bootErrors || []).filter((m) => /unhandled/.test(m))), []);
+  });
+}
+
+/// A5-21: a list that failed to load says so, with a Retry - it is not the
+/// first-run empty state - and a repeated toast is counted, not stacked.
+async function scenarioLoadErrors(browser, server) {
+  const card = (page, host) => page.evaluate((h) => {
+    const c = document.querySelector(h + ' .load-error');
+    return c ? { text: c.textContent, retry: [...c.querySelectorAll('button')].some((b) => /retry/i.test(b.textContent)) } : null;
+  }, host);
+
+  await withApp(browser, server, { replies: { key_list: { $reject: 'Backend unavailable.' } } }, 'keys fail to load', async (app) => {
+    const { page } = app;
+    const c = await card(page, '#keyList');
+    yes('A5-21 the key list says the keys could not be loaded, with the reason', c && c.text.includes('Backend unavailable.'), JSON.stringify(c));
+    yes('A5-21 with a Retry', c && c.retry);
+    check('A5-21 and not "No keys yet"', await page.evaluate(() => document.getElementById('emptyState').hidden), true);
+    await page.evaluate(() => { delete window.__replies.key_list; });
+    await page.click('#keyList .load-error button');
+    await page.waitForTimeout(150);
+    check('A5-21 Retry loads them', [await card(page, '#keyList'), await page.evaluate(() => document.querySelectorAll('#keyList .key-row').length)], [null, 2]);
+  });
+
+  await withApp(browser, server, { replies: { server_list: { $reject: 'Backend unavailable.' } } }, 'servers fail to load', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => switchView('connect'));
+    const c = await card(page, '#serverList');
+    yes('A5-21 the server list says the servers could not be loaded', c && c.text.includes('Backend unavailable.') && c.retry, JSON.stringify(c));
+    check('A5-21 and not "No saved servers yet"', await page.evaluate(() => document.getElementById('serverEmpty').hidden), true);
+    await page.evaluate(() => { delete window.__replies.server_list; });
+    await page.click('#serverList .load-error button');
+    await page.waitForTimeout(150);
+    check('A5-21 Retry loads them', [await card(page, '#serverList'), await page.evaluate(() => document.querySelectorAll('#serverList .server-row').length)], [null, 1]);
+  });
+
+  await withApp(browser, server, { settings: { autoLockMinutes: '0' } }, 'settings fail to load', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => { window.__replies.settings_get = () => { throw 'Database is busy.'; }; });
+    await page.evaluate(() => switchView('settings'));
+    const c = await card(page, '#settingsRows');
+    yes('A5-21 Settings says the settings could not be loaded, with a Retry', c && c.text.includes('Database is busy.') && c.retry, JSON.stringify(c));
+    check('A5-21 and keeps the settings in effect instead of resetting them',
+      [await page.evaluate(() => state.settings.autoLockMinutes), await page.textContent('#vaultSub')], ['0', 'auto-lock off']);
+    await page.evaluate(() => { delete window.__replies.settings_get; });
+    await page.click('#settingsRows .load-error button');
+    await page.waitForTimeout(150);
+    yes('A5-21 Retry brings the rows', (await card(page, '#settingsRows')) === null
+      && await page.evaluate(() => document.querySelectorAll('#settingsRows .settings-row').length > 5));
+  });
+
+  await withApp(browser, server, {}, 'repeated toasts', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      toast('Backend unavailable.', 'err'); toast('Backend unavailable.', 'err'); toast('Backend unavailable.', 'err');
+      toast('Something else.', 'err');
+      toast('Backend unavailable.', 'info');
+    });
+    const items = await page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].map((n) => ({
+      text: n.querySelector('.toast-text').textContent,
+      count: n.querySelector('.toast-count') ? n.querySelector('.toast-count').textContent : null,
+    })));
+    check('A5-21 an identical toast while one is up is counted, not stacked',
+      items.filter((i) => i.text === 'Backend unavailable.').length, 2);
+    check('A5-21 the count is shown on it', items.map((i) => i.count).filter(Boolean), ['×3']);
+    check('A5-21 other messages still get their own toast', items.length, 3);
+  });
+}
+
 // ─── runner ─────────────────────────────────────────────────────────────────
 
 const SCENARIOS = [
@@ -1143,6 +1841,17 @@ const SCENARIOS = [
   ['sftp dialogs: closed by the central Escape handler and by a lock', scenarioSftpDialogs],
   ['terminal paste: native paste is reviewed like explicit paste', scenarioPaste],
   ['assistant: YOLO dialog fails closed', scenarioYolo],
+  ['backup: written by Rust, busy button, path and counts reported', scenarioBackupCreate],
+  ['restore: confirm first, password round-trip, everything reloaded', scenarioBackupRestore],
+  ['server form: the .pem browse picks a path only', scenarioPemPicker],
+  ['settings: the values in effect are shown', scenarioSettingsDefaults],
+  ['settings: a refused save puts the control back', scenarioSettingsRevert],
+  ['lock: controls the backend refuses while locked are disabled', scenarioLockGates],
+  ['master password change: busy, not dismissable, safe across a lock', scenarioPasswordChange],
+  ['audit CSV: formula cells are neutralised', scenarioAuditCsv],
+  ['create dialog: names the real KDF', scenarioCreateCopy],
+  ['boot: one failing call does not stop the wiring', scenarioBoot],
+  ['load errors: a card with Retry, repeated toasts counted', scenarioLoadErrors],
 ];
 
 (async () => {

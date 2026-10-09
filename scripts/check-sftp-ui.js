@@ -706,8 +706,12 @@ async function scenarioChmod(browser, server) {
     check('no page errors', app.errors, []);
   });
 
-  // A server that leaves the file-type bits out of the mode: the type comes
-  // from the listing instead (a folder is split, a file never is).
+  // A server that leaves the file-type bits out of the mode. sftp_chmod walks
+  // only a path its own stat calls a folder; anything else gets a root-only
+  // change whatever applyTo says. So the folders-then-files split would set
+  // the full mode and then the plain bits on the SAME path, stripping the
+  // special bits that were meant to stay: one full-mode call instead, whatever
+  // the listing says the path is.
   await withFiles(browser, server, { remote, modes: { '/srv/shared': 0o2775, '/srv/b.sh': 0o4755 }, local: HOME_ONLY },
     'A3-20 chmod without type bits', async (app) => {
       const { page } = app;
@@ -723,8 +727,8 @@ async function scenarioChmod(browser, server) {
       };
       let n = await app.count('sftp_chmod');
       await recursiveApply('/srv/shared');
-      check('A3-20 a folder whose type the server did not report is still split, folders first',
-        await sent(n), [['/srv/shared', 0o2775, true, 'dirs'], ['/srv/shared', 0o775, true, 'files']]);
+      check('A3-20 a folder whose type the server did not report gets ONE full-mode call (its special bits stay)',
+        await sent(n), [['/srv/shared', 0o2775, true, 'all']]);
       n = await app.count('sftp_chmod');
       await recursiveApply('/srv/b.sh');
       check('A3-20 a setuid file is never split: it keeps its own bits', await sent(n), [['/srv/b.sh', 0o4755, true, 'all']]);

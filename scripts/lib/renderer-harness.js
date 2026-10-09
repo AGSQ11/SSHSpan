@@ -126,8 +126,9 @@ async function openPage(browser, server, replies) {
 /// Installed before any page script. It answers the commands the renderer
 /// sends, records every call in window.__calls, and exposes just enough control
 /// for a test: window.__backend (vault/session state), window.__replies
-/// (per-command override: a value or a function(args)), window.__gates (hold a
-/// command until released), window.__emit (fire a Tauri event).
+/// (per-command override: a value, a function(args), or { $reject: message }
+/// for a command that fails), window.__gates (hold a command until released),
+/// window.__emit (fire a Tauri event).
 function stubInit(cfg) {
   const calls = [];
   const listeners = {};
@@ -196,6 +197,10 @@ function stubInit(cfg) {
     if (gate) await gate.promise;
     const r = window.__replies[cmd];
     if (typeof r === 'function') return r(args || {});
+    // A failing command, declared as data so it can be set before boot (a
+    // function does not survive addInitScript's argument). Rejects with the
+    // bare message string, the way a Rust Err(String) reaches the page.
+    if (r && typeof r === 'object' && Object.prototype.hasOwnProperty.call(r, '$reject')) throw r.$reject;
     if (r !== undefined) return r;
     const h = H[cmd];
     return h ? h(args || {}) : {};
@@ -256,6 +261,9 @@ const CATEGORY = { id: 'c1', name: 'Prod', parent_id: null, scope: 'key', sort_i
 
 /// Open the real app against the stub. `clock: true` installs Playwright's fake
 /// clock and pauses it after boot, so time only moves through app.tick().
+/// `bootCmd` names the IPC command whose first call counts as "booted"
+/// (default settings_get); a test of a boot that may not get that far waits
+/// for an earlier one instead.
 async function openApp(browser, server, o = {}) {
   const context = await browser.newContext({ viewport: { width: 1400, height: 900 } });
   // The paste checks put real text on the clipboard and press a real key.
@@ -282,7 +290,7 @@ async function openApp(browser, server, o = {}) {
   await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
   // main() reads settings only after every script has loaded and the first
   // vault_status has been applied, so this means "booted".
-  await page.waitForFunction(() => window.__calls.some((c) => c.cmd === 'settings_get'));
+  await page.waitForFunction((cmd) => window.__calls.some((c) => c.cmd === cmd), o.bootCmd || 'settings_get');
   await page.waitForTimeout(60);
   if (o.clock) {
     const now = await page.evaluate(() => Date.now());

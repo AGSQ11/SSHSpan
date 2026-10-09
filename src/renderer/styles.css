@@ -475,6 +475,11 @@ label:focus-within { color: var(--text); }
 .empty-state .empty-ico svg { width: 22px; height: 22px; }
 .empty-state h3 { color: var(--text); font-weight: 650; font-size: 14px; }
 .empty-state p { font-size: 12.5px; color: var(--text-faint); margin-bottom: 6px; }
+/* A list that could not be loaded (A5-21): the same card, marked as an error,
+   with the backend's message and a Retry instead of the first-run copy. */
+.empty-state.load-error { border-style: solid; border-color: rgba(var(--danger-rgb), 0.45); }
+.empty-state.load-error .empty-ico { color: var(--danger); }
+.load-error-msg { max-width: 520px; overflow-wrap: anywhere; }
 
 /* ---- detail pane -------------------------------------------------------- */
 
@@ -812,6 +817,12 @@ label:focus-within { color: var(--text); }
   padding: 2px 4px; border-radius: 5px;
 }
 .toast-dismiss:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+/* How many times the same message arrived while it was on screen (A5-21). */
+.toast-count {
+  flex: none; font-size: 11px; font-weight: 700; line-height: 1;
+  padding: 3px 6px; border-radius: 999px;
+  background: rgba(255,255,255,0.08); color: var(--text-dim);
+}
 .toast-item.err  { border-color: rgba(var(--danger-rgb), 0.5); color: #fecaca; }
 .toast-item.err::before  { background: var(--danger); }
 .toast-item.warn { border-color: rgba(var(--warn-rgb), 0.45); }
@@ -948,6 +959,9 @@ label:focus-within { color: var(--text); }
 .cat-node.active .cat-actions-btn { opacity: 1; }
 .cat-actions-btn:hover { color: var(--text); background: var(--panel-2); }
 .cat-actions-btn svg { width: 14px; height: 14px; }
+/* Locked vault (A6-08): the menu's actions are refused, its tooltip says why. */
+.cat-actions-btn:disabled { cursor: not-allowed; }
+.cat-actions-btn:disabled:hover { color: var(--text-faint); background: transparent; }
 
 .cat-children {
   display: flex; flex-direction: column; gap: 1px;
@@ -2252,6 +2266,11 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .settings-row-control .toggle-input:checked + .toggle-box { background: rgba(var(--accent-rgb), 0.25); border-color: var(--accent); }
 .settings-row-control .toggle-input:checked + .toggle-box::after { transform: translateX(13px); background: var(--accent); }
 .settings-row-control .toggle-input:focus-visible + .toggle-box { box-shadow: var(--ring); }
+/* A security setting while the vault is locked (A6-08): disabled, and the row
+   says why. */
+.settings-row-locked { font-size: 11.5px; color: var(--warn); margin-top: 3px; }
+.settings-row:has(.toggle-input:disabled) { cursor: default; }
+.settings-row-control .toggle-input:disabled + .toggle-box { opacity: 0.45; }
 
 .settings-foot {
   display: flex; align-items: center; gap: 10px;

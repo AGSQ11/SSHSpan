@@ -2015,24 +2015,20 @@ function sftpModeDigits(mode) {
 /// made every file in the tree setgid. The folders get the full mode first
 /// (that call is what restores traversal of a tree the owner cannot enter,
 /// e.g. a 2664 folder), then the files the plain bits in a call of their own.
-/// A file, or a mode without special bits, is one call.
+/// A mode without special bits is one call.
+///
+/// `kind` is the path's type as its own stat reports it ('dir' | 'file' |
+/// 'unknown'), and only a stat-reported folder is split: that is the only
+/// case in which the backend walks. A stat without type bits gets a change to
+/// the path itself whatever applyTo says, so the two calls would set the full
+/// mode and then the plain bits on that same path - stripping the special
+/// bits the user meant to keep. A file, or a path of unknown type, is ONE
+/// full-mode call (nothing spreads from it).
 function sftpChmodRequests(mode, kind, recursive, scope) {
-  if (!recursive || kind === 'file' || !(mode & 0o7000) || scope === 'dirs') return [{ mode, applyTo: scope }];
+  if (!recursive || kind !== 'dir' || !(mode & 0o7000) || scope === 'dirs') return [{ mode, applyTo: scope }];
   const requests = scope === 'all' ? [{ mode, applyTo: 'dirs' }] : [];
   requests.push({ mode: mode & 0o777, applyTo: 'files' });
   return requests;
-}
-
-/// A path's type as the listing on screen knows it, for a server that leaves
-/// the type bits out of the mode: 'dir' | 'file', or 'unknown' when the path
-/// is not in the folder shown or is a symlink (the listing describes the link,
-/// the stat its target).
-function sftpListedKind(tabId, path) {
-  const tab = sftpTab(tabId);
-  if (!tab || !tab._entryMap || sftpParent(path) !== tab.sftpPath) return 'unknown';
-  const entry = tab._entryMap.get(path.split('/').filter(Boolean).pop());
-  if (!entry || entry.isLink) return 'unknown';
-  return entry.isDir ? 'dir' : 'file';
 }
 
 /// Permissions dialog for one or more remote paths. It starts from what is
@@ -2068,7 +2064,7 @@ function openChmodDialog(tabId, paths, entry) {
   const sessionId = tab.sessionId;
   const openId = ++sftpChmodOpenSeq;
   let modes = null;   // each path's current mode & 0o7777, once read
-  let kinds = null;   // each path's type ('dir' | 'file' | 'unknown'): the stat's type bits, else the listing
+  let kinds = null;   // each path's type from its stat's type bits: 'dir' | 'file' | 'unknown'
   let special = null; // setuid/setgid/sticky as typed; null keeps each path's own
 
   recurse.checked = false;
@@ -2120,7 +2116,9 @@ function openChmodDialog(tabId, paths, entry) {
       return;
     }
     modes = results.map((r) => r.mode);
-    kinds = results.map((r, i) => (r.kind === 'unknown' ? sftpListedKind(tabId, paths[i]) : r.kind));
+    // The stat's own type, not the listing's: the backend decides whether to
+    // walk from the same stat (see sftpChmodRequests).
+    kinds = results.map((r) => r.kind);
     for (const { mask, cb } of boxes) {
       const n = modes.filter((m) => m & mask).length;
       cb.checked = n === modes.length;

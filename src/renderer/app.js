@@ -3,8 +3,11 @@
  * ---------------------------------------------------------------------------
  * Plain DOM + Tauri's invoke(). No Node, no require, no framework.
  * Every IPC call goes through invoke() which returns the Rust Result<T, String>.
- * Private key material never reaches this process; exports are explicit
- * user-initiated downloads.
+ * Private key material enters this process on one path only: the explicit
+ * key import, where the user pastes a key or picks a key file for it (see
+ * docs/SECURITY.md). Private-key exports and vault backups are written to
+ * disk by Rust behind its own save dialogs, a restore reads its file in Rust,
+ * and the server form's .pem browse returns a path without reading the file.
  * ---------------------------------------------------------------------------
  */
 
@@ -51,8 +54,16 @@ function toast(msg, kind) {
   const host = el('toast');
   if (!host) return;
   kind = kind || 'info';
+  // The same message again while it is still on screen - a load failing on
+  // every poll, a batch failing the same way N times - counts on that toast
+  // instead of stacking copies that push everything else out (A5-21).
+  const same = [...host.children].find((n) => !n._done && n._kind === kind && n._text === String(msg));
+  if (same) { same._repeat(); return; }
   const item = document.createElement('div');
   item.className = 'toast-item ' + kind;
+  item._kind = kind;
+  item._text = String(msg);
+  item._count = 1;
   // role=alert for errors so a screen reader interrupts; status for the rest.
   item.setAttribute('role', kind === 'err' ? 'alert' : 'status');
 
@@ -78,12 +89,74 @@ function toast(msg, kind) {
   };
   dismiss.addEventListener('click', remove);
   // Errors linger longer than confirmations - they are the ones worth reading.
-  item._timer = setTimeout(remove, TOAST_TTL_MS[kind] || TOAST_TTL_MS.info);
+  const ttl = TOAST_TTL_MS[kind] || TOAST_TTL_MS.info;
+  item._timer = setTimeout(remove, ttl);
+  // Arrived again: show how many times, give it a fresh lifetime, and make it
+  // the newest - it is the message being reacted to.
+  item._repeat = () => {
+    item._count += 1;
+    let badge = item.querySelector('.toast-count');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'toast-count';
+      item.insertBefore(badge, dismiss);
+    }
+    badge.textContent = '×' + item._count;
+    clearTimeout(item._timer);
+    item._timer = setTimeout(remove, ttl);
+    host.appendChild(item);
+  };
 
   host.appendChild(item);
   // Cap the stack so a failing batch cannot bury the whole window; the oldest
   // goes first, since the newest message is the one being reacted to.
   while (host.children.length > TOAST_MAX) host.firstElementChild.remove();
+}
+
+/// Run `fn` while `button` shows that it is working: disabled, aria-busy,
+/// relabelled when a label is given. A second click - or a second call -
+/// while it runs is ignored instead of starting the work again (A2-18). The
+/// button's own content and state come back afterwards.
+async function withBusy(button, busyLabel, fn) {
+  if (!button) return fn();
+  if (button.getAttribute('aria-busy') === 'true') return undefined;
+  const content = [...button.childNodes];
+  const wasDisabled = button.disabled;
+  button.setAttribute('aria-busy', 'true');
+  button.disabled = true;
+  if (busyLabel) button.textContent = busyLabel;
+  try {
+    return await fn();
+  } finally {
+    button.removeAttribute('aria-busy');
+    if (busyLabel) button.replaceChildren(...content);
+    button.disabled = wasDisabled;
+  }
+}
+
+/// A list that could not be loaded says so where the list would be - the
+/// backend's own message and a Retry - instead of the first-run empty state,
+/// which read as "your keys are gone" and invited re-creating them (A5-21).
+/// Everything dynamic goes in through textContent.
+function renderLoadError(host, title, message, retry) {
+  const card = document.createElement('div');
+  card.className = 'empty-state load-error';
+  card.setAttribute('role', 'alert');
+  const icon = document.createElement('div');
+  icon.className = 'empty-ico';
+  icon.innerHTML = ico('triangle-alert');
+  const heading = document.createElement('h3');
+  heading.textContent = title;
+  const text = document.createElement('p');
+  text.className = 'load-error-msg';
+  text.textContent = message;
+  const again = document.createElement('button');
+  again.type = 'button';
+  again.className = 'ghost-btn';
+  again.innerHTML = `${ico('refresh-cw')}<span>Retry</span>`;
+  again.addEventListener('click', () => withBusy(again, 'Retrying…', () => retry()));
+  card.append(icon, heading, text, again);
+  host.replaceChildren(card);
 }
 
 // \u2500\u2500\u2500 modal focus management \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -512,7 +585,9 @@ function catNodeEl(cat, depth) {
   row.className = 'cat-node';
   row.dataset.id = cat.id;
   row.dataset.depth = String(depth);
-  row.draggable = true;
+  // A drop is category_reparent, which the backend refuses while the vault
+  // is locked (A6-08); applyLockGates() keeps this in step afterwards.
+  row.draggable = state.unlocked;
   if (activeCategoryId() === cat.id) row.classList.add('active');
 
   const kids = childrenOf(cat.id);
@@ -547,6 +622,8 @@ function catNodeEl(cat, depth) {
   menuBtn.title = 'Category actions';
   menuBtn.innerHTML = ico('ellipsis');
   menuBtn.addEventListener('click', (e) => { e.stopPropagation(); openCatMenu(cat, menuBtn); });
+  // Every item in that menu changes categories (A6-08).
+  lockGate(menuBtn, 'categories');
   row.appendChild(menuBtn);
 
   row.addEventListener('click', () => { setActiveCategory(cat.id); });
@@ -614,7 +691,17 @@ function setActiveCategory(id) {
 // ─── category CRUD ─────────────────────────────────────────────────────────
 
 async function loadCategories() {
-  const res = await call('category_list');
+  let res;
+  try {
+    res = await call('category_list');
+  } catch (e) {
+    // Reported here, not thrown (A2-20): through loadKeys() a rejection here
+    // used to abort refreshVaultStatus() and, at boot, main() itself - no 10 s
+    // poll, no idle-activity listeners, no stored settings. The tree keeps
+    // what it had.
+    toast('Could not load categories: ' + (e.message || String(e)), 'err');
+    return;
+  }
   state.categories = res.categories || [];
   state.categoryScope = currentCategoryScope();
   state.keyCategories = res.allKeyCategories || {};
@@ -632,6 +719,7 @@ async function createCategory(name, parentId, color) {
 }
 
 async function deleteCategory(id) {
+  if (!lockGateOpen('categories')) return;
   const cat = catById(id);
   if (!cat) return;
   const ok = await confirmModal('Delete category',
@@ -648,6 +736,7 @@ async function deleteCategory(id) {
 }
 
 async function renameCategory(id) {
+  if (!lockGateOpen('categories')) return;
   const cat = catById(id); if (!cat) return;
   promptModal(`Rename category`, 'Enter a new name.', cat.name, async (newName) => {
     if (!newName || newName === cat.name) return;
@@ -657,6 +746,7 @@ async function renameCategory(id) {
 }
 
 async function moveCategoryPrompt(id) {
+  if (!lockGateOpen('categories')) return;
   // opens the picker in single-select mode for choosing a new parent
   openCategoryPicker({
     title: 'Move to...',
@@ -672,10 +762,16 @@ async function moveCategoryPrompt(id) {
 }
 
 async function addCategoryPrompt(parentId) {
+  if (!lockGateOpen('categories')) return;
   promptModal('New category', 'Enter a name.', '', async (name) => {
     if (!name) return;
-    const cat = await createCategory(name, parentId || null, null);
-    if (cat) { state.expandedCatIds.add(parentId || ''); /* noop for roots */ if (parentId) state.expandedCatIds.add(parentId); renderCategoryTree(); toast(`Created "${cat.name}".`, 'ok'); }
+    // promptModal does not await this callback, so a rejection here was only
+    // ever an "unhandled rejection" log line: a refused create looked like
+    // nothing had happened (A2-20).
+    try {
+      const cat = await createCategory(name, parentId || null, null);
+      if (cat) { state.expandedCatIds.add(parentId || ''); /* noop for roots */ if (parentId) state.expandedCatIds.add(parentId); renderCategoryTree(); toast(`Created "${cat.name}".`, 'ok'); }
+    } catch (e) { toast(e.message || String(e), 'err'); }
   });
 }
 
@@ -759,6 +855,8 @@ function attachCatDnD(row, cat, depth) {
     state.draggingCatId = null;
     row.classList.remove('drop-before', 'drop-after', 'drop-into');
     if (!draggedId || draggedId === cat.id) return;
+    // A drag that started before the vault locked.
+    if (!lockGateOpen('categories')) return;
     const before = row.classList.contains('drop-before');
     const into = row.classList.contains('drop-into');
     let newParent, newSortIndex = null;
@@ -1089,6 +1187,11 @@ const state = window.state = {
   vaultGate: undefined,
   vaultDismissed: false,
   keys: [],
+  // The backend's message when the last key/server list load failed, else
+  // null: the list then shows an error card with Retry instead of the
+  // first-run empty state (A5-21).
+  keysLoadError: null,
+  serversLoadError: null,
   selectedId: null,
   deploySelected: new Set(),
   settings: {},
@@ -1127,6 +1230,64 @@ const state = window.state = {
 
 // ─── vault gate ────────────────────────────────────────────────────────────
 
+/// What the vault dialog says in each mode, and what it says while that
+/// mode's request is running.
+const VAULT_DIALOG_COPY = {
+  create: {
+    title: 'Create your vault',
+    text: 'Choose a master password. It encrypts every private key at rest (Argon2id + AES-256-GCM). There is no recovery — if you lose it, the keys are gone.',
+    primary: 'Create vault',
+    busy: 'Creating vault…',
+  },
+  change: {
+    title: 'Change master password',
+    text: 'Every stored private key is re-encrypted with the new password before the vault accepts it.',
+    primary: 'Change password',
+    busy: 'Re-encrypting…',
+    busyText: 'Re-encrypting your vault… This takes a few seconds per key; this dialog closes when it is done.',
+  },
+  unlock: {
+    title: 'Unlock vault',
+    text: 'Enter your master password to decrypt your keys for this session.',
+    primary: 'Unlock',
+    busy: 'Unlocking…',
+  },
+};
+
+/// The submit that owns the vault dialog's busy state, and whether one is
+/// running. A lock takes the dialog over in the middle of a request (see
+/// closeDialogsForLock): it bumps the sequence, so the abandoned request's
+/// late answer can neither close nor relabel the unlock gate that replaced it.
+let vaultSubmitSeq = 0;
+let vaultSubmitBusy = false;
+
+/// Title, text and buttons for the current mode - and, while its request runs,
+/// the busy state: the primary button says what is happening and takes no
+/// second submit, and a master-password change cannot be cancelled (RU1 C1).
+function paintVaultDialog() {
+  const mode = state.vaultMode;
+  const copy = VAULT_DIALOG_COPY[mode] || VAULT_DIALOG_COPY.unlock;
+  const busy = vaultSubmitBusy;
+  el('vaultModalTitle').textContent = copy.title;
+  el('vaultModalText').textContent = busy && copy.busyText ? copy.busyText : copy.text;
+  const primary = el('vaultPrimary');
+  primary.textContent = busy ? copy.busy : copy.primary;
+  primary.disabled = busy;
+  if (busy) primary.setAttribute('aria-busy', 'true');
+  else primary.removeAttribute('aria-busy');
+  el('vaultCancelBtn').disabled = busy && mode === 'change';
+}
+
+/// A lock in the middle of a vault request: that request now belongs to a
+/// vault that is locking, and its dialog is gone. Drop its busy state so the
+/// unlock gate that follows is usable at once.
+function releaseVaultSubmit() {
+  if (!vaultSubmitBusy) return;
+  vaultSubmitSeq += 1;
+  vaultSubmitBusy = false;
+  paintVaultDialog();
+}
+
 function showVaultModal(mode) {
   const backdrop = el('vaultModal');
   // refreshVaultStatus() runs on a 10s interval and calls straight back in
@@ -1137,12 +1298,9 @@ function showVaultModal(mode) {
   // the fields when the dialog is actually being opened, or switching mode.
   const reopening = backdrop.hidden || state.vaultMode !== mode;
   state.vaultMode = mode;
-  const title = el('vaultModalTitle');
-  const text = el('vaultModalText');
   const pw = el('vaultPassword');
   const confirmPw = el('vaultPasswordConfirm');
   const current = el('vaultPasswordCurrent');
-  const primary = el('vaultPrimary');
   if (reopening) clearVaultFields();
   pw.hidden = false;
   confirmPw.hidden = mode !== 'create' && mode !== 'change';
@@ -1163,19 +1321,9 @@ function showVaultModal(mode) {
     pw.placeholder = 'Master password';
     confirmPw.placeholder = 'Confirm password';
   }
-  if (mode === 'create') {
-    title.textContent = 'Create your vault';
-    text.textContent = 'Choose a master password. It encrypts every private key at rest (scrypt + AES-256-GCM). There is no recovery \u2014 if you lose it, the keys are gone.';
-    primary.textContent = 'Create vault';
-  } else if (mode === 'change') {
-    title.textContent = 'Change master password';
-    text.textContent = 'Every stored private key is re-encrypted with the new password before the vault accepts it.';
-    primary.textContent = 'Change password';
-  } else {
-    title.textContent = 'Unlock vault';
-    text.textContent = 'Enter your master password to decrypt your keys for this session.';
-    primary.textContent = 'Unlock';
-  }
+  // The create copy names Argon2id, the KDF the vault really uses; it said
+  // scrypt, at the one moment the user is told what protects the vault (A8-11).
+  paintVaultDialog();
   backdrop.hidden = false;
   // Same reason as the field reset above: focusing on every poll would yank
   // the caret out of the confirm field back into the password field every
@@ -1201,6 +1349,11 @@ function hideVaultModal() {
 /// while locked and made the "Vault stays locked" toast a lie. The change-
 /// password dialog is a deliberate request, not a gate, and just closes.
 function dismissVaultModal() {
+  // A master-password change that is running keeps its dialog (RU1 C1):
+  // closing it mid-rotation is how the rest of the app came to write vault
+  // data that was being re-sealed. Cancel is disabled meanwhile; this is the
+  // Escape path. A lock still closes it (closeDialogsForLock).
+  if (vaultSubmitBusy && state.vaultMode === 'change') return;
   const wasGate = state.vaultMode !== 'change';
   hideVaultModal();
   if (!wasGate) return;
@@ -1235,6 +1388,7 @@ async function refreshVaultStatus(silent) {
   if (caret) caret.innerHTML = s.unlocked || s.hasVault ? ico('chevron-down') : '';
   el('newKeyBtn').disabled = !s.unlocked;
   applyNavLockState();
+  applyLockGates();
   updateNavCounts();
 
   // The idle clock, BEFORE anything below that can wait or fail. Only a
@@ -1353,9 +1507,55 @@ function applyNavLockState() {
   }
 }
 
+/// Controls whose command the backend refuses while the vault is locked, with
+/// a bare "Vault is locked." (A6-08): clearing the audit log, forgetting a
+/// pinned host key, every category change, and the four security settings
+/// (autoLockMinutes, confirmDelete, autoUpdateCheck, confirmMultiLinePaste).
+/// Settings, the known hosts and the category tree all stay on screen while
+/// locked, so these are disabled then, with a tooltip that says why, instead
+/// of offering a click that can only fail.
+const LOCK_GATE_HINTS = {
+  audit: 'Unlock the vault to clear the audit log.',
+  hosts: 'Unlock the vault to forget a pinned host key.',
+  categories: 'Unlock the vault to change categories.',
+  settings: 'Unlock the vault to change this.',
+};
+
+/// Mark `control` as needing an unlocked vault (`kind` picks the reason) and
+/// set it for the current state. Its own tooltip comes back on unlock.
+function lockGate(control, kind) {
+  if (!control) return;
+  control.dataset.lockGate = kind;
+  if (control.dataset.unlockedTitle === undefined) control.dataset.unlockedTitle = control.title || '';
+  applyLockGate(control);
+}
+
+function applyLockGate(control) {
+  const locked = !state.unlocked;
+  control.disabled = locked;
+  control.title = locked ? (LOCK_GATE_HINTS[control.dataset.lockGate] || '') : control.dataset.unlockedTitle;
+}
+
+/// Re-apply every gate after a vault state change. Run from every status
+/// refresh, so a lock from the tray or the idle watchdog is picked up too.
+function applyLockGates() {
+  for (const n of document.querySelectorAll('[data-lock-gate]')) applyLockGate(n);
+  for (const n of document.querySelectorAll('[data-lock-hint]')) n.hidden = state.unlocked;
+  for (const n of document.querySelectorAll('#catTree .cat-node:not(.uncategorized)')) n.draggable = state.unlocked;
+}
+
+/// The same rule for the actions behind those controls, for a menu or a drag
+/// begun before the lock: false (with the reason) while locked.
+function lockGateOpen(kind) {
+  if (state.unlocked) return true;
+  toast(LOCK_GATE_HINTS[kind], 'info');
+  return false;
+}
+
 // Called when the vault locks or while the connect view is shown without an unlocked vault.
 function clearConnectView() {
   state.servers = [];
+  state.serversLoadError = null;
   state.connectSelectedId = null;
   if (typeof window.terminalResetActive === 'function') window.terminalResetActive();
   const list = el('serverList'); if (list) list.innerHTML = '';
@@ -1392,49 +1592,76 @@ function clearConnectView() {
   renderTermTabs();
 }
 
+/// The backend's answer when a lock lands while a master-password change is
+/// running and aborts it before anything is committed.
+const VAULT_LOCKED_MIDWAY = 'Vault was locked while the operation was in progress.';
+
 async function submitVaultModal() {
   // Re-entrancy guard. The button was not disabled while the request was in
   // flight, so a double click - or Enter held down, which repeats - submitted
   // twice; a second vault_create answers "A vault already exists" right after
   // the success toast, and a second wrong guess counts toward the throttle.
-  if (submitVaultModal._busy) return;
+  if (vaultSubmitBusy) return;
   const mode = state.vaultMode;
   const pwEl = el('vaultPassword');
   const currentEl = el('vaultPasswordCurrent');
   const pw = pwEl.value;
   const confirmPw = el('vaultPasswordConfirm').value;
   const current = currentEl.value;
-  submitVaultModal._busy = true;
-  const primary = el('vaultPrimary');
-  primary.disabled = true;
+  const seq = ++vaultSubmitSeq;
+  // From here until the answer: busy button, no second submit, and in change
+  // mode no Cancel - vault_change_password re-seals every record off the main
+  // thread and can take seconds per key.
+  const busy = () => { vaultSubmitBusy = true; paintVaultDialog(); };
   try {
     if (mode === 'create') {
       if (pw.length < 8) throw new Error('Master password must be at least 8 characters.');
       if (pw !== confirmPw) throw new Error('Passwords do not match.');
+      busy();
       await call('vault_create', { password: pw });
       toast('Vault created. Welcome to SSHSpan.', 'ok');
     } else if (mode === 'change') {
       if (pw.length < 8) throw new Error('New password must be at least 8 characters.');
       if (pw !== confirmPw) throw new Error('Passwords do not match.');
       if (!current) throw new Error('Enter your current master password.');
+      busy();
       await call('vault_change_password', { currentPassword: current, newPassword: pw });
       toast('Master password changed; all keys re-encrypted.', 'ok');
     } else {
+      busy();
       await call('vault_unlock', { password: pw });
       toast('Vault unlocked.', 'ok');
     }
     // Never leave submitted passwords in the DOM inputs; this also closes the
-    // dialog (the change-password dialog is not closed by the status refresh).
-    hideVaultModal();
+    // dialog (the change-password dialog is not closed by the status refresh) -
+    // unless a lock took the dialog over meanwhile: it is the unlock gate now.
+    if (seq === vaultSubmitSeq) hideVaultModal();
     await refreshVaultStatus();
+    if (mode === 'change' && !state.unlocked) {
+      // The change committed, then a lock landed (tray, idle watchdog) before
+      // the new password took over: the vault stays locked, and it is the NEW
+      // password that opens it now.
+      toast('The vault locked while the password was being changed - unlock it with the new master password.', 'info');
+    }
   } catch (e) {
-    toast(e.message || String(e), 'err');
+    const msg = e.message || String(e);
+    if (msg === VAULT_LOCKED_MIDWAY) {
+      toast('The vault was locked while the password was being changed, so nothing was changed - your current master password still unlocks it.', 'err');
+      refreshVaultStatus().catch(() => {});
+    } else {
+      toast(msg, 'err');
+    }
     // Put the caret on the box that was wrong: a bad current password is the
-    // first box in change mode, everything else is the (new) password.
-    (mode === 'change' && /current/i.test(e.message || String(e)) ? currentEl : pwEl).select();
+    // first box in change mode, everything else is the (new) password. Not
+    // once a lock has replaced this dialog with the unlock gate.
+    if (seq === vaultSubmitSeq && state.vaultMode === mode) {
+      (mode === 'change' && /current/i.test(msg) ? currentEl : pwEl).select();
+    }
   } finally {
-    submitVaultModal._busy = false;
-    primary.disabled = false;
+    if (seq === vaultSubmitSeq) {
+      vaultSubmitBusy = false;
+      paintVaultDialog();
+    }
   }
 }
 
@@ -1442,6 +1669,7 @@ async function submitVaultModal() {
 
 function clearKeysUI() {
   state.keys = [];
+  state.keysLoadError = null;
   state.selectedId = null;
   state.deploySelected.clear();
   el('keyList').innerHTML = '';
@@ -1530,6 +1758,14 @@ function updateSelectionHint() {
 function renderKeyList() {
   const list = el('keyList');
   list.innerHTML = '';
+  if (state.keysLoadError) {
+    // Not "No keys yet": the keys could not be read (A5-21).
+    el('emptyState').hidden = true;
+    const chip = el('keyCount');
+    if (chip) chip.hidden = true;
+    renderLoadError(list, 'Could not load your keys', state.keysLoadError, loadKeys);
+    return;
+  }
   const rows = filteredKeys();
   const total = state.keys.length;
   el('emptyState').hidden = total > 0;
@@ -1791,10 +2027,13 @@ async function loadKeys() {
   try {
     const res = await call('key_list');
     state.keys = (res.keys || []).map(k => ({ ...k, category_ids: k.category_ids || [] }));
+    state.keysLoadError = null;
   } catch (e) {
     state.keys = [];
-    toast(e.message || String(e), 'err');
+    state.keysLoadError = e.message || String(e);
+    toast(state.keysLoadError, 'err');
   }
+  // Never rejects: a failure is reported in a toast (A2-20).
   await loadCategories();
   renderKeyList();
   updateSelectionHint();
@@ -2673,19 +2912,38 @@ function showSettingsSection(section) {
 window.showSettingsSection = showSettingsSection;
 window.switchView = switchView;
 
+/// Parallel transfers in effect, read the way the transfer queue reads it
+/// (sftp/queue.rs parallel_limit: trimmed, a whole number clamped to 1..4,
+/// anything else 4). settings_get always returns the setting now; the old
+/// `|| 2` showed a default the queue never used (A8-14).
+const SFTP_PARALLEL_DEFAULT = 4;
+
+function sftpParallelSetting() {
+  const raw = state.settings ? state.settings.sftpParallel : undefined;
+  const text = raw === undefined || raw === null ? '' : String(raw).trim();
+  if (!/^\+?\d+$/.test(text)) return SFTP_PARALLEL_DEFAULT;
+  return Math.min(4, Math.max(1, parseInt(text, 10)));
+}
+
 async function loadSettings() {
   fillPathHints();
+  const grid = el('settingsRows');
+  let loaded;
   try {
-    state.settings = await call('settings_get');
+    loaded = await call('settings_get');
   } catch (e) {
-    state.settings = {};
-    toast(e.message || String(e), 'err');
+    // Say so where the rows would be, with a Retry (A5-21). This used to
+    // leave a blank page AND replace state.settings with {}, quietly putting
+    // every setting back to its default for the rest of the session.
+    const msg = e.message || String(e);
+    renderLoadError(grid, 'Could not load settings', msg, loadSettings);
+    toast(msg, 'err');
     return;
   }
+  state.settings = loaded;
   // The stored minutes may differ from what the timer was armed with. Arming
   // measures from the last real input, so this cannot extend the idle time.
   armAutoLockTimer();
-  const grid = el('settingsRows');
   grid.innerHTML = '';
 
   /// One row shape for every setting: what it is on the left, what it costs you
@@ -2693,7 +2951,11 @@ async function loadSettings() {
   /// the rest of the app uses - Settings rendered raw browser checkboxes while
   /// the deploy options one screen away used styled toggles, so the same control
   /// had two appearances depending on where you found it.
-  const mkRow = (labelText, control, description) => {
+  ///
+  /// opts.lockGated marks the four settings the backend refuses to change
+  /// while the vault is locked (A6-08): the control is disabled then and the
+  /// row says why, until the vault is unlocked (applyLockGates).
+  const mkRow = (labelText, control, description, opts) => {
     const row = document.createElement('label');
     row.className = 'settings-row';
     const text = document.createElement('span');
@@ -2707,6 +2969,15 @@ async function loadSettings() {
       sub.className = 'settings-row-sub';
       sub.textContent = description;
       text.appendChild(sub);
+    }
+    if (opts && opts.lockGated) {
+      const why = document.createElement('span');
+      why.className = 'settings-row-locked';
+      why.dataset.lockHint = '';
+      why.textContent = LOCK_GATE_HINTS.settings;
+      why.hidden = state.unlocked;
+      text.appendChild(why);
+      lockGate(control, 'settings');
     }
     row.appendChild(text);
     const ctl = document.createElement('span');
@@ -2722,6 +2993,55 @@ async function loadSettings() {
     }
     row.appendChild(ctl);
     grid.appendChild(row);
+  };
+
+  /// Save one setting for a control that has already changed on screen. When
+  /// the backend refuses it - a value outside that key's domain, a locked
+  /// vault for the four security settings, a write error - `revert` puts the
+  /// control back to the value still in effect (state.settings changes only
+  /// after a save that went through) and the backend's own message is shown.
+  /// The rows used to stay flipped on a failure, so the screen and the setting
+  /// in effect disagreed (A5-32).
+  const save = async (key, value, revert) => {
+    try {
+      await call('settings_set', { key, value });
+    } catch (e) {
+      revert();
+      toast(e.message || String(e), 'err');
+      return false;
+    }
+    state.settings[key] = value;
+    return true;
+  };
+
+  /// A toggle for one setting. `isOn` reads the stored value the way that
+  /// setting's consumer does; `on`/`off` are the exact spellings the key
+  /// accepts (settings_set validates them per key).
+  const toggleFor = (key, isOn, on, off) => {
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    const shown = () => { box.checked = isOn(state.settings[key]); };
+    shown();
+    box.addEventListener('change', async () => {
+      if (await save(key, box.checked ? on : off, shown)) toast('Saved.', 'ok');
+    });
+    return box;
+  };
+
+  /// A select for one setting; `fallback` is what an unset value - or one no
+  /// option matches - shows.
+  const selectFor = (key, optionsHtml, fallback, savedMessage) => {
+    const sel = document.createElement('select');
+    sel.innerHTML = optionsHtml;
+    const shown = () => {
+      sel.value = state.settings[key] || fallback;
+      if (!sel.value) sel.value = fallback;
+    };
+    shown();
+    sel.addEventListener('change', async () => {
+      if (await save(key, sel.value, shown)) toast(savedMessage, 'ok');
+    });
+    return sel;
   };
 
   const autoLock = document.createElement('input');
@@ -2742,15 +3062,14 @@ async function loadSettings() {
     }
     const mins = Math.min(AUTO_LOCK_MAX_MINUTES, parseInt(typed, 10));
     autoLock.value = String(mins);
-    try {
-      await call('settings_set', { key: 'autoLockMinutes', value: String(mins) });
-      state.settings.autoLockMinutes = String(mins);
-      armAutoLockTimer();
-      toast('Auto-lock updated.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    const saved = await save('autoLockMinutes', String(mins), () => { autoLock.value = String(autoLockMinutes()); });
+    if (!saved) return;
+    armAutoLockTimer();
+    toast('Auto-lock updated.', 'ok');
   });
   mkRow('Lock the vault when idle', autoLock,
-    'Minutes without keyboard or mouse input before the vault locks. Locking closes open SSH sessions and pauses file transfers. Typing in a terminal counts as activity; output from a server does not. 0 turns auto-lock off.');
+    'Minutes without keyboard or mouse input before the vault locks. Locking closes open SSH sessions and pauses file transfers. Typing in a terminal counts as activity; output from a server does not. 0 turns auto-lock off.',
+    { lockGated: true });
 
   // Interface scale. The stylesheet is written in px throughout, so a root
   // font-size would only resize text and leave every control the same size.
@@ -2768,56 +3087,30 @@ async function loadSettings() {
     const pct = clampUiScale(uiScale.value);
     uiScale.value = String(pct);
     applyUiScale(pct);
-    try {
-      await call('settings_set', { key: 'uiScale', value: String(pct) });
-      state.settings.uiScale = String(pct);
-      toast('Interface scale set to ' + pct + '%.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    const saved = await save('uiScale', String(pct), () => {
+      // Back to the scale in effect, in the list and in the window.
+      uiScale.value = String(currentUiScale());
+      applyUiScale(currentUiScale());
+    });
+    if (saved) toast('Interface scale set to ' + pct + '%.', 'ok');
   });
   mkRow('Interface scale', uiScale,
     'Scales the whole window, not just text - the layout is sized in pixels.');
 
-  const confirmDelete = document.createElement('input');
-  confirmDelete.type = 'checkbox';
-  confirmDelete.checked = settingOn(state.settings.confirmDelete);
-  confirmDelete.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'confirmDelete', value: String(confirmDelete.checked) });
-      // Mirror into state: the delete guards read it, and collect_settings
-      // returns strings, so a stale undefined here meant the guard could
-      // not see this session's change.
-      state.settings.confirmDelete = String(confirmDelete.checked);
-      toast('Saved.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  // state.settings mirrors every saved value (save() above): the delete guards
+  // read this one, and collect_settings returns strings, so a stale undefined
+  // there meant the guard could not see this session's change.
+  const confirmDelete = toggleFor('confirmDelete', settingOn, 'true', 'false');
   mkRow('Confirm before deleting a key', confirmDelete,
-    'Deletion is permanent. The audit log keeps a record either way.');
+    'Deletion is permanent. The audit log keeps a record either way.', { lockGated: true });
 
-  const confirmPaste = document.createElement('input');
-  confirmPaste.type = 'checkbox';
-  confirmPaste.checked = state.settings.confirmMultiLinePaste !== '0';
-  confirmPaste.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'confirmMultiLinePaste', value: confirmPaste.checked ? '1' : '0' });
-      state.settings.confirmMultiLinePaste = confirmPaste.checked ? '1' : '0';
-      toast('Saved.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const confirmPaste = toggleFor('confirmMultiLinePaste', (v) => v !== '0', '1', '0');
   mkRow('Confirm multi-line pastes into the terminal', confirmPaste,
-    'A pasted newline runs the line. This catches a copied block before it executes.');
+    'A pasted newline runs the line. This catches a copied block before it executes.', { lockGated: true });
 
-  const autoUpdate = document.createElement('input');
-  autoUpdate.type = 'checkbox';
-  autoUpdate.checked = settingOn(state.settings.autoUpdateCheck);
-  autoUpdate.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'autoUpdateCheck', value: String(autoUpdate.checked) });
-      state.settings.autoUpdateCheck = String(autoUpdate.checked);
-      toast('Saved.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const autoUpdate = toggleFor('autoUpdateCheck', settingOn, 'true', 'false');
   mkRow('Check GitHub for new releases', autoUpdate,
-    'Fetches a version number only. Nothing about your vault leaves this machine.');
+    'Fetches a version number only. Nothing about your vault leaves this machine.', { lockGated: true });
 
   const checkNow = document.createElement('button');
   checkNow.className = 'ghost-btn';
@@ -2830,29 +3123,23 @@ async function loadSettings() {
   sftpParallel.type = 'number';
   sftpParallel.min = '1';
   sftpParallel.max = '4';
-  sftpParallel.value = state.settings.sftpParallel || 2;
+  sftpParallel.value = String(sftpParallelSetting());
   sftpParallel.addEventListener('change', async () => {
-    const v = Math.max(1, Math.min(4, parseInt(sftpParallel.value, 10) || 2));
-    sftpParallel.value = v;
-    try {
-      await call('settings_set', { key: 'sftpParallel', value: String(v) });
-      state.settings.sftpParallel = v;
-      toast('Parallel transfers updated.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    const typed = String(sftpParallel.value).trim();
+    if (!/^\d+$/.test(typed)) {
+      sftpParallel.value = String(sftpParallelSetting());
+      toast('Parallel transfers needs a whole number from 1 to 4.', 'err');
+      return;
+    }
+    const v = Math.max(1, Math.min(4, parseInt(typed, 10)));
+    sftpParallel.value = String(v);
+    const saved = await save('sftpParallel', String(v), () => { sftpParallel.value = String(sftpParallelSetting()); });
+    if (saved) toast('Parallel transfers updated.', 'ok');
   });
   mkRow('Parallel file transfers', sftpParallel,
     'More streams help on fast links and hurt on congested ones. 1 to 4.');
 
-  const sftpHidden = document.createElement('input');
-  sftpHidden.type = 'checkbox';
-  sftpHidden.checked = state.settings.sftpShowHidden === '1';
-  sftpHidden.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'sftpShowHidden', value: sftpHidden.checked ? '1' : '0' });
-      state.settings.sftpShowHidden = sftpHidden.checked ? '1' : '0';
-      toast('Saved.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const sftpHidden = toggleFor('sftpShowHidden', (v) => v === '1', '1', '0');
   mkRow('Show hidden files in the file browser', sftpHidden,
     'Dotfiles are hidden by default; you can always toggle this per session.');
 
@@ -2867,30 +3154,36 @@ async function loadSettings() {
   // Bandwidth throttle (Task 3): stored as whole bytes/sec (sftpMaxBps), but
   // shown as a magnitude + KB/s-or-MB/s unit with an explicit Unlimited
   // toggle - nobody thinks in raw bytes/sec.
-  const bpsStored = parseInt(state.settings.sftpMaxBps || '0', 10) || 0;
   const bpsWrap = document.createElement('span');
   bpsWrap.className = 'settings-combo';
   const bpsUnlimited = document.createElement('input');
   bpsUnlimited.type = 'checkbox';
-  bpsUnlimited.checked = bpsStored === 0;
   const bpsNum = document.createElement('input');
   bpsNum.type = 'number';
   bpsNum.min = '1';
   bpsNum.max = '1000000';
   const bpsUnit = document.createElement('select');
   bpsUnit.innerHTML = '<option value="1024">KB/s</option><option value="1048576">MB/s</option>';
-  if (bpsStored > 0 && bpsStored % 1048576 === 0) {
-    bpsUnit.value = '1048576';
-    bpsNum.value = bpsStored / 1048576;
-  } else {
-    bpsUnit.value = '1024';
-    bpsNum.value = bpsStored > 0 ? Math.max(1, Math.round(bpsStored / 1024)) : 512;
-  }
-  bpsNum.disabled = bpsUnlimited.checked;
-  bpsUnit.disabled = bpsUnlimited.checked;
   const bpsUnlimitedTag = document.createElement('span');
   bpsUnlimitedTag.className = 'settings-combo-tag';
   bpsUnlimitedTag.textContent = 'Unlimited';
+  /// The three controls for the stored limit: at first render, and to put
+  /// them back when a save is refused.
+  const showThrottle = () => {
+    const bpsStored = parseInt(state.settings.sftpMaxBps || '0', 10) || 0;
+    bpsUnlimited.checked = bpsStored === 0;
+    if (bpsStored > 0 && bpsStored % 1048576 === 0) {
+      bpsUnit.value = '1048576';
+      bpsNum.value = bpsStored / 1048576;
+    } else {
+      bpsUnit.value = '1024';
+      bpsNum.value = bpsStored > 0 ? Math.max(1, Math.round(bpsStored / 1024)) : 512;
+    }
+    bpsNum.disabled = bpsUnlimited.checked;
+    bpsUnit.disabled = bpsUnlimited.checked;
+    bpsUnlimitedTag.classList.toggle('active', bpsUnlimited.checked);
+  };
+  showThrottle();
   bpsUnlimitedTag.addEventListener('click', () => {
     bpsUnlimited.checked = !bpsUnlimited.checked;
     bpsUnlimited.dispatchEvent(new Event('change'));
@@ -2902,23 +3195,26 @@ async function loadSettings() {
     const mag = Math.max(1, Math.min(1000000, parseInt(bpsNum.value, 10) || 1));
     bpsNum.value = mag;
     const bytesPerSec = bpsUnlimited.checked ? 0 : mag * parseInt(bpsUnit.value, 10);
+    if (!(await save('sftpMaxBps', String(bytesPerSec), showThrottle))) return;
     try {
-      await call('settings_set', { key: 'sftpMaxBps', value: String(bytesPerSec) });
       // Also push it live - settings_set alone only takes effect on the
       // NEXT transfer (restore_pending re-reads it at startup); workers
       // already running re-check rate_bps every chunk, so this applies the
       // change to them immediately instead of making the user wait.
       await call('sftp_queue_set_rate_limit', { bytesPerSec });
-      state.settings.sftpMaxBps = String(bytesPerSec);
-      toast(bytesPerSec === 0
-        ? 'Bandwidth limit removed.'
-        : `Bandwidth limit set to ${mag} ${bpsUnit.value === '1048576' ? 'MB/s' : 'KB/s'}.`, 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    } catch (e) {
+      // Saved, so the next transfer uses it; only the running ones did not
+      // get it. The control stays: it shows the stored limit.
+      toast(e.message || String(e), 'err');
+      return;
+    }
+    toast(bytesPerSec === 0
+      ? 'Bandwidth limit removed.'
+      : `Bandwidth limit set to ${mag} ${bpsUnit.value === '1048576' ? 'MB/s' : 'KB/s'}.`, 'ok');
   };
   bpsUnlimited.addEventListener('change', applyThrottle);
   bpsNum.addEventListener('change', applyThrottle);
   bpsUnit.addEventListener('change', applyThrottle);
-  bpsUnlimitedTag.classList.toggle('active', bpsUnlimited.checked);
   bpsWrap.appendChild(bpsUnlimited);
   bpsWrap.appendChild(bpsUnlimitedTag);
   bpsWrap.appendChild(bpsNum);
@@ -2929,17 +3225,7 @@ async function loadSettings() {
   // Verify toggle (Task 4): off by default - the label states the actual
   // cost up front rather than burying it in a tooltip, since re-reading
   // both sides to hash them roughly doubles the traffic a transfer uses.
-  const sftpVerify = document.createElement('input');
-  sftpVerify.type = 'checkbox';
-  sftpVerify.checked = state.settings.sftpVerifyTransfers === 'true';
-  sftpVerify.addEventListener('change', async () => {
-    const value = sftpVerify.checked ? 'true' : 'false';
-    try {
-      await call('settings_set', { key: 'sftpVerifyTransfers', value });
-      state.settings.sftpVerifyTransfers = value;
-      toast('Saved.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const sftpVerify = toggleFor('sftpVerifyTransfers', (v) => v === 'true', 'true', 'false');
   mkRow('Verify transfers with SHA-256', sftpVerify,
     'Re-reads both sides to compare hashes - roughly doubles the traffic a transfer uses.');
 
@@ -2954,15 +3240,16 @@ async function loadSettings() {
   const mkConflictRow = (labelText, key, description) => {
     const sel = document.createElement('select');
     sel.innerHTML = conflictOptions;
-    sel.value = (state.settings && state.settings[key]) ||
-      (window.sftpConflictDefaults && window.sftpConflictDefaults[key]) || 'ask';
+    const shown = () => {
+      sel.value = (state.settings && state.settings[key]) ||
+        (window.sftpConflictDefaults && window.sftpConflictDefaults[key]) || 'ask';
+    };
+    shown();
     sel.addEventListener('change', async () => {
-      try {
-        await call('settings_set', { key, value: sel.value });
-        if (state.settings) state.settings[key] = sel.value;
-        if (window.sftpConflictDefaults) window.sftpConflictDefaults[key] = sel.value;
-        toast('Saved.', 'ok');
-      } catch (e) { toast(e.message || String(e), 'err'); }
+      const value = sel.value;
+      if (!(await save(key, value, shown))) return;
+      if (window.sftpConflictDefaults) window.sftpConflictDefaults[key] = value;
+      toast('Saved.', 'ok');
     });
     mkRow(labelText, sel, description);
   };
@@ -2975,20 +3262,11 @@ async function loadSettings() {
   // destinations are all new, and the Send-to path). The backend has always
   // read this key - `resolve_resume_mode` in commands/sftp.rs - but nothing in
   // the UI could set it, so it sat at "ask" forever.
-  const resumeDefault = document.createElement('select');
-  resumeDefault.innerHTML =
+  const resumeDefault = selectFor('sftpResumeDefault',
     '<option value="ask">Ask every time</option>' +
     '<option value="overwrite">Overwrite</option>' +
-    '<option value="resume">Resume</option>';
-  resumeDefault.value = state.settings.sftpResumeDefault || 'ask';
-  if (!resumeDefault.value) resumeDefault.value = 'ask';
-  resumeDefault.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'sftpResumeDefault', value: resumeDefault.value });
-      state.settings.sftpResumeDefault = resumeDefault.value;
-      toast('Saved.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+    '<option value="resume">Resume</option>',
+    'ask', 'Saved.');
   mkRow('Default transfer mode when no conflict is detected', resumeDefault,
     'Applies when a transfer never reaches the conflict dialog. Resume continues a part-finished transfer.');
 
@@ -3001,78 +3279,43 @@ async function loadSettings() {
   termScrollback.addEventListener('change', async () => {
     const v = Math.max(1000, Math.min(50000, parseInt(termScrollback.value, 10) || 5000));
     termScrollback.value = v;
-    try {
-      await call('settings_set', { key: 'terminalScrollback', value: String(v) });
-      state.settings.terminalScrollback = String(v);
-      if (typeof window.terminalApplySettings === 'function') window.terminalApplySettings();
-      toast('Terminal scrollback updated.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    const saved = await save('terminalScrollback', String(v), () => {
+      termScrollback.value = state.settings.terminalScrollback || 5000;
+    });
+    if (!saved) return;
+    if (typeof window.terminalApplySettings === 'function') window.terminalApplySettings();
+    toast('Terminal scrollback updated.', 'ok');
   });
   mkRow('Terminal scrollback', termScrollback,
     'Lines of history kept per session. More costs memory in every open tab.');
 
-  const termBell = document.createElement('select');
-  termBell.innerHTML = '<option value="visual">Visual</option><option value="sound">Sound</option><option value="silent">Silent</option>';
-  termBell.value = state.settings.terminalBell || 'visual';
-  termBell.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'terminalBell', value: termBell.value });
-      state.settings.terminalBell = termBell.value;
-      toast('Terminal bell updated.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const termBell = selectFor('terminalBell',
+    '<option value="visual">Visual</option><option value="sound">Sound</option><option value="silent">Silent</option>',
+    'visual', 'Terminal bell updated.');
   mkRow('Terminal bell', termBell,
     'What happens when a remote program rings the bell. Visual flashes the tab.');
 
-  const termBackspace = document.createElement('select');
-  termBackspace.innerHTML = '<option value="default">Delete (0x7f)</option><option value="backspace">Backspace (0x08)</option>';
-  termBackspace.value = state.settings.terminalBackspace || 'default';
-  termBackspace.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'terminalBackspace', value: termBackspace.value });
-      state.settings.terminalBackspace = termBackspace.value;
-      toast('Backspace compatibility updated; it applies to new terminals.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const termBackspace = selectFor('terminalBackspace',
+    '<option value="default">Delete (0x7f)</option><option value="backspace">Backspace (0x08)</option>',
+    'default', 'Backspace compatibility updated; it applies to new terminals.');
   mkRow('Backspace key sends', termBackspace,
     'Change this only if Backspace prints ^H on a particular host. Applies to new terminals.');
 
-  const termHomeEnd = document.createElement('select');
-  termHomeEnd.innerHTML = '<option value="default">xterm/Home+End standard</option><option value="rxvt">rxvt/Home+End compatibility</option>';
-  termHomeEnd.value = state.settings.terminalHomeEnd || 'default';
-  termHomeEnd.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'terminalHomeEnd', value: termHomeEnd.value });
-      state.settings.terminalHomeEnd = termHomeEnd.value;
-      toast('Home/End compatibility updated; it applies to new terminals.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const termHomeEnd = selectFor('terminalHomeEnd',
+    '<option value="default">xterm/Home+End standard</option><option value="rxvt">rxvt/Home+End compatibility</option>',
+    'default', 'Home/End compatibility updated; it applies to new terminals.');
   mkRow('Home and End key mode', termHomeEnd,
     'Switch to rxvt if those keys misbehave on an older host. Applies to new terminals.');
 
-  const termAppCursor = document.createElement('select');
-  termAppCursor.innerHTML = '<option value="default">Allow application cursor keys</option><option value="disabled">Disable application cursor keys</option>';
-  termAppCursor.value = state.settings.terminalAppCursorKeys || 'default';
-  termAppCursor.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'terminalAppCursorKeys', value: termAppCursor.value });
-      state.settings.terminalAppCursorKeys = termAppCursor.value;
-      toast('Cursor-key compatibility updated; it applies to new terminals.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const termAppCursor = selectFor('terminalAppCursorKeys',
+    '<option value="default">Allow application cursor keys</option><option value="disabled">Disable application cursor keys</option>',
+    'default', 'Cursor-key compatibility updated; it applies to new terminals.');
   mkRow('Application cursor keys', termAppCursor,
     'Disable if arrow keys emit escape sequences inside an editor. Applies to new terminals.');
 
-  const termAppKeypad = document.createElement('select');
-  termAppKeypad.innerHTML = '<option value="default">Allow application keypad</option><option value="disabled">Disable application keypad</option>';
-  termAppKeypad.value = state.settings.terminalAppKeypad || 'default';
-  termAppKeypad.addEventListener('change', async () => {
-    try {
-      await call('settings_set', { key: 'terminalAppKeypad', value: termAppKeypad.value });
-      state.settings.terminalAppKeypad = termAppKeypad.value;
-      toast('Keypad compatibility updated; it applies to new terminals.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
-  });
+  const termAppKeypad = selectFor('terminalAppKeypad',
+    '<option value="default">Allow application keypad</option><option value="disabled">Disable application keypad</option>',
+    'default', 'Keypad compatibility updated; it applies to new terminals.');
   mkRow('Application keypad', termAppKeypad,
     'Disable if the numeric keypad types the wrong characters. Applies to new terminals.');
 
@@ -3088,63 +3331,94 @@ async function loadSettings() {
   loadKnownHosts();
 }
 
-// ─── known hosts (Settings panel) ──────────────────────────────────────────
 // ─── vault backup / restore (Settings panel) ───────────────────────────────
+//
+// Both run in Rust, behind native dialogs (A6-03 / A2-48, ruling R5). The
+// sealed vault used to come back to this window as JSON for the page to save,
+// and a restore read the whole file into it - the exposure vault_export had
+// been de-registered to prevent. The page now only asks, shows that it is
+// working, and reports what happened.
+
+/// "2 keys, 1 categories, ..." for the counts a backup or a restore returns.
+function backupCountsText(c) {
+  const n = (v) => Number(v) || 0;
+  c = c || {};
+  return `${n(c.keys)} keys, ${n(c.categories)} categories, ${n(c.servers)} servers, ` +
+    `${n(c.knownHosts)} known hosts, SFTP bookmarks for ${n(c.sftpBookmarks)} server(s)`;
+}
 
 async function backupCreate() {
-  try {
-    const r = await call('vault_backup_create');
-    const pick = await call('system_pick_save_path', {
-      title: 'Save vault backup',
-      defaultName: r.filename,
-    });
-    if (pick.canceled) return;
-    await call('system_write_text_file', {
-      path: pick.path,
-      contents: JSON.stringify(r.json, null, 2),
-    });
-    const c = r.counts;
-    el('backupStatus').textContent = `Backup saved: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
-    toast('Backup created.', 'ok');
-  } catch (e) { toast(e.message || String(e), 'err'); }
+  if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
+  await withBusy(el('backupExportBtn'), 'Saving backup…', async () => {
+    try {
+      const r = await call('vault_backup_export_to_file');
+      if (!r || r.canceled) return; // the save dialog was dismissed
+      const summary = backupCountsText(r.counts);
+      el('backupStatus').textContent = `Backup saved to ${r.path}: ${summary}.`;
+      toast(`Backup saved to ${r.path} - ${summary}.`, 'ok');
+    } catch (e) {
+      const msg = e.message || String(e);
+      toast(msg === VAULT_LOCKED_MIDWAY ? 'The vault was locked before the backup was written, so no file was saved.' : msg, 'err');
+    }
+  });
 }
 
 async function backupRestore() {
-  try {
-    const pick = await call('system_select_file', { title: 'Select vault backup file' });
-    if (pick.canceled) return;
-    const payloadJson = pick.text;
-    const go = await confirmModal('Restore backup',
-      'Restoring will add or overwrite entries with the ones from this backup. Continue?', 'Restore');
-    if (!go) return;
-    try {
-      const r = await call('vault_backup_restore', { payloadJson, backupPassword: null });
-      finishRestore(r);
-    } catch (e) {
-      const msg = e.message || String(e);
-      if (!msg.includes('different master password')) throw e;
-      // The backup was created under a different master password - ask for it.
-      // A secret prompt: the field is masked, the password is sent exactly as
-      // typed (edge whitespace included) and the field is emptied on close.
-      promptModal('Backup password',
-        'This backup was created with a different master password. Enter the one that was active when the backup was taken:',
-        '', async (pw) => {
-          if (!pw) return;
-          try {
-            const r2 = await call('vault_backup_restore', { payloadJson, backupPassword: pw });
-            finishRestore(r2);
-          } catch (e2) { toast(e2.message || String(e2), 'err'); }
-        }, { secret: true });
-    }
-  } catch (e) { toast(e.message || String(e), 'err'); }
+  if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
+  // Asked first: Rust opens the file dialog and reads the file itself, so
+  // there is no later point at which this page could still say no.
+  const go = await confirmModal('Restore backup',
+    'Restoring adds or overwrites keys, categories, servers, known hosts, settings, MCP servers and SFTP bookmarks with the ones in the backup you choose next. Continue?',
+    'Choose backup...');
+  // A lock while the question was open answers it no; this also covers a lock
+  // that landed right after the answer.
+  if (!go || !state.unlocked) return;
+  await runRestore({});
 }
 
-function finishRestore(r) {
-  const c = r.counts;
-  let msg = `Restored: ${c.keys} keys, ${c.categories} categories, ${c.servers} servers, ${c.knownHosts} known hosts.`;
-  el('backupStatus').textContent = msg;
-  loadKeys();
-  loadServers();
+/// One restore call. `{}` lets Rust open the file dialog; `{path,
+/// backupPassword}` is the retry for a backup sealed under a different master
+/// password, which Rust accepts only for the path it offered back - once,
+/// within a few minutes.
+async function runRestore(args) {
+  await withBusy(el('backupImportBtn'), 'Restoring…', async () => {
+    let r;
+    try {
+      r = await call('vault_backup_restore_from_file', args);
+    } catch (e) {
+      const msg = e.message || String(e);
+      // A wrong password uses up the retry Rust granted for that file, so the
+      // only way on is to pick the file again. A lock during the restore
+      // aborts it before anything is written. Every other message - a busy
+      // re-encryption included - is shown as the backend wrote it.
+      if (/^Backup password is incorrect/.test(msg)) {
+        toast('Backup password is incorrect. Start the restore again to choose the file and try another password.', 'err');
+      } else if (msg === VAULT_LOCKED_MIDWAY) {
+        toast('The vault was locked during the restore, so nothing was restored.', 'err');
+      } else {
+        toast(msg, 'err');
+      }
+      return;
+    }
+    if (!r || r.canceled) return; // the file dialog was dismissed
+    if (r.needsPassword) { askBackupPassword(r.path); return; }
+    await finishRestore(r);
+  });
+}
+
+/// A secret prompt: masked, handed over exactly as typed (edge whitespace is
+/// part of a password) and emptied however it closes. A lock closes it
+/// without running the callback.
+function askBackupPassword(path) {
+  promptModal('Backup password',
+    'This backup was sealed with a different master password. Enter the one that was current when it was taken:',
+    '', (pw) => { if (pw) runRestore({ path, backupPassword: pw }); }, { secret: true });
+}
+
+async function finishRestore(r) {
+  const c = r.counts || {};
+  el('backupStatus').textContent =
+    `Restored: ${backupCountsText(c)}, ${Number(c.settings) || 0} settings, ${Number(c.mcpServers) || 0} MCP servers.`;
   const conflicts = c.knownHostsConflicts || 0;
   const imported = c.knownHostsImported || 0;
   const skipped = r.resealFailures || 0;
@@ -3160,7 +3434,35 @@ function finishRestore(r) {
     // unconfirmed; the user re-confirms the fingerprint on first connection.
     toast(`${imported} host-key pin(s) came from the backup and are marked unconfirmed - you will be asked to confirm each fingerprint on its first connection.`, 'info');
   }
+  if (c.settingsDropped > 0) {
+    toast(`${c.settingsDropped} setting(s) in the backup were not recognised or not valid here and were left out.`, 'info');
+  }
+  await reloadAfterRestore();
 }
+
+/// After a restore everything read from the vault is stale - keys, servers,
+/// and the settings the restore wrote: auto-lock, delete confirmation, update
+/// check, interface scale, terminal options. Only keys and servers used to be
+/// reloaded, so the app went on behaving per the old settings and the next
+/// toggle wrote a stale value back (A2-30).
+async function reloadAfterRestore() {
+  // Neither rejects: a failure shows in its own list (A5-21).
+  await loadKeys();
+  await loadServers();
+  try {
+    state.settings = await call('settings_get');
+  } catch (e) {
+    toast('Restored, but the settings could not be read back: ' + (e.message || String(e)), 'err');
+    return;
+  }
+  state.sftpDualPane = state.settings.sftpDualPane === '1';
+  applyUiScale(currentUiScale());
+  armAutoLockTimer();
+  if (typeof window.terminalApplySettings === 'function') window.terminalApplySettings();
+  if (state.view === 'settings') await loadSettings();
+}
+
+// ─── known hosts (Settings panel) ──────────────────────────────────────────
 async function loadKnownHosts() {
   const body = el('knownHostsBody');
   const empty = el('knownHostsEmpty');
@@ -3190,7 +3492,10 @@ async function loadKnownHosts() {
       const forget = document.createElement('button');
       forget.className = 'ghost-btn';
       forget.innerHTML = `${ico('trash-2')}<span>Forget</span>`;
+      // known_hosts_forget is refused while the vault is locked (A6-08).
+      lockGate(forget, 'hosts');
       forget.addEventListener('click', async () => {
+        if (!lockGateOpen('hosts')) return;
         const forgetIt = await confirmModal('Forget host key',
           `Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`,
           'Forget');
@@ -3265,8 +3570,13 @@ async function loadAudit() {
 /// RFC 4180 field escaping: wrap in quotes and double any embedded quote.
 /// The detail column carries arbitrary strings (file paths, host names,
 /// sanitized key names), so a comma or quote in one must not shift columns.
+/// A cell that starts with = + - @, a TAB or a CR also gets a leading single
+/// quote (OWASP's CSV-injection advice): Excel and LibreOffice evaluate such a
+/// cell as a formula when the file is opened, and a key or server name like
+/// `=HYPERLINK(...)` reaches this export verbatim (A2-32).
 function csvField(value) {
-  const s = value === undefined || value === null ? '' : String(value);
+  let s = value === undefined || value === null ? '' : String(value);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return '"' + s.replace(/"/g, '""') + '"';
 }
 
@@ -3295,6 +3605,9 @@ async function auditExport() {
 /// Clear the audit log after a confirmation. The backend records the clear
 /// itself, so the log is never left with no trace that it was emptied.
 async function auditClear() {
+  // audit_clear is refused while the vault is locked (A6-08); the button is
+  // disabled then too.
+  if (!lockGateOpen('audit')) return;
   try {
     const res = await call('audit_list', { limit: 1 });
     const total = typeof res.total === 'number' ? res.total : 0;
@@ -3428,6 +3741,7 @@ function wire() {
   el('searchInput').addEventListener('input', renderKeyList);
   el('typeFilter').addEventListener('change', renderKeyList);
   el('catAddRootBtn').addEventListener('click', () => addCategoryPrompt(null));
+  lockGate(el('catAddRootBtn'), 'categories');
 
   // selection actions (what used to be the Deploy view's entry point)
   el('selDeployBtn').addEventListener('click', openDeploySheet);
@@ -3593,6 +3907,7 @@ function wire() {
   // audit log (Settings)
   el('auditExportBtn').addEventListener('click', auditExport);
   el('auditClearBtn').addEventListener('click', auditClear);
+  lockGate(el('auditClearBtn'), 'audit');
 
   // picker modal
   el('pickerCloseBtn').addEventListener('click', closeCategoryPicker);
@@ -3762,9 +4077,12 @@ function wire() {
     b.addEventListener('click', () => setConnectAuthMethod(b.dataset.auth));
   }
   el('srvBrowsePemBtn').addEventListener('click', async () => {
+    // A path only: the file is not read. system_select_file read the private
+    // key and shipped its text into this window just to fill in a path
+    // (A6-04 / A2-19).
     try {
-      const r = await call('system_select_file', { title: 'Select .pem file' });
-      if (!r.canceled) el('srvPemPath').value = r.path;
+      const r = await call('system_pick_file_path', { title: 'Select .pem file' });
+      if (r && !r.canceled) el('srvPemPath').value = r.path;
     } catch (e) { toast(e.message || String(e), 'err'); }
   });
   el('srvSaveBtn').addEventListener('click', submitServerModal);
@@ -3851,6 +4169,10 @@ function closeDialogsForLock() {
     node.hidden = true;
   }
   hideVaultModal();
+  // A master-password change still running belongs to the vault that is
+  // locking now: its dialog is gone, so its busy state must not carry over
+  // to the unlock gate that follows (a disabled Cancel, "Re-encrypting…").
+  releaseVaultSubmit();
   clearSensitiveInputs();
 }
 
@@ -3869,13 +4191,14 @@ function clearSensitiveInputs() {
 
 // ─── Auto-lock (idle timer, honors the autoLockMinutes setting) ────────────
 
-// The backend watchdog also falls back to 15 minutes when the setting is absent
-// or not an integer. It is NOT identical at the edges, and the two are not
-// guaranteed to agree there: the watchdog treats any value <= 0 as "off" (the
-// renderer treats a negative as invalid and uses this default) and it applies
-// no upper limit (the renderer caps at AUTO_LOCK_MAX_MINUTES). The Settings
-// field no longer writes a negative, but settings_set accepts any string, so a
-// restored backup or a hand-edited database can still carry one.
+// The backend watchdog reads autoLockMinutes exactly the way autoLockMinutes()
+// below does: absent, blank or not a plain whole number (a negative, "+5",
+// "1.5") means 15, an explicit "0" means off, anything above
+// AUTO_LOCK_MAX_MINUTES means that maximum, surrounding whitespace ignored.
+// settings_get reports "15" when nothing is stored, and settings_set accepts
+// only digits from 0 to 1440, so an out-of-range value can only be a legacy one
+// (an older build, a hand-edited database) - and it reads the same on both
+// sides. (A restore drops a value settings_set would refuse.)
 const AUTO_LOCK_DEFAULT_MINUTES = 15;
 // The Settings field's own maximum (a day). It also keeps the timeout well
 // under setTimeout's 2^31 ms limit, past which a timer fires immediately.
@@ -3889,12 +4212,11 @@ let autoLockTicker = null;
 let lastUserActivityAt = Date.now();
 
 /// Effective auto-lock timeout in minutes; 0 means off. An explicit 0 is the
-/// only way to switch it off. The setting is ABSENT on a fresh install
-/// (settings_get returns only keys that were saved), and absent - like
-/// anything that is not a whole non-negative number - means the default, which
-/// is also what the backend watchdog does for an absent or unparsable value
-/// (see AUTO_LOCK_DEFAULT_MINUTES for where the two differ). It used to mean
-/// "off" here, so a new install advertised a lock it never performed.
+/// only way to switch it off. settings_get reports the default ("15") when
+/// nothing is stored; absent here (settings not loaded) - like anything that
+/// is not a whole non-negative number - also means the default, exactly as the
+/// backend watchdog reads it (see AUTO_LOCK_DEFAULT_MINUTES). Absent used to
+/// mean "off" here, so a new install advertised a lock it never performed.
 function autoLockMinutes() {
   const raw = state.settings ? state.settings.autoLockMinutes : undefined;
   if (raw === undefined || raw === null) return AUTO_LOCK_DEFAULT_MINUTES;
@@ -4071,9 +4393,11 @@ async function loadServers() {
   try {
     const res = await call('server_list');
     state.servers = res.servers || [];
+    state.serversLoadError = null;
   } catch (e) {
     state.servers = [];
-    toast(e.message || String(e), 'err');
+    state.serversLoadError = e.message || String(e);
+    toast(state.serversLoadError, 'err');
   }
   renderServerList();
   if (state.view === 'connect') { state.orphans = state.servers.some(s => !s.categoryId); renderCategoryTree(); }
@@ -4107,6 +4431,13 @@ function renderServerList() {
       .some(v => v.toLowerCase().includes(filter));
   });
   list.innerHTML = '';
+  if (state.serversLoadError) {
+    // Not "No saved servers yet": the servers could not be read (A5-21).
+    empty.hidden = true;
+    list.hidden = false;
+    renderLoadError(list, 'Could not load your servers', state.serversLoadError, loadServers);
+    return;
+  }
   if (state.servers.length === 0) {
     empty.hidden = false;
     list.hidden = true;
@@ -4941,7 +5272,18 @@ function escapeHtml(s) {
     toast('xterm.js did not expose window.Terminal - terminal rendering unavailable.', 'err');
   }
 
-  await refreshVaultStatus();
+  // One failing call in here (vault_status itself, or a load behind an
+  // unlocked vault) used to reject out of main() before anything below was
+  // wired: no stored settings, no idle-activity listeners, no 10 s status
+  // poll - an app that never noticed a lock (A2-20). It is reported instead;
+  // the poll below tries again.
+  try {
+    await refreshVaultStatus();
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    window.__bootErrors.push('first vault refresh failed: ' + msg);
+    toast(msg, 'err');
+  }
 
   // Auto-lock needs the persisted settings at boot (loadSettings only runs
   // when the Settings view is opened).
