@@ -26,6 +26,10 @@ use crate::db::{Database, ServerRecord};
 /// One live interactive session.
 pub struct SessionHandle {
     pub session_id: String,
+    /// Saved-server id this session was opened for. Session ids die with the
+    /// connection; this is what the SFTP transfer queue matches a RECONNECTED
+    /// session against so paused/restored transfers can resume (A7-17).
+    pub server_id: String,
     pub server_name: String,
     pub host: String,
     pub port: u16,
@@ -97,6 +101,26 @@ impl SessionRegistry {
 
     pub fn remove(&self, id: &str) -> Option<SessionHandle> {
         self.sessions.lock().unwrap().remove(id)
+    }
+
+    /// Saved-server id a live session was opened for.
+    pub fn server_id_of(&self, id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| s.server_id.clone())
+    }
+
+    /// `(session_id, server_id, started_at_ms)` of every live session - what
+    /// the SFTP transfer queue matches paused jobs against after a reconnect.
+    pub fn live_server_sessions(&self) -> Vec<(String, String, i64)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| (s.session_id.clone(), s.server_id.clone(), s.started_at_ms))
+            .collect()
     }
 
     pub fn list(&self) -> Vec<(String, String, String, u16, i64)> {
@@ -639,6 +663,7 @@ pub async fn start_interactive(
 
     registry.insert(SessionHandle {
         session_id: session_id.clone(),
+        server_id: params.server.id.clone(),
         server_name: params.server.name.clone(),
         host: target_host.clone(),
         port: target_port,

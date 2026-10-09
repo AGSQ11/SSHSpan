@@ -4,21 +4,33 @@
 
 pub mod queue;
 
+/// In-process SFTP server (a real `SftpSession` over an in-memory stream) for
+/// the unit tests of everything that talks to a remote filesystem. Unix only:
+/// it relies on symlinks and mode bits.
+#[cfg(all(test, unix))]
+pub(crate) mod testkit;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use russh_sftp::client::SftpSession;
 
-/// Per-connection SFTP sessions, keyed by SSH session id.
+/// Per-connection SFTP sessions, keyed by SSH session id, plus the recursive
+/// search each session is currently running.
 #[derive(Default)]
 pub struct SftpRegistry {
     sessions: Mutex<HashMap<String, Arc<SftpSession>>>,
+    /// The search in flight per session: the id of the newest search and its
+    /// cancel flag. One per session by design - the search bar has one result
+    /// list, so a new search supersedes the old one (A7-21).
+    searches: Mutex<HashMap<String, (String, Arc<std::sync::atomic::AtomicBool>)>>,
 }
 
 impl SftpRegistry {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            searches: Mutex::new(HashMap::new()),
         }
     }
     pub fn insert(&self, id: String, sftp: Arc<SftpSession>) {
@@ -28,6 +40,8 @@ impl SftpRegistry {
         self.sessions.lock().unwrap().get(id).cloned()
     }
     pub fn remove(&self, id: &str) -> Option<Arc<SftpSession>> {
+        // A search walks THIS session; without it there is nothing to walk.
+        self.cancel_session_search(id);
         self.sessions.lock().unwrap().remove(id)
     }
     /// Drop every open SFTP session. Called when the vault locks: the shell
@@ -35,7 +49,66 @@ impl SftpRegistry {
     /// OWN russh channel, so clearing the shell registry alone left these
     /// handles live and every `sftp_*` command still working against them.
     pub fn clear(&self) {
+        let mut searches = self.searches.lock().unwrap();
+        for (_, (_, cancel)) in searches.drain() {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        drop(searches);
         self.sessions.lock().unwrap().clear();
+    }
+
+    /// Register a new search for `session_id` and return its cancel flag. The
+    /// search it supersedes (if any) is cancelled: overlapping walks of one
+    /// session used to cross-contaminate one result list, and the stale walk's
+    /// `done` event killed the live listener (A7-21).
+    pub fn begin_search(
+        &self,
+        session_id: &str,
+        search_id: &str,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let previous = self.searches.lock().unwrap().insert(
+            session_id.to_string(),
+            (search_id.to_string(), cancel.clone()),
+        );
+        if let Some((_, old)) = previous {
+            old.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        cancel
+    }
+
+    /// Cancel `search_id` if it is still the session's current search. A late
+    /// cancel for a search that has since been replaced does nothing - it must
+    /// not stop the newer one.
+    pub fn cancel_search(&self, session_id: &str, search_id: &str) -> bool {
+        let mut searches = self.searches.lock().unwrap();
+        match searches.get(session_id) {
+            Some((current, cancel)) if current == search_id => {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                searches.remove(session_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The search ended on its own: forget it, unless a newer one has already
+    /// taken its place.
+    pub fn finish_search(&self, session_id: &str, search_id: &str) {
+        let mut searches = self.searches.lock().unwrap();
+        if searches
+            .get(session_id)
+            .is_some_and(|(current, _)| current == search_id)
+        {
+            searches.remove(session_id);
+        }
+    }
+
+    /// Cancel whatever search the session is running (tab closed).
+    pub fn cancel_session_search(&self, session_id: &str) {
+        if let Some((_, cancel)) = self.searches.lock().unwrap().remove(session_id) {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -295,7 +368,12 @@ fn is_windows_device_name(stem: &str) -> bool {
 /// The staged name does not affect what is uploaded back - the original
 /// remote path is untouched - so collapsing names to `.txt` costs nothing
 /// except a default-app association.
-const INERT_STAGE_EXTENSIONS: [&str; 25] = [
+///
+/// `pub` is deliberately absent although it is an SSH public key suffix: on
+/// Windows it is the Microsoft Publisher association (an Office application
+/// with macro support), which would be handed remote-supplied content. A
+/// `.pub` file stages as `.txt` like any other unknown extension.
+const INERT_STAGE_EXTENSIONS: [&str; 24] = [
     "txt",
     "text",
     "log",
@@ -319,7 +397,6 @@ const INERT_STAGE_EXTENSIONS: [&str; 25] = [
     "crt",
     "cer",
     "key",
-    "pub",
     "properties",
 ];
 
@@ -345,17 +422,22 @@ pub fn path_has_inert_extension(path: &std::path::Path) -> bool {
 }
 
 /// Unpredictable staged-file name for a remote file: `{base}.{uuid}.{ext}`
-/// (no extension → `{base}-{uuid}`). The random component prevents another
-/// local user from pre-creating or guessing the path of a file that will
-/// hold remote (potentially secret) contents; the sanitized base and the
+/// (no usable extension → `{base}-{uuid}.txt`). The random component prevents
+/// another local user from pre-creating or guessing the path of a file that
+/// will hold remote (potentially secret) contents; the sanitized base and the
 /// original extension are preserved so the editor association still works.
 ///
-/// If the remote extension is not on the inert allowlist (executable,
-/// packaged, binary, or simply unknown - e.g. `.scr`, `.exe`, `.7z`), it is
-/// NEVER preserved - the staged name is forced to end in `.txt` so the OS
-/// shell opens it in an editor instead of handing it to whatever handler the
-/// extension maps to. A remote name that is only a non-inert extension
-/// (`.scr`) or empty stages as `file.{uuid}.txt`.
+/// The result ALWAYS ends in an inert extension, because
+/// `system_open_external` refuses to launch anything else: if the remote
+/// extension is not on the inert allowlist (executable, packaged, binary, or
+/// simply unknown - e.g. `.scr`, `.exe`, `.7z`), it is NEVER preserved - the
+/// staged name is forced to end in `.txt` so the OS shell opens it in an
+/// editor instead of handing it to whatever handler the extension maps to.
+/// Names with no usable extension at all (`Makefile`, `authorized_keys`,
+/// `.conf`) get `.txt` appended for the same reason; they used to keep a bare
+/// `-{uuid}` suffix, which the opener's own gate then rejected. A remote name
+/// that is only a non-inert extension (`.scr`) or empty stages as
+/// `file.{uuid}.txt`.
 pub fn staged_file_name(remote_name: &str) -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let base = sanitize_stage_base(remote_name);
@@ -373,13 +455,15 @@ pub fn staged_file_name(remote_name: &str) -> String {
             }
         }
         // No usable stem/extension. Three cases: no extension at all
-        // ("Makefile") and bare inert extensions (".conf") keep the suffix
-        // form; a bare NON-inert extension (".scr") stages as inert text.
+        // ("Makefile"), a bare inert extension (".conf") and an over-long
+        // "extension" take the suffix form - with `.txt` appended so the name
+        // still passes the opener's inert-extension gate; a bare NON-inert
+        // extension (".scr") stages as plain inert text.
         _ => {
             if base.starts_with('.') && base.len() > 1 && !is_inert_stage_extension(&base[1..]) {
                 format!("file.{id}.txt")
             } else {
-                format!("{base}-{id}")
+                format!("{base}-{id}.txt")
             }
         }
     }
@@ -679,7 +763,7 @@ mod tests {
         }
         for bad in [
             "x.exe", "x.scr", "x.bat", "x.cmd", "x.com", "x.msi", "x.ps1", "x.vbs", "x.js",
-            "x.jar", "x.sh", "x.dll", "x.bin", "x.7z", "x",
+            "x.jar", "x.sh", "x.dll", "x.bin", "x.7z", "x", "x.pub",
         ] {
             assert!(
                 !path_has_inert_extension(Path::new(bad)),
@@ -703,6 +787,92 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(!reuse_is_safe(&link));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── in-flight searches (A7-21) ───────────────────────────────────────────
+
+    fn is_cancelled(flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Refining a query in a big tree starts a second walk while the first is
+    /// still running. The first used to keep going and mix its matches into
+    /// the new result list; now it is told to stop.
+    #[test]
+    fn a_new_search_cancels_the_one_it_supersedes() {
+        let reg = SftpRegistry::new();
+        let first = reg.begin_search("sess", "s1");
+        assert!(!is_cancelled(&first));
+
+        let second = reg.begin_search("sess", "s2");
+
+        assert!(is_cancelled(&first), "the superseded walk must stop");
+        assert!(!is_cancelled(&second));
+    }
+
+    #[test]
+    fn searches_of_different_sessions_do_not_affect_each_other() {
+        let reg = SftpRegistry::new();
+        let a = reg.begin_search("sess-a", "s1");
+        let b = reg.begin_search("sess-b", "s2");
+        assert!(!is_cancelled(&a) && !is_cancelled(&b));
+        assert!(reg.cancel_search("sess-a", "s1"));
+        assert!(is_cancelled(&a) && !is_cancelled(&b));
+    }
+
+    /// A late "Stop" for a search that was already replaced must not stop the
+    /// replacement.
+    #[test]
+    fn cancel_search_only_hits_the_current_search() {
+        let reg = SftpRegistry::new();
+        let _old = reg.begin_search("sess", "old");
+        let current = reg.begin_search("sess", "current");
+
+        assert!(!reg.cancel_search("sess", "old"), "stale id");
+        assert!(
+            !reg.cancel_search("other-session", "current"),
+            "wrong session"
+        );
+        assert!(!is_cancelled(&current));
+
+        assert!(reg.cancel_search("sess", "current"));
+        assert!(is_cancelled(&current));
+        assert!(!reg.cancel_search("sess", "current"), "already gone");
+    }
+
+    /// The old walk finishing after a newer one started must not unregister
+    /// the newer one (it would become uncancellable).
+    #[test]
+    fn finish_search_does_not_forget_a_newer_search() {
+        let reg = SftpRegistry::new();
+        reg.begin_search("sess", "s1");
+        let second = reg.begin_search("sess", "s2");
+
+        reg.finish_search("sess", "s1");
+
+        assert!(reg.cancel_search("sess", "s2"));
+        assert!(is_cancelled(&second));
+        // Finishing the current one unregisters it.
+        reg.begin_search("sess", "s3");
+        reg.finish_search("sess", "s3");
+        assert!(!reg.cancel_search("sess", "s3"));
+    }
+
+    /// Closing the SFTP tab, or locking the vault, ends the walk too.
+    #[test]
+    fn closing_a_session_or_locking_the_vault_cancels_its_search() {
+        let reg = SftpRegistry::new();
+        let a = reg.begin_search("sess-a", "s1");
+        let b = reg.begin_search("sess-b", "s2");
+
+        assert!(
+            reg.remove("sess-a").is_none(),
+            "no SFTP session was inserted"
+        );
+        assert!(is_cancelled(&a) && !is_cancelled(&b));
+
+        reg.clear();
+        assert!(is_cancelled(&b));
     }
 
     #[test]
@@ -733,7 +903,76 @@ mod tests {
     fn staged_name_no_extension_uses_suffix() {
         let a = staged_file_name("Makefile");
         assert!(a.starts_with("Makefile-"), "unexpected name: {a}");
-        assert!(!a.contains('.'), "no extension was given: {a}");
+        // No usable extension: the uuid is a suffix, and `.txt` is appended so
+        // the opener's inert-extension gate accepts the staged path (A7-06).
+        let middle = a
+            .strip_prefix("Makefile-")
+            .and_then(|s| s.strip_suffix(".txt"))
+            .expect("expected Makefile-{uuid}.txt");
+        assert_eq!(middle.len(), 32, "expected a 32-hex-char uuid: {a}");
+        assert!(!middle.contains('.'), "no extension was given: {a}");
+    }
+
+    /// A7-06 COMPOSITION: `system_open_external` refuses any path whose
+    /// extension is not on the inert allowlist, so every name the staging code
+    /// can produce has to pass that same gate. Each half was unit-tested on its
+    /// own while the composition failed for every extension-less name - the
+    /// files people most often edit on servers (`authorized_keys`,
+    /// `known_hosts`, `/etc/hosts`, `fstab`, `sshd_config`, `Makefile`).
+    #[test]
+    fn every_staged_name_passes_the_opener_gate() {
+        for name in [
+            "Makefile",
+            "Dockerfile",
+            "authorized_keys",
+            "known_hosts",
+            "hosts",
+            "fstab",
+            "sshd_config",
+            "crontab",
+            ".bashrc",
+            ".conf",
+            ".scr",
+            "",
+            ".",
+            "..",
+            "a.",
+            "..a",
+            "noext-with-dash",
+            "v1.2.3.verylongextensionnamethatexceedssixteen",
+            "CON",
+            "NUL",
+            "x.pub",
+            "id_rsa.pub",
+            "evil.EXE",
+            "notes.txt",
+            "a/b\\c",
+            "日本語",
+            "trailing.dot.",
+            " spaced name ",
+        ] {
+            let staged = staged_file_name(name);
+            assert!(
+                path_has_inert_extension(std::path::Path::new(&staged)),
+                "{name:?} staged as {staged:?}, which system_open_external would refuse"
+            );
+        }
+    }
+
+    /// A6-14: `.pub` was on the allowlist, but on Windows it is the Microsoft
+    /// Publisher association - an Office application with macro support, handed
+    /// remote-supplied content. It must stage as plain text like every other
+    /// non-inert extension.
+    #[test]
+    fn pub_is_not_an_inert_extension() {
+        assert!(!is_inert_stage_extension("pub"));
+        assert!(!is_inert_stage_extension("PUB"));
+        assert!(!path_has_inert_extension(std::path::Path::new(
+            "id_rsa.pub"
+        )));
+        let staged = staged_file_name("id_rsa.pub");
+        assert!(staged.starts_with("id_rsa."), "base must survive: {staged}");
+        assert!(staged.ends_with(".txt"), "must stage as text: {staged}");
     }
 
     #[test]

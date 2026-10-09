@@ -134,6 +134,30 @@ const CANCELLED_SENTINEL: &str = "cancelled";
 /// must never treat the two the same way.
 const PAUSED_SENTINEL: &str = "paused";
 
+/// Start of the error `copy_chunks` returns when its source ENDED BEFORE the
+/// expected size (A7-18). Like the sentinels above it is matched on by text -
+/// through [`is_incomplete_transfer`], so the producer and the consumers share
+/// one definition.
+const INCOMPLETE_TRANSFER: &str = "incomplete transfer";
+
+fn incomplete_transfer_error(done: u64, expected: u64) -> String {
+    format!("{INCOMPLETE_TRANSFER}: got {done} of {expected} bytes")
+}
+
+fn is_incomplete_transfer(err: &str) -> bool {
+    err.starts_with(INCOMPLETE_TRANSFER)
+}
+
+/// Whether a failed first leg of a server-to-server copy should be retried on
+/// the interactive browse channel. That retry exists for servers that
+/// read-block FRESH channels, so it fits a failing read - and nothing else: a
+/// user's pause/cancel must be honoured, and a source that simply ENDED EARLY
+/// (a file truncated or rotated mid-copy) would only be re-read from the start
+/// over the other channel to end early again.
+fn leg1_retries_on_interactive_channel(err: &str) -> bool {
+    err != CANCELLED_SENTINEL && err != PAUSED_SENTINEL && !is_incomplete_transfer(err)
+}
+
 /// Derive the `.part` staging path for a destination. The staging file stays
 /// in the destination's own directory so the final rename is a same-directory
 /// (atomic on POSIX, MoveFileEx-like on Windows) operation, never a
@@ -142,24 +166,43 @@ pub fn part_path(dest: &str) -> String {
     format!("{dest}{PART_SUFFIX}")
 }
 
+/// The directories above `remote_path`, outermost first - exactly the levels
+/// [`ensure_remote_dir`] has to make sure exist before a file can be opened
+/// there. `/srv/up/a/file.txt` → `/srv`, `/srv/up`, `/srv/up/a`; a path with
+/// no directory part yields nothing. Relative paths stay relative (they
+/// resolve against the SFTP session's start directory), so `a/b/f` yields `a`,
+/// `a/b` rather than `/a`, `/a/b`.
+fn remote_parent_chain(remote_path: &str) -> Vec<String> {
+    let Some((parent, _file)) = remote_path.rsplit_once('/') else {
+        return Vec::new();
+    };
+    let mut chain = Vec::new();
+    let mut cur = if remote_path.starts_with('/') {
+        String::from("/")
+    } else {
+        String::new()
+    };
+    for seg in parent.split('/').filter(|s| !s.is_empty()) {
+        if !(cur.is_empty() || cur.ends_with('/')) {
+            cur.push('/');
+        }
+        cur.push_str(seg);
+        chain.push(cur.clone());
+    }
+    chain
+}
+
 /// Best-effort ensure the parent directory of `remote_path` exists on the
 /// target SFTP server, creating each missing level. Errors are logged and
 /// swallowed - the subsequent open will surface a real failure if the dir is
-/// genuinely not creatable. Used so a folder Send-to can place nested files
-/// under directories that don't exist yet on the target.
+/// genuinely not creatable. Used so a folder Send-to AND a folder upload can
+/// place nested files under directories that don't exist yet on the target:
+/// an SFTP server does not create missing parents on open, and the upload
+/// expansion enqueues one job per FILE (A7-09 - without this every file of an
+/// uploaded folder failed with "No such file").
 async fn ensure_remote_dir(sftp: &russh_sftp::client::SftpSession, remote_path: &str) {
-    let Some(parent) = remote_path.rsplit_once('/').map(|(p, _)| p) else {
-        return;
-    };
-    let parent = if parent.is_empty() { "/" } else { parent };
-    if parent == "/" {
-        return;
-    }
-    // Walk down from the root, creating each missing component.
-    let mut cur = String::new();
-    for seg in parent.split('/').filter(|s| !s.is_empty()) {
-        cur.push('/');
-        cur.push_str(seg);
+    // Walk down from the outermost level, creating each missing component.
+    for cur in remote_parent_chain(remote_path) {
         match sftp.metadata(&cur).await {
             Ok(md) if md.is_dir() => continue,
             Ok(_) => {
@@ -229,30 +272,86 @@ async fn remote_part_offset(
     }
 }
 
-/// Read and drop exactly `n` bytes from `reader` (256 KiB chunks, the same
-/// buffer size as `copy_with_progress`). russh-sftp's `File` exposes no
-/// offset-taking read, so skipping a prefix on the remote side means
-/// issuing reads and discarding the data locally. Returns the number of
-/// bytes discarded.
-async fn discard_exact<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-    n: u64,
-) -> Result<u64, String> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut done: u64 = 0;
-    while done < n {
-        let want = ((n - done) as usize).min(buf.len());
-        let read = reader
-            .read(&mut buf[..want])
-            .await
-            .map_err(|e| e.to_string())?;
-        if read == 0 {
-            return Err(format!("unexpected EOF at {done} of {n} skipped bytes"));
-        }
-        done += read as u64;
+/// Rename a COMPLETE remote file `from` onto `to`, replacing whatever is at
+/// `to`. SFTP v3 says RENAME must fail when the target exists and OpenSSH's
+/// sftp-server follows that, so on a failed rename the target is removed and
+/// the rename retried. The removal only happens while `from` is still there:
+/// if it vanished (or the failure was a dropped connection) deleting the old
+/// target would lose data for nothing. Shared by the upload leg, the
+/// server-to-server leg and the edit-and-sync upload so none of them can
+/// forget the retry - or, as two of them did, return early from it and skip
+/// the verification and timestamp steps that follow.
+///
+/// The error is the first rename's failure, rendered for the user.
+pub(crate) async fn rename_over(
+    sftp: &russh_sftp::client::SftpSession,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    let first = match sftp.rename(from, to).await {
+        Ok(()) => return Ok(()),
+        Err(e) => crate::commands::sftp::sftp_error_detail(e),
+    };
+    if sftp.metadata(from).await.is_ok()
+        && sftp.remove_file(to).await.is_ok()
+        && sftp.rename(from, to).await.is_ok()
+    {
+        return Ok(());
     }
-    Ok(done)
+    Err(first)
+}
+
+/// Everything an upload needs settled before its first byte, returning the
+/// `.part` path to write and the offset to continue from (0 = start fresh):
+/// the destination directory must exist, and the resume offset is decided
+/// against whatever `.part` an earlier attempt left. Starting from 0 removes a
+/// stale `.part`.
+///
+/// The expansion of a folder upload enqueues one job per FILE and never
+/// touches the server, and an SFTP server does not create missing parents on
+/// open - so without making the directory here every file of an uploaded
+/// folder failed with "No such file" (A7-09).
+async fn prepare_upload(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+    local_size: u64,
+    resume: Option<ResumeMode>,
+) -> (String, u64) {
+    let rpart = part_path(remote);
+    ensure_remote_dir(sftp, remote).await;
+    let offset = match resume {
+        Some(ResumeMode::Resume) => match remote_part_offset(sftp, &rpart, local_size).await {
+            Ok(off) => off,
+            Err(note) => {
+                log::info!("[sshspan-sftp] upload {remote}: {note}");
+                0
+            }
+        },
+        _ => 0,
+    };
+    if offset == 0 {
+        if let Err(e) = sftp.remove_file(&rpart).await {
+            log::debug!("[sshspan-sftp] upload pre-clean of {rpart}: {e}");
+        }
+    }
+    (rpart, offset)
+}
+
+/// Position an open remote file at `offset` for a resumed download WITHOUT
+/// reading the part that is already on disk (A7-35). russh-sftp's `File`
+/// implements `AsyncSeek`, and `SeekFrom::Start` is a free local assignment:
+/// every later read just asks the server for that offset. (The code used to
+/// read-and-discard the prefix on the false belief that the crate cannot
+/// seek - re-transferring it all, ignoring pause, cancel and the bandwidth
+/// cap, with the job frozen at its old progress meanwhile.)
+async fn seek_remote<S: tokio::io::AsyncSeek + Unpin>(
+    file: &mut S,
+    offset: u64,
+) -> Result<(), String> {
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("resume seek on remote failed: {e}"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,6 +361,12 @@ pub struct TransferJob {
     pub kind: JobKind,
     pub session_id: String,
     pub server_name: String,
+    /// Saved-server id the job's `session_id` was opened for, stamped by
+    /// `enqueue` from the session registry. Session ids are per-run, so this is
+    /// what lets a Paused/restored job be matched to a RECONNECTED session of
+    /// the same server (see `rebind_job`). `None` for jobs persisted before the
+    /// field existed - those can only be cancelled or re-queued by hand.
+    pub server_id: Option<String>,
     pub local_path: String,
     pub remote_path: String,
     pub size: u64,
@@ -286,6 +391,10 @@ pub struct TransferJob {
     /// ServerCopy only: target server name (display in the queue panel).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_server_name: Option<String>,
+    /// ServerCopy only: saved-server id of the target session (see
+    /// `server_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_server_id: Option<String>,
     /// ServerCopy only: absolute remote destination path on the target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_remote_path: Option<String>,
@@ -294,9 +403,11 @@ pub struct TransferJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<ResumeMode>,
     /// Preserve timestamps (FileZilla "Preserve timestamps of transferred
-    /// files"): after a successful upload / server-copy target leg, push the
-    /// source mtime onto the remote destination via setstat. Additive Option
-    /// so construction sites that don't care keep compiling (default false).
+    /// files"): after a successful transfer, carry the source mtime over to
+    /// the destination - onto the REMOTE file via setstat after an upload /
+    /// server-copy target leg, onto the LOCAL file via `File::set_modified`
+    /// after a download. Additive Option so construction sites that don't care
+    /// keep compiling (default false).
     #[serde(skip)]
     pub preserve_ts: Option<bool>,
     /// Automatic-retry counter (distinct from a user clicking Retry, which
@@ -350,6 +461,7 @@ impl TransferJob {
             "kind": self.kind,
             "sessionId": self.session_id,
             "serverName": self.server_name,
+            "serverId": self.server_id,
             "localPath": self.local_path,
             "remotePath": self.remote_path,
             "size": self.size,
@@ -359,6 +471,7 @@ impl TransferJob {
             "speed": speed,
             "targetSessionId": self.target_session_id,
             "targetServerName": self.target_server_name,
+            "targetServerId": self.target_server_id,
             "targetRemotePath": self.target_remote_path,
             "resume": self.resume,
             "attempts": self.attempts,
@@ -376,7 +489,9 @@ impl TransferJob {
     /// (see `db::QueueJobRow`). `session_id`/`target_session_id` are stored
     /// as-is even though they're only valid for the run that created them -
     /// turning a stale one into a "needs reconnect" job is `restore_pending`'s
-    /// job on the NEXT startup, not this method's.
+    /// job on the NEXT startup, not this method's. The saved-server ids are
+    /// stored alongside precisely because they outlive the run: they are what
+    /// `rebind_job` matches a reconnected session against.
     fn to_row(&self) -> crate::db::QueueJobRow {
         crate::db::QueueJobRow {
             id: self.id as i64,
@@ -396,6 +511,8 @@ impl TransferJob {
             target_remote_path: self.target_remote_path.clone(),
             attempts: self.attempts as i64,
             verify: self.verify,
+            server_id: self.server_id.clone(),
+            target_server_id: self.target_server_id.clone(),
         }
     }
 }
@@ -656,7 +773,9 @@ pub struct QueuedItem {
     /// How to treat an existing destination / leftover `.part` (None =
     /// Overwrite; kept optional so existing callers compile unchanged).
     pub resume: Option<ResumeMode>,
-    /// Preserve timestamps on upload/server-copy target legs (default false).
+    /// Keep the source mtime on the destination (default false): the remote
+    /// file's on an upload / server-copy target leg, the local file's on a
+    /// download.
     pub preserve_ts: Option<bool>,
 }
 
@@ -696,16 +815,36 @@ impl QueuedItem {
 pub fn enqueue<R: tauri::Runtime>(app: &tauri::AppHandle<R>, items: Vec<QueuedItem>) {
     let q = app.state::<TransferQueue>();
     let verify = verify_enabled(app);
+    // Remember which SAVED SERVER each session belongs to: the session ids die
+    // with the connection, the server ids are what a reconnected session is
+    // matched on (A7-17). Looked up BEFORE the queue lock is taken, so the
+    // session-registry lock is never held inside it.
+    let server_ids: Vec<(Option<String>, Option<String>)> = {
+        let registry = app.state::<Arc<SessionRegistry>>();
+        items
+            .iter()
+            .map(|item| {
+                (
+                    registry.server_id_of(&item.session_id),
+                    item.target
+                        .as_ref()
+                        .and_then(|t| registry.server_id_of(&t.session_id)),
+                )
+            })
+            .collect()
+    };
     let mut new_rows = Vec::new();
     {
         let mut guard = q.jobs.lock().unwrap();
-        for item in items {
+        for (item, (server_id, target_server_id)) in items.into_iter().zip(server_ids) {
             let id = q.next_id.fetch_add(1, Ordering::SeqCst);
             let job = TransferJob {
                 id,
                 kind: item.kind,
                 session_id: item.session_id,
                 server_name: item.server_name,
+                server_id,
+                target_server_id,
                 local_path: item.local_path,
                 remote_path: item.remote_path,
                 size: item.size,
@@ -899,6 +1038,48 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    copy_chunks(
+        reader,
+        writer,
+        &cancel,
+        &pause,
+        max_read,
+        progress_offset,
+        |position, speed| update_progress(app, job_id, position, Some(speed)),
+        |bytes| async move {
+            // Global bandwidth pacing: a no-op (no lock taken) when unlimited.
+            app.state::<TransferQueue>().throttle_bandwidth(bytes).await
+        },
+    )
+    .await
+}
+
+/// The copy loop behind [`copy_with_progress`], with everything that needs a
+/// Tauri app (progress events, the shared bandwidth bucket) passed in as
+/// closures so the loop itself - clamping, pause/cancel, short-copy detection -
+/// can be unit-tested against in-memory readers and writers.
+///
+/// `on_progress(position, bytes_per_sec)` fires about every 200 ms with the
+/// job-relative position (`progress_offset` + bytes copied here);
+/// `throttle(bytes)` is awaited after every chunk.
+#[allow(clippy::too_many_arguments)]
+async fn copy_chunks<R, W, P, T, TF>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    max_read: Option<u64>,
+    progress_offset: u64,
+    mut on_progress: P,
+    throttle: T,
+) -> Result<u64, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    P: FnMut(u64, f64),
+    T: Fn(u64) -> TF,
+    TF: std::future::Future<Output = ()>,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // Unwrap russh-sftp read failures the same way download_to does, so a bare
     // server SSH_FX_FAILURE surfaces as a truthful single-layer message in the
@@ -937,7 +1118,8 @@ where
             Some(max) => ((max - done) as usize).min(buf.len()),
             None => buf.len(),
         };
-        let off = progress_offset + done;
+        // saturating: an unknown-size leg 2 passes `u64::MAX` as its offset.
+        let off = progress_offset.saturating_add(done);
         let n = reader
             .read(&mut buf[..want])
             .await
@@ -951,10 +1133,7 @@ where
             .map_err(|e| e.to_string())?;
         done += n as u64;
 
-        // Global bandwidth pacing: a no-op (no lock taken) when unlimited.
-        app.state::<TransferQueue>()
-            .throttle_bandwidth(n as u64)
-            .await;
+        throttle(n as u64).await;
 
         let now = std::time::Instant::now();
         if last_emit.elapsed().as_millis() >= 200 {
@@ -962,18 +1141,33 @@ where
             if dt > 0.0 {
                 speed = (done - last_bytes) as f64 / dt;
             }
-            update_progress(app, job_id, progress_offset + done, Some(speed));
+            on_progress(progress_offset.saturating_add(done), speed);
             last_emit = now;
             last_bytes = done;
         }
     }
     writer.flush().await.map_err(|e| e.to_string())?;
     // russh-sftp 2.4.0 File: poll_shutdown drains pending write ACKs and
-    // sends the SFTP CLOSE, setting `closed = true`. File::close() calls
-    // shutdown() again, which is a no-op on an already-closed file (the
-    // future state was cleared), so caller-side `rf.close()` after this is
-    // a cheap no-op, not a double CLOSE.
+    // sends the SFTP CLOSE. It keeps no "already closed" guard, so a
+    // caller-side `rf.close()` AFTER this sends a SECOND CLOSE for a handle
+    // the server has already released, and the server answers that with a
+    // failure (pinned by `sftp::testkit`'s double-close test). That is why the
+    // callers treat a failed close after a completed copy as non-fatal and
+    // check the staged size instead.
     writer.shutdown().await.map_err(|e| e.to_string())?;
+    // Short-copy detection (A7-18): hitting EOF before `max_read` bytes means
+    // the source ended early - a remote file truncated or rotated mid-download,
+    // a server answering an early EOF, a local file that shrank during an
+    // upload. This used to return `Ok(done)` and the callers went on to rename
+    // the `.part` into place and finish the job as Done with a short file and
+    // no warning. Checked AFTER the flush so what did arrive is on disk and a
+    // later Resume can continue from it; `u64::MAX` is the "size unknown"
+    // sentinel, where reading until EOF is the only option.
+    if let Some(expected) = max_read {
+        if expected != u64::MAX && done < expected {
+            return Err(incomplete_transfer_error(done, expected));
+        }
+    }
     Ok(done)
 }
 
@@ -1106,6 +1300,24 @@ async fn apply_preserved_mtime(
             source_local.display()
         ),
     }
+}
+
+/// The remote mtime worth stamping onto a downloaded file: `None` when the
+/// server did not send one, and also for `0`, which servers that fill in
+/// "dummy" attributes send for "unknown" - stamping 1970 onto a file would be
+/// worse than leaving its fresh timestamp.
+fn preservable_mtime(remote_mtime: Option<u32>) -> Option<u32> {
+    remote_mtime.filter(|&secs| secs != 0)
+}
+
+/// Set a finished local file's modification time to `secs` (Unix seconds) -
+/// the download half of "preserve timestamps". `File::set_modified` is stable
+/// and portable (Windows `SetFileTime`, Unix `futimens`), which is what the
+/// old "std has no portable mtime setter" note got wrong. The file is opened
+/// for write (Windows needs write access for `SetFileTime`) but not truncated.
+fn set_local_mtime(path: &std::path::Path, secs: u32) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(secs)))
 }
 
 impl Drop for StageGuard {
@@ -1243,21 +1455,32 @@ async fn run_server_copy<RT: tauri::Runtime>(
     )
     .await;
     if let Err(fresh_err) = fresh_result {
-        // A user-requested stop, not a genuine read failure: clean up and
-        // return the bare sentinel so `run_job` recognizes it. The
-        // diagnostic/fallback path below exists to tell "this server
-        // read-blocks fresh channels" apart from "the read pattern itself is
-        // broken" - it must never fire just because the user paused or
-        // cancelled mid-read (retrying via the interactive session at that
-        // point would ignore the request and keep transferring).
-        if fresh_err == CANCELLED_SENTINEL || fresh_err == PAUSED_SENTINEL {
+        // Two failures that are not "this server read-blocks fresh channels"
+        // (see `leg1_retries_on_interactive_channel`): a user-requested stop,
+        // and a source that ENDED EARLY. Clean up and return - the
+        // diagnostic/fallback path below exists to tell a read-blocked channel
+        // apart from "the read pattern itself is broken", so it must never
+        // fire just because the user paused or cancelled mid-read (retrying
+        // via the interactive session at that point would ignore the request
+        // and keep transferring), nor re-read the whole file only to end early
+        // again.
+        if !leg1_retries_on_interactive_channel(&fresh_err) {
             let _ = lf.flush().await;
             drop(lf);
             if let Err(e) = rf.close().await {
                 log::debug!("[sshspan-sftp] sendto leg1 close after {fresh_err}: {e}");
             }
             drop(sftp);
-            return Err(fresh_err);
+            // A stop reaches `run_job` as the bare sentinel, which it matches
+            // on; a source that ended early is a genuine failure and says so.
+            return Err(if is_incomplete_transfer(&fresh_err) {
+                log::warn!(
+                    "[sshspan-sftp] sendto leg1 source {source_remote} ended early: {fresh_err}"
+                );
+                format!("source read: {fresh_err} (stat size {size})")
+            } else {
+                fresh_err
+            });
         }
         // DIAGNOSTIC + FALLBACK: the fresh transfer channel failed the read.
         // Retry the identical clamped read on the interactive browse session -
@@ -1444,17 +1667,10 @@ async fn run_server_copy<RT: tauri::Runtime>(
         }
     }
     // Some servers refuse rename-over-an-existing-file; the .part is fully
-    // uploaded at this point, so removing the final name first is a safe retry.
-    if let Err(e) = target_sftp.rename(&tpart, &target.remote_path).await {
-        let d = crate::commands::sftp::sftp_error_detail(e);
-        if target_sftp.remove_file(&target.remote_path).await.is_ok()
-            && target_sftp
-                .rename(&tpart, &target.remote_path)
-                .await
-                .is_ok()
-        {
-            return Ok(());
-        }
+    // uploaded at this point, so removing the final name first is a safe retry
+    // (`rename_over`). Not an early return: verification and timestamps below
+    // must run on that path too.
+    if let Err(d) = rename_over(&target_sftp, &tpart, &target.remote_path).await {
         log::error!(
             "[sshspan-sftp] sendto leg2 rename {tpart} -> {}: {d}",
             target.remote_path
@@ -1575,24 +1791,9 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         // name happens only after a complete upload, so an
                         // interrupted upload leaves a resumable partial (never
                         // a truncated file that looks complete).
-                        let rpart = part_path(&remote);
-                        let offset = match resume {
-                            Some(ResumeMode::Resume) => {
-                                match remote_part_offset(&sftp, &rpart, lsize).await {
-                                    Ok(off) => off,
-                                    Err(note) => {
-                                        log::info!("[sshspan-sftp] upload {remote}: {note}");
-                                        0
-                                    }
-                                }
-                            }
-                            _ => 0,
-                        };
-                        if offset == 0 {
-                            if let Err(e) = sftp.remove_file(&rpart).await {
-                                log::debug!("[sshspan-sftp] upload pre-clean of {rpart}: {e}");
-                            }
-                        } else {
+                        let (rpart, offset) =
+                            prepare_upload(&sftp, &remote, lsize, resume).await;
+                        if offset > 0 {
                             lf.seek(SeekFrom::Start(offset))
                                 .await
                                 .map_err(|e| format!("local seek to resume offset failed: {e}"))?;
@@ -1647,18 +1848,14 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                                 }
                             }
                         }
-                        // Some servers refuse rename-over-an-existing file;
-                        // the .part is complete here, so removing the final
-                        // name first is a safe retry.
-                        if let Err(e) = sftp.rename(&rpart, &remote).await {
-                            let d = crate::commands::sftp::sftp_error_detail(e);
-                            if sftp.remove_file(&remote).await.is_ok()
-                                && sftp.rename(&rpart, &remote).await.is_ok()
-                            {
-                                return Ok(());
-                            }
-                            return Err(format!("final rename failed: {d}"));
-                        }
+                        // Some servers refuse rename-over-an-existing file; the
+                        // .part is complete here, so `rename_over` removing the
+                        // final name first is a safe retry. Falling through
+                        // (not returning) keeps the verification and timestamp
+                        // steps below running on that path too.
+                        rename_over(&sftp, &rpart, &remote)
+                            .await
+                            .map_err(|d| format!("final rename failed: {d}"))?;
                         // Opt-in verification: hash the local source and the
                         // now-renamed remote destination and compare. A
                         // mismatch removes the remote file rather than
@@ -1702,17 +1899,16 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                     }
                     JobKind::Download => {
                         // Stat first: the size clamp and resume-alignment
-                        // check both rely on it.
-                        let size = sftp
-                            .metadata(&remote)
-                            .await
-                            .map_err(|e| {
-                                format!(
-                                    "remote stat failed: {}",
-                                    crate::commands::sftp::sftp_error_detail(e)
-                                )
-                            })?
-                            .size;
+                        // check both rely on it, and the mtime is what
+                        // "preserve timestamps" stamps onto the finished file.
+                        let remote_md = sftp.metadata(&remote).await.map_err(|e| {
+                            format!(
+                                "remote stat failed: {}",
+                                crate::commands::sftp::sftp_error_detail(e)
+                            )
+                        })?;
+                        let size = remote_md.size;
+                        let remote_mtime = remote_md.mtime;
                         // Unknown remote size must never mean "0-byte file":
                         // clamp to an effectively unbounded stream so the copy
                         // reads until a real short read (the EOF signal on
@@ -1763,13 +1959,9 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                                 .await
                             {
                                 Ok((file, md)) if md.len() == offset => {
-                                    // Genuine resumable partial: skip the
-                                    // already-downloaded prefix on the remote.
-                                    if let Err(e) = discard_exact(&mut rf, offset).await {
-                                        return Err(format!(
-                                            "resume seek on remote failed: {e}"
-                                        ));
-                                    }
+                                    // Genuine resumable partial: continue where
+                                    // it ended, without re-reading the prefix.
+                                    seek_remote(&mut rf, offset).await?;
                                     file
                                 }
                                 Ok((_, md)) => {
@@ -1853,13 +2045,32 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                                 }
                             }
                         }
-                        // Preserve-timestamps on DOWNLOADS is NOT applied here:
-                        // the remote mtime would have to be written onto the
-                        // LOCAL file, and std has no portable mtime setter
-                        // (Windows needs SetFileTime; adding a crate for it is
-                        // out of scope). The renderer can apply it later via
-                        // the sftp_set_mtime IPC command for non-queue flows;
-                        // queue downloads keep the local file's fresh mtime.
+                        // Preserve timestamps (A7-36), after the rename and any
+                        // verification so nothing later touches the file: stamp
+                        // the REMOTE mtime onto the finished local file.
+                        // `File::set_modified` is portable, so this needs no
+                        // crate. Best-effort like the upload side - a refused
+                        // timestamp must never fail a completed download.
+                        if preserve_ts {
+                            if let Some(secs) = preservable_mtime(remote_mtime) {
+                                let target = std::path::PathBuf::from(&local);
+                                match tokio::task::spawn_blocking(move || {
+                                    set_local_mtime(&target, secs)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(())) => log::info!(
+                                        "[sshspan-sftp] preserved mtime {secs} on {local}"
+                                    ),
+                                    Ok(Err(e)) => log::warn!(
+                                        "[sshspan-sftp] could not preserve mtime on {local}: {e}"
+                                    ),
+                                    Err(e) => log::warn!(
+                                        "[sshspan-sftp] mtime task for {local} failed: {e}"
+                                    ),
+                                }
+                            }
+                        }
                     }
                     JobKind::ServerCopy => unreachable!("handled above"),
                 }
@@ -2081,27 +2292,57 @@ pub fn cancel_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
     emit_queue(app);
 }
 
-/// Re-queue a failed/cancelled job. A user-initiated retry is a fresh start
-/// for the auto-retry counter too: `attempts` resets to 0 and any pending
-/// backoff (`retry_at`) is cleared, distinguishing this from
-/// `handle_job_failure`'s automatic re-queue.
+/// Failed/Cancelled → Queued. A user-initiated retry is a fresh start for the
+/// auto-retry counter too: `attempts` resets to 0 and any pending backoff
+/// (`retry_at`) is cleared, distinguishing this from `handle_job_failure`'s
+/// automatic re-queue. A job whose session died is first re-pointed at a
+/// reconnected session of the same saved server (see [`rebind_job`]); if there
+/// is none it stays as it is with a reconnect note, since a retry could only
+/// fail again with "Session closed.".
+fn retry_failed(j: &mut TransferJob, live: &[LiveSession]) {
+    if rebind_job(j, live) == Rebind::NeedsReconnect {
+        j.error = Some(reconnect_note(&j.server_name, "retry"));
+        return;
+    }
+    j.state = JobState::Queued;
+    j.error = None;
+    // bytes_done resets, but a leftover `.part` is deliberately
+    // NOT deleted: with Resume mode the retried job continues
+    // from it. Cleanup of stale `.part` files is the user's /
+    // clear_finished's concern, not retry's.
+    j.bytes_done = 0;
+    j.cancel = None;
+    j.pause = None;
+    j.attempts = 0;
+    j.retry_at = None;
+}
+
+/// Paused → Queued, forcing `ResumeMode::Resume` (the whole point of pausing
+/// is that the `.part` survives, so the resumed attempt must continue from it
+/// rather than restart from `Overwrite`/`Ask` semantics). A job whose session
+/// died is first re-pointed at a reconnected session of the same saved server
+/// (see [`rebind_job`]); if there is none it stays Paused with a reconnect
+/// note instead of being started only to fail with "Session closed.".
+fn resume_paused(j: &mut TransferJob, live: &[LiveSession]) {
+    if rebind_job(j, live) == Rebind::NeedsReconnect {
+        j.error = Some(reconnect_note(&j.server_name, "resume"));
+        return;
+    }
+    j.state = JobState::Queued;
+    j.error = None;
+    j.retry_at = None;
+    j.resume = Some(ResumeMode::Resume);
+}
+
+/// Re-queue a failed/cancelled job - see [`retry_failed`].
 pub fn retry_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
+    let live = live_sessions(app);
     let q = app.state::<TransferQueue>();
     let row = {
         let mut guard = q.jobs.lock().unwrap();
         match guard.iter_mut().find(|j| j.id == job_id) {
             Some(j) if matches!(j.state, JobState::Failed | JobState::Cancelled) => {
-                j.state = JobState::Queued;
-                j.error = None;
-                // bytes_done resets, but a leftover `.part` is deliberately
-                // NOT deleted: with Resume mode the retried job continues
-                // from it. Cleanup of stale `.part` files is the user's /
-                // clear_finished's concern, not retry's.
-                j.bytes_done = 0;
-                j.cancel = None;
-                j.pause = None;
-                j.attempts = 0;
-                j.retry_at = None;
+                retry_failed(j, &live);
                 Some(j.to_row())
             }
             _ => None,
@@ -2130,32 +2371,94 @@ pub fn clear_finished<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
     emit_queue(app);
 }
 
-/// Cancel everything belonging to a session (disconnect/lock). A
-/// ServerCopy job belongs to BOTH its source and target sessions.
-pub fn cancel_for_session<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, session_id: &str) {
-    let q = app.state::<TransferQueue>();
-    let mut rows = Vec::new();
-    {
-        let mut guard = q.jobs.lock().unwrap();
-        for j in guard.iter_mut() {
-            let owns =
-                j.session_id == session_id || j.target_session_id.as_deref() == Some(session_id);
-            if owns && matches!(j.state, JobState::Queued | JobState::Active) {
-                if let Some(c) = &j.cancel {
-                    c.store(true, Ordering::SeqCst);
-                }
-                if j.state == JobState::Queued {
-                    j.state = JobState::Cancelled;
-                }
-                rows.push(j.to_row());
+// ─── rebinding to reconnected sessions (A7-17) ──────────────────────────────
+//
+// A job names the SSH SESSION it runs on, and a session id is minted per
+// connection. After a drop, a vault lock or an app restart the id is dead for
+// good, so a paused/restored job pointing at it could never be resumed even
+// after the user reconnected. Each job therefore also carries the id of the
+// SAVED SERVER its session belonged to, and resume/retry re-point it at the
+// newest live session of that same server.
+//
+// (This replaces `cancel_for_session`, which nothing ever called and whose
+// "cancel everything on disconnect" meaning is the opposite of what the
+// persistence feature promises: a dropped connection pauses nothing, fails
+// the in-flight attempts, and leaves the rest resumable after reconnect.)
+
+/// A live SSH session as far as rebinding queued transfers is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSession {
+    session_id: String,
+    server_id: String,
+    started_at_ms: i64,
+}
+
+/// Snapshot of the live sessions. Callers take it BEFORE they lock the queue
+/// (`resume_job`, `resume_all`, `retry_job`; `enqueue` does the same for its
+/// server-id lookup), so the session-registry lock is never held inside the
+/// queue lock.
+fn live_sessions<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<LiveSession> {
+    app.state::<Arc<SessionRegistry>>()
+        .live_server_sessions()
+        .into_iter()
+        .map(|(session_id, server_id, started_at_ms)| LiveSession {
+            session_id,
+            server_id,
+            started_at_ms,
+        })
+        .collect()
+}
+
+/// Whether a job can reach its server(s) right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebind {
+    /// Every endpoint has a live session (possibly just assigned).
+    Ready,
+    /// An endpoint's session is gone and no live session of the same saved
+    /// server exists (or the job predates `server_id`), so nothing can be
+    /// started until the user reconnects.
+    NeedsReconnect,
+}
+
+/// Where one endpoint of a job should run now: the current session while it is
+/// still live, otherwise the NEWEST live session of the same saved server
+/// (never another server's - a transfer must not silently move hosts),
+/// otherwise nowhere.
+fn rebind_endpoint(current: &str, server_id: Option<&str>, live: &[LiveSession]) -> Option<String> {
+    if live.iter().any(|s| s.session_id == current) {
+        return Some(current.to_string());
+    }
+    let server_id = server_id?;
+    live.iter()
+        .filter(|s| s.server_id == server_id)
+        .max_by_key(|s| s.started_at_ms)
+        .map(|s| s.session_id.clone())
+}
+
+/// Point `job` at live sessions (see [`rebind_endpoint`]; a ServerCopy has two
+/// endpoints and needs both). Mutates the job only on [`Rebind::Ready`].
+fn rebind_job(job: &mut TransferJob, live: &[LiveSession]) -> Rebind {
+    let source = rebind_endpoint(&job.session_id, job.server_id.as_deref(), live);
+    let target = match job.target_session_id.as_deref() {
+        Some(t) => rebind_endpoint(t, job.target_server_id.as_deref(), live).map(Some),
+        None => Some(None),
+    };
+    match (source, target) {
+        (Some(source), Some(target)) => {
+            job.session_id = source;
+            if target.is_some() {
+                job.target_session_id = target;
             }
+            Rebind::Ready
         }
+        _ => Rebind::NeedsReconnect,
     }
-    drop(q);
-    for row in rows {
-        persist_job(app, row);
-    }
-    emit_queue(app);
+}
+
+/// The note a paused/failed job carries while it waits for its server to come
+/// back; `then` finishes the sentence ("resume", "retry").
+fn reconnect_note(server_name: &str, then: &str) -> String {
+    format!("Reconnect to \"{server_name}\" to {then}.")
 }
 
 /// Pause one job. An Active job winds down at its next chunk boundary - only
@@ -2194,21 +2497,16 @@ pub fn pause_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
     emit_queue(app);
 }
 
-/// Resume one paused job: `Paused` → `Queued`, then kick the dispatcher.
-/// Forces `ResumeMode::Resume` regardless of how the job was originally
-/// queued - the whole point of pausing is that its `.part` survives, so the
-/// resumed attempt must continue from it rather than restart from
-/// `Overwrite`/`Ask` semantics. Any state other than `Paused` is a no-op.
+/// Resume one paused job: `Paused` → `Queued` (see [`resume_paused`]), then
+/// kick the dispatcher. Any state other than `Paused` is a no-op.
 pub fn resume_job<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, job_id: u64) {
+    let live = live_sessions(app);
     let q = app.state::<TransferQueue>();
     let row = {
         let mut guard = q.jobs.lock().unwrap();
         match guard.iter_mut().find(|j| j.id == job_id) {
             Some(j) if j.state == JobState::Paused => {
-                j.state = JobState::Queued;
-                j.error = None;
-                j.retry_at = None;
-                j.resume = Some(ResumeMode::Resume);
+                resume_paused(j, &live);
                 Some(j.to_row())
             }
             _ => None,
@@ -2252,19 +2550,18 @@ pub fn pause_all<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
     emit_queue(app);
 }
 
-/// Resume every Paused job - see [`resume_job`] for the forced-`Resume`
-/// rationale applied to each.
+/// Resume every Paused job - see [`resume_paused`] for the forced-`Resume`
+/// rationale and the reconnect handling applied to each: jobs whose server is
+/// not connected stay Paused (with a note), so this is safe to call blindly.
 pub fn resume_all<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
+    let live = live_sessions(app);
     let q = app.state::<TransferQueue>();
     let mut rows = Vec::new();
     {
         let mut guard = q.jobs.lock().unwrap();
         for j in guard.iter_mut() {
             if j.state == JobState::Paused {
-                j.state = JobState::Queued;
-                j.error = None;
-                j.retry_at = None;
-                j.resume = Some(ResumeMode::Resume);
+                resume_paused(j, &live);
                 rows.push(j.to_row());
             }
         }
@@ -2277,14 +2574,55 @@ pub fn resume_all<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>) {
     dispatch(app);
 }
 
+/// Rebuild a job from its persisted row as a PAUSED job carrying a "needs
+/// reconnect" note. Pure (no app needed) so the row ↔ job mapping - above all
+/// that the saved-server ids survive, which is what makes the job resumable
+/// after a reconnect - is unit-testable. `Err` says why a row cannot be
+/// restored.
+fn job_from_row(row: crate::db::QueueJobRow) -> Result<TransferJob, String> {
+    let Some(kind) = JobKind::from_db_str(&row.kind) else {
+        return Err(format!("has unknown kind {:?}", row.kind));
+    };
+    Ok(TransferJob {
+        id: row.id.max(0) as u64,
+        kind,
+        session_id: row.session_id,
+        server_name: row.server_name.clone(),
+        server_id: row.server_id,
+        local_path: row.local_path,
+        remote_path: row.remote_path,
+        size: row.size.max(0) as u64,
+        bytes_done: row.bytes_done.max(0) as u64,
+        state: JobState::Paused,
+        error: Some(format!(
+            "Session closed before restart - reconnect to \"{}\" and resume.",
+            row.server_name
+        )),
+        cancel: None,
+        pause: None,
+        started_at: None,
+        target_session_id: row.target_session_id,
+        target_server_name: row.target_server_name,
+        target_server_id: row.target_server_id,
+        target_remote_path: row.target_remote_path,
+        resume: row.resume.as_deref().map(ResumeMode::from_str_loose),
+        preserve_ts: row.preserve_ts,
+        attempts: row.attempts.max(0) as u32,
+        retry_at: None,
+        verify: row.verify,
+        last_persist_at: None,
+    })
+}
+
 /// Reload jobs left `Queued`/`Active`/`Paused` from a previous run and bring
 /// them back as `Paused` - never auto-started. The previous run's SSH
 /// sessions no longer exist (a new run has fresh, differently-numbered
 /// ones), so silently reconnecting and resuming writes at startup would
 /// surprise a user who never asked for it; surfacing the job as Paused with
 /// an explicit "needs reconnect" error lets them resume it deliberately
-/// (`resume_job`) once they've reopened the right connection. Returns the
-/// number of jobs restored.
+/// (`resume_job`) once they've reopened the right connection - `resume_job`
+/// then re-points the job at that new session by its persisted saved-server id
+/// (see `rebind_job`). Returns the number of jobs restored.
 ///
 /// Must be called once at startup, AFTER both `AppState` (the DB) and
 /// `TransferQueue` are managed - see lib.rs's `setup()`. Also seeds the
@@ -2314,39 +2652,12 @@ pub fn restore_pending<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> usize {
         for row in rows {
             let id = row.id.max(0) as u64;
             max_id = max_id.max(id + 1);
-            let Some(kind) = JobKind::from_db_str(&row.kind) else {
-                log::warn!(
-                    "[sshspan-sftp] queue restore: job {id} has unknown kind {:?}, skipping",
-                    row.kind
-                );
-                continue;
-            };
-            let job = TransferJob {
-                id,
-                kind,
-                session_id: row.session_id,
-                server_name: row.server_name.clone(),
-                local_path: row.local_path,
-                remote_path: row.remote_path,
-                size: row.size.max(0) as u64,
-                bytes_done: row.bytes_done.max(0) as u64,
-                state: JobState::Paused,
-                error: Some(format!(
-                    "Session closed before restart - reconnect to \"{}\" and resume.",
-                    row.server_name
-                )),
-                cancel: None,
-                pause: None,
-                started_at: None,
-                target_session_id: row.target_session_id,
-                target_server_name: row.target_server_name,
-                target_remote_path: row.target_remote_path,
-                resume: row.resume.as_deref().map(ResumeMode::from_str_loose),
-                preserve_ts: row.preserve_ts,
-                attempts: row.attempts.max(0) as u32,
-                retry_at: None,
-                verify: row.verify,
-                last_persist_at: None,
+            let job = match job_from_row(row) {
+                Ok(job) => job,
+                Err(why) => {
+                    log::warn!("[sshspan-sftp] queue restore: job {id} {why}, skipping");
+                    continue;
+                }
             };
             restored_rows.push(job.to_row());
             guard.push(job);
@@ -2407,20 +2718,346 @@ mod tests {
         assert!(part_alignment(300, u64::MAX).is_err());
     }
 
+    // ── resume by seeking (A7-35) ────────────────────────────────────────────
+
+    /// Against a real russh-sftp client: after `seek_remote` the next read
+    /// returns the bytes from `offset` on, and ONLY those cross the wire. The
+    /// old read-and-discard loop moved the whole prefix first - resuming a
+    /// 10 GB download at 9.9 GB transferred 9.9 GB again before the first new
+    /// byte.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn discard_exact_skips_and_reports_eof() {
-        let data = vec![7u8; 100 * 1024]; // > one 32 KiB buffer
-        let mut r = std::io::Cursor::new(data.clone());
-        // Discarding the whole stream is fine (n bytes, then the caller
-        // copies 0 more).
-        assert_eq!(
-            discard_exact(&mut r, data.len() as u64).await.unwrap(),
-            100 * 1024
+    async fn resume_seeks_the_remote_instead_of_rereading_the_prefix() {
+        use tokio::io::AsyncReadExt;
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        let data: Vec<u8> = (0..=250u8).cycle().take(1_000_000).collect();
+        fx.write("/big.bin", &data);
+
+        let mut rf = sftp.open("/big.bin").await.unwrap();
+        seek_remote(&mut rf, 900_000).await.unwrap();
+        let mut rest = Vec::new();
+        rf.read_to_end(&mut rest).await.unwrap();
+
+        // (`assert!`, not `assert_eq!`: a failure must not dump a megabyte.)
+        assert!(
+            rest == data[900_000..],
+            "read the wrong bytes after seeking"
         );
-        // Discarding past EOF fails with the position in the message.
-        let mut r2 = std::io::Cursor::new(vec![1u8; 10]);
-        let err = discard_exact(&mut r2, 11).await.unwrap_err();
-        assert!(err.contains("EOF at 10 of 11"), "unexpected message: {err}");
+        assert_eq!(
+            fx.knobs.lock().unwrap().bytes_read,
+            100_000,
+            "only the missing suffix may be read from the server"
+        );
+    }
+
+    // ── replacing a remote file (rename over an existing one) ────────────────
+
+    /// OpenSSH refuses RENAME onto an existing file. The queue's final step
+    /// must still replace it - and must say so only when the new content is
+    /// really in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_over_replaces_an_existing_file_despite_the_sftp_v3_rule() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/final.bin", b"old");
+        fx.write("/d/final.bin.part", b"new content");
+
+        rename_over(&sftp, "/d/final.bin.part", "/d/final.bin")
+            .await
+            .expect("rename over an existing file");
+
+        assert_eq!(fx.read("/d/final.bin"), b"new content");
+        assert!(!fx.exists("/d/final.bin.part"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_over_into_a_free_name_is_a_single_plain_rename() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/final.bin.part", b"data");
+
+        rename_over(&sftp, "/d/final.bin.part", "/d/final.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(fx.read("/d/final.bin"), b"data");
+        assert_eq!(fx.ops(), vec!["rename /d/final.bin.part /d/final.bin"]);
+    }
+
+    /// The retry deletes the old target, so it must never run when the file
+    /// that was supposed to replace it is not there - that would turn one
+    /// failed rename into lost data.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_over_never_deletes_the_target_when_the_source_is_gone() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/final.bin", b"precious");
+
+        let err = rename_over(&sftp, "/d/missing.part", "/d/final.bin")
+            .await
+            .expect_err("nothing to rename");
+
+        assert!(!err.is_empty());
+        assert_eq!(fx.read("/d/final.bin"), b"precious");
+        assert!(
+            !fx.ops().iter().any(|op| op.starts_with("remove")),
+            "target must not be removed: {:?}",
+            fx.ops()
+        );
+    }
+
+    // ── remote parent directories (A7-09) ────────────────────────────────────
+
+    /// A7-09 end to end through the upload preparation: a folder upload
+    /// enqueues one job per FILE and never makes the directories, so the first
+    /// file of `/up/a/b/` must create the whole chain - the server refuses to
+    /// open `/up/a/b/f.bin.part` otherwise, which is what failed every file of
+    /// an uploaded folder with "No such file".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_preparation_creates_the_missing_remote_directories() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+
+        let (rpart, offset) =
+            prepare_upload(&sftp, "/up/a/b/f.bin", 10, Some(ResumeMode::Resume)).await;
+
+        assert_eq!((rpart.as_str(), offset), ("/up/a/b/f.bin.part", 0));
+        assert!(fx.path("/up/a/b").is_dir());
+        // ...and the part file can now actually be opened for writing.
+        sftp.open_with_flags(
+            &rpart,
+            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+        )
+        .await
+        .expect("destination directory exists");
+        // Existing directories are left alone: the second job of the same
+        // folder must not fail on a mkdir of something that is already there.
+        prepare_upload(&sftp, "/up/a/b/g.bin", 10, None).await;
+        assert!(fx.path("/up/a/b").is_dir());
+    }
+
+    /// The resume decision made against an earlier attempt's `.part`: a strict
+    /// prefix continues, anything else (or any non-Resume mode) starts over and
+    /// clears the stale partial.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_preparation_resumes_a_matching_part_and_clears_a_stale_one() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/f.bin.part", b"0123");
+
+        // 4 of 10 bytes already there: continue at 4.
+        let (_, offset) = prepare_upload(&sftp, "/d/f.bin", 10, Some(ResumeMode::Resume)).await;
+        assert_eq!(offset, 4);
+        assert!(fx.exists("/d/f.bin.part"), "a resumable part is kept");
+
+        // The source is now SHORTER than the part: it cannot be a prefix.
+        let (_, offset) = prepare_upload(&sftp, "/d/f.bin", 3, Some(ResumeMode::Resume)).await;
+        assert_eq!(offset, 0);
+        assert!(!fx.exists("/d/f.bin.part"), "a stale part is removed");
+
+        // Overwrite never resumes, even when the part would fit.
+        fx.write("/d/f.bin.part", b"0123");
+        let (_, offset) = prepare_upload(&sftp, "/d/f.bin", 10, Some(ResumeMode::Overwrite)).await;
+        assert_eq!(offset, 0);
+        assert!(!fx.exists("/d/f.bin.part"));
+    }
+
+    /// `ensure_remote_dir` itself, creating outermost first and tolerating
+    /// directories that already exist or are created concurrently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_remote_dir_creates_each_level_once_outermost_first() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.mkdir("/srv/up");
+
+        ensure_remote_dir(&sftp, "/srv/up/a/b/file.txt").await;
+
+        assert!(fx.path("/srv/up/a/b").is_dir());
+        // Only the missing levels were created, in order.
+        assert_eq!(fx.ops(), vec!["mkdir /srv/up/a", "mkdir /srv/up/a/b"]);
+        // Idempotent.
+        ensure_remote_dir(&sftp, "/srv/up/a/b/other.txt").await;
+        assert_eq!(fx.ops().len(), 2);
+        // A file in the way stops the walk without panicking.
+        fx.write("/srv/blocker", b"x");
+        ensure_remote_dir(&sftp, "/srv/blocker/deeper/f.txt").await;
+        assert!(!fx.exists("/srv/blocker/deeper"));
+    }
+
+    /// The levels `ensure_remote_dir` has to create before an upload can open
+    /// `<dir>/<file>.part`: every directory above the file, outermost first.
+    #[test]
+    fn remote_parent_chain_lists_every_level_outermost_first() {
+        assert_eq!(
+            remote_parent_chain("/srv/up/a/b/file.txt"),
+            vec!["/srv", "/srv/up", "/srv/up/a", "/srv/up/a/b"]
+        );
+        // A file directly under the root has nothing to create.
+        assert!(remote_parent_chain("/file.txt").is_empty());
+        assert!(remote_parent_chain("/").is_empty());
+        assert!(remote_parent_chain("").is_empty());
+        assert!(remote_parent_chain("file.txt").is_empty());
+        // Empty segments from doubled slashes collapse.
+        assert_eq!(remote_parent_chain("//srv//x/f"), vec!["/srv", "/srv/x"]);
+    }
+
+    /// Relative remote paths resolve against the session's start directory, so
+    /// the chain must stay relative: the old walk prefixed `/` and would have
+    /// created `/a/b` instead of `a/b`.
+    #[test]
+    fn remote_parent_chain_keeps_relative_paths_relative() {
+        assert_eq!(remote_parent_chain("a/b/f"), vec!["a", "a/b"]);
+        assert_eq!(remote_parent_chain("a/f"), vec!["a"]);
+    }
+
+    // ── preserve timestamps on downloads (A7-36) ─────────────────────────────
+
+    #[test]
+    fn preservable_mtime_ignores_missing_and_zero() {
+        assert_eq!(preservable_mtime(Some(1_600_000_000)), Some(1_600_000_000));
+        assert_eq!(preservable_mtime(None), None);
+        assert_eq!(preservable_mtime(Some(0)), None);
+    }
+
+    #[test]
+    fn set_local_mtime_stamps_a_finished_file() {
+        let dir = std::env::temp_dir().join(format!("sshspan-mtime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.bin");
+        std::fs::write(&file, b"payload").unwrap();
+
+        set_local_mtime(&file, 1_600_000_000).expect("set mtime");
+
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1_600_000_000
+        );
+        // Only the timestamp changed.
+        assert_eq!(std::fs::read(&file).unwrap(), b"payload");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_local_mtime_reports_a_missing_file() {
+        let missing = std::env::temp_dir().join(format!("sshspan-nope-{}", uuid::Uuid::new_v4()));
+        assert!(set_local_mtime(&missing, 1_600_000_000).is_err());
+    }
+
+    // ── copy loop: short-copy detection (A7-18) ──────────────────────────────
+
+    /// Drive `copy_chunks` over an in-memory source with no progress sink and
+    /// no throttle, returning the result and what reached the writer.
+    async fn run_copy(
+        source: Vec<u8>,
+        max_read: Option<u64>,
+        cancel: bool,
+        pause: bool,
+    ) -> (Result<u64, String>, Vec<u8>) {
+        let mut reader = std::io::Cursor::new(source);
+        let mut sink: Vec<u8> = Vec::new();
+        let result = copy_chunks(
+            &mut reader,
+            &mut sink,
+            &AtomicBool::new(cancel),
+            &AtomicBool::new(pause),
+            max_read,
+            0,
+            |_, _| {},
+            |_| async {},
+        )
+        .await;
+        (result, sink)
+    }
+
+    #[tokio::test]
+    async fn copy_chunks_copies_a_complete_source() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(600 * 1024).collect(); // > 2 chunks
+        let (result, sink) = run_copy(data.clone(), Some(data.len() as u64), false, false).await;
+        assert_eq!(result, Ok(data.len() as u64));
+        assert_eq!(sink, data);
+    }
+
+    /// Reads are clamped to the expected size (the EOF-crossing-read defence):
+    /// a source LONGER than expected is not an error, the surplus is simply not
+    /// requested.
+    #[tokio::test]
+    async fn copy_chunks_clamps_reads_to_the_expected_size() {
+        let (result, sink) = run_copy(vec![9u8; 100], Some(40), false, false).await;
+        assert_eq!(result, Ok(40));
+        assert_eq!(sink.len(), 40);
+    }
+
+    /// A7-18: the source hit EOF before the expected number of bytes - a remote
+    /// file truncated/rotated mid-download, a server answering early EOF, a
+    /// local file that shrank during an upload. That used to return `Ok` and
+    /// the job finished as Done with a short destination and no warning.
+    #[tokio::test]
+    async fn copy_chunks_reports_an_early_eof_as_incomplete() {
+        let (result, sink) = run_copy(vec![7u8; 10], Some(100), false, false).await;
+        let err = result.expect_err("a short copy must not look like success");
+        assert!(
+            err.starts_with("incomplete transfer"),
+            "unexpected message: {err}"
+        );
+        assert!(err.contains("10 of 100"), "unexpected message: {err}");
+        // What did arrive is still flushed, so a Resume can continue from it.
+        assert_eq!(sink.len(), 10);
+    }
+
+    /// A source that ended EARLY is not a read-blocked channel: the Send-to
+    /// leg must not respond by re-reading the whole file over the interactive
+    /// channel (which would just end early again). The decision is made on the
+    /// REAL error `copy_chunks` produces, so a rewording cannot silently break it.
+    #[tokio::test]
+    async fn an_early_eof_is_not_retried_on_the_interactive_channel() {
+        let (result, _) = run_copy(vec![7u8; 10], Some(100), false, false).await;
+        let err = result.expect_err("a short copy");
+
+        assert!(is_incomplete_transfer(&err), "{err}");
+        assert!(
+            !leg1_retries_on_interactive_channel(&err),
+            "an early EOF must stop the leg, not trigger a full re-read: {err}"
+        );
+    }
+
+    /// What the fallback is FOR keeps working: a rejected read (the server
+    /// failing a read on the fresh channel) is retried on the browse channel;
+    /// a user's pause/cancel never is.
+    #[test]
+    fn read_failures_still_retry_on_the_interactive_channel() {
+        for msg in [
+            "SFTP server returned Failure (code 4) with no further detail (at offset 0, len 262144)",
+            "Permission denied (code 3): no (at offset 4096, len 262144)",
+        ] {
+            assert!(leg1_retries_on_interactive_channel(msg), "{msg}");
+        }
+        assert!(!leg1_retries_on_interactive_channel(CANCELLED_SENTINEL));
+        assert!(!leg1_retries_on_interactive_channel(PAUSED_SENTINEL));
+    }
+
+    /// `u64::MAX` is the "remote size unknown" sentinel: reading until a real
+    /// EOF is the only option there, so a short source is not an error.
+    #[tokio::test]
+    async fn copy_chunks_does_not_check_an_unknown_size() {
+        let (result, sink) = run_copy(vec![1u8; 10], Some(u64::MAX), false, false).await;
+        assert_eq!(result, Ok(10));
+        assert_eq!(sink.len(), 10);
+    }
+
+    /// The pause/cancel sentinels still win over everything else (the
+    /// completeness check must not turn a user-requested stop into a failure).
+    #[tokio::test]
+    async fn copy_chunks_honours_cancel_and_pause() {
+        let (result, sink) = run_copy(vec![1u8; 10], Some(10), true, false).await;
+        assert_eq!(result, Err(CANCELLED_SENTINEL.to_string()));
+        assert!(sink.is_empty());
+        let (result, sink) = run_copy(vec![1u8; 10], Some(10), false, true).await;
+        assert_eq!(result, Err(PAUSED_SENTINEL.to_string()));
+        assert!(sink.is_empty());
     }
 
     /// Minimal `TransferJob` for tests that only care about a couple of
@@ -2433,6 +3070,7 @@ mod tests {
             kind: JobKind::Upload,
             session_id: "s1".into(),
             server_name: "srv".into(),
+            server_id: Some("server-1".into()),
             local_path: "/local/a".into(),
             remote_path: "/remote/a".into(),
             size: 100,
@@ -2444,6 +3082,7 @@ mod tests {
             started_at: None,
             target_session_id: None,
             target_server_name: None,
+            target_server_id: None,
             target_remote_path: None,
             resume: None,
             preserve_ts: None,
@@ -2452,6 +3091,196 @@ mod tests {
             verify: None,
             last_persist_at: None,
         }
+    }
+
+    // ── rebinding to reconnected sessions (A7-17) ────────────────────────────
+
+    fn live(session: &str, server: &str, started_at_ms: i64) -> LiveSession {
+        LiveSession {
+            session_id: session.into(),
+            server_id: server.into(),
+            started_at_ms,
+        }
+    }
+
+    /// A restored job must come back with the saved-server ids it was queued
+    /// with: they are the ONLY thing that outlives the dead session ids, so a
+    /// row that lost them would make "reconnect and resume" impossible.
+    #[test]
+    fn restored_jobs_keep_their_server_ids_and_come_back_paused() {
+        let mut job = test_job(7, JobState::Active);
+        job.kind = JobKind::ServerCopy;
+        job.target_session_id = Some("t1".into());
+        job.target_server_name = Some("tgt".into());
+        job.target_server_id = Some("server-2".into());
+        job.target_remote_path = Some("/dest".into());
+
+        let restored = job_from_row(job.to_row()).expect("restorable row");
+
+        assert_eq!(restored.id, 7);
+        assert_eq!(restored.state, JobState::Paused, "never auto-started");
+        assert_eq!(restored.server_id.as_deref(), Some("server-1"));
+        assert_eq!(restored.target_server_id.as_deref(), Some("server-2"));
+        assert!(restored
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("reconnect to \"srv\"")));
+    }
+
+    #[test]
+    fn unknown_row_kinds_are_not_restored() {
+        let mut row = test_job(1, JobState::Queued).to_row();
+        row.kind = "mystery".into();
+        assert!(job_from_row(row).is_err());
+    }
+
+    #[test]
+    fn rebind_keeps_a_session_that_is_still_live() {
+        let mut job = test_job(1, JobState::Paused);
+        let live = [live("s1", "server-1", 10), live("s9", "server-1", 99)];
+        assert_eq!(rebind_job(&mut job, &live), Rebind::Ready);
+        // Two tabs to one server: the job stays on ITS session, not the newer.
+        assert_eq!(job.session_id, "s1");
+    }
+
+    #[test]
+    fn rebind_moves_a_dead_session_to_the_newest_live_one_of_the_same_server() {
+        let mut job = test_job(1, JobState::Paused);
+        job.session_id = "dead".into();
+        let live = [
+            live("old", "server-1", 10),
+            live("new", "server-1", 20),
+            live("elsewhere", "server-2", 30),
+        ];
+        assert_eq!(rebind_job(&mut job, &live), Rebind::Ready);
+        assert_eq!(job.session_id, "new");
+    }
+
+    /// A transfer must never silently move to a different host.
+    #[test]
+    fn rebind_never_crosses_servers() {
+        let mut job = test_job(1, JobState::Paused);
+        job.session_id = "dead".into();
+        let live = [live("other", "server-2", 10)];
+        assert_eq!(rebind_job(&mut job, &live), Rebind::NeedsReconnect);
+        assert_eq!(job.session_id, "dead", "a failed rebind changes nothing");
+    }
+
+    /// Jobs persisted before `server_id` existed cannot be matched to anything
+    /// but their own (long dead) session.
+    #[test]
+    fn rebind_needs_a_server_id_to_match_on() {
+        let mut job = test_job(1, JobState::Paused);
+        job.session_id = "dead".into();
+        job.server_id = None;
+        let live = [live("s2", "server-1", 10)];
+        assert_eq!(rebind_job(&mut job, &live), Rebind::NeedsReconnect);
+        assert_eq!(rebind_job(&mut job, &[]), Rebind::NeedsReconnect);
+    }
+
+    /// A server-to-server copy has two endpoints and needs BOTH, matched
+    /// independently by their own server ids.
+    #[test]
+    fn rebind_covers_both_ends_of_a_server_copy() {
+        let mut job = test_job(1, JobState::Paused);
+        job.kind = JobKind::ServerCopy;
+        job.session_id = "src-dead".into();
+        job.target_session_id = Some("tgt-dead".into());
+        job.target_server_id = Some("server-2".into());
+
+        // Only the source server is back: nothing changes.
+        let only_source = [live("src-new", "server-1", 10)];
+        assert_eq!(rebind_job(&mut job, &only_source), Rebind::NeedsReconnect);
+        assert_eq!(job.session_id, "src-dead");
+        assert_eq!(job.target_session_id.as_deref(), Some("tgt-dead"));
+
+        // Both are back: both ends move.
+        let both = [
+            live("src-new", "server-1", 10),
+            live("tgt-new", "server-2", 11),
+        ];
+        assert_eq!(rebind_job(&mut job, &both), Rebind::Ready);
+        assert_eq!(job.session_id, "src-new");
+        assert_eq!(job.target_session_id.as_deref(), Some("tgt-new"));
+    }
+
+    /// The end-to-end behaviour A7-17 is about: pause → connection drops →
+    /// reconnect → Resume must continue the transfer on the NEW session.
+    #[test]
+    fn resume_continues_a_paused_job_on_the_reconnected_session() {
+        let mut job = test_job(1, JobState::Paused);
+        job.session_id = "dead".into();
+        job.resume = Some(ResumeMode::Overwrite);
+        job.error = Some("Session closed before restart - reconnect.".into());
+
+        resume_paused(&mut job, &[live("fresh", "server-1", 5)]);
+
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.session_id, "fresh");
+        assert_eq!(job.resume, Some(ResumeMode::Resume), "continue the .part");
+        assert_eq!(job.error, None);
+    }
+
+    /// With nothing to reconnect to, Resume must NOT start the job (it could
+    /// only fail with "Session closed.", losing the helpful note) - it stays
+    /// Paused and says what to do. This also makes "Resume all" safe to call
+    /// without first working out which servers are connected.
+    #[test]
+    fn resume_leaves_a_job_paused_while_its_server_is_not_connected() {
+        let mut job = test_job(1, JobState::Paused);
+        job.session_id = "dead".into();
+
+        resume_paused(&mut job, &[live("other", "server-2", 5)]);
+
+        assert_eq!(job.state, JobState::Paused);
+        assert_eq!(job.session_id, "dead");
+        assert_eq!(
+            job.error.as_deref(),
+            Some("Reconnect to \"srv\" to resume.")
+        );
+    }
+
+    #[test]
+    fn retry_rebinds_a_failed_job_after_a_reconnect() {
+        let mut job = test_job(1, JobState::Failed);
+        job.session_id = "dead".into();
+        job.error = Some("Session closed.".into());
+        job.attempts = 3;
+        job.bytes_done = 50;
+
+        retry_failed(&mut job, &[live("fresh", "server-1", 5)]);
+
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.session_id, "fresh");
+        assert_eq!(
+            (job.error.as_deref(), job.attempts, job.bytes_done),
+            (None, 0, 0)
+        );
+    }
+
+    #[test]
+    fn retry_keeps_a_failed_job_failed_while_its_server_is_not_connected() {
+        let mut job = test_job(1, JobState::Failed);
+        job.session_id = "dead".into();
+        job.error = Some("Session closed.".into());
+
+        retry_failed(&mut job, &[]);
+
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.error.as_deref(), Some("Reconnect to \"srv\" to retry."));
+    }
+
+    /// A failure unrelated to the session (the server said no) on a session
+    /// that is still alive retries exactly as before.
+    #[test]
+    fn retry_on_a_live_session_just_requeues() {
+        let mut job = test_job(1, JobState::Failed);
+        job.error = Some("Permission denied".into());
+
+        retry_failed(&mut job, &[live("s1", "server-1", 5)]);
+
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.session_id, "s1");
     }
 
     #[test]

@@ -134,6 +134,13 @@ pub struct QueueJobRow {
     pub target_remote_path: Option<String>,
     pub attempts: i64,
     pub verify: Option<bool>,
+    /// Saved-server id the job's `session_id` was opened for. Session ids are
+    /// per-run, so this is the only thing that lets a Paused/restored job be
+    /// matched to a RECONNECTED session of the same server (A7-17). `None` for
+    /// rows written before the column existed.
+    pub server_id: Option<String>,
+    /// ServerCopy only: saved-server id of the TARGET session.
+    pub target_server_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,12 +665,35 @@ impl Database {
                     target_remote_path  TEXT,
                     attempts            INTEGER NOT NULL DEFAULT 0,
                     verify              INTEGER,
-                    updated_at          TEXT NOT NULL
+                    updated_at          TEXT NOT NULL,
+                    server_id           TEXT,
+                    target_server_id    TEXT
                 )
                 "#,
             )
             .execute(&self.pool)
             .await?;
+            // `server_id`/`target_server_id` (A7-17): the saved servers the
+            // job's sessions belonged to, which - unlike the per-run session
+            // ids - are what a reconnected session can be matched on. Added in
+            // place for databases created before they existed; jobs already in
+            // such a table simply have NULL and stay un-rebindable.
+            for column in ["server_id", "target_server_id"] {
+                let has_column: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pragma_table_info('transfer_queue') WHERE name = ?",
+                )
+                .bind(column)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+                if has_column == 0 {
+                    sqlx::query(&format!(
+                        "ALTER TABLE transfer_queue ADD COLUMN {column} TEXT"
+                    ))
+                    .execute(&self.pool)
+                    .await?;
+                }
+            }
             sqlx::query(
                 "CREATE INDEX IF NOT EXISTS idx_transfer_queue_state ON transfer_queue(state)",
             )
@@ -1987,8 +2017,8 @@ impl Database {
                     id, kind, session_id, server_name, local_path, remote_path,
                     size, bytes_done, state, error, resume, preserve_ts,
                     target_session_id, target_server_name, target_remote_path,
-                    attempts, verify, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    attempts, verify, updated_at, server_id, target_server_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     kind = excluded.kind,
                     session_id = excluded.session_id,
@@ -2006,7 +2036,9 @@ impl Database {
                     target_remote_path = excluded.target_remote_path,
                     attempts = excluded.attempts,
                     verify = excluded.verify,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    server_id = excluded.server_id,
+                    target_server_id = excluded.target_server_id
                 "#,
             )
             .bind(row.id)
@@ -2027,6 +2059,8 @@ impl Database {
             .bind(row.attempts)
             .bind(row.verify.map(|b| b as i64))
             .bind(Utc::now().to_rfc3339())
+            .bind(&row.server_id)
+            .bind(&row.target_server_id)
             .execute(&self.pool)
             .await?;
             Ok(())
@@ -2059,10 +2093,21 @@ impl Database {
 
     /// Jobs left `Queued`/`Active`/`Paused` by a previous run - what
     /// `sftp::queue::restore_pending` reloads at startup.
+    ///
+    /// The columns are NAMED rather than `SELECT *`: a pooled connection that
+    /// loaded the schema before `migrate()` added the `server_id` columns would
+    /// otherwise prepare `*` against its stale 18-column view, and sqlx caches
+    /// that column count - then panics building the first 20-column row (seen
+    /// in the migration test). A named column missing from a stale schema
+    /// instead makes SQLite notice the change and re-prepare.
     pub fn list_pending_queue_jobs(&self) -> Result<Vec<QueueJobRow>> {
         block(async {
             let rows = sqlx::query(
-                "SELECT * FROM transfer_queue WHERE state IN ('queued', 'active', 'paused') \
+                "SELECT id, kind, session_id, server_name, local_path, remote_path, size, \
+                 bytes_done, state, error, resume, preserve_ts, target_session_id, \
+                 target_server_name, target_remote_path, attempts, verify, server_id, \
+                 target_server_id \
+                 FROM transfer_queue WHERE state IN ('queued', 'active', 'paused') \
                  ORDER BY id ASC",
             )
             .fetch_all(&self.pool)
@@ -2090,6 +2135,8 @@ impl Database {
             target_remote_path: row.get("target_remote_path"),
             attempts: row.get("attempts"),
             verify: row.get::<Option<i64>, _>("verify").map(|v| v != 0),
+            server_id: row.get("server_id"),
+            target_server_id: row.get("target_server_id"),
         }
     }
 
@@ -2607,6 +2654,8 @@ mod tests {
             target_remote_path: None,
             attempts: 1,
             verify: Some(false),
+            server_id: Some("srv-1".to_string()),
+            target_server_id: None,
         }
     }
 
@@ -2686,6 +2735,7 @@ mod tests {
         row.target_session_id = Some("target-sess".to_string());
         row.target_server_name = Some("target-server".to_string());
         row.target_remote_path = Some("/remote/dest".to_string());
+        row.target_server_id = Some("srv-2".to_string());
         db.upsert_queue_job(&row).expect("insert");
 
         let pending = db.list_pending_queue_jobs().expect("list pending");
@@ -2707,6 +2757,78 @@ mod tests {
         assert_eq!(got.target_remote_path.as_deref(), Some("/remote/dest"));
         assert_eq!(got.attempts, 1);
         assert_eq!(got.verify, Some(false));
+        // A7-17: the saved-server ids survive, so a restored job can find the
+        // reconnected session of the same server.
+        assert_eq!(got.server_id.as_deref(), Some("srv-1"));
+        assert_eq!(got.target_server_id.as_deref(), Some("srv-2"));
+    }
+
+    /// A database from before `server_id` existed must open (the columns are
+    /// added in place) and its pending jobs must still load - with no server
+    /// id, so they stay Paused until the user re-queues them rather than being
+    /// rebound to the wrong server.
+    #[test]
+    fn migrate_adds_server_id_columns_to_an_old_transfer_queue() {
+        use sqlx::Connection;
+        // An old database FILE, made by a throwaway connection that is closed
+        // before the app opens it - exactly an upgrade launch: the table exists
+        // in its previous shape (no server-id columns) with one pending job.
+        let db_path = std::env::temp_dir().join(format!(
+            "sshspan-old-queue-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        block(async {
+            let mut conn =
+                sqlx::SqliteConnection::connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
+                    .await
+                    .unwrap();
+            sqlx::query(
+                r#"
+                CREATE TABLE transfer_queue (
+                    id INTEGER PRIMARY KEY, kind TEXT NOT NULL, session_id TEXT NOT NULL,
+                    server_name TEXT NOT NULL, local_path TEXT NOT NULL,
+                    remote_path TEXT NOT NULL, size INTEGER NOT NULL,
+                    bytes_done INTEGER NOT NULL, state TEXT NOT NULL, error TEXT,
+                    resume TEXT, preserve_ts INTEGER, target_session_id TEXT,
+                    target_server_name TEXT, target_remote_path TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0, verify INTEGER,
+                    updated_at TEXT NOT NULL
+                )
+                "#,
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO transfer_queue (id, kind, session_id, server_name, local_path, \
+                 remote_path, size, bytes_done, state, attempts, updated_at) \
+                 VALUES (7, 'download', 'old-sess', 'old-server', '/l', '/r', 10, 5, 'paused', 0, 'x')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+        });
+
+        let db = Database::open_at(db_path).expect("open and migrate an old database");
+
+        let pending = db.list_pending_queue_jobs().expect("list pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, 7);
+        assert_eq!(pending[0].server_id, None);
+        assert_eq!(pending[0].target_server_id, None);
+        // ...and the migrated table accepts the new fields.
+        let mut row = sample_row(8, "paused");
+        row.target_server_id = Some("srv-9".into());
+        db.upsert_queue_job(&row).expect("upsert after migrate");
+        let got = db
+            .list_pending_queue_jobs()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == 8)
+            .unwrap();
+        assert_eq!(got.server_id.as_deref(), Some("srv-1"));
+        assert_eq!(got.target_server_id.as_deref(), Some("srv-9"));
     }
 
     // ── F3/F6: atomic vault rotation ─────────────────────────────────────────

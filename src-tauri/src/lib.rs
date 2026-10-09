@@ -148,17 +148,20 @@ pub fn run() {
             known_hosts_forget,
             // Renderer liveness heartbeat (backend idle auto-lock input)
             heartbeat,
+            // `sftp_upload`, `sftp_stage_path`, `sftp_file_sha256` and
+            // `sftp_set_mtime` are deliberately NOT registered: nothing in the
+            // renderer calls them (uploads go through the queue, which does its
+            // own staging, verification and timestamps), and an unused
+            // command is IPC surface that only a compromised renderer could
+            // reach. Each keeps a doc comment saying so.
             sftp_open,
             sftp_list_dir,
             sftp_resolve_link,
             sftp_dir_size,
-            sftp_file_sha256,
             sftp_mkdir,
             sftp_remove,
             sftp_rename,
-            sftp_set_mtime,
             sftp_download,
-            sftp_upload,
             sftp_open_for_edit,
             sftp_close_edit,
             sftp_chmod,
@@ -178,6 +181,7 @@ pub fn run() {
             sftp_queue_clear_finished,
             sftp_server_copy,
             sftp_search,
+            sftp_search_cancel,
             sftp_bookmarks_list,
             sftp_bookmarks_save,
             sftp_local_list,
@@ -186,7 +190,6 @@ pub fn run() {
             sftp_local_remove,
             sftp_local_open_folder,
             sftp_close,
-            sftp_stage_path,
             // Bitwarden commands
             bitwarden_get_config,
             bitwarden_save_config,
