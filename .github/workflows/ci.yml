@@ -136,6 +136,10 @@ jobs:
           # backend-gated typing, per-tab lifecycle, bounded history and the
           # MCP/provider settings round-trip, against stubbed IPC only.
           npm run test:assistant
+          # Keys, categories and the deploy sheet: creation and export, the
+          # import formats, the key list, category drag and drop, the
+          # backend-planned deploy preview and removing a deployed copy.
+          npm run test:keys
 
   cargo-audit:
     name: Dependency advisories

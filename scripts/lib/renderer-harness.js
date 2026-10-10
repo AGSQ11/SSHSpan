@@ -89,6 +89,15 @@ function serve(root = DEFAULT_RENDERER_DIR) {
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
+/// Playwright's call log says what it was waiting for ("waiting for
+/// locator(...)", "element is not visible"); without it a timeout in a
+/// shared run cannot be told apart from another.
+const waitedFor = (e) => {
+  const lines = String((e && e.message) || '').split('\n').map((l) => l.trim()).filter((l) => l.startsWith('- '));
+  const target = lines.find((l) => /waiting for (locator|selector|function)/.test(l));
+  const reason = [...lines].reverse().find((l) => /not |intercepts|detached|unstable/.test(l));
+  return [target, reason].filter(Boolean).join(' / ');
+};
 
 /// A block that may throw (a selector that never appears, a timeout) must fail
 /// its own checks, not take the rest of the scenario down with it.
@@ -96,7 +105,8 @@ async function part(title, fn) {
   try {
     await fn();
   } catch (e) {
-    console.log(`  FAIL  ${title} - aborted: ${firstLine(e)}`);
+    const why = waitedFor(e);
+    console.log(`  FAIL  ${title} - aborted: ${firstLine(e)}${why ? ' [' + why + ']' : ''}`);
     failures.push(`${title} (aborted)`);
   }
 }
@@ -357,6 +367,16 @@ async function openLiveTab(app, auth) {
   return page.evaluate(() => [...state.sessions.keys()][0]);
 }
 
+/// Let every timer the page has ALREADY scheduled, with a delay of up to `ms`,
+/// run first. Timers run in due-time order, so one scheduled now for `ms` from
+/// now runs after all of them: an ordering barrier, not a guess at how slow
+/// the machine is. terminal.js focuses a tab's terminal 50-60 ms after a
+/// connect or a tab switch; a test that focuses a tab chip and then presses a
+/// key lost that key to the terminal whenever the deferred focus landed in
+/// between - which a loaded machine makes likely (the test:polish flake).
+const afterScheduledTimers = (page, ms = 100) =>
+  page.evaluate((d) => new Promise((r) => setTimeout(r, d)), ms);
+
 const bytesOf = (c) => String.fromCharCode(...(c.args.bytes || []));
 const sends = async (app) => (await app.calls('terminal_send')).map(bytesOf);
 
@@ -382,6 +402,6 @@ module.exports = {
   delay, firstLine, part,
   openPage,
   stubInit, PASSWORD, T0, KEY, SERVER, CATEGORY,
-  openApp, withApp, settled, waitVisible, focusIs, answerConfirm, openLiveTab, bytesOf, sends,
+  openApp, withApp, settled, waitVisible, focusIs, answerConfirm, openLiveTab, afterScheduledTimers, bytesOf, sends,
   toasts, hold, letGo,
 };

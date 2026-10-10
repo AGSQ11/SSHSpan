@@ -121,6 +121,7 @@ async function withBusy(button, busyLabel, fn) {
   if (!button) return fn();
   if (button.getAttribute('aria-busy') === 'true') return undefined;
   const content = [...button.childNodes];
+  const returnFocus = busyFocusReturn(button);
   button.setAttribute('aria-busy', 'true');
   setDisabledFor(button, 'busy', true);
   if (busyLabel) button.textContent = busyLabel;
@@ -130,7 +131,47 @@ async function withBusy(button, busyLabel, fn) {
     button.removeAttribute('aria-busy');
     if (busyLabel) button.replaceChildren(...content);
     setDisabledFor(button, 'busy', false);
+    returnFocus();
   }
+}
+
+/// Disabling a focused button blurs it to body (I1). After the work, when the
+/// button had the focus: focus that has since moved to a control still on
+/// screen (a validation field, wherever the user went) stays there; focus
+/// left on body or on a control that went away goes back to the button, or -
+/// for a key action whose button the result hid (a closed dialog, a hidden
+/// pane) - to the key search box, never to body. (Round 1 also tracked every
+/// focus move during the work; that only ever changed the outcome by leaving
+/// focus on body after the user's control vanished - fix2.)
+function busyFocusReturn(button) {
+  const ownedFocus = document.activeElement === button;
+  // Key dialogs close or hide their own action buttons on success.
+  const keyAction = !!button.closest('#view-keys, #modalBackdrop, #deployModal');
+  return () => {
+    if (!ownedFocus) return;
+    const current = document.activeElement;
+    if (current !== button && current !== document.body && focusTargetAvailable(current)) return;
+    const target = focusTargetAvailable(button) ? button : keyAction ? el('searchInput') : null;
+    if (focusTargetAvailable(target)) target.focus({ preventScroll: true });
+  };
+}
+
+/// Hidden, detached or disabled controls cannot own usable keyboard focus.
+function focusTargetAvailable(node) {
+  return !!node && node instanceof HTMLElement && node.isConnected && !node.disabled
+    && !node.closest('[hidden]') && node.getClientRects().length > 0;
+}
+
+/// Backend array fields may be absent in older replies. Normalise them once,
+/// without mutating the reply (deploy/undeploy and loaders share this rule).
+function arrayOrEmpty(value) { return Array.isArray(value) ? value : []; }
+
+/// Field-level messages share the same safe rendering and clearing rule.
+function showFieldMessage(id, message) {
+  const node = el(id);
+  if (!node) return;
+  node.textContent = message || '';
+  node.hidden = !message;
 }
 
 /// A control can be disabled for more than one reason at once - the vault is
@@ -393,18 +434,6 @@ function safeFileName(name) {
   return String(name || 'key').replace(/[^\w.\-]+/g, '-').slice(0, 64) || 'key';
 }
 
-function download(filename, text) {
-  const blob = new Blob([text], { type: 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
-}
-
 // Copy via Tauri's clipboard plugin first, the browser API second.
 //
 // Under WebKitGTK (every Linux build, and the AppImage in particular)
@@ -476,8 +505,11 @@ function ico(name) {
 
 /** 32-36px rounded key-type tile used by key rows and the detail pane. */
 function keyAvatar(kind) {
-  const map = { ed25519: 'ed25519', 'ed25519-sk': 'ed25519', rsa: 'rsa', ecdsa: 'ecdsa' };
-  const k = map[kind] || '';
+  // By the type's family, as the detail pane and the type badge do: stored
+  // ECDSA tags are ecdsa-p256/p384/p521, which a lookup of the whole tag
+  // missed, so ECDSA keys got the grey tile (A2-28).
+  const family = String(kind || '').split('-')[0];
+  const k = ['ed25519', 'rsa', 'ecdsa'].includes(family) ? family : '';
   const span = document.createElement('span');
   span.className = 'key-avatar';
   span.dataset.type = k;
@@ -513,13 +545,50 @@ function currentCategoryScope() { return state.view === 'connect' ? 'host' : 'ke
 function rebuildCategoryIndex() {
   state.catsById = new Map();
   state.childrenOf = new Map();
-  for (const c of state.categories.filter(c => c.scope === state.categoryScope)) {
-    state.catsById.set(c.id, c);
-    const key = c.parent_id || ''; // empty string for roots
+  state.uiParentOf = new Map();
+  const scoped = state.categories.filter(c => c.scope === state.categoryScope);
+  for (const c of scoped) state.catsById.set(c.id, c);
+  const cycleRoots = categoryCycleRoots(scoped, state.catsById);
+  for (const c of scoped) {
+    // A dangling parent is a UI root. A cycle also needs ONE UI root, so its
+    // members have menus and can be moved to break it (M4). Only this index's
+    // edge is cut: never change the restored parent links without an action.
+    const key = !cycleRoots.has(c.id) && c.parent_id && state.catsById.has(c.parent_id) ? c.parent_id : '';
     if (!state.childrenOf.has(key)) state.childrenOf.set(key, []);
     state.childrenOf.get(key).push(c);
+    // Where the row is SHOWN (null: top level) - what a drop beside it means.
+    state.uiParentOf.set(c.id, key || null);
   }
-  for (const list of state.childrenOf.values()) list.sort((a, b) => a.sort_index - b.sort_index || a.name.localeCompare(b.name));
+  for (const list of state.childrenOf.values()) list.sort(categoryOrder);
+}
+
+function categoryOrder(a, b) {
+  return a.sort_index - b.sort_index || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+}
+
+/// One stable representative per parent cycle (including self-links). A
+/// parent graph has at most one outgoing edge per node; finish each chain
+/// once, and only cut an edge inside its repeated suffix, never an incoming
+/// child's edge. The tree/picker can then render every member exactly once.
+function categoryCycleRoots(categories, byId) {
+  const done = new Set();
+  const roots = new Set();
+  for (const cat of categories) {
+    const path = [];
+    const at = new Map();
+    let cur = cat;
+    while (cur && !done.has(cur.id)) {
+      if (at.has(cur.id)) {
+        roots.add(path.slice(at.get(cur.id)).sort(categoryOrder)[0].id);
+        break;
+      }
+      at.set(cur.id, path.length);
+      path.push(cur);
+      cur = byId.get(cur.parent_id);
+    }
+    for (const c of path) done.add(c.id);
+  }
+  return roots;
 }
 
 function catById(id) { return state.catsById.get(id) || state.categories.find(c => c.id === id); }
@@ -538,58 +607,105 @@ function childrenOfScoped(parentId, scope) {
     .sort((a, b) => a.sort_index - b.sort_index || a.name.localeCompare(b.name));
 }
 
+/// The names from the top of a category's parent chain down to it. A parent
+/// cycle - a restored backup can hold one - ends the walk at the first repeat;
+/// without that this grew an array until the engine gave up, freezing the
+/// window for seconds and breaking the palette (A2-45).
 function catPath(id) {
   const out = [];
+  const seen = new Set();
   let cur = catById(id);
-  while (cur) { out.push(cur.name); cur = cur.parent_id ? catById(cur.parent_id) : null; }
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    out.push(cur.name);
+    cur = cur.parent_id ? catById(cur.parent_id) : null;
+  }
   out.reverse();
   return out;
 }
 
 function catPathString(id) { return catPath(id).join(' / '); }
 
-function directKeyCount(catId) {
-  let n = 0;
-  for (const ids of Object.values(state.keyCategories)) if (ids.includes(catId)) n++;
-  return n;
+/// The top of a category's parent chain: the first ancestor with no parent,
+/// or whose parent no longer exists. null when the chain runs in a circle and
+/// so has no top (A2-45).
+function catRoot(cat) {
+  const seen = new Set();
+  let cur = cat;
+  while (cur) {
+    if (seen.has(cur.id)) return null;
+    seen.add(cur.id);
+    const parent = cur.parent_id ? catById(cur.parent_id) : null;
+    if (!parent) return cur;
+    cur = parent;
+  }
+  return null;
 }
 
-function directHostCount(catId) {
-  return state.servers.filter(s => s.categoryId === catId).length;
+/// Said when a move would put a category under one whose SAVED parent chain
+/// runs in a loop (fix2 N1).
+const CATEGORY_LOOP_REFUSAL = 'That category is part of a loop - move one of its categories to the top level first.';
+
+/// Whether `parentId` (null: the top level) may receive a category. Not a
+/// category whose saved chain has no root: category_reparent walks the new
+/// parent's chain upwards looking for the moved id, and a loop that does not
+/// contain it never ends - on the main thread, so the whole app froze (N1).
+/// Loop members are shown (M4) so they can be moved OUT; nothing moves IN.
+function categoryCanHoldChildren(parentId) {
+  if (!parentId) return true;
+  const parent = catById(parentId);
+  return !!parent && !!catRoot(parent);
+}
+
+/// A category and every category under it, each once - cycle-safe (A2-45).
+/// `scope` names the tree to walk when it may not be the one the sidebar is
+/// showing (the key list is rebuilt from the Servers view too).
+function categoryAndDescendants(catId, scope) {
+  const kids = scope && scope !== state.categoryScope ? (id) => childrenOfScoped(id, scope) : childrenOf;
+  const seen = new Set();
+  const stack = [catId];
+  while (stack.length) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const child of kids(id)) stack.push(child.id);
+  }
+  return seen;
 }
 
 function activeCategoryId() { return state.activeCategoryByScope[state.categoryScope] || 'all'; }
 
-function categoryCount(catId) { return state.categoryScope === 'host' ? directHostCount(catId) : directKeyCount(catId); }
+/// What selecting the category lists - its keys (or servers) and those of
+/// every category under it, each counted once (A2-23). The badge counted only
+/// direct members, so "Prod 0" opened a populated list.
+function categoryCount(catId) {
+  return state.categoryScope === 'host' ? hostsInCategoryRecursive(catId).length : keysInCategoryRecursive(catId).length;
+}
 
-function totalKeyCountFor(catId) {
-  // direct + descendants
-  const stack = [catId];
-  let n = 0;
-  while (stack.length) {
-    const id = stack.pop();
-    for (const ids of Object.values(state.keyCategories)) if (ids.includes(id)) n++;
-    for (const child of childrenOf(id)) stack.push(child.id);
-  }
-  return n;
+/// Whether a key belongs under "Uncategorized": none of its categories leads
+/// up to a root of the tree - it has none, they no longer exist, or a restored
+/// vault left them in a parent cycle. Such a key used to render nowhere at all
+/// in the default list (A2-45).
+function keyIsUncategorized(k) {
+  return !(state.keyCategories[k.id] || []).some((id) => {
+    const c = catById(id);
+    return !!c && c.scope === 'key' && !!catRoot(c);
+  });
 }
 
 function uncategorizedKeyCount() {
-  let n = 0;
-  for (const k of state.keys) if ((state.keyCategories[k.id] || []).length === 0) n++;
-  return n;
+  return state.keys.filter(keyIsUncategorized).length;
 }
 
 function keysInCategoryRecursive(catId) {
-  const ids = new Set();
-  const stack = [catId];
-  while (stack.length) {
-    const id = stack.pop();
-    for (const k of state.keys) if ((state.keyCategories[k.id] || []).includes(id)) ids.add(k.id);
-    for (const child of childrenOf(id)) stack.push(child.id);
-  }
-  return state.keys.filter(k => ids.has(k.id));
+  const cats = categoryAndDescendants(catId, 'key');
+  return state.keys.filter(k => (state.keyCategories[k.id] || []).some((id) => cats.has(id)));
 }
+
+/// The category the KEY list is filtered by, whichever tree the sidebar shows.
+/// The list used the active category of the sidebar's scope, so a key list
+/// rebuilt from the Servers view was filtered by a server category.
+function activeKeyCategoryId() { return state.activeCategoryByScope.key || 'all'; }
 
 /// The key list the UI renders: the active CATEGORY narrows the pool first,
 /// then the search box and the type filter narrow it further.
@@ -604,9 +720,9 @@ function filteredKeys() {
   const q = el('searchInput').value.trim().toLowerCase();
   const type = el('typeFilter').value;
   let pool = state.keys;
-  const activeCat = activeCategoryId();
+  const activeCat = activeKeyCategoryId();
   if (activeCat === 'uncategorized') {
-    pool = state.keys.filter(k => (state.keyCategories[k.id] || []).length === 0);
+    pool = state.keys.filter(keyIsUncategorized);
   } else if (activeCat !== 'all') {
     pool = keysInCategoryRecursive(activeCat);
   }
@@ -725,15 +841,18 @@ function renderCategoryTree() {
   const title = el('catPanelTitle');
   if (title) title.textContent = state.categoryScope === 'host' ? 'Server categories' : 'Key categories';
   if (panel) {
-    panel.hidden = !relevant
+    // Nothing while the vault is locked: category names are vault content.
+    panel.hidden = !relevant || !state.unlocked
       || (state.categories.filter(c => c.scope === state.categoryScope).length === 0 && !state.orphans);
     // The narrow-window drawer shows this same panel: with nothing in it, its
-    // buttons are disabled and say why, and an open drawer closes.
+    // buttons are disabled and say why - the vault first, if that is the
+    // reason - and an open drawer closes.
     for (const b of document.querySelectorAll('.cat-drawer-btn')) {
       if (b.dataset.drawerTitle === undefined) b.dataset.drawerTitle = b.title;
       b.disabled = panel.hidden;
       b.title = !panel.hidden ? b.dataset.drawerTitle
-        : 'No categories yet - add a ' + (state.categoryScope === 'host' ? 'server' : 'key') + ' first';
+        : !state.unlocked ? (state.hasVault ? 'Unlock the vault to see categories' : 'Create a vault to use categories')
+          : 'No categories yet - add a ' + (state.categoryScope === 'host' ? 'server' : 'key') + ' first';
     }
     if (panel.hidden && catDrawerOpen()) setCatDrawer(false);
   }
@@ -835,8 +954,10 @@ async function loadCategories() {
   state.categories = res.categories || [];
   state.categoryScope = currentCategoryScope();
   state.keyCategories = res.allKeyCategories || {};
-  state.orphans = state.categoryScope === 'host' ? !!res.hostOrphans : !!res.orphans;
   rebuildCategoryIndex();
+  // The backend only counts empty category links. Keys under rootless
+  // cycles or deleted ids are Uncategorized in this UI too (A2-45 / M4).
+  state.orphans = state.categoryScope === 'host' ? !!res.hostOrphans : uncategorizedKeyCount() > 0;
   renderCategoryTree();
   updateBreadcrumb();
 }
@@ -852,16 +973,29 @@ async function deleteCategory(id) {
   if (!lockGateOpen('categories')) return;
   const cat = catById(id);
   if (!cat) return;
-  const ok = await confirmModal('Delete category',
-    `Delete category "${cat.name}"? Children will be reassigned to its parent, and any keys using this category will become Uncategorized.`,
+  // What the backend does: subcategories move up to the parent, and so do the
+  // servers of a server category (to Uncategorized at the top level); keys
+  // just lose this category.
+  const parent = cat.parent_id ? catById(cat.parent_id) : null;
+  const up = parent ? `"${parent.name}"` : 'the top level';
+  const ok = await confirmModal('Delete category', cat.scope === 'host'
+    ? `Delete category "${cat.name}"? Its subcategories move up to ${up}, and its servers to ${parent ? up : 'Uncategorized'}.`
+    : `Delete category "${cat.name}"? Its subcategories move up to ${up}; keys filed under it lose this category (a key with no other category becomes Uncategorized).`,
     'Delete');
   if (!ok) return;
   try {
     const res = await call('category_delete', { id });
     await loadCategories();
     if (activeCategoryId() === id) setActiveCategory('all');
+    // Its servers point at another category now: read them again, or they
+    // keep the deleted id - out of every category view, and not savable
+    // (A2-54). loadServers re-renders the list.
+    if (cat.scope === 'host') await loadServers();
     if (state.categoryScope === 'host') renderServerList(); else renderKeyList();
-    toast(`Category "${cat.name}" deleted.` + (res.reassigned && res.reassigned.length ? ` ${res.reassigned.length} child(ren) reassigned.` : ''), 'ok');
+    // `reassigned` lists only the moved subcategories now (A2-31: it used to
+    // hold every sibling as well).
+    const moved = res && Array.isArray(res.reassigned) ? res.reassigned.length : 0;
+    toast(`Category "${cat.name}" deleted.` + (moved ? ` ${moved} ${moved === 1 ? 'subcategory' : 'subcategories'} moved up.` : ''), 'ok');
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
@@ -877,15 +1011,24 @@ async function renameCategory(id) {
 
 async function moveCategoryPrompt(id) {
   if (!lockGateOpen('categories')) return;
+  // The category itself and what is under it cannot be its new parent, and
+  // neither can a member of a restored loop (fix2 N1). The top level is
+  // always offered: that is how a loop member is moved out to repair it.
+  const own = categoryAndDescendants(id);
   // opens the picker in single-select mode for choosing a new parent
   openCategoryPicker({
     title: 'Move to...',
     scope: state.categoryScope,
     initial: [],
     single: true,
+    topLevel: true,
+    exclude: (cat) => own.has(cat.id) || !categoryCanHoldChildren(cat.id),
     onSave: async (parentIds) => {
       if (!parentIds.length) return;
-      try { await call('category_reparent', { id, newParentId: parentIds[0] }); await loadCategories(); toast('Moved.', 'ok'); }
+      const parentId = parentIds[0] || null;  // '' is the top-level row
+      // Whatever reached here, a loop is never sent as the destination.
+      if (!categoryCanHoldChildren(parentId)) { toast(CATEGORY_LOOP_REFUSAL, 'err'); return; }
+      try { await call('category_reparent', { id, newParentId: parentId }); await loadCategories(); toast('Moved.', 'ok'); }
       catch (e) { toast(e.message || String(e), 'err'); }
     },
   });
@@ -1055,12 +1198,8 @@ function attachCatDnD(row, cat, depth) {
     if (!state.draggingCatId || state.draggingCatId === cat.id) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    const rect = row.getBoundingClientRect();
-    const y = e.clientY - rect.top;
     row.classList.remove('drop-before', 'drop-after', 'drop-into');
-    if (y < rect.height * 0.25) row.classList.add('drop-before');
-    else if (y > rect.height * 0.75) row.classList.add('drop-after');
-    else row.classList.add('drop-into');
+    row.classList.add('drop-' + catDropZone(row, e.clientY));
   });
   row.addEventListener('dragleave', () => {
     row.classList.remove('drop-before', 'drop-after', 'drop-into');
@@ -1069,29 +1208,64 @@ function attachCatDnD(row, cat, depth) {
     e.preventDefault();
     const draggedId = state.draggingCatId;
     state.draggingCatId = null;
+    // Where it landed, from the pointer - the same rule that drew the drop
+    // highlight. This read the highlight classes AFTER clearing them, so every
+    // drop was "after": nesting by drag never worked (A2-07).
+    const zone = catDropZone(row, e.clientY);
     row.classList.remove('drop-before', 'drop-after', 'drop-into');
     if (!draggedId || draggedId === cat.id) return;
     // A drag that started before the vault locked.
     if (!lockGateOpen('categories')) return;
-    const before = row.classList.contains('drop-before');
-    const into = row.classList.contains('drop-into');
-    let newParent, newSortIndex = null;
-    if (into) {
-      newParent = cat.id;
-      // sort_index: max sibling + 1 within the new parent
-      const sibs = childrenOf(newParent);
-      newSortIndex = sibs.length ? Math.max(...sibs.map(s => s.sort_index)) + 1 : 0;
-    } else {
-      newParent = cat.parent_id || null;
-      if (before) newSortIndex = cat.sort_index;
-      else newSortIndex = cat.sort_index + 1;
-    }
     try {
-      await call('category_reparent', { id: draggedId, newParentId: newParent, sortIndex: newSortIndex });
-      await loadCategories();
-      renderKeyList();
+      await moveCategoryTo(draggedId, cat, zone);
     } catch (err) { toast(err.message || String(err), 'err'); }
+    // Read back whatever did change (a refused move changes nothing; a failed
+    // renumbering may have changed some), never rejects. Then the list the
+    // tree filters - server categories are dragged in Servers.
+    await loadCategories();
+    if (state.categoryScope === 'host') renderServerList(); else renderKeyList();
   });
+}
+
+/// Which part of a category row the pointer is over: the top quarter means
+/// before it, the bottom quarter after it, the middle into it.
+function catDropZone(row, clientY) {
+  const rect = row.getBoundingClientRect();
+  const y = clientY - rect.top;
+  if (y < rect.height * 0.25) return 'before';
+  if (y > rect.height * 0.75) return 'after';
+  return 'into';
+}
+
+/// Move category `id` before, after or into `target`, numbering the siblings
+/// it joins 0..n-1 in their new order (A2-07). "sort_index + 1" used to tie
+/// with the next sibling, and ties are broken by name, so a drop could land
+/// anywhere. The moved category is sent first: the backend refuses a move
+/// into its own subtree, and then nothing else changes.
+async function moveCategoryTo(id, target, zone) {
+  // Beside a row means under the parent it is SHOWN under (fix2 N1): a
+  // promoted loop member, or one whose parent no longer exists, is top level.
+  // Its saved parent was taken before, so a drop beside CycA sent CycB - a
+  // loop - as the new parent, and the backend's walk never ended.
+  const parentId = zone === 'into' ? target.id : (state.uiParentOf.get(target.id) || null);
+  if (!categoryCanHoldChildren(parentId)) throw new Error(CATEGORY_LOOP_REFUSAL);
+  const siblings = childrenOf(parentId).filter((c) => c.id !== id);
+  let at = siblings.length;
+  if (zone !== 'into') {
+    const i = siblings.findIndex((c) => c.id === target.id);
+    at = i === -1 ? siblings.length : (zone === 'before' ? i : i + 1);
+  }
+  await call('category_reparent', { id, newParentId: parentId, sortIndex: at });
+  const order = [...siblings.slice(0, at), { id }, ...siblings.slice(at)];
+  for (let i = 0; i < order.length; i++) {
+    const c = order[i];
+    if (c.id === id || c.sort_index === i) continue;
+    // Only genuine siblings are renumbered. A promoted loop member or a
+    // category with a dangling parent is shown at the top level, but writing
+    // it there would quietly change its saved parent (fix2 N1).
+    if ((c.parent_id || null) !== parentId) continue;
+    await call('category_reparent', { id: c.id, newParentId: parentId, sortIndex: i });
+  }
 }
 
 // ─── breadcrumb + toolbar cat-filter button ───────────────────────────────
@@ -1120,8 +1294,9 @@ function updateBreadcrumb() {
     const cur = document.createElement('span'); cur.className = 'crumb-current'; cur.textContent = state.categoryScope === 'host' ? 'Uncategorized servers' : 'Uncategorized keys'; bc.appendChild(cur);
   } else {
     const segs = catPath(activeCat);
+    // The same walk as catPath, ids instead of names; a cycle ends it (A2-45).
     const ids = []; let cur = catById(activeCat);
-    while (cur) { ids.unshift(cur.id); cur = cur.parent_id ? catById(cur.parent_id) : null; }
+    while (cur && !ids.includes(cur.id)) { ids.unshift(cur.id); cur = cur.parent_id ? catById(cur.parent_id) : null; }
     for (let i = 0; i < segs.length; i++) {
       const sep = document.createElement('span'); sep.className = 'crumb-sep'; sep.textContent = '/'; bc.appendChild(sep);
       const isLast = i === segs.length - 1;
@@ -1143,14 +1318,24 @@ function updateBreadcrumb() {
 
 // ─── multi-select picker (shared widget) ──────────────────────────────────
 
-function openCategoryPicker({ title, initial, single, onSave, scope }) {
-  if (scope) {
+/// exclude(cat): leave that category (and what is under it) out; topLevel:
+/// offer "Top level" first, which answers '' (no parent).
+function openCategoryPicker({ title, initial, single, onSave, scope, exclude, topLevel }) {
+  // The picker's scope is its own while it is open; the sidebar's comes back
+  // when it closes (A2-15). It used to stay switched: the New key dialog
+  // opened from Servers left the sidebar on KEY categories, so "+" created a
+  // key category there and a click on the tree filtered the wrong list.
+  if (el('pickerModal').hidden) state.pickerPrevScope = state.categoryScope;
+  if (scope && scope !== state.categoryScope) {
     state.categoryScope = scope;
     rebuildCategoryIndex();
   }
   state.pickerSelected = new Set(initial || []);
   state.pickerSingle = !!single;
   state.pickerCallback = onSave;
+  // Move to... (fix2 N1): categories it may not offer, and a top-level row.
+  state.pickerExclude = typeof exclude === 'function' ? exclude : null;
+  state.pickerTopLevel = !!topLevel;
   state.pickerActive = -1;
   state.pickerTrigger = document.activeElement;
   el('pickerTitle').textContent = title || 'Categories';
@@ -1164,9 +1349,16 @@ function openCategoryPicker({ title, initial, single, onSave, scope }) {
 
 function closeCategoryPicker() {
   el('pickerModal').hidden = true;
+  if (state.pickerPrevScope && state.pickerPrevScope !== state.categoryScope) {
+    state.categoryScope = state.pickerPrevScope;
+    rebuildCategoryIndex();
+  }
+  state.pickerPrevScope = null;
   state.pickerCallback = null;
   state.pickerSelected = new Set();
   state.pickerSingle = false;
+  state.pickerExclude = null;
+  state.pickerTopLevel = false;
   state.pickerActive = -1;
   if (state.pickerTrigger && document.contains(state.pickerTrigger)) state.pickerTrigger.focus();
   state.pickerTrigger = null;
@@ -1215,6 +1407,9 @@ function renderPickerSelection() {
   host.appendChild(clear);
 }
 
+/// The Move to... picker's row for "no parent".
+const PICKER_TOP_LEVEL = 'Top level (no parent)';
+
 function renderPickerTree(filter) {
   const tree = el('pickerTree');
   tree.innerHTML = '';
@@ -1223,6 +1418,8 @@ function renderPickerTree(filter) {
   const rows = [];
   const matches = (name) => !lower || name.toLowerCase().includes(lower);
   const walk = (cat, depth) => {
+    // A category the caller rules out goes with everything under it.
+    if (state.pickerExclude && state.pickerExclude(cat)) return;
     const visible = matches(cat.name) || (depth === 0 && lower === '');
     const anyDesc = !lower ? true : treeHasMatchingDescendant(cat.id, lower);
     if (!visible && !anyDesc) return;
@@ -1230,7 +1427,8 @@ function renderPickerTree(filter) {
     for (const c of childrenOf(cat.id)) walk(c, depth + 1);
   };
   for (const c of childrenOf(null)) walk(c, 0);
-  if (scopedCategories.length === 0 || !rows.length) {
+  if (state.pickerTopLevel && matches(PICKER_TOP_LEVEL)) rows.unshift({ cat: { id: '', name: PICKER_TOP_LEVEL }, depth: 0 });
+  if (!rows.length) {
     tree.innerHTML = scopedCategories.length === 0
       ? '<div class="picker-empty">No categories yet. Create one in the sidebar.</div>'
       : '<div class="picker-empty">No matching categories.</div>';
@@ -1241,7 +1439,7 @@ function renderPickerTree(filter) {
     const row = document.createElement('div');
     row.className = 'picker-row' + (state.pickerSelected.has(cat.id) ? ' checked' : '');
     row.dataset.depth = String(depth); row.dataset.index = String(index); row.dataset.id = cat.id;
-    row.id = `picker-option-${cat.id}`; row.setAttribute('role', 'option');
+    row.id = `picker-option-${cat.id || 'top-level'}`; row.setAttribute('role', 'option');
     row.setAttribute('aria-selected', String(state.pickerSelected.has(cat.id)));
     row.tabIndex = -1;
     if (index === state.pickerActive) row.classList.add('active');
@@ -1260,9 +1458,11 @@ function renderPickerTree(filter) {
 }
 
 function treeHasMatchingDescendant(catId, lower) {
-  for (const c of childrenOf(catId)) {
-    if (c.name.toLowerCase().includes(lower)) return true;
-    if (treeHasMatchingDescendant(c.id, lower)) return true;
+  // Every category below catId, each visited once (A2-45).
+  for (const id of categoryAndDescendants(catId)) {
+    if (id === catId) continue;
+    const c = catById(id);
+    if (c && c.name.toLowerCase().includes(lower)) return true;
   }
   return false;
 }
@@ -1374,6 +1574,27 @@ function confirmModal(title, message, okLabel, opts) {
   });
 }
 
+/// confirmModal with one checkbox under the question - an extra that goes
+/// with a yes, like removing a deleted key's deployed files. Resolves
+/// { ok, option }: option is the box's state when OK was pressed, false
+/// otherwise. Same rules as confirmModal (Cancel focused, Escape / a lock
+/// answer no, one question at a time).
+async function confirmWithOption(title, message, okLabel, option, opts) {
+  if (confirmPending && !el('confirmModal').hidden) return { ok: false, option: false };
+  const row = el('confirmOptionRow');
+  const box = el('confirmOption');
+  el('confirmOptionLabel').textContent = option.label;
+  box.checked = !!option.checked;
+  row.hidden = false;
+  try {
+    const ok = await confirmModal(title, message, okLabel, opts);
+    return { ok, option: ok && box.checked };
+  } finally {
+    row.hidden = true;
+    box.checked = false;
+  }
+}
+
 // ─── category chip rendering (shared) ─────────────────────────────────────
 
 function renderCategoryChips(targetEl, ids, { removable, onRemove, onClickPath } = {}) {
@@ -1418,6 +1639,7 @@ const state = window.state = {
   serversLoadError: null,
   selectedId: null,
   deploySelected: new Set(),
+  deployPreview: null,       // the deploy sheet's last key_deploy_preview answer
   settings: {},
   view: 'keys',
   // category tree
@@ -1428,7 +1650,6 @@ const state = window.state = {
   activeCategoryByScope: { key: 'all', host: 'all' },
   keyCategories: {},         // keyId -> [catId]
   orphans: false,            // true when at least one key has no categories
-  activeCategoryId: 'all',   // 'all' | 'uncategorized' | categoryId
   expandedCatIds: new Set(), // sidebar expanded nodes
   groupExpanded: new Set(),  // key-list group ids the user COLLAPSED (absent = expanded)
   // picker
@@ -1436,6 +1657,10 @@ const state = window.state = {
   pickerSelected: new Set(),  // ids the user has ticked
   pickerActive: -1,
   pickerTrigger: null,
+  pickerPrevScope: null,      // the sidebar's scope while a picker of another scope is open
+  pickerExclude: null,        // Move to...: categories that may not be offered
+  pickerTopLevel: false,      // Move to...: offer "Top level" first
+  uiParentOf: new Map(),      // category id -> the parent its row is SHOWN under (null: top level)
   // drag
   draggingCatId: null,
   // prompt
@@ -1639,6 +1864,7 @@ async function refreshVaultStatus(silent) {
   if (gate !== prevGate) state.vaultDismissed = false;
 
   if (gate === 'create') {
+    clearCategoryTree();
     if (!state.vaultDismissed) showVaultModal('create');
   } else if (gate === 'unlock') {
     clearKeysUI();
@@ -1714,9 +1940,9 @@ function applyNavLockState() {
 /// a bare "Vault is locked." (A6-08): clearing the audit log, forgetting a
 /// pinned host key, every category change, and the four security settings
 /// (autoLockMinutes, confirmDelete, autoUpdateCheck, confirmMultiLinePaste).
-/// Settings, the known hosts and the category tree all stay on screen while
-/// locked, so these are disabled then, with a tooltip that says why, instead
-/// of offering a click that can only fail.
+/// Settings and the known hosts stay on screen while locked; the category
+/// tree is cleared. These controls are disabled then, with a tooltip that
+/// says why, instead of offering a click that can only fail.
 const LOCK_GATE_HINTS = {
   audit: 'Unlock the vault to clear the audit log.',
   hosts: 'Unlock the vault to forget a pinned host key.',
@@ -1882,12 +2108,23 @@ function clearKeysUI() {
   state.selectedId = null;
   state.deploySelected.clear();
   el('keyList').innerHTML = '';
-  el('detailPane').hidden = true;
+  hideDetailPane();
   el('emptyState').hidden = false;
-  state.keyCategories = {};
-  state.orphans = false;
+  clearCategoryTree();
   updateSelectionHint();
   updateBreadcrumb();
+}
+
+/// The sidebar's category tree while the vault is locked or there is none:
+/// empty - category names stayed on screen behind a locked vault - with its
+/// drawer closed and its toggles disabled, saying why (renderCategoryTree).
+/// At boot the toggles said "Show the category tree" and did nothing.
+function clearCategoryTree() {
+  state.categories = [];
+  state.keyCategories = {};
+  state.orphans = false;
+  rebuildCategoryIndex();
+  renderCategoryTree();
 }
 
 function openTerminalContextMenu(x, y, tabId) {
@@ -1937,12 +2174,77 @@ function updateSelectionHint() {
   const sub = el('viewSubtitle');
   if (sub && state.view === 'keys') {
     const total = state.keys.length;
-    const deployed = state.keys.filter(k => k.deployed).length;
+    const deployed = state.keys.filter(keyIsDeployed).length;
     sub.textContent = n > 0
       ? n + ' of ' + total + ' selected'
       : (total === 0 ? '' : total + (total === 1 ? ' key' : ' keys') + ' · ' + deployed + ' deployed');
   }
+  syncSelectAll();
   updateNavCounts();
+}
+
+/// The select-all box over the list (A5-34): it acts on the keys SHOWN - a
+/// 30-key deploy was 30 clicks - and shows whether all, some or none of them
+/// are selected.
+function syncSelectAll(rows) {
+  const box = el('selectAllKeys');
+  if (!box) return;
+  const shownKeys = rows || (state.keysLoadError ? [] : filteredKeys());
+  const picked = shownKeys.filter((k) => state.deploySelected.has(k.id)).length;
+  el('keyListHead').hidden = shownKeys.length === 0;
+  box.checked = picked > 0 && picked === shownKeys.length;
+  box.indeterminate = picked > 0 && picked < shownKeys.length;
+  const filtered = shownKeys.length !== state.keys.length;
+  el('selectAllLabel').textContent = filtered ? `Select all ${shownKeys.length} shown` : 'Select all';
+}
+
+function toggleSelectAllShown() {
+  const shownKeys = filteredKeys();
+  const all = shownKeys.length > 0 && shownKeys.every((k) => state.deploySelected.has(k.id));
+  for (const k of shownKeys) {
+    if (all) state.deploySelected.delete(k.id);
+    else state.deploySelected.add(k.id);
+  }
+  renderKeyList();
+  updateSelectionHint();
+}
+
+/// Everything that narrows the key list - the search, the type and the
+/// category - back to "show all".
+function clearKeyFilters() {
+  el('searchInput').value = '';
+  el('typeFilter').value = '';
+  if (state.activeCategoryByScope.key !== 'all') {
+    state.activeCategoryByScope.key = 'all';
+    if (state.categoryScope === 'key') { renderCategoryTree(); updateBreadcrumb(); }
+  }
+  renderKeyList();
+  updateSelectionHint();
+}
+
+/// The row a filter that matches nothing leaves in the list (A2-26).
+function keyNoMatchRow() {
+  const row = document.createElement('div');
+  row.className = 'key-list-nomatch';
+  row.setAttribute('role', 'status');
+  const msg = document.createElement('span');
+  const q = el('searchInput').value.trim();
+  msg.textContent = q ? `No keys match "${q}".` : 'No keys match the current filter.';
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.className = 'ghost-btn';
+  clear.textContent = 'Clear filter';
+  clear.addEventListener('click', () => { clearKeyFilters(); el('searchInput').focus(); });
+  row.append(msg, clear);
+  return row;
+}
+
+/// Open a key from outside the list (the palette). When the search or a
+/// filter hides it they are cleared first: the detail pane never shows a key
+/// the list does not.
+function revealKey(id) {
+  if (!filteredKeys().some((k) => k.id === id)) clearKeyFilters();
+  return selectKey(id, { reveal: true });
 }
 
 function renderKeyList() {
@@ -1968,11 +2270,13 @@ function renderKeyList() {
     el('emptyState').hidden = true;
     const chip = el('keyCount');
     if (chip) chip.hidden = true;
+    syncSelectAll([]); // nothing to select
     renderLoadError(list, 'Could not load your keys', state.keysLoadError, loadKeys);
     return;
   }
   const rows = filteredKeys();
   const total = state.keys.length;
+  pruneHiddenKeys(rows);
   el('emptyState').hidden = total > 0;
   const countChip = el('keyCount');
   if (countChip) {
@@ -1983,10 +2287,15 @@ function renderKeyList() {
       countChip.hidden = true;
     }
   }
-  if (rows.length === 0) return;
+  if (rows.length === 0) {
+    // A search or filter that matches nothing says so, with a way back. The
+    // list used to go blank - indistinguishable from a broken one (A2-26).
+    if (total > 0) list.appendChild(keyNoMatchRow());
+    return;
+  }
 
   // When a category filter is active, render a single (un-grouped) flat list.
-  if (activeCategoryId() !== 'all') {
+  if (activeKeyCategoryId() !== 'all') {
     const flat = document.createElement('div');
     flat.className = 'key-group';
     for (const k of rows) flat.appendChild(keyRowEl(k));
@@ -1995,6 +2304,31 @@ function renderKeyList() {
     return;
   }
 
+  for (const g of keyGroups(rows)) list.appendChild(keyGroupEl(g));
+  restoreFocus();
+}
+
+/// What the filter hides is neither selected nor open (A5-34 / A5-27). The
+/// checkbox selection kept keys that were off screen - "3 keys selected" over
+/// one visible row, and Delete or Deploy acted on all three - and the detail
+/// pane went on showing a key the list no longer did.
+function pruneHiddenKeys(rows) {
+  const visible = new Set(rows.map((k) => k.id));
+  let pruned = false;
+  for (const id of [...state.deploySelected]) {
+    if (!visible.has(id)) { state.deploySelected.delete(id); pruned = true; }
+  }
+  if (state.selectedId && !visible.has(state.selectedId)) {
+    state.selectedId = null;
+    hideDetailPane();
+  }
+  if (pruned) updateSelectionHint();
+  else syncSelectAll(rows);
+}
+
+/// The default (unfiltered) list's groups: one per root category, in tree
+/// order, then Uncategorized. Split from renderKeyList (M7).
+function keyGroups(rows) {
   // Grouped: by category (or uncategorized if no cats).
   // First, build the group order: roots in sort_index order; for each, walk sub-tree.
   const groups = []; // { id: 'cat:<rootId>' | 'uncategorized', name, keys[] }
@@ -2005,19 +2339,9 @@ function renderKeyList() {
   /// is how every categorized key used to end up in no group and so render
   /// nowhere in this view.
   const catsOf = (k) => (state.keyCategories[k.id] || []).map(catById).filter(Boolean);
-  /// The root ancestor of a category, tolerating a parent chain that a
-  /// restored or hand-edited vault left dangling or circular.
-  const rootOf = (cat) => {
-    let top = cat;
-    const chain = new Set([top.id]);
-    while (top.parent_id) {
-      const parent = catById(top.parent_id);
-      if (!parent || chain.has(parent.id)) break;
-      chain.add(parent.id);
-      top = parent;
-    }
-    return top;
-  };
+  /// The root ancestor of a category (catRoot), as an id: a chain that a
+  /// restored vault left circular has none (A2-45).
+  const rootIdOf = (cat) => { const top = catRoot(cat); return top ? top.id : null; };
   const groupFor = (id, name) => {
     let g = groups.find(g => g.id === id);
     if (!g) { g = { id, name, keys: [] }; groups.push(g); }
@@ -2042,55 +2366,60 @@ function renderKeyList() {
     // collects. Walking roots outer and keys inner is what keeps both the
     // group order and the order within each group stable.
     for (const k of rows) {
-      if (!catsOf(k).some(c => rootOf(c).id === root.id)) continue;
+      if (!catsOf(k).some(c => rootIdOf(c) === root.id)) continue;
       const id = 'cat:' + root.id;
       if (seen.has(id + ':' + k.id)) continue;
       seen.add(id + ':' + k.id);
       groupFor(id, catPathString(root.id)).keys.push(k);
     }
   }
+  // Every key that reached no root's group - no categories, deleted ones, or
+  // only categories in a parent cycle (A2-45) - is Uncategorized, so no key
+  // can be left out of the list.
   for (const k of rows) {
-    if (!catsOf(k).length) groupFor('uncategorized', 'Uncategorized').keys.push(k);
+    if (keyIsUncategorized(k)) groupFor('uncategorized', 'Uncategorized').keys.push(k);
   }
-
-  for (const g of groups) {
-    const grp = document.createElement('div');
-    grp.className = 'key-group';
-    grp.dataset.group = g.id;
-    const head = document.createElement('div');
-    head.className = 'key-group-head';
-    const name = document.createElement('span');
-    name.className = 'key-group-name';
-    name.textContent = g.name;
-    head.appendChild(name);
-    const expandBtn = document.createElement('button');
-    expandBtn.className = 'icon-btn';
-    // The Set tracks COLLAPSED group ids (absent = expanded, the default).
-    // The handler must write the toggle back into it: renderKeyList rebuilds
-    // the whole list (search, select, category switch), and a choice kept
-    // only on the old DOM node popped back open on the next render.
-    const collapsed = state.groupExpanded.has(g.id);
-    if (collapsed) {
-      grp.classList.add('collapsed');
-    }
-    expandBtn.innerHTML = ico(collapsed ? 'plus' : 'minus');
-    expandBtn.title = collapsed ? 'Expand group' : 'Collapse group';
-    expandBtn.addEventListener('click', () => {
-      const nowCollapsed = grp.classList.toggle('collapsed');
-      if (nowCollapsed) state.groupExpanded.add(g.id);
-      else state.groupExpanded.delete(g.id);
-      expandBtn.innerHTML = ico(nowCollapsed ? 'plus' : 'minus');
-      expandBtn.title = nowCollapsed ? 'Expand group' : 'Collapse group';
-    });
-    head.appendChild(expandBtn);
-    grp.appendChild(head);
-    for (const k of g.keys) grp.appendChild(keyRowEl(k, g.keys));
-    list.appendChild(grp);
-  }
-  restoreFocus();
+  return groups;
 }
 
-function keyRowEl(k, groupKeys) {
+/// One group of the default list: its header with the collapse toggle, then
+/// its rows.
+function keyGroupEl(g) {
+  const grp = document.createElement('div');
+  grp.className = 'key-group';
+  grp.dataset.group = g.id;
+  const head = document.createElement('div');
+  head.className = 'key-group-head';
+  const name = document.createElement('span');
+  name.className = 'key-group-name';
+  name.textContent = g.name;
+  head.appendChild(name);
+  const expandBtn = document.createElement('button');
+  expandBtn.className = 'icon-btn';
+  // The Set tracks COLLAPSED group ids (absent = expanded, the default).
+  // The handler must write the toggle back into it: renderKeyList rebuilds
+  // the whole list (search, select, category switch), and a choice kept
+  // only on the old DOM node popped back open on the next render.
+  const collapsed = state.groupExpanded.has(g.id);
+  if (collapsed) {
+    grp.classList.add('collapsed');
+  }
+  expandBtn.innerHTML = ico(collapsed ? 'plus' : 'minus');
+  expandBtn.title = collapsed ? 'Expand group' : 'Collapse group';
+  expandBtn.addEventListener('click', () => {
+    const nowCollapsed = grp.classList.toggle('collapsed');
+    if (nowCollapsed) state.groupExpanded.add(g.id);
+    else state.groupExpanded.delete(g.id);
+    expandBtn.innerHTML = ico(nowCollapsed ? 'plus' : 'minus');
+    expandBtn.title = nowCollapsed ? 'Expand group' : 'Collapse group';
+  });
+  head.appendChild(expandBtn);
+  grp.appendChild(head);
+  for (const k of g.keys) grp.appendChild(keyRowEl(k));
+  return grp;
+}
+
+function keyRowEl(k) {
   const row = document.createElement('div');
   row.className = 'key-row' + (k.id === state.selectedId ? ' selected' : '');
   row.dataset.id = k.id;
@@ -2103,7 +2432,7 @@ function keyRowEl(k, groupKeys) {
   row.addEventListener('keydown', (ev) => {
     if (ev.target !== row || (ev.key !== 'Enter' && ev.key !== ' ')) return;
     ev.preventDefault();
-    selectKey(k.id);
+    selectKey(k.id, { reveal: true });
   });
 
   const cb = document.createElement('input');
@@ -2124,7 +2453,13 @@ function keyRowEl(k, groupKeys) {
   main.className = 'key-row-main';
   const name = document.createElement('div');
   name.className = 'key-row-name';
-  name.textContent = k.name || '(unnamed)';
+  // The name in its own element, so it can end in "..." on one line (A1-07):
+  // as a bare text node it matched no ellipsis rule and wrapped mid-word.
+  const title = document.createElement('span');
+  title.className = 'key-row-title';
+  title.textContent = k.name || '(unnamed)';
+  title.title = k.name || '';
+  name.appendChild(title);
   if (!k.has_private) {
     const pub = document.createElement('span');
     pub.className = 'badge pub';
@@ -2135,8 +2470,14 @@ function keyRowEl(k, groupKeys) {
   if (cats.length > 1) {
     // "in N categories" badge - only show if this key appears in more than one category.
     // We only know the count locally; "appears in more than one group" depends on group structure.
+    // catRoot stops at a parent cycle a restored vault can hold; this walk
+    // used to loop forever on one (A2-45).
     const distinctTop = new Set();
-    for (const cid of cats) { let t = cid; while (true) { const c = catById(t); if (!c) break; if (!c.parent_id) { distinctTop.add(c.id); break; } t = c.parent_id; } }
+    for (const cid of cats) {
+      const c = catById(cid);
+      const top = c && catRoot(c);
+      if (top) distinctTop.add(top.id);
+    }
     if (distinctTop.size > 1) {
       const b = document.createElement('span');
       b.className = 'badge dim';
@@ -2160,7 +2501,7 @@ function keyRowEl(k, groupKeys) {
 
   const actions = document.createElement('div');
   actions.className = 'key-row-actions';
-  if (k.deployed) {
+  if (keyIsDeployed(k)) {
     const dep = document.createElement('span');
     dep.className = 'chip ok';
     dep.title = 'A copy of this key is deployed on this machine';
@@ -2176,15 +2517,18 @@ function keyRowEl(k, groupKeys) {
     conn.innerHTML = `${ico('plug-zap')}<span>Connect</span>`;
     conn.addEventListener('click', (ev) => {
       ev.stopPropagation();
-      selectKey(k.id);
+      // Measured BEFORE selectKey(), which rebuilds the list and this button
+      // with it: measured after, the button was a detached node at (0, 0) and
+      // the menu opened in the window's top-left corner.
       const r = conn.getBoundingClientRect();
+      selectKey(k.id);
       openKeyConnectMenu(r.left, r.bottom + 4, k);
     });
     actions.appendChild(conn);
   }
   row.appendChild(actions);
   row.appendChild(typeBadge(k.key_type));
-  row.addEventListener('click', () => selectKey(k.id));
+  row.addEventListener('click', () => selectKey(k.id, { reveal: true }));
   row.addEventListener('contextmenu', (ev) => {
     if (!k.has_private) return; // can't connect with a public-only key
     ev.preventDefault();
@@ -2242,7 +2586,8 @@ function closeKeyConnectMenu(o) {
   }
 }
 
-async function loadKeys() {
+/// opts.autoSelect false: when no key is open afterwards, leave it that way.
+async function loadKeys(opts) {
   try {
     const res = await call('key_list');
     state.keys = (res.keys || []).map(k => ({ ...k, category_ids: k.category_ids || [] }));
@@ -2258,19 +2603,34 @@ async function loadKeys() {
   updateSelectionHint();
   if (state.selectedId && state.keys.some(k => k.id === state.selectedId)) {
     await selectKey(state.selectedId);
-  } else if (state.keys.length > 0 && !state.selectedId) {
-    await selectKey(state.keys[0].id);
-  } else if (!state.selectedId) {
-    el('detailPane').hidden = true;
+    return;
   }
+  // The open key is gone (deleted) or nothing was open. The first key SHOWN
+  // opens only when the caller allows it: after a delete, another key's
+  // Delete button used to appear right where the last one was (A5-34).
+  state.selectedId = null;
+  const first = !(opts && opts.autoSelect === false) && filteredKeys()[0];
+  if (first) await selectKey(first.id);
+  else hideDetailPane();
 }
 
-async function selectKey(id) {
+/// The answer that may fill the detail pane: only the latest selectKey's
+/// (A2-29). Two requests in flight could finish out of order and leave the
+/// pane showing one key while Delete, Export and Rename acted on another.
+let selectKeySeq = 0;
+
+/// opts.reveal: an explicit pick (a click, Enter, the palette) - bring the
+/// pane on screen when it is below the list (A1-24).
+async function selectKey(id, opts) {
+  const seq = ++selectKeySeq;
   state.selectedId = id;
   renderKeyList();
+  // A key the search or a filter hides is not opened (the list cleared it).
+  if (state.selectedId !== id) return;
   const pane = el('detailPane');
   try {
     const k = await call('key_get', { id });
+    if (seq !== selectKeySeq || state.selectedId !== id) return;
     pane.hidden = false;
     // A different key means a different set of secrets: never carry the Export
     // tab (or a typed passphrase) across from the key you were just looking at.
@@ -2333,11 +2693,41 @@ async function selectKey(id) {
     el('detailFingerprint').textContent = k.fingerprint_sha256 || '\u2014';
     el('detailAuthorized').value = k.public_key || '';
     el('detailConnectBtn').disabled = !k.has_private;
+    // A deployed key can be taken back off the disk from here (A7-22 / A5-43).
+    el('detailUndeployBtn').hidden = !keyIsDeployed(k);
     renderExportFormats(k);
+    if (opts && opts.reveal) revealDetailPane();
   } catch (e) {
-    pane.hidden = true;
+    if (seq !== selectKeySeq) return;
+    hideDetailPane();
     toast(e.message || String(e), 'err');
   }
+}
+
+/// One rule for every action that asks "is this key deployed?" (M7). The list
+/// carries `deployed`; key_get also carries the recorded path.
+function keyIsDeployed(k) {
+  return !!(k && (k.deployed || k.deploy_path));
+}
+
+/// Hiding the pane also returns it to Overview, which wipes any passphrase
+/// typed for an Export that is no longer visible (M1).
+function hideDetailPane() {
+  showDetailTab('overview');
+  el('detailPane').hidden = true;
+}
+
+/// Bring the detail pane on screen if it is not (A1-24). Beside the list it
+/// is sticky and always is; stacked under the list (a narrow window) it opened
+/// below the fold, so choosing a key looked like it did nothing.
+function revealDetailPane() {
+  const pane = el('detailPane');
+  const view = el('view-keys');
+  if (pane.hidden || !view) return;
+  const p = pane.getBoundingClientRect();
+  const v = view.getBoundingClientRect();
+  if (p.top >= v.top && p.top <= v.bottom - Math.min(160, v.height / 3)) return;
+  pane.scrollIntoView({ block: 'start' });
 }
 
 async function deleteSelected() {
@@ -2346,22 +2736,84 @@ async function deleteSelected() {
   // happens to the selection while the dialog is open.
   const id = state.selectedId;
   const k = state.keys.find(x => x.id === id);
+  const name = k ? k.name : id;
+  const deployed = keyIsDeployed(k);
+  let removeFiles = false;
   if (settingOn(state.settings.confirmDelete)) {
-    const ok = await confirmModal('Delete key',
-      'Delete key "' + (k ? k.name : id) + '" from the vault?\nDeployed copies on disk are not removed.',
-      'Delete');
-    if (!ok) return;
+    if (deployed) {
+      // A deleted key's deployed private key used to stay in ~/.ssh with
+      // nothing tracking it any more (A7-22 / A5-43): it goes too, unless the
+      // box is unticked.
+      const answer = await confirmWithOption('Delete key', 'Delete key "' + name + '" from the vault?', 'Delete',
+        { label: 'Also remove its deployed copy: the key file in ~/.ssh, its .pub and its Host block.', checked: true });
+      if (!answer.ok) return;
+      removeFiles = answer.option;
+    } else if (!(await confirmModal('Delete key', 'Delete key "' + name + '" from the vault?', 'Delete'))) {
+      return;
+    }
   }
-  try {
-    await call('key_delete', { id });
-    state.deploySelected.delete(id);
-    state.selectedId = null;
-    toast('Key deleted.', 'ok');
+  // After the question, while the change runs: one delete per click, and a
+  // keyboard user is not left on body when the pane goes (I1).
+  await withBusy(el('detailDeleteBtn'), null, async () => {
+    try {
+      if (removeFiles) {
+        // First, while the vault still records where the copy is. If it cannot
+        // be removed the key is kept: deleting it would orphan the file.
+        try {
+          await removeDeployedCopy(id);
+        } catch (e) {
+          toast('The deployed copy of "' + name + '" could not be removed, so the key was not deleted: ' + (e.message || String(e)), 'err');
+          await loadKeys();
+          return;
+        }
+      }
+      await call('key_delete', { id });
+      state.deploySelected.delete(id);
+      state.selectedId = null;
+      toast(deployed && !removeFiles ? 'Key deleted. Its deployed copy is still on disk.' : 'Key deleted.', 'ok');
+      // Nothing else opens in its place (A5-34).
+      await loadKeys({ autoSelect: false });
+      updateSelectionHint();
+    } catch (e) {
+      toast(e.message || String(e), 'err');
+    }
+  });
+}
+
+/// Take a key's deployed copy off the disk (A7-22 / A5-43): its private key
+/// file in ~/.ssh, the .pub beside it and the Host blocks in SSHSpan's ssh
+/// config that point at them. Says what went and every warning; rejects -
+/// the key stays marked as deployed - when the key file cannot be deleted.
+async function removeDeployedCopy(id) {
+  const r = await call('key_remove_deployed', { id });
+  const removed = arrayOrEmpty(r && r.removed);
+  const hosts = arrayOrEmpty(r && r.removedHosts);
+  const parts = [];
+  if (removed.length) parts.push('Removed ' + removed.join(', '));
+  if (hosts.length) parts.push((hosts.length === 1 ? 'Host block ' : 'Host blocks ') + hosts.join(', '));
+  toast(parts.length ? parts.join('; ') + '.' : 'There was no deployed copy to remove.', 'ok');
+  for (const w of arrayOrEmpty(r && r.warnings)) toast(w, 'warn');
+  return r;
+}
+
+/// "Remove deployed copy" in the detail pane.
+async function undeploySelected() {
+  const id = state.selectedId;
+  if (!id) return;
+  const k = state.keys.find(x => x.id === id);
+  const ok = await confirmModal('Remove deployed copy',
+    'Delete the deployed copy of "' + (k ? k.name : id) + '" - its key file in ~/.ssh and the .pub beside it - and the Host block in SSHSpan\'s ssh config that points at it? The key stays in the vault.',
+    'Remove');
+  if (!ok) return;
+  await withBusy(el('detailUndeployBtn'), 'Removing…', async () => {
+    try {
+      await removeDeployedCopy(id);
+    } catch (e) {
+      toast(e.message || String(e), 'err');
+    }
+    // The Deployed chip and the detail pane follow the record either way.
     await loadKeys();
-    updateSelectionHint();
-  } catch (e) {
-    toast(e.message || String(e), 'err');
-  }
+  });
 }
 
 /// Bulk delete from the selection bar. Separate from deleteSelected(), which
@@ -2377,26 +2829,68 @@ async function deleteSelectedKeys() {
   });
   const listed = names.slice(0, 8).join('\n  ');
   const more = names.length > 8 ? `\n  ...and ${names.length - 8} more` : '';
+  const deployedIds = ids.filter((id) => keyIsDeployed(state.keys.find(x => x.id === id)));
+  let removeFiles = false;
   if (settingOn(state.settings.confirmDelete)) {
-    const ok = await confirmModal('Delete keys',
-      `Delete ${ids.length} key(s) from the vault?\n\n  ${listed}${more}\n\nDeployed copies on disk are not removed.`,
-      'Delete');
-    if (!ok) return;
+    const question = `Delete ${ids.length} key(s) from the vault?\n\n  ${listed}${more}`;
+    if (deployedIds.length) {
+      // As for one key (A5-43): the deployed copies go too unless unticked.
+      const answer = await confirmWithOption('Delete keys', question, 'Delete',
+        { label: `Also remove the deployed copies of the ${deployedIds.length} deployed key(s): key files in ~/.ssh, their .pub files and Host blocks.`, checked: true });
+      if (!answer.ok) return;
+      removeFiles = answer.option;
+    } else if (!(await confirmModal('Delete keys', question, 'Delete'))) {
+      return;
+    }
   }
+  // The selection bar disappears with its selection; busy focus falls back to
+  // search instead of body (I1), and repeated clicks cannot delete twice.
+  await withBusy(el('selDeleteBtn'), null, () => deleteKeyBatch(ids, deployedIds, removeFiles));
+}
+
+/// The work behind a confirmed bulk delete, split from its question. A copy
+/// that cannot be removed keeps its key; a copy intentionally kept is counted.
+async function deleteKeyBatch(ids, deployedIds, removeFiles) {
   let failed = 0;
+  let undeployed = 0;
+  let leftOnDisk = 0;
+  const kept = [];
+  const warnings = [];
   for (const id of ids) {
-    try { await call('key_delete', { id }); } catch (e) { failed += 1; }
+    const wasDeployed = deployedIds.includes(id);
+    if (removeFiles && wasDeployed) {
+      // A copy that cannot be removed keeps its key, as for one key.
+      try {
+        const r = await call('key_remove_deployed', { id });
+        undeployed += 1;
+        warnings.push(...arrayOrEmpty(r && r.warnings));
+      } catch (e) {
+        failed += 1;
+        kept.push(e.message || String(e));
+        continue;
+      }
+    }
+    try {
+      await call('key_delete', { id });
+      if (wasDeployed && !removeFiles) leftOnDisk += 1;
+    } catch (e) { failed += 1; }
   }
   state.deploySelected.clear();
   if (ids.includes(state.selectedId)) {
     state.selectedId = null;
-    el('detailPane').hidden = true;
+    hideDetailPane();
   }
-  await loadKeys();
+  await loadKeys({ autoSelect: false });
   updateSelectionHint();
+  if (undeployed) toast(`Removed the deployed copies of ${undeployed} key(s).`, 'ok');
+  if (warnings.length) toast(warnings.join('\n'), 'warn');
+  if (kept.length) toast('Not deleted - the deployed copy could not be removed:\n' + kept.join('\n'), 'err');
+  const stillOnDisk = leftOnDisk
+    ? ` ${leftOnDisk} deployed ${leftOnDisk === 1 ? 'copy is' : 'copies are'} still on disk.`
+    : '';
   toast(failed
-    ? `${ids.length - failed} deleted, ${failed} failed.`
-    : `${ids.length} key(s) deleted.`, failed ? 'err' : 'ok');
+    ? `${ids.length - failed} deleted, ${failed} failed.${stillOnDisk}`
+    : `${ids.length} key(s) deleted.${stillOnDisk}`, failed ? 'err' : 'ok');
 }
 
 async function copyPublic() {
@@ -2411,11 +2905,11 @@ async function copyPublic() {
   }
 }
 
+/// File-name extensions for the PUBLIC formats, which the renderer names
+/// (Rust names the private ones). An SPKI key is a PEM file, not the OpenSSH
+/// one-liner tools expect in a .pub (A2-42).
 const EXPORT_EXT = {
-  'openssh-private': '',
-  'ppk': '.ppk',
-  'pkcs8': '.pem',
-  'public-pem': '.pub',
+  'public-pem': '.pem',
   'authorized_keys': '.authorized_keys'
 };
 
@@ -2424,16 +2918,20 @@ const EXPORT_EXT = {
 // file so the decrypted key never crosses the IPC boundary into the WebView.
 const PRIVATE_EXPORT_FORMATS = ['openssh-private', 'ppk', 'pkcs8', 'pkcs8-encrypted'];
 
-// Formats that wrap the private key in a passphrase. Only these show the
-// passphrase field; it used to sit on screen permanently, including for the
-// four formats that ignore it and the two that carry no private key at all.
+// Formats that wrap the private key in a passphrase and need one: the
+// passphrase is the format (A2-03 / A5-38).
 const SEALED_EXPORT_FORMATS = ['pkcs8-encrypted'];
+
+// Formats that take a passphrase if one is given and are unprotected without
+// (A8-12). The backend always honoured it for these two; the field was never
+// shown, so the documented protected OpenSSH / PuTTY export was unreachable.
+const OPTIONAL_PASSPHRASE_FORMATS = ['openssh-private', 'ppk'];
 
 /// What each format actually hands you, in the terms that matter when you are
 /// about to write it to a file someone else might read.
 const EXPORT_FORMATS = [
-  { id: 'openssh-private', name: 'OpenSSH private key', sub: 'The usual id_ed25519 file. Unprotected.', risk: 'secret' },
-  { id: 'ppk', name: 'PuTTY private key (.ppk v3)', sub: 'For PuTTY, WinSCP and FileZilla on Windows.', risk: 'secret' },
+  { id: 'openssh-private', name: 'OpenSSH private key', sub: 'The usual id_ed25519 file. Unprotected unless you set a passphrase.', risk: 'secret' },
+  { id: 'ppk', name: 'PuTTY private key (.ppk v3)', sub: 'For PuTTY, WinSCP and FileZilla on Windows. Unprotected unless you set a passphrase.', risk: 'secret' },
   { id: 'pkcs8-encrypted', name: 'PKCS#8 PEM, encrypted', sub: 'Wrapped with a passphrase you choose below.', risk: 'sealed' },
   { id: 'pkcs8', name: 'PKCS#8 PEM, unencrypted', sub: 'Plain private key in PEM form.', risk: 'secret' },
   { id: 'public-pem', name: 'Public key PEM (SPKI)', sub: 'No private material. Safe to hand out.', risk: 'public' },
@@ -2471,20 +2969,33 @@ function renderExportFormats(k) {
   syncExportControls();
 }
 
-/// The passphrase field appears only when the chosen format uses one, and the
-/// button says what pressing it does - a private-key export opens a save dialog
-/// in the Rust process; a public one downloads straight away.
+/// The passphrase field appears only when the chosen format uses one - and
+/// says whether it must be filled in (encrypted PKCS#8) or may be left blank
+/// (OpenSSH, PuTTY: A8-12). Every format is written to a file chosen in a save
+/// dialog now, public ones too (A2-42), so the button reads the same for all.
 function syncExportControls() {
   const format = el('detailExportFormat').value;
-  const sealed = SEALED_EXPORT_FORMATS.indexOf(format) !== -1;
-  el('detailExportPass').hidden = !sealed;
-  el('exportPassLabel').hidden = !sealed;
-  if (!sealed) el('detailExportPass').value = '';
+  const required = SEALED_EXPORT_FORMATS.indexOf(format) !== -1;
+  const optional = OPTIONAL_PASSPHRASE_FORMATS.indexOf(format) !== -1;
+  const pass = el('detailExportPass');
+  pass.hidden = !required && !optional;
+  el('exportPassLabel').hidden = pass.hidden;
+  el('exportPassLabel').textContent = required
+    ? 'Passphrase for the exported file'
+    : 'Passphrase for the exported file (optional)';
+  pass.placeholder = required ? 'Required for an encrypted export' : 'Leave blank for an unprotected file';
+  if (pass.hidden) pass.value = '';
   const isPrivate = PRIVATE_EXPORT_FORMATS.indexOf(format) !== -1;
-  el('detailExportBtnLabel').textContent = isPrivate ? 'Choose where to save...' : 'Export';
   el('exportHint').textContent = isPrivate
     ? 'Private material is serialised in the Rust process and written straight to the file you pick - it never crosses into this window.'
     : 'This format carries no private key material.';
+}
+
+/// What a private-key export did about a passphrase, for its toast: whether
+/// the written OpenSSH / PuTTY file is protected depends on the field.
+function exportProtectionNote(format, passphrase) {
+  if (OPTIONAL_PASSPHRASE_FORMATS.indexOf(format) === -1) return '';
+  return passphrase ? ' (passphrase-protected)' : ' (no passphrase)';
 }
 
 /// Overview / Export. Switching away from Export clears any typed passphrase:
@@ -2503,26 +3014,52 @@ function showDetailTab(tab) {
 
 async function exportSelected() {
   if (!state.selectedId) return;
+  const id = state.selectedId;
   const format = el('detailExportFormat').value;
-  const passphrase = el('detailExportPass').value;
-  const k = state.keys.find(x => x.id === state.selectedId);
-  try {
-    if (PRIVATE_EXPORT_FORMATS.indexOf(format) !== -1) {
-      const r = await call('key_export_to_file', { id: state.selectedId, format, passphrase });
-      if (r.canceled) { toast('Export cancelled.', 'info'); return; }
-      toast('Exported ' + format + ' to ' + r.path, 'ok');
-      return;
-    }
-    const out = await call('key_export', { id: state.selectedId, format, passphrase });
-    const base = safeFileName(k ? k.name : state.selectedId);
-    const ext = EXPORT_EXT[format] !== undefined ? EXPORT_EXT[format] : '.txt';
-    download(base + ext, out.data);
-    toast('Exported ' + format + '.', 'ok');
-  } catch (e) {
-    toast(e.message || String(e), 'err');
-  } finally {
-    el('detailExportPass').value = '';
+  const passEl = el('detailExportPass');
+  const passphrase = passEl.value;
+  const k = state.keys.find(x => x.id === id);
+  const spec = EXPORT_FORMATS.find((f) => f.id === format);
+  const label = spec ? spec.name : format;
+  // "PKCS#8 PEM, encrypted" with no passphrase used to write a PLAINTEXT key
+  // and report "Exported pkcs8-encrypted" (A2-03 / A5-38). Asked for here,
+  // before anything is decrypted or a dialog opens; the backend refuses it too.
+  if (SEALED_EXPORT_FORMATS.indexOf(format) !== -1 && !passphrase) {
+    toast('Enter a passphrase for the encrypted PKCS#8 export.', 'err');
+    passEl.focus();
+    return;
   }
+  // One export per click (A2-18): the button stays busy until the save dialog
+  // has been answered and the file written.
+  await withBusy(el('detailExportBtn'), 'Exporting…', async () => {
+    try {
+      if (PRIVATE_EXPORT_FORMATS.indexOf(format) !== -1) {
+        const r = await call('key_export_to_file', { id, format, passphrase: passphrase || undefined });
+        if (!r || r.canceled) { toast('Export cancelled.', 'info'); return; }
+        // The format that was written, in the words the list uses - not an
+        // internal id that read as if a sealed file had been written (A5-38).
+        toast('Exported ' + label + exportProtectionNote(format, passphrase) + ' to ' + r.path, 'ok');
+        return;
+      }
+      // Public material goes through a save dialog and a Rust write like every
+      // other file this app writes (A2-42). The blob download it used may
+      // silently do nothing under WebKitGTK while the toast said "Exported".
+      // Asked first, so a cancelled dialog exports (and audits) nothing.
+      const ext = EXPORT_EXT[format] !== undefined ? EXPORT_EXT[format] : '.txt';
+      const pick = await call('system_pick_save_path', {
+        title: 'Export ' + label,
+        defaultName: safeFileName(k ? k.name : id) + ext,
+      });
+      if (!pick || pick.canceled) { toast('Export cancelled.', 'info'); return; }
+      const out = await call('key_export', { id, format });
+      await call('system_write_text_file', { path: pick.path, contents: out.data });
+      toast('Exported ' + label + ' to ' + pick.path, 'ok');
+    } catch (e) {
+      toast(e.message || String(e), 'err');
+    } finally {
+      passEl.value = '';
+    }
+  });
 }
 
 // ─── command palette ───────────────────────────────────────────────────────
@@ -2584,7 +3121,8 @@ function paletteCandidates() {
       sub: [k.key_type, k.comment, cats.join(', ')].filter(Boolean).join(' · '),
       hint: 'Open key',
       terms: [k.name, k.comment, k.fingerprint_sha256],
-      run: () => { switchView('keys'); selectKey(k.id); },
+      // revealKey: a filter that hides the key is cleared, or nothing opened.
+      run: () => { switchView('keys'); revealKey(k.id); },
     });
   }
   for (const c of state.categories) {
@@ -2745,8 +3283,27 @@ function movePaletteActive(delta) {
 
 function openKeyModal() {
   if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
-  el('modalBackdrop').hidden = false;
+  // Every opening starts on Generate with a fresh category choice (A2-37): the
+  // chips of the previous key used to carry over and file the next one under
+  // them unseen, and the dialog reopened on whichever tab was used last. The
+  // fresh choice is the category the list is filtered by, so a new key lands
+  // where the user is looking instead of vanishing behind the filter (A5-42).
+  switchTab('generate');
+  if (state._resetPendingKeyCategories) state._resetPendingKeyCategories(newKeyCategoryIds());
+  showImportFormatMsg('');
+  const modal = el('modalBackdrop');
+  modal.hidden = false;
+  // Capture the real opener before genName takes focus (A5-23). Waiting for
+  // the MutationObserver captured genName instead, so Cancel returned to body.
+  modalDidOpen(modal);
   el('genName').focus();
+}
+
+/// The category a new key starts in: the one the key list is filtered by, if
+/// it is a real key category ("all" and "Uncategorized" are not).
+function newKeyCategoryIds() {
+  const id = state.activeCategoryByScope.key;
+  return state.categories.some((c) => c.id === id && c.scope === 'key') ? [id] : [];
 }
 
 function closeKeyModal() {
@@ -2758,6 +3315,7 @@ function closeKeyModal() {
   el('importPem').value = '';
   el('importPass').value = '';
   resetImportFileHint();
+  showImportFormatMsg('');
 }
 
 function switchTab(tab) {
@@ -2770,12 +3328,15 @@ function switchTab(tab) {
   el('tab-generate').hidden = tab !== 'generate';
   el('tab-import').hidden = tab !== 'import';
   el('modalPrimary').textContent = tab === 'generate' ? 'Create' : 'Import';
-  el('modalTitle').textContent = tab === 'generate' ? 'New Key' : 'Import Key';
+  el('modalTitle').textContent = tab === 'generate' ? 'New key' : 'Import key';
 }
 
 function onGenTypeChange() {
   const t = el('genType').value;
   el('genBitsRow').hidden = t !== 'rsa';
+  // Large RSA keys are generated off the UI thread now, but still take time;
+  // say so before the user waits on Create (A5-12(d)).
+  el('genBitsHint').hidden = t !== 'rsa';
   el('genCurveRow').hidden = t !== 'ecdsa';
 }
 
@@ -2790,7 +3351,11 @@ async function browseForImport() {
       nameInput.value = (res.name || 'imported-key').replace(/\.[^.]+$/, '');
     }
     el('importPem').value = pem;
-    el('importFileHint').textContent = 'Loaded ' + res.name + ' \u2014 press Import to add it.';
+    el('importFileHint').textContent = 'Loaded ' + res.name + ' - press Import to add it.';
+    // A file in a format the vault cannot import says so at once (R9).
+    const unsupported = unsupportedImportMessage(pem);
+    showImportFormatMsg(unsupported);
+    if (unsupported) return;
     el('importPass').focus();
     toast('Loaded ' + res.name + '. Enter the passphrase if the key is encrypted, then Import.', 'info');
   } catch (e) {
@@ -2803,53 +3368,150 @@ function resetImportFileHint() {
   if (hint) hint.textContent = 'or paste the key material below';
 }
 
-async function submitKeyModal() {
-  // Re-entrancy guard, same as the host form: key generation can take seconds
-  // (RSA-4096), the button stayed live meanwhile, and a second click stored a
-  // second identical key.
-  if (submitKeyModal._busy) return;
-  submitKeyModal._busy = true;
-  const primary = el('modalPrimary');
-  primary.disabled = true;
-  const activeTab = document.querySelector('.tab.active').dataset.tab;
-  try {
-    if (activeTab === 'generate') {
-      const cats = (state._pendingGenerateCategories && state._pendingGenerateCategories()) || [];
-      await call('key_create_with_categories', {
-        keyType: el('genType').value === 'ecdsa'
-          ? `ecdsa-${el('genCurve').value || 'p256'}`
-          : el('genType').value,
-        bits: Number(el('genBits').value),
-        name: el('genName').value.trim() || undefined,
-        comment: el('genComment').value.trim() || undefined,
-        categoryIds: cats,
-      });
-      toast('Key generated.', 'ok');
-    } else {
-      const pem = el('importPem').value;
-      if (!pem.trim()) throw new Error('Paste key material first.');
-      // key_import doesn't take categoryIds in our IPC; create first, then assign.
-      const res = await call('key_import', {
-        pem,
-        name: el('importName').value.trim() || undefined,
-        passphrase: el('importPass').value || undefined,
-      });
-      const cats = (state._pendingImportCategories && state._pendingImportCategories()) || [];
-      if (res && res.id && cats.length) {
-        try { await call('key_set_categories', { keyId: res.id, categoryIds: cats }); }
-        catch (e) { /* assignment failed but key was created; surface but don't fail the create */ toast('Key imported, but category assignment failed: ' + (e.message || e), 'err'); }
-      }
-      toast('Key imported.', 'ok');
+/// What key_import says about a key it cannot read, said here first (ruling
+/// R9 / A7-03 / A5-39). The backend reads OpenSSH private keys and PuTTY .ppk
+/// files only; for the formats people actually have - PKCS#1 / SEC1 / PKCS#8
+/// PEM files, public keys - this returns the backend's own guidance, word for
+/// word (keys::unsupported_import_message in src-tauri/src/crypto/keys.rs), so
+/// the private key is never sent across just to be refused. null: a supported
+/// format, or text it does not recognise, which the backend judges.
+const IMPORT_SUPPORTED = 'SSHSpan imports OpenSSH private keys (-----BEGIN OPENSSH PRIVATE KEY-----) and PuTTY .ppk files only.';
+const IMPORT_CONVERT = 'Convert a copy with: ssh-keygen -p -o -f <copy-of-the-key-file> (it rewrites that file in OpenSSH format and asks for a passphrase to keep or set), then import the result.';
+const IMPORT_PUTTYGEN = ' Or load it in PuTTYgen and use "Save private key" to get a .ppk.';
+/// [header, what it is, whether PuTTYgen can load it] - the order matters:
+/// "BEGIN ENCRYPTED PRIVATE KEY" contains "PRIVATE KEY" too.
+const IMPORT_PRIVATE_PEM = [
+  ['-----BEGIN RSA PRIVATE KEY-----', 'a PKCS#1 RSA private key', true],
+  ['-----BEGIN EC PRIVATE KEY-----', 'a SEC1 EC private key', true],
+  ['-----BEGIN ENCRYPTED PRIVATE KEY-----', 'an encrypted PKCS#8 private key', false],
+  ['-----BEGIN PRIVATE KEY-----', 'a PKCS#8 private key', false],
+];
+
+function unsupportedImportMessage(text) {
+  const t = String(text || '').trim();
+  if (t.startsWith('-----BEGIN OPENSSH PRIVATE KEY-----') || t.startsWith('PuTTY-User-Key-File-')) return null;
+  for (const [header, what, puttygen] of IMPORT_PRIVATE_PEM) {
+    if (t.includes(header)) {
+      return `Unsupported key format: this is ${what} (${header}). ${IMPORT_SUPPORTED} ${IMPORT_CONVERT}${puttygen ? IMPORT_PUTTYGEN : ''}`;
     }
-    closeKeyModal();
-    el('genName').value = ''; el('genComment').value = '';
-    el('importName').value = '';
-    await loadKeys();
+  }
+  let what = null;
+  if (t.includes('-----BEGIN PUBLIC KEY-----')) what = 'an SPKI public key (-----BEGIN PUBLIC KEY-----)';
+  else if (t.includes('---- BEGIN SSH2 PUBLIC KEY ----')) what = 'an RFC 4716 public key (---- BEGIN SSH2 PUBLIC KEY ----)';
+  else if (looksLikePublicKeyLine(t)) what = 'an OpenSSH public key line (authorized_keys / .pub)';
+  return what
+    ? `Unsupported key format: this is ${what}, which holds only the public half. A vault key needs the private key - import the matching OpenSSH private key or PuTTY .ppk file instead.`
+    : null;
+}
+
+/// An authorized_keys / .pub line: an SSH algorithm name followed by base64
+/// starting "AAAA", options in front allowed - the backend's test, mirrored.
+function looksLikePublicKeyLine(text) {
+  return text.split('\n').some((line) => {
+    const words = line.trim().split(/\s+/);
+    return words.some((w, i) => i + 1 < words.length
+      && (w.startsWith('ssh-') || w.startsWith('ecdsa-sha2-') || w.startsWith('sk-'))
+      && words[i + 1].startsWith('AAAA'));
+  });
+}
+
+/// The import tab's format message: shown with `msg`, emptied and hidden
+/// without one (a hidden description must not keep stale words either).
+function showImportFormatMsg(msg) { showFieldMessage('importFormatMsg', msg); }
+
+/// The backend's answer to a name another key already has (A2-46 / A5-25).
+const DUPLICATE_KEY_NAME = /^A key named ".*" already exists\./;
+
+/// The Generate tab's request (split from submitKeyModal, M7).
+async function createKeyFromForm() {
+  const cats = (state._pendingGenerateCategories && state._pendingGenerateCategories()) || [];
+  return call('key_create_with_categories', {
+    keyType: el('genType').value === 'ecdsa'
+      ? `ecdsa-${el('genCurve').value || 'p256'}`
+      : el('genType').value,
+    bits: Number(el('genBits').value),
+    name: el('genName').value.trim() || undefined,
+    comment: el('genComment').value.trim() || undefined,
+    categoryIds: cats,
+  });
+}
+
+/// The Import tab's request. Resolves null when the dialog shows the format
+/// guidance instead; throws every other refusal for the caller to report.
+async function importKeyFromForm() {
+  const pem = el('importPem').value;
+  if (!pem.trim()) throw new Error('Paste key material first.');
+  // Only OpenSSH private keys and PuTTY .ppk files can be imported (R9).
+  // Anything else recognisable is answered here, with the backend's own
+  // guidance, before a private key is sent across just to be refused.
+  const unsupported = unsupportedImportMessage(pem);
+  if (unsupported) {
+    showImportFormatMsg(unsupported);
+    el('importPem').focus();
+    return null;
+  }
+  // key_import doesn't take categoryIds in our IPC; create first, then assign.
+  let res;
+  try {
+    res = await call('key_import', {
+      pem,
+      name: el('importName').value.trim() || undefined,
+      passphrase: el('importPass').value || undefined,
+    });
   } catch (e) {
-    toast(e.message || String(e), 'err');
-  } finally {
-    submitKeyModal._busy = false;
-    primary.disabled = false;
+    const msg = e.message || String(e);
+    // The format guidance belongs beside the key it is about, where it
+    // stays readable; every other refusal is a toast like before.
+    if (/^Unsupported key format/.test(msg)) {
+      showImportFormatMsg(msg);
+      el('importPem').focus();
+      return null;
+    }
+    throw e;
+  }
+  const cats = (state._pendingImportCategories && state._pendingImportCategories()) || [];
+  if (res && res.id && cats.length) {
+    try { await call('key_set_categories', { keyId: res.id, categoryIds: cats }); }
+    catch (e) { /* assignment failed but key was created; surface but don't fail the create */ toast('Key imported, but category assignment failed: ' + (e.message || e), 'err'); }
+  }
+  return res || {};
+}
+
+async function submitKeyModal() {
+  const activeTab = document.querySelector('.tab.active').dataset.tab;
+  const generating = activeTab === 'generate';
+  // withBusy is the re-entrancy guard (A2-18): key generation can take seconds
+  // (RSA-4096), and a second click - or Enter held down - used to store a
+  // second identical key.
+  await withBusy(el('modalPrimary'), generating ? 'Creating…' : 'Importing…', async () => {
+    try {
+      const res = generating ? await createKeyFromForm() : await importKeyFromForm();
+      // null: the dialog itself says what to do instead (an import format).
+      if (res === null) return;
+      closeKeyModal();
+      el('genName').value = ''; el('genComment').value = '';
+      el('importName').value = '';
+      await loadKeys();
+      // A key the list's filter hides was reported as plainly "generated", and
+      // looked lost (A5-42).
+      const done = generating ? 'Key generated' : 'Key imported';
+      const hidden = res && res.id && state.keys.some((k) => k.id === res.id) && !filteredKeys().some((k) => k.id === res.id);
+      toast(hidden ? done + ' - it is hidden by the current filter. Clear the filter to see it.' : done + '.', 'ok');
+    } catch (e) {
+      const msg = e.message || String(e);
+      toast(msg, 'err');
+      // A name another key has: the backend's words, and the caret on the name.
+      if (DUPLICATE_KEY_NAME.test(msg)) {
+        const nameField = el(generating ? 'genName' : 'importName');
+        nameField.focus();
+        nameField.select();
+      }
+    }
+  });
+  // withBusy put back the label it found; a tab switched meanwhile has its own.
+  // Not from a second call that withBusy turned away while the first runs.
+  if (!el('modalBackdrop').hidden && el('modalPrimary').getAttribute('aria-busy') !== 'true') {
+    switchTab(document.querySelector('.tab.active').dataset.tab);
   }
 }
 
@@ -2874,116 +3536,326 @@ async function openDeploySheet() {
   el('deployModalTitle').textContent = ids.length === 1 ? 'Deploy 1 key' : 'Deploy ' + ids.length + ' keys';
   el('deployConfigBtnLabel').textContent = ids.length === 1 ? 'Deploy 1 key' : 'Deploy ' + ids.length + ' keys';
   await fillPathHints();
+  syncDeployRegisterToggle();
   el('deployModal').hidden = false;
   await previewConfig();
   el('cfgHost').focus();
 }
 
 function closeDeploySheet() {
+  // A preview still waiting on the typing delay must not ask the backend
+  // about a sheet that is gone; an answer on its way is dropped (M7).
+  cancelScheduledDeployPreview();
+  deployPreviewSeq += 1;
   el('deployModal').hidden = true;
   const pass = el('keyPassphraseInput');
   if (pass) pass.value = '';
+  showDeployFieldError('');
 }
 
+/// The sheet's host fields as key_deploy_preview / key_deploy take them, or
+/// { error, field } for one the backend cannot be sent. The port must be a
+/// whole number from 1 to 65535: anything else reached the command as a u16
+/// argument-decoding error, shown raw (A2-39). Blank fields are left out; the
+/// backend checks HostName, User and the alias itself, and its answer is
+/// shown in the sheet before anything is written (A2-33).
+function deployFields() {
+  const port = el('cfgPort');
+  const raw = port.value.trim();
+  // A number field hands over "" for text it cannot read: badInput says so.
+  if ((port.validity && port.validity.badInput) || (raw !== '' && (!/^\d+$/.test(raw) || +raw < 1 || +raw > 65535))) {
+    return { error: 'Port must be between 1 and 65535.', field: 'cfgPort' };
+  }
+  const text = (id) => el(id).value.trim() || undefined;
+  return {
+    hostAlias: text('cfgHost'),
+    hostname: text('cfgHostname'),
+    user: text('cfgUser'),
+    port: raw === '' ? undefined : Number(raw),
+    strictHostKey: el('strictHostKeyToggle').checked,
+  };
+}
+
+/// Why the sheet's fields cannot be deployed as they stand, under them.
+function showDeployFieldError(msg) { showFieldMessage('deployFieldError', msg); }
+
+/// "Also save these as servers" registers each deployed key FILE as a server's
+/// key. SSHSpan's own client cannot open a passphrase-protected key file, so
+/// with a deploy passphrase those servers could never connect (A7-32 / A5-26):
+/// the option is off and says why while a passphrase is set.
+function syncDeployRegisterToggle() {
+  const toggle = el('deployRegisterToggle');
+  const locked = el('keyPassphraseToggle').checked;
+  if (locked) toggle.checked = false;
+  setDisabledFor(toggle, 'passphrase', locked);
+  el('deployRegisterHint').textContent = locked
+    ? 'Not with a passphrase: SSHSpan\'s client cannot open a passphrase-protected key file. Connect with the vault key instead.'
+    : 'They appear under Servers, ready to connect. Needs a Host alias and a User.';
+}
+
+/// `dir` and `name` joined with the separator `dir` itself uses: system_paths
+/// reports a Windows path with backslashes, which the hint used to end in
+/// "/sshspan_<name>" (A8-26).
+function joinPlatformPath(dir, name) {
+  const d = String(dir || '');
+  const sep = d.includes('\\') ? '\\' : '/';
+  return d.endsWith(sep) ? d + name : d + sep + name;
+}
+
+/// Only the latest preview may fill the sheet: the fields change faster than
+/// the answers come back.
+let deployPreviewSeq = 0;
+let deployPreviewTimer = null;
+const DEPLOY_PREVIEW_DELAY_MS = 150;
+
+function cancelScheduledDeployPreview() {
+  clearTimeout(deployPreviewTimer);
+  deployPreviewTimer = null;
+}
+
+/// Keystrokes coalesce into one backend read (M7). An answer still on its way
+/// for older fields is invalidated at once, not when the delay expires. A
+/// local field error (the port) is shown at once and asks the backend nothing.
+/// Deploy and Copy config ask afresh themselves, so neither waits on the delay
+/// or acts on text for older fields.
+function scheduleDeployPreview() {
+  cancelScheduledDeployPreview();
+  deployPreviewSeq += 1;
+  const fields = deployFields();
+  if (fields.error) {
+    previewConfig();
+    return;
+  }
+  showDeployFieldError('');
+  deployPreviewTimer = setTimeout(() => { deployPreviewTimer = null; previewConfig(); }, DEPLOY_PREVIEW_DELAY_MS);
+}
+
+/// What the deploy would write, as the backend plans it (ruling R3). The
+/// sheet used to build its own guess - a Host / HostName / User / Port block
+/// between "managed" markers - while key_deploy wrote something else (the key
+/// name as the alias, none of those fields, no markers) into a file ssh never
+/// read (A2-05 / A7-04 / A8-01 / A5-04). key_deploy_preview runs the same plan
+/// the deploy does and returns its exact text, each key's real files, and why
+/// any key would be refused (A2-46).
+///
+/// Resolves with the plan for the fields as they were when it was asked
+/// (null: nothing to plan, or the backend refused the fields). The sheet is
+/// only redrawn by the latest request.
 async function previewConfig() {
+  // Asked now: whatever was waiting on the typing delay is superseded.
+  cancelScheduledDeployPreview();
+  const seq = ++deployPreviewSeq;
   const ids = [...state.deploySelected];
-  if (ids.length === 0) { el('configPreview').value = ''; return; }
-  const host = el('cfgHost').value.trim() || 'sshspan-host';
-  const user = el('cfgUser').value.trim();
-  const port = Number(el('cfgPort').value) || 22;
-  const strict = el('strictHostKeyToggle')?.checked !== false;
-  const encrypted = el('keyPassphraseToggle')?.checked === true;
-  const selected = state.keys.filter(k => ids.includes(k.id));
-  const blocks = selected.map((key) => {
-    const alias = selected.length === 1 ? host : `${host}-${safeFileName(key.name)}`;
-    const keyFile = `~/.ssh/sshspan_${safeFileName(key.name)}`;
-    return [
-      `Host ${alias}`,
-      `  HostName ${alias}`,
-      user ? `  User ${user}` : '',
-      `  Port ${port}`,
-      `  IdentityFile ${keyFile}`,
-      '  IdentitiesOnly yes',
-      `  StrictHostKeyChecking ${strict ? 'yes' : 'no'}`,
-      encrypted ? '  # deployed private key is passphrase-protected' : '',
-    ].filter(Boolean).join('\n');
-  });
-  /// These joins were '\\n' - an escaped backslash, so the preview rendered the
-  /// two characters \n instead of a line break and the whole config came out as
-  /// one unreadable line. deployConfig() a few lines down always used '\n'.
-  el('configPreview').value =
-    '# >>> SSHSpan managed >>>\n' + blocks.join('\n\n') + '\n# <<< SSHSpan managed <<<\n';
+  const fields = deployFields();
+  showDeployFieldError(fields.error || '');
+  if (!ids.length || fields.error) {
+    state.deployPreview = null;
+    renderDeployPreview(null, !ids.length);
+    return null;
+  }
+  let res;
+  try {
+    res = await call('key_deploy_preview', {
+      ids, hostAlias: fields.hostAlias, hostname: fields.hostname, user: fields.user,
+      port: fields.port, strictHostKey: fields.strictHostKey,
+    });
+  } catch (e) {
+    if (seq !== deployPreviewSeq) return null;
+    // A field the backend will not write (alias pattern, quotes in HostName,
+    // ...): its own words, under the fields, and nothing to deploy.
+    state.deployPreview = null;
+    showDeployFieldError(e.message || String(e));
+    renderDeployPreview(null, false);
+    return null;
+  }
+  const plan = res || {};
+  if (seq !== deployPreviewSeq) return plan;
+  state.deployPreview = plan;
+  renderDeployPreview(plan, false);
+  return plan;
+}
+
+/// Fill the preview side of the sheet from a key_deploy_preview answer (null:
+/// nothing to show). Everything dynamic goes in through textContent.
+function renderDeployPreview(p, noSelection) {
+  const keys = arrayOrEmpty(p && p.keys);
+  const text = el('configPreview');
+  text.value = p && typeof p.configText === 'string' ? p.configText : '';
+  text.placeholder = noSelection ? '# Select at least one key'
+    : !p ? '# Nothing to show until the fields above can be written'
+      : '# None of the selected keys would be written';
+  if (p && p.sshDir) el('deployDirHint').textContent = joinPlatformPath(p.sshDir, 'sshspan_<name>');
+  if (p && p.configPath) el('sshConfigHint').textContent = p.configPath;
+  el('deployIncludeLine').textContent = (p && p.includeLine) || '…';
+  el('copyIncludeBtn').disabled = !(p && p.includeLine);
+  const plan = el('deployPlan');
+  plan.replaceChildren(...keys.map(deployPlanItem));
+  plan.hidden = keys.length === 0;
+  const refused = keys.filter((k) => k.refusal).length;
+  el('deploySelectionHint').textContent = refused
+    ? `${refused} of ${keys.length} selected key(s) cannot be deployed - see why above.`
+    : 'Nothing is written until you press Deploy.';
+  // Nothing to deploy: fields the backend refuses, or every key refused.
+  setDisabledFor(el('deployConfigBtn'), 'invalid', !noSelection && (!p || (keys.length > 0 && refused === keys.length)));
+}
+
+/// One key of the plan: where its files go and its Host alias - or, for a
+/// key the deploy will refuse, the reason in the backend's words.
+function deployPlanItem(k) {
+  const li = document.createElement('li');
+  li.className = 'deploy-plan-item' + (k.refusal ? ' refused' : '');
+  const head = document.createElement('span');
+  head.className = 'deploy-plan-name';
+  head.textContent = (k.name || k.id) + (k.alias ? ' - Host ' + k.alias : '');
+  li.appendChild(head);
+  for (const f of [k.file, k.pubFile]) {
+    if (!f) continue;
+    const code = document.createElement('code');
+    code.textContent = f;
+    li.appendChild(code);
+  }
+  const notes = [];
+  if (k.refusal) notes.push(k.refusal);
+  else {
+    // The backend refuses each of these; said here too should one ever come
+    // without its refusal.
+    if (k.ownedByOtherKey) notes.push('This file belongs to another key.');
+    if (k.overwritesFile) notes.push('A file SSHSpan did not write for this key is already there.');
+    if (k.aliasOwnedByOtherKey) notes.push('This Host alias already points at another key.');
+  }
+  for (const n of notes) {
+    const why = document.createElement('span');
+    why.className = 'deploy-plan-refusal';
+    why.textContent = n;
+    li.appendChild(why);
+  }
+  return li;
 }
 
 async function deployConfig() {
+  // One deploy per click (A2-18): the button stays busy until it is done.
+  await withBusy(el('deployConfigBtn'), 'Deploying…', runDeploy);
+}
+
+async function runDeploy() {
   const ids = [...state.deploySelected];
   if (ids.length === 0) { toast('Select at least one key first.', 'err'); return; }
-  // Real paths, from the backend. This prompt used to say it updated
-  // ~/.ssh/config; it does not - the managed config lives in the app config
-  // dir, while the private key really does land in ~/.ssh. Someone ticking
-  // "strict host key checking" here was told their system SSH was being
-  // configured when it was not.
-  const paths = await systemPaths();
-  const sure = await confirmModal('Deploy keys',
-    'Deploy ' + ids.length + ' key(s) to ' + paths.deployDir + '/ and update ' + paths.sshConfig + '?',
-    'Deploy', { danger: false });
-  if (!sure) return;
-  try {
-    const passphraseEnabled = el('keyPassphraseToggle')?.checked === true;
-    const passphrase = passphraseEnabled ? (el('keyPassphraseInput')?.value || '') : undefined;
-    if (passphraseEnabled && !passphrase) {
-      toast('Enter a passphrase for encrypted deployed keys.', 'err');
-      el('keyPassphraseInput')?.focus();
-      return;
-    }
-    const strictHostKey = el('strictHostKeyToggle')?.checked !== false;
-    const res = await call('key_deploy', { ids, passphrase, strictHostKey });
-    el('configPreview').value = 'Deployed ' + res.keys.length + ' key(s)\n'
-      + res.keys.map(k => '  ' + k.name + ' -> ' + k.file).join('\n');
-    toast('Keys deployed.', 'ok');
-    // The sheet has done its job; the Deployed chips on the rows behind it are
-    // now the record, so reload them and get out of the way.
-    closeDeploySheet();
-    state.deploySelected.clear();
-    await loadKeys();
-    updateSelectionHint();
-
-    // Optionally register the deployed keys as saved servers (Deploy ↔ Servers bridge).
-    if (el('deployRegisterToggle')?.checked) {
-      const alias = el('cfgHost').value.trim();
-      const user = el('cfgUser').value.trim();
-      if (!alias || !user) {
-        toast('Enter a Host alias and User to register servers.', 'info');
-        return;
-      }
-      const multi = res.keys.length > 1;
-      let registered = 0;
-      for (const k of res.keys) {
-        try {
-          await call('server_save', {
-            id: null,
-            name: multi ? `${alias} · ${k.name}` : alias,
-            host: alias,
-            port: parseInt(el('cfgPort').value, 10) || 22,
-            username: user,
-            authMethod: 'publickey',
-            keyId: null,
-            pemPath: k.file,
-            savedPassword: null,
-            categoryId: null,
-            color: null,
-          });
-          registered += 1;
-        } catch (e) { /* keep registering the rest */ }
-      }
-      if (registered) {
-        await loadServers();
-        toast(`${registered} server(s) saved under Servers.`, 'ok');
-      }
-    }
-  } catch (e) {
-    toast(e.message || String(e), 'err');
+  // Everything that can be checked here is checked BEFORE anything is
+  // written (A2-33): the "save as servers" fields used to be checked only
+  // after the keys were on disk and the sheet had closed.
+  const fields = deployFields();
+  if (fields.error) {
+    showDeployFieldError(fields.error);
+    el(fields.field).focus();
+    return;
   }
+  const passphraseEnabled = el('keyPassphraseToggle').checked;
+  const passphrase = passphraseEnabled ? el('keyPassphraseInput').value : undefined;
+  if (passphraseEnabled && !passphrase) {
+    toast('Enter a passphrase for encrypted deployed keys.', 'err');
+    el('keyPassphraseInput').focus();
+    return;
+  }
+  const register = el('deployRegisterToggle').checked && !passphraseEnabled;
+  if (register && (!fields.hostAlias || !fields.user)) {
+    showDeployFieldError('Enter a Host alias and a User to save the keys as servers - or untick "Also save these as servers".');
+    el(fields.hostAlias ? 'cfgUser' : 'cfgHost').focus();
+    return;
+  }
+  // The plan as the backend sees it now, for the question below: the real
+  // files (not "<deploy dir>/" with the wrong separator, A8-26) and the keys
+  // it will refuse. A field it will not write stops here, with its reason.
+  // Asked directly, never through the typing delay (M7); the answer used is
+  // the one for exactly these fields, even if a later keystroke superseded
+  // what the sheet shows.
+  const plan = await previewConfig();
+  if (!plan) return;
+  const planned = arrayOrEmpty(plan.keys);
+  const writes = planned.filter((k) => !k.refusal);
+  const refused = planned.filter((k) => k.refusal);
+  if (planned.length && !writes.length) {
+    toast('None of the selected keys can be deployed:\n' + refused.map((k) => k.refusal).join('\n'), 'err');
+    return;
+  }
+  const sure = await confirmModal('Deploy keys', deployQuestion(writes, refused, plan, ids.length), 'Deploy', { danger: false });
+  if (!sure) return;
+  let res;
+  try {
+    res = await call('key_deploy', {
+      ids, passphrase, strictHostKey: fields.strictHostKey,
+      hostAlias: fields.hostAlias, hostname: fields.hostname, user: fields.user, port: fields.port,
+    });
+  } catch (e) {
+    // Nothing was deployed; the reasons, one per key. The sheet stays open.
+    toast(e.message || String(e), 'err');
+    return;
+  }
+  const deployed = arrayOrEmpty(res && res.keys);
+  // Servers BEFORE the sheet closes, with every failure reported (A2-33):
+  // they were saved after it had closed, and a failed save was swallowed.
+  const notSaved = register ? await saveDeployedAsServers(deployed, fields) : [];
+  closeDeploySheet();
+  state.deploySelected.clear();
+  await loadKeys();
+  updateSelectionHint();
+  toast(deployed.length === 1 ? 'Deployed 1 key.' : `Deployed ${deployed.length} keys.`, 'ok');
+  // A partial deploy says what it did not do, and what went wrong around it.
+  const errors = arrayOrEmpty(res && res.errors);
+  if (errors.length) toast(errors.map((e) => e.error || e.name).join('\n'), 'err');
+  const warnings = arrayOrEmpty(res && res.warnings);
+  if (warnings.length) toast(warnings.join('\n'), 'warn');
+  if (notSaved.length) toast('Not saved as servers:\n' + notSaved.join('\n'), 'err');
+}
+
+/// The question before a deploy: the files it writes, the file it updates,
+/// and the keys it will skip.
+function deployQuestion(writes, refused, plan, selected) {
+  const lines = [];
+  if (writes.length) {
+    lines.push(`Deploy ${writes.length} key(s)?`, '');
+    for (const k of writes.slice(0, 8)) lines.push('  ' + k.file);
+    if (writes.length > 8) lines.push(`  ...and ${writes.length - 8} more`);
+  } else {
+    lines.push(`Deploy ${selected} key(s)?`);
+  }
+  if (plan.configPath) lines.push('', 'Host blocks go in ' + plan.configPath + '.');
+  if (refused.length) lines.push('', 'Not deployed: ' + refused.map((k) => '"' + (k.name || k.id) + '"').join(', ') + ' (see the sheet).');
+  return lines.join('\n');
+}
+
+/// "Also save these as servers": one saved server per deployed key file, with
+/// the sheet's fields. Returns "<server>: <reason>" for each that could not be
+/// saved.
+async function saveDeployedAsServers(deployed, fields) {
+  const failed = [];
+  let saved = 0;
+  for (const k of deployed) {
+    // The Host alias the deploy wrote for this key - the one ssh knows it by.
+    const name = k.alias || (deployed.length > 1 ? `${fields.hostAlias} - ${k.name}` : fields.hostAlias);
+    try {
+      await call('server_save', {
+        id: null,
+        name,
+        host: fields.hostname || fields.hostAlias,
+        port: fields.port || 22,
+        username: fields.user,
+        authMethod: 'publickey',
+        keyId: null,
+        pemPath: k.file,
+        savedPassword: null,
+        categoryId: null,
+        color: null,
+      });
+      saved += 1;
+    } catch (e) {
+      failed.push(name + ': ' + (e.message || String(e)));
+    }
+  }
+  if (saved) {
+    await loadServers();
+    toast(`${saved} server(s) saved under Servers.`, 'ok');
+  }
+  return failed;
 }
 
 // Import a Host block from ~/.ssh/config into the server-edit modal, prefilled.
@@ -3026,10 +3898,29 @@ async function importFromSshConfig(anchorEl) {
 }
 
 async function copyConfig() {
+  // Fields typed within the preview delay are not shown yet: ask now rather
+  // than copy the text of older fields (M7).
+  if (deployPreviewTimer) await previewConfig();
   const text = el('configPreview').value;
-  if (!text) { toast('Nothing to copy \u2014 preview first.', 'err'); return; }
+  // The preview is always live: the old message sent the user to a Preview
+  // button that no longer exists (A2-34 / A8-26). Say what is missing.
+  if (!text) {
+    toast(!state.deploySelected.size ? 'Nothing to copy - select at least one key first.'
+      : 'Nothing to copy - none of the selected keys can be deployed as the sheet stands.', 'err');
+    return;
+  }
   const ok = await copyText(text);
   toast(ok ? 'Config copied.' : 'Clipboard unavailable.', ok ? 'ok' : 'err');
+}
+
+/// Copy the line that makes ssh read SSHSpan's config file (A5-05): deployed
+/// Host blocks did nothing until ~/.ssh/config included that file, and
+/// nothing said so.
+async function copyIncludeLine() {
+  const line = state.deployPreview && state.deployPreview.includeLine;
+  if (!line) return;
+  const ok = await copyText(line);
+  toast(ok ? 'Include line copied - put it at the top of ~/.ssh/config.' : 'Clipboard unavailable.', ok ? 'ok' : 'err');
 }
 
 // ─── bitwarden sync settings ───────────────────────────────────────────────
@@ -3049,9 +3940,14 @@ function setBwStatus(text, cls) {
   s.textContent = text;
 }
 
+/// The latest form load only; the form is built aside and swapped in whole
+/// (A2-29): it used to be cleared before the await and filled after it, so
+/// two loads at once built every field twice.
+let bwConfigSeq = 0;
+
 async function loadBitwardenConfig() {
   const grid = el('bwGrid');
-  grid.innerHTML = '';
+  const seq = ++bwConfigSeq;
 
   let config = {};
   try {
@@ -3059,7 +3955,9 @@ async function loadBitwardenConfig() {
   } catch {
     // first launch - no config yet
   }
+  if (seq !== bwConfigSeq) return;
 
+  const fields = document.createDocumentFragment();
   for (const f of BW_FIELDS) {
     const label = document.createElement('label');
     const span = document.createElement('span');
@@ -3076,8 +3974,9 @@ async function loadBitwardenConfig() {
     if (f.key === 'master_password') inp.value = ''; // never pre-fill password
     label.appendChild(span);
     label.appendChild(inp);
-    grid.appendChild(label);
+    fields.appendChild(label);
   }
+  grid.replaceChildren(fields);
   wireRevealToggles(grid); // the master password's eye button (A5-35)
 
   // Sync status
@@ -3173,7 +4072,8 @@ async function fillPathHints() {
   const set = (id, val) => { const n = el(id); if (n) n.textContent = val; };
   set('dataDirHint', p.database);
   set('sshConfigHint', p.sshConfig);
-  set('deployDirHint', p.deployDir + '/sshspan_<name>');
+  // With the separator of the path it extends (A8-26).
+  set('deployDirHint', joinPlatformPath(p.deployDir, 'sshspan_<name>'));
 }
 
 /// Settings is one page with a section rail, not five destinations. Audit used
@@ -3632,8 +4532,9 @@ async function loadSettings() {
   keepaliveInfo.textContent = 'Automatic - protocol-level, every 30 s';
   mkRow('SSH keepalive', keepaliveInfo,
     'Protocol-level, so it never sends bytes your remote shell can see.');
-
-  loadKnownHosts();
+  // The pinned hosts are not read here: switchView('settings') and the
+  // restore read them, and doing it here too made every Settings visit read
+  // them twice (A2-29).
 }
 
 // ─── vault backup / restore (Settings panel) ───────────────────────────────
@@ -3765,7 +4666,10 @@ async function reloadAfterRestore() {
     return;
   }
   applyStoredSettings(stored);
-  if (state.view === 'settings') await loadSettings();
+  if (state.view === 'settings') {
+    await loadSettings();
+    await loadKnownHosts(); // the restore brought pinned host keys too
+  }
 }
 
 /// Put stored settings into effect: the SFTP dual-pane default, the interface
@@ -3781,57 +4685,89 @@ function applyStoredSettings(stored) {
 }
 
 // ─── known hosts (Settings panel) ──────────────────────────────────────────
+
+/// Only the latest load may fill the table (A2-29). The table was cleared
+/// before the await and filled after it, so two loads at once - Settings used
+/// to start two - listed every host twice, and an older answer arriving late
+/// replaced a newer one.
+let knownHostsSeq = 0;
+
 async function loadKnownHosts() {
   const body = el('knownHostsBody');
   const empty = el('knownHostsEmpty');
   if (!body) return;
-  body.innerHTML = '';
+  const seq = ++knownHostsSeq;
+  const chip = el('knownHostsCount');
+  let hosts;
   try {
     const res = await call('known_hosts_list');
-    const hosts = res.hosts || [];
-    empty.hidden = hosts.length > 0;
-    const chip = el('knownHostsCount');
-    if (chip) {
-      chip.hidden = hosts.length === 0;
-      chip.textContent = hosts.length === 1 ? '1 pinned' : hosts.length + ' pinned';
-    }
-    for (const h of hosts) {
-      const tr = document.createElement('tr');
-      const tdHost = document.createElement('td');
-      tdHost.textContent = h.host;
-      const tdFp = document.createElement('td');
-      const code = document.createElement('code');
-      code.className = 'mono';
-      code.textContent = h.fingerprintSha256 || '-';
-      tdFp.appendChild(code);
-      const tdSeen = document.createElement('td');
-      tdSeen.textContent = fmtTime(h.firstSeen);
-      const tdAct = document.createElement('td');
-      const forget = document.createElement('button');
-      forget.className = 'ghost-btn';
-      forget.innerHTML = `${ico('trash-2')}<span>Forget</span>`;
-      // known_hosts_forget is refused while the vault is locked (A6-08).
-      lockGate(forget, 'hosts');
-      forget.addEventListener('click', async () => {
-        if (!lockGateOpen('hosts')) return;
-        const forgetIt = await confirmModal('Forget host key',
-          `Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`,
-          'Forget');
-        if (!forgetIt) return;
-        try {
-          await call('known_hosts_forget', { host: h.host });
-          await loadKnownHosts();
-          toast('Host forgotten.', 'ok');
-        } catch (e) { toast(e.message || String(e), 'err'); }
-      });
-      tdAct.appendChild(forget);
-      tr.appendChild(tdHost); tr.appendChild(tdFp); tr.appendChild(tdSeen); tr.appendChild(tdAct);
-      body.appendChild(tr);
-    }
+    hosts = res.hosts || [];
   } catch (e) {
-    empty.hidden = false;
-    body.innerHTML = '';
+    if (seq !== knownHostsSeq) return;
+    // A failure is not "No hosts pinned yet" - that is what it used to show,
+    // with no word of the error. Said in the table, with a Retry, and toasted.
+    const msg = e.message || String(e);
+    empty.hidden = true;
+    if (chip) chip.hidden = true;
+    const tr = document.createElement('tr');
+    tr.className = 'load-error-row';
+    const td = document.createElement('td');
+    td.colSpan = 4;
+    const text = document.createElement('span');
+    text.textContent = 'Could not load the pinned host keys: ' + msg;
+    const again = document.createElement('button');
+    again.type = 'button';
+    again.className = 'ghost-btn';
+    again.innerHTML = `${ico('refresh-cw')}<span>Retry</span>`;
+    again.addEventListener('click', () => withBusy(again, 'Retrying…', () => loadKnownHosts()));
+    td.append(text, again);
+    tr.appendChild(td);
+    body.replaceChildren(tr);
+    toast(msg, 'err');
+    return;
   }
+  if (seq !== knownHostsSeq) return;
+  empty.hidden = hosts.length > 0;
+  if (chip) {
+    chip.hidden = hosts.length === 0;
+    chip.textContent = hosts.length === 1 ? '1 pinned' : hosts.length + ' pinned';
+  }
+  // Built aside and swapped in whole, so the table is never half-filled.
+  const rows = document.createDocumentFragment();
+  for (const h of hosts) {
+    const tr = document.createElement('tr');
+    const tdHost = document.createElement('td');
+    tdHost.textContent = h.host;
+    const tdFp = document.createElement('td');
+    const code = document.createElement('code');
+    code.className = 'mono';
+    code.textContent = h.fingerprintSha256 || '-';
+    tdFp.appendChild(code);
+    const tdSeen = document.createElement('td');
+    tdSeen.textContent = fmtTime(h.firstSeen);
+    const tdAct = document.createElement('td');
+    const forget = document.createElement('button');
+    forget.className = 'ghost-btn';
+    forget.innerHTML = `${ico('trash-2')}<span>Forget</span>`;
+    // known_hosts_forget is refused while the vault is locked (A6-08).
+    lockGate(forget, 'hosts');
+    forget.addEventListener('click', async () => {
+      if (!lockGateOpen('hosts')) return;
+      const forgetIt = await confirmModal('Forget host key',
+        `Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`,
+        'Forget');
+      if (!forgetIt) return;
+      try {
+        await call('known_hosts_forget', { host: h.host });
+        await loadKnownHosts();
+        toast('Host forgotten.', 'ok');
+      } catch (e) { toast(e.message || String(e), 'err'); }
+    });
+    tdAct.appendChild(forget);
+    tr.appendChild(tdHost); tr.appendChild(tdFp); tr.appendChild(tdSeen); tr.appendChild(tdAct);
+    rows.appendChild(tr);
+  }
+  body.replaceChildren(rows);
 }
 
 // ─── audit view ────────────────────────────────────────────────────────────
@@ -4209,13 +5145,14 @@ function wire() {
     b.addEventListener('click', closeDeploySheet);
   }
   // Live preview: the old one stayed empty until you pressed a Preview button,
-  // so the first answer to "what will this write?" was nothing.
-  for (const id of ['cfgHost', 'cfgUser', 'cfgPort']) {
-    el(id).addEventListener('input', previewConfig);
+  // so the first answer to "what will this write?" was nothing. It is the
+  // backend's own plan now (R3), asked again as the fields change.
+  for (const id of ['cfgHost', 'cfgHostname', 'cfgUser', 'cfgPort']) {
+    el(id).addEventListener('input', scheduleDeployPreview);
   }
-  for (const id of ['strictHostKeyToggle', 'keyPassphraseToggle']) {
-    el(id).addEventListener('change', previewConfig);
-  }
+  el('strictHostKeyToggle').addEventListener('change', previewConfig);
+  el('keyPassphraseToggle').addEventListener('change', syncDeployRegisterToggle);
+  el('copyIncludeBtn').addEventListener('click', copyIncludeLine);
 
   // command palette
   el('paletteModal').addEventListener('click', (ev) => {
@@ -4237,7 +5174,9 @@ function wire() {
     if (!state.selectedId) return;
     const k = state.keys.find(x => x.id === state.selectedId);
     if (!k) return;
-    promptModal('Rename key', 'New name (no spaces - it is used as the Host alias in your SSH config):', k.name, async (name) => {
+    // Deploy names the key file after it, and uses it as the Host alias when
+    // the sheet's own alias field is left blank (R3) - not always, as this said.
+    promptModal('Rename key', 'New name (no spaces - a deploy names the key file after it, and uses it as the Host alias when none is given):', k.name, async (name) => {
       const next = (name || '').trim();
       if (!next || next === k.name) return;
       try {
@@ -4250,11 +5189,15 @@ function wire() {
   });
   el('detailCopyPublicBtn').addEventListener('click', copyPublic);
   el('detailDeleteBtn').addEventListener('click', deleteSelected);
+  el('detailUndeployBtn').addEventListener('click', undeploySelected);
   el('detailExportBtn').addEventListener('click', exportSelected);
+  el('selectAllKeys').addEventListener('change', toggleSelectAllShown);
 
   // new-key modal: category field
   const wireNewKeyCategories = (chipEl, btnEl, getCurrent, setCurrent) => {
-    const render = () => renderCategoryChips(chipEl, getCurrent(), { removable: true, onRemove: (id) => setCurrent(getCurrent().filter(x => x !== id)) });
+    // The chip's x removes it from the choice AND from the screen; it used to
+    // update only the choice, so a removed chip stayed on show.
+    const render = () => renderCategoryChips(chipEl, getCurrent(), { removable: true, onRemove: (id) => { setCurrent(getCurrent().filter(x => x !== id)); render(); } });
     btnEl.addEventListener('click', () => openCategoryPicker({
       title: 'Assign categories',
       scope: 'key',
@@ -4262,16 +5205,24 @@ function wire() {
       onSave: (ids) => { setCurrent(ids); render(); },
     }));
     render();
+    return render;
   };
   const genPicker = el('genBrowseCategoriesBtn');
   const impPicker = el('importBrowseCategoriesBtn');
   if (genPicker && impPicker) {
     const store = { generate: [], import: [] };
-    wireNewKeyCategories(el('genCategories'), genPicker, () => store.generate, (v) => { store.generate = v; });
-    wireNewKeyCategories(el('importCategories'), impPicker, () => store.import, (v) => { store.import = v; });
+    const renderGen = wireNewKeyCategories(el('genCategories'), genPicker, () => store.generate, (v) => { store.generate = v; });
+    const renderImp = wireNewKeyCategories(el('importCategories'), impPicker, () => store.import, (v) => { store.import = v; });
     // expose for submitKeyModal
     state._pendingGenerateCategories = () => store.generate;
     state._pendingImportCategories = () => store.import;
+    // openKeyModal starts both tabs from the same choice (A2-37 / A5-42).
+    state._resetPendingKeyCategories = (ids) => {
+      store.generate = [...ids];
+      store.import = [...ids];
+      renderGen();
+      renderImp();
+    };
   }
 
   // key modal
@@ -4297,6 +5248,9 @@ function wire() {
   });
   el('genType').addEventListener('change', onGenTypeChange);
   el('importBrowseBtn').addEventListener('click', browseForImport);
+  // The format message follows the pasted text: it shows as soon as a key in
+  // a format the vault cannot import is pasted, and goes when it is replaced.
+  el('importPem').addEventListener('input', () => showImportFormatMsg(unsupportedImportMessage(el('importPem').value)));
 
   // deploy sheet actions (Preview is gone - the preview is always live now)
   el('deployConfigBtn').addEventListener('click', deployConfig);
@@ -4359,7 +5313,12 @@ function wire() {
       e.preventDefault();
       if (!rows.length) return;
       const delta = e.key === 'ArrowDown' ? 1 : -1;
-      state.pickerActive = (state.pickerActive + delta + rows.length) % rows.length;
+      // From the search box (nothing highlighted yet, -1) Up goes to the last
+      // row and Down to the first; the modulo alone made Up land on the
+      // second-to-last (A2-36).
+      state.pickerActive = state.pickerActive < 0
+        ? (delta < 0 ? rows.length - 1 : 0)
+        : (state.pickerActive + delta + rows.length) % rows.length;
       renderPickerTree(el('pickerSearch').value);
       el('pickerTree').querySelector(`[data-index="${state.pickerActive}"]`)?.scrollIntoView({ block: 'nearest' });
       return;
@@ -4584,6 +5543,9 @@ function onVaultLocked() {
 /// then wipe the places a secret can sit. The vault dialog itself is closed
 /// without being marked dismissed: the unlock gate that follows must show.
 function closeDialogsForLock() {
+  // An open menu goes too: a category's Rename / Delete or a key's Connect,
+  // over a tree and a list the lock empties.
+  closeKeyConnectMenu();
   const rank = (n) => modalStack.findIndex((m) => m.node === n);
   const open = [...document.querySelectorAll('.modal-backdrop')]
     .filter((n) => !n.hidden && n !== el('vaultModal'))
@@ -4939,14 +5901,9 @@ function currentSelectedServer() {
 }
 
 function hostsInCategoryRecursive(catId) {
-  const ids = new Set();
-  const stack = [catId];
-  while (stack.length) {
-    const id = stack.pop();
-    for (const s of state.servers) if (s.categoryId === id) ids.add(s.id);
-    for (const child of childrenOf(id)) stack.push(child.id);
-  }
-  return state.servers.filter(s => ids.has(s.id));
+  // Cycle-safe like the key walk (A2-45): a parent cycle made this loop forever.
+  const cats = categoryAndDescendants(catId, 'host');
+  return state.servers.filter(s => cats.has(s.categoryId));
 }
 
 function renderServerList() {

@@ -98,12 +98,17 @@
         </div>
         <div class="keys-layout">
           <div class="key-list-col">
+            <!-- Select every key shown (A5-34): a bulk deploy was one click per
+                 key. It acts on what the search and filters leave visible. -->
+            <div class="key-list-head" id="keyListHead" hidden>
+              <label class="select-all"><input type="checkbox" id="selectAllKeys" /><span id="selectAllLabel">Select all</span></label>
+            </div>
             <div class="key-list" id="keyList"></div>
             <div class="empty-state" id="emptyState" hidden>
               <div class="empty-ico" data-ico="key-round"></div>
               <h3>No keys yet</h3>
               <p>Generate or import your first SSH key pair.</p>
-              <button id="emptyNewBtn" class="ghost-btn">+ New Key</button>
+              <button id="emptyNewBtn" class="ghost-btn">+ New key</button>
             </div>
             <!-- Selection acts here, where the selection is. Deploy used to be a
                  separate top-level view whose own copy read "select keys using
@@ -137,6 +142,8 @@
 
             <div class="detail-panel" id="detailPanel-overview" role="tabpanel" aria-labelledby="detailTab-overview">
               <dl class="detail-meta" id="detailMeta"></dl>
+              <!-- Deploy's inverse (A7-22 / A5-43): only for a deployed key. -->
+              <button id="detailUndeployBtn" class="ghost-btn undeploy-btn" type="button" hidden title="Delete the deployed key file and its Host block; the key stays in the vault"><span data-ico="trash-2"></span>Remove deployed copy</button>
               <h3 class="detail-label">Categories</h3>
               <div class="cat-chips" id="detailCategories"></div>
               <h3 class="detail-label">Fingerprint</h3>
@@ -591,7 +598,7 @@
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="key-square"></span>
-          <h2 id="modalTitle">New Key</h2>
+          <h2 id="modalTitle">New key</h2>
         </div>
         <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
       </header>
@@ -610,17 +617,21 @@
             </select>
           </label>
           <label id="genBitsRow">Bits
-            <select id="genBits">
+            <select id="genBits" aria-describedby="genBitsHint">
               <option value="3072">3072</option>
               <option value="4096" selected>4096</option>
               <option value="8192">8192</option>
             </select>
           </label>
+          <!-- Outside the label: a description, not part of the select's name. -->
+          <p class="hint gen-bits-hint" id="genBitsHint">RSA 4096 and 8192 can take a minute or longer to generate. The window stays usable while the key is being created.</p>
+          <!-- The values are the curve tags the backend's key types use
+               (ecdsa-p256 ...); the nistp* names stay as the labels (A2-02). -->
           <label id="genCurveRow" hidden>Curve
             <select id="genCurve">
-              <option value="nistp256" selected>nistp256</option>
-              <option value="nistp384">nistp384</option>
-              <option value="nistp521">nistp521</option>
+              <option value="p256" selected>nistp256</option>
+              <option value="p384">nistp384</option>
+              <option value="p521">nistp521</option>
             </select>
           </label>
           <label>Comment <input type="text" id="genComment" placeholder="user@host" spellcheck="false" autocomplete="off" /></label>
@@ -636,9 +647,13 @@
             <button type="button" id="importBrowseBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse for key file...</button>
             <span class="hint" id="importFileHint">or paste the key material below</span>
           </div>
-          <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, PuTTY .ppk v3, SPKI public PEM, or authorized_keys line)
-            <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."></textarea>
+          <!-- The two formats key_import reads (ruling R9). Anything else that
+               is recognisable gets the backend's conversion advice in
+               #importFormatMsg before it is sent anywhere. -->
+          <label>Paste an OpenSSH private key or a PuTTY .ppk file
+            <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ... or PuTTY-User-Key-File-3: ..." aria-describedby="importFormatMsg"></textarea>
           </label>
+          <p class="hint import-format-msg" id="importFormatMsg" role="alert" hidden></p>
           <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" autocomplete="off" /></label>
           <div class="cat-field">
             <span class="cat-field-label">Categories</span>
@@ -711,7 +726,7 @@
           <span class="modal-title-ico" data-ico="shield-check"></span>
           <div>
             <h2 id="deployModalTitle">Deploy keys</h2>
-            <p class="modal-sub">Writes the private keys to disk and adds a matching Host block to your SSH config.</p>
+            <p class="modal-sub">Writes each private key into your ~/.ssh folder and a Host block into SSHSpan's own ssh config file, which ssh reads once ~/.ssh/config includes it.</p>
           </div>
         </div>
         <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
@@ -719,11 +734,15 @@
       <div class="modal-body deploy-body">
         <div class="deploy-form">
           <div class="cat-chips" id="deployKeyChips"></div>
+          <!-- Every field goes into the Host block key_deploy writes (R3);
+               the preview beside them is the backend's own text for them. -->
           <div class="deploy-grid">
             <label class="span-2">Host alias <input type="text" id="cfgHost" placeholder="myserver" spellcheck="false" autocomplete="off" /></label>
+            <label class="span-2">HostName <input type="text" id="cfgHostname" placeholder="192.0.2.10 or host.example.com" spellcheck="false" autocomplete="off" /></label>
             <label>User <input type="text" id="cfgUser" placeholder="deploy" spellcheck="false" autocomplete="off" /></label>
             <label>Port <input type="number" id="cfgPort" placeholder="22" min="1" max="65535" /></label>
           </div>
+          <p class="field-error" id="deployFieldError" role="alert" hidden></p>
           <div class="opt-list">
             <label class="opt-row">
               <input type="checkbox" id="strictHostKeyToggle" checked /><span class="toggle-box"></span>
@@ -744,7 +763,7 @@
               <input type="checkbox" id="deployRegisterToggle" /><span class="toggle-box"></span>
               <span class="opt-text">
                 <span class="opt-title">Also save these as servers in SSHSpan</span>
-                <span class="opt-sub">They appear under Servers, ready to connect.</span>
+                <span class="opt-sub" id="deployRegisterHint">They appear under Servers, ready to connect. Needs a Host alias and a User.</span>
               </span>
             </label>
           </div>
@@ -756,11 +775,18 @@
             <span class="spacer"></span>
             <span class="hint">updates as you type</span>
           </div>
-          <p class="hint deploy-paths">
-            Keys go to <code id="deployDirHint">&hellip;</code>, owner-only. Host blocks go in
-            <code id="sshConfigHint">&hellip;</code> between <code># &gt;&gt;&gt; SSHSpan managed &gt;&gt;&gt;</code> markers.
-          </p>
-          <textarea id="configPreview" readonly spellcheck="false" placeholder="# Select at least one key"></textarea>
+          <div class="hint deploy-paths">
+            <p>Key files go to <code id="deployDirHint">&hellip;</code>, readable by you only:</p>
+            <ul class="deploy-plan" id="deployPlan" hidden></ul>
+            <p>Host blocks go in SSHSpan's own config file <code id="sshConfigHint">&hellip;</code>.
+              ssh reads it only through an Include line: put this line at the top of
+              ~/.ssh/config, before any Host block.</p>
+            <div class="include-row">
+              <code id="deployIncludeLine">&hellip;</code>
+              <button id="copyIncludeBtn" class="ghost-btn" type="button" title="Copy the Include line"><span data-ico="copy"></span>Copy</button>
+            </div>
+          </div>
+          <textarea id="configPreview" readonly spellcheck="false" placeholder="# Select at least one key" aria-label="The Host blocks this deploy writes"></textarea>
         </div>
       </div>
       <footer class="modal-footer">
@@ -911,6 +937,13 @@
       </header>
       <div class="modal-body">
         <p id="confirmMessage" class="hint"></p>
+        <!-- One optional choice that goes with the answer (confirmWithOption),
+             e.g. also removing a deleted key's deployed files. Hidden for
+             every other question. -->
+        <label class="toggle-chip confirm-option" id="confirmOptionRow" hidden>
+          <input type="checkbox" id="confirmOption" /><span class="toggle-box"></span>
+          <span id="confirmOptionLabel"></span>
+        </label>
       </div>
       <footer class="modal-footer">
         <button id="confirmCancelBtn" class="ghost-btn">Cancel</button>

@@ -36,7 +36,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const {
   failures, check, yes, loadChromium, rendererDir, serve, part,
-  KEY, SERVER, CATEGORY, withApp, waitVisible, openLiveTab,
+  KEY, SERVER, CATEGORY, withApp, waitVisible, openLiveTab, afterScheduledTimers,
 } = require('./lib/renderer-harness');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -359,6 +359,9 @@ async function scenarioKeyboard(browser, server) {
     check('A1-11 session tabs are reachable with Tab and say what they are', tabs.map((t) => [t.tabIndex, t.role]), [[0, 'button'], [0, 'button']]);
     check('A1-11 their close control is a named button', tabs.map((t) => t.close), [['BUTTON', true], ['BUTTON', true]]);
     const first = await page.evaluate(() => [...state.sessions.keys()][0]);
+    // The second tab's connect scheduled a deferred terminal focus (50-60 ms);
+    // let it land before the chip takes the focus, or Enter goes to the shell.
+    await afterScheduledTimers(page);
     await page.focus('#termTabs .term-tab');
     await page.keyboard.press('Enter');
     await page.waitForTimeout(100);
@@ -1110,6 +1113,8 @@ async function scenarioNestedKeys(browser, server) {
     await page.waitForFunction(() => [...state.sessions.keys()].filter((id) => window.tabSessionLive(id)).length === 2, null, { polling: 25 });
     const [first, second] = await page.evaluate(() => [...state.sessions.keys()]);
     await page.evaluate((t) => activateSessionTab(t), second);
+    // activateSessionTab focuses that terminal 60 ms later; let it land first.
+    await afterScheduledTimers(page);
     await page.focus(`#termTabs .term-tab[data-tab-id="${first}"] .term-tab-close`);
     await page.keyboard.press('Enter');
     await page.waitForTimeout(100);

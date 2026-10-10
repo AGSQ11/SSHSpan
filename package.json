@@ -42,6 +42,7 @@
     "test:sftp": "node scripts/check-sftp-ui.js",
     "test:polish": "node scripts/check-ui-polish.js",
     "test:assistant": "node scripts/check-assistant-ui.js",
+    "test:keys": "node scripts/check-keys-ui.js",
     "check:vendor": "node scripts/check-vendor.js"
   },
   "engines": {

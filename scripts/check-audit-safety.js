@@ -1522,9 +1522,9 @@ async function scenarioLockGates(browser, server) {
     const locked = await categoryControls();
     check('A6-08 locked: New category is disabled', locked.add, true);
     yes('A6-08 with a tooltip that says why', /unlock the vault/i.test(locked.addTitle), locked.addTitle);
-    check('A6-08 every category menu is disabled, with the reason',
-      locked.menus.map(([d, t]) => d && /unlock the vault/i.test(t)), [true]);
-    check('A6-08 and categories cannot be dragged', locked.drag, [false]);
+    // Since JU4 a lock empties the tree (category names are vault content):
+    // no category row is left to drag and no "..." menu to open.
+    check('A6-08 locked: no category menu or row is left to use', [locked.menus, locked.drag], [[], []]);
 
     await page.evaluate(() => switchView('settings'));
     const lockedOther = await otherControls();

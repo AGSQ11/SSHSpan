@@ -653,6 +653,16 @@ async function checkUxRefactor(browser, server) {
       core: {
         invoke: async (cmd, args) => {
           if (cmd === 'key_get') return r.key_list.keys.find(k => k.id === args.id);
+          // The deploy sheet shows the backend's own plan (R3): a stand-in that
+          // answers from the fields it is sent, as key_deploy_preview does.
+          if (cmd === 'key_deploy_preview') {
+            return {
+              configPath: '/home/u/.config/sshspan/ssh/config', sshDir: '/home/u/.ssh',
+              includeLine: 'Include "/home/u/.config/sshspan/ssh/config"',
+              keys: args.ids.map((id) => ({ id, name: id, alias: (args.hostAlias || id) + '-' + id, file: '/home/u/.ssh/sshspan_' + id, pubFile: '/home/u/.ssh/sshspan_' + id + '.pub', refusal: null })),
+              configText: args.ids.map((id) => `Host ${(args.hostAlias || id)}-${id}\n  IdentityFile /home/u/.ssh/sshspan_${id}\n  IdentitiesOnly yes\n`).join('\n'),
+            };
+          }
           return r[cmd] ?? {};
         },
       },
@@ -701,6 +711,9 @@ async function checkUxRefactor(browser, server) {
   await page.waitForTimeout(80);
   check('the detail pane opens on Overview', await page.isVisible('#detailPanel-overview'), true);
   await page.click('.detail-tab[data-detail-tab="export"]');
+  // The default OpenSSH format takes an optional passphrase now (A8-12), so
+  // the format that takes none is picked first.
+  await page.click('.format-row[data-format="pkcs8"]');
   check('the passphrase field is hidden for an unencrypted format',
     await page.isHidden('#detailExportPass'), true);
   await page.click('.format-row[data-format="pkcs8-encrypted"]');
@@ -732,8 +745,9 @@ async function checkUxRefactor(browser, server) {
   check('the preview breaks lines instead of printing a literal backslash-n',
     preview.includes('\\n'), false);
   await page.fill('#cfgHost', 'prod-web-1');
-  await page.waitForTimeout(80);
-  check('and follows the form as you type',
+  // The sheet asks the backend once typing pauses (150 ms); allow for it.
+  await page.waitForFunction(() => document.getElementById('configPreview').value.includes('Host prod-web-1'), null, { timeout: 1500 }).catch(() => {});
+  check('and follows the form as you type (asking the backend again)',
     (await page.inputValue('#configPreview')).includes('Host prod-web-1'), true);
   await page.keyboard.press('Escape');
   check('Escape closes the sheet', await page.isHidden('#deployModal'), true);

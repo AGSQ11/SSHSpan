@@ -426,7 +426,8 @@ label:focus-within { color: var(--text); }
   background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.09), rgba(var(--accent-rgb), 0.04)), var(--panel);
   box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.12);
 }
-.key-row input[type="checkbox"] {
+.key-row input[type="checkbox"],
+.key-list-head input[type="checkbox"] {
   appearance: none; cursor: pointer;
   width: 16px; height: 16px; flex: none;
   border: 1.5px solid var(--line-strong);
@@ -435,13 +436,37 @@ label:focus-within { color: var(--text); }
   display: grid; place-content: center;
   transition: border-color 0.12s ease, background 0.12s ease;
 }
-.key-row input[type="checkbox"]:hover { border-color: var(--text-faint); }
-.key-row input[type="checkbox"]:checked {
+.key-row input[type="checkbox"]:hover,
+.key-list-head input[type="checkbox"]:hover { border-color: var(--text-faint); }
+.key-row input[type="checkbox"]:checked,
+.key-list-head input[type="checkbox"]:checked,
+.key-list-head input[type="checkbox"]:indeterminate {
   background: var(--accent); border-color: var(--accent);
 }
-.key-row input[type="checkbox"]:checked::after {
+.key-row input[type="checkbox"]:checked::after,
+.key-list-head input[type="checkbox"]:checked::after {
   content: ""; width: 8px; height: 8px;
   background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230b1020' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E") center/contain no-repeat;
+}
+/* Some of the keys shown are selected: a bar instead of a tick. */
+.key-list-head input[type="checkbox"]:indeterminate::after {
+  content: ""; width: 8px; height: 2px; border-radius: 1px; background: #0b1020;
+}
+
+/* Select all, over the list (A5-34): lined up with the rows' boxes. */
+.key-list-head { display: flex; align-items: center; padding: 0 13px; }
+.key-list-head .select-all {
+  flex-direction: row; align-items: center; gap: 10px;
+  cursor: pointer; font-size: 12px; color: var(--text-dim);
+}
+
+/* A search or filter that matches nothing (A2-26). */
+.key-list-nomatch {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 14px 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  color: var(--text-dim); font-size: 12.5px;
 }
 
 /* key-type avatar (built in JS) */
@@ -465,7 +490,10 @@ label:focus-within { color: var(--text); }
   min-width: 0;
   color: var(--text);
 }
-.key-row-name > :first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* One line, cut with "..." (A1-07). This rule sat on the name's first child,
+   which a bare text node is not, so long names wrapped mid-word; the name
+   has its own element now and its full text in the tooltip. */
+.key-row-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .key-row-sub {
   color: var(--text-faint); font-size: 11px;
@@ -482,7 +510,9 @@ label:focus-within { color: var(--text); }
 .badge[data-kind="ed25519"] { background: var(--t-ed25519-bg); color: var(--t-ed25519); }
 .badge[data-kind="rsa"]     { background: var(--t-rsa-bg);      color: var(--t-rsa); }
 .badge[data-kind="ecdsa"]   { background: var(--t-ecdsa-bg);    color: var(--t-ecdsa); }
-.badge.pub                 { background: rgba(245, 181, 68, 0.13); color: var(--warn); }
+/* .warn is the server list's "key missing": an error state, drawn in the
+   warning colour - it fell back to the green ed25519 tint (A1-40). */
+.badge.pub, .badge.warn    { background: rgba(245, 181, 68, 0.13); color: var(--warn); }
 .badge.dim                 { background: var(--panel-3); color: var(--text-dim); }
 
 /* ---- empty state -------------------------------------------------------- */
@@ -514,6 +544,11 @@ label:focus-within { color: var(--text); }
 
 /* ---- detail pane -------------------------------------------------------- */
 
+/* Beside the list the pane stays in view while the list scrolls, and scrolls
+   on its own when it is taller than the window (A1-24): with a long list,
+   the pane of a key near the end was scrolled away above the window. Stacked
+   under the list (narrow windows) it is static, and selectKey scrolls it into
+   view instead. */
 .detail-pane {
   flex: 1 1 350px;
   min-width: 0;
@@ -523,7 +558,12 @@ label:focus-within { color: var(--text); }
   padding: 18px;
   display: flex; flex-direction: column; gap: 10px;
   box-shadow: var(--shadow-1);
+  position: sticky; top: 0;
+  max-height: calc(100vh - var(--topbar-h) - 44px);
+  overflow-y: auto;
 }
+.detail-pane > * { flex-shrink: 0; }
+.undeploy-btn { align-self: flex-start; }
 
 .detail-head { display: flex; align-items: center; gap: 11px; }
 .detail-head h2 { font-size: 16px; font-weight: 650; min-width: 0; overflow-wrap: anywhere; flex: 1; }
@@ -554,6 +594,20 @@ label:focus-within { color: var(--text); }
 
 .import-source { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .import-source .hint { min-width: 0; overflow-wrap: anywhere; }
+/* What the backend says about a key in a format it cannot import (R9): its
+   conversion advice, beside the pasted key. */
+.import-format-msg {
+  padding: 9px 11px; line-height: 1.5; overflow-wrap: anywhere;
+  color: var(--text-dim);
+  background: rgba(var(--warn-rgb), 0.08);
+  border: 1px solid rgba(var(--warn-rgb), 0.28);
+  border-radius: var(--r-sm);
+}
+
+/* The confirmation's one optional choice (confirmWithOption): its label is a
+   sentence, so it wraps inside the small dialog. */
+.toggle-chip.confirm-option { white-space: normal; align-items: flex-start; margin-top: 10px; }
+.toggle-chip.confirm-option .toggle-box { margin-top: 1px; }
 
 
 /* ==========================================================================
@@ -591,8 +645,6 @@ label:focus-within { color: var(--text); }
 .toggle-chip input:checked + .toggle-box::after { transform: translateX(13px); background: var(--accent); }
 .toggle-chip input:focus-visible + .toggle-box { box-shadow: var(--ring); }
 .toggle-chip:has(input:checked) { color: var(--text); border-color: rgba(var(--accent-rgb), 0.5); }
-
-#configPreview { margin-top: 4px; width: 100%; }
 
 /* ==========================================================================
    Settings
@@ -684,6 +736,9 @@ label:focus-within { color: var(--text); }
 .audit-more:has(> [hidden]) { display: none; }
 .audit-table tr.audit-error td { color: var(--danger); }
 .audit-table tr.audit-error .ghost-btn { margin-left: 10px; }
+/* The pinned-hosts table when the list could not be read (A2-29). */
+tr.load-error-row td { color: var(--danger); }
+tr.load-error-row .ghost-btn { margin-left: 10px; }
 
 /* ==========================================================================
    Modals
@@ -890,6 +945,8 @@ label:focus-within { color: var(--text); }
   }
   .keys-layout { flex-direction: column; }
   .detail-pane, .key-list-col { flex: 1 1 auto; width: 100%; }
+  /* Stacked under the list: part of the page, scrolled into view on select. */
+  .detail-pane { position: static; max-height: none; overflow: visible; }
   /* The 66px rail has no room for the category tree (its rows spilled out
      across the key list), so it opens as a drawer over the page from the
      Categories buttons instead (A1-06 / A5-13). The window minimum is 880px,
@@ -1094,6 +1151,9 @@ label:focus-within { color: var(--text); }
    Grouped key list
    ========================================================================== */
 .key-group { display: flex; flex-direction: column; gap: 6px; }
+/* A collapsed group keeps its header and hides its rows; the toggle only
+   swapped its icon (A1-12). */
+.key-group.collapsed > .key-row { display: none; }
 .key-group + .key-group { margin-top: 14px; }
 .key-group-head {
   display: flex; align-items: center; gap: 8px;
@@ -2037,10 +2097,17 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 /* ---- key rows: actions on the right ------------------------------------- */
 
 .key-row-actions { display: flex; align-items: center; gap: 7px; flex: none; }
-.key-row .row-btn { opacity: 0; padding: 5px 10px; font-size: 12px; }
+/* Connect shows on hover, on the selected row and on keyboard focus, and
+   takes no room otherwise (A1-07): invisible, it still reserved 88px and
+   squeezed the name into wrapping mid-word. Collapsed rather than
+   display:none, so Tab still reaches it - and it opens up when it does. */
+.key-row .row-btn {
+  max-width: 0; padding: 0; border-width: 0; overflow: hidden;
+  opacity: 0; font-size: 12px;
+}
 .key-row:hover .row-btn,
 .key-row.selected .row-btn,
-.key-row .row-btn:focus-visible { opacity: 1; }
+.key-row .row-btn:focus-visible { max-width: 140px; padding: 5px 10px; border-width: 1px; opacity: 1; }
 
 .chip {
   display: inline-flex; align-items: center; gap: 5px;
@@ -2194,6 +2261,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   border-right: 1px solid var(--line);
   overflow-y: auto;
 }
+/* The form scrolls when it is taller than the sheet; its parts keep their
+   size (the key chips were squeezed under the first field). */
+.deploy-form > * { flex-shrink: 0; }
 .deploy-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .deploy-grid .span-2 { grid-column: span 2; }
 
@@ -2208,6 +2278,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   transition: border-color 0.12s ease;
 }
 .opt-row:hover { border-color: #39445a; }
+/* A passphrase disables saving deployed files as servers (M3). The row needs
+   the same visible disabled affordance as a settings toggle, not a live hand. */
+.opt-row:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
 .opt-row input[type="checkbox"] { position: absolute; opacity: 0; pointer-events: none; }
 .opt-row .toggle-box { margin-top: 1px; }
 /* The checked rules were scoped to .toggle-chip, so these read as permanently
@@ -2220,27 +2293,49 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .opt-sub { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
 .opt-sub.mono { font-family: var(--mono); }
 
+/* The preview side scrolls as a whole when the plan (one entry per key, with
+   any refusal) and the config text do not fit, rather than clipping either. */
 .deploy-preview {
   flex: 1; min-width: 0;
   display: flex; flex-direction: column;
   background: var(--bg-elev);
+  overflow-y: auto;
 }
+.deploy-preview > * { flex-shrink: 0; }
 .deploy-preview-head {
   display: flex; align-items: center; gap: 8px;
   padding: 11px 16px;
   border-bottom: 1px solid var(--line);
 }
 .deploy-preview-head .detail-label { margin-top: 0; }
-.deploy-paths { padding: 12px 16px 0; }
+.deploy-paths { padding: 12px 16px 0; display: flex; flex-direction: column; gap: 8px; overflow-wrap: anywhere; }
 .deploy-paths code {
   font-family: var(--mono); font-size: 11px; color: var(--accent);
   background: rgba(var(--accent-rgb), 0.08);
   padding: 1px 5px; border-radius: 4px;
 }
+/* Each key's real files and alias, from the backend's plan (R3), and the
+   reason a key will be refused (A2-46). */
+.deploy-plan { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.deploy-plan-item { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.deploy-plan-name { color: var(--text-dim); font-weight: 600; }
+.deploy-plan-item.refused code { color: var(--text-faint); background: var(--panel-3); text-decoration: line-through; }
+.deploy-plan-refusal { color: var(--danger); }
+/* The Include line for ~/.ssh/config, with its Copy button (A5-05). */
+.include-row { display: flex; align-items: center; gap: 8px; }
+.include-row code { flex: 1; min-width: 0; }
+.include-row .ghost-btn { padding: 4px 9px; font-size: 11.5px; flex: none; }
+/* Why the sheet's fields cannot be deployed as they stand (A2-33). Scoped to
+   the dialog body so its own paragraph colour does not win. */
+.modal-body .field-error { color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
+/* Grows into the room left, never below a readable height, inside the side
+   margins. A leftover "#configPreview { width: 100% }" from the old Deploy
+   view overrode this rule, so the box ran 16px past the sheet's edge and
+   lost its right border; it is gone (seen in review). */
 .deploy-preview textarea {
-  flex: 1; min-height: 0;
+  flex: 1 0 160px;
   margin: 12px 16px 16px;
-  width: auto;
+  width: calc(100% - 32px);
   resize: none;
   font-family: var(--mono); font-size: 11.5px; line-height: 1.7;
   background: var(--bg);
