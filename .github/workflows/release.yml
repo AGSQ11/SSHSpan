@@ -187,10 +187,24 @@ jobs:
       # ── Release signing (minisign) ──────────────────────────────────────────
       # Every installer gets a detached minisign signature (`.minisig`) which
       # the in-app updater verifies against the public key embedded in
-      # src-tauri/src/commands/updater.rs (MINISIGN_PUBLIC_KEY). This binds the
-      # installer to the source tree, so replacing BOTH the binary and its
-      # GitHub-computed SHA-256 digest (repo/token compromise) is no longer
-      # enough to push a malicious update.
+      # src-tauri/src/commands/updater.rs (MINISIGN_PUBLIC_KEY). The signed
+      # trusted comment is "SSHSpan release <tag>" (the -t option below), and
+      # the updater refuses a signature whose comment names a different release
+      # than the one it is installing.
+      #
+      # What this protects against: an installer or `.minisig` swapped into an
+      # already-published release, a hostile mirror or proxy, and a genuine
+      # older signed build re-published under a newer tag. In short, it detects
+      # TAMPERED PUBLISHED ASSETS. The GitHub-computed SHA-256 digest cannot,
+      # because it comes from the same release that serves the file.
+      #
+      # What it does NOT protect against: this job signs whatever a pushed `v*`
+      # tag builds, so anyone who can push a tag or change this workflow (a
+      # repository or token compromise), or who can read the MINISIGN_SECRET_KEY
+      # Actions secret, can produce validly signed malicious installers. The
+      # key is not a defence against a compromised repository. After such a
+      # compromise rotate the key (see MAINTAINER SETUP below and the
+      # MINISIGN_PUBLIC_KEY notes in updater.rs) and re-cut the release.
       #
       # MAINTAINER SETUP (one-time, see CHANGELOG "Unreleased" for details):
       #   1. Install minisign (https://jedisct1.github.io/minisign/) and run
@@ -203,8 +217,10 @@ jobs:
       #      with "RW") into the MINISIGN_PUBLIC_KEY const in
       #      src-tauri/src/commands/updater.rs, replacing the placeholder.
       # Until the secret exists this step is skipped with a warning and the
-      # release proceeds unsigned (the updater likewise falls back to the
-      # GitHub digest check while that const is still the placeholder).
+      # release proceeds unsigned. The key has been provisioned since
+      # 2026-09-12, so the in-app updater is fail-closed: it refuses an
+      # unsigned release instead of falling back to the GitHub digest check
+      # (that fallback exists only while the const is still the placeholder).
       - name: Sign installers with minisign
         id: minisign_sign
         shell: bash
