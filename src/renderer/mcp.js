@@ -380,11 +380,13 @@ async function mcpRemoveServer(sv) {
       mcpLastErrors.delete(sv.id);
       if (mcpToolsShownFor === sv.id) mcpToolsShownFor = null;
       await mcpLoadSettings();
-      // The entry is gone either way; a failed session teardown is said
-      // where it stays readable (A4-27), as text.
+      // The entry is gone either way; what went wrong around it - a failed
+      // session teardown (A4-27), an audit row that could not be written
+      // (RU6b), or both - is said as the backend says it, as text, where it
+      // stays readable.
       if (r && r.warning) {
-        mcpSetStatus('MCP server removed, but: ' + r.warning, 'err');
-        toast('MCP server removed - the session teardown failed.', 'warn');
+        mcpSetStatus('MCP server removed. ' + r.warning, 'warn');
+        toast('MCP server removed. ' + r.warning, 'warn');
       } else {
         toast('MCP server removed.', 'ok');
       }
@@ -632,16 +634,23 @@ async function mcpSaveServer() {
       auth_env_var: withSecret && source === 'env' ? val('mcpAuthEnvVar') : null,
     };
     try {
-      await mcpCall('mcp_save_server', payload);
+      const r = await mcpCall('mcp_save_server', payload);
+      // Saved, but something after it failed (RU6b: the audit row): said as
+      // the backend says it, without undoing the save.
+      const warning = r && r.warning ? String(r.warning) : '';
       if (secretInput) secretInput.value = '';
       mcpCloseForm();
       await mcpLoadSettings();
       if (keptEnv) {
-        mcpSetStatus('Saved. No secret was entered, so the environment variable ' + keptEnv + ' stays in effect.');
-        toast('MCP server saved - the environment variable ' + keptEnv + ' stays in effect.', 'ok');
+        mcpSetStatus('Saved. No secret was entered, so the environment variable ' + keptEnv + ' stays in effect.'
+          + (warning ? ' ' + warning : ''), warning ? 'warn' : undefined);
+        if (!warning) toast('MCP server saved - the environment variable ' + keptEnv + ' stays in effect.', 'ok');
+      } else if (warning) {
+        mcpSetStatus(warning, 'warn');
       } else {
         toast('MCP server saved.', 'ok');
       }
+      if (warning) toast(warning, 'warn');
     } catch (e) {
       toast(mcpErrText(e), 'err');
     }
@@ -715,14 +724,21 @@ async function mcpSetToolState(serverId, t, enabled, autoApprove) {
   const args = { id: serverId, tool: t.name, enabled, auto_approve: enabled && autoApprove };
   if (enabled) args.expected_hash = t.definition_hash == null ? null : String(t.definition_hash);
   let refusal = null;
+  let warning = '';
   try {
-    await mcpCall('mcp_set_tool_state', args);
+    const r = await mcpCall('mcp_set_tool_state', args);
+    // Done, but its audit row could not be written (RU6b): said as it is.
+    warning = r && r.warning ? String(r.warning) : '';
   } catch (e) {
     refusal = mcpErrText(e);
   } finally {
     mcpToolBusy.delete(key); // before the redraw, or its toggles stay disabled
   }
   await mcpLoadSettings();
+  if (warning) {
+    mcpSetStatus(warning, 'warn');
+    toast(warning, 'warn');
+  }
   if (refusal === null) return;
   if (mcpIsDefinitionRefusal(refusal)) {
     mcpSetStatus('Tool "' + t.name + '" was not approved: ' + refusal

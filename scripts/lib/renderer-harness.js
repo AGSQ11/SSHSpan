@@ -269,6 +269,28 @@ const SERVER = (id, name, auth) => ({
 });
 const CATEGORY = { id: 'c1', name: 'Prod', parent_id: null, scope: 'key', sort_index: 0, color: null };
 
+/// How long the app may take to load and boot (openApp) - not a step's wait.
+const BOOT_TIMEOUT_MS = 20000;
+
+/// Pause the fake clock `lead` ms ahead of the page's own time. Installed, the
+/// clock runs at real speed until it is paused, so on a loaded machine the
+/// page's time can pass the target between reading it and pausing there:
+/// pauseAt then throws "Cannot fast-forward to the past" (test:safety under
+/// load - JU5 fix round 2). It has paused the clock by then (Playwright pauses
+/// first, then fast-forwards), so the next try, from the page's now frozen
+/// time, lands - the clock still stops `lead` ms past where the page is.
+async function pauseClockAhead(page, lead) {
+  for (let tries = 1; ; tries++) {
+    const now = await page.evaluate(() => Date.now());
+    try {
+      await page.clock.pauseAt(now + lead);
+      return;
+    } catch (e) {
+      if (tries >= 3 || !/fast-forward to the past/i.test(String((e && e.message) || e))) throw e;
+    }
+  }
+}
+
 /// Open the real app against the stub. `clock: true` installs Playwright's fake
 /// clock and pauses it after boot, so time only moves through app.tick().
 /// `bootCmd` names the IPC command whose first call counts as "booted"
@@ -297,15 +319,29 @@ async function openApp(browser, server, o = {}) {
     countTimers: !!o.countTimers,
     dragDrop: !!o.dragDrop,
   });
-  await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
+  // The boot is setup, not a check: on a loaded machine (suites run side by
+  // side, a coverage run) loading the page and its scripts took longer than
+  // the 3.5 s every step gets, and a run failed before it began. The steps
+  // keep their 3.5 s (JU5 fix round 2).
+  await page.goto(`http://127.0.0.1:${server.address().port}/index.html`, { timeout: BOOT_TIMEOUT_MS });
   // main() reads settings only after every script has loaded and the first
-  // vault_status has been applied, so this means "booted".
-  await page.waitForFunction((cmd) => window.__calls.some((c) => c.cmd === cmd), o.bootCmd || 'settings_get');
-  await page.waitForTimeout(60);
-  if (o.clock) {
-    const now = await page.evaluate(() => Date.now());
-    await page.clock.pauseAt(now + 20);
+  // vault_status has been applied, so this means "booted". Polled on an
+  // interval, not on animation frames, which a starved renderer can hold back;
+  // a boot that does not get there says how far it got.
+  try {
+    await page.waitForFunction((cmd) => window.__calls.some((c) => c.cmd === cmd), o.bootCmd || 'settings_get',
+      { timeout: BOOT_TIMEOUT_MS, polling: 50 });
+  } catch (e) {
+    const where = await page.evaluate(() => ({
+      calls: (window.__calls || []).map((c) => c.cmd).slice(0, 12),
+      bootErrors: window.__bootErrors || [],
+      scripts: [...document.scripts].map((s) => (s.src || '').split('/').pop()).filter(Boolean),
+      ready: document.readyState,
+    })).catch((x) => ({ unreadable: String((x && x.message) || x).split('\n')[0] }));
+    throw new Error(`the app did not boot in ${BOOT_TIMEOUT_MS} ms: ${JSON.stringify(where)}`);
   }
+  await page.waitForTimeout(60);
+  if (o.clock) await pauseClockAhead(page, 20);
   const app = {
     page, context, errors, warnings,
     calls: (cmd) => page.evaluate((c) => window.__calls.filter((x) => !c || x.cmd === c), cmd || null),
@@ -370,10 +406,12 @@ async function openLiveTab(app, auth) {
 /// Let every timer the page has ALREADY scheduled, with a delay of up to `ms`,
 /// run first. Timers run in due-time order, so one scheduled now for `ms` from
 /// now runs after all of them: an ordering barrier, not a guess at how slow
-/// the machine is. terminal.js focuses a tab's terminal 50-60 ms after a
-/// connect or a tab switch; a test that focuses a tab chip and then presses a
-/// key lost that key to the terminal whenever the deferred focus landed in
-/// between - which a loaded machine makes likely (the test:polish flake).
+/// the machine is. Used where a step must follow the page's own deferred work
+/// (check-keys-ui.js: the open key's answer resets the detail pane before the
+/// Export tab is chosen). It is no longer needed around the terminal's deferred
+/// focus: since JU5 that never takes the keyboard from a control the user has
+/// moved to (terminal.js terminalFocus), so the two test:polish waits that
+/// worked around it are gone.
 const afterScheduledTimers = (page, ms = 100) =>
   page.evaluate((d) => new Promise((r) => setTimeout(r, d)), ms);
 

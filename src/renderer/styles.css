@@ -35,7 +35,6 @@
   /* brand / status */
   --accent:        #6ea8ff;
   --accent-rgb:    110, 168, 255;
-  --accent-strong: #4f8ef7;
   --accent-weak:   rgba(110, 168, 255, 0.12);
   --ok:            #34d399;
   --ok-rgb:        52, 211, 153;
@@ -59,7 +58,6 @@
   --r-lg: 15px;
   --shadow-1: 0 1px 2px rgba(0,0,0,0.35);
   --shadow-2: 0 8px 28px rgba(0,0,0,0.42);
-  --shadow-glow: 0 0 0 1px rgba(var(--accent-rgb), 0.4), 0 0 0 4px rgba(var(--accent-rgb), 0.15);
   --ring: 0 0 0 2px rgba(var(--accent-rgb), 0.55);
 
   --mono: 'Cascadia Code', 'Consolas', 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Menlo, monospace;
@@ -461,7 +459,7 @@ label:focus-within { color: var(--text); }
 }
 
 /* A search or filter that matches nothing (A2-26). */
-.key-list-nomatch {
+.key-list-nomatch, .server-list-nomatch {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
   padding: 14px 16px;
   border: 1px dashed var(--line-strong);
@@ -614,9 +612,13 @@ label:focus-within { color: var(--text); }
    Deploy / config view
    ========================================================================== */
 
+/* A row, over the column the global `label` rule (and .server-grid label)
+   gives every label - by specificity, not !important (A1-29). */
+label.toggle-chip,
+.server-grid label.toggle-chip { flex-direction: row; }
 .toggle-chip {
   appearance: none; cursor: pointer;
-  flex-direction: row !important; align-items: center; gap: 8px;
+  align-items: center; gap: 8px;
   font-size: 12.5px; color: var(--text-dim); font-weight: 500;
   border: 1px solid var(--line-strong);
   background: var(--bg-elev);
@@ -700,7 +702,23 @@ label:focus-within { color: var(--text); }
 .status-strip.info::before { background: var(--accent); animation: pulse 1.4s ease infinite; }
 .status-strip.syncing { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.4); }
 .status-strip.syncing::before { background: var(--accent); animation: pulse 1s ease infinite; }
+/* Done, with failures (a Bitwarden sync with errors - A2-08). */
+.status-strip.warn { color: var(--warn); border-color: rgba(var(--warn-rgb), 0.4); }
+.status-strip.warn::before { background: var(--warn); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* A Bitwarden sync's failed items, under its status line. */
+.bw-errors {
+  margin: 6px 0 0; padding: 8px 12px 8px 28px;
+  max-height: 180px; overflow-y: auto;
+  font-size: 12px; line-height: 1.5; color: var(--text-dim);
+  background: var(--bg-elev);
+  border: 1px solid rgba(var(--warn-rgb), 0.3);
+  border-radius: var(--r-sm);
+  overflow-wrap: anywhere;
+}
+/* What a field's blank or current value means (the Bitwarden password). */
+.field-hint { font-size: 11.5px; color: var(--text-faint); font-weight: 400; }
 
 /* ==========================================================================
    Audit
@@ -1274,6 +1292,7 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
   min-height: 0;
 }
 .server-row {
+  position: relative;
   padding: 8px 10px;
   border-radius: 8px;
   cursor: pointer;
@@ -1285,19 +1304,44 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
   background: var(--accent-weak);
   border-color: var(--accent);
 }
+/* The name right after its dot and as wide as the row allows; it used to be
+   pushed toward the middle (space-between) and cut short by the room an
+   invisible Connect button kept (A1-20). */
 .server-row-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  justify-content: space-between;
 }
 .server-name {
+  flex: 1;
+  min-width: 0;
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Connect and "..." (A5-28) sit over the row's right end, shown on hover and
+   focus - out of the layout, so they take no width from the name. */
+.server-row-actions {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 8px;
+  /* Opaque, the row's own colour in each state: the name runs under it. */
+  background: var(--panel);
+  opacity: 0;
+}
+.server-row:hover .server-row-actions,
+.server-row.selected .server-row-actions,
+.server-row:focus-within .server-row-actions { opacity: 1; }
+.server-row:hover .server-row-actions { background: var(--hover); }
+.server-row.selected .server-row-actions { background: linear-gradient(var(--accent-weak), var(--accent-weak)), var(--panel); }
+.server-row-more { width: 24px; height: 24px; }
+.server-row-more svg { width: 14px; height: 14px; }
 .server-row-sub {
   font-size: 12px;
   color: var(--text-dim);
@@ -1324,60 +1368,62 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
   min-height: 0;
   position: relative;
 }
+/* The header never clips its controls (fix round 1): with a live tab the
+   actions were wider than the column at the default 1100x720 window, and the
+   column hides overflow, so the maximize button and half of Disconnect were
+   cut off. The title gives way first (an ellipsis); in a header narrower than
+   760 px the action buttons show their icons only - the label stays their
+   accessible name and the title their tooltip; and should that still not fit,
+   the actions wrap under the title instead of running off. */
 .terminal-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
+  container-type: inline-size;
 }
 .terminal-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 0;
+  flex: 1 1 0;
+  min-width: 96px;
 }
 .terminal-title strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.terminal-actions { display: flex; gap: 6px; }
+.terminal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-left: auto; max-width: 100%; }
+@container (max-width: 760px) {
+  .terminal-actions .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .terminal-actions .ghost-btn, .terminal-actions .danger-btn { padding: 7px 8px; }
+  .terminal-actions .seg-btn { padding: 6px 9px; }
+}
 .terminal-host {
   flex: 1;
   background: #0f1115;
-  /* No padding: xterm measures the host box exactly; padding skews FitAddon. */
-  padding: 4px;
+  /* No padding here: FitAddon measures this box (its border box) and took the
+     padding for room, so the last row was clipped at some heights (A1-38).
+     The breathing space is the .xterm element's own padding, below, which
+     FitAddon subtracts. */
+  padding: 0;
   min-height: 0;
   overflow: hidden;
 }
+.terminal-host .xterm { padding: 4px; }
 /* xterm sizes its own rows/cols; FitAddon picks dimensions that fill this box.
    Do NOT force heights on .xterm-* elements - that breaks rendering. */
 
-/* Floating maximize/restore (<>) control, lower-right above the strip. */
-.term-max-btn {
-  position: absolute;
-  right: 8px;
-  bottom: 34px;
-  z-index: 30;
-  width: 26px;
-  height: 26px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(18, 22, 31, 0.85);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  color: var(--text-dim);
-  cursor: pointer;
-  opacity: 0.35;
-  padding: 0;
-}
-.term-max-btn:hover {
-  opacity: 1;
-  color: var(--text);
-  border-color: var(--line-strong);
-}
+/* Maximize/restore, in the terminal header with the other actions: it used to
+   float over the terminal's last column at 35% opacity (A1-38). */
+.term-max-btn { width: 28px; height: 28px; }
 .term-max-btn svg { width: 14px; height: 14px; }
 
 /* ─── xterm.js core rules missing from the vendored xterm.css ────────────────
@@ -1488,12 +1534,19 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 }
 /* Inside the segment's rounded, overflow-hidden frame the ring sits inside. */
 .seg-btn:focus-visible { outline-offset: -2px; }
+/* The vault key and the .pem path are alternatives: one above the other, each
+   the row's full width (A1-21 - side by side the path got ~70px). */
+.server-key-row { display: flex; flex-direction: column; gap: 0; min-width: 0; }
+.server-key-row select { width: 100%; min-width: 0; }
+.server-grid .port-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pw-row #srvPwSavedHint { margin: 6px 0; }
+.pw-row #srvClearPwBtn { margin-bottom: 6px; }
 .pem-row {
   display: flex;
   gap: 6px;
   margin-top: 8px;
 }
-.pem-row input { flex: 1; }
+.pem-row input { flex: 1; min-width: 0; text-overflow: ellipsis; }
 
 /* ─── Context menu (key right-click + server right-click) ─────────────── */
 
@@ -1536,6 +1589,10 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 .ctx-item.danger:hover, .ctx-item.danger:focus-visible { background: rgba(var(--danger-rgb), 0.12); }
 .ctx-item svg { width: 14px; height: 14px; flex: none; }
 .ctx-item small { color: var(--text-dim); font-size: 11px; }
+/* A line of explanation in a menu (the key picker's left-out servers). */
+/* A line of text in a menu (the host picker says why some servers are not
+   listed): readable, not an item - 4.9:1 on the menu background. */
+.ctx-menu .ctx-note { margin: 0; padding: 6px 10px; white-space: normal; max-width: 280px; font-size: 11.5px; color: var(--text-faint); }
 /* One rule for every separator, whatever its tag: border 0, so an <hr> does
    not draw the browser's inset double line (A1-28). */
 .ctx-sep { height: 1px; border: 0; background: var(--line); margin: 4px 6px; flex: none; }
@@ -1593,6 +1650,10 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
   flex: none;
 }
 .term-tab-dot.live { background: var(--ok); }
+/* Connecting (A5-10): the dot pulses until the session is there. */
+.term-tab.connecting .term-tab-dot { background: var(--accent); animation: pulse 1s ease infinite; }
+/* The visual bell (A3-26): the chip lights up briefly. */
+.term-tab.bell-flash { background: rgba(var(--warn-rgb), 0.28); border-color: var(--warn); color: var(--text); }
 .term-tab-name { overflow: hidden; text-overflow: ellipsis; }
 .term-tab-close {
   appearance: none; background: transparent; border: 0; font: inherit; line-height: 1; cursor: pointer;
@@ -2268,8 +2329,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .deploy-grid .span-2 { grid-column: span 2; }
 
 .opt-list { display: flex; flex-direction: column; gap: 8px; }
+label.opt-row { flex-direction: row; }
 .opt-row {
-  flex-direction: row !important; align-items: flex-start; gap: 10px;
+  align-items: flex-start; gap: 10px;
   cursor: pointer; user-select: none;
   padding: 9px 11px;
   background: var(--bg-elev);
@@ -2432,15 +2494,12 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 }
 .server-dot.live { background: var(--ok); box-shadow: 0 0 0 3px rgba(var(--ok-rgb), 0.15); }
 .server-row:focus-visible { outline: none; box-shadow: var(--ring); }
+/* Shown with its row's actions (.server-row-actions), never on its own. */
 .server-go {
-  opacity: 0;
   padding: 3px 9px; font-size: 11px;
   flex: none;
 }
 .server-go svg { width: 11px; height: 11px; }
-.server-row:hover .server-go,
-.server-row.selected .server-go,
-.server-go:focus-visible { opacity: 1; }
 
 /* ---- remote path breadcrumb (replaces the bare text field) --------------- */
 
@@ -2502,11 +2561,8 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   }
   .session-surface.assistant-open:not(.split) .terminal-body { min-width: 320px; }
 }
-/* A4-04: the floating maximize button sat on the panel's Send button; it
-   moves to the panel's left edge while the panel is shown. */
-#app:not(.term-max) .session-surface.assistant-open ~ .term-max-btn {
-  right: calc(min(380px, 100% - 24px) + 8px);
-}
+/* (A4-04's rule moving the floating maximize button off the panel's Send
+   button is gone with the floating button: it sits in the header now.) */
 
 .ai-head {
   display: flex; align-items: center; gap: 8px;
@@ -2632,7 +2688,17 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .ai-card pre code { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
 /* Long commands wrap rather than scroll sideways: the panel is 380px wide,
    and a one-line command with a long path is the common case. */
-.ai-cmd { white-space: pre-wrap; word-break: break-word; }
+/* A command or its arguments are laid out in the order they are sent, left to
+   right, whatever letters they hold (fix round 1): with every direction
+   control escaped, right-to-left letters could still reorder the characters
+   around them on screen. */
+.ai-cmd { white-space: pre-wrap; word-break: break-word; unicode-bidi: bidi-override; direction: ltr; }
+/* An invisible or direction-changing character in a command or argument,
+   shown as its code point (JU3 deferral): marked so it cannot pass for text. */
+.ai-hidden-char {
+  color: var(--warn); background: rgba(var(--warn-rgb), 0.14);
+  border-radius: 3px; padding: 0 2px;
+}
 .ai-card-actions { display: flex; gap: 6px; }
 .ai-card-actions button { font-size: 11px; padding: 3px 10px; }
 .ai-card.confirm { border-color: var(--warn); }

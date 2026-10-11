@@ -412,15 +412,20 @@ async function scenarioLockSweep(browser, server) {
     check('no page errors', app.errors, []);
   });
 
-  // Locking by hand stays immediate: no question, live shells or not.
-  await withApp(browser, server, {}, 'manual lock is immediate', async (app) => {
+  // A lock by hand with a live shell asks first, naming what it ends (A5-09,
+  // plan ruling R2 - JU5); OK locks and tears the shell down. (Nothing live:
+  // no question - check-servers-ui.js.)
+  await withApp(browser, server, {}, 'manual lock with a live session', async (app) => {
     await openLiveTab(app);
     await app.page.waitForTimeout(150);
     await app.page.click('#vaultStatus');
     await app.page.click('#keyConnectMenu .ctx-item:has-text("Lock now")');
+    const asked = await waitVisible(app.page, '#confirmModal', 800);
+    check('Lock now with a live session open asks before it locks',
+      { asked, locks: await app.count('vault_lock') }, { asked: true, locks: 0 });
+    if (asked) await answerConfirm(app.page, 'ok');
     await app.page.waitForTimeout(150);
-    check('Lock now asks nothing and locks at once, with a live session open',
-      { asked: await app.open('confirmModal'), locks: await app.count('vault_lock') }, { asked: false, locks: 1 });
+    check('and OK locks', await app.count('vault_lock'), 1);
     check('and the live shell is torn down', await app.page.evaluate(() => state.sessions.size), 0);
     check('no page errors', app.errors, []);
   });
@@ -1128,6 +1133,8 @@ async function scenarioYolo(browser, server) {
     await page.evaluate((id) => { aiTabState(id).level = 'read'; aiSetLevel(id, 'yolo'); }, tab);
     await waitVisible(page, '#yoloModal');
     await page.keyboard.press('Control+l');
+    // A session is live, so Ctrl+L first asks whether to lock (A5-09, JU5).
+    if (await waitVisible(page, '#confirmModal', 800)) await answerConfirm(page, 'ok');
     await page.waitForTimeout(120);
     yes('locking the vault closes it', !(await app.open('yoloModal')));
     check('without enabling YOLO', await yoloCalls(app), 1);

@@ -36,7 +36,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const {
   failures, check, yes, loadChromium, rendererDir, serve, part,
-  KEY, SERVER, CATEGORY, withApp, waitVisible, openLiveTab, afterScheduledTimers,
+  KEY, SERVER, CATEGORY, withApp, waitVisible, openLiveTab,
 } = require('./lib/renderer-harness');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -175,8 +175,9 @@ async function scenarioMenus(browser, server) {
     await page.keyboard.press('Enter');
     await page.waitForTimeout(80);
     let m = await menuState(page);
-    check('A2-50 the vault menu is a menu of menu items', m && [m.role, m.itemRoles], ['menu', ['menuitem', 'menuitem', 'menuitem']]);
-    check('A2-50 with the same items as before', m && m.labels, ['Lock now  (Ctrl+L)', 'Change master password...', 'Auto-lock settings...']);
+    check('A2-50 the vault menu is a menu of menu items', m && [m.role, m.itemRoles], ['menu', ['menuitem', 'menuitem', 'menuitem', 'menuitem']]);
+    check('A2-50 with the same items as before, and Quit (R11, JU5)', m && m.labels,
+      ['Lock now  (Ctrl+L)', 'Change master password...', 'Auto-lock settings...', 'Quit SSHSpan  (Ctrl+Q)']);
     check('A1-26 the first item has the focus', m && m.focused, 0);
     check('A2-50 the vault button says it is expanded', await attr(page, '#vaultStatus', 'aria-expanded'), 'true');
     const moves = [];
@@ -184,7 +185,7 @@ async function scenarioMenus(browser, server) {
       await page.keyboard.press(k);
       moves.push((await menuState(page)).focused);
     }
-    check('A2-50 ArrowDown, End, Home and ArrowUp (wrapping) move the focus', moves, [1, 2, 0, 2]);
+    check('A2-50 ArrowDown, End, Home and ArrowUp (wrapping) move the focus', moves, [1, 3, 0, 3]);
     await page.keyboard.press('Escape');
     await page.waitForTimeout(60);
     check('A2-50 Escape closes it', await menuState(page), null);
@@ -252,7 +253,9 @@ async function scenarioMenus(browser, server) {
     await page.waitForTimeout(80);
     m = await menuState(page);
     check('A1-04 a server menu opened at the bottom-right corner stays on screen', m && m.inViewport, true);
-    check('A2-50 it keeps its items and has the focus', m && [m.role, m.labels, m.focused], ['menu', ['Connect', 'Edit', 'Delete'], 0]);
+    // "Test connection" joined the server menu in JU5 fix round 1 (item 12).
+    check('A2-50 it keeps its items and has the focus', m && [m.role, m.labels, m.focused], ['menu', ['Connect', 'Test connection', 'Edit', 'Delete'], 0]);
+    await page.keyboard.press('ArrowDown');
     await page.keyboard.press('ArrowDown');
     await page.keyboard.press('Enter');
     yes('A2-50 Enter on an item runs it (Edit opens the server form)', await waitVisible(page, '#serverModal'));
@@ -266,8 +269,10 @@ async function scenarioMenus(browser, server) {
     await page.waitForTimeout(80);
     const m = await menuState(page);
     check('A1-04 the terminal menu opened at the bottom-right corner stays on screen', m && m.inViewport, true);
+    // No "Duplicate session" (it was "New session" twice - A5-33) and the mode
+    // item says where it goes (A3-31) - JU5.
     check('A2-50 it keeps its items', m && m.labels, ['Copy', 'Copy all to clipboard', 'Paste', 'Clear scrollback',
-      'Reset terminal', 'New session', 'Duplicate session', 'Restart session', 'Switch to SFTP']);
+      'Reset terminal', 'New session', 'Restart session', 'Open file browser']);
     check('A1-28 Paste, Clear scrollback and Reset terminal show their icons', m && [m.icons[2], m.icons[3], m.icons[4]], [true, true, true]);
     check('A1-28 its separators are thin rules with no inset border', await page.evaluate(() =>
       [...document.querySelectorAll('#keyConnectMenu .ctx-sep')].map((s) => [getComputedStyle(s).borderTopWidth, s.getBoundingClientRect().height])),
@@ -359,9 +364,8 @@ async function scenarioKeyboard(browser, server) {
     check('A1-11 session tabs are reachable with Tab and say what they are', tabs.map((t) => [t.tabIndex, t.role]), [[0, 'button'], [0, 'button']]);
     check('A1-11 their close control is a named button', tabs.map((t) => t.close), [['BUTTON', true], ['BUTTON', true]]);
     const first = await page.evaluate(() => [...state.sessions.keys()][0]);
-    // The second tab's connect scheduled a deferred terminal focus (50-60 ms);
-    // let it land before the chip takes the focus, or Enter goes to the shell.
-    await afterScheduledTimers(page);
+    // No waiting for the second tab's deferred terminal focus: since JU5 it
+    // never takes the keyboard from a control the user moved to meanwhile.
     await page.focus('#termTabs .term-tab');
     await page.keyboard.press('Enter');
     await page.waitForTimeout(100);
@@ -1007,18 +1011,21 @@ async function scenarioFieldNames(browser, server) {
     names.mcpAuthSecret = await axName(page, '#mcpAuthSecret', 'textbox');
     await page.evaluate(() => showSettingsSection('sync'));
     names.bwMasterPassword = await axName(page, '#bw_master_password', 'textbox');
+    // Captions as JU5 left them: the server password's is no longer the untrue
+    // "only used at connect time" (unsaved, a typed password was dropped), and
+    // "Master password" is sentence case (A8-25).
     check('fix1-1 each password field is named by its caption alone, not "... Show password"', names, {
-      srvPassword: 'Password (optional, only used at connect time)',
+      srvPassword: 'Password (optional)',
       importPass: 'Passphrase (only if the pasted key is encrypted)',
       aiApiKey: 'API key',
       mcpAuthSecret: 'Secret',
-      bwMasterPassword: 'Master Password',
+      bwMasterPassword: 'Master password',
     });
     check('fix1-1 the eye button keeps its own name', await axName(page, '#bwGrid .reveal-btn', 'button'), 'Show password');
     await page.click('#bwGrid .reveal-btn');
     check('fix1-1 and showing the password changes the button\'s name only',
       [await axName(page, '#bw_master_password', 'textbox'), await axName(page, '#bwGrid .reveal-btn', 'button')],
-      ['Master Password', 'Hide password']);
+      ['Master password', 'Hide password']);
     check('no page errors', app.errors, []);
   });
 }
@@ -1113,8 +1120,8 @@ async function scenarioNestedKeys(browser, server) {
     await page.waitForFunction(() => [...state.sessions.keys()].filter((id) => window.tabSessionLive(id)).length === 2, null, { polling: 25 });
     const [first, second] = await page.evaluate(() => [...state.sessions.keys()]);
     await page.evaluate((t) => activateSessionTab(t), second);
-    // activateSessionTab focuses that terminal 60 ms later; let it land first.
-    await afterScheduledTimers(page);
+    // activateSessionTab focuses that terminal 60 ms later - unless, as here,
+    // the user has reached another control by then (JU5): no barrier needed.
     await page.focus(`#termTabs .term-tab[data-tab-id="${first}"] .term-tab-close`);
     await page.keyboard.press('Enter');
     await page.waitForTimeout(100);

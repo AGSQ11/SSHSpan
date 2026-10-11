@@ -50,20 +50,25 @@ function settingOn(v) {
 const TOAST_TTL_MS = { err: 9000, warn: 6000, ok: 3800, info: 3800 };
 const TOAST_MAX = 4;
 
-function toast(msg, kind) {
+/// Show a toast; returns it, with dismiss(). opts.sticky keeps it until it is
+/// dismissed (a notice that arrives while the window is hidden); opts.ttlMs
+/// gives it a lifetime of its own; opts.pinned keeps newer toasts from pushing
+/// it out of the stack (the idle-lock warning).
+function toast(msg, kind, opts) {
   const host = el('toast');
-  if (!host) return;
+  if (!host) return null;
   kind = kind || 'info';
   // The same message again while it is still on screen - a load failing on
   // every poll, a batch failing the same way N times - counts on that toast
   // instead of stacking copies that push everything else out (A5-21).
   const same = [...host.children].find((n) => !n._done && n._kind === kind && n._text === String(msg));
-  if (same) { same._repeat(); return; }
+  if (same) { same._repeat(); return same; }
   const item = document.createElement('div');
   item.className = 'toast-item ' + kind;
   item._kind = kind;
   item._text = String(msg);
   item._count = 1;
+  item._pinned = !!(opts && opts.pinned);
   // role=alert for errors so a screen reader interrupts; status for the rest.
   item.setAttribute('role', kind === 'err' ? 'alert' : 'status');
 
@@ -89,8 +94,8 @@ function toast(msg, kind) {
   };
   dismiss.addEventListener('click', remove);
   // Errors linger longer than confirmations - they are the ones worth reading.
-  const ttl = TOAST_TTL_MS[kind] || TOAST_TTL_MS.info;
-  item._timer = setTimeout(remove, ttl);
+  const ttl = opts && opts.sticky ? 0 : ((opts && opts.ttlMs) || TOAST_TTL_MS[kind] || TOAST_TTL_MS.info);
+  if (ttl) item._timer = setTimeout(remove, ttl);
   // Arrived again: show how many times, give it a fresh lifetime, and make it
   // the newest - it is the message being reacted to.
   item._repeat = () => {
@@ -103,14 +108,21 @@ function toast(msg, kind) {
     }
     badge.textContent = '×' + item._count;
     clearTimeout(item._timer);
-    item._timer = setTimeout(remove, ttl);
+    if (ttl) item._timer = setTimeout(remove, ttl);
     host.appendChild(item);
   };
+  item.dismiss = remove;
 
   host.appendChild(item);
   // Cap the stack so a failing batch cannot bury the whole window; the oldest
-  // goes first, since the newest message is the one being reacted to.
-  while (host.children.length > TOAST_MAX) host.firstElementChild.remove();
+  // goes first, since the newest message is the one being reacted to - but
+  // never a pinned one.
+  while (host.children.length > TOAST_MAX) {
+    const oldest = [...host.children].find((n) => !n._pinned);
+    if (!oldest) break;
+    oldest.remove();
+  }
+  return item;
 }
 
 /// Run `fn` while `button` shows that it is working: disabled, aria-busy,
@@ -165,6 +177,9 @@ function focusTargetAvailable(node) {
 /// Backend array fields may be absent in older replies. Normalise them once,
 /// without mutating the reply (deploy/undeploy and loaders share this rule).
 function arrayOrEmpty(value) { return Array.isArray(value) ? value : []; }
+
+/// "1 transfer", "2 transfers".
+function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
 
 /// Field-level messages share the same safe rendering and clearing rule.
 function showFieldMessage(id, message) {
@@ -1526,7 +1541,9 @@ let confirmPending = null;
 ///     question while one is open is refused (answered "no") instead of
 ///     rewriting the text under the user's cursor - or, as before, having one
 ///     click answer both.
-///   - Cancel has the focus, so a reflexive Enter or Space is a "no".
+///   - Cancel has the focus, so a reflexive Enter or Space is a "no" - unless
+///     the yes is the safe answer (opts.focusOk: the lock question, where
+///     locking is what protects the vault).
 ///   - Cancel, Escape, a backdrop click and a vault lock all answer "no", and
 ///     the answer is given exactly once.
 /// opts.danger: false for a confirmation that is not destructive (the button is
@@ -1570,7 +1587,7 @@ function confirmModal(title, message, okLabel, opts) {
     modal.hidden = false;
     // After the modal manager has noted what had the focus (it is the control
     // focus returns to), then onto the safe button.
-    setTimeout(() => { if (!settled) cancelBtn.focus(); }, 0);
+    setTimeout(() => { if (!settled) (opts && opts.focusOk ? okBtn : cancelBtn).focus(); }, 0);
   });
 }
 
@@ -1671,10 +1688,11 @@ const state = window.state = {
   connectSelectedId: null,
   connectAuthMethod: 'publickey',
   _pendingConnectServer: null,  // server id set by openServerPickerForKey
-  _pendingConnectKey: null,
   // multi-tab SSH sessions
-  sessions: new Map(),   // tabId -> {tabId, sessionId, serverId, serverName, host, port, mode, sftpReady, sftpPath, ended}
+  sessions: new Map(),   // tabId -> {tabId, sessionId, serverId, serverName, host, port, mode, sftpReady, sftpPath, ended, connecting, connectOpts, status}
   activeTabId: null,
+  // R12: {version, platform} from app_info, null until it answers.
+  appInfo: null,
 };
 
 // ─── vault gate ────────────────────────────────────────────────────────────
@@ -1684,7 +1702,7 @@ const state = window.state = {
 const VAULT_DIALOG_COPY = {
   create: {
     title: 'Create your vault',
-    text: 'Choose a master password. It encrypts every private key at rest (Argon2id + AES-256-GCM). There is no recovery — if you lose it, the keys are gone.',
+    text: 'Choose a master password. It encrypts every private key at rest (Argon2id + AES-256-GCM). There is no recovery - if you lose it, the keys are gone.',
     primary: 'Create vault',
     busy: 'Creating vault…',
   },
@@ -1807,7 +1825,7 @@ function dismissVaultModal() {
   hideVaultModal();
   if (!wasGate) return;
   state.vaultDismissed = true;
-  if (!state.unlocked) toast('Vault stays locked — unlock it any time.', 'info');
+  if (!state.unlocked) toast('Vault stays locked - unlock it any time.', 'info');
 }
 
 /// An explicit request to see the vault dialog (menu item, Ctrl+N, palette,
@@ -1911,12 +1929,15 @@ function openVaultMenu(anchor) {
     items = [{ label: 'Unlock vault...', icon: 'lock-open', onSelect: () => requestVaultModal('unlock') }];
   } else {
     items = [
-      { label: 'Lock now  (Ctrl+L)', icon: 'lock', onSelect: lockNow },
+      { label: 'Lock now  (Ctrl+L)', icon: 'lock', onSelect: lockFromUser },
       { label: 'Change master password...', icon: 'key-round', onSelect: () => requestVaultModal('change') },
       'sep',
       { label: 'Auto-lock settings...', icon: 'settings', onSelect: () => { switchView('settings'); showSettingsSection('general'); } },
     ];
   }
+  // Quit, whatever the vault's state (R11): closing the window only hides it
+  // to the tray, and on a desktop without a visible tray that was no way out.
+  items.push('sep', { label: 'Quit SSHSpan  (Ctrl+Q)', icon: 'x', onSelect: quitApp });
   // Anchored above the control: it sits at the bottom of the sidebar, so a
   // menu dropped below it would open off-screen.
   openMenu(anchor, items, { above: true, label: 'Vault' });
@@ -1948,6 +1969,9 @@ const LOCK_GATE_HINTS = {
   hosts: 'Unlock the vault to forget a pinned host key.',
   categories: 'Unlock the vault to change categories.',
   settings: 'Unlock the vault to change this.',
+  // ssh_config_list_hosts refuses while locked (R4): the user's ssh config is
+  // an inventory of hosts, accounts and key paths.
+  sshconfig: 'Unlock the vault to import servers from your SSH config.',
 };
 
 /// Mark `control` as needing an unlocked vault (`kind` picks the reason) and
@@ -1999,13 +2023,12 @@ function clearConnectView() {
   el('termDisconnectBtn').hidden = true;
   el('termStrip').textContent = state.unlocked ? 'Ready.' : 'Unlock the vault to connect.';
   state._pendingConnectServer = null;
-  state._pendingConnectKey = null;
   // Close every session tab.
   for (const tabId of [...state.sessions.keys()]) {
     const tab = state.sessions.get(tabId);
-    if (tab && window.tabSessionLive(tabId)) {
-      call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
-    }
+    // The session terminal.js really holds (liveSessionId), not app.js's copy.
+    const sessionId = tab ? liveSessionId(tabId) : null;
+    if (sessionId) call('terminal_disconnect', { sessionId }).catch(() => {});
     if (tab && tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
     window.destroyTabTerminal(tabId);
     state.sessions.delete(tabId);
@@ -2131,13 +2154,20 @@ function openTerminalContextMenu(x, y, tabId) {
   closeKeyConnectMenu();
   const tab = state.sessions.get(tabId);
   if (!tab) return;
-  // After the action, hand the focus back to the terminal so the user can keep
-  // typing without re-clicking the surface.
+  // After an action on this terminal, hand the focus back to it so the user
+  // can keep typing without re-clicking the surface. (Not after the session
+  // items: they open another tab, a question or another surface.)
   const act = (fn) => () => {
     fn();
-    try { window.tabRecord(tabId)?.term.focus(); } catch (e) {}
+    if (typeof window.terminalFocusTab === 'function') window.terminalFocusTab(tabId);
   };
   const server = () => state.servers.find(s => s.id === tab.serverId);
+  // The mode item says where it goes (A3-31). It used to cycle shell, files,
+  // split under a label naming one of them, so "Switch to SFTP" in Split took
+  // the file browser away.
+  const mode = tab.mode === 'ssh'
+    ? { label: 'Open file browser', icon: 'folder-tree', to: 'sftp' }
+    : { label: 'Show terminal only', icon: 'terminal', to: 'ssh' };
   openMenu({ x, y }, [
     { label: 'Copy', icon: 'copy', onSelect: act(() => window.terminalCopySelection(tabId)) },
     { label: 'Copy all to clipboard', icon: 'copy', onSelect: act(() => window.terminalCopyAll(tabId)) },
@@ -2146,11 +2176,14 @@ function openTerminalContextMenu(x, y, tabId) {
     { label: 'Clear scrollback', icon: 'eraser', onSelect: act(() => window.terminalClearScrollback(tabId)) },
     { label: 'Reset terminal', icon: 'rotate-ccw', onSelect: act(() => window.terminalReset(tabId)) },
     'sep',
-    { label: 'New session', icon: 'plus', onSelect: act(() => { const srv = server(); if (srv) openSessionTab(srv); }) },
-    { label: 'Duplicate session', icon: 'copy', onSelect: act(() => { const srv = server(); if (srv) openSessionTab(srv); }) },
-    { label: 'Restart session', icon: 'refresh-cw', onSelect: act(() => reconnectActiveTab()) },
-    { label: tab.mode === 'sftp' ? 'Switch to terminal' : 'Switch to SFTP', icon: 'folder-tree',
-      disabled: !window.tabSessionLive(tabId), onSelect: act(() => window.toggleSshSftpMode()) },
+    // Another session to the same server, opened the way this one was (with
+    // its key override). "Duplicate session" sat beside it doing exactly the
+    // same thing (A5-33).
+    { label: 'New session', icon: 'plus', onSelect: () => { const srv = server(); if (srv) openSessionTab(srv, tab.connectOpts || {}); } },
+    // Not while the tab connects (A3-14); on a live session it asks (A3-13).
+    { label: 'Restart session', icon: 'refresh-cw', disabled: !!tab.connecting, onSelect: () => reconnectActiveTab() },
+    { label: mode.label, icon: mode.icon, disabled: !window.tabSessionLive(tabId),
+      onSelect: () => { if (typeof window.setSessionMode === 'function') window.setSessionMode(mode.to); } },
   ], { label: 'Terminal' });
 }
 
@@ -2161,6 +2194,19 @@ function markTerminalBell(tabId) {
   renderTermTabs();
 }
 window.markTerminalBell = markTerminalBell;
+
+/// The visual bell (A3-26): the tab's chip flashes - the tab being watched
+/// too, which nothing marked at all (xterm 5 has no visual bell of its own).
+function flashTerminalTab(tabId) {
+  const chip = [...document.querySelectorAll('#termTabs .term-tab')].find((c) => c.dataset.tabId === tabId);
+  if (!chip) return;
+  chip.classList.remove('bell-flash');
+  void chip.offsetWidth; // a bell during a flash starts it over
+  chip.classList.add('bell-flash');
+  clearTimeout(chip._bellFlashTimer);
+  chip._bellFlashTimer = setTimeout(() => chip.classList.remove('bell-flash'), 400);
+}
+window.flashTerminalTab = flashTerminalTab;
 
 /// The selection bar is the whole of what used to be the Deploy view's entry
 /// point. It appears where the selection is, so no instruction to go and tick
@@ -3140,11 +3186,12 @@ function paletteCandidates() {
     { group: 'Actions', icon: 'server', name: 'New server...', terms: ['new', 'server', 'host'], run: () => { switchView('connect'); openServerModal({}); } },
     { group: 'Actions', icon: 'shield-check', name: n ? `Deploy ${n} selected key(s)...` : 'Deploy keys (select some first)',
       terms: ['deploy', 'ssh config'], run: () => { switchView('keys'); openDeploySheet(); } },
-    { group: 'Actions', icon: 'lock', name: 'Lock the vault', terms: ['lock'], run: lockNow },
+    { group: 'Actions', icon: 'lock', name: 'Lock the vault', terms: ['lock'], run: lockFromUser },
     { group: 'Actions', icon: 'key-round', name: 'Change master password...', terms: ['password', 'master password', 'vault'],
       run: () => requestVaultModal('change') },
     { group: 'Actions', icon: 'refresh-cw', name: 'Check for updates', terms: ['update', 'updates', 'version', 'release'],
-      run: manualUpdateCheck },
+      run: () => manualUpdateCheck() },
+    PALETTE_QUIT,
   );
   // Every Settings section is a destination of its own (A5-17): the palette
   // used to reach only the first one and the audit log.
@@ -3154,6 +3201,9 @@ function paletteCandidates() {
   }
   return out;
 }
+
+/// Quit (R11), locked or not.
+const PALETTE_QUIT = { group: 'Actions', icon: 'x', name: 'Quit SSHSpan', terms: ['quit', 'exit', 'close app'], run: () => quitApp() };
 
 /// [section, title, icon, words someone would type for it].
 const PALETTE_SETTINGS_SECTIONS = [
@@ -3197,7 +3247,8 @@ function paletteScore(item, words, query) {
 function renderPalette(query) {
   const words = paletteWords(query);
   const all = state.unlocked ? paletteCandidates()
-    : [{ group: 'Actions', icon: 'lock-open', name: 'Unlock the vault...', terms: ['unlock'], run: () => requestVaultModal(state.hasVault ? 'unlock' : 'create') }];
+    : [{ group: 'Actions', icon: 'lock-open', name: 'Unlock the vault...', terms: ['unlock'], run: () => requestVaultModal(state.hasVault ? 'unlock' : 'create') },
+      PALETTE_QUIT];
   if (!words.length) {
     paletteItems = all;
   } else {
@@ -3858,12 +3909,20 @@ async function saveDeployedAsServers(deployed, fields) {
   return failed;
 }
 
-// Import a Host block from ~/.ssh/config into the server-edit modal, prefilled.
+// Import a Host block from the user's own ~/.ssh/config into the server form,
+// prefilled (R4). The backend reads that file read-only: literal Host names
+// only, Include followed one level, Match blocks and wildcard patterns
+// skipped. It used to read SSHSpan's private managed file instead, which never
+// holds the hosts a user already has (A2-43 / A5-05).
 async function importFromSshConfig(anchorEl) {
+  // An inventory of hosts, accounts and key paths: the backend refuses it
+  // while the vault is locked, and the button says so (R4).
+  if (!lockGateOpen('sshconfig')) return;
   try {
-    const res = await call('ssh_config_list_hosts');
+    const res = await call('ssh_config_list_hosts', { source: 'user' });
     const hosts = res.hosts || [];
-    if (hosts.length === 0) { toast('No Host blocks found in ' + (await systemPaths()).sshConfig + '.', 'info'); return; }
+    const file = res.path || '~/.ssh/config';
+    if (hosts.length === 0) { toast('No Host blocks found in ' + file + '.', 'info'); return; }
     const items = hosts.map((h) => ({
       label: h.host, sub: `(${h.user || '?'}@${h.hostname || h.host}:${h.port || 22})`, icon: 'server',
       onSelect: () => {
@@ -3893,7 +3952,9 @@ async function importFromSshConfig(anchorEl) {
         }
       },
     }));
-    openMenu(anchorEl, items, { label: 'Hosts in your SSH config' });
+    // Which file these came from, as the menu's first, inert line.
+    items.unshift({ label: 'From ' + file, icon: 'file-text', disabled: true, onSelect: () => {} }, 'sep');
+    openMenu(anchorEl, items, { label: 'Hosts in ' + file });
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
@@ -3928,16 +3989,74 @@ async function copyIncludeLine() {
 const BW_FIELDS = [
   { key: 'server_url',      label: 'Server URL',          type: 'url',      placeholder: 'https://vault.example.com', required: true },
   { key: 'email',           label: 'Email',               type: 'email',    placeholder: 'you@example.com',           required: true },
-  { key: 'master_password', label: 'Master Password',     type: 'password', placeholder: 'Your Bitwarden master password', required: false },
+  { key: 'master_password', label: 'Master password',     type: 'password', placeholder: 'Your Bitwarden master password', required: false },
   { key: 'folder_name',          label: 'Keys folder',    type: 'text', placeholder: 'SSHSpan_Keys',     required: false },
   { key: 'servers_folder_name', label: 'Servers folder', type: 'text', placeholder: 'SSHSpan_Servers', required: false },
 ];
 
 function setBwStatus(text, cls) {
   const s = el('bwStatus');
-  s.classList.remove('ok', 'err', 'info', 'syncing');
+  s.classList.remove('ok', 'err', 'info', 'syncing', 'warn');
   if (cls) s.classList.add(cls);
   s.textContent = text;
+}
+
+/// The server, account and stored-password flag as saved, so the form can say
+/// what a blank password field means (A5-35) - and that it means nothing once
+/// the server or account is changed: the backend uses a stored password for
+/// the saved server and account only, and refuses to save another endpoint
+/// without a new one (RU5).
+let bwSaved = { server_url: '', email: '', hasMasterPassword: false };
+
+const bwUrlKey = (u) => String(u || '').trim().replace(/\/+$/, '').toLowerCase();
+
+function bwEndpointChanged() {
+  const url = el('bw_server_url') ? el('bw_server_url').value : '';
+  const email = el('bw_email') ? el('bw_email').value : '';
+  return bwUrlKey(url) !== bwUrlKey(bwSaved.server_url)
+    || String(email).trim().toLowerCase() !== String(bwSaved.email || '').trim().toLowerCase();
+}
+
+function paintBwPasswordHint() {
+  const input = el('bw_master_password');
+  const hint = el('bwPasswordHint');
+  if (!input || !hint) return;
+  let text = '';
+  if (bwSaved.hasMasterPassword && !bwEndpointChanged()) {
+    text = 'A password is stored - leave blank to keep it.';
+    input.placeholder = 'Stored - leave blank to keep it';
+  } else if (bwSaved.hasMasterPassword) {
+    text = 'A password is needed: the server or account changed, and the stored one is only used for the saved server and account.';
+    input.placeholder = 'Needed for the new server or account';
+  } else {
+    input.placeholder = 'Your Bitwarden master password';
+  }
+  hint.textContent = text;
+  hint.hidden = !text;
+}
+
+/// A sync's failed items under the status line (A2-08): what each is about -
+/// a key's name, a server, a folder, a Bitwarden item id, whichever the
+/// backend names - and its reason, as text.
+const BW_ERRORS_SHOWN = 50;
+
+function renderBwErrors(errors) {
+  const list = el('bwErrors');
+  if (!list) return;
+  const all = arrayOrEmpty(errors);
+  const rows = all.slice(0, BW_ERRORS_SHOWN).map((e) => {
+    const li = document.createElement('li');
+    const about = e ? (e.name || e.server || e.folder || e.cipher_id) : '';
+    li.textContent = (about ? about + ': ' : '') + ((e && e.error) || 'failed');
+    return li;
+  });
+  if (all.length > BW_ERRORS_SHOWN) {
+    const more = document.createElement('li');
+    more.textContent = '... and ' + (all.length - BW_ERRORS_SHOWN) + ' more.';
+    rows.push(more);
+  }
+  list.replaceChildren(...rows);
+  list.hidden = !rows.length;
 }
 
 /// The latest form load only; the form is built aside and swapped in whole
@@ -3956,6 +4075,8 @@ async function loadBitwardenConfig() {
     // first launch - no config yet
   }
   if (seq !== bwConfigSeq) return;
+  config = config || {};
+  bwSaved = { server_url: config.server_url || '', email: config.email || '', hasMasterPassword: config.hasMasterPassword === true };
 
   const fields = document.createDocumentFragment();
   for (const f of BW_FIELDS) {
@@ -3971,13 +4092,24 @@ async function loadBitwardenConfig() {
     inp.spellcheck = false;
     inp.setAttribute('autocomplete', 'off');
     if (config[f.key]) inp.value = config[f.key];
-    if (f.key === 'master_password') inp.value = ''; // never pre-fill password
     label.appendChild(span);
     label.appendChild(inp);
+    if (f.key === 'master_password') {
+      inp.value = ''; // never pre-filled: the stored one stays in Rust
+      const hint = document.createElement('span');
+      hint.className = 'field-hint';
+      hint.id = 'bwPasswordHint';
+      hint.hidden = true;
+      inp.setAttribute('aria-describedby', hint.id);
+      label.appendChild(hint);
+    }
     fields.appendChild(label);
   }
   grid.replaceChildren(fields);
   wireRevealToggles(grid); // the master password's eye button (A5-35)
+  for (const id of ['bw_server_url', 'bw_email']) el(id).addEventListener('input', paintBwPasswordHint);
+  paintBwPasswordHint();
+  renderBwErrors([]);
 
   // Sync status
   if (config.last_sync) {
@@ -3989,78 +4121,151 @@ async function loadBitwardenConfig() {
 
 async function saveBitwardenConfig() {
   if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
-  const payload = {
-    serverUrl: el('bw_server_url').value.trim(),
-    email: el('bw_email').value.trim(),
-    masterPassword: el('bw_master_password').value || undefined,
-    folderName: el('bw_folder_name').value.trim() || undefined,
-    serversFolderName: el('bw_servers_folder_name') ? (el('bw_servers_folder_name').value.trim() || undefined) : undefined,
-  };
-  if (!payload.serverUrl) { toast('Server URL is required.', 'err'); el('bw_server_url').focus(); return; }
-  if (!payload.email) { toast('Email is required.', 'err'); el('bw_email').focus(); return; }
-  try {
-    await call('bitwarden_save_config', payload);
-    toast('Bitwarden config saved.', 'ok');
-    el('bw_master_password').value = ''; // clear after save
-    await loadBitwardenConfig();
-  } catch (e) {
-    toast(e.message || String(e), 'err');
-  }
-}
-
-async function bwTest() {
-  try {
-    await call('bitwarden_test_connection');
-    setBwStatus('Connection OK.', 'ok');
-    toast('Connection OK.', 'ok');
-  } catch (e) {
-    setBwStatus(e.message || String(e), 'err');
-    toast(e.message || String(e), 'err');
-  }
-}
-
-async function bwSyncNow(allowRemoteOverwrite) {
-  const btn = el('bwSyncNowBtn');
-  btn.disabled = true;
-  setBwStatus('Syncing\u2026', 'syncing');
-  try {
-    // camelCase: Tauri v2 converts a command's snake_case parameter to
-    // camelCase by default, so `allow_remote_overwrite` never matched
-    // `allowRemoteOverwrite`, deserialized to None, and unwrap_or(false)
-    // applied. The "Apply them now?" approval was silently discarded and the
-    // UI still reported "Sync complete."
-    const s = await call('bitwarden_sync', { allowRemoteOverwrite: allowRemoteOverwrite === true });
-    const skipped = (s.skippedOverwrites || 0) + (s.skippedNew || 0);
-    if (skipped > 0 && !allowRemoteOverwrite) {
-      const msg = [
-        'Remote changes need your approval:',
-        s.skippedOverwrites ? s.skippedOverwrites + ' local overwrite(s)' : null,
-        s.skippedNew ? s.skippedNew + ' new remote item(s)' : null,
-      ];
-      const detail = msg.filter(Boolean).join(', ');
-      const apply = await confirmModal('Apply remote changes', detail + '. Apply them now?', 'Apply');
-      // The vault can lock while the dialog is open; a lock answers it "no",
-      // and this keeps a late approval from reaching a vault that is sealed.
-      if (apply && state.unlocked) {
-        return await bwSyncNow(true);
-      }
+  // One save at a time (A2-18): a double click saved twice.
+  return withBusy(el('bwSaveBtn'), 'Saving…', async () => {
+    const payload = {
+      serverUrl: el('bw_server_url').value.trim(),
+      email: el('bw_email').value.trim(),
+      masterPassword: el('bw_master_password').value || undefined,
+      folderName: el('bw_folder_name').value.trim() || undefined,
+      serversFolderName: el('bw_servers_folder_name') ? (el('bw_servers_folder_name').value.trim() || undefined) : undefined,
+    };
+    if (!payload.serverUrl) { toast('Server URL is required.', 'err'); el('bw_server_url').focus(); return; }
+    if (!payload.email) { toast('Email is required.', 'err'); el('bw_email').focus(); return; }
+    try {
+      await call('bitwarden_save_config', payload);
+      toast('Bitwarden settings saved.', 'ok');
+      el('bw_master_password').value = ''; // clear after save
+      await loadBitwardenConfig();
+    } catch (e) {
+      // The backend's own words, e.g. a new server or account without a new
+      // password (RU5).
+      toast(e.message || String(e), 'err');
     }
-    const parts = [];
-    if (s.pushed) parts.push(s.pushed + ' pushed');
-    if (s.pulled) parts.push(s.pulled + ' pulled');
-    if (s.updatedRemote) parts.push(s.updatedRemote + ' updated remote');
-    if (s.updatedLocal) parts.push(s.updatedLocal + ' updated local');
-    if (s.linked) parts.push(s.linked + ' linked');
-    if (s.conflicts) parts.push(s.conflicts + ' conflicts');
-    setBwStatus(parts.length ? 'Sync: ' + parts.join(', ') : 'Nothing to sync.', 'ok');
-    toast('Sync complete.', 'ok');
-    await loadKeys();
-  } catch (e) {
-    setBwStatus(e.message || String(e), 'err');
-    toast(e.message || String(e), 'err');
-  } finally {
-    btn.disabled = false;
+  });
+}
+
+/// Test what the form shows, not what was saved last (A2-52): "Test" before
+/// "Save" used to test the old settings - or nothing - and say "Connection
+/// OK." A blank field is left out, so the saved value is used; the backend
+/// unseals the stored password only for the saved server and account. The
+/// result names the server and the account it reached.
+async function bwTest() {
+  return withBusy(el('bwTestBtn'), 'Testing…', async () => {
+    const field = (id) => (el(id) ? el(id).value.trim() : '');
+    const serverUrl = field('bw_server_url');
+    const email = field('bw_email');
+    const masterPassword = el('bw_master_password') ? el('bw_master_password').value : '';
+    setBwStatus('Testing the connection…', 'syncing');
+    try {
+      const r = await call('bitwarden_test_connection', {
+        serverUrl: serverUrl || undefined,
+        email: email || undefined,
+        masterPassword: masterPassword || undefined,
+      });
+      const items = r && Number.isFinite(r.sshItemCount) ? ', ' + plural(r.sshItemCount, 'SSH key item') : '';
+      const text = `Connection OK - ${(r && r.account) || email} on ${(r && r.server) || serverUrl}${items}.`;
+      setBwStatus(text, 'ok');
+      toast(text, 'ok');
+    } catch (e) {
+      const msg = e.message || String(e);
+      setBwStatus(msg, 'err');
+      toast(msg, 'err');
+    }
+  });
+}
+
+/// The changes a sync left for the user to approve, in words - key and server
+/// overwrites and new items alike (A2-47: servers used to be applied unasked).
+function bwPendingRemoteChanges(s) {
+  const parts = [];
+  if (s.skippedOverwrites) parts.push(plural(s.skippedOverwrites, 'key') + ' replaced by a newer Bitwarden copy');
+  if (s.skippedNew) parts.push(plural(s.skippedNew, 'new key') + ' from Bitwarden');
+  if (s.skippedServerOverwrites) parts.push(plural(s.skippedServerOverwrites, 'server') + ' replaced by a newer Bitwarden copy');
+  if (s.skippedServerNew) parts.push(plural(s.skippedServerNew, 'new server') + ' from Bitwarden');
+  return parts.join(', ');
+}
+
+/// What a sync did, keys and servers apart (A7-24: only the key counters were
+/// read, so a run that only moved servers said "Nothing to sync."), with the
+/// linked items gone from Bitwarden and what was renamed or left unapplied.
+/// `linked` and `conflicts` count keys and servers together (bitwarden/
+/// sync.rs adds to both from either pass), so they are said apart from the
+/// two groups - under "Keys:" they claimed servers' links and conflicts as
+/// keys' (fix round 1).
+function bwSyncSummary(s) {
+  const counted = (pairs) => pairs.filter(([n]) => n > 0).map(([n, label]) => n + ' ' + label);
+  const keys = counted([
+    [s.pushed, 'pushed'], [s.updatedRemote, 'updated in Bitwarden'], [s.pulled, 'pulled'],
+    [s.updatedLocal, 'updated here'], [s.recreatedRemote, 're-created in Bitwarden'],
+  ]);
+  const servers = counted([
+    [s.serversPushed, 'pushed'], [s.serversUpdatedRemote, 'updated in Bitwarden'], [s.serversPulled, 'pulled'],
+    [s.serversUpdatedLocal, 'updated here'], [s.serversRecreatedRemote, 're-created in Bitwarden'],
+  ]);
+  const parts = [];
+  if (keys.length) parts.push('Keys: ' + keys.join(', ') + '.');
+  if (servers.length) parts.push('Servers: ' + servers.join(', ') + '.');
+  if (s.linked > 0) parts.push('Matched to existing Bitwarden items: ' + s.linked + '.');
+  if (s.conflicts > 0) parts.push('Conflicts (changed on both sides - the copy here replaced the one in Bitwarden): ' + s.conflicts + '.');
+  if (s.remoteDeleted) parts.push(plural(s.remoteDeleted, 'linked item') + ' gone from Bitwarden (kept here).');
+  const renamed = arrayOrEmpty(s.renamed);
+  if (renamed.length) parts.push('Renamed: ' + renamed.map((r) => `${r.name} stored as ${r.storedAs}`).join(', ') + '.');
+  const pending = bwPendingRemoteChanges(s);
+  if (pending) parts.push('Not applied: ' + pending + '.');
+  return parts.join(' ');
+}
+
+/// Show a sync's result as it is (A2-08 / A7-24): a run that stopped part-way
+/// (RU5: ok false, aborted) or had failed items is never "Sync complete.".
+function showBwSyncResult(s) {
+  const errors = arrayOrEmpty(s.errors);
+  const summary = bwSyncSummary(s);
+  renderBwErrors(errors);
+  if (s.ok === false) {
+    const reason = s.aborted || 'The sync stopped before it finished.';
+    setBwStatus('Sync stopped: ' + reason + (summary ? ' Done before it stopped: ' + summary : ''), 'err');
+    toast('Bitwarden sync stopped: ' + reason, 'err');
+    return;
   }
+  if (errors.length) {
+    const n = plural(errors.length, 'error');
+    setBwStatus((summary ? summary + ' ' : '') + n + ' - see the list below.', 'warn');
+    toast('Bitwarden sync finished with ' + n + ' - see Settings > Bitwarden sync.', 'warn');
+    return;
+  }
+  setBwStatus(summary || 'Nothing to sync.', 'ok');
+  toast('Sync complete.', 'ok');
+}
+
+async function bwSyncNow() {
+  return withBusy(el('bwSyncNowBtn'), 'Syncing…', async () => {
+    setBwStatus('Syncing…', 'syncing');
+    renderBwErrors([]);
+    try {
+      // camelCase: Tauri v2 converts a command's snake_case parameter to
+      // camelCase by default, so `allow_remote_overwrite` never matched
+      // `allowRemoteOverwrite`, deserialized to None, and unwrap_or(false)
+      // applied. The "Apply them now?" approval was silently discarded and the
+      // UI still reported "Sync complete."
+      let s = await call('bitwarden_sync', { allowRemoteOverwrite: false });
+      const pending = s && s.ok !== false ? bwPendingRemoteChanges(s) : '';
+      if (pending) {
+        const apply = await confirmModal('Apply remote changes',
+          'Bitwarden has changes that need your approval: ' + pending + '. Apply them now?', 'Apply');
+        // The vault can lock while the dialog is open; a lock answers it "no",
+        // and this keeps a late approval from reaching a vault that is sealed.
+        if (apply && state.unlocked) s = await call('bitwarden_sync', { allowRemoteOverwrite: true });
+      }
+      showBwSyncResult(s || {});
+      await loadKeys();
+      if (state.view === 'connect' || state.servers.length) await loadServers();
+    } catch (e) {
+      const msg = e.message || String(e);
+      setBwStatus(msg, 'err');
+      toast(msg, 'err');
+    }
+  });
 }
 
 // ─── settings view ─────────────────────────────────────────────────────────
@@ -4316,9 +4521,12 @@ async function loadSettings() {
   const checkNow = document.createElement('button');
   checkNow.className = 'ghost-btn';
   checkNow.innerHTML = `${ico('refresh-cw')}<span>Check now</span>`;
-  checkNow.addEventListener('click', manualUpdateCheck);
+  checkNow.addEventListener('click', () => manualUpdateCheck(checkNow));
+  // The version from app_info (R12): there was none anywhere, only a stale
+  // development build marker.
+  const version = state.appInfo && state.appInfo.version ? `This is SSHSpan ${state.appInfo.version}. ` : '';
   mkRow('Check for an update now', checkNow,
-    'Compares this build against the latest GitHub release.');
+    version + 'Compares it against the latest GitHub release.');
 
   const sftpParallel = document.createElement('input');
   sftpParallel.type = 'number';
@@ -4503,8 +4711,10 @@ async function loadSettings() {
   const termBackspace = selectFor('terminalBackspace',
     '<option value="default">Delete (0x7f)</option><option value="backspace">Backspace (0x08)</option>',
     'default', 'Backspace compatibility updated; it applies to new terminals.');
+  // A host whose erase character is ^H echoes DEL as "^?" - the symptom that
+  // calls for 0x08 (the copy named ^H, the opposite case).
   mkRow('Backspace key sends', termBackspace,
-    'Change this only if Backspace prints ^H on a particular host. Applies to new terminals.');
+    'Change this only if Backspace prints ^? on a particular host. Applies to new terminals.');
 
   const termHomeEnd = selectFor('terminalHomeEnd',
     '<option value="default">xterm/Home+End standard</option><option value="rxvt">rxvt/Home+End compatibility</option>',
@@ -4951,6 +5161,7 @@ const VIEW_SUBS = {
 async function switchView(view) {
   setCatDrawer(false);
   remaskSecrets(document); // a password shown in Settings is not left shown (A5-35)
+  const cameFrom = state.view;
   state.view = view;
   state.categoryScope = currentCategoryScope();
   // Terminal-maximized is a state of the Connect surface, not of the app:
@@ -4991,7 +5202,13 @@ async function switchView(view) {
     applyNavLockState();
     if (state.unlocked) {
       await loadServers();
-      el('termStrip').textContent = 'Ready. (build ' + (window.__SSHPAN_BUILD__ || 'unknown') + ')';
+      if (state.view !== 'connect') return;
+      // The status line belongs to the active tab (A2-25 / A3-27): it used to
+      // be replaced by "Ready. (build ...)" on every visit, mid-connect too.
+      showActiveTabStatus();
+      // Back from another view, the keyboard goes back to the session: it was
+      // left on <body> and the next keystrokes went nowhere (A3-27).
+      if (cameFrom !== 'connect' && state.sessions.has(state.activeTabId)) activateSessionSurface(state.activeTabId);
     } else {
       clearConnectView();
     }
@@ -5257,7 +5474,7 @@ function wire() {
   el('copyConfigBtn').addEventListener('click', copyConfig);
 
   // vault actions, now in Settings rather than the corner of every view
-  el('lockBtn').addEventListener('click', lockNow);
+  el('lockBtn').addEventListener('click', lockFromUser);
   // Changing the password needs an unlocked vault; otherwise the useful dialog
   // is the one that unlocks (or creates) it.
   el('changePasswordBtn').addEventListener('click', () =>
@@ -5384,9 +5601,28 @@ function wire() {
       }
       return;
     }
+    // Ctrl+Shift+M maximizes the terminal and restores it (A5-44). The hint
+    // used to say Escape, which a focused terminal sends to the shell instead;
+    // terminal.js lets this chord through, so it works wherever the focus is.
+    if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && !ev.altKey && ev.code === 'KeyM') {
+      if (dialogOpen) return;
+      if (state.view === 'connect' || el('app').classList.contains('term-max')) {
+        ev.preventDefault();
+        toggleTermMax();
+      }
+      return;
+    }
     if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.shiftKey) return;
     const k = ev.key.toLowerCase();
-    if (k === 'l') { ev.preventDefault(); lockNow(); return; }
+    // Only a real press counts: a second Ctrl+L or Ctrl+Q is the yes of its
+    // question (confirmLiveWork), and a key held for half a second repeats,
+    // so holding it answered its own question - locking or quitting, live
+    // sessions and all, unasked (fix round 2).
+    if ((k === 'l' || k === 'q') && ev.repeat) { ev.preventDefault(); return; }
+    if (k === 'l') { ev.preventDefault(); lockFromUser(); return; }
+    // Quit (R11). Like Ctrl+L it works with a dialog open; in a focused
+    // terminal Ctrl+Q stays the shell's (XON) and never gets here.
+    if (k === 'q') { ev.preventDefault(); quitApp(); return; }
     if (dialogOpen) return;
     if (k === '1') { switchView('keys'); ev.preventDefault(); }
     else if (k === '2') { switchView('connect'); ev.preventDefault(); }
@@ -5404,8 +5640,21 @@ function wire() {
     }
   });
 
-  // Listen for vault-lock-requested from the tray menu
+  // Listen for vault-lock-requested from the tray menu. It locks without a
+  // question: the window may be hidden, where no one would see one.
   listen('vault-lock-requested', () => { lockNow(); });
+
+  // The first X-close of a run hides the window to the tray (R11 / A5-24).
+  // The notice stays until dismissed: the window is hidden when it arrives,
+  // so a timed toast would be gone before anyone came back to read it.
+  listen('window-hidden-to-tray', () => {
+    if (trayNoticeShown) return;
+    trayNoticeShown = true;
+    toast('SSHSpan keeps running in the tray - Quit from the tray or Ctrl+Q', 'info', { sticky: true });
+  });
+
+  // Transfers, for the lock and quit questions (A5-09).
+  listen('sftp-queue', onQueueEvent);
 
   // The backend idle watchdog locked the vault without us (nothing arrived
   // for autoLockMinutes). The renderer would otherwise find out at the next
@@ -5419,24 +5668,35 @@ function wire() {
   // The "+" tab-strip chip: show the server list so the user can pick (or
   // add) the host for a new session. It previously had no handler at all -
   // hover styles and a title promising an action, doing nothing.
+  // On the Servers view it did nothing visible; the list is where a server is
+  // picked, so the keyboard goes there (the terminal's own layout first, when
+  // maximized hides the list).
   const termAddBtn = el('termTabAdd');
-  if (termAddBtn) termAddBtn.addEventListener('click', () => switchView('connect'));
+  if (termAddBtn) termAddBtn.addEventListener('click', async () => {
+    if (el('app').classList.contains('term-max')) toggleTermMax();
+    await switchView('connect');
+    el('serverSearch').focus();
+  });
 
   // ─── Connect view wiring ────────────────────────────────────────────────
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
   el('serverImportBtn').addEventListener('click', (ev) => importFromSshConfig(ev.currentTarget));
+  lockGate(el('serverImportBtn'), 'sshconfig');
   el('serverSearch').addEventListener('input', renderServerList);
   el('termDisconnectBtn').addEventListener('click', disconnectActiveTab);
   const termMaxBtn = el('termMaxBtn');
   if (termMaxBtn) termMaxBtn.addEventListener('click', toggleTermMax);
+  // The header's buttons act on what it shows (A2-44 / A3-10): Reconnect
+  // reconnects the active tab - it connected the list selection, in a new
+  // tab, which could be another host than the one the header named. With no
+  // tab the same button is Connect, for the selected server.
   el('termReconnectBtn').addEventListener('click', () => {
+    if (state.sessions.has(state.activeTabId)) { reconnectActiveTab(); return; }
     const srv = currentSelectedServer();
     if (srv) openSessionTab(srv);
   });
-  el('termTestBtn').addEventListener('click', () => {
-    const srv = currentSelectedServer();
-    if (srv) testSelectedServer(srv);
-  });
+  el('termTestBtn').addEventListener('click', () => testSelectedServer(headServer()));
+  el('termCancelBtn').addEventListener('click', cancelActiveConnect);
   const assistantToggleBtn = el('assistantToggleBtn');
   if (assistantToggleBtn) assistantToggleBtn.addEventListener('click', () => {
     if (typeof window.assistantToggle === 'function') window.assistantToggle();
@@ -5474,8 +5734,23 @@ function wire() {
     // (A6-04 / A2-19).
     try {
       const r = await call('system_pick_file_path', { title: 'Select .pem file' });
-      if (r && !r.canceled) el('srvPemPath').value = r.path;
+      if (r && !r.canceled) { el('srvPemPath').value = r.path; el('srvPemPath').title = r.path; }
     } catch (e) { toast(e.message || String(e), 'err'); }
+  });
+  // A long path is cut off in the field; its tooltip has all of it (A1-21).
+  el('srvPemPath').addEventListener('input', () => { el('srvPemPath').title = el('srvPemPath').value; });
+  // "Remove saved password" is a toggle: pressed, Save removes it (A5-03).
+  el('srvClearPwBtn').addEventListener('click', () => {
+    state._clearSavedPw = !state._clearSavedPw;
+    paintSavedPasswordRow();
+  });
+  // A port refused on Save is checked again as it is corrected (A5-30).
+  el('srvPort').addEventListener('input', () => {
+    if (el('srvPort').getAttribute('aria-invalid') !== 'true') return;
+    if (!serverPortFrom(el('srvPort').value).error) {
+      showFieldMessage('srvPortMsg', '');
+      el('srvPort').removeAttribute('aria-invalid');
+    }
   });
   el('srvSaveBtn').addEventListener('click', submitServerModal);
   // Enter submits from any single-line field in the host form, the way a real
@@ -5515,8 +5790,102 @@ function wire() {
   });
 }
 
-/// Lock now, immediately: no confirmation, whatever is open.
-async function lockNow() {
+/// The tray notice is shown once per run (the backend sends its event once,
+/// and this does not trust that alone).
+let trayNoticeShown = false;
+
+/// Transfer states as the queue reports them, by job id (sftp-queue events
+/// carry every job or just one), for the lock and quit questions. sftp.js
+/// keeps its own copy for its panel, which exists only once a file browser
+/// was opened.
+const transferStates = new Map();
+
+function onQueueEvent(ev) {
+  for (const j of arrayOrEmpty(ev && ev.payload && ev.payload.jobs)) {
+    if (j && j.id !== undefined) transferStates.set(j.id, j.state);
+  }
+}
+
+/// What a lock, a quit or an update would end, in words - "closes 2 live SSH
+/// sessions and pauses 1 transfer" - or '' when nothing is running.
+function liveWorkText() {
+  let sessions = 0;
+  for (const tabId of state.sessions.keys()) {
+    if (window.tabSessionLive && window.tabSessionLive(tabId)) sessions += 1;
+  }
+  let transfers = 0;
+  for (const s of transferStates.values()) if (s === 'active' || s === 'queued') transfers += 1;
+  const parts = [];
+  if (sessions) parts.push('closes ' + plural(sessions, 'live SSH session'));
+  if (transfers) parts.push('pauses ' + plural(transfers, 'transfer'));
+  return parts.join(' and ');
+}
+
+/// The lock or quit question while it is open: { kind, settle } - settle is
+/// confirmModal's answer function for that very question.
+let liveWorkQuestion = null;
+
+/// A question about ending live work - kind 'lock' or 'quit'. The same chord
+/// again while its question is open is the answer yes (fix round 1): Ctrl+L
+/// twice locks, Ctrl+Q twice quits; that second call resolves null and leaves
+/// the work to the first. Otherwise one question at a time (confirmModal): a
+/// confirmation still open is answered "no" first - the lock or quit is what
+/// the user asked for now. The lock question has Lock focused (locking is the
+/// safe answer); the quit question keeps Cancel focused.
+function confirmLiveWork(kind, title, message, okLabel) {
+  const open = !!confirmPending && !el('confirmModal').hidden;
+  if (open && liveWorkQuestion && liveWorkQuestion.kind === kind && liveWorkQuestion.settle === confirmPending) {
+    confirmPending(true);
+    return Promise.resolve(null);
+  }
+  if (open) confirmPending(false);
+  const asked = confirmModal(title, message, okLabel, kind === 'lock' ? { focusOk: true } : undefined);
+  const question = { kind, settle: confirmPending };
+  liveWorkQuestion = question;
+  return asked.then((answer) => {
+    if (liveWorkQuestion === question) liveWorkQuestion = null;
+    return answer;
+  });
+}
+
+/// A lock the user asked for in this window - the vault menu, Ctrl+L, the
+/// palette, Settings. With sessions live or transfers running it asks first,
+/// naming them (A5-09, R2): a lock ends every session and pauses every
+/// transfer, and Ctrl+L outside a terminal took them all without a word. The
+/// tray's lock and the idle timer do not ask (the window may be hidden; the
+/// idle lock warns a minute ahead).
+function lockFromUser() {
+  return lockNow({ ask: true });
+}
+
+/// Quit SSHSpan (R11): app_quit is the tray's Quit - the vault lock teardown,
+/// then exit. Closing the window only hides it to the tray. With live work it
+/// asks first, like a lock.
+async function quitApp() {
+  const work = liveWorkText();
+  if (work) {
+    const ok = await confirmLiveWork('quit', 'Quit SSHSpan?', 'Quitting ' + work + '.\n\nPress Ctrl+Q again to quit.', 'Quit');
+    if (!ok) return; // no, or null: a second Ctrl+Q answered the first question
+  }
+  try {
+    await call('app_quit');
+  } catch (e) {
+    toast(e.message || String(e), 'err');
+  }
+}
+window.appQuit = quitApp;
+
+/// Lock now. opts.ask: a lock from the user in this window (lockFromUser).
+async function lockNow(opts) {
+  if (opts && opts.ask && state.unlocked) {
+    const work = liveWorkText();
+    if (work) {
+      const ok = await confirmLiveWork('lock', 'Lock the vault?', 'Locking ' + work + '.\n\nPress Ctrl+L again to lock.', 'Lock');
+      if (!ok) return; // no, or null: a second Ctrl+L answered the first question
+    }
+    // Locked meanwhile (the tray, the watchdog): nothing left to do.
+    if (!state.unlocked) return;
+  }
   // Settle every open dialog BEFORE the round trip. Between the lock request
   // and the status refresh a pending "Confirm" could otherwise still be
   // clicked, and its action would run against a vault that is already locking.
@@ -5740,9 +6109,55 @@ function noteUserActivity() {
   lastUserActivityAt = Date.now();
   const mins = autoLockMinutes();
   if (autoLockDeadline && mins > 0) autoLockDeadline = lastUserActivityAt + mins * 60 * 1000;
+  dismissAutoLockWarning();
   queueActivityHeartbeat();
 }
 window.noteUserActivity = noteUserActivity;
+
+/// A minute before an idle lock the user is told (A5-09, R2): the lock ends
+/// every SSH session and pauses every transfer, and it used to come without a
+/// word. Any input takes the warning away and moves the deadline; while it is
+/// up, moving the mouse counts too, as it says. With an auto-lock of two
+/// minutes or less it comes half-way instead, so it is never up from the start.
+/// It gives the time really left when it appears (a shorter auto-lock set
+/// meanwhile can leave less than the usual minute - it said "60 s" whatever),
+/// it is pinned so newer toasts cannot push it off the screen, and it comes
+/// back if anything removed it (fix round 1).
+const AUTO_LOCK_WARN_MS = 60 * 1000;
+let autoLockWarning = null;
+
+function autoLockWarnLead(mins) {
+  return Math.min(AUTO_LOCK_WARN_MS, (mins * 60 * 1000) / 2);
+}
+
+/// Show or take away the warning for where the deadline stands now. Run from
+/// the countdown's one-second ticker and whenever the timer is armed or
+/// cancelled.
+function paintAutoLockWarning() {
+  const mins = autoLockMinutes();
+  const left = autoLockDeadline ? autoLockDeadline - Date.now() : 0;
+  const due = state.unlocked && autoLockDeadline > 0 && mins > 0 && left > 0 && left <= autoLockWarnLead(mins);
+  if (!due) { dismissAutoLockWarning(); return; }
+  if (autoLockWarning && autoLockWarning.isConnected && !autoLockWarning._done) return;
+  const secs = Math.ceil(left / 1000);
+  autoLockWarning = toast(`Locking in ${secs} s - move the mouse or press a key to stay unlocked`, 'warn', { sticky: true, pinned: true });
+  // Once only, however often the warning is raised (the same listener again
+  // is not added twice).
+  window.addEventListener('mousemove', onWarningMouseMove, { capture: true, passive: true });
+}
+
+function dismissAutoLockWarning() {
+  if (!autoLockWarning) return;
+  const shown = autoLockWarning;
+  autoLockWarning = null;
+  window.removeEventListener('mousemove', onWarningMouseMove, { capture: true });
+  if (shown.dismiss) shown.dismiss();
+}
+
+function onWarningMouseMove(ev) {
+  if (ev.isTrusted === false) return;
+  noteUserActivity();
+}
 
 const HUMAN_INPUT_EVENTS = ['keydown', 'mousedown', 'pointerdown', 'wheel', 'touchstart'];
 
@@ -5773,6 +6188,7 @@ function renderVaultCountdown() {
     sub.textContent = 'locks in ' + m + ':' + String(s).padStart(2, '0');
   }
   paintVaultChipName();
+  paintAutoLockWarning();
 }
 
 /// The vault control's name and tooltip carry the state and the countdown, so
@@ -5820,26 +6236,71 @@ function queueActivityHeartbeat() {
 
 // ─── Update check (GitHub releases; manual + auto per setting) ─────────────
 
-async function manualUpdateCheck() {
+/// "Check now" (Settings, `button`) or the palette. An update is offered in
+/// the app's own dialog - the version, that SSHSpan closes to install it, and
+/// the sessions and transfers that ends (A5-22) - and downloaded only after
+/// OK, with the button busy and a notice up until the app closes (there is no
+/// progress to show: R10). A newer release with no installer for this
+/// platform is said to exist (A2-41) - it used to read "latest version".
+///
+/// One run at a time, whatever starts it (fix round 1): the palette, "Check
+/// now", or a "Check now" Settings drew again while a run was on - the busy
+/// button only guarded itself. The run is check, question and download; a
+/// second request meanwhile is told what is going on and starts nothing.
+let updateRunPhase = null;
+const UPDATE_RUNNING = {
+  checking: 'Already checking for an update.',
+  asking: 'The update question is already open.',
+  downloading: 'The update is already downloading - SSHSpan closes to install it.',
+};
+
+async function manualUpdateCheck(button) {
+  if (updateRunPhase) {
+    toast(UPDATE_RUNNING[updateRunPhase], 'info');
+    return;
+  }
+  updateRunPhase = 'checking';
   try {
-    const r = await call('update_check');
-    if (r.available) {
-      const install = await confirmModal('Update available',
-        `A newer version is available: ${r.current} → ${r.version}\n\n` +
-        `${r.notes ? r.notes.slice(0, 800) + '\n\n' : ''}` +
-        `Download and run the installer for this OS?`,
-        'Download and install', { danger: false });
-      if (install) {
-        toast('Downloading installer...', 'info');
-        await call('update_download_and_run', { url: r.assetUrl, version: r.version, expectedSha256: r.assetDigest });
-        // The app exits itself right after spawning the installer.
-      }
-    } else {
-      toast(`You are on the latest version (${r.current}).`, 'ok');
-    }
+    await runUpdateCheck(button instanceof HTMLElement ? button : null);
+  } finally {
+    updateRunPhase = null;
+  }
+}
+
+async function runUpdateCheck(btn) {
+  let r;
+  try {
+    r = await withBusy(btn, 'Checking…', () => call('update_check'));
   } catch (e) {
     toast(e.message || String(e), 'err');
+    return;
   }
+  if (!r) return; // the button was busy with something else
+  if (!r.available) {
+    if (r.newerVersion) toast(`Version ${r.newerVersion} exists but has no installer for this platform.`, 'info');
+    else toast(`You are on the latest version (${r.current}).`, 'ok');
+    return;
+  }
+  const work = liveWorkText();
+  updateRunPhase = 'asking';
+  const install = await confirmModal(`Update to ${r.version}?`,
+    `SSHSpan ${r.current} → ${r.version}.` +
+    (r.notes ? '\n\n' + r.notes.slice(0, 800) : '') +
+    '\n\nSSHSpan will close to install the update.' + (work ? ' That ' + work + '.' : ''),
+    'Download and install', { danger: false });
+  if (!install) return;
+  updateRunPhase = 'downloading';
+  await withBusy(btn, 'Downloading…', async () => {
+    const notice = toast(`Downloading SSHSpan ${r.version} - SSHSpan will close to install it.`, 'info', { sticky: true });
+    try {
+      await call('update_download_and_run', { url: r.assetUrl, version: r.version, expectedSha256: r.assetDigest });
+      // The backend exits the app right after it starts the installer.
+    } catch (e) {
+      if (notice && notice.dismiss) notice.dismiss();
+      // The backend's own reason, e.g. a declined UAC prompt (RU5).
+      toast(e.message || String(e), 'err');
+    }
+  });
 }
 
 async function autoUpdateCheckOnBoot() {
@@ -5855,8 +6316,9 @@ async function autoUpdateCheckOnBoot() {
 // ─── Connect: saved servers + SSH sessions ─────────────────────────────────
 
 // Password prompt for connect - uses a custom modal instead of native prompt()
-// which silently fails in Tauri's WebView.
-function askConnectPassword(server, callback) {
+// which silently fails in Tauri's WebView. `purpose` 'test' (Test connection)
+// labels the button Test; anything else is a connect, labelled Connect.
+function askConnectPassword(server, callback, purpose) {
   const modal = document.getElementById('connectPwModal');
   if (!modal) return callback(null); // fallback
   // One prompt at a time: a second request used to overwrite the first one's
@@ -5865,6 +6327,8 @@ function askConnectPassword(server, callback) {
   modal.hidden = false;
   const label = document.getElementById('connectPwLabel');
   if (label) label.textContent = `Password for ${server.username}@${server.host}:`;
+  const ok = document.getElementById('connectPwOkBtn');
+  if (ok) ok.textContent = purpose === 'test' ? 'Test' : 'Connect';
   const inp = document.getElementById('connectPwInput');
   if (inp) { inp.value = ''; setTimeout(() => inp.focus(), 0); }
   state._connectPwCallback = callback;
@@ -5906,11 +6370,46 @@ function hostsInCategoryRecursive(catId) {
   return state.servers.filter(s => cats.has(s.categoryId));
 }
 
+/// The category the SERVER list is filtered by, whichever tree the sidebar
+/// shows (as activeKeyCategoryId for keys): a server list rebuilt from another
+/// view - a Bitwarden sync reloads it from Settings - was filtered by the
+/// sidebar's key category, and now that a hidden server is deselected that
+/// would cost the selection.
+function activeHostCategoryId() { return state.activeCategoryByScope.host || 'all'; }
+
+/// Everything that narrows the server list - the search and the host
+/// category - back to "show all" (A2-26, as clearKeyFilters).
+function clearServerFilters() {
+  el('serverSearch').value = '';
+  if (state.activeCategoryByScope.host !== 'all') {
+    state.activeCategoryByScope.host = 'all';
+    if (state.categoryScope === 'host') { renderCategoryTree(); updateBreadcrumb(); }
+  }
+  renderServerList();
+}
+
+/// The row a filter that matches nothing leaves in the server list (A2-26,
+/// as keyNoMatchRow): the list used to go blank.
+function serverNoMatchRow(query) {
+  const row = document.createElement('div');
+  row.className = 'server-list-nomatch';
+  row.setAttribute('role', 'status');
+  const msg = document.createElement('span');
+  msg.textContent = query ? `No servers match "${query}".` : 'No servers match the current filter.';
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.className = 'ghost-btn';
+  clear.textContent = 'Clear filter';
+  clear.addEventListener('click', () => { clearServerFilters(); el('serverSearch').focus(); });
+  row.append(msg, clear);
+  return row;
+}
+
 function renderServerList() {
   const list = el('serverList');
   const empty = el('serverEmpty');
   const filter = (el('serverSearch').value || '').toLowerCase().trim();
-  const activeCat = activeCategoryId();
+  const activeCat = activeHostCategoryId();
   let categoryPool = state.servers;
   if (activeCat === 'uncategorized') categoryPool = state.servers.filter(s => !s.categoryId);
   else if (activeCat !== 'all') categoryPool = hostsInCategoryRecursive(activeCat);
@@ -5933,6 +6432,17 @@ function renderServerList() {
   }
   empty.hidden = true;
   list.hidden = false;
+  // What the filter hides is not selected (A2-26, as pruneHiddenKeys): the
+  // header went on showing - and its Connect and Test acting on - a server
+  // the list no longer did.
+  if (state.connectSelectedId && !filtered.some((s) => s.id === state.connectSelectedId)) {
+    state.connectSelectedId = null;
+    updateTerminalHead();
+  }
+  if (filtered.length === 0) {
+    list.appendChild(serverNoMatchRow((el('serverSearch').value || '').trim()));
+    return;
+  }
   for (const s of filtered) {
     const row = document.createElement('div');
     row.className = 'server-row' + (s.id === state.connectSelectedId ? ' selected' : '');
@@ -5980,23 +6490,45 @@ function renderServerList() {
 
     /// Connecting used to be a double-click and nothing else, with nothing on
     /// screen saying so. The button is the affordance; double-click and Enter
-    /// still work for anyone who already knew.
+    /// still work for anyone who already knew. With it, "..." opens the menu
+    /// (Connect, Edit, Delete) that only a right-click reached (A5-28). Both
+    /// sit over the row's right end, shown on hover and focus, so the name
+    /// keeps the row's width instead of what an invisible button left of it
+    /// (A1-20).
+    const actions = document.createElement('div');
+    actions.className = 'server-row-actions';
     const go = document.createElement('button');
+    go.type = 'button';
     go.className = 'server-go' + (isLive ? ' ghost-btn' : ' primary-btn');
     go.title = isLive ? 'Switch to the open session' : 'Connect to this server';
     go.innerHTML = `${ico(isLive ? 'terminal' : 'plug-zap')}<span>${isLive ? 'Open' : 'Connect'}</span>`;
     go.addEventListener('click', (ev) => {
       ev.stopPropagation();
+      if (ev.detail > 1) return; // the second click of a double click: one session
       selectServer(s.id);
       if (isLive) activateSessionTab(openTab.tabId);
       else openSessionTab(s);
     });
-    head.appendChild(go);
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'icon-btn server-row-more';
+    more.innerHTML = ico('ellipsis');
+    more.title = 'Connect, edit or delete';
+    more.setAttribute('aria-label', 'Actions for ' + (s.name || s.host || 'this server'));
+    more.setAttribute('aria-haspopup', 'menu');
+    more.setAttribute('aria-expanded', 'false');
+    // Not a row click as well: that re-renders the list, and the menu would
+    // be anchored to a button no longer on the page.
+    more.addEventListener('click', (ev) => { ev.stopPropagation(); openServerMenu(more, s); });
+    actions.append(go, more);
+    row.appendChild(actions);
 
     row.addEventListener('click', () => selectServer(s.id));
-    row.addEventListener('dblclick', () => openSessionTab(s));
+    row.addEventListener('dblclick', (ev) => { if (!ev.target.closest('button')) openSessionTab(s); });
     row.addEventListener('keydown', (ev) => {
-      if (ev.key !== 'Enter') return;
+      // Enter on the row itself: its buttons do their own job only (an Enter
+      // on "..." would have opened the menu AND connected).
+      if (ev.key !== 'Enter' || ev.target !== row) return;
       ev.preventDefault();
       selectServer(s.id);
       if (isLive) activateSessionTab(openTab.tabId);
@@ -6016,9 +6548,12 @@ function selectServer(id) {
   updateTerminalHead();
 }
 
-function openServerContextMenu(x, y, srv) {
-  openMenu({ x, y }, [
+/// One server's menu: the row's right-click and its "..." button (A5-28).
+/// Test connection tests that row's server, whatever the header shows.
+function serverMenuItems(srv) {
+  return [
     { label: 'Connect', icon: 'plug-zap', onSelect: () => openSessionTab(srv) },
+    { label: 'Test connection', icon: 'server-cog', onSelect: () => testSelectedServer(srv) },
     { label: 'Edit', icon: 'pencil', onSelect: () => openServerModal({ id: srv.id }) },
     { label: 'Delete', icon: 'trash-2', onSelect: async () => {
       if (!(await confirmModal('Delete server', `Delete server "${srv.name}"?`, 'Delete'))) return;
@@ -6029,14 +6564,23 @@ function openServerContextMenu(x, y, srv) {
         toast('Server deleted.', 'ok');
       } catch (e) { toast(e.message || String(e), 'err'); }
     } },
-  ], { label: 'Server' });
+  ];
+}
+
+function openServerContextMenu(x, y, srv) {
+  openMenu({ x, y }, serverMenuItems(srv), { label: 'Server' });
+}
+
+/// The row's "..." button: the same menu, anchored under it.
+function openServerMenu(anchor, srv) {
+  openMenu(anchor, serverMenuItems(srv), { label: 'Server ' + (srv.name || srv.host || ''), alignRight: true });
 }
 
 // ─── Server modal ───────────────────────────────────────────────────────────
 
 function openServerModal({ id, keyId, prefill } = {}) {
   el('serverModal').hidden = false;
-  el('serverModalTitle').textContent = id ? 'Edit Server' : 'New Server';
+  el('serverModalTitle').textContent = id ? 'Edit server' : 'New server';
   // Populate key dropdown from cached state.keys
   const sel = el('srvKeyId');
   sel.innerHTML = '<option value="">- select a key -</option>';
@@ -6060,9 +6604,18 @@ function openServerModal({ id, keyId, prefill } = {}) {
   el('srvUser').value    = srv ? srv.username : (prefill?.username || '');
   el('srvKeyId').value   = srv ? (srv.keyId || keyId || '') : (keyId || '');
   el('srvPemPath').value = srv ? (srv.pemPath || '') : (prefill?.pemPath || '');
+  el('srvPemPath').title = el('srvPemPath').value;
   el('srvPassword').value = '';
   el('srvSavePw').checked = false;
-  setConnectAuthMethod(srv ? srv.authMethod : (keyId ? 'publickey' : 'publickey'));
+  setConnectAuthMethod(srv ? srv.authMethod : 'publickey');
+  // A password saved for this server stays unless it is replaced or removed
+  // on purpose (A2-04 / A5-03): the form used to send savedPassword: null on
+  // every edit - a rename too - and the backend erased it.
+  state._editingSavedPw = !!(srv && srv.hasSavedPassword);
+  state._clearSavedPw = false;
+  paintSavedPasswordRow();
+  showFieldMessage('srvPortMsg', '');
+  el('srvPort').removeAttribute('aria-invalid');
   // Category (single-select; schema is one category_id per server)
   state._pendingServerCategory = srv ? (srv.categoryId || null) : null;
   renderServerCategoryChips();
@@ -6082,8 +6635,44 @@ function closeServerModal() {
   el('serverModal').hidden = true;
   state._editingServerId = null;
   state._pendingServerCategory = null;
+  state._editingSavedPw = false;
+  state._clearSavedPw = false;
   // A typed server password does not stay behind in a hidden field.
   el('srvPassword').value = '';
+}
+
+/// The password row says what Save will do with a saved password (A5-03): a
+/// server that has one gets "A password is saved - leave blank to keep it"
+/// and a Remove toggle, and a typed password replaces it; the "Save password"
+/// switch is for servers that have none.
+function paintSavedPasswordRow() {
+  const saved = !!state._editingSavedPw;
+  const clearing = saved && !!state._clearSavedPw;
+  // The hint is the field's accessible description (aria-describedby), and a
+  // hidden element still describes: it is empty whenever it is hidden, or a
+  // new server's field was announced as having a saved password (fix round 1).
+  const hint = el('srvPwSavedHint');
+  hint.hidden = !saved;
+  hint.textContent = !saved ? '' : (clearing ? 'The saved password is removed when you save.' : 'A password is saved - leave blank to keep it.');
+  const remove = el('srvClearPwBtn');
+  remove.hidden = !saved;
+  remove.setAttribute('aria-pressed', clearing ? 'true' : 'false');
+  el('srvSavePwChip').hidden = saved;
+  const pw = el('srvPassword');
+  pw.disabled = clearing;
+  if (clearing) pw.value = '';
+  pw.placeholder = saved ? 'Type a new password to replace it' : 'Leave blank to type it when you connect';
+}
+
+/// The port as typed (A2-39 / A5-30): a whole number from 1 to 65535, blank
+/// meaning 22. `parseInt(...) || 22` turned 0 into 22 and 1.5 into 1, and sent
+/// 70000 on to a raw "invalid args `port`" error.
+function serverPortFrom(text) {
+  const t = String(text == null ? '' : text).trim();
+  if (!t) return { port: 22 };
+  const n = /^\d+$/.test(t) ? parseInt(t, 10) : NaN;
+  if (!(n >= 1 && n <= 65535)) return { error: 'Port must be a whole number from 1 to 65535.' };
+  return { port: n };
 }
 
 function setConnectAuthMethod(method) {
@@ -6103,43 +6692,56 @@ function setConnectAuthMethod(method) {
 async function submitServerModal() {
   const name = el('srvName').value.trim();
   const host = el('srvHost').value.trim();
-  const port = parseInt(el('srvPort').value, 10) || 22;
   const username = el('srvUser').value.trim();
   const method = state.connectAuthMethod;
   if (!name) return toast('Name is required.', 'err');
   if (!host) return toast('Host is required.', 'err');
+  // Checked here and said next to the field (A5-30), never sent on to fail.
+  const portField = el('srvPort');
+  const parsed = serverPortFrom(portField.value);
+  if (parsed.error) {
+    showFieldMessage('srvPortMsg', parsed.error);
+    portField.setAttribute('aria-invalid', 'true');
+    portField.focus();
+    return;
+  }
+  showFieldMessage('srvPortMsg', '');
+  portField.removeAttribute('aria-invalid');
   if (!username) return toast('Username is required.', 'err');
   if (method === 'publickey' && !el('srvKeyId').value && !el('srvPemPath').value.trim()) {
     return toast('Choose a key or a .pem file.', 'err');
   }
-  const args = {
-    id: state._editingServerId,
-    name, host, port, username,
-    authMethod: method,
-    keyId: method === 'publickey' ? (el('srvKeyId').value || null) : null,
-    pemPath: method === 'publickey' ? (el('srvPemPath').value.trim() || null) : null,
-    savedPassword: (method !== 'publickey' && el('srvSavePw').checked) ? el('srvPassword').value : null,
-    categoryId: state._pendingServerCategory,
-    color: null,
-  };
-  // Re-entrancy guard: Save was not disabled while the save was in flight, so
-  // a double-click (or Enter held down, now that Enter submits) fired
-  // server_save twice and created two rows for the same new host.
-  if (submitServerModal._busy) return;
-  submitServerModal._busy = true;
-  const saveBtn = el('srvSaveBtn');
-  saveBtn.disabled = true;
-  try {
-    const r = await call('server_save', args);
-    closeServerModal();
-    await loadServers();
-    if (r && r.id) selectServer(r.id);
-    toast('Server saved.', 'ok');
-  } catch (e) { toast(e.message || String(e), 'err'); }
-  finally {
-    submitServerModal._busy = false;
-    saveBtn.disabled = false;
-  }
+  const hadSaved = !!state._editingSavedPw;
+  const clearSaved = hadSaved && !!state._clearSavedPw;
+  const typed = el('srvPassword').value;
+  // savedPassword is a password to store - a server with one saved replaces it
+  // with what is typed; one with none stores it only with "Save password" on -
+  // and null otherwise, which KEEPS a stored one (RU4). Removing it is
+  // clearSavedPassword. Key login needs none: the backend drops it.
+  const savedPassword = method === 'publickey' || clearSaved ? null
+    : (typed && (hadSaved || el('srvSavePw').checked) ? typed : null);
+  // One save at a time (A2-18): a double click - or Enter held down - saved
+  // a new server twice.
+  await withBusy(el('srvSaveBtn'), 'Saving…', async () => {
+    try {
+      const r = await call('server_save', {
+        id: state._editingServerId,
+        name, host, port: parsed.port, username,
+        authMethod: method,
+        keyId: method === 'publickey' ? (el('srvKeyId').value || null) : null,
+        pemPath: method === 'publickey' ? (el('srvPemPath').value.trim() || null) : null,
+        savedPassword,
+        clearSavedPassword: clearSaved,
+        categoryId: state._pendingServerCategory,
+        color: null,
+      });
+      closeServerModal();
+      await loadServers();
+      if (r && r.id) selectServer(r.id);
+      toast(hadSaved && method === 'publickey' ? 'Server saved - its saved password was removed (key login uses none).'
+        : clearSaved ? 'Server saved - its saved password was removed.' : 'Server saved.', 'ok');
+    } catch (e) { toast(e.message || String(e), 'err'); }
+  });
 }
 
 // ─── cascading host picker (key -> category -> ... -> host) ────────────────
@@ -6206,14 +6808,23 @@ function positionCtxFlyout(menu, anchorEl) {
   menu.style.top = Math.max(pad, Math.min(a.top - 4, window.innerHeight - r.height - pad)) + 'px';
 }
 
+/// The servers "Use this key to connect" can use: key-login ones (A2-35 /
+/// A5-41). The backend applies a key override to publickey servers only, so a
+/// password server offered here answered "connect with this key" with a
+/// password prompt.
+function keyLoginServers() {
+  return state.servers.filter((s) => (s.authMethod || 'publickey') === 'publickey');
+}
+
 /// The host category tree, pruned to branches that actually contain a server.
 /// Anything the walk does not reach - a server with no category, one pointing
 /// at a deleted or key-scope category, one orphaned by a reparent cycle - is
 /// returned in `loose` and shown at the top level, so no host is unreachable
 /// through the picker no matter what the category table looks like.
 function hostPickerTree() {
+  const pool = keyLoginServers();
   const byCat = new Map();
-  for (const s of state.servers) {
+  for (const s of pool) {
     if (!s.categoryId) continue;
     if (!byCat.has(s.categoryId)) byCat.set(s.categoryId, []);
     byCat.get(s.categoryId).push(s);
@@ -6243,7 +6854,7 @@ function hostPickerTree() {
       walk(n.children);
     }
   })(roots);
-  return { roots, loose: state.servers.filter(s => !placed.has(s.id)).sort(byLabel) };
+  return { roots, loose: pool.filter(s => !placed.has(s.id)).sort(byLabel) };
 }
 
 /// Render one level of the picker into `menu`: a row per category that opens
@@ -6286,7 +6897,6 @@ function buildHostPickerLevel(menu, depth, nodes, hosts, key) {
     b.addEventListener('mouseenter', () => hostPickerScheduleClose(depth + 1));
     b.addEventListener('click', () => {
       closeKeyConnectMenu();
-      state._pendingConnectKey = key.id;
       // Set the selection directly rather than through selectServer(): the
       // server list is still rendering under the Keys view's category scope
       // here, and switchView('connect') inside openSessionTab re-renders it
@@ -6309,13 +6919,28 @@ async function openServerPickerForKey(key, x, y) {
     return;
   }
   const { roots, loose } = hostPickerTree();
+  // What had the focus, to go back to when Escape closes the picker.
+  const returnTo = document.activeElement;
   const menu = document.createElement('div');
   menu.className = 'ctx-menu';
   menu.id = 'keyConnectMenu';
+  menu.setAttribute('role', 'group');
+  menu.setAttribute('aria-label', 'Servers to connect to with ' + (key.name || 'this key'));
   buildHostPickerLevel(menu, 0, roots, loose, key);
   const sep = document.createElement('div');
   sep.className = 'ctx-sep';
   menu.appendChild(sep);
+  // Say why a server the user knows is not here (A5-41) - as text that
+  // describes the picker (aria-describedby). It was a disabled button, which
+  // the keyboard skips and assistive tech reads as an unusable control.
+  if (keyLoginServers().length < state.servers.length) {
+    const note = document.createElement('p');
+    note.className = 'ctx-note';
+    note.id = 'hostPickerNote';
+    note.textContent = 'Password and keyboard-interactive servers are not listed - they do not log in with a key.';
+    menu.appendChild(note);
+    menu.setAttribute('aria-describedby', note.id);
+  }
   const newBtn = document.createElement('button');
   newBtn.className = 'ctx-item';
   newBtn.innerHTML = `${ico('plus')}<span>New server with this key...</span>`;
@@ -6327,12 +6952,19 @@ async function openServerPickerForKey(key, x, y) {
   menu.appendChild(newBtn);
   document.body.appendChild(menu);
   positionCtxMenuAt(menu, x, y);
+  // The keyboard starts in the picker (it opens at the end of the page, where
+  // Tab would reach it last), and its description is read on the way in.
+  const first = menu.querySelector('button.ctx-item');
+  if (first) first.focus();
   // One handler for the whole chain: a click inside any menu in it - opening a
   // flyout, say - must not dismiss the menu, which the old per-menu {once:true}
   // listener got wrong (it was spent by the first click, inside or out).
   const away = (ev) => {
     if (ev.type === 'keydown') {
-      if (ev.key === 'Escape') closeKeyConnectMenu();
+      if (ev.key === 'Escape') {
+        closeKeyConnectMenu();
+        if (returnTo && returnTo !== document.body && document.contains(returnTo)) returnTo.focus();
+      }
       return;
     }
     if (ev.target.closest && ev.target.closest('.ctx-menu')) return;
@@ -6348,26 +6980,97 @@ async function openServerPickerForKey(key, x, y) {
 
 // ─── Connect / disconnect / test ───────────────────────────────────────────
 
+/// The server the terminal header is about: the active tab's, else the list
+/// selection. Its buttons act on what it shows (A3-10).
+function headServer() {
+  const tab = state.sessions.get(state.activeTabId);
+  if (tab) return state.servers.find((s) => s.id === tab.serverId) || null;
+  return currentSelectedServer();
+}
+
+/// A connection test is under way - from the header's Test or a server row's
+/// "Test connection" - its password prompt included.
+let serverTestRunning = false;
+
 async function testSelectedServer(srv) {
   if (!srv) return;
-  terminalSetStatus(`Testing ${srv.host}:${srv.port || 22}...`);
-  try {
-    // Host-key consent is backend-owned: if the host is unpinned, the native
-    // trust dialog (with the fingerprint) is raised by the Rust handler
-    // during the handshake. The renderer deliberately passes no consent flag.
-    const result = await call('server_test', { serverId: srv.id });
-    if (result && result.ok === false) throw new Error(result.error || 'Connection test failed.');
-    const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
-    terminalSetStatus(`Connection OK${ms}`);
-    toast(`Connection to ${srv.name} succeeded${ms}.`, 'ok');
-  } catch (e) {
-    terminalSetStatus('Connection test failed.');
-    toast(e.message || String(e), 'err');
+  // One test at a time (A2-18), known before any password is asked for: the
+  // header button's busy state was the only guard, and a row's test that met
+  // it after its prompt dropped the typed password without a word (fix
+  // round 2).
+  if (serverTestRunning) {
+    toast('A connection test is already running.', 'info');
+    return;
   }
+  serverTestRunning = true;
+  try {
+    await runServerTest(srv);
+  } finally {
+    serverTestRunning = false;
+  }
+}
+
+async function runServerTest(srv) {
+  // A password or keyboard-interactive server with nothing saved needs the
+  // password for a test too (A2-11 / A5-20): the test used to fail with "No
+  // password available for this session." for exactly those servers.
+  let promptPassword;
+  if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
+    const pw = await new Promise((resolve) => askConnectPassword(srv, resolve, 'test'));
+    if (pw === null || pw === undefined) return;
+    promptPassword = pw;
+  }
+  // The result is a toast: the status line belongs to the session on screen
+  // (A2-25). The header's Test shows that a test runs, whichever started it.
+  await withBusy(el('termTestBtn'), 'Testing…', async () => {
+    try {
+      // Host-key consent is backend-owned: if the host is unpinned, the native
+      // trust dialog (with the fingerprint) is raised by the Rust handler
+      // during the handshake. The renderer deliberately passes no consent flag.
+      const result = await call('server_test', { serverId: srv.id, promptPassword });
+      if (result && result.ok === false) throw new Error(result.error || 'Connection test failed.');
+      const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
+      toast(`Connection to ${srv.name || srv.host} succeeded${ms}.`, 'ok');
+    } catch (e) {
+      // The backend's own words, as they are (RU4).
+      toast(e.message || String(e), 'err');
+    }
+  });
 }
 
 function newTabId() {
   return 'tab-' + Date.now().toString(36) + Math.floor(Math.random() * 1e4);
+}
+
+/// The status line's text, whoever owns it.
+function setStripText(text) {
+  const strip = el('termStrip');
+  if (strip) strip.textContent = text;
+}
+
+/// A tab's status line (A2-25 / A3-27): kept on the tab and shown while it is
+/// the active one. A view switch, a test or another tab's progress used to
+/// overwrite the single line, so it could say "Ready." mid-connect or
+/// describe another host.
+function setTabStatus(tabId, text) {
+  const tab = state.sessions.get(tabId);
+  if (tab) tab.status = text;
+  if (tabId === state.activeTabId) setStripText(text);
+}
+
+/// The active tab's status, or the idle text when there is no tab.
+function showActiveTabStatus() {
+  const tab = state.sessions.get(state.activeTabId);
+  setStripText(tab ? (tab.status || '') : (state.unlocked ? 'Ready.' : 'Unlock the vault to connect.'));
+}
+
+/// What a tab keeps of how it was opened, for Reconnect and New session
+/// (A2-44): the key or user override - never a password.
+function connectOptsFrom(opts) {
+  const o = {};
+  if (opts && opts.overrideKeyId) o.overrideKeyId = opts.overrideKeyId;
+  if (opts && opts.overrideUsername) o.overrideUsername = opts.overrideUsername;
+  return o;
 }
 
 /// Open a NEW session tab for a server (always a new tab - never replaces).
@@ -6389,44 +7092,107 @@ async function openSessionTab(srv, opts = {}) {
     sftpReady: false,
     sftpPath: '/',
     ended: false,
+    connecting: false,
+    connectOpts: connectOptsFrom(opts),
+    status: '',
   };
   state.sessions.set(tabId, tab);
   window.createTabTerminal(tabId);
   activateSessionSurface(tabId);
-  el('termDisconnectBtn').hidden = true;
-  el('termReconnectBtn').hidden = true;
-  terminalSetStatus(`Connecting to ${srv.host}:${srv.port}...`);
+  await connectTab(tab, srv, { fresh: true });
+}
 
-  let pw = null;
+/// Connect a tab - a new one, or a reconnect of the same tab: the password
+/// prompt when one is needed, then the connect. While it runs the tab and
+/// the header say "Connecting..." and offer Cancel (A5-10). After every wait
+/// the tab must still be there and this still its latest attempt: a tab
+/// closed or a connect cancelled meanwhile is left alone, and terminal.js
+/// disconnects a session that arrives for it (A2-12). `beforeConnect` runs
+/// once the password is in hand, right before the connect: a restart ends the
+/// running session there, so Cancel at the prompt leaves it running.
+async function connectTab(tab, srv, { fresh, beforeConnect } = {}) {
+  const seq = tab.connectSeq = (tab.connectSeq || 0) + 1;
+  const ours = () => state.sessions.get(tab.tabId) === tab && tab.connectSeq === seq;
+  const target = `${srv.host}:${srv.port || 22}`;
+  let promptPassword = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
-    pw = await new Promise(resolve => askConnectPassword(srv, resolve));
-    if (pw === null || pw === undefined) {
-      terminalSetStatus('Cancelled.');
-      closeSessionTab(tabId, { skipConfirm: true });
+    setTabStatus(tab.tabId, `Password needed for ${srv.username}@${target}`);
+    promptPassword = await new Promise((resolve) => askConnectPassword(srv, resolve, 'connect'));
+    if (!ours()) return;
+    if (promptPassword === null || promptPassword === undefined) {
+      if (fresh) {
+        closeSessionTab(tab.tabId, { skipConfirm: true });
+        if (!state.activeTabId) setStripText('Cancelled.');
+      } else if (window.tabSessionLive(tab.tabId)) {
+        // A restart given up at the prompt: the session it would have
+        // replaced is still there, and still the tab's.
+        setTabStatus(tab.tabId, `Restart cancelled - still connected to ${target}.`);
+      } else {
+        setTabStatus(tab.tabId, 'Reconnect cancelled.');
+      }
       return;
     }
   }
-
+  if (beforeConnect) beforeConnect();
+  tab.connecting = true;
+  tab.ended = false;
+  setTabStatus(tab.tabId, `Connecting to ${target}…`);
+  renderTermTabs();
+  updateTerminalHead();
   try {
-    const sessionId = await window.terminalConnectInTab(tabId, srv, { ...opts, promptPassword: pw });
+    const sessionId = await window.terminalConnectInTab(tab.tabId, srv, { ...tab.connectOpts, promptPassword });
+    if (!ours()) return;
+    tab.connecting = false;
     tab.sessionId = sessionId;
-    renderTermTabs();
-    updateTerminalHead();
-    terminalSetStatus(`Connected to ${srv.host}:${srv.port} - streaming`);
+    setTabStatus(tab.tabId, `Connected to ${target}`);
   } catch (e) {
+    if (!ours()) return;
+    tab.connecting = false;
     tab.ended = true;
-    renderTermTabs();
-    updateTerminalHead();
-    terminalSetStatus(`Failed: ${e.message || e}`);
-    toast(e.message || String(e), 'err');
+    // The backend's words as they are (RU4): a host-key mismatch, a declined
+    // key, a timeout - "Failed: " in front of them added nothing.
+    const msg = (e && e.message) || String(e);
+    setTabStatus(tab.tabId, msg);
+    toast(msg, 'err');
   }
+  renderTermTabs();
+  updateTerminalHead();
+}
+
+/// Cancel, in the header while the active tab connects (A5-10): the tab is
+/// done now. The backend cannot abort a handshake; the session, if it still
+/// opens, is disconnected when it arrives.
+function cancelActiveConnect() {
+  const tab = state.sessions.get(state.activeTabId);
+  if (!tab || !tab.connecting) return;
+  const hadFocus = document.activeElement === el('termCancelBtn');
+  tab.connectSeq = (tab.connectSeq || 0) + 1;
+  if (typeof window.terminalCancelConnect === 'function') window.terminalCancelConnect(tab.tabId);
+  tab.connecting = false;
+  tab.ended = true;
+  setTabStatus(tab.tabId, 'Connection cancelled.');
+  renderTermTabs();
+  updateTerminalHead();
+  // The button pressed is gone; the focus goes to the one that took its place.
+  if (hadFocus) el('termReconnectBtn').focus();
+}
+
+/// The session terminal.js holds open for a tab - the one a disconnect must
+/// end. tab.sessionId is app.js's copy, set when a connect completes and
+/// cleared when the session ends; whatever ends a session asks terminal.js,
+/// so a copy that ever lags behind (fix round 1: a cancelled restart) cannot
+/// leave a live shell nobody can close.
+function liveSessionId(tabId) {
+  const rec = typeof window.tabRecord === 'function' ? window.tabRecord(tabId) : null;
+  return (rec && rec.sessionId) || null;
 }
 
 /// Disconnect the active tab's live session (tab stays with [connection closed]).
 async function disconnectActiveTab() {
   const tab = state.sessions.get(state.activeTabId);
-  if (!tab || !window.tabSessionLive(tab.tabId)) return;
-  try { await call('terminal_disconnect', { sessionId: tab.sessionId }); } catch (e) {}
+  const sessionId = tab ? liveSessionId(tab.tabId) : null;
+  if (!sessionId) return;
+  try { await call('terminal_disconnect', { sessionId }); } catch (e) {}
   // The close-detection poll fires onSessionClosed, which finalizes tab state.
 }
 
@@ -6437,47 +7203,56 @@ function toggleTermMax() {
   const app = el('app');
   const btn = el('termMaxBtn');
   if (!app || !btn) return;
+  // What had the focus: the refit-and-focus below runs later and must not
+  // take the keyboard from wherever the user has moved by then.
+  const origin = document.activeElement;
   const max = app.classList.toggle('term-max');
   btn.innerHTML = ico(max ? 'minimize-2' : 'maximize-2');
-  btn.title = max ? 'Restore terminal size (<>)' : 'Expand terminal to full window';
-  if (typeof terminalSetStatus === 'function') {
-    terminalSetStatus(max ? 'Terminal maximized - press Esc or <> to restore.' : 'Restored.');
-  }
+  // The way back that works (A5-44): the hint said Escape, which a focused
+  // terminal sends to the shell. Ctrl+Shift+M reaches the app from there.
+  btn.title = max ? 'Restore the normal layout (Ctrl+Shift+M)' : 'Expand the terminal to the whole window (Ctrl+Shift+M)';
+  // A toggle button: its name stays "Maximize terminal" and aria-pressed says
+  // whether it is on. Changing the name as well said it twice, two ways.
+  btn.setAttribute('aria-pressed', max ? 'true' : 'false');
+  if (max) setStripText('Terminal maximized - Ctrl+Shift+M or the restore button brings the normal layout back.');
+  else showActiveTabStatus();
   // Let the layout settle, then refit + push the new PTY size. Focus after
   // maximize is wanted (the terminal is the whole view); fitActiveTerminal
   // alone does not focus, so a window resize never steals keystrokes from a
   // modal or input.
-  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(); }, 80);
-  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(); }, 250);
+  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(origin); }, 80);
+  setTimeout(() => { if (typeof window.fitActiveTerminalAndFocus === 'function') window.fitActiveTerminalAndFocus(origin); }, 250);
 }
 
-/// Reconnect the active tab: new session in the SAME tab (keeps scrollback).
+/// Reconnect the active tab: a new session in the SAME tab, opened the way
+/// the tab was (its key override - A2-44), keeping its scrollback (A3-36). A
+/// live session ends for it, so that asks first (A3-13); nothing starts while
+/// the tab still connects (A3-14).
 async function reconnectActiveTab() {
   const tab = state.sessions.get(state.activeTabId);
-  if (!tab) return;
+  if (!tab || tab.connecting) return;
   const srv = state.servers.find(s => s.id === tab.serverId);
   if (!srv) { toast('Server no longer exists.', 'err'); return; }
-  let pw = null;
-  if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
-    pw = await new Promise(resolve => askConnectPassword(srv, resolve));
-    if (pw === null || pw === undefined) return;
+  let beforeConnect;
+  if (window.tabSessionLive(tab.tabId)) {
+    const ok = await confirmModal('Restart session?',
+      `Restart the session to ${tab.serverName}? Its shell ends - anything running in it stops - and a new one starts in this tab.`,
+      'Restart session');
+    if (!ok) return;
+    // Asked, not frozen: the tab can have closed, ended or started connecting.
+    if (state.sessions.get(tab.tabId) !== tab || tab.connecting) return;
+    // What the end of a session does - SFTP closed, the file browser's state
+    // dropped, back to the shell, the assistant back at Read - before the new
+    // session: a restart left the tab's SFTP pointing at the dead session, so
+    // every file action failed (A3-13). But only once the password is in hand
+    // (connectTab runs this right before the connect): ended before the
+    // prompt, a restart cancelled there left the session open with the tab
+    // calling it gone, and Disconnect sent no id (fix round 1).
+    beforeConnect = () => {
+      if (window.tabSessionLive(tab.tabId) && typeof window.onSessionClosed === 'function') window.onSessionClosed(tab.tabId);
+    };
   }
-  terminalSetStatus(`Reconnecting to ${srv.host}:${srv.port}...`);
-  el('termDisconnectBtn').hidden = true;
-  el('termReconnectBtn').hidden = true;
-  try {
-    const sessionId = await window.terminalConnectInTab(tab.tabId, srv, { promptPassword: pw });
-    tab.sessionId = sessionId;
-    tab.ended = false;
-    renderTermTabs();
-    updateTerminalHead();
-    terminalSetStatus(`Connected to ${srv.host}:${srv.port} - streaming`);
-  } catch (e) {
-    renderTermTabs();
-    updateTerminalHead();
-    terminalSetStatus(`Failed: ${e.message || e}`);
-    toast(e.message || String(e), 'err');
-  }
+  await connectTab(tab, srv, { beforeConnect });
 }
 
 /// Activate the complete SSH/SFTP surface for one connection tab.
@@ -6501,6 +7276,8 @@ function activateSessionSurface(tabId) {
   }
   renderTermTabs();
   updateTerminalHead();
+  // The status line follows the tab shown (A3-27).
+  setStripText(tab.status || '');
 }
 
 /// Close a tab: disconnect if live, dispose terminal, forget the session.
@@ -6518,7 +7295,8 @@ async function closeSessionTab(tabId, { skipConfirm = false } = {}) {
     if (state.sessions.get(tabId) !== tab) return;
     live = window.tabSessionLive(tabId);
   }
-  if (live) call('terminal_disconnect', { sessionId: tab.sessionId }).catch(() => {});
+  const sessionId = live ? liveSessionId(tabId) : null;
+  if (sessionId) call('terminal_disconnect', { sessionId }).catch(() => {});
   if (tab.sftpReady) call('sftp_close', { sessionId: tab.sessionId || '' }).catch(() => {});
   window.destroyTabTerminal(tabId);
   const panel = document.getElementById('sftpPanel-' + tabId);
@@ -6564,7 +7342,8 @@ function renderTermTabs() {
   const addBtn = el('termTabAdd');
   for (const [tabId, tab] of state.sessions) {
     const chip = document.createElement('div');
-    chip.className = 'term-tab' + (tabId === state.activeTabId ? ' active' : '') + (tab.ended ? ' ended' : '') + (tab.bell ? ' bell' : '');
+    chip.className = 'term-tab' + (tabId === state.activeTabId ? ' active' : '') + (tab.ended ? ' ended' : '')
+      + (tab.connecting ? ' connecting' : '') + (tab.bell ? ' bell' : '');
     chip.dataset.tabId = tabId;
     // Keyboard-operable (A1-11): a tab stop, Enter/Space switch to it.
     chip.tabIndex = 0;
@@ -6609,18 +7388,25 @@ function renderTermTabs() {
   updateNavCounts();
 }
 
-/// Head title + buttons follow the active tab, or the selected server.
+/// Head title + buttons follow the active tab, or the selected server - and
+/// act on what they show (A3-10): with a tab, Reconnect is that tab's and
+/// Test tests its server; with none, the same button is Connect for the
+/// selected server. While a tab connects it offers Cancel (A5-10).
 function updateTerminalHead() {
   const tab = state.sessions.get(state.activeTabId);
   const srv = currentSelectedServer();
-  el('termTestBtn').hidden = !srv;
+  el('termTestBtn').hidden = !headServer();
+  el('termCancelBtn').hidden = !(tab && tab.connecting);
+  // "Cancel" alone does not say what it cancels.
+  if (tab && tab.connecting) el('termCancelBtn').setAttribute('aria-label', 'Cancel connecting to ' + tab.serverName);
   if (tab) {
     el('termTitle').textContent = tab.serverName;
     el('termBadge').textContent = `${tab.host}:${tab.port}`;
     el('termBadge').hidden = false;
     const live = window.tabSessionLive(tab.tabId);
     el('termDisconnectBtn').hidden = !live;
-    el('termReconnectBtn').hidden = live;
+    el('termReconnectBtn').hidden = live || !!tab.connecting;
+    setReconnectLabel('Reconnect');
     setModeSeg(live, tab.mode);
   } else if (srv) {
     el('termTitle').textContent = srv.name;
@@ -6628,6 +7414,7 @@ function updateTerminalHead() {
     el('termBadge').hidden = false;
     el('termDisconnectBtn').hidden = true;
     el('termReconnectBtn').hidden = false;
+    setReconnectLabel('Connect');
     setModeSeg(false);
   } else {
     el('termTitle').textContent = 'No connection';
@@ -6637,6 +7424,15 @@ function updateTerminalHead() {
     setModeSeg(false);
   }
   updateNavCounts();
+}
+
+/// "Reconnect" beside a tab, "Connect" with no tab (A2-44).
+function setReconnectLabel(text) {
+  const b = el('termReconnectBtn');
+  if (b.dataset.label === text) return;
+  b.dataset.label = text;
+  b.title = text === 'Connect' ? 'Connect to the selected server' : 'Reconnect this tab';
+  b.innerHTML = `${ico(text === 'Connect' ? 'plug-zap' : 'refresh-cw')}<span class="btn-label">${text}</span>`;
 }
 
 /// The surface control shows which of the three you are LOOKING AT. The button
@@ -6670,10 +7466,8 @@ function onSessionClosed(tabId) {
   // Shell/Files/Split control, so there was no visible way out.
   if (tab.mode !== 'ssh') tab.mode = 'ssh';
   tab.sessionId = null;
-  if (tabId === state.activeTabId) {
-    activateSessionSurface(tabId);
-    terminalSetStatus('Connection closed.');
-  }
+  setTabStatus(tabId, 'Connection closed.');
+  if (tabId === state.activeTabId) activateSessionSurface(tabId);
   renderTermTabs();
   updateTerminalHead();
 }
@@ -6712,6 +7506,22 @@ function escapeHtml(s) {
 
 // ─── boot ──────────────────────────────────────────────────────────────────
 
+/// The real version, from the backend's CARGO_PKG_VERSION (R12): the sidebar
+/// and the status line showed a development build marker three releases old
+/// instead (A2-24 / A8-26). The brand keeps its "Key manager" subtitle;
+/// Settings shows the version too.
+async function loadAppInfo() {
+  try {
+    state.appInfo = await call('app_info');
+  } catch (e) {
+    state.appInfo = null;
+  }
+  const version = state.appInfo && state.appInfo.version;
+  const brandSub = document.querySelector('.brand-sub');
+  if (brandSub) brandSub.textContent = version ? 'Key manager · v' + version : 'Key manager';
+  if (version) document.title = 'SSHSpan ' + version;
+}
+
 (async function main() {
   // Persistent boot-error log - readable via CDP even after the toast fades.
   window.__bootErrors = window.__bootErrors || [];
@@ -6724,9 +7534,6 @@ function escapeHtml(s) {
     const r = ev.reason;
     window.__bootErrors.push('unhandled rejection: ' + (r && r.message ? r.message : String(r)));
   });
-
-  window.__SSHPAN_BUILD__ = 'v14-tabs';;;
-  document.title = 'SSHSpan (' + window.__SSHPAN_BUILD__ + ')';
 
   injectIcons();
   // Show/hide on every password field (A5-35); the prompt's only shows while
@@ -6748,6 +7555,7 @@ function escapeHtml(s) {
   switchTab('generate');
   updateSelectionHint();
   loadBrandIcon();
+  loadAppInfo();
 
   // Load the terminal stack explicitly, in order, with loud per-file errors.
   // A statically-failed <script src> fires no window.onerror - it fails
@@ -6765,11 +7573,6 @@ function escapeHtml(s) {
     results.push(r);
     if (!r.ok) toast('Failed to load ' + src + ' - Connect will not work.', 'err');
   }
-
-  // Build marker: visible in the sidebar brand on every screen (the window
-  // title is owned by the OS window and does not follow document.title).
-  const brandSub = document.querySelector('.brand-sub');
-  if (brandSub) brandSub.textContent = 'KEYS & SESSIONS · ' + window.__SSHPAN_BUILD__;
 
   if (!window.__SSHPAN_TERMINAL_JS__) {
     toast('terminal.js loaded but did not initialize - Connect view will not work.', 'err');

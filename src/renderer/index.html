@@ -220,15 +220,25 @@
                      at the shell, so the label was unreadable either way. Split
                      exists because editing a file and running a command is one
                      task, not two modes. -->
+                <!-- Every label is a .btn-label: in a narrow header the buttons
+                     show their icons only, the label still their name and the
+                     title a tooltip (fix round 1 - they used to be clipped). -->
                 <div class="seg mode-seg" id="termModeSeg" hidden role="tablist" aria-label="Session surface">
-                  <button type="button" class="seg-btn active" data-mode="ssh" role="tab" aria-selected="true" aria-controls="sessionSurface" tabindex="0" title="Terminal only (Ctrl+Shift+1)"><span data-ico="terminal"></span>Shell</button>
-                  <button type="button" class="seg-btn" data-mode="sftp" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="File browser only (Ctrl+Shift+2)"><span data-ico="folder-tree"></span>Files</button>
-                  <button type="button" class="seg-btn" data-mode="split" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span>Split</button>
+                  <button type="button" class="seg-btn active" data-mode="ssh" role="tab" aria-selected="true" aria-controls="sessionSurface" tabindex="0" title="Terminal only (Ctrl+Shift+1)"><span data-ico="terminal"></span><span class="btn-label">Shell</span></button>
+                  <button type="button" class="seg-btn" data-mode="sftp" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="File browser only (Ctrl+Shift+2)"><span data-ico="folder-tree"></span><span class="btn-label">Files</span></button>
+                  <button type="button" class="seg-btn" data-mode="split" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span><span class="btn-label">Split</span></button>
                 </div>
-                <button id="termTestBtn" class="ghost-btn" hidden><span data-ico="plug-zap"></span>Test</button>
-                <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)" aria-pressed="false" aria-controls="assistantPanel"><span data-ico="message-square"></span>Assistant</button>
-                <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span>Reconnect</button>
-                <button id="termDisconnectBtn" class="danger-btn" hidden><span data-ico="x"></span>Disconnect</button>
+                <button id="termTestBtn" class="ghost-btn" title="Test the connection to this server" hidden><span data-ico="plug-zap"></span><span class="btn-label">Test</span></button>
+                <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)" aria-pressed="false" aria-controls="assistantPanel"><span data-ico="message-square"></span><span class="btn-label">Assistant</span></button>
+                <!-- While a tab connects (A5-10): the backend cannot abort a
+                     handshake, but the tab gives up on it and a session that
+                     still arrives is disconnected. -->
+                <button id="termCancelBtn" class="ghost-btn" title="Cancel connecting" hidden><span data-ico="x"></span><span class="btn-label">Cancel</span></button>
+                <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span><span class="btn-label">Reconnect</span></button>
+                <button id="termDisconnectBtn" class="danger-btn" title="Disconnect this session" hidden><span data-ico="x"></span><span class="btn-label">Disconnect</span></button>
+                <!-- In the header, not floating over the last column of the
+                     terminal at 35% opacity (A1-38). -->
+                <button id="termMaxBtn" class="icon-btn term-max-btn" type="button" title="Expand the terminal to the whole window (Ctrl+Shift+M)" aria-label="Maximize terminal" aria-pressed="false" data-ico="maximize-2"></button>
               </div>
             </div>
             <div class="term-tabs" id="termTabs">
@@ -278,8 +288,7 @@
                 </footer>
               </aside>
             </div>
-            <button id="termMaxBtn" class="term-max-btn" title="Expand terminal to full window" data-ico="maximize-2"></button>
-            <div class="terminal-strip" id="termStrip">Ready.</div>
+            <div class="terminal-strip" id="termStrip" role="status" aria-live="polite">Ready.</div>
           </section>
         </div>
       </div>
@@ -357,12 +366,14 @@
                 <div>
                   <h2>Bitwarden / Vaultwarden sync</h2>
                   <p class="card-sub">
-                    Keeps your SSH keys mirrored as SSH key items in your own vault (folder
-                    <code>SSHSpan</code> by default). Two-way: changes sync in both directions,
-                    newest wins; deletions are never propagated automatically. Self-hosted servers
-                    must use a public hostname &mdash; private, LAN and localhost addresses are
-                    refused for safety. The stored vault password is sealed with your SSHSpan
-                    master password and only readable while the vault is unlocked.
+                    Keeps your SSH keys and saved servers mirrored as items in your own vault
+                    (folders <code>SSHSpan_Keys</code> and <code>SSHSpan_Servers</code> by default).
+                    Two-way: changes sync in both directions, newest wins; changes coming from
+                    Bitwarden that would replace or add data here wait for your approval, and
+                    deletions are never propagated automatically. Self-hosted servers must use a
+                    public hostname - private, LAN and localhost addresses are refused for safety.
+                    The stored vault password is sealed with your SSHSpan master password and only
+                    readable while the vault is unlocked.
                   </p>
                 </div>
               </div>
@@ -372,7 +383,9 @@
                 <button id="bwTestBtn" class="ghost-btn"><span data-ico="server-cog"></span>Test connection</button>
                 <button id="bwSyncNowBtn" class="primary-btn"><span data-ico="refresh-cw"></span>Sync now</button>
               </div>
-              <div class="status-strip" id="bwStatus">Not configured yet.</div>
+              <div class="status-strip" id="bwStatus" role="status" aria-live="polite">Not configured yet.</div>
+              <!-- A sync's failed items, one per line (A2-08). -->
+              <ul class="bw-errors" id="bwErrors" aria-label="Items the last sync could not handle" hidden></ul>
             </section>
 
             <section class="card settings-section" data-section="assistant" hidden>
@@ -700,7 +713,7 @@
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="key-round"></span>
-          <h2 id="connectPwTitle">Enter Password</h2>
+          <h2 id="connectPwTitle">Enter password</h2>
         </div>
       </header>
       <div class="modal-body">
@@ -853,7 +866,7 @@
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="server"></span>
-          <h2 id="serverModalTitle">New Server</h2>
+          <h2 id="serverModalTitle">New server</h2>
         </div>
         <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
       </header>
@@ -861,7 +874,12 @@
         <div class="server-grid">
           <label class="span-2">Name <input type="text" id="srvName" placeholder="prod-web-1" spellcheck="false" autocomplete="off" /></label>
           <label>Host <input type="text" id="srvHost" placeholder="192.0.2.10 or host.example.com" spellcheck="false" autocomplete="off" /></label>
-          <label>Port <input type="number" id="srvPort" placeholder="22" min="1" max="65535" autocomplete="off" /></label>
+          <!-- Checked on Save, the reason shown under it (A5-30) - outside
+               the label, so it does not become part of the field's name. -->
+          <div class="port-field">
+            <label>Port <input type="number" id="srvPort" placeholder="22" min="1" max="65535" autocomplete="off" aria-describedby="srvPortMsg" /></label>
+            <p class="field-error" id="srvPortMsg" role="alert" hidden></p>
+          </div>
           <label>Username <input type="text" id="srvUser" placeholder="deploy" spellcheck="false" autocomplete="off" /></label>
           <!-- A radio group, not a <label>: a label forwarded every click on its
                blank space to the first button inside (Key), so a stray click
@@ -874,22 +892,28 @@
               <button type="button" data-auth="keyboard-interactive" class="seg-btn" role="radio" aria-checked="false" tabindex="-1">Keyboard-interactive</button>
             </div>
           </div>
-          <div class="span-2 key-row" id="srvKeyRow">
+          <!-- Its own class (A1-21): as "key-row" it was drawn as a key-list
+               card and squeezed the .pem path to a few characters. The key
+               and the path are alternatives, one above the other. -->
+          <div class="span-2 server-key-row" id="srvKeyRow">
             <label>Vault key
               <select id="srvKeyId">
                 <option value="">- select a key -</option>
               </select>
             </label>
             <div class="pem-row">
-              <input type="text" id="srvPemPath" placeholder="...or pick a .pem file on disk" spellcheck="false" autocomplete="off" />
+              <input type="text" id="srvPemPath" aria-label="Key file (.pem) on disk" placeholder="...or pick a .pem file on disk" spellcheck="false" autocomplete="off" />
               <button type="button" id="srvBrowsePemBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse</button>
             </div>
           </div>
           <div class="span-2 pw-row" id="srvPwRow" hidden>
-            <label>Password (optional, only used at connect time)
-              <input type="password" id="srvPassword" placeholder="leave blank to type at connect time" autocomplete="off" />
+            <label>Password (optional)
+              <input type="password" id="srvPassword" placeholder="Leave blank to type it when you connect" autocomplete="off" aria-describedby="srvPwSavedHint" />
             </label>
-            <label class="toggle-chip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
+            <!-- A saved password is kept unless replaced or removed (A5-03). -->
+            <p class="hint" id="srvPwSavedHint" hidden></p>
+            <button type="button" class="ghost-btn" id="srvClearPwBtn" aria-pressed="false" hidden>Remove saved password</button>
+            <label class="toggle-chip" id="srvSavePwChip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
           </div>
           <div class="span-2 cat-field">
             <span class="cat-field-label">Category</span>

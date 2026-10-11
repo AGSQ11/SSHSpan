@@ -288,7 +288,7 @@ function buildSftpPanel(tabId) {
   const mkdirBtn = mkBtn('folder-plus', 'New folder', () => sftpMkdirPrompt(tabId), 'Folder');
   const newFileBtn = mkBtn('file-text', 'New empty file', () => sftpTouchPrompt(tabId), 'File');
   const uploadBtn = mkBtn('upload-cloud',
-    'Upload the files selected in the local pane to this folder (or drop files from your file manager onto the list)',
+    'Upload files from this computer to this folder (or drop them from your file manager onto the list)',
     () => sftpUploadSelected(tabId), 'Upload');
   const bookmarkBtn = mkBtn('star', 'Bookmarks', (ev) => openBookmarkMenu(ev, tabId), 'Bookmarks');
   const searchBtn = mkBtn('search', 'Search recursively (in current tree)', () => toggleSearchBar(tabId), 'Search');
@@ -1848,22 +1848,78 @@ function openSftpDirMenu(x, y, tabId) {
   sftpShowMenu(menu, x, y);
 }
 
-/// Upload, from the toolbar or the folder menu. No native "open files" picker
-/// is available to the renderer (file dialogs are opened by Rust, and no
-/// command offers a multi-file pick), so this uploads what is selected in the
-/// local pane to the folder on screen - and when the pane is closed or nothing
-/// is selected there, opens it and says how.
-function sftpUploadSelected(tabId) {
+/// Upload, from the toolbar or the folder menu (A5-40): the native picker for
+/// several files (system_pick_files - Rust opens it and returns paths, nothing
+/// is read here), then every picked file into the folder on screen with ONE
+/// sftp_queue_add, through the same conflict check as any upload. Uploading
+/// used to need the local pane and a selection in it, which nothing on screen
+/// explained. The local pane keeps its own Upload in its menu.
+async function sftpUploadSelected(tabId) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   sftpTabState(tab);
-  const names = tab.dualPane ? [...tab.localSelected] : [];
-  if (!tab.dualPane) toggleDualPane(tabId, { persist: false });
-  if (!names.length || !tab.localPath) {
-    toast('Select files in the local pane on the left, then Upload - or drop files from your file manager onto the remote list.', 'info');
+  const dir = tab.sftpPath || '/';
+  let pick;
+  try {
+    pick = await sftpCall('system_pick_files', { title: 'Upload to ' + dir, multiple: true });
+  } catch (e) {
+    toast(e.message || String(e), 'err');
     return;
   }
-  queueUploads(tabId, names.map((n) => ({ local: joinLocal(tab.localPath, n), remote: sftpJoin(tab.sftpPath, n) })));
+  const paths = pick && !pick.canceled ? arrayOrEmpty(pick.paths) : [];
+  if (!paths.length) return;
+  // The file's name on either platform's separator.
+  const baseName = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
+  await queueUploads(tabId, paths.map((p) => ({ local: p, remote: sftpJoin(dir, baseName(p)) })),
+    (r) => sftpReportPickedUploads(tabId, r));
+}
+
+/// What became of each picked file (RU6a fix1 contract: `items`, one per
+/// picked file - `status` "queued" or "error", `added`, `error`, `warnings`
+/// (that item's own notes) - with each error also first in `warnings`; the
+/// call fails only when every file does). An item counts as queued only when
+/// it put a transfer in the queue: "queued" with `added` 0 is a pick the
+/// backend walked and skipped (a FIFO, a link to a folder), its reason in its
+/// warnings. Shown generically: every item and its notes in the activity log,
+/// and a toast that counts what went and names the first that did not (or,
+/// all queued, the first note). Without `items` (an older backend) the usual
+/// queue report is used.
+function sftpReportPickedUploads(tabId, r) {
+  const items = arrayOrEmpty(r && r.items).filter(Boolean);
+  if (!items.length) {
+    sftpLog(tabId, `queued ${(r && r.added) || 0} upload(s)`);
+    sftpReportQueueWarnings(tabId, r);
+    if (r && r.added > 0) toast(`${r.added} upload(s) queued.`, 'ok');
+    return;
+  }
+  const queued = (i) => i.status === 'queued' && i.added > 0;
+  const notesOf = (i) => arrayOrEmpty(i.warnings).map(String);
+  const reasonOf = (i) => i.error || notesOf(i)[0] || `${i.path}: nothing to upload`;
+  const left = items.filter((i) => !queued(i));
+  const shown = new Set();
+  for (const i of items) {
+    sftpLog(tabId, queued(i)
+      ? `upload queued: ${i.path}${i.added > 1 ? ` (${i.added} transfers)` : ''}`
+      : `upload not queued: ${reasonOf(i)}`);
+    shown.add(reasonOf(i));
+    for (const w of notesOf(i)) {
+      if (!queued(i) && w === reasonOf(i)) continue;
+      sftpLog(tabId, `  ${w}`);
+      shown.add(w);
+    }
+    if (i.error) shown.add(i.error);
+  }
+  // Notes that belong to no item (a renamed download, say): the usual report.
+  sftpReportQueueWarnings(tabId, { warnings: arrayOrEmpty(r && r.warnings).filter((w) => !shown.has(w)) });
+  const notes = items.filter(queued).flatMap(notesOf);
+  const more = (n) => (n > 1 ? ` (and ${n - 1} more - see the activity log)` : '');
+  if (left.length) {
+    toast(`${items.length - left.length} of ${items.length} files queued - ${reasonOf(left[0])}${more(left.length)}`, 'warn');
+  } else if (notes.length) {
+    toast(`${plural(items.length, 'file')} queued for upload - ${notes[0]}${more(notes.length)}`, 'warn');
+  } else {
+    toast(`${plural(items.length, 'file')} queued for upload.`, 'ok');
+  }
 }
 
 /// Right-click menu for a remote file/dir (selection-aware).
@@ -2929,7 +2985,9 @@ async function queueDownloads(tabId, remotePaths) {
   } catch (e) { toast(e.message || String(e), 'err'); }
 }
 
-async function queueUploads(tabId, pairs) {
+/// `report(r)`, when given, shows the result of sftp_queue_add in place of the
+/// usual report (the Upload picker's per-file report).
+async function queueUploads(tabId, pairs, report) {
   const tab = sftpTab(tabId);
   if (!tab) return;
   try {
@@ -2986,6 +3044,10 @@ async function queueUploads(tabId, pairs) {
       items,
       preserveTs: !!tab.sftpPreserveTs,
     });
+    if (typeof report === 'function') {
+      report(r);
+      return;
+    }
     sftpLog(tabId, `queued ${r.added} upload(s)`);
     sftpReportQueueWarnings(tabId, r);
     if (r.added > 0) toast(`${r.added} upload(s) queued.`, 'ok');

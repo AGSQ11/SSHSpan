@@ -140,6 +140,11 @@ jobs:
           # import formats, the key list, category drag and drop, the
           # backend-planned deploy preview and removing a deployed copy.
           npm run test:keys
+          # Servers, terminal sessions and the app lifecycle: saved passwords,
+          # the connect lifecycle and status line, key compatibility, paste,
+          # chords and focus in a real xterm, Quit, the lock questions, the
+          # updater dialog, Bitwarden sync results and the Upload picker.
+          npm run test:servers
 
   cargo-audit:
     name: Dependency advisories

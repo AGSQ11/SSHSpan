@@ -33,12 +33,18 @@ the build.
 
 ## A note on the terminal's link handling
 
-`addon-web-links` linkifies `http(s)` matches in terminal output, and clicks are
-routed through the backend's `system_open_url`, which accepts only `http`/`https`.
+Two kinds of link reach a click in the terminal:
 
-xterm also parses OSC 8 hyperlinks, where the visible text and the target are
-independent — a hostile server could display one URL and open another. That is
-**not** currently reachable: xterm surfaces OSC 8 links only when the terminal's
-`linkHandler` option is set, and `terminal.js` does not set it (verified against
-the real page — the OSC 8 sequence produces no anchor). If `linkHandler` is ever
-added, show the real target before opening it.
+- plain `http(s)` URLs in the output, which `addon-web-links` linkifies;
+- OSC 8 hyperlinks, which xterm parses and hands to the terminal's
+  `linkHandler` option. `terminal.js` sets it, so xterm never falls back to a
+  native `confirm()` and `window.open()`. Here the visible text and the target
+  are independent - a hostile server can display one URL and point at another.
+
+Both go through `terminalOpenLink` in `terminal.js`, which parses the target
+once and refuses, with a reason and without asking, a link whose scheme is not
+`http`/`https` or that carries a user name or password in front of the host
+(`https://accounts.google.com:signin@evil.tld/` opens `evil.tld`). Any other
+link is shown in the app's own dialog - `Site: <host>` on a line of its own
+first, then the address, cut at 300 characters - and opens only on OK,
+through the backend's `system_open_url`, which accepts only `http`/`https`.

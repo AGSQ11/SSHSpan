@@ -1243,21 +1243,26 @@ async function scenarioPanel(browser, server) {
     yes('A5-40 the toolbar has an Upload button', uploadBtn !== null, uploadBtn);
     check('Upload for a tab that is gone does nothing (no exception)',
       await page.evaluate(() => { try { sftpUploadSelected('no-such-tab'); return 'ok'; } catch (e) { return String(e); } }), 'ok');
+    // Upload opens the native picker for several files and queues the picks
+    // into the folder on screen with one call (A5-40, JU5); the per-file
+    // report and the refusals are pinned in check-servers-ui.js.
     const clickUpload = () => page.evaluate(() =>
       [...document.querySelectorAll('#sftpPanel-t1 .sftp-toolbar button')].find((x) => /^upload/i.test(x.textContent.trim())).click());
-    await rowEvent(page, 'click', 'l1.txt', { local: true });
-    await rowEvent(page, 'click', 'l2.txt', { local: true, init: { ctrlKey: true } });
+    await page.evaluate(() => {
+      window.__replies.system_pick_files = { canceled: false, paths: ['/home/me/l1.txt', '/home/me/l2.txt'] };
+    });
     const adds = (await queueAdds(app)).length;
     if (uploadBtn !== null) await clickUpload();
     await settle(page, 300);
-    check('A5-40 Upload sends the files selected in the local pane to the remote folder',
+    check('A5-40 Upload asks for files with the native picker', (await app.calls('system_pick_files')).map((c) => c.args.multiple), [true]);
+    check('A5-40 and sends the picked files to the remote folder in one batch',
       (await queueAdds(app)).slice(adds).map((a) => a.items.map((i) => [i.local, i.remote])),
       [[['/home/me/l1.txt', '/home/u/l1.txt'], ['/home/me/l2.txt', '/home/u/l2.txt']]]);
-    await page.evaluate(() => document.querySelector('#sftpLocalPane-t1 .sftp-tablewrap').dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    await page.evaluate(() => { window.__replies.system_pick_files = { canceled: true, paths: [] }; });
+    const before = (await queueAdds(app)).length;
     if (uploadBtn !== null) await clickUpload();
     await settle(page);
-    yes('A5-40 with nothing selected it explains where to pick files', (await toasts(page)).some((t) => /local/i.test(t) && /select/i.test(t)),
-      JSON.stringify(await toasts(page)));
+    check('A5-40 a cancelled pick uploads nothing', (await queueAdds(app)).length, before);
     await page.evaluate(() => document.querySelector('#sftpPanel-t1 .sftp-remote .sftp-tablewrap')
       .dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 600, clientY: 600 })));
     await settle(page, 60);

@@ -47,7 +47,8 @@ const AI_RESULT_CAP_BYTES = 65536;
 // in whole groups (a user message and everything up to the next one), so a
 // tool call never loses its result.
 const AI_HISTORY_MAX = 40;
-// How much of a tool's arguments/result a tool-event row shows.
+// How much of a tool's result a tool-event row shows. (Its parameters are
+// shown like on an approval card, through aiArgsBlock.)
 const AI_EVENT_PREVIEW = 600;
 
 // Per-tab state: tabId -> {messages, level, running, stopRequested, listEl}.
@@ -452,11 +453,41 @@ function aiSetThinking(tabId, s) {
 
 // ─── tool cards (propose / confirm) ─────────────────────────────────────────
 
+/// Characters that change how text looks without showing themselves - every
+/// format character (Cf: direction overrides and isolates, zero-width ones,
+/// tags...) and every default-ignorable one (variation selectors, Hangul
+/// fillers...), the line and paragraph separators, and the control characters
+/// (C0 but TAB and LF, DEL, C1). A card is what the user judges, so it must
+/// not show "ls" for a command that runs something else. The backend refuses
+/// the same set (DISGUISING_CHARS, assistant/mod.rs); its ranges are listed
+/// here too, so a webview with older Unicode tables still escapes all of
+/// them - test:servers checks this set covers that table.
+const AI_HIDDEN_CHARS = /[\p{Cf}\p{Default_Ignorable_Code_Point}\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u034F\u0600-\u0605\u061C\u06DD\u070F\u0890-\u0891\u08E2\u115F-\u1160\u17B4-\u17B5\u180B-\u180F\u200B-\u200F\u2028-\u2029\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF0-\uFFFB\u{110BD}\u{110CD}\u{13430}-\u{1343F}\u{1BCA0}-\u{1BCA3}\u{1D173}-\u{1D17A}\u{E0000}-\u{E0FFF}]/gu;
+
+/// Put `text` into `parent` with every hidden character shown as a marked
+/// code point (U+202E) - escaped for display only: the command or arguments
+/// the card stands for are not changed. Text only, never markup.
+function aiAppendVisible(parent, text) {
+  const s = String(text == null ? '' : text);
+  let last = 0;
+  for (const m of s.matchAll(AI_HIDDEN_CHARS)) {
+    if (m.index > last) parent.appendChild(document.createTextNode(s.slice(last, m.index)));
+    const mark = document.createElement('span');
+    mark.className = 'ai-hidden-char';
+    const cp = m[0].codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
+    mark.textContent = '<U+' + cp + '>';
+    mark.title = 'An invisible character is here (U+' + cp + ')';
+    parent.appendChild(mark);
+    last = m.index + m[0].length;
+  }
+  if (last < s.length) parent.appendChild(document.createTextNode(s.slice(last)));
+}
+
 function aiCardCmd(container, command) {
   const pre = document.createElement('pre');
   const code = document.createElement('code');
   code.className = 'ai-cmd';
-  code.textContent = command;
+  aiAppendVisible(code, command);
   pre.appendChild(code);
   container.appendChild(pre);
 }
@@ -627,7 +658,9 @@ function aiArgsBlock(container, args, label) {
     const pre = document.createElement('pre');
     const code = document.createElement('code');
     code.className = 'ai-cmd';
-    code.textContent = text;
+    // JSON leaves direction and zero-width characters as they are: shown as
+    // code points, like on the command card.
+    aiAppendVisible(code, text);
     pre.appendChild(code);
     return pre;
   };
@@ -687,8 +720,9 @@ function aiPreview(text) {
 }
 
 /// One read-only row per tool call, whatever approved it (A4-17): which
-/// service and tool, the arguments (credentials masked), who approved it,
-/// how it ended, and the start of the result. All text, no controls.
+/// service and tool, every argument as the approval card shows it (nothing is
+/// masked - see aiArgsBlock), who approved it, how it ended, and the start of
+/// the result. All text, no controls.
 function aiToolEvent(tabId, s, ev) {
   if (aiTabs.get(tabId) !== s) return;
   const row = document.createElement('div');
@@ -1088,8 +1122,10 @@ function aiFriendlyError(msg) {
 
 // The backend's answers that mean "not set up yet": load_provider in
 // src-tauri/src/assistant/mod.rs ("AI assistant is not configured - open
-// Settings > AI assistant.", "No API key stored - ...", "No model configured.").
-const AI_SETUP_ERRORS = /not configured - open Settings|No API key stored|No model configured/;
+// Settings > AI assistant.", "No API key stored - ...", "No model configured."
+// and, since RU6b, "The saved assistant URL is no longer accepted - open
+// Assistant settings and save it again.").
+const AI_SETUP_ERRORS = /not configured - open Settings|No API key stored|No model configured|saved assistant URL is no longer accepted/;
 
 /// A turn's result for the model when a call never ran: the turn stopped
 /// (Stop, the tool-call cap, an error) before it was its turn.
@@ -1404,10 +1440,11 @@ async function aiLoadConfigNow(force) {
   aiSyncProviderHints();
 }
 
-/// Save the form as it is on screen; true when it was saved. When the
-/// provider or the key's address changed without a new key, the backend
-/// refuses to move the stored key there; the user is asked, and only a
-/// confirmation resends with reuseKeyAtNewOrigin (A4-13).
+/// Save the form as it is on screen; true when it was saved - or, saved with a
+/// warning (RU6b: the audit row could not be written), the warning, already
+/// shown. When the provider or the key's address changed without a new key,
+/// the backend refuses to move the stored key there; the user is asked, and
+/// only a confirmation resends with reuseKeyAtNewOrigin (A4-13).
 async function aiSaveForm() {
   if (aiSaving) return false;
   aiSaving = true;
@@ -1419,10 +1456,11 @@ async function aiSaveForm() {
     clearApiKey: false,
     reuseKeyAtNewOrigin: reuse,
   });
+  let saved;
   try {
     aiSetStatus('Saving...', 'info');
     try {
-      await req(false);
+      saved = await req(false);
     } catch (e) {
       // check_key_reuse's refusal (src-tauri/src/assistant/mod.rs): "The
       // provider or base URL changed but no new API key was entered - ...".
@@ -1436,7 +1474,7 @@ async function aiSaveForm() {
         aiSetStatus('Not saved - enter the API key for the new endpoint, or confirm reusing the stored one.', 'err');
         return false;
       }
-      await req(true);
+      saved = await req(true);
     }
   } catch (e) {
     aiSetStatus('Not saved: ' + aiErrText(e), 'err');
@@ -1448,13 +1486,27 @@ async function aiSaveForm() {
   if (keyInput) keyInput.value = '';
   aiFormDirty = false;
   await aiLoadConfig({ force: true });
+  const warning = aiSaveWarning(saved);
+  if (warning) return warning;
   aiSetStatus('Saved.', 'ok');
   return true;
 }
 
+/// The warning a save answered with (RU6b: `warning`, a sentence that says
+/// what was saved and what went wrong after), shown as it is and not in the
+/// way: the save itself went through. Returns it ('' when there is none).
+function aiSaveWarning(r) {
+  const warning = r && r.warning ? String(r.warning) : '';
+  if (!warning) return '';
+  aiSetStatus(warning, 'warn');
+  toast(warning, 'warn');
+  return warning;
+}
+
 async function aiSaveConfig() {
   return withBusy(document.getElementById('aiSaveBtn'), 'Saving...', async () => {
-    if (await aiSaveForm()) toast('AI assistant settings saved.', 'ok');
+    // A warning was shown already; the plain confirmation is for a clean save.
+    if ((await aiSaveForm()) === true) toast('AI assistant settings saved.', 'ok');
   });
 }
 
@@ -1468,7 +1520,10 @@ async function aiTestConnection() {
       const r = await aiCall('assistant_test_connection');
       aiSetStatus((r && r.detail) || 'Connected.', 'ok');
     } catch (e) {
-      aiSetStatus('Connection test failed: ' + aiFriendlyError(aiErrText(e)), 'err');
+      // The backend's words as they are (RU6b: "The saved assistant URL is
+      // no longer accepted - ..." is a whole sentence; a prefix in front of
+      // it only got in the way).
+      aiSetStatus(aiFriendlyError(aiErrText(e)), 'err');
     }
   });
 }
@@ -1482,8 +1537,9 @@ async function aiRemoveKey() {
       'Remove key');
     if (!ok) return;
     const c = aiSavedConfig || {};
+    let removed;
     try {
-      await aiCall('assistant_save_config', {
+      removed = await aiCall('assistant_save_config', {
         provider: c.provider || 'openai',
         baseUrl: c.base_url || null,
         model: c.model || '',
@@ -1497,7 +1553,7 @@ async function aiRemoveKey() {
     }
     aiSavedConfig = Object.assign({}, c, { has_api_key: false });
     aiPaintKeyState(aiSavedConfig);
-    aiSetStatus('The stored API key was removed.', 'ok');
+    if (!aiSaveWarning(removed)) aiSetStatus('The stored API key was removed.', 'ok');
   });
 }
 
