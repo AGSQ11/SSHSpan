@@ -175,7 +175,9 @@ impl DeployHostFields {
     /// verbatim. HostName and User must be one word: a space adds arguments
     /// ssh_config rejects, a quote opens a quoted string ("invalid quotes" -
     /// fatal for every ssh command once the managed file is Included) and a
-    /// leading `#` turns the rest of the line into a comment. The port cannot
+    /// leading `#` turns the rest of the line into a comment; a leading `=`
+    /// is taken as the keyword's separator, and User may not hold `%` or `${`
+    /// (OpenSSH 10 expands both there). The port cannot
     /// be 0. The alias may not contain `*`, `?` or `!` - they would make it a
     /// pattern matching other hosts (`Host *` with `StrictHostKeyChecking no`
     /// would apply to every host); anything else unusual in it is replaced
@@ -202,10 +204,36 @@ impl DeployHostFields {
                     "{label} must be a single word without spaces, quotes or control characters, and must not start with #."
                 ));
             }
+            // ssh_config takes one `=` after the keyword as the separator, so
+            // `HostName =evil` connects to `evil` (and `User ==x` logs in as
+            // `=x`): the value written would not be the value ssh uses.
+            if value.starts_with('=') {
+                return Err(format!(
+                    "{label} must not start with = - ssh_config reads it as part of the keyword."
+                ));
+            }
             if value.chars().count() > MAX_HOST_FIELD_CHARS {
                 return Err(format!(
                     "{label} is too long (at most {MAX_HOST_FIELD_CHARS} characters)."
                 ));
+            }
+            Ok(())
+        }
+        /// OpenSSH 10 expands `%` tokens and `${VARIABLE}` in User (`User
+        /// a%hb` logs in as `a<host>b`, an unterminated `${` makes ssh refuse
+        /// the file), and User has no escape for either.
+        fn literal_user(value: &str) -> std::result::Result<(), String> {
+            if value.contains('%') {
+                return Err(
+                    "User cannot contain % - OpenSSH 10 replaces %-tokens in User with other values."
+                        .into(),
+                );
+            }
+            if value.contains("${") {
+                return Err(
+                    "User cannot contain ${ - OpenSSH 10 replaces ${NAME} in User with an environment variable."
+                        .into(),
+                );
             }
             Ok(())
         }
@@ -226,6 +254,7 @@ impl DeployHostFields {
         }
         if let Some(u) = &user {
             one_word("User", u)?;
+            literal_user(u)?;
         }
         if port == Some(0) {
             return Err("Port must be between 1 and 65535.".into());
@@ -291,6 +320,9 @@ pub struct DeployPlan {
     pub keys: Vec<PlannedKey>,
     /// The managed config as it was read when planning.
     base: SshConfig,
+    /// `Host` lines in the user's own ssh config naming hosts this deploy
+    /// writes (see [`LegacyHostLine`]).
+    legacy: Vec<LegacyHostLine>,
 }
 
 impl DeployPlan {
@@ -314,6 +346,62 @@ impl DeployPlan {
         self.target.include_line()
     }
 
+    /// `Host` lines in the user's own `~/.ssh/config` that name a host this
+    /// deploy writes - typically left there by an older SSHSpan.
+    pub fn legacy_host_lines(&self) -> Vec<LegacyHostLine> {
+        self.legacy.clone()
+    }
+
+    /// What the preview should warn about, as sentences that say what to do.
+    pub fn preview_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.target.config_path.to_string_lossy().contains('%') {
+            warnings.push(
+                "The managed config path contains a % sign. The Include line writes it as %% \
+                 (what OpenSSH expects), but Win32-OpenSSH 9.5p1 reads %% literally and will \
+                 not find the file - with that version, write the Include line with a single %."
+                    .to_string(),
+            );
+        }
+        for l in &self.legacy {
+            warnings.push(legacy_line_warning(l));
+        }
+        warnings
+    }
+
+    /// `current` (the managed config as it is NOW) with a stanza merged in
+    /// for each of `keys`, and a warning for each key whose alias another
+    /// deploy took after this plan was made: that stanza is not re-pointed.
+    fn merge_into(&self, mut current: SshConfig, keys: &[&PlannedKey]) -> (SshConfig, Vec<String>) {
+        let identity_of = |config: &SshConfig, alias: &str| -> Option<String> {
+            config
+                .hosts
+                .iter()
+                .find(|h| h.host == alias)
+                .and_then(|h| h.identity_file.clone())
+        };
+        let mut warnings = Vec::new();
+        for key in keys {
+            let planned = identity_of(&self.base, &key.alias);
+            let now = identity_of(&current, &key.alias);
+            match now {
+                Some(other)
+                    if Some(&other) != planned.as_ref()
+                        && !identity_names(&other, Path::new(&key.file)) =>
+                {
+                    warnings.push(format!(
+                        "{} was written, but the Host alias \"{}\" was given to {} by another \
+                         deploy meanwhile, so no entry was added for it. Deploy \"{}\" again \
+                         with another alias.",
+                        key.file, key.alias, other, key.name
+                    ));
+                }
+                _ => merge_stanza(&mut current, &key.alias, &key.file, &self.fields),
+            }
+        }
+        (current, warnings)
+    }
+
     /// The base config with a stanza merged in for each of `keys`.
     fn with_stanzas(&self, keys: &[&PlannedKey]) -> SshConfig {
         let mut config = self.base.clone();
@@ -322,6 +410,73 @@ impl DeployPlan {
         }
         config
     }
+}
+
+/// A `Host` line in the user's own ssh config that names a host a deploy
+/// writes: either left there by an older SSHSpan, which used the raw key name
+/// as the alias (`Host bob's-key`), or the user's own entry for the same
+/// host. SSHSpan never edits that file; the preview reports these lines so
+/// the user can decide.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyHostLine {
+    /// The file the line is in.
+    pub file: String,
+    /// 1-based line number.
+    pub line: usize,
+    /// The line as written (trimmed, control characters removed).
+    pub text: String,
+    /// The vault key whose host it names.
+    pub key: String,
+    /// ssh cannot read the line at all (an unbalanced quote), which stops
+    /// every ssh command while it is there.
+    pub unreadable: bool,
+    /// Its block uses an `sshspan_*` key file: an older SSHSpan wrote it.
+    /// Otherwise it is the user's own entry - never something to remove.
+    pub written_by_sshspan: bool,
+}
+
+/// What the preview says about one [`LegacyHostLine`]. Only a block that an
+/// older SSHSpan wrote (its key file is an `sshspan_*` one) is attributed to
+/// it, with the advice to remove it; the user's own entry for the same host
+/// is described as an overlap - the advice to remove it used to delete a
+/// hand-written `Host github` block.
+fn legacy_line_warning(l: &LegacyHostLine) -> String {
+    let at = format!("{}, line {}: \"{}\"", l.file, l.line, l.text);
+    match (l.written_by_sshspan, l.unreadable) {
+        (true, true) => format!(
+            "{at} names the host of key \"{}\" and cannot be read by ssh (an unbalanced quote), \
+             so every ssh command fails while it is there. An older SSHSpan wrote it; SSHSpan \
+             never edits this file - remove or fix the line yourself.",
+            l.key
+        ),
+        (true, false) => format!(
+            "{at} names the host of key \"{}\" - an older SSHSpan wrote it (its key file is an \
+             sshspan_ one). SSHSpan never edits this file; remove that line and the settings \
+             under it yourself so ssh uses only the new entry.",
+            l.key
+        ),
+        (false, true) => format!(
+            "{at} is your own entry for the host of key \"{}\", and ssh cannot read it (an \
+             unbalanced quote), so every ssh command fails while it is there. SSHSpan never \
+             edits this file - fix the quoting of that line yourself.",
+            l.key
+        ),
+        (false, false) => format!(
+            "{at} is your own entry for the host of key \"{}\". ssh combines it with the new \
+             entry and, for each setting, uses the first value it reads - check that the two \
+             agree. SSHSpan never edits this file.",
+            l.key
+        ),
+    }
+}
+
+/// Whether `identity_file` names a key file a deploy writes (`sshspan_*`).
+fn is_sshspan_key_file(identity_file: &str) -> bool {
+    identity_file
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.starts_with("sshspan_"))
 }
 
 /// Key material for one planned key.
@@ -404,7 +559,10 @@ impl SshService {
         recorded: &[RecordedDeployment],
         fields: &DeployHostFields,
     ) -> Result<DeployPlan> {
-        let base = SshConfigService::at(target.config_path.clone()).read()?;
+        let base = {
+            let _no_writer = managed_config_lock();
+            SshConfigService::at(target.config_path.clone()).read()?
+        };
         let several = keys.len() > 1;
         let mut planned: Vec<PlannedKey> = Vec::with_capacity(keys.len());
         let mut aliases_taken: Vec<String> = Vec::new();
@@ -486,11 +644,13 @@ impl SshService {
                 refusal,
             });
         }
+        let legacy = find_legacy_host_lines(target, &planned, fields);
         Ok(DeployPlan {
             target: target.clone(),
             fields: fields.clone(),
             keys: planned,
             base,
+            legacy,
         })
     }
 
@@ -535,12 +695,28 @@ impl SshService {
             }
         }
         if !written.is_empty() {
-            let config = plan.with_stanzas(&written);
-            if let Err(e) = SshConfigService::at(plan.target.config_path.clone()).write(&config) {
-                outcome.warnings.push(format!(
-                    "The key files were written, but {} could not be updated: {e}",
+            // The stanzas go into the file as it is NOW, under the lock every
+            // read-modify-write of it takes. Writing back the copy read when
+            // the deploy was planned - before every key was unsealed - undid
+            // an undeploy that ran meanwhile and dropped the stanzas of a
+            // concurrent deploy.
+            let _writes = managed_config_lock();
+            let service = SshConfigService::at(plan.target.config_path.clone());
+            match service.read() {
+                Ok(current) => {
+                    let (config, taken) = plan.merge_into(current, &written);
+                    outcome.warnings.extend(taken);
+                    if let Err(e) = service.write(&config) {
+                        outcome.warnings.push(format!(
+                            "The key files were written, but {} could not be updated: {e}",
+                            plan.target.config_path.display()
+                        ));
+                    }
+                }
+                Err(e) => outcome.warnings.push(format!(
+                    "The key files were written, but {} could not be read to add their entries: {e}",
                     plan.target.config_path.display()
-                ));
+                )),
             }
         }
         outcome
@@ -577,6 +753,7 @@ impl SshService {
                 .push(format!("Could not remove {public}: {e}")),
         }
         let service = SshConfigService::at(target.config_path.clone());
+        let _writes = managed_config_lock();
         match service.read() {
             Ok(mut config) => {
                 let (gone, kept): (Vec<SshHostConfig>, Vec<SshHostConfig>) =
@@ -621,6 +798,74 @@ impl SshService {
         let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         same_path(&canonical(parent), &canonical(&target.ssh_dir))
     }
+}
+
+/// Serialises every read-modify-write of the managed config in this process
+/// (deploy, undeploy, and the read a plan starts from): a deploy and an
+/// undeploy running at once each wrote back the file as they had read it, so
+/// one dropped the other's change.
+static MANAGED_CONFIG_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`MANAGED_CONFIG_WRITES`]. Held only around the file's own read and
+/// write - never while keys are unsealed or other work runs.
+fn managed_config_lock() -> std::sync::MutexGuard<'static, ()> {
+    MANAGED_CONFIG_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `Host` lines of the user's own ssh config (`<ssh dir>/config`) that name
+/// the host of one of `keys` - by the alias this deploy gives it, by the
+/// key's name (older builds used it raw: `Host bob's-key`) or by the alias
+/// that was typed. Case is ignored. Read-only: a missing or unreadable file
+/// yields nothing, and nothing is ever written to it.
+fn find_legacy_host_lines(
+    target: &DeployTarget,
+    keys: &[PlannedKey],
+    fields: &DeployHostFields,
+) -> Vec<LegacyHostLine> {
+    let path = target.ssh_dir.join("config");
+    let Ok(Some(text)) = crate::config::read_config_text(&path) else {
+        return Vec::new();
+    };
+    let file = path.display().to_string();
+    let candidates: Vec<(String, Vec<String>)> = keys
+        .iter()
+        .map(|k| {
+            let mut names = vec![k.alias.to_lowercase(), k.name.to_lowercase()];
+            names.extend(fields.host_alias.iter().map(|a| a.to_lowercase()));
+            (k.name.clone(), names)
+        })
+        .collect();
+    let mut found = Vec::new();
+    for line in crate::config::host_lines(&text) {
+        let words: Vec<String> = match &line.patterns {
+            Some(patterns) => patterns.iter().map(|p| p.to_lowercase()).collect(),
+            // ssh cannot split this line; compare the words as written.
+            None => {
+                let rest = line
+                    .text
+                    .find(|c: char| c.is_whitespace() || c == '=')
+                    .map_or("", |i| line.text[i..].trim_start());
+                let rest = rest.strip_prefix('=').unwrap_or(rest);
+                rest.split_whitespace().map(str::to_lowercase).collect()
+            }
+        };
+        let owner = candidates
+            .iter()
+            .find(|(_, names)| words.iter().any(|w| names.contains(w)));
+        if let Some((key, _)) = owner {
+            found.push(LegacyHostLine {
+                file: file.clone(),
+                line: line.line,
+                text: line.text.chars().filter(|c| !c.is_control()).collect(),
+                key: key.clone(),
+                unreadable: line.patterns.is_none(),
+                written_by_sshspan: line.identity_files.iter().any(|f| is_sshspan_key_file(f)),
+            });
+        }
+    }
+    found
 }
 
 /// Write one key's private file (owner-only) and its `.pub`; a failure
@@ -1388,6 +1633,236 @@ mod deploy_tests {
             "nothing else was touched"
         );
         assert!(s.config().contains("Host web\n"));
+    }
+
+    // ── RU6a item 11 ──
+
+    /// What OpenSSH would rewrite is refused, like the other HostName / User
+    /// refusals: a leading `=` is eaten as the keyword separator (`HostName
+    /// =evil` connects to `evil`), and OpenSSH 10 expands `%` tokens and
+    /// `${VAR}` in User (`User a%hb` logs in as `a<hostname>b`).
+    #[test]
+    fn ru6a_host_name_and_user_refuse_what_openssh_would_rewrite() {
+        for (hostname, user, needle) in [
+            (Some("=evil.example"), None, "start with ="),
+            (None, Some("=root"), "start with ="),
+            (None, Some("a%hb"), "%"),
+            (None, Some("%"), "%"),
+            (None, Some("x${HOME}"), "${"),
+        ] {
+            let err = DeployHostFields::parse(
+                None,
+                hostname.map(String::from),
+                user.map(String::from),
+                None,
+                None,
+            )
+            .expect_err(&format!("{hostname:?} {user:?}"));
+            assert!(err.contains(needle), "{hostname:?} {user:?}: {err}");
+            assert!(err.ends_with('.'), "a sentence: {err}");
+        }
+        // Still fine: a % in HostName (written doubled), an `=` inside a
+        // value, a lone `$` (Windows machine accounts end in one).
+        let f = DeployHostFields::parse(
+            None,
+            Some("fe80::1%eth0".into()),
+            Some("PC01$".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(f.user.as_deref(), Some("PC01$"));
+        assert!(
+            DeployHostFields::parse(None, Some("a=b".into()), Some("u=v".into()), None, None)
+                .is_ok()
+        );
+    }
+
+    /// Win32-OpenSSH 9.5p1 mishandles the doubled `%%` the Include line needs
+    /// for a `%` in the managed config's path, so the preview says so.
+    #[test]
+    fn ru6a_preview_warns_when_the_managed_config_path_holds_a_percent_sign() {
+        let s = Scratch::new("percent-path");
+        let odd = DeployTarget::new(
+            s.target.ssh_dir.clone(),
+            s.root.join("app 100%").join("ssh").join("config"),
+        );
+        let p = SshService::plan_deploy(&odd, &[key("k1", "web")], &[], &fields(None)).unwrap();
+        let warnings = p.preview_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains('%') && w.contains("Include")),
+            "{warnings:?}"
+        );
+        let plain = plan(&s, &[key("k1", "web")], &fields(None));
+        assert!(
+            plain.preview_warnings().is_empty(),
+            "{:?}",
+            plain.preview_warnings()
+        );
+    }
+
+    /// The managed config is read when the deploy is PLANNED and was written
+    /// back from that copy - after unsealing every key. An undeploy that ran in
+    /// between had its removal undone (and another deploy's stanzas were
+    /// dropped). The write now re-reads the file.
+    #[test]
+    fn ru6a_a_deploy_writes_over_the_current_managed_config_not_the_one_it_planned_from() {
+        let s = Scratch::new("stale-base");
+        let first = plan(&s, &[key("k1", "web")], &fields(None));
+        SshService::apply_deploy(&first, material);
+        assert!(s.config().contains("Host web\n"));
+        // k2's deploy is planned (it reads the file WITH web's stanza)...
+        let second = plan(&s, &[key("k2", "db")], &fields(None));
+        // ...web is undeployed meanwhile...
+        let web = s.file("sshspan_web").display().to_string();
+        SshService::remove_key(&s.target, &web).unwrap();
+        assert!(!s.config().contains("Host web\n"));
+        // ...and k2's deploy finishes.
+        let outcome = SshService::apply_deploy(&second, material);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let config = s.config();
+        assert!(config.contains("Host db\n"), "{config}");
+        assert!(
+            !config.contains("Host web\n"),
+            "the undeployed stanza came back:\n{config}"
+        );
+    }
+
+    /// Concurrent deploys (each holding its key material for a while, as
+    /// unsealing does) used to keep only the stanza of the last one to write.
+    #[test]
+    fn ru6a_concurrent_deploys_keep_every_stanza() {
+        let s = Scratch::new("concurrent");
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let target = s.target.clone();
+                std::thread::spawn(move || {
+                    let k = key(&format!("k{i}"), &format!("key{i}"));
+                    let p = SshService::plan_deploy(&target, &[k], &[], &fields(None)).unwrap();
+                    SshService::apply_deploy(&p, |planned| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        material(planned)
+                    })
+                })
+            })
+            .collect();
+        for worker in workers {
+            let outcome = worker.join().unwrap();
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(outcome.deployed.len(), 1);
+        }
+        let config = s.config();
+        for i in 0..8 {
+            assert!(
+                config.contains(&format!("Host key{i}\n")),
+                "key{i} lost:\n{config}"
+            );
+        }
+    }
+
+    /// Two deploys planned at the same time with the same alias: the one that
+    /// writes second must not re-point the stanza the first just wrote for
+    /// another key. It reports it instead.
+    #[test]
+    fn ru6a_an_alias_another_deploy_took_meanwhile_is_not_repointed() {
+        let s = Scratch::new("alias-race");
+        let mine = plan(&s, &[key("k1", "web")], &fields(Some("prod")));
+        let theirs = plan(&s, &[key("k2", "db")], &fields(Some("prod")));
+        SshService::apply_deploy(&theirs, material);
+        let outcome = SshService::apply_deploy(&mine, material);
+        let db = s.file("sshspan_db").display().to_string();
+        let config = SshConfig::parse(&s.config());
+        let prod = config.hosts.iter().find(|h| h.host == "prod").unwrap();
+        assert_eq!(prod.identity_file.as_deref(), Some(db.as_str()));
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("\"prod\"")),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
+    /// Older builds wrote `Host <raw key name>` lines; `Host bob's-key` makes
+    /// ssh refuse the whole file. The preview lists such lines in the user's
+    /// own `~/.ssh/config` with their line numbers - and nothing ever edits
+    /// that file.
+    #[test]
+    fn ru6a_legacy_host_lines_in_the_users_config_are_reported_not_edited() {
+        let s = Scratch::new("legacy-lines");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        let user_config = s.target.ssh_dir.join("config");
+        let text = "Include \"/elsewhere/config\"\n\n\
+                    Host bob's-key\n    IdentityFile ~/.ssh/sshspan_bob_s_key\n\n\
+                    Host unrelated\n    HostName u.example\n\n\
+                    Host other BOB-S-KEY\n";
+        fs::write(&user_config, text).unwrap();
+        let p = plan(&s, &[key("k1", "bob's-key")], &fields(None));
+        assert_eq!(p.keys[0].alias, "bob-s-key");
+        let found: Vec<(usize, bool, String)> = p
+            .legacy_host_lines()
+            .into_iter()
+            .map(|l| (l.line, l.unreadable, l.key))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (3, true, "bob's-key".to_string()),
+                (9, false, "bob's-key".to_string())
+            ]
+        );
+        let warnings = p.preview_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("line 3") && w.contains("Host bob's-key")),
+            "{warnings:?}"
+        );
+        SshService::apply_deploy(&p, material);
+        assert_eq!(
+            fs::read_to_string(&user_config).unwrap(),
+            text,
+            "the user's own ssh config is never edited"
+        );
+    }
+
+    /// RU6a fix round 1, item 12: every Host line naming the alias or the key
+    /// was blamed on "an older SSHSpan" with the advice to remove it - on a
+    /// hand-written `Host github` block that deletes the user's own config.
+    /// Only a block whose IdentityFile is an `sshspan_*` file is SSHSpan's;
+    /// any other is the user's own entry for the same host, described as an
+    /// overlap, never to be removed.
+    #[test]
+    fn ru6a_fix1_only_an_sshspan_key_block_is_blamed_on_an_older_sshspan() {
+        let s = Scratch::new("legacy-owner");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        let text = "Host github\n    HostName github.com\n    IdentityFile ~/.ssh/id_ed25519\n\n\
+                    Host web\n    IdentityFile ~/.ssh/sshspan_web\n\n\
+                    Match host github\n    IdentityFile ~/.ssh/sshspan_web\n";
+        fs::write(s.target.ssh_dir.join("config"), text).unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(Some("github")));
+
+        let lines = serde_json::to_value(p.legacy_host_lines()).unwrap();
+        let owners: Vec<(serde_json::Value, serde_json::Value)> = lines
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| (l["line"].clone(), l["writtenBySshspan"].clone()))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![(1.into(), false.into()), (5.into(), true.into())],
+            "{lines}"
+        );
+        let warnings = p.preview_warnings();
+        let github = warnings.iter().find(|w| w.contains("line 1")).unwrap();
+        assert!(
+            !github.contains("older SSHSpan") && !github.to_lowercase().contains("remove"),
+            "{github}"
+        );
+        assert!(github.contains("your own"), "{github}");
+        let web = warnings.iter().find(|w| w.contains("line 5")).unwrap();
+        assert!(web.contains("older SSHSpan"), "{web}");
     }
 
     #[test]

@@ -1201,6 +1201,47 @@ mod tests {
         )));
     }
 
+    /// RU6a: a Windows path prefix compares by its plain spelling. dunce
+    /// keeps `\\?\C:\...` for a path longer than 260 characters, and the
+    /// textual comparison judged such a path to be outside the folder it is
+    /// in. Pure, so it runs on every platform.
+    #[test]
+    fn ru6a_verbatim_path_prefixes_compare_as_their_plain_spelling() {
+        assert_eq!(comparable_prefix(r"\\?\C:"), "c:");
+        assert_eq!(comparable_prefix("C:"), "c:");
+        assert_eq!(comparable_prefix(r"\\?\UNC\Srv\Share"), r"\\srv\share");
+        assert_eq!(comparable_prefix(r"\\?\unc\srv\share"), r"\\srv\share");
+        assert_eq!(comparable_prefix(r"\\srv\share"), r"\\srv\share");
+        // Prefixes without a plain spelling are compared as they are.
+        assert_eq!(comparable_prefix(r"\\?\Volume{1234}"), r"\\?\volume{1234}");
+        assert_eq!(comparable_prefix(r"\\.\COM1"), r"\\.\com1");
+    }
+
+    /// RU6a, on Windows itself: a deep verbatim path is inside its plain
+    /// folder and the other way round; another drive is not.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ru6a_a_deep_verbatim_path_is_inside_its_plain_folder() {
+        use std::path::Path;
+        let deep = format!(r"\\?\C:\Users\me\Downloads\{}\f.txt", "d".repeat(300));
+        assert!(path_starts_with(
+            Path::new(&deep),
+            Path::new(r"C:\Users\me\Downloads")
+        ));
+        assert!(path_starts_with(
+            Path::new(r"c:\users\me\.ssh\id"),
+            Path::new(r"\\?\C:\Users\me\.ssh")
+        ));
+        assert!(path_starts_with(
+            Path::new(r"\\?\UNC\srv\share\x\y"),
+            Path::new(r"\\srv\share\x")
+        ));
+        assert!(!path_starts_with(
+            Path::new(r"\\?\D:\Users\me\Downloads\x"),
+            Path::new(r"C:\Users\me\Downloads")
+        ));
+    }
+
     /// An absolute path outside the app data / system dirs is accepted. The
     /// fixture is anchored at the current directory rather than temp_dir:
     /// on some machines %TEMP% itself lives under the Windows directory,
@@ -1666,6 +1707,41 @@ mod tests {
             "the first key's file is untouched"
         );
         assert!(!db.get_key("k2").unwrap().unwrap().deployed);
+    }
+
+    /// RU6a: the preview carries the plan's warnings and the `Host` lines of
+    /// the user's own ssh config that name a host the deploy writes.
+    #[test]
+    fn ru6a_the_deploy_preview_reports_warnings_and_legacy_host_lines() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("legacy");
+        std::fs::create_dir_all(&target.ssh_dir).unwrap();
+        std::fs::write(
+            target.ssh_dir.join("config"),
+            "Host prod\n  IdentityFile ~/.ssh/sshspan_web\n",
+        )
+        .unwrap();
+        let ids = vec!["k1".to_string()];
+        let preview = key_deploy_preview_in(&db, &target, &ids, &host_fields());
+        let _ = std::fs::remove_dir_all(&root);
+
+        let preview = preview.unwrap();
+        let lines = preview["legacyHostLines"].as_array().cloned();
+        assert_eq!(lines.as_ref().map(Vec::len), Some(1), "{preview}");
+        let line = &lines.unwrap()[0];
+        assert_eq!(
+            (line["line"].clone(), line["key"].clone()),
+            (1.into(), "web".into())
+        );
+        assert_eq!(line["writtenBySshspan"], true, "{preview}");
+        let warnings = preview["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|w| w.contains("line 1"))),
+            "{preview}"
+        );
     }
 
     #[test]
@@ -3696,13 +3772,19 @@ pub fn system_write_text_file(
 /// On Windows the comparison is CASE-INSENSITIVE (NTFS/ReFS preserve case
 /// but ignore it, so `c:\users\...` and `C:\Users\...` are the same
 /// directory - a case-sensitive `starts_with` would let a hostile renderer
-/// bypass the app-data guard by merely changing case). On Unix it is
+/// bypass the app-data guard by merely changing case), and a verbatim prefix
+/// equals its plain form (see [`comparable_prefix`]). On Unix it is
 /// `Path::starts_with` verbatim.
 #[cfg(target_os = "windows")]
 pub(crate) fn path_starts_with(p: &std::path::Path, base: &std::path::Path) -> bool {
     let lower_components = |path: &std::path::Path| -> Vec<String> {
         path.components()
-            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .map(|c| match c {
+                std::path::Component::Prefix(prefix) => {
+                    comparable_prefix(&prefix.as_os_str().to_string_lossy())
+                }
+                other => other.as_os_str().to_string_lossy().to_lowercase(),
+            })
             .collect()
     };
     let (pc, bc) = (lower_components(p), lower_components(base));
@@ -3712,6 +3794,30 @@ pub(crate) fn path_starts_with(p: &std::path::Path, base: &std::path::Path) -> b
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn path_starts_with(p: &std::path::Path, base: &std::path::Path) -> bool {
     p.starts_with(base)
+}
+
+/// A Windows path prefix as [`path_starts_with`] compares it: lower case,
+/// and the verbatim forms `\\?\C:` and `\\?\UNC\srv\share` as the plain `C:`
+/// and `\\srv\share` they name. dunce keeps the verbatim form for a path
+/// longer than 260 characters, so comparing prefixes as written judged such
+/// a path to be outside the folder it is in (and a deep path in `~/.ssh` to
+/// be outside `~/.ssh`). Other prefixes (`\\?\Volume{...}`, `\\.\COM1`) have
+/// no plain form and are compared as written. Pure, so it is tested on
+/// every platform.
+#[cfg(any(target_os = "windows", test))]
+fn comparable_prefix(prefix: &str) -> String {
+    let lower = prefix.to_lowercase();
+    let Some(rest) = lower.strip_prefix(r"\\?\") else {
+        return lower;
+    };
+    if let Some(unc) = rest.strip_prefix(r"unc\") {
+        return format!(r"\\{unc}");
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return rest.to_string();
+    }
+    lower
 }
 
 /// Reject paths that are not absolute or that would write into the app data
@@ -3760,6 +3866,17 @@ pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
     // prefix-match "C:\Program Files".
     let normalized = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
 
+    system_dirs()
+        .iter()
+        .map(|d| dunce::canonicalize(d).unwrap_or_else(|_| d.clone()))
+        .any(|d| path_starts_with(&normalized, &d))
+}
+
+/// The system folders [`is_system_path`] protects, as configured (not
+/// resolved). The SFTP rules resolve them once per batch instead of once per
+/// path (`commands::sftp::SensitiveLocations`).
+#[cfg(target_os = "windows")]
+pub(crate) fn system_dirs() -> Vec<std::path::PathBuf> {
     let mut protected: Vec<std::path::PathBuf> = vec![
         std::path::PathBuf::from("C:\\Windows"),
         std::path::PathBuf::from("C:\\Program Files"),
@@ -3778,9 +3895,6 @@ pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
         }
     }
     protected
-        .iter()
-        .map(|d| dunce::canonicalize(d).unwrap_or_else(|_| d.clone()))
-        .any(|d| path_starts_with(&normalized, &d))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -3790,7 +3904,13 @@ pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
     // exist (yet) is checked in its literal form instead of skipping the
     // check entirely.
     let normalized = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let system_dirs = [
+    system_dirs().iter().any(|d| normalized.starts_with(d))
+}
+
+/// See the Windows `system_dirs`.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn system_dirs() -> Vec<std::path::PathBuf> {
+    [
         "/bin",
         "/sbin",
         "/usr/bin",
@@ -3800,11 +3920,10 @@ pub(crate) fn is_system_path(p: &std::path::Path) -> bool {
         "/lib64",
         "/usr/lib",
         "/usr/lib64",
-    ];
-    system_dirs
-        .iter()
-        .map(std::path::Path::new)
-        .any(|d| normalized.starts_with(d))
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect()
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -4418,6 +4537,10 @@ fn key_deploy_preview_in(
         "includeLine": plan.include_line(),
         "keys": plan.keys,
         "configText": plan.config_text(),
+        // Sentences that say what to do, and the `Host` lines of the user's
+        // own ssh config that name a host this deploy writes (never edited).
+        "warnings": plan.preview_warnings(),
+        "legacyHostLines": plan.legacy_host_lines(),
     }))
 }
 

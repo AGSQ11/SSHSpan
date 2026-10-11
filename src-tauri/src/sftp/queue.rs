@@ -205,6 +205,12 @@ async fn ensure_remote_dir(sftp: &russh_sftp::client::SftpSession, remote_path: 
     for cur in remote_parent_chain(remote_path) {
         match sftp.metadata(&cur).await {
             Ok(md) if md.is_dir() => continue,
+            // No file-type bits: this server does not say what the entry is,
+            // so it is walked through - every existing folder of such a
+            // server used to look like "not a directory" and stop the walk at
+            // the first level. If it is not a folder, the next mkdir or the
+            // final open reports that.
+            Ok(md) if md.permissions.is_none_or(|mode| mode & 0o170000 == 0) => continue,
             Ok(_) => {
                 log::warn!("[sshspan-sftp] ensure_remote_dir: {cur} exists but is not a directory");
                 return;
@@ -252,23 +258,24 @@ async fn local_part_offset(lpart: &str, total: u64) -> Result<u64, String> {
 }
 
 /// Resume offset for a REMOTE `.part` (upload direction, incl. the
-/// server-copy target leg). A missing `.part` (or an unreadable one - the
-/// create-truncate below overwrites it anyway) yields Ok(0).
+/// server-copy target leg). A missing `.part` yields Ok(0). Only a REGULAR
+/// file is continued: it is examined with LSTAT, never STAT - STAT follows a
+/// link planted at `<remote>.part`, and the upload was then appended to the
+/// link's target (F1).
 async fn remote_part_offset(
     sftp: &russh_sftp::client::SftpSession,
     rpart: &str,
     total: u64,
 ) -> Result<u64, String> {
-    let md = match sftp.metadata(rpart).await {
-        Ok(md) => md,
-        Err(_) => return Ok(0),
-    };
-    if md.is_dir() {
-        return Err(format!("{rpart} exists but is a directory - starting over"));
+    if sftp.symlink_metadata(rpart).await.is_err() {
+        return Ok(0);
     }
-    match md.size {
-        Some(len) => part_alignment(len, total),
-        None => Err(format!("size of {rpart} unknown - starting over")),
+    match crate::commands::sftp::regular_file_attrs(sftp, rpart, None).await {
+        Ok(md) => match md.size {
+            Some(len) => part_alignment(len, total),
+            None => Err(format!("size of {rpart} unknown - starting over")),
+        },
+        Err(why) => Err(format!("{why} - starting over")),
     }
 }
 
@@ -282,17 +289,35 @@ async fn remote_part_offset(
 /// forget the retry - or, as two of them did, return early from it and skip
 /// the verification and timestamp steps that follow.
 ///
+/// `from` must be a REGULAR file, checked with LSTAT before anything is
+/// renamed or removed: a temporary file swapped for a symbolic link (in a
+/// folder others can write to) used to pass - STAT follows the link - and the
+/// retry then deleted the real `to` and put the link in its place (F1). A
+/// residual window remains between that check and the RENAME (SFTP v3 has no
+/// check-and-rename); the names are unpredictable or created exclusively, so
+/// something has to be swapped in during it.
+///
 /// The error is the first rename's failure, rendered for the user.
+///
+/// `written`: the bytes just written to `from`, when known - on a server
+/// that leaves the type bits out it is how `from` is recognised as the file
+/// that was written (see [`crate::commands::sftp::regular_file_attrs`]).
 pub(crate) async fn rename_over(
     sftp: &russh_sftp::client::SftpSession,
     from: &str,
     to: &str,
+    written: Option<u64>,
 ) -> Result<(), String> {
+    crate::commands::sftp::regular_file_attrs(sftp, from, written)
+        .await
+        .map_err(|why| format!("{why}, so {to} was left as it was"))?;
     let first = match sftp.rename(from, to).await {
         Ok(()) => return Ok(()),
         Err(e) => crate::commands::sftp::sftp_error_detail(e),
     };
-    if sftp.metadata(from).await.is_ok()
+    if crate::commands::sftp::regular_file_attrs(sftp, from, written)
+        .await
+        .is_ok()
         && sftp.remove_file(to).await.is_ok()
         && sftp.rename(from, to).await.is_ok()
     {
@@ -304,8 +329,14 @@ pub(crate) async fn rename_over(
 /// Everything an upload needs settled before its first byte, returning the
 /// `.part` path to write and the offset to continue from (0 = start fresh):
 /// the destination directory must exist, and the resume offset is decided
-/// against whatever `.part` an earlier attempt left. Starting from 0 removes a
-/// stale `.part`.
+/// against whatever `.part` an earlier attempt left - only a regular file is
+/// continued (see [`remote_part_offset`]). Starting from 0 removes a stale
+/// `.part` when it is a regular file, a symbolic link (REMOVE never follows a
+/// link, so a planted link goes and its target is never touched) or of a type
+/// the server does not tell (REMOVE cannot remove a folder either: such a
+/// `.part` used to block every later upload); a folder or a special file is
+/// left, and the exclusive create in [`open_upload_part`] then says that
+/// something is in the way.
 ///
 /// The expansion of a folder upload enqueues one job per FILE and never
 /// touches the server, and an SFTP server does not create missing parents on
@@ -330,11 +361,119 @@ async fn prepare_upload(
         _ => 0,
     };
     if offset == 0 {
-        if let Err(e) = sftp.remove_file(&rpart).await {
-            log::debug!("[sshspan-sftp] upload pre-clean of {rpart}: {e}");
+        use crate::commands::sftp::{lstat_kind, EntryKind};
+        if let Some(EntryKind::File | EntryKind::Symlink | EntryKind::Unknown) =
+            lstat_kind(sftp, &rpart).await
+        {
+            if let Err(e) = sftp.remove_file(&rpart).await {
+                log::debug!("[sshspan-sftp] upload pre-clean of {rpart}: {e}");
+            }
         }
     }
     (rpart, offset)
+}
+
+/// The error for a `.part` that cannot be safely created or continued.
+fn part_in_the_way(rpart: &str) -> String {
+    format!(
+        "A temporary file is in the way: {rpart} exists on the server and is not a partial \
+         upload SSHSpan can continue or replace. Move or delete it, then retry."
+    )
+}
+
+/// Bytes before the resume point that are read back from a `.part` and
+/// compared with the source before it is continued.
+const RESUME_CHECK_BYTES: u64 = 64 * 1024;
+
+/// Open the `.part` an upload writes, and leave the source `local` at the
+/// offset the upload goes on from - returned with the file: `offset`, or 0
+/// when that `.part` could not be continued and was replaced.
+///
+/// A fresh one (`offset` 0) is created EXCLUSIVELY (CREATE|EXCL): an existing
+/// name - a link or file someone planted after the pre-clean, or anything the
+/// pre-clean would not remove - fails the open instead of being truncated or
+/// written through. A continued one is opened READ|WRITE|APPEND, and before
+/// anything is written its FSTAT size (of the file actually opened) must be
+/// `offset` AND the last `min(offset, 64 KiB)` bytes before it, read back
+/// through that very handle, must be the source's bytes at the same offsets.
+/// The size alone used to decide, and whoever planted the `.part` controls
+/// it: a `.part` the size of a victim file, swapped for a link to the victim
+/// between the LSTAT and the OPEN, had the upload appended to the victim
+/// (and a `.part` of other content was continued into a corrupt file). One
+/// that fails either check is not this upload's: it is removed (REMOVE never
+/// follows a link) and the upload starts over, exclusively.
+async fn open_upload_part<L>(
+    sftp: &russh_sftp::client::SftpSession,
+    rpart: &str,
+    offset: u64,
+    local: &mut L,
+) -> Result<(russh_sftp::client::fs::File, u64), String>
+where
+    L: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    use crate::commands::sftp::sftp_error_detail;
+    if offset > 0 {
+        let mut file = sftp
+            .open_with_flags(
+                rpart,
+                OpenFlags::READ | OpenFlags::WRITE | OpenFlags::APPEND,
+            )
+            .await
+            .map_err(sftp_error_detail)?;
+        let size_ok = matches!(file.metadata().await, Ok(md) if md.size == Some(offset));
+        if size_ok && continues_source(&mut file, local, offset).await {
+            return Ok((file, offset));
+        }
+        let _ = file.close().await;
+        log::warn!("[sshspan-sftp] {rpart} is not this file's partial upload - starting over");
+        if let Err(e) = sftp.remove_file(rpart).await {
+            log::debug!("[sshspan-sftp] could not remove {rpart}: {e}");
+        }
+    }
+    local
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|e| format!("local seek failed: {e}"))?;
+    match sftp
+        .open_with_flags(
+            rpart,
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+        )
+        .await
+    {
+        Ok(file) => Ok((file, 0)),
+        Err(_) if sftp.symlink_metadata(rpart).await.is_ok() => Err(part_in_the_way(rpart)),
+        Err(e) => Err(sftp_error_detail(e)),
+    }
+}
+
+/// Whether the `min(offset, RESUME_CHECK_BYTES)` bytes before `offset` are
+/// the same in the opened remote `.part` and in the local source. Leaves
+/// both at `offset` when they are.
+async fn continues_source<L>(
+    remote: &mut russh_sftp::client::fs::File,
+    local: &mut L,
+    offset: u64,
+) -> bool
+where
+    L: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let len = offset.min(RESUME_CHECK_BYTES);
+    let start = offset - len;
+    let mut theirs = vec![0u8; len as usize];
+    let mut ours = vec![0u8; len as usize];
+    let remote_read = async {
+        remote.seek(SeekFrom::Start(start)).await?;
+        remote.read_exact(&mut theirs).await.map(drop)
+    }
+    .await;
+    let local_read = async {
+        local.seek(SeekFrom::Start(start)).await?;
+        local.read_exact(&mut ours).await.map(drop)
+    }
+    .await;
+    remote_read.is_ok() && local_read.is_ok() && theirs == ours
 }
 
 /// Position an open remote file at `offset` for a resumed download WITHOUT
@@ -819,51 +958,16 @@ pub fn enqueue<R: tauri::Runtime>(app: &tauri::AppHandle<R>, items: Vec<QueuedIt
     // with the connection, the server ids are what a reconnected session is
     // matched on (A7-17). Looked up BEFORE the queue lock is taken, so the
     // session-registry lock is never held inside it.
-    let server_ids: Vec<(Option<String>, Option<String>)> = {
+    let server_ids = {
         let registry = app.state::<Arc<SessionRegistry>>();
-        items
-            .iter()
-            .map(|item| {
-                (
-                    registry.server_id_of(&item.session_id),
-                    item.target
-                        .as_ref()
-                        .and_then(|t| registry.server_id_of(&t.session_id)),
-                )
-            })
-            .collect()
+        endpoint_server_ids(&items, |session| registry.server_id_of(session))
     };
     let mut new_rows = Vec::new();
     {
         let mut guard = q.jobs.lock().unwrap();
         for (item, (server_id, target_server_id)) in items.into_iter().zip(server_ids) {
             let id = q.next_id.fetch_add(1, Ordering::SeqCst);
-            let job = TransferJob {
-                id,
-                kind: item.kind,
-                session_id: item.session_id,
-                server_name: item.server_name,
-                server_id,
-                target_server_id,
-                local_path: item.local_path,
-                remote_path: item.remote_path,
-                size: item.size,
-                bytes_done: 0,
-                state: JobState::Queued,
-                error: None,
-                cancel: None,
-                pause: None,
-                started_at: None,
-                target_session_id: item.target.as_ref().map(|t| t.session_id.clone()),
-                target_server_name: item.target.as_ref().map(|t| t.server_name.clone()),
-                target_remote_path: item.target.as_ref().map(|t| t.remote_path.clone()),
-                resume: item.resume,
-                preserve_ts: item.preserve_ts,
-                attempts: 0,
-                retry_at: None,
-                verify: Some(verify),
-                last_persist_at: None,
-            };
+            let job = new_job(id, item, server_id, target_server_id, verify);
             new_rows.push(job.to_row());
             guard.push(job);
         }
@@ -875,6 +979,63 @@ pub fn enqueue<R: tauri::Runtime>(app: &tauri::AppHandle<R>, items: Vec<QueuedIt
     }
     emit_queue(app);
     dispatch(app);
+}
+
+/// The saved-server id of each item's session and, for a server copy, of its
+/// target session - what [`enqueue`] stamps on the new jobs. `server_id_of` is
+/// the session registry's lookup (a parameter so the mapping is testable).
+fn endpoint_server_ids(
+    items: &[QueuedItem],
+    server_id_of: impl Fn(&str) -> Option<String>,
+) -> Vec<(Option<String>, Option<String>)> {
+    items
+        .iter()
+        .map(|item| {
+            (
+                server_id_of(&item.session_id),
+                item.target
+                    .as_ref()
+                    .and_then(|t| server_id_of(&t.session_id)),
+            )
+        })
+        .collect()
+}
+
+/// A freshly queued job for `item`, carrying the saved-server ids its
+/// endpoints were looked up as.
+fn new_job(
+    id: u64,
+    item: QueuedItem,
+    server_id: Option<String>,
+    target_server_id: Option<String>,
+    verify: bool,
+) -> TransferJob {
+    TransferJob {
+        id,
+        kind: item.kind,
+        session_id: item.session_id,
+        server_name: item.server_name,
+        server_id,
+        target_server_id,
+        local_path: item.local_path,
+        remote_path: item.remote_path,
+        size: item.size,
+        bytes_done: 0,
+        state: JobState::Queued,
+        error: None,
+        cancel: None,
+        pause: None,
+        started_at: None,
+        target_session_id: item.target.as_ref().map(|t| t.session_id.clone()),
+        target_server_name: item.target.as_ref().map(|t| t.server_name.clone()),
+        target_remote_path: item.target.as_ref().map(|t| t.remote_path.clone()),
+        resume: item.resume,
+        preserve_ts: item.preserve_ts,
+        attempts: 0,
+        retry_at: None,
+        verify: Some(verify),
+        last_persist_at: None,
+    }
 }
 
 /// Whether `dispatch` may start this job right now: it must be Queued, and
@@ -1566,50 +1727,20 @@ async fn run_server_copy<RT: tauri::Runtime>(
         .map_err(|e| format!("local open failed: {e}"))?;
     // Stage into `<target>.part`; only a fully uploaded file is renamed to
     // the final name, so an interrupted copy leaves a resumable partial
-    // rather than a truncated "complete" file on the target.
-    let tpart = part_path(&target.remote_path);
-    // Resume only the TARGET leg (the local staging file above is always
-    // rebuilt from scratch by leg 1 - it is removed on every exit path).
-    let offset = match resume {
-        Some(ResumeMode::Resume) => {
-            let aligned = remote_part_offset(&target_sftp, &tpart, size).await;
-            match aligned {
-                Ok(off) => off,
-                Err(note) => {
-                    log::info!("[sshspan-sftp] sendto leg2: {note}");
-                    0
-                }
-            }
-        }
-        _ => 0,
-    };
-    if offset == 0 {
-        if let Err(e) = target_sftp.remove_file(&tpart).await {
-            log::debug!("[sshspan-sftp] sendto leg2 pre-clean of {tpart}: {e}");
-        }
-    } else {
-        lf.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| format!("local seek to resume offset failed: {e}"))?;
-    }
-    // Ensure the destination's parent directory exists on the target. A folder
-    // Send-to expands into nested per-file jobs, and the target SFTP server does
-    // not create missing parents on open - without this the copy of a nested
-    // file fails at open with "No such file".
-    ensure_remote_dir(&target_sftp, &target.remote_path).await;
-    let mut rf = target_sftp
-        .open_with_flags(
-            &tpart,
-            if offset > 0 {
-                OpenFlags::WRITE | OpenFlags::APPEND
-            } else {
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
-            },
-        )
+    // rather than a truncated "complete" file on the target. Resume only the
+    // TARGET leg (the local staging file above is always rebuilt from scratch
+    // by leg 1 - it is removed on every exit path). The same preparation as
+    // an upload: the destination's parent folders are made (a folder Send-to
+    // expands into nested per-file jobs, and the server does not create
+    // missing parents on open), and the `.part` is checked before it is
+    // continued or replaced.
+    let (tpart, offset) = prepare_upload(&target_sftp, &target.remote_path, size, resume).await;
+    // Leaves `lf` at the offset the upload goes on from (0 when the `.part`
+    // was not this copy's and was replaced).
+    let (mut rf, offset) = open_upload_part(&target_sftp, &tpart, offset, &mut lf)
         .await
-        .map_err(|e| {
-            let d = crate::commands::sftp::sftp_error_detail(e);
-            log::error!("[sshspan-sftp] sendto leg2 open {}: {d}", tpart);
+        .map_err(|d| {
+            log::error!("[sshspan-sftp] sendto leg2 open {tpart}: {d}");
             format!("target open: {d}")
         })?;
     // Progress = second half of the overall copy, reported absolutely
@@ -1647,7 +1778,7 @@ async fn run_server_copy<RT: tauri::Runtime>(
     // before trusting it for the rename, so we never rename an empty file.
     if let Err(e) = rf.close().await {
         let expected = size;
-        match target_sftp.metadata(&tpart).await {
+        match target_sftp.symlink_metadata(&tpart).await {
             Ok(md) if expected == u64::MAX || md.size == Some(expected) => {
                 log::warn!(
                     "[sshspan-sftp] sendto leg2 close of {tpart} failed ({e}) but size matches; proceeding"
@@ -1670,7 +1801,8 @@ async fn run_server_copy<RT: tauri::Runtime>(
     // uploaded at this point, so removing the final name first is a safe retry
     // (`rename_over`). Not an early return: verification and timestamps below
     // must run on that path too.
-    if let Err(d) = rename_over(&target_sftp, &tpart, &target.remote_path).await {
+    let written = (size != u64::MAX).then_some(size);
+    if let Err(d) = rename_over(&target_sftp, &tpart, &target.remote_path, written).await {
         log::error!(
             "[sshspan-sftp] sendto leg2 rename {tpart} -> {}: {d}",
             target.remote_path
@@ -1793,27 +1925,11 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         // a truncated file that looks complete).
                         let (rpart, offset) =
                             prepare_upload(&sftp, &remote, lsize, resume).await;
-                        if offset > 0 {
-                            lf.seek(SeekFrom::Start(offset))
-                                .await
-                                .map_err(|e| format!("local seek to resume offset failed: {e}"))?;
-                        }
-                        let mut rf = sftp
-                            .open_with_flags(
-                                &rpart,
-                                if offset > 0 {
-                                    OpenFlags::WRITE | OpenFlags::APPEND
-                                } else {
-                                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
-                                },
-                            )
+                        // Leaves `lf` at the offset the upload goes on from
+                        // (0 when the `.part` was not this upload's).
+                        let (mut rf, offset) = open_upload_part(&sftp, &rpart, offset, &mut lf)
                             .await
-                            .map_err(|e| {
-                                format!(
-                                    "remote open failed: {}",
-                                    crate::commands::sftp::sftp_error_detail(e)
-                                )
-                            })?;
+                            .map_err(|d| format!("remote open failed: {d}"))?;
                         // Report progress absolutely: offset = already-uploaded
                         // prefix that this attempt skips.
                         copy_with_progress(
@@ -1831,7 +1947,7 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         // a FAILURE on CLOSE after a fully-written .part does not
                         // mean the data is missing. Verify size before the rename.
                         if let Err(e) = rf.close().await {
-                            match sftp.metadata(&rpart).await {
+                            match sftp.symlink_metadata(&rpart).await {
                                 Ok(md) if md.size == Some(lsize) => {
                                     log::warn!(
                                         "[sshspan-sftp] upload close of {rpart} failed ({e}) but size matches; proceeding"
@@ -1853,7 +1969,7 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         // final name first is a safe retry. Falling through
                         // (not returning) keeps the verification and timestamp
                         // steps below running on that path too.
-                        rename_over(&sftp, &rpart, &remote)
+                        rename_over(&sftp, &rpart, &remote, Some(lsize))
                             .await
                             .map_err(|d| format!("final rename failed: {d}"))?;
                         // Opt-in verification: hash the local source and the
@@ -1898,6 +2014,29 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         }
                     }
                     JobKind::Download => {
+                        // The write deny-list on the final path, again, before
+                        // anything is opened: the job may run long after it
+                        // was queued (resumed after a reconnect, restored
+                        // after a restart), and nothing may be written into
+                        // `~/.ssh`, a Startup folder, a shell rc file or
+                        // SSHSpan's own folders (A6-02). Filesystem work, so
+                        // on a blocking thread; a check that cannot run
+                        // refuses.
+                        let refused = {
+                            let local = local.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::commands::sftp::local_write_refusal(std::path::Path::new(
+                                    &local,
+                                ))
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                Some(format!("the local path could not be checked ({e})"))
+                            })
+                        };
+                        if let Some(why) = refused {
+                            return Err(format!("{local}: {why}"));
+                        }
                         // Stat first: the size clamp and resume-alignment
                         // check both rely on it, and the mtime is what
                         // "preserve timestamps" stamps onto the finished file.
@@ -2762,7 +2901,7 @@ mod tests {
         fx.write("/d/final.bin", b"old");
         fx.write("/d/final.bin.part", b"new content");
 
-        rename_over(&sftp, "/d/final.bin.part", "/d/final.bin")
+        rename_over(&sftp, "/d/final.bin.part", "/d/final.bin", None)
             .await
             .expect("rename over an existing file");
 
@@ -2776,7 +2915,7 @@ mod tests {
         let (sftp, fx) = crate::sftp::testkit::serve().await;
         fx.write("/d/final.bin.part", b"data");
 
-        rename_over(&sftp, "/d/final.bin.part", "/d/final.bin")
+        rename_over(&sftp, "/d/final.bin.part", "/d/final.bin", None)
             .await
             .unwrap();
 
@@ -2793,7 +2932,7 @@ mod tests {
         let (sftp, fx) = crate::sftp::testkit::serve().await;
         fx.write("/d/final.bin", b"precious");
 
-        let err = rename_over(&sftp, "/d/missing.part", "/d/final.bin")
+        let err = rename_over(&sftp, "/d/missing.part", "/d/final.bin", None)
             .await
             .expect_err("nothing to rename");
 
@@ -2882,6 +3021,291 @@ mod tests {
         fx.write("/srv/blocker", b"x");
         ensure_remote_dir(&sftp, "/srv/blocker/deeper/f.txt").await;
         assert!(!fx.exists("/srv/blocker/deeper"));
+    }
+
+    // ── RU6a fix 1, item 1 (F1): a `.part` someone else planted ──────────────
+
+    /// Upload `bytes` to `remote` the way the upload leg does (prepare, open,
+    /// write, close, rename) and return the `.part` offset it went on from.
+    #[cfg(unix)]
+    async fn upload_via_part(
+        sftp: &russh_sftp::client::SftpSession,
+        remote: &str,
+        bytes: &[u8],
+        resume: ResumeMode,
+    ) -> Result<u64, String> {
+        use tokio::io::AsyncWriteExt;
+        let (rpart, offset) = prepare_upload(sftp, remote, bytes.len() as u64, Some(resume)).await;
+        let mut local = std::io::Cursor::new(bytes.to_vec());
+        let (mut rf, offset) = open_upload_part(sftp, &rpart, offset, &mut local).await?;
+        assert_eq!(local.position(), offset, "the source is left at the offset");
+        rf.write_all(&bytes[offset as usize..])
+            .await
+            .map_err(|e| e.to_string())?;
+        rf.shutdown().await.map_err(|e| e.to_string())?;
+        rename_over(sftp, &rpart, remote, Some(bytes.len() as u64)).await?;
+        Ok(offset)
+    }
+
+    /// A link planted at `<remote>.part`: Resume used to STAT it - following
+    /// the link - and append the upload to the link's TARGET, and the rename
+    /// then put the link in place of the upload. The link is never written
+    /// through, in either mode; the upload starts over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_a_planted_part_link_is_never_written_through() {
+        for resume in [ResumeMode::Resume, ResumeMode::Overwrite] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/victim", b"victim data");
+            fx.mkdir("/up");
+            fx.symlink("../victim", "/up/f.bin.part");
+            let payload = vec![b'u'; 100];
+
+            let offset = upload_via_part(&sftp, "/up/f.bin", &payload, resume)
+                .await
+                .unwrap_or_else(|e| panic!("{resume:?}: {e}"));
+
+            assert_eq!(offset, 0, "{resume:?}: a link is never resumed");
+            assert_eq!(fx.read("/victim"), b"victim data", "{resume:?}");
+            assert_eq!(fx.read("/up/f.bin"), payload, "{resume:?}");
+            assert!(
+                !std::fs::symlink_metadata(fx.path("/up/f.bin"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{resume:?}: the upload must be a regular file"
+            );
+        }
+    }
+
+    /// On a server that leaves the type bits out, a `.part` that is a link is
+    /// told apart by READLINK and not resumed; a real one still is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_an_untyped_part_is_resumed_only_when_it_is_not_a_link() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/real.bin.part", b"0123");
+        fx.write("/victim", b"0123");
+        fx.symlink("../victim", "/d/link.bin.part");
+        fx.knobs.lock().unwrap().untyped_modes = true;
+
+        let (_, real) = prepare_upload(&sftp, "/d/real.bin", 10, Some(ResumeMode::Resume)).await;
+        let (_, link) = prepare_upload(&sftp, "/d/link.bin", 10, Some(ResumeMode::Resume)).await;
+
+        assert_eq!(real, 4, "a regular .part is continued");
+        assert_eq!(link, 0, "a link is not");
+        assert_eq!(fx.read("/victim"), b"0123");
+    }
+
+    /// `rename_over` checked `from` with STAT - which follows a link - before it
+    /// deleted the target: a `.part` swapped for a link replaced the user's file
+    /// with that link. `from` must be the regular file that was written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_rename_over_never_puts_a_link_in_place_of_the_target() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/final.bin", b"precious");
+        fx.write("/elsewhere", b"attacker");
+        fx.symlink("../elsewhere", "/d/final.bin.part");
+
+        let err = rename_over(&sftp, "/d/final.bin.part", "/d/final.bin", None)
+            .await
+            .expect_err("a link is not renamed into place");
+
+        assert!(err.contains("not a regular file"), "{err}");
+        assert_eq!(fx.read("/d/final.bin"), b"precious");
+        assert!(!std::fs::symlink_metadata(fx.path("/d/final.bin"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            !fx.ops().iter().any(|op| op == "remove /d/final.bin"),
+            "{:?}",
+            fx.ops()
+        );
+    }
+
+    // ── RU6a fix round 2 ─────────────────────────────────────────────────────
+
+    /// Item 3: on a server that leaves the type bits out and answers "list
+    /// this folder" on a file with "permission denied", the `.part` could not
+    /// be proven to be a file: every upload failed (it worked before round
+    /// 1), and the unknown `.part` then blocked the next upload - the
+    /// pre-clean left it and the exclusive create failed. A `.part` that is
+    /// not a link and holds exactly the bytes just written is accepted, and a
+    /// stale one of unknown type is removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_uploads_work_when_the_folder_probe_on_a_file_is_refused() {
+        use russh_sftp::protocol::StatusCode;
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        {
+            let mut knobs = fx.knobs.lock().unwrap();
+            knobs.untyped_modes = true;
+            knobs.opendir_file_status = Some(StatusCode::PermissionDenied);
+        }
+        fx.write("/d/f.bin", b"old");
+
+        let first = upload_via_part(&sftp, "/d/f.bin", b"new content", ResumeMode::Overwrite).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(fx.read("/d/f.bin"), b"new content");
+
+        fx.write("/d/f.bin.part", b"stale");
+        let second = upload_via_part(&sftp, "/d/f.bin", b"newer", ResumeMode::Overwrite).await;
+        assert!(second.is_ok(), "{second:?}");
+        assert_eq!(fx.read("/d/f.bin"), b"newer");
+        assert!(!fx.exists("/d/f.bin.part"));
+    }
+
+    /// Item 5 (sec N1): a resumed `.part` was protected only by its size,
+    /// which whoever planted it controls - a regular `.part` the size of a
+    /// victim file, swapped for a link to the victim between our LSTAT and
+    /// our OPEN, had the upload appended to the victim. The bytes before the
+    /// resume point are read back through the opened handle and compared
+    /// with the source first; on a mismatch the `.part` goes and the upload
+    /// starts over, exclusively.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_a_resumed_part_swapped_for_a_link_is_not_appended_to() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/victim", b"VICTIMDATA");
+        fx.write("/d/f.bin.part", b"0123456789");
+        fx.knobs.lock().unwrap().swap_for_link_on_open =
+            Some(("/d/f.bin.part".into(), "victim".into()));
+
+        let offset = upload_via_part(
+            &sftp,
+            "/d/f.bin",
+            b"0123456789abcdefghij",
+            ResumeMode::Resume,
+        )
+        .await;
+
+        assert_eq!(fx.read("/d/victim"), b"VICTIMDATA", "{offset:?}");
+        assert_eq!(offset, Ok(0));
+        assert_eq!(fx.read("/d/f.bin"), b"0123456789abcdefghij");
+    }
+
+    /// Item 5: a `.part` whose bytes are not the start of this source (the
+    /// local file changed since, or the `.part` is someone else's) was
+    /// continued anyway - a corrupt file that passes the size check. It is
+    /// started over now; a genuine partial upload is still continued.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_a_part_that_is_not_this_upload_is_started_over() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/f.bin.part", b"XXXXXXXXXX");
+        let offset = upload_via_part(
+            &sftp,
+            "/d/f.bin",
+            b"0123456789abcdefghij",
+            ResumeMode::Resume,
+        )
+        .await;
+        assert_eq!(offset, Ok(0));
+        assert_eq!(fx.read("/d/f.bin"), b"0123456789abcdefghij");
+
+        fx.write("/d/g.bin.part", b"0123456789");
+        let offset = upload_via_part(
+            &sftp,
+            "/d/g.bin",
+            b"0123456789abcdefghij",
+            ResumeMode::Resume,
+        )
+        .await;
+        assert_eq!(offset, Ok(10));
+        assert_eq!(fx.read("/d/g.bin"), b"0123456789abcdefghij");
+    }
+
+    /// RU6a item 2: on a server whose attributes carry no file type, every
+    /// existing folder looked like "exists but is not a directory", so the
+    /// walk gave up at the first level and the upload of a nested file failed
+    /// with "No such file". An entry of unknown type is walked through; the
+    /// open that follows reports a real obstacle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_ensure_remote_dir_walks_through_folders_of_an_untyped_server() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.mkdir("/srv/up");
+        fx.write("/srv/blocker", b"x");
+        fx.knobs.lock().unwrap().untyped_modes = true;
+
+        ensure_remote_dir(&sftp, "/srv/up/a/b/file.txt").await;
+
+        assert!(fx.path("/srv/up/a/b").is_dir(), "{:?}", fx.ops());
+        // A file in the way still stops it, without a panic.
+        ensure_remote_dir(&sftp, "/srv/blocker/deeper/f.txt").await;
+        assert!(!fx.exists("/srv/blocker/deeper"));
+    }
+
+    /// RU6a item 7 (Task 10's missing tests): `enqueue` stamps every job with
+    /// the saved server of its session - and a server copy with its target's
+    /// too - and the row it persists keeps them.
+    #[test]
+    fn ru6a_queued_jobs_carry_the_saved_server_of_each_endpoint() {
+        let download = QueuedItem::simple(
+            JobKind::Download,
+            "s1".into(),
+            "Alpha".into(),
+            "/local/a".into(),
+            "/remote/a".into(),
+            1,
+        );
+        let mut copy = QueuedItem::simple(
+            JobKind::ServerCopy,
+            "s1".into(),
+            "Alpha".into(),
+            String::new(),
+            "/remote/b".into(),
+            2,
+        );
+        copy.target = Some(ServerCopyTarget {
+            session_id: "s2".into(),
+            server_name: "Beta".into(),
+            remote_path: "/dest/b".into(),
+        });
+        let orphan = QueuedItem::simple(
+            JobKind::Upload,
+            "gone".into(),
+            "Gamma".into(),
+            "/local/c".into(),
+            "/remote/c".into(),
+            3,
+        );
+        let items = vec![download, copy, orphan];
+        let lookup = |session: &str| match session {
+            "s1" => Some("srv-a".to_string()),
+            "s2" => Some("srv-b".to_string()),
+            _ => None,
+        };
+
+        let ids = endpoint_server_ids(&items, lookup);
+        assert_eq!(
+            ids,
+            vec![
+                (Some("srv-a".to_string()), None),
+                (Some("srv-a".to_string()), Some("srv-b".to_string())),
+                (None, None),
+            ]
+        );
+        let jobs: Vec<TransferJob> = items
+            .into_iter()
+            .zip(ids)
+            .enumerate()
+            .map(|(i, (item, (server, target)))| new_job(i as u64, item, server, target, true))
+            .collect();
+        assert_eq!(jobs[1].server_id.as_deref(), Some("srv-a"));
+        assert_eq!(jobs[1].target_server_id.as_deref(), Some("srv-b"));
+        assert_eq!(jobs[1].target_session_id.as_deref(), Some("s2"));
+        assert!(jobs
+            .iter()
+            .all(|j| j.state == JobState::Queued && j.verify == Some(true)));
+        let row = jobs[1].to_row();
+        assert_eq!(
+            (row.server_id.as_deref(), row.target_server_id.as_deref()),
+            (Some("srv-a"), Some("srv-b"))
+        );
+        assert_eq!(jobs[2].to_row().server_id, None);
     }
 
     /// The levels `ensure_remote_dir` has to create before an upload can open

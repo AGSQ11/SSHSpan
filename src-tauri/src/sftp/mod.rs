@@ -11,7 +11,7 @@ pub mod queue;
 pub(crate) mod testkit;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use russh_sftp::client::SftpSession;
 
@@ -112,16 +112,12 @@ impl SftpRegistry {
     }
 }
 
-/// One "open with system editor" watch: when the local temp file is written,
-/// its contents are re-uploaded to the remote path (debounced).
+/// One "open with system editor" watch: the file watcher and the sync state
+/// it drives (see `commands::sftp::EditSync`).
 pub struct EditWatch {
     pub session_id: String,
-    pub remote_path: String,
-    pub local_path: String,
-    pub sftp: Arc<SftpSession>,
     pub watcher: Option<notify::RecommendedWatcher>,
-    /// Set when the watch should stop (file closed / session ended).
-    pub stopped: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) sync: Arc<crate::commands::sftp::EditSync>,
 }
 
 #[derive(Default)]
@@ -135,66 +131,247 @@ impl EditRegistry {
             watches: Mutex::new(HashMap::new()),
         }
     }
-    pub fn get(&self, key: &str) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    /// Register an edit. A watch it replaces (two opens of one file racing)
+    /// is ENDED - it used to be dropped silently: its copy lingered and its
+    /// saves stopped syncing without a word.
+    pub fn insert(&self, key: String, watch: EditWatch) {
+        let replaced = self.watches.lock().unwrap().insert(key, watch);
+        if let Some(old) = replaced {
+            end_watch(old);
+        }
+    }
+    /// Register an edit - unless `key` already has one that `usable`
+    /// accepts: that one is returned and `watch` is ended instead (its staged
+    /// copy deleted). Decided under the registry lock, so of two opens of one
+    /// file that raced through the download exactly one session survives,
+    /// and none is ended after its caller handed out its copy. An edit that
+    /// is not usable any more is replaced (and ended).
+    pub(crate) fn insert_unless_live(
+        &self,
+        key: String,
+        watch: EditWatch,
+        usable: impl Fn(&crate::commands::sftp::EditSync) -> bool,
+    ) -> Result<(), Arc<crate::commands::sftp::EditSync>> {
+        let mut watches = self.watches.lock().unwrap();
+        if let Some(live) = watches.get(&key).filter(|w| usable(&w.sync)) {
+            let live = live.sync.clone();
+            drop(watches);
+            end_watch(watch);
+            return Err(live);
+        }
+        let replaced = watches.insert(key, watch);
+        drop(watches);
+        if let Some(old) = replaced {
+            end_watch(old);
+        }
+        Ok(())
+    }
+    /// The live edit session of `key` (`{sessionId}:{remotePath}`).
+    pub(crate) fn live_for_key(&self, key: &str) -> Option<Arc<crate::commands::sftp::EditSync>> {
         self.watches
             .lock()
             .unwrap()
             .get(key)
-            .map(|w| w.stopped.clone())
+            .map(|w| w.sync.clone())
     }
-    pub fn insert(&self, key: String, watch: EditWatch) {
-        self.watches.lock().unwrap().insert(key, watch);
+    /// The live edit session with this id (the renderer's handle on it).
+    pub(crate) fn find(&self, edit_id: &str) -> Option<Arc<crate::commands::sftp::EditSync>> {
+        self.watches
+            .lock()
+            .unwrap()
+            .values()
+            .find(|w| w.sync.edit_id() == edit_id)
+            .map(|w| w.sync.clone())
     }
-    pub fn stop(&self, key: &str) -> Option<String> {
-        let mut guard = self.watches.lock().unwrap();
-        if let Some(mut w) = guard.remove(key) {
-            w.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = w.watcher.take(); // dropped = watch stopped (notify 7 has no close())
-            Some(w.local_path)
-        } else {
-            None
-        }
-    }
-    pub fn stop_all(&self) {
-        let mut guard = self.watches.lock().unwrap();
-        let stopped: Vec<String> = guard
-            .iter_mut()
-            .map(|(_, w)| {
-                w.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-                let _ = w.watcher.take(); // dropped = stopped
-                w.local_path.clone()
-            })
-            .collect();
-        guard.clear();
-        drop(guard);
-        // Clean the staged copies (best-effort) so edited remote file
-        // contents do not linger in the temp dir after the app locks the
-        // vault or shuts down.
-        for local in stopped {
-            let _ = std::fs::remove_file(&local);
-        }
-    }
-    pub fn stop_all_for_session(&self, session_id: &str) {
-        let mut guard = self.watches.lock().unwrap();
-        let keys: Vec<String> = guard
-            .iter()
-            .filter(|(_, w)| w.session_id == session_id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        let mut locals: Vec<String> = Vec::new();
-        for k in keys {
-            if let Some(mut w) = guard.remove(&k) {
-                w.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-                let _ = w.watcher.take(); // dropped = stopped
-                locals.push(w.local_path);
+    /// End the edit of `key`: the watcher stops and the staged copy is
+    /// discarded (see [`StagedCopy::discard`]). `false` when there was none.
+    pub fn stop(&self, key: &str) -> bool {
+        let removed = self.watches.lock().unwrap().remove(key);
+        match removed {
+            Some(watch) => {
+                end_watch(watch);
+                true
             }
-        }
-        drop(guard);
-        // Clean the session's staged copies (best-effort).
-        for local in locals {
-            let _ = std::fs::remove_file(&local);
+            None => false,
         }
     }
+    /// End every edit (vault lock, shutdown): staged copies of edited remote
+    /// files must not linger in the temp dir.
+    pub fn stop_all(&self) {
+        let ended: Vec<EditWatch> = self
+            .watches
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, w)| w)
+            .collect();
+        ended.into_iter().for_each(end_watch);
+    }
+    /// End the edits of one session (its tab or SFTP pane closed).
+    pub fn stop_all_for_session(&self, session_id: &str) {
+        let ended: Vec<EditWatch> = {
+            let mut guard = self.watches.lock().unwrap();
+            let keys: Vec<String> = guard
+                .iter()
+                .filter(|(_, w)| w.session_id == session_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.iter().filter_map(|k| guard.remove(k)).collect()
+        };
+        ended.into_iter().for_each(end_watch);
+    }
+}
+
+/// Stop one watch - outside the registry lock - and discard its staged copy.
+fn end_watch(mut watch: EditWatch) {
+    // Dropped = watch stopped (notify 7 has no close()).
+    let _ = watch.watcher.take();
+    watch.sync.end();
+}
+
+/// The local copy of a file opened for editing, deleted when the edit ends -
+/// but never while one of OUR OWN handles on it is open (an upload or hash
+/// still reading it, a reload writing it): on Windows a file that is open
+/// cannot be deleted, and the delete then failed and left the copy behind.
+/// Whoever holds the last handle deletes it once that handle is closed.
+pub(crate) struct StagedCopy {
+    path: std::path::PathBuf,
+    state: Mutex<StagedState>,
+}
+
+#[derive(Default)]
+struct StagedState {
+    /// Our handles currently open on the file.
+    open: usize,
+    /// The edit ended: delete as soon as `open` is zero.
+    discarded: bool,
+    /// The delete has been attempted (it is attempted once).
+    removed: bool,
+}
+
+/// Proof that one of our handles on a [`StagedCopy`] is open; dropping it
+/// (after the file handle itself is closed) may delete a discarded copy.
+pub(crate) struct StagedHandle(Arc<StagedCopy>);
+
+impl StagedCopy {
+    pub(crate) fn new(path: std::path::PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            path,
+            state: Mutex::new(StagedState::default()),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Register a handle about to be opened on the copy; `None` once the edit
+    /// ended - nothing may open it any more.
+    pub(crate) fn open_handle(self: &Arc<Self>) -> Option<StagedHandle> {
+        let mut state = self.state.lock().unwrap();
+        if state.discarded {
+            return None;
+        }
+        state.open += 1;
+        Some(StagedHandle(self.clone()))
+    }
+
+    /// The edit ended: delete the copy now, or - while one of our handles is
+    /// open - as soon as the last of them closes.
+    pub(crate) fn discard(&self) {
+        let remove = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.discarded = true;
+            state.take_removal()
+        };
+        if remove {
+            remove_staged_file(&self.path);
+        }
+    }
+}
+
+impl StagedState {
+    /// Whether the copy is to be deleted now (discarded, no handle open, not
+    /// attempted yet); marks the attempt.
+    fn take_removal(&mut self) -> bool {
+        let due = self.discarded && self.open == 0 && !self.removed;
+        if due {
+            self.removed = true;
+        }
+        due
+    }
+}
+
+impl Drop for StagedHandle {
+    fn drop(&mut self) {
+        let remove = {
+            let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.open = state.open.saturating_sub(1);
+            state.take_removal()
+        };
+        if remove {
+            remove_staged_file(&self.0.path);
+        }
+    }
+}
+
+/// How long a staged copy's delete waits before its one retry.
+const STAGED_DELETE_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Delete a staged copy (best effort, never blocking the caller): our own
+/// handles are closed by now (see [`StagedCopy`]); if ANOTHER program holds
+/// it open without delete sharing - the editor, for a moment while it saves -
+/// the delete is tried once more a little later.
+fn remove_staged_file(path: &std::path::Path) {
+    remove_staged_file_with(
+        path,
+        |p: &std::path::Path| std::fs::remove_file(p),
+        is_sharing_violation,
+        |retry: Box<dyn FnOnce() + Send>| {
+            std::thread::spawn(move || {
+                std::thread::sleep(STAGED_DELETE_RETRY);
+                retry();
+            });
+        },
+    );
+}
+
+/// [`remove_staged_file`] with the delete, the "sharing violation" test and
+/// the way the delayed retry is run given, so the retry policy is testable.
+fn remove_staged_file_with<R, S, L>(path: &std::path::Path, remove: R, sharing: S, later: L)
+where
+    R: Fn(&std::path::Path) -> std::io::Result<()> + Send + 'static,
+    S: Fn(&std::io::Error) -> bool,
+    L: FnOnce(Box<dyn FnOnce() + Send>),
+{
+    match remove(path) {
+        Err(e) if sharing(&e) => {
+            let path = path.to_path_buf();
+            later(Box::new(move || {
+                report_staged_removal(&path, remove(&path))
+            }));
+        }
+        result => report_staged_removal(path, result),
+    }
+}
+
+/// Log a failed delete of a staged copy (gone already is fine).
+fn report_staged_removal(path: &std::path::Path, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                "[sshspan-sftp] could not delete the staged copy {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Windows' ERROR_SHARING_VIOLATION: another process has the file open
+/// without delete sharing - typically the editor, for a moment while saving.
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    cfg!(windows) && e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
 }
 
 /// Default temp dir for edited remote files.
@@ -326,6 +503,9 @@ fn sanitize_stage_base(name: &str) -> String {
         .map(|c| match c {
             '/' | '\\' => '_',
             ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            // Control characters are invalid in Windows file names (and the
+            // staged path is re-checked as a plain file name).
+            c if c.is_control() => '_',
             _ => c,
         })
         .collect();
@@ -1166,5 +1346,96 @@ mod tests {
         assert!(fresh.exists(), "fresh file must survive");
         assert!(keep_dir.exists(), "directories must never be touched");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── RU6a item 6: a staged copy is deleted after OUR handles close ──
+
+    fn scratch_file(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sshspan-staged-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, b"remote secret").unwrap();
+        path
+    }
+
+    /// The edit ended while an upload (or hash, or reload) still had the file
+    /// open: on Windows the delete then failed and the copy of the remote
+    /// file stayed in the temp dir. It waits for our handles; the last one to
+    /// close deletes it, and a discarded copy cannot be opened again.
+    #[test]
+    fn ru6a_a_staged_copy_waits_for_our_open_handles_before_it_is_deleted() {
+        let path = scratch_file("handles");
+        let staged = StagedCopy::new(path.clone());
+        let first = staged.open_handle().expect("not discarded yet");
+        let second = staged.open_handle().expect("not discarded yet");
+
+        staged.discard();
+
+        assert!(path.exists(), "deleted while our handles were open");
+        assert!(
+            staged.open_handle().is_none(),
+            "a discarded copy cannot be opened again"
+        );
+        drop(first);
+        assert!(path.exists(), "one handle is still open");
+        drop(second);
+        assert!(!path.exists(), "the last handle to close deletes it");
+
+        // With no handle open, discarding deletes at once.
+        let now = scratch_file("now");
+        StagedCopy::new(now.clone()).discard();
+        assert!(!now.exists());
+    }
+
+    /// One later retry for a sharing violation (another program - usually
+    /// the editor, for a moment while saving - has the file open without
+    /// delete sharing); any other failure is not retried.
+    #[test]
+    fn ru6a_a_sharing_violation_is_retried_once_and_nothing_else_is() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = |failures: usize, sharing: bool| -> usize {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            remove_staged_file_with(
+                std::path::Path::new("/staged-copy"),
+                move |_: &std::path::Path| {
+                    if counter.fetch_add(1, Ordering::SeqCst) < failures {
+                        Err(std::io::Error::other("in use"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                move |_: &std::io::Error| sharing,
+                |retry: Box<dyn FnOnce() + Send>| retry(),
+            );
+            calls.load(Ordering::SeqCst)
+        };
+        assert_eq!(attempts(0, true), 1, "it worked at once");
+        assert_eq!(attempts(1, true), 2, "a sharing violation is retried");
+        assert_eq!(attempts(5, true), 2, "once");
+        assert_eq!(attempts(1, false), 1, "nothing else is retried");
+    }
+
+    /// RU6a fix round 1: Windows' ERROR_SHARING_VIOLATION (32) is a sharing
+    /// violation; access denied and errors without an OS code are not.
+    /// (Compile-checked on windows-gnu; it runs on Windows.)
+    #[cfg(windows)]
+    #[test]
+    fn ru6a_a_sharing_violation_is_windows_error_32() {
+        assert!(is_sharing_violation(&std::io::Error::from_raw_os_error(32)));
+        assert!(!is_sharing_violation(&std::io::Error::from_raw_os_error(5)));
+        assert!(!is_sharing_violation(&std::io::Error::other("in use")));
+    }
+
+    /// Elsewhere code 32 is something else (EPIPE on Linux): never a sharing
+    /// violation, so nothing is retried.
+    #[cfg(not(windows))]
+    #[test]
+    fn ru6a_there_is_no_sharing_violation_off_windows() {
+        assert!(!is_sharing_violation(&std::io::Error::from_raw_os_error(
+            32
+        )));
+        assert!(!is_sharing_violation(&std::io::Error::other("in use")));
     }
 }

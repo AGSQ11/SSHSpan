@@ -25,23 +25,34 @@ pub struct SshConfig {
 }
 
 impl SshConfig {
+    /// SSHSpan's managed config, read the way ssh reads it: a keyword ends
+    /// at ` \t\r\n` or `=` (so `Host=x` and `Host = x` are Host lines), and
+    /// every `Match` block - like a `Host` or `Match` line with no argument,
+    /// or one ssh cannot read (`Host\u{a0}x`) - ends the stanza before it.
+    /// The lines of such a block apply to no host, so they are dropped like
+    /// lines before the first `Host`: they used to be filed into the stanza
+    /// before, and the next rewrite of the file gave that host their
+    /// settings.
     pub fn parse(content: &str) -> Self {
         let mut hosts = Vec::new();
         let mut current_host: Option<SshHostConfig> = None;
 
         for line in content.lines() {
-            let line = line.trim();
+            let line = config_line(line);
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-
-            let parts: Vec<&str> = line.splitn(2, whitespace).collect();
-            if parts.len() < 2 {
+            let directive = split_keyword(line);
+            let host_line = matches!(&directive, Some((keyword, _)) if keyword == "host");
+            if !host_line && names_a_block(line) {
+                if let Some(host) = current_host.take() {
+                    hosts.push(host);
+                }
                 continue;
             }
-
-            let keyword = parts[0].to_lowercase();
-            let value = parts[1].trim();
+            let Some((keyword, value)) = directive else {
+                continue;
+            };
 
             match keyword.as_str() {
                 "host" => {
@@ -191,6 +202,13 @@ fn sanitize_config_value(value: &str) -> String {
 /// starts a comment). Inside double quotes ssh_config unescapes `\\`, `\"`
 /// and `\'` (OpenSSH's `argv_split`), so `\` and `"` are escaped; [`config_word`]
 /// is the inverse. Ordinary values are left exactly as they are.
+///
+/// A backslash alone is enough to force the quotes, and every `\` is then
+/// written as `\\`. That is right for OpenSSH 8.7 and later, whose parser
+/// (`argv_split`) unescapes it. OpenSSH older than 8.7 does not process escapes
+/// inside quotes and reads `\\` as two backslashes - a Windows path such as
+/// an IdentityFile under `C:\Users\...`, or a `DOMAIN\user` User, then comes
+/// out with every separator doubled there.
 fn quote_config_word(value: &str) -> String {
     let plain = !value.is_empty()
         && !value.starts_with('#')
@@ -265,8 +283,34 @@ fn split_config_args(line: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-fn whitespace(c: char) -> bool {
-    c.is_whitespace()
+/// The characters OpenSSH's config parser splits words on (its `WHITESPACE`,
+/// ` \t\r\n`). Any other space - `\u{a0}`, `\u{3000}` - is part of a word.
+fn is_config_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// One line of an ssh_config as OpenSSH sees it: trailing ` \t\r\n` and form
+/// feeds cut, leading ` \t\r\n` skipped - and nothing else (`str::trim` also
+/// took `\u{a0}` away, so `\u{a0}Host a` was read as a Host line ssh refuses).
+fn config_line(raw: &str) -> &str {
+    raw.trim_end_matches(|c: char| is_config_space(c) || c == '\u{c}')
+        .trim_start_matches(is_config_space)
+}
+
+/// Whether `line` reads as a `Host` or `Match` line to a person - its first
+/// word, split at ANY whitespace or `=`, is one of them - whatever ssh makes
+/// of it. A line that does but is not one to ssh (no argument, `Host\u{a0}x`)
+/// still starts a block: one that applies to nothing, so the lines under it
+/// do not land in the block before it (after `Host *`: every host). OpenSSH
+/// 8.7 and later refuse such a file; older ones read a bare `Host` as
+/// matching nothing.
+fn names_a_block(line: &str) -> bool {
+    let word = line
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '=')
+        .next()
+        .unwrap_or("");
+    word.eq_ignore_ascii_case("host") || word.eq_ignore_ascii_case("match")
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -431,30 +475,32 @@ fn read_capped(reader: impl std::io::Read) -> Result<String> {
         .take(USER_CONFIG_MAX_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > USER_CONFIG_MAX_BYTES {
-        anyhow::bail!("larger than {USER_CONFIG_MAX_BYTES} bytes");
+        anyhow::bail!("{}", too_large());
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Why a config file over the size cap is not read.
+fn too_large() -> String {
+    format!("it is larger than {} MiB", USER_CONFIG_MAX_BYTES >> 20)
+}
+
 /// One config file's text (bytes that are not UTF-8 become U+FFFD); `None`
-/// when the file does not exist.
-fn read_config_text(path: &Path) -> Result<Option<String>> {
+/// when the file does not exist. The errors do not repeat the path: callers
+/// say "Could not read <path>: <reason>".
+pub(crate) fn read_config_text(path: &Path) -> Result<Option<String>> {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     if !meta.is_file() {
-        anyhow::bail!("{} is not a file", path.display());
+        anyhow::bail!("it is not a regular file");
     }
     if meta.len() > USER_CONFIG_MAX_BYTES {
-        anyhow::bail!(
-            "{} is larger than {USER_CONFIG_MAX_BYTES} bytes",
-            path.display()
-        );
+        anyhow::bail!("{}", too_large());
     }
-    let text = read_capped(fs::File::open(path)?)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let text = read_capped(fs::File::open(path)?)?;
     Ok(Some(text))
 }
 
@@ -524,11 +570,23 @@ impl UserConfigReader<'_> {
         });
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         for line in text.lines() {
-            let line = line.trim();
+            let line = config_line(line);
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((keyword, rest)) = split_keyword(line) else {
+            let directive = split_keyword(line);
+            let block_line = matches!(&directive, Some((k, _)) if k == "host" || k == "match");
+            // A `Host` or `Match` line ssh does not read as one - no argument,
+            // or `Host\u{a0}x` - still starts a block, one that applies to
+            // nothing (see [`names_a_block`]).
+            if !block_line && names_a_block(line) {
+                self.blocks.push(Block {
+                    scope: Scope::Skipped,
+                    directives: Vec::new(),
+                });
+                continue;
+            }
+            let Some((keyword, rest)) = directive else {
                 continue;
             };
             // ProxyCommand is a shell command line, not ssh_config words.
@@ -622,6 +680,18 @@ impl UserConfigReader<'_> {
 
     /// One entry per literal Host name, in order of first appearance.
     fn hosts(&self) -> Vec<SshHostConfig> {
+        self.literal_aliases()
+            .into_iter()
+            .map(|alias| self.resolve(alias))
+            .collect()
+    }
+
+    /// The literal Host names, each once, in order of first appearance, at
+    /// most `USER_CONFIG_MAX_HOSTS`. A set answers "seen already?" - the old
+    /// `Vec::contains` made this quadratic in the number of names (a 1 MiB
+    /// file holds over 100 000), and the scan stops once the cap is reached.
+    fn literal_aliases(&self) -> Vec<&str> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut aliases: Vec<&str> = Vec::new();
         for block in &self.blocks {
             let Scope::Hosts(patterns) = &block.scope else {
@@ -629,16 +699,15 @@ impl UserConfigReader<'_> {
             };
             for pattern in patterns {
                 let literal = !pattern.is_empty() && !pattern.contains(['*', '?', '!']);
-                if literal && !aliases.contains(&pattern.as_str()) {
+                if literal && seen.insert(pattern.as_str()) {
                     aliases.push(pattern.as_str());
+                    if aliases.len() == USER_CONFIG_MAX_HOSTS {
+                        return aliases;
+                    }
                 }
             }
         }
-        aliases.truncate(USER_CONFIG_MAX_HOSTS);
         aliases
-            .into_iter()
-            .map(|alias| self.resolve(alias))
-            .collect()
     }
 
     /// What `ssh <alias>` would use: the first value obtained wins.
@@ -693,16 +762,70 @@ impl UserConfigReader<'_> {
 }
 
 /// A directive line split like OpenSSH's `strdelim`: the keyword (lower
-/// case) ends at whitespace or `=`, then one `=` may follow. A keyword with
-/// nothing after it is no directive.
+/// case) ends at ` \t\r\n` or `=` - no other whitespace (`Host\u{a0}a` is one
+/// unknown keyword to ssh, not a Host line) - then one `=` may follow. A
+/// keyword with nothing after it is no directive. `line` is a
+/// [`config_line`].
 fn split_keyword(line: &str) -> Option<(String, &str)> {
-    let end = line.find(|c: char| c.is_whitespace() || c == '=')?;
-    let rest = line[end..].trim_start();
-    let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+    let end = line.find(|c: char| is_config_space(c) || c == '=')?;
+    let rest = line[end..].trim_start_matches(is_config_space);
+    let rest = rest
+        .strip_prefix('=')
+        .unwrap_or(rest)
+        .trim_start_matches(is_config_space);
     if rest.is_empty() {
         return None;
     }
     Some((line[..end].to_ascii_lowercase(), rest))
+}
+
+/// One `Host` line of an ssh_config file, as the deploy preview reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostLine {
+    /// 1-based line number in the file.
+    pub line: usize,
+    /// The line as written, trimmed.
+    pub text: String,
+    /// Its patterns as ssh splits them; `None` when ssh cannot split the line
+    /// at all (an unbalanced quote - `Host bob's-key` - stops ssh from reading
+    /// the file).
+    pub patterns: Option<Vec<String>>,
+    /// The `IdentityFile`s set in its block, as written (unquoted).
+    pub identity_files: Vec<String>,
+}
+
+/// Every `Host` line of an ssh_config text, with its line number and the
+/// `IdentityFile`s of its block (up to the next Host or Match line).
+pub(crate) fn host_lines(text: &str) -> Vec<HostLine> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut found: Vec<HostLine> = Vec::new();
+    let mut in_host_block = false;
+    for (i, raw) in text.lines().enumerate() {
+        let line = config_line(raw);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let directive = split_keyword(line);
+        match directive {
+            Some((keyword, rest)) if keyword == "host" => {
+                found.push(HostLine {
+                    line: i + 1,
+                    text: line.to_string(),
+                    patterns: split_config_args(rest).filter(|args| !args.is_empty()),
+                    identity_files: Vec::new(),
+                });
+                in_host_block = true;
+            }
+            _ if names_a_block(line) => in_host_block = false,
+            Some((keyword, rest)) if keyword == "identityfile" && in_host_block => {
+                if let Some(block) = found.last_mut() {
+                    block.identity_files.push(config_word(rest));
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// `HostName`'s two tokens: `%h` is the alias, `%%` a percent sign.
@@ -992,6 +1115,60 @@ mod tests {
         assert_eq!(sanitize_config_value("clean"), "clean");
         assert_eq!(sanitize_config_value("a\u{0}b"), "a_b");
         assert_eq!(sanitize_config_value("a\tb\rc\nd"), "a_b_c_d");
+    }
+
+    /// RU6a item 8: a bare `Host` line in the managed file ends the stanza
+    /// before it. Its lines used to be filed into that stanza, so a deploy's
+    /// rewrite of the file applied them to the previous host.
+    #[test]
+    fn ru6a_the_managed_parser_keeps_a_bare_host_block_apart() {
+        let text = "Host a\n    User alice\nHost\n    HostName evil.example\n    User mallory\n\
+                    Host b\n    HostName b.example\n";
+        let parsed = SshConfig::parse(text);
+        let a = parsed.hosts.iter().find(|h| h.host == "a").unwrap();
+        assert_eq!(a.hostname, None, "{parsed:?}");
+        assert_eq!(a.user.as_deref(), Some("alice"), "{parsed:?}");
+        let b = parsed.hosts.iter().find(|h| h.host == "b").unwrap();
+        assert_eq!(b.hostname.as_deref(), Some("b.example"));
+        // A rewrite keeps it that way.
+        let out = parsed.to_config_string();
+        let back = SshConfig::parse(&out);
+        let a = back.hosts.iter().find(|h| h.host == "a").unwrap();
+        assert_eq!(
+            (a.hostname.as_deref(), a.user.as_deref()),
+            (None, Some("alice")),
+            "{out}"
+        );
+    }
+
+    /// RU6a item 11: the deploy preview lists `Host` lines with their line
+    /// numbers - including one ssh cannot even split (`Host bob's-key`).
+    #[test]
+    fn ru6a_host_lines_come_with_line_numbers_even_when_ssh_cannot_split_them() {
+        let text = "# comment\nHost web\n  HostName x\nhost bob's-key\nMatch all\n\
+                    Host=a b\n  Host inner\nHostName not-a-host-line\n";
+        let lines = host_lines(text);
+        let got: Vec<(usize, &str, Option<Vec<&str>>)> = lines
+            .iter()
+            .map(|l| {
+                (
+                    l.line,
+                    l.text.as_str(),
+                    l.patterns
+                        .as_ref()
+                        .map(|p| p.iter().map(String::as_str).collect()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (2, "Host web", Some(vec!["web"])),
+                (4, "host bob's-key", None),
+                (6, "Host=a b", Some(vec!["a", "b"])),
+                (7, "Host inner", Some(vec!["inner"])),
+            ]
+        );
     }
 }
 
@@ -1293,6 +1470,117 @@ mod ru4_user_config_tests {
         assert_eq!(host(&hosts, "later").user, None);
     }
 
+    /// RU6a item 8: a `Host` or `Match` line with NO argument (`Host`,
+    /// `Match`, `Host =`) starts a block that applies to nothing. Its lines
+    /// used to land in the block before it - after `Host *`: every host.
+    #[test]
+    fn ru6a_a_bare_host_or_match_line_takes_its_directives_with_it() {
+        let f = Fixture::new();
+        f.write(
+            "config",
+            "Host ok\n  User ok-user\nHost *\n  Port 2222\n\
+             Host\n  HostName evil.example\n  User injected\n\
+             Match\n  IdentityFile /evil/key\n\
+             Host =\n  ProxyJump evil-jump\n\
+             host\n  ForwardAgent yes\n\
+             Host later\n",
+        );
+        let hosts = f.read();
+        assert_eq!(names(&hosts), ["ok", "later"]);
+        for h in &hosts {
+            assert_eq!(h.hostname, None, "{}", h.host);
+            assert_eq!(h.identity_file, None, "{}", h.host);
+            assert_eq!(h.proxy_jump, None, "{}", h.host);
+            assert_eq!(h.forward_agent, None, "{}", h.host);
+            assert_eq!(h.port, Some(2222), "{}", h.host);
+        }
+        assert_eq!(host(&hosts, "ok").user.as_deref(), Some("ok-user"));
+        assert_eq!(host(&hosts, "later").user, None);
+    }
+
+    /// RU6a item 8: collecting the literal names used `Vec::contains` for
+    /// every pattern - quadratic in the number of names, and it only cut the
+    /// list to the cap at the end. A config of many short names (a 1 MiB
+    /// file holds over 100 000) made the import hang. A set, and the scan
+    /// stops at the cap.
+    #[test]
+    fn ru6a_imported_aliases_are_deduplicated_with_a_set_and_stop_at_the_cap() {
+        let reader = |patterns: Vec<String>| UserConfigReader {
+            ssh_dir: Path::new("/"),
+            home: None,
+            blocks: vec![Block {
+                scope: Scope::Hosts(patterns),
+                directives: Vec::new(),
+            }],
+            included: 0,
+            scan_budget: 0,
+        };
+        let bound = std::time::Duration::from_secs(3);
+
+        // Fewer names than the cap, each repeated many times.
+        let distinct: Vec<String> = (0..USER_CONFIG_MAX_HOSTS - 1)
+            .map(|i| format!("h{i}"))
+            .collect();
+        let mut repeated = Vec::with_capacity(distinct.len() * 301);
+        for _ in 0..301 {
+            repeated.extend(distinct.iter().cloned());
+        }
+        let r = reader(repeated);
+        let started = std::time::Instant::now();
+        let aliases = r.literal_aliases();
+        let took = started.elapsed();
+        assert!(
+            aliases
+                .iter()
+                .copied()
+                .eq(distinct.iter().map(String::as_str)),
+            "each name once, in order of first appearance"
+        );
+        assert!(took < bound, "repeated names took {took:?}");
+
+        // Far more distinct names than the cap: the first ones, cut at the cap.
+        let many: Vec<String> = (0..60_000).map(|i| format!("n{i}")).collect();
+        let r = reader(many.clone());
+        let started = std::time::Instant::now();
+        let aliases = r.literal_aliases();
+        let took = started.elapsed();
+        assert_eq!(aliases.len(), USER_CONFIG_MAX_HOSTS);
+        assert!(aliases
+            .iter()
+            .copied()
+            .eq(many[..USER_CONFIG_MAX_HOSTS].iter().map(String::as_str)));
+        assert!(took < bound, "60 000 names took {took:?}");
+    }
+
+    /// RU6a item 10: the caller says "Could not read <path>: <reason>", so the
+    /// reason must not repeat the path ("Could not read /x: /x is larger
+    /// than ...").
+    #[test]
+    fn ru6a_an_unreadable_config_names_its_path_once() {
+        let f = Fixture::new();
+        let mut big = String::from("Host big\n");
+        big.push_str(&"# padding\n".repeat((USER_CONFIG_MAX_BYTES as usize / 10) + 10));
+        let path = f.write("config", &big);
+        let dir = f.ssh_dir().join("a-folder");
+        fs::create_dir_all(&dir).unwrap();
+        for target in [&path, &dir] {
+            let err = read_user_ssh_config_in(target, &f.ssh_dir(), Some(&f.root))
+                .unwrap_err()
+                .to_string();
+            // What `ssh_config_list_hosts` shows.
+            let shown = format!("Could not read {}: {err}", target.display());
+            assert_eq!(
+                shown.matches(&target.display().to_string()).count(),
+                1,
+                "{shown}"
+            );
+        }
+        let err = read_user_ssh_config_in(&path, &f.ssh_dir(), Some(&f.root))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 MiB"), "{err}");
+    }
+
     /// The parser agrees with OpenSSH itself (`ssh -G`) on every imported
     /// host. Skipped when no ssh client is installed; Unix only.
     #[cfg(unix)]
@@ -1364,5 +1652,89 @@ mod ru4_user_config_tests {
             }
         }
         assert!(problems.is_empty(), "{}\n{text}", problems.join("\n"));
+
+        // RU6a item 8: a bare `Host` / `Match` line. OpenSSH 8.7 and later
+        // refuse the whole file ("no argument after keyword"); older ones take
+        // the bare `Host` as a block that matches nothing. Either way ssh never
+        // applies the lines under it to another host - and neither may the
+        // import, which reads around the bad line instead of refusing the file.
+        for bare in ["Host", "Match"] {
+            let text = format!("Host *\n  Port 2222\n{bare}\n  HostName leaked.example\nHost a\n");
+            let cfg = f.write("bare.conf", &text);
+            let out = std::process::Command::new("ssh")
+                .arg("-G")
+                .arg("-F")
+                .arg(&cfg)
+                .arg("a")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                !out.status.success() || !stdout.lines().any(|l| l == "hostname leaked.example"),
+                "ssh -G applied the bare {bare} block to another host:\n{stdout}"
+            );
+            let hosts = read_user_ssh_config_in(&cfg, &dir, Some(&f.root)).unwrap();
+            assert_eq!(names(&hosts), ["a"], "{bare}");
+            assert_eq!(host(&hosts, "a").hostname, None, "{bare}: {text}");
+            assert_eq!(host(&hosts, "a").port, Some(2222), "{bare}");
+        }
+    }
+
+    /// RU6a fix round 1, item 11: OpenSSH ends a keyword at ` \t\r\n` or `=`
+    /// only, and trims a line of those (and trailing form feeds) only.
+    /// `Host\u{a0}a` was imported as host `a` while `ssh -G` refuses the
+    /// file: such a line is no Host line now - it starts a block that
+    /// applies to nothing, like any Host line ssh cannot read - and the
+    /// deploy preview and the managed config read it the same way.
+    #[test]
+    fn ru6a_fix1_only_ascii_whitespace_ends_a_keyword() {
+        let f = Fixture::new();
+        f.write(
+            "config",
+            "Host\u{a0}nbsp\n  User x\n\u{a0}Host lead\n  User y\nHost\u{3000}ideo\n\
+             Host\ttab\r\n  User t\nHost=eq\nHost ff\u{c}\n",
+        );
+        let hosts = f.read();
+        assert_eq!(names(&hosts), ["tab", "eq", "ff"]);
+        assert_eq!(host(&hosts, "tab").user.as_deref(), Some("t"));
+        assert_eq!(host(&hosts, "eq").user, None);
+
+        let lines: Vec<String> = host_lines("Host\u{a0}a\nHost b\n")
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(lines, ["Host b"]);
+
+        let managed = SshConfig::parse("Host a\n  User alice\nHost\u{a0}b\n  User bob\n");
+        let names: Vec<(&str, Option<&str>)> = managed
+            .hosts
+            .iter()
+            .map(|h| (h.host.as_str(), h.user.as_deref()))
+            .collect();
+        assert_eq!(names, [("a", Some("alice"))]);
+    }
+
+    /// RU6a fix round 1, item 14: the managed-config parser filed the lines
+    /// after `Match <criteria>` into the Host before it (`Host a / User alice
+    /// / Match host b / HostName evil.example` gave host `a` that HostName -
+    /// written back to it on the next save) and skipped `Host=x`. A Match
+    /// line ends the stanza (its lines apply to no host), and `Host=x` /
+    /// `Host = x` are read like the user-config reader reads them.
+    #[test]
+    fn ru6a_fix1_the_managed_parser_ends_a_host_at_match_and_reads_host_equals() {
+        let config = SshConfig::parse(
+            "Host a\n  User alice\nMatch host b\n  HostName evil.example\n\
+             Host=c\n  User carol\nHost = d\n  Port 22\n",
+        );
+        let names: Vec<&str> = config.hosts.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(names, ["a", "c", "d"]);
+        let a = &config.hosts[0];
+        assert_eq!(
+            (a.user.as_deref(), a.hostname.as_deref()),
+            (Some("alice"), None)
+        );
+        assert!(a.extra.is_empty(), "{:?}", a.extra);
+        assert_eq!(config.hosts[1].user.as_deref(), Some("carol"));
+        assert_eq!(config.hosts[2].port, Some(22));
     }
 }

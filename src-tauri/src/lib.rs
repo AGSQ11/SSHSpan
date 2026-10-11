@@ -208,6 +208,7 @@ pub fn run() {
             sftp_download,
             sftp_open_for_edit,
             sftp_close_edit,
+            sftp_edit_resolve,
             sftp_chmod,
             sftp_get_permissions,
             sftp_touch,

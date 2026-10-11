@@ -380,9 +380,7 @@ fn verify_mac_v3(
     mac_key: &[u8],
     plaintext_private_blob: &[u8],
 ) -> anyhow::Result<()> {
-    if parsed.mac.is_empty() {
-        return Ok(());
-    }
+    // No early return for an empty MAC: it compares unequal and fails.
     let preimage = mac_preimage(parsed, plaintext_private_blob);
     let mut mac = Hmac::<Sha256>::new_from_slice(mac_key).expect("HMAC accepts any key size");
     mac.update(&preimage);
@@ -398,9 +396,7 @@ fn verify_mac_v2(
     mac_key: &[u8; 20],
     plaintext_private_blob: &[u8],
 ) -> anyhow::Result<()> {
-    if parsed.mac.is_empty() {
-        return Ok(());
-    }
+    // No early return for an empty MAC: it compares unequal and fails.
     let preimage = mac_preimage(parsed, plaintext_private_blob);
     let mut mac = Hmac::<Sha1>::new_from_slice(mac_key).expect("HMAC accepts any key size");
     mac.update(&preimage);
@@ -595,6 +591,15 @@ fn build_keypair_data(
 /// standard `PrivateKeyData`, ready for storage/export like any other key.
 pub fn import_ppk(data: &str, passphrase: Option<&str>) -> anyhow::Result<PrivateKeyData> {
     let parsed = parse_ppk_file(data)?;
+    // Every PPK file carries a MAC over its contents, encrypted or not. A
+    // missing or empty one used to skip the check entirely, so an edited or
+    // truncated key imported as if it were intact. Refused before any key
+    // derivation is spent on it.
+    if parsed.mac.is_empty() {
+        anyhow::bail!(
+            "This .ppk file has no Private-MAC, so SSHSpan cannot tell whether it was damaged or edited. Save the key again in PuTTYgen and import that file."
+        );
+    }
     let pass = passphrase.unwrap_or("");
 
     let plaintext_private_blob = if parsed.encrypted {
@@ -1033,6 +1038,43 @@ mod tests {
         );
         let stored = PrivateKey::from_bytes(&imported.private_key).unwrap();
         assert_eq!(stored.comment(), imported.comment);
+    }
+
+    /// RU6a item 11: a file whose `Private-MAC` is missing or empty skipped
+    /// the MAC check entirely, so an edited (or truncated) key imported as if
+    /// it were intact - encrypted or not.
+    #[test]
+    fn ru6a_a_ppk_without_a_private_mac_is_refused() {
+        let key = &crate::crypto::keys::sample_keys()[1];
+        for passphrase in [None, Some("ppk mac")] {
+            let ppk = export_ppk(key, passphrase).unwrap();
+            let rewrite = |mac_line: Option<&str>| -> String {
+                ppk.lines()
+                    .filter_map(|l| {
+                        if l.starts_with("Private-MAC:") {
+                            mac_line.map(str::to_string)
+                        } else {
+                            Some(l.to_string())
+                        }
+                    })
+                    .map(|l| format!("{l}\n"))
+                    .collect()
+            };
+            for (what, text) in [
+                ("missing", rewrite(None)),
+                ("empty", rewrite(Some("Private-MAC:"))),
+                ("blank", rewrite(Some("Private-MAC:   "))),
+            ] {
+                let err = import_ppk(&text, passphrase)
+                    .expect_err(&format!("{what} MAC, passphrase {passphrase:?}"));
+                assert!(
+                    err.to_string().contains("Private-MAC"),
+                    "{what} MAC, passphrase {passphrase:?}: {err}"
+                );
+            }
+            // The intact file still imports.
+            assert!(import_ppk(&ppk, passphrase).is_ok());
+        }
     }
 
     #[test]
