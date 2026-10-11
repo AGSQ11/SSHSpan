@@ -51,7 +51,16 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
-            let state = AppState::new(app.handle())?;
+            let state = match AppState::new(app.handle()) {
+                Ok(state) => state,
+                Err(e) => {
+                    // No state is managed: the window stays hidden, commands
+                    // are refused (see `refuse_after_failed_startup`) and the
+                    // app exits when the user closes the dialog.
+                    report_startup_failure(app.handle(), &e);
+                    return Ok(());
+                }
+            };
             app.manage(state);
 
             // Vault password lives in memory only; cleared on lock / quit
@@ -93,7 +102,28 @@ pub fn run() {
             // renderer cannot lock the vault itself (hung/crashed webview).
             commands::spawn_auto_lock_watchdog(app.handle().clone());
 
-            create_tray(app.handle())?;
+            // Installers a previous update left behind (they must outlive the
+            // app that launches them) or a crash left half-written (A7-42).
+            // Off the startup path: the temp directory can be large.
+            std::thread::spawn(|| {
+                for dir in update_staging_dirs() {
+                    let removed = prune_stale_update_files(&dir, STALE_UPDATE_MAX_AGE);
+                    if removed > 0 {
+                        log::info!(
+                            "[sshspan-update] removed {removed} stale installer(s) from {}",
+                            dir.display()
+                        );
+                    }
+                }
+            });
+
+            // A tray that cannot be created is not fatal: the app runs, and
+            // closing the window quits instead of hiding into a tray that is
+            // not there (A7-37).
+            if let Err(e) = create_tray(app.handle()) {
+                log::warn!("[sshspan] could not create the tray icon: {e}");
+                TRAY_AVAILABLE.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -101,7 +131,10 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(refuse_after_failed_startup(tauri::generate_handler![
+            // App lifecycle (rulings R11 / R12)
+            app_quit,
+            app_info,
             // Vault commands
             vault_create,
             vault_unlock,
@@ -234,54 +267,162 @@ pub fn run() {
             system_open_url,
             system_select_file,
             system_pick_file_path,
+            system_pick_files,
             system_pick_save_path,
             system_write_text_file,
             update_check,
             update_download_and_run,
-        ])
+        ]))
         // Closing the window hides it to the tray instead of exiting, which is
         // what the tray has always implied (it offers Show and Quit, and until
         // now the X button silently killed the process and the tray with it).
         // The vault deliberately stays unlocked: hiding is not a security
         // boundary, and the tray's "Lock Vault" and the idle auto-lock are the
-        // controls for that. Quit goes through `app.exit`, which sets QUITTING
-        // first so this handler lets the exit proceed.
+        // controls for that. Quit (the tray's, or `app_quit` from the window)
+        // sets QUITTING first so this handler lets the exit proceed. The first
+        // hide of a run emits `window-hidden-to-tray`, so the renderer can tell
+        // the user where the app went (R11 / A5-24). Without a tray there is
+        // nothing to come back from, so the close goes through and quits.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
-                    api.prevent_close();
-                    let _ = window.hide();
+                let ordering = std::sync::atomic::Ordering::SeqCst;
+                if QUITTING.load(ordering) || !TRAY_AVAILABLE.load(ordering) {
+                    return;
+                }
+                api.prevent_close();
+                let _ = window.hide();
+                if first_time(&HIDE_NOTICE_SENT) {
+                    let _ = window.emit("window-hidden-to-tray", ());
                 }
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        // Best-effort lifecycle teardown: Tauri v2's desktop run loop does NOT
+        // Lifecycle teardown: every exit - the tray's Quit, `app_quit`, the
+        // updater handing over to an installer, closing a tray-less window -
+        // runs the vault lock path (`lock_vault_internal`): live sessions
+        // killed, SFTP and edit registries cleared (staged copies of remote
+        // files deleted), the transfer queue paused, MCP sessions torn down,
+        // the master password cleared and `vault.lock` audited (A6-09 / A7-47
+        // / A8-23). The MCP DELETE requests are started, not awaited, so one
+        // can be cut off by the exit. Tauri v2's desktop run loop does NOT
         // expose OS suspend/lock events (WindowEvent::Suspended/Resumed are
-        // mobile-only).  We therefore reuse the existing `vault_lock` teardown
-        // when the app is about to exit.  This clears the in-memory master
-        // password and stops live sessions, but it cannot cover an OS suspend
-        // that leaves the process alive.  A true OS-suspend handler would need a
-        // platform-specific crate (e.g. `windows` on Win32) and is out of scope
-        // for this fix.
-        .run(|_app_handle, event| match event {
-            tauri::RunEvent::ExitRequested { .. } => {
-                let _ = _app_handle
-                    .state::<crate::commands::VaultPasswordStore>()
-                    .clear();
-                _app_handle
-                    .state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
-                    .kill_all();
+        // mobile-only), so an OS suspend that leaves the process alive is not
+        // covered; that would need a platform-specific crate.
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                exit_teardown(app_handle);
             }
-            _ => {}
         });
 }
 
 /// True once a real quit is under way, so the window-close handler can tell
 /// "the user clicked X" (hide to tray) from "the app is exiting" (let it
-/// through). Set by the tray's Quit item; without it `prevent_close()` would
-/// also swallow the tray's own Quit and the app could never be exited.
+/// through). Set by [`request_quit`]; without it `prevent_close()` would also
+/// swallow a Quit and the app could never be exited.
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// False when the tray icon could not be created: closing the window then
+/// quits instead of hiding the app where it cannot be found again.
+static TRAY_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set by the first hide-to-tray of this run (`window-hidden-to-tray` is
+/// emitted once per run).
+static HIDE_NOTICE_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the first exit teardown, so it runs once per run.
+static EXIT_TEARDOWN_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set when setup failed: no state is managed, so commands are refused.
+static STARTUP_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True the first time it is called for `flag`, false every time after.
+fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Exit the app the way the tray's Quit always has: mark the exit as
+/// deliberate BEFORE asking to exit, so the close handler does not hide the
+/// window instead. The exit itself runs the vault lock teardown
+/// ([`exit_teardown`]).
+fn request_quit(app: &tauri::AppHandle) {
+    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+    app.exit(0);
+}
+
+/// Quit from the window (ruling R11: Ctrl+Q, the palette, the vault menu) -
+/// the same path as the tray's Quit. Closing the window only hides it, and on
+/// desktops without a visible tray there was no way to exit at all (A7-37).
+#[tauri::command]
+fn app_quit(app: tauri::AppHandle) -> Result<serde_json::Value, commands::CmdError> {
+    request_quit(&app);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// The teardown for an exit: the vault lock path, once, and only when there
+/// is something to tear down - after a completed setup (a failed one manages
+/// no state) and while the vault is unlocked (a lock already tore everything
+/// down).
+fn exit_teardown(app: &tauri::AppHandle) {
+    let unlocked = app
+        .try_state::<commands::VaultPasswordStore>()
+        .is_some_and(|store| store.is_set());
+    if unlocked && first_time(&EXIT_TEARDOWN_DONE) {
+        commands::lock_vault_internal(app);
+    }
+}
+
+/// While setup has failed nothing is managed, and a command would panic on
+/// the missing state - taking the error dialog down with it. Refuse them.
+fn refuse_after_failed_startup<F>(
+    handler: F,
+) -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static
+where
+    F: Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static,
+{
+    move |invoke| {
+        if STARTUP_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+            invoke
+                .resolver
+                .reject("SSHSpan could not start - see the error message.");
+            return true;
+        }
+        handler(invoke)
+    }
+}
+
+/// Tell the user why SSHSpan cannot start, then exit when the dialog closes
+/// (A7-31). Tauri turns a setup error into a panic while the window is still
+/// hidden (and, in release builds on Windows, with no console), so the app
+/// used to vanish without a word on every launch. Non-blocking `show`: setup
+/// runs on the main thread, where a blocking dialog would deadlock.
+fn report_startup_failure(app: &tauri::AppHandle, error: &anyhow::Error) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    STARTUP_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+    log::error!("[sshspan] startup failed: {error:#}");
+    let db_path = db::get_db_path(app).ok();
+    let handle = app.clone();
+    app.dialog()
+        .message(startup_failure_message(error, db_path.as_deref()))
+        .title("SSHSpan cannot start")
+        .kind(MessageDialogKind::Error)
+        .show(move |_| handle.exit(1));
+}
+
+/// The startup error dialog's text: the cause and where the database is.
+fn startup_failure_message(error: &anyhow::Error, db_path: Option<&std::path::Path>) -> String {
+    let location = db_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unknown (the app data folder could not be determined)".to_string());
+    format!(
+        "SSHSpan could not open its vault database, so it cannot start.\n\n\
+         Cause: {error:#}\n\n\
+         Database: {location}\n\n\
+         Check that the folder exists and is writable, that no other program has \
+         the file open and that the disk is not full. SSHSpan will close now."
+    )
+}
 
 /// Create system tray with menu
 fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
@@ -313,12 +454,7 @@ fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
                     crate::commands::lock_vault_internal(app);
                     let _ = window.emit("vault-lock-requested", "");
                 }
-                "quit" => {
-                    // Mark the exit as deliberate BEFORE asking to exit, so the
-                    // CloseRequested handler does not hide the window instead.
-                    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
-                    app.exit(0);
-                }
+                "quit" => request_quit(app),
                 _ => {}
             }
         })
@@ -338,4 +474,36 @@ fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
         .build(app)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hide_notice_is_sent_once_per_run() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(first_time(&flag));
+        assert!(!first_time(&flag));
+        assert!(!first_time(&flag));
+    }
+
+    #[test]
+    fn startup_failure_message_names_the_cause_and_the_database() {
+        let error = anyhow::anyhow!("disk I/O error").context("could not migrate the vault");
+        let message = startup_failure_message(
+            &error,
+            Some(std::path::Path::new(
+                "/home/u/.local/share/sshspan/sshspan.db",
+            )),
+        );
+        assert!(message.contains("could not migrate the vault"), "{message}");
+        assert!(message.contains("disk I/O error"), "{message}");
+        assert!(
+            message.contains("/home/u/.local/share/sshspan/sshspan.db"),
+            "{message}"
+        );
+        let unknown = startup_failure_message(&error, None);
+        assert!(unknown.contains("unknown"), "{unknown}");
+    }
 }

@@ -3926,6 +3926,15 @@ fn unseal_key_data(key: &KeyRecord, vault_pw: &str) -> Result<keys::PrivateKeyDa
 /// main thread now - cannot both pass the check (A2-46 / A5-25).
 static KEY_NAME_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Hold [`KEY_NAME_WRITES`] around a name check and the write that takes the
+/// name - also from the Bitwarden sync, which stores pulled keys under a free
+/// name (RU5 hand-off 10). Never held across an await.
+pub(crate) fn lock_key_names() -> std::sync::MutexGuard<'static, ()> {
+    KEY_NAME_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Refuse a key name another key already has, compared without regard to
 /// case. Existing duplicates in older vaults stay as they are; only a new
 /// create, import or rename is refused.
@@ -3950,9 +3959,7 @@ fn write_with_free_key_name<T>(
     except_id: Option<&str>,
     write: impl FnOnce() -> anyhow::Result<T>,
 ) -> CmdResult<T> {
-    let _names = KEY_NAME_WRITES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _names = lock_key_names();
     ensure_key_name_free(db, name, except_id)?;
     write().map_err(|e| CmdError(e.to_string()))
 }
@@ -4893,8 +4900,20 @@ fn key_set_categories_in(
             return Err(format!("Unknown category: {cid}").into());
         }
     }
+    let before: std::collections::HashSet<String> = db
+        .list_categories_for_key(key_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    let after: std::collections::HashSet<String> = category_ids.iter().cloned().collect();
     db.set_key_categories(key_id, category_ids)
         .map_err(|e| e.to_string())?;
+    // Categories travel in the Bitwarden item's notes but live in no key
+    // column: a real change has to mark the key changed or it never syncs
+    // (A7-23). Saving the same set again is not a change.
+    if before != after {
+        db.mark_key_changed(key_id).map_err(|e| e.to_string())?;
+    }
     db.add_audit(
         "key.categories_set",
         Some(key_id),
@@ -5206,6 +5225,8 @@ mod ssh_config_list_hosts_tests {
 //  BITWARDEN commands
 // ═════════════════════════════════════════════════════════════════════════════
 
+/// The saved sync settings for the form, and whether a master password is
+/// stored (`hasMasterPassword`, A5-35) - never the sealed password itself.
 #[tauri::command]
 pub fn bitwarden_get_config(app: AppHandle) -> CmdResult<serde_json::Value> {
     let config = app
@@ -5213,18 +5234,16 @@ pub fn bitwarden_get_config(app: AppHandle) -> CmdResult<serde_json::Value> {
         .db
         .load_bitwarden_config()
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({
-        "server_url": config.server_url,
-        "email": config.email,
-        "folder_name": config.folder_name,
-        "servers_folder_name": config.servers_folder_name,
-        "last_sync": config.last_sync.map(|d| d.to_rfc3339()),
-        "last_result": config.last_result.as_ref().and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()),
-    }))
+    Ok(crate::bitwarden::config_view(&config))
 }
 
+/// Save the sync settings. Async on purpose (A7-48): the URL check resolves
+/// the host with the system resolver - seconds for a slow or mistyped name -
+/// and sealing the Bitwarden password runs Argon2id; as a synchronous command
+/// both ran on the main thread and froze the window. They run on the
+/// blocking pool now.
 #[tauri::command]
-pub fn bitwarden_save_config(
+pub async fn bitwarden_save_config(
     app: AppHandle,
     server_url: String,
     email: String,
@@ -5232,6 +5251,9 @@ pub fn bitwarden_save_config(
     folder_name: Option<String>,
     servers_folder_name: Option<String>,
 ) -> CmdResult<serde_json::Value> {
+    let master_password = master_password
+        .filter(|s| !s.is_empty())
+        .map(zeroize::Zeroizing::new);
     if vault_password(&app)?.is_empty() {
         return Err("Vault is locked.".into());
     }
@@ -5240,77 +5262,111 @@ pub fn bitwarden_save_config(
     let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
 
-    // SSRF-validate the server URL at save time
-    let validated_url =
-        crate::bitwarden::ssrf::resolve_safe_server_url(&server_url).map_err(|e| e.to_string())?;
-
     let email = email.trim().to_string();
     if !email.contains('@') {
         return Err("Enter the account email of your vault.".into());
     }
 
-    let db = &app.state::<AppState>().db;
-    let mut config = db.load_bitwarden_config().map_err(|e| e.to_string())?;
-    config.server_url = Some(validated_url);
-    config.email = Some(email);
-    if let Some(mp) = master_password.filter(|s| !s.is_empty()) {
-        // Wrap in Zeroizing immediately: the plaintext Bitwarden master
-        // password must be wiped from this frame once sealed, not left as
-        // freed heap (secret-wiping hardening).
-        let mp = zeroize::Zeroizing::new(mp);
-        // Seal the Bitwarden master password with the SSHSpan vault password
-        let sealed = crate::crypto::vault::seal(&pw, mp.as_bytes()).map_err(|e| e.to_string())?;
-        config.master_password = Some(sealed);
-    }
-    config.folder_name = Some(folder_name.unwrap_or_else(|| "SSHSpan_Keys".to_string()));
-    config.servers_folder_name =
-        Some(servers_folder_name.unwrap_or_else(|| "SSHSpan_Servers".to_string()));
-    if config.device_id.is_none() {
-        config.device_id = Some(Uuid::new_v4().to_string());
-    }
-    db.save_bitwarden_config(&config)
-        .map_err(|e| e.to_string())?;
+    let db = app.state::<AppState>().db.clone();
+    let folder_name = folder_name.unwrap_or_else(|| "SSHSpan_Keys".to_string());
+    let servers_folder_name = servers_folder_name.unwrap_or_else(|| "SSHSpan_Servers".to_string());
+
+    // SSRF-validate the server URL and seal a new password off the main
+    // thread; then ONE transaction re-reads the settings, keeps a stored
+    // password only for its own server and account (F1 / F1-b) and writes.
+    let prepare = run_blocking(move || {
+        let server_url = crate::bitwarden::ssrf::resolve_safe_server_url(&server_url)
+            .map_err(|e| CmdError(e.to_string()))?;
+        // The plaintext Bitwarden master password is `Zeroizing`: wiped once
+        // sealed, not left as freed heap (secret-wiping hardening).
+        let sealed_password = match master_password {
+            Some(mp) => Some(
+                crate::crypto::vault::seal(&pw, mp.as_bytes())
+                    .map_err(|e| CmdError(e.to_string()))?,
+            ),
+            None => None,
+        };
+        Ok(crate::bitwarden::BitwardenSave {
+            server_url,
+            email,
+            sealed_password,
+            folder_name,
+            servers_folder_name,
+        })
+    });
+    crate::bitwarden::save_bitwarden_settings(&db, async move { prepare.await.map_err(|e| e.0) })
+        .await
+        .map_err(CmdError)?;
     db.add_audit("sync.config", None, "saved")
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Log in to a vault and list what it holds, without changing anything. Each
+/// of `server_url`, `email` and `master_password` is taken from the form when
+/// given (not blank) and from the saved settings otherwise (A2-52) - testing
+/// used to read only the saved settings, so a form tested before Save failed,
+/// and an edited URL reported success for the OLD server. The result names
+/// the server and account actually tested (`server`, `account`).
 #[tauri::command]
-pub async fn bitwarden_test_connection(app: AppHandle) -> CmdResult<serde_json::Value> {
+pub async fn bitwarden_test_connection(
+    app: AppHandle,
+    server_url: Option<String>,
+    email: Option<String>,
+    master_password: Option<String>,
+) -> CmdResult<serde_json::Value> {
+    let master_password = master_password.map(zeroize::Zeroizing::new);
+    // Reads - and may unseal - the stored Bitwarden password: not while a
+    // master-password change re-encrypts it (C1 / F2). Held until the unseal
+    // is done.
+    let rotation = rotation_shared(&app)?;
+    let pw = vault_password(&app)?;
+    if pw.is_empty() {
+        return Err("Vault is locked.".into());
+    }
     let config = app
         .state::<AppState>()
         .db
         .load_bitwarden_config()
         .map_err(|e| e.to_string())?;
-    let server_url = config
-        .server_url
-        .ok_or_else(|| "No server URL configured.".to_string())?;
-    let email = config
-        .email
-        .ok_or_else(|| "No email configured.".to_string())?;
-    let mp_sealed = config
-        .master_password
-        .ok_or_else(|| "No master password stored. Re-save the sync settings.".to_string())?;
-
-    let pw = vault_password(&app)?;
-    // Zeroizing: the decrypted Bitwarden master password is wiped on drop.
-    let master_password = zeroize::Zeroizing::new(
-        String::from_utf8(crate::crypto::vault::unseal(&pw, &mp_sealed).map_err(|_| {
-            "Failed to decrypt stored Bitwarden password. Re-save the sync settings.".to_string()
-        })?)
-        .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())?,
-    );
+    // The URL check (a blocking DNS lookup) and the Argon2id unseal run on
+    // the blocking pool, not on an async worker (A7-48 / F2).
+    let saved = config.clone();
+    let target = run_blocking(move || {
+        crate::bitwarden::resolve_test_target(
+            &saved,
+            server_url,
+            email,
+            master_password,
+            |url| crate::bitwarden::ssrf::resolve_safe_server_url(url).map_err(|e| e.to_string()),
+            |sealed| {
+                let bytes = crate::crypto::vault::unseal(&pw, sealed).map_err(|_| {
+                    "Failed to decrypt stored Bitwarden password. Re-save the sync settings."
+                        .to_string()
+                })?;
+                // Zeroizing: the decrypted Bitwarden master password is wiped on drop.
+                String::from_utf8(bytes)
+                    .map(zeroize::Zeroizing::new)
+                    .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())
+            },
+        )
+        .map_err(CmdError)
+    })
+    .await?;
+    drop(rotation);
 
     let device_id = config
         .device_id
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let base_url = target.server_url.clone();
 
-    let base_url =
-        crate::bitwarden::ssrf::resolve_safe_server_url(&server_url).map_err(|e| e.to_string())?;
-
-    let mut client =
-        crate::bitwarden::BitwardenClient::new(&server_url, &email, &master_password, &device_id)
-            .map_err(|e| e.to_string())?;
+    let mut client = crate::bitwarden::BitwardenClient::new(
+        &target.server_url,
+        &target.email,
+        &target.master_password,
+        &device_id,
+    )
+    .map_err(|e| e.to_string())?;
     let kdf = client.connect().await.map_err(|e| e.to_string())?;
     let remote = client.sync().await.map_err(|e| e.to_string())?;
     let ssh_count = remote
@@ -5327,7 +5383,7 @@ pub async fn bitwarden_test_connection(app: AppHandle) -> CmdResult<serde_json::
         .profile
         .as_ref()
         .and_then(|p| p.email.clone())
-        .unwrap_or(email);
+        .unwrap_or_else(|| target.email.clone());
     client.close();
 
     Ok(serde_json::json!({
@@ -5340,6 +5396,12 @@ pub async fn bitwarden_test_connection(app: AppHandle) -> CmdResult<serde_json::
     }))
 }
 
+/// Run a two-way sync with the saved settings. Every run is audited (A8-04):
+/// `sync.run` with the counts and one `sync.error` per failed item (capped),
+/// or one `sync.error` when the sync fails before comparing anything (login,
+/// vault fetch) - names, ids and error messages only, never secrets. A run
+/// that stops part-way (vault locked, an error mid-run) returns, stores and
+/// audits its counts so far with `ok: false` and `aborted: <reason>` (M7).
 #[tauri::command]
 pub async fn bitwarden_sync(
     app: AppHandle,
@@ -5347,8 +5409,8 @@ pub async fn bitwarden_sync(
 ) -> CmdResult<serde_json::Value> {
     // Held for the whole run (C1): the sync seals pulled keys and server
     // passwords with the master password it reads below, between network
-    // round trips, and rewrites whole key/server rows - a master-password
-    // change must neither start in the middle nor be running when it starts.
+    // round trips, and rewrites key/server rows - a master-password change
+    // must neither start in the middle nor be running when it starts.
     let _rotation = rotation_shared(&app)?;
     let config = app
         .state::<AppState>()
@@ -5401,7 +5463,7 @@ pub async fn bitwarden_sync(
     // run_sync is async (network + DB). The DB layer internally hops onto a
     // blocking thread when called from within the async runtime, so awaiting
     // it directly here is safe and does not nest a tokio runtime.
-    let result = crate::bitwarden::sync::run_sync(
+    let result = match crate::bitwarden::sync::run_sync(
         &server_url,
         &email,
         &master_password,
@@ -5414,16 +5476,128 @@ pub async fn bitwarden_sync(
         &cancelled,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let message = e.to_string();
+            audit_or_warn(
+                &db,
+                "sync.error",
+                None,
+                &crate::bitwarden::sync::sync_failure_audit_text(&message),
+            );
+            return Err(CmdError(message));
+        }
+    };
+    for (action, details) in crate::bitwarden::sync::sync_audit_rows(&result) {
+        audit_or_warn(&db, action, None, &details);
+    }
 
-    // Store sync result
-    let mut config = db.load_bitwarden_config().map_err(|e| e.to_string())?;
-    config.last_sync = Some(chrono::Utc::now());
-    config.last_result = Some(serde_json::to_string(&result).unwrap_or_default());
-    db.save_bitwarden_config(&config)
-        .map_err(|e| e.to_string())?;
+    // Store the sync result - only those two fields, in one transaction, so a
+    // settings save made while the sync ran is not overwritten with the
+    // values read before it. Not fatal: the run itself is done (and audited),
+    // so failing to store its summary must not turn it into an error.
+    let last_result = serde_json::to_string(&result).unwrap_or_default();
+    if let Err(e) = db.update_bitwarden_config(|config| {
+        config.last_sync = Some(chrono::Utc::now());
+        config.last_result = Some(last_result);
+        Ok(())
+    }) {
+        log::warn!("[sshspan-sync] the sync finished, but its result could not be stored: {e}");
+    }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod ru5_tests {
+    use super::*;
+
+    fn test_db() -> db::Database {
+        db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-test-{}.db", uuid::Uuid::new_v4())),
+        )
+        .expect("failed to open test database")
+    }
+
+    fn unlocked() -> VaultPasswordStore {
+        let store = VaultPasswordStore::new();
+        store.set("vault-pw".into());
+        store
+    }
+
+    fn stored_key(db: &db::Database, updated_at: chrono::DateTime<chrono::Utc>) -> KeyRecord {
+        let key = KeyRecord {
+            id: Uuid::new_v4().to_string(),
+            name: format!("k-{}", &Uuid::new_v4().simple().to_string()[..8]),
+            key_type: "ed25519".into(),
+            public_key: "ssh-ed25519 AAAA test".into(),
+            private_key_encrypted: "sealed".into(),
+            fingerprint_sha256: format!("SHA256:{}", Uuid::new_v4().simple()),
+            fingerprint_md5: "MD5:x".into(),
+            comment: String::new(),
+            created_at: updated_at,
+            updated_at,
+            deployed: false,
+            deploy_path: None,
+            bitwarden_id: Some("c1".into()),
+            bitwarden_sync: true,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: Some(updated_at.timestamp_millis()),
+            category_ids: Vec::new(),
+        };
+        db.insert_key(&key).unwrap();
+        key
+    }
+
+    #[test]
+    fn category_change_marks_the_key_changed_for_sync() {
+        // A7-23: categories travel in the Bitwarden item's notes, but changing
+        // them touched no key column, so they never synced.
+        let db = test_db();
+        let long_ago = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let key = stored_key(&db, long_ago);
+        let prod = db
+            .ensure_category_path_scoped("Prod", "key")
+            .unwrap()
+            .unwrap();
+        key_set_categories_in(&db, &unlocked(), &key.id, std::slice::from_ref(&prod)).unwrap();
+        let changed = db.get_key(&key.id).unwrap().unwrap();
+        assert!(
+            changed.updated_at > long_ago,
+            "a category change must mark the key changed"
+        );
+        // Saving the same set again is not a change.
+        key_set_categories_in(&db, &unlocked(), &key.id, &[prod]).unwrap();
+        let again = db.get_key(&key.id).unwrap().unwrap();
+        assert_eq!(again.updated_at, changed.updated_at);
+    }
+
+    #[test]
+    fn app_info_names_this_build() {
+        // R12 / A2-24: the real version instead of "v14-tabs".
+        let info = app_info_value();
+        assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(info["platform"], std::env::consts::OS);
+        // The two version sources the release workflow syncs from the tag
+        // must agree, or the UI and the updater name different versions.
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        assert_eq!(info["version"], conf["version"]);
+    }
+
+    #[test]
+    fn picked_files_result_lists_paths_only() {
+        assert_eq!(
+            picked_files_result(None),
+            serde_json::json!({ "canceled": true, "paths": [] })
+        );
+        assert_eq!(picked_files_result(Some(Vec::new()))["canceled"], true);
+        assert_eq!(
+            picked_files_result(Some(vec!["/a/x.txt".into(), "/b/y.bin".into()])),
+            serde_json::json!({ "canceled": false, "paths": ["/a/x.txt", "/b/y.bin"] })
+        );
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -5931,6 +6105,55 @@ pub async fn system_pick_file_path(
             serde_json::json!({ "canceled": false, "path": path, "name": name })
         }
         None => serde_json::json!({ "canceled": true }),
+    })
+}
+
+/// Native open dialog for several files that returns only their paths -
+/// nothing is read (A5-40: the SFTP Upload button had no picker). `multiple`
+/// allows choosing more than one file. Returns `{canceled: true, paths: []}`
+/// or `{canceled: false, paths: [...]}`.
+#[tauri::command]
+/// NOTE: async on purpose - a dialog must not block the main thread (see
+/// `system_pick_save_path`).
+pub async fn system_pick_files(
+    app: AppHandle,
+    title: Option<String>,
+    multiple: bool,
+) -> CmdResult<serde_json::Value> {
+    use tauri_plugin_dialog::DialogExt;
+    let dialog = app
+        .dialog()
+        .file()
+        .set_title(title.unwrap_or_else(|| "Select files".into()));
+    let picked = if multiple {
+        dialog.blocking_pick_files()
+    } else {
+        dialog.blocking_pick_file().map(|path| vec![path])
+    };
+    Ok(picked_files_result(picked.map(|paths| {
+        paths.into_iter().map(|path| path.to_string()).collect()
+    })))
+}
+
+/// The `system_pick_files` answer for what the dialog returned.
+fn picked_files_result(picked: Option<Vec<String>>) -> serde_json::Value {
+    let paths = picked.unwrap_or_default();
+    serde_json::json!({ "canceled": paths.is_empty(), "paths": paths })
+}
+
+/// The running build, for the renderer's title and status lines (ruling
+/// R12): the crate version - `CARGO_PKG_VERSION`, which the release workflow
+/// sets from the tag together with tauri.conf.json - and the target OS. It
+/// replaces the stale `v14-tabs` marker (A2-24 / A8-26).
+#[tauri::command]
+pub fn app_info() -> CmdResult<serde_json::Value> {
+    Ok(app_info_value())
+}
+
+fn app_info_value() -> serde_json::Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": std::env::consts::OS,
     })
 }
 

@@ -148,19 +148,78 @@ fn check_typed_text(level: &str, text: &str) -> Result<(), String> {
                 .into(),
         );
     }
-    if let Some(c) = text.chars().find(|c| c.is_control() && *c != '\t') {
-        return Err(format!(
+    match forbidden_terminal_char(text) {
+        Some(ForbiddenChar::Control(c)) => Err(format!(
             "This text contains a control character (U+{:04X}) - the assistant may not send control keys. Nothing was typed.",
             c as u32
-        ));
-    }
-    if let Some(c) = text.chars().find(|&c| is_disguising(c)) {
-        return Err(format!(
+        )),
+        Some(ForbiddenChar::Disguising(c)) => Err(format!(
             "This text contains an invisible or text-direction character (U+{:04X}) that could disguise what is typed. Nothing was typed.",
             c as u32
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A character the assistant may never send to a terminal.
+enum ForbiddenChar {
+    /// A control character other than TAB: a key (Enter, Ctrl-C, ESC, ...),
+    /// not text.
+    Control(char),
+    /// A character that could make the text look different from what is
+    /// sent ([`DISGUISING_CHARS`]).
+    Disguising(char),
+}
+
+/// The character of `text` the assistant may not send - any control
+/// character other than TAB first, else any disguising one. Shared by typing
+/// ([`check_typed_text`]) and running ([`check_exec_command`]), so a card the
+/// user reviews always shows exactly what reaches the shell.
+fn forbidden_terminal_char(text: &str) -> Option<ForbiddenChar> {
+    text.chars()
+        .find(|c| c.is_control() && *c != '\t')
+        .map(ForbiddenChar::Control)
+        .or_else(|| {
+            text.chars()
+                .find(|&c| is_disguising(c))
+                .map(ForbiddenChar::Disguising)
+        })
+}
+
+/// Whether the assistant may run `command` at `level` (`assistant_exec`), and
+/// if not, the refusal the model and the user see: Execute or higher, and -
+/// like typing - no control character other than TAB and nothing invisible
+/// or text-direction (item 17). The Approve card has to show exactly what
+/// runs: a right-to-left override or a zero-width character displayed the
+/// command reordered or shortened (Trojan Source) while the shell ran it as
+/// written, and an embedded line break ran a second line. Nothing is sent on
+/// a refusal. Pure so the rule is unit-testable without a session.
+fn check_exec_command(level: &str, command: &str) -> Result<(), String> {
+    if !level_permits_exec(level) {
+        return Err(format!(
+            "AI access level is '{level}' - raise it in the assistant panel to let the assistant run commands."
         ));
     }
-    Ok(())
+    // TAB is fine to TYPE (completion is wanted there), but in a command it
+    // makes readline complete before Enter, so what runs could differ from
+    // what was approved (F6).
+    if command.contains('\t') {
+        return Err(
+            "This command contains a TAB - the shell would complete on it before running, so what runs could differ from what was approved. Nothing was run."
+                .into(),
+        );
+    }
+    match forbidden_terminal_char(command) {
+        Some(ForbiddenChar::Control(c)) => Err(format!(
+            "This command contains a control character (U+{:04X}) - the assistant may only run one line with no control keys, exactly as shown for approval. Nothing was run.",
+            c as u32
+        )),
+        Some(ForbiddenChar::Disguising(c)) => Err(format!(
+            "This command contains an invisible or text-direction character (U+{:04X}) that could make it look different from what would run. Nothing was run.",
+            c as u32
+        )),
+        None => Ok(()),
+    }
 }
 
 // ─── Config commands ────────────────────────────────────────────────────────
@@ -1001,6 +1060,10 @@ pub fn assistant_get_level(app: AppHandle, tab_id: String) -> CmdResult<serde_js
     Ok(serde_json::json!({ "level": level }))
 }
 
+/// Run a command the user approved on the assistant's card: the command plus
+/// Enter on the session's stdin. The tab's level (Execute or higher) and the
+/// command's characters are checked first ([`check_exec_command`]); every run
+/// is audited (`assistant.exec`, first 200 characters).
 #[tauri::command]
 pub fn assistant_exec(
     app: AppHandle,
@@ -1009,12 +1072,7 @@ pub fn assistant_exec(
     command: String,
 ) -> CmdResult<serde_json::Value> {
     let level = app.state::<AssistantLevels>().get(&tab_id);
-    if !level_permits_exec(&level) {
-        return Err(format!(
-            "AI access level is '{level}' - raise it in the assistant panel to let the assistant run commands."
-        )
-        .into());
-    }
+    check_exec_command(&level, &command).map_err(CmdError)?;
     // The same gate as terminal_send (and assistant_type_text): a locked
     // vault drives no session - and leaves no audit row for a command that
     // could not run.
@@ -1438,6 +1496,79 @@ mod tests {
         assert!(check_typed_text("draft", &longest).is_ok());
         let err = check_typed_text("draft", &format!("{longest}x")).unwrap_err();
         assert!(err.contains("4096"), "{err}");
+    }
+
+    // ── AI commands run exactly what the Approve card shows (item 17) ───
+
+    /// Trojan Source: a bidi override or an invisible character makes the
+    /// Approve card show a command reordered or shortened, while the shell
+    /// runs it as written. `assistant_exec` refuses what typing refuses.
+    #[test]
+    fn exec_refuses_commands_that_could_hide_what_they_run() {
+        for hidden in [
+            "ls \u{202E}txt.exe",               // right-to-left override
+            "echo safe \u{2066}; rm x\u{2069}", // isolates
+            "rm\u{200B} -rf /tmp/x",            // zero-width space
+            "cat a\u{200F}b",                   // right-to-left mark
+            "\u{FEFF}id",                       // zero-width no-break space
+            "id\u{2028}rm x",                   // line separator
+            "a\u{2060}b",                       // word joiner
+            "a\u{E0041}b",                      // tag character
+        ] {
+            let err = check_exec_command("execute", hidden)
+                .expect_err(&format!("{hidden:?} must be refused"));
+            assert!(
+                err.contains("invisible or text-direction"),
+                "{hidden:?}: {err}"
+            );
+            assert!(err.contains("Nothing was run"), "{hidden:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn exec_refuses_control_characters_other_than_tab() {
+        for bad in [
+            "ls\nrm -rf /tmp/x", // a second line the card may not show
+            "ls\r",
+            "\u{3}",    // Ctrl-C
+            "\u{1b}[A", // ESC
+            "a\u{0}b",  // NUL
+            "a\u{9b}b", // C1 CSI
+        ] {
+            let err =
+                check_exec_command("yolo", bad).expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.contains("control character"), "{bad:?}: {err}");
+            assert!(err.contains("Nothing was run"), "{bad:?}: {err}");
+        }
+        let err = check_exec_command("execute", "id\nwhoami").unwrap_err();
+        assert!(err.contains("U+000A"), "{err}");
+        // Ordinary Unicode commands still run.
+        for ok in ["df -h", "echo 'héllo ✓'", "ls -la && df -h"] {
+            assert!(check_exec_command("execute", ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    /// F6: readline completes on TAB before Enter, so a command with a TAB
+    /// can run as something other than what was approved. Typing keeps TAB
+    /// (completion is what the user wants there).
+    #[test]
+    fn exec_refuses_tab_but_typing_keeps_it() {
+        for with_tab in ["ls /etc/pass\t", "printf 'a\tb'"] {
+            let err = check_exec_command("execute", with_tab)
+                .expect_err(&format!("{with_tab:?} must be refused"));
+            assert!(err.contains("TAB"), "{with_tab:?}: {err}");
+            assert!(err.contains("Nothing was run"), "{with_tab:?}: {err}");
+        }
+        assert!(check_typed_text("draft", "cd /var/log\t").is_ok());
+    }
+
+    #[test]
+    fn exec_still_needs_execute_or_yolo() {
+        for level in ["read", "draft", "", "admin"] {
+            let err = check_exec_command(level, "df -h").unwrap_err();
+            assert!(err.contains("access level"), "{level}: {err}");
+        }
+        assert!(check_exec_command("yolo", "df -h").is_ok());
     }
 
     // ── Provider client hardening (A6-10) ───────────────────────────────

@@ -198,7 +198,11 @@ impl BitwardenClient {
     }
 
     async fn connect_inner(&mut self) -> Result<KdfParams> {
-        self.base_url = resolve_safe_server_url(&self.server_url)?;
+        // The URL check resolves the host with the system resolver, which
+        // blocks: run it on the blocking pool, not on an async worker (A7-48).
+        let server_url = self.server_url.clone();
+        self.base_url =
+            tokio::task::spawn_blocking(move || resolve_safe_server_url(&server_url)).await??;
         if !self.email.contains('@') {
             anyhow::bail!("A valid account email is required.");
         }
@@ -269,29 +273,7 @@ impl BitwardenClient {
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
         if !status.is_success() {
-            if data
-                .get("TwoFactorProviders")
-                .map_or(false, |v| !v.is_null())
-            {
-                anyhow::bail!(
-                    "This account has two-factor login enabled, which SSHSpan does not support yet. \
-                     Use a dedicated account without 2FA for the sync."
-                );
-            }
-            let detail = data
-                .get("error_description")
-                .and_then(|v| v.as_str())
-                .or_else(|| data.get("error").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let suffix = if detail.is_empty() {
-                format!(" (HTTP {}).", status)
-            } else {
-                format!(": {}", detail)
-            };
-            anyhow::bail!(
-                "Vault login failed{} Check the server URL, account email and master password.",
-                suffix
-            );
+            anyhow::bail!("{}", login_failure_message(status, &data));
         }
 
         self.access_token = Some(zeroize::Zeroizing::new(
@@ -400,7 +382,7 @@ impl BitwardenClient {
             reject_redirect(resp.status())?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let detail = read_body_capped_text(resp).await.unwrap_or_default();
+                let detail = error_detail(&read_body_capped_text(resp).await.unwrap_or_default());
                 anyhow::bail!("Vault request {method} {path} failed (HTTP {status}): {detail}");
             }
             return read_body_capped_json(resp).await;
@@ -617,6 +599,204 @@ impl BitwardenClient {
     }
 }
 
+/// What `bitwarden_get_config` shows the renderer: the saved settings and the
+/// last result, and whether a master password is stored - never the sealed
+/// password itself. Without `hasMasterPassword` the form showed an empty
+/// field after Save and a missing password only surfaced at the next sync
+/// (A5-35).
+pub fn config_view(config: &crate::db::BitwardenConfig) -> serde_json::Value {
+    serde_json::json!({
+        "server_url": config.server_url,
+        "email": config.email,
+        "folder_name": config.folder_name,
+        "servers_folder_name": config.servers_folder_name,
+        "last_sync": config.last_sync.map(|d| d.to_rfc3339()),
+        "last_result": config
+            .last_result
+            .as_ref()
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()),
+        "hasMasterPassword": config
+            .master_password
+            .as_deref()
+            .is_some_and(|sealed| !sealed.is_empty()),
+    })
+}
+
+/// The account `bitwarden_test_connection` logs in to.
+pub struct TestTarget {
+    pub server_url: String,
+    pub email: String,
+    pub master_password: zeroize::Zeroizing<String>,
+}
+
+/// Whether two account emails name the same account (trimmed, case-folded).
+fn same_account(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// Whether `server_url` (already normalized) and `email` are the saved ones -
+/// the only server and account the SAVED master password may be sent to.
+fn is_saved_endpoint(saved: &crate::db::BitwardenConfig, server_url: &str, email: &str) -> bool {
+    saved.server_url.as_deref() == Some(server_url)
+        && saved
+            .email
+            .as_deref()
+            .is_some_and(|saved_email| same_account(saved_email, email))
+}
+
+/// The account to test: each field as typed into the form when it was given
+/// (not blank), the saved setting otherwise (A2-52). "Test connection" used
+/// to read only the saved settings, so testing a form before saving it
+/// failed, and testing an edited URL reported success for the OLD server.
+/// `normalize_url` is the save-time URL check (`resolve_safe_server_url`), so
+/// the server compared and returned is the normalized one. The saved password
+/// is unsealed (`unseal_saved`) only when no password was typed AND the server
+/// and account are the saved ones: a compromised renderer must not be able to
+/// send the saved master password's hash to a server of its choosing (F1).
+pub fn resolve_test_target(
+    saved: &crate::db::BitwardenConfig,
+    server_url: Option<String>,
+    email: Option<String>,
+    master_password: Option<zeroize::Zeroizing<String>>,
+    normalize_url: impl Fn(&str) -> std::result::Result<String, String>,
+    unseal_saved: impl FnOnce(&str) -> std::result::Result<zeroize::Zeroizing<String>, String>,
+) -> std::result::Result<TestTarget, String> {
+    let given = |value: Option<String>| {
+        value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let server_url = given(server_url)
+        .or_else(|| given(saved.server_url.clone()))
+        .ok_or_else(|| "Enter the server URL to test the connection.".to_string())?;
+    let server_url = normalize_url(&server_url)?;
+    let email = given(email)
+        .or_else(|| given(saved.email.clone()))
+        .ok_or_else(|| "Enter the account email to test the connection.".to_string())?;
+    let master_password = match master_password.filter(|pw| !pw.is_empty()) {
+        Some(typed) => typed,
+        None => {
+            let sealed = saved
+                .master_password
+                .as_deref()
+                .filter(|sealed| !sealed.is_empty())
+                .ok_or_else(|| {
+                    "Enter the vault master password to test the connection.".to_string()
+                })?;
+            if !is_saved_endpoint(saved, &server_url, &email) {
+                return Err(
+                    "Enter the vault master password to test a different server or account.".into(),
+                );
+            }
+            unseal_saved(sealed)?
+        }
+    };
+    Ok(TestTarget {
+        server_url,
+        email,
+        master_password,
+    })
+}
+
+/// Whether saving these settings without a new password may keep the stored
+/// one: only for the same server and account (F1). A changed URL or email
+/// with no new password is refused - the old password is never kept for a
+/// different endpoint, and dropping it silently would surprise the user at
+/// the next sync. `server_url` is normalized.
+pub fn check_save_keeps_password(
+    saved: &crate::db::BitwardenConfig,
+    server_url: &str,
+    email: &str,
+    new_password_given: bool,
+) -> std::result::Result<(), String> {
+    let has_stored = saved
+        .master_password
+        .as_deref()
+        .is_some_and(|sealed| !sealed.is_empty());
+    if new_password_given || !has_stored || is_saved_endpoint(saved, server_url, email) {
+        Ok(())
+    } else {
+        Err("Enter the master password for the new server or account.".into())
+    }
+}
+
+/// The error for a refused login (`token_request`), from the status and the
+/// server's JSON answer. The server's text is cut like every other vault
+/// error detail ([`error_detail`]); it used to be quoted whole.
+fn login_failure_message(status: reqwest::StatusCode, data: &serde_json::Value) -> String {
+    if data
+        .get("TwoFactorProviders")
+        .map_or(false, |v| !v.is_null())
+    {
+        return "This account has two-factor login enabled, which SSHSpan does not support yet. \
+                Use a dedicated account without 2FA for the sync."
+            .to_string();
+    }
+    let detail = data
+        .get("error_description")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("error").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let suffix = if detail.is_empty() {
+        format!(" (HTTP {}).", status)
+    } else {
+        format!(": {}", error_detail(detail))
+    };
+    format!("Vault login failed{suffix} Check the server URL, account email and master password.")
+}
+
+/// What a sync-settings save writes: the URL (already normalized by the
+/// save-time check), the account email, a newly sealed master password
+/// (`None` = keep the stored one) and the folder names.
+pub struct BitwardenSave {
+    pub server_url: String,
+    pub email: String,
+    pub sealed_password: Option<String>,
+    pub folder_name: String,
+    pub servers_folder_name: String,
+}
+
+/// Apply a save to `current` - the settings as stored when the save is
+/// written. The stored password is only kept for its own server and account
+/// ([`check_save_keeps_password`] against `current`, not against a copy read
+/// earlier), and only a newly sealed password is written.
+pub fn apply_bitwarden_save(
+    current: &mut crate::db::BitwardenConfig,
+    save: BitwardenSave,
+) -> Result<()> {
+    check_save_keeps_password(
+        current,
+        &save.server_url,
+        &save.email,
+        save.sealed_password.is_some(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    current.server_url = Some(save.server_url);
+    current.email = Some(save.email);
+    if let Some(sealed) = save.sealed_password {
+        current.master_password = Some(sealed);
+    }
+    current.folder_name = Some(save.folder_name);
+    current.servers_folder_name = Some(save.servers_folder_name);
+    if current.device_id.is_none() {
+        current.device_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    Ok(())
+}
+
+/// Save the sync settings: `prepare` does the slow part (the URL check, the
+/// seal) and returns what to write; the write is then ONE transaction that
+/// re-reads the settings and checks the save against them (F1-b) - nothing
+/// read before the slow part is written back.
+pub async fn save_bitwarden_settings(
+    db: &crate::db::Database,
+    prepare: impl std::future::Future<Output = std::result::Result<BitwardenSave, String>>,
+) -> std::result::Result<(), String> {
+    let save = prepare.await?;
+    db.update_bitwarden_config(|current| apply_bitwarden_save(current, save))
+        .map_err(|e| e.to_string())
+}
+
 /// Best-effort anonymous server probe used by "Test connection".
 pub async fn probe_server_version(base_url: &str) -> Option<String> {
     // Same no-redirect policy as the main client (see BitwardenClient::new),
@@ -683,6 +863,23 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
         }
     }
     Ok(body)
+}
+
+/// Longest server text an error message keeps.
+const MAX_ERROR_DETAIL_CHARS: usize = 300;
+
+/// A vault server's error body, as it goes into an error message: cut to
+/// [`MAX_ERROR_DETAIL_CHARS`] characters (on a character boundary) with an
+/// ellipsis. The whole body - up to the 50 MiB read cap - used to land in the
+/// error, the sync result's `errors` and the stored last result (F7).
+fn error_detail(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(MAX_ERROR_DETAIL_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 /// Read a response body as text with the size cap enforced.
@@ -850,6 +1047,270 @@ mod tests {
             "refresh token must be zeroed after close()"
         );
         assert!(client.master_password.is_empty());
+    }
+
+    fn saved_config() -> crate::db::BitwardenConfig {
+        crate::db::BitwardenConfig {
+            server_url: Some("https://vault.saved.example".into()),
+            email: Some("saved@example.com".into()),
+            master_password: Some("sealed-blob".into()),
+            folder_name: Some("SSHSpan_Keys".into()),
+            servers_folder_name: None,
+            device_id: Some("device".into()),
+            last_sync: None,
+            last_result: None,
+        }
+    }
+
+    #[test]
+    fn config_view_reports_a_stored_master_password_without_returning_it() {
+        // A5-35: the form could not tell whether a password was stored.
+        let view = config_view(&saved_config());
+        assert_eq!(view["hasMasterPassword"], true);
+        assert_eq!(view["server_url"], "https://vault.saved.example");
+        assert!(view.get("master_password").is_none());
+        assert!(
+            !view.to_string().contains("sealed-blob"),
+            "the sealed password never reaches the renderer"
+        );
+        let mut none = saved_config();
+        none.master_password = None;
+        assert_eq!(config_view(&none)["hasMasterPassword"], false);
+        let mut empty = saved_config();
+        empty.master_password = Some(String::new());
+        assert_eq!(config_view(&empty)["hasMasterPassword"], false);
+    }
+
+    #[test]
+    fn test_connection_uses_the_form_values_before_the_saved_ones() {
+        use zeroize::Zeroizing;
+        // A2-52: "Test connection" before "Save" tested the OLD settings.
+        let saved = saved_config();
+        let target = resolve_test_target(
+            &saved,
+            Some(" https://vault.form.example ".into()),
+            Some("form@example.com".into()),
+            Some(Zeroizing::new("form-pw".into())),
+            |url: &str| Ok(url.trim_end_matches('/').to_string()),
+            |_| panic!("a password typed into the form must not unseal the saved one"),
+        )
+        .unwrap();
+        assert_eq!(target.server_url, "https://vault.form.example");
+        assert_eq!(target.email, "form@example.com");
+        assert_eq!(target.master_password.as_str(), "form-pw");
+
+        // Blank form fields fall back to the saved settings.
+        let target = resolve_test_target(
+            &saved,
+            Some("   ".into()),
+            None,
+            Some(Zeroizing::new(String::new())),
+            |url: &str| Ok(url.trim_end_matches('/').to_string()),
+            |sealed| {
+                assert_eq!(sealed, "sealed-blob");
+                Ok(Zeroizing::new("saved-pw".into()))
+            },
+        )
+        .unwrap();
+        assert_eq!(target.server_url, "https://vault.saved.example");
+        assert_eq!(target.email, "saved@example.com");
+        assert_eq!(target.master_password.as_str(), "saved-pw");
+
+        // A first-time form with nothing saved yet names what is missing.
+        let blank = crate::db::BitwardenConfig::default();
+        let missing = |url: Option<&str>, email: Option<&str>, pw: Option<&str>| {
+            resolve_test_target(
+                &blank,
+                url.map(String::from),
+                email.map(String::from),
+                pw.map(|p| Zeroizing::new(p.to_string())),
+                |url: &str| Ok(url.trim_end_matches('/').to_string()),
+                |_| unreachable!("nothing is saved"),
+            )
+            .err()
+            .unwrap()
+        };
+        assert!(missing(None, Some("a@b.example"), Some("p")).contains("server URL"));
+        assert!(missing(Some("https://v.example"), None, Some("p")).contains("email"));
+        assert!(
+            missing(Some("https://v.example"), Some("a@b.example"), None)
+                .contains("master password")
+        );
+    }
+
+    #[test]
+    fn saved_password_is_only_unsealed_for_the_saved_server_and_account() {
+        use zeroize::Zeroizing;
+        // F1: a compromised renderer typed its own server (or account) and let
+        // the SAVED master password log in there.
+        let saved = saved_config();
+        for (url, email) in [
+            (Some("https://evil.example"), None),
+            (None, Some("someone-else@example.com")),
+        ] {
+            let err = resolve_test_target(
+                &saved,
+                url.map(String::from),
+                email.map(String::from),
+                None::<Zeroizing<String>>,
+                |url: &str| Ok(url.trim_end_matches('/').to_string()),
+                |sealed| -> std::result::Result<Zeroizing<String>, String> {
+                    panic!("the saved password must not be unsealed for {sealed}")
+                },
+            )
+            .err()
+            .unwrap();
+            assert!(err.contains("different server or account"), "{err}");
+        }
+    }
+
+    fn fix2_db() -> crate::db::Database {
+        let db = crate::db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-test-{}.db", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        db.save_bitwarden_config(&saved_config()).unwrap();
+        db
+    }
+
+    fn save_for(url: &str, email: &str, sealed: Option<&str>) -> BitwardenSave {
+        BitwardenSave {
+            server_url: url.into(),
+            email: email.into(),
+            sealed_password: sealed.map(String::from),
+            folder_name: "SSHSpan_Keys".into(),
+            servers_folder_name: "SSHSpan_Servers".into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_less_save_keeps_a_password_stored_meanwhile() {
+        // F1-b (c): the save wrote back the sealed password it had read before
+        // its URL check, over the one another save had just stored.
+        let db = fix2_db();
+        let other = db.clone();
+        save_bitwarden_settings(&db, async move {
+            other
+                .update_bitwarden_config(|current| {
+                    current.master_password = Some("sealed-new".into());
+                    Ok(())
+                })
+                .unwrap();
+            Ok(save_for(
+                "https://vault.saved.example",
+                "saved@example.com",
+                None,
+            ))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.load_bitwarden_config()
+                .unwrap()
+                .master_password
+                .as_deref(),
+            Some("sealed-new")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_endpoint_check_uses_the_settings_as_stored_at_write_time() {
+        // F1-b: another save moved the settings to a new server (with its own
+        // password) while this password-less save of the OLD server ran: the
+        // new password must not be kept for the old server.
+        let db = fix2_db();
+        let other = db.clone();
+        let err = save_bitwarden_settings(&db, async move {
+            other
+                .update_bitwarden_config(|current| {
+                    current.server_url = Some("https://vault.new.example".into());
+                    current.master_password = Some("sealed-new".into());
+                    Ok(())
+                })
+                .unwrap();
+            Ok(save_for(
+                "https://vault.saved.example",
+                "saved@example.com",
+                None,
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Enter the master password for the new server or account."
+        );
+        let stored = db.load_bitwarden_config().unwrap();
+        assert_eq!(
+            stored.server_url.as_deref(),
+            Some("https://vault.new.example")
+        );
+        assert_eq!(stored.master_password.as_deref(), Some("sealed-new"));
+    }
+
+    #[test]
+    fn a_login_refusal_quotes_at_most_a_short_server_text() {
+        // F7 sibling: token_request put the server's error_description into
+        // the error uncapped.
+        let data = serde_json::json!({ "error_description": "x".repeat(100_000) });
+        let message = login_failure_message(reqwest::StatusCode::BAD_REQUEST, &data);
+        assert!(message.starts_with("Vault login failed: "), "{message}");
+        assert!(message.chars().count() < 500, "{}", message.len());
+        assert!(message.contains('…'));
+        let short = serde_json::json!({ "error": "invalid_grant" });
+        assert_eq!(
+            login_failure_message(reqwest::StatusCode::BAD_REQUEST, &short),
+            "Vault login failed: invalid_grant Check the server URL, account email and master password."
+        );
+    }
+
+    #[test]
+    fn a_changed_server_or_account_needs_its_own_password() {
+        // F1, save side: a changed URL or email with no new password must not
+        // keep the old sealed password for the new endpoint.
+        let saved = saved_config();
+        assert!(check_save_keeps_password(
+            &saved,
+            "https://vault.saved.example",
+            " SAVED@example.com ",
+            false
+        )
+        .is_ok());
+        for (url, email) in [
+            ("https://vault.other.example", "saved@example.com"),
+            ("https://vault.saved.example", "other@example.com"),
+        ] {
+            let err = check_save_keeps_password(&saved, url, email, false).unwrap_err();
+            assert_eq!(
+                err,
+                "Enter the master password for the new server or account."
+            );
+            assert!(check_save_keeps_password(&saved, url, email, true).is_ok());
+        }
+        let mut nothing_stored = saved_config();
+        nothing_stored.master_password = None;
+        assert!(check_save_keeps_password(
+            &nothing_stored,
+            "https://other.example",
+            "x@y.example",
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn vault_error_details_are_cut_short() {
+        // F7: a whole response body (up to 50 MiB) went into errors and the
+        // stored last result.
+        let long = "é".repeat(5_000);
+        let detail = error_detail(&long);
+        assert!(
+            detail.chars().count() <= MAX_ERROR_DETAIL_CHARS + 1,
+            "{}",
+            detail.len()
+        );
+        assert!(detail.ends_with('…'));
+        assert_eq!(error_detail("short"), "short");
     }
 
     #[test]

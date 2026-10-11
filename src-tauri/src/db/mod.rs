@@ -88,6 +88,39 @@ pub struct ServerRecord {
     pub bitwarden_updated_at: Option<String>,
 }
 
+/// What a Bitwarden pull writes into an existing key row
+/// ([`Database::apply_pulled_key`]).
+#[derive(Debug, Clone)]
+pub struct KeyPull {
+    pub name: String,
+    pub key_type: String,
+    pub public_key: String,
+    /// Sealed with the vault password.
+    pub private_key_encrypted: String,
+    pub fingerprint_sha256: String,
+    pub fingerprint_md5: String,
+    pub comment: String,
+    /// The remote copy's revision, epoch milliseconds.
+    pub bitwarden_revision_ts: Option<i64>,
+}
+
+/// What a Bitwarden pull writes into an existing server row
+/// ([`Database::apply_pulled_server`]).
+#[derive(Debug, Clone)]
+pub struct ServerPull {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_method: String,
+    pub key_id: Option<String>,
+    pub category_id: Option<String>,
+    /// Sealed with the vault password, `None` when the item holds none.
+    pub saved_password: Option<String>,
+    /// The remote copy's `revisionDate`.
+    pub bitwarden_revision_ts: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownHost {
     pub host: String,
@@ -876,16 +909,101 @@ impl Database {
     }
 
     /// Record (`Some`) or clear (`None`) where a key is deployed - those two
-    /// columns and `updated_at`, nothing else (C1): the deploy commands used
-    /// to write the whole row back, sealed blob included.
+    /// columns, nothing else (C1): the deploy commands used to write the whole
+    /// row back, sealed blob included. Not `updated_at` either: that is the
+    /// Bitwarden sync's "changed locally" marker, and a deploy or undeploy
+    /// changes nothing the sync uploads - bumping it re-uploaded the key on
+    /// the next sync and counted a conflict (A7-23 / RU5 hand-off 11).
     pub fn set_key_deployment(&self, id: &str, deploy_path: Option<&str>) -> Result<()> {
         block(async {
-            sqlx::query(
-                "UPDATE keys SET deployed = ?, deploy_path = ?, updated_at = ? WHERE id = ?",
+            sqlx::query("UPDATE keys SET deployed = ?, deploy_path = ? WHERE id = ?")
+                .bind(deploy_path.is_some() as i64)
+                .bind(deploy_path)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Mark a key as changed for the Bitwarden sync (`updated_at` only) - for
+    /// changes the sync uploads that touch no key column, such as its
+    /// categories, which travel in the item's notes (A7-23).
+    pub fn mark_key_changed(&self, id: &str) -> Result<()> {
+        block(async {
+            sqlx::query("UPDATE keys SET updated_at = ? WHERE id = ?")
+                .bind(Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Write a key pulled from Bitwarden into its row: the key material,
+    /// name and comment the item carries, the remote revision, and the sync
+    /// marks - and nothing else. The sync used to write back the whole row it
+    /// had read before its network round trips, which erased a deployment
+    /// recorded meanwhile (RU5 hand-off 12).
+    /// Written only while the row is still the one the sync read
+    /// (`expected_updated_at`): a rename made while the pull sealed, or a row
+    /// deleted meanwhile, is never overwritten - false then, nothing written
+    /// (fix round M4).
+    pub fn apply_pulled_key(
+        &self,
+        id: &str,
+        pulled: &KeyPull,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        block(async {
+            // BEGIN IMMEDIATE: the row is read, then written - a deferred
+            // transaction was refused at once ("database is locked") when
+            // another connection was writing; this one waits (round 4).
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT updated_at FROM keys WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(stored) = stored.filter(|s| same_instant(s, expected_updated_at)) else {
+                return Ok(false);
+            };
+            let res = sqlx::query(
+                "UPDATE keys SET name = ?, key_type = ?, public_key = ?, private_key_encrypted = ?, \
+                 fingerprint_sha256 = ?, fingerprint_md5 = ?, comment = ?, updated_at = ?, \
+                 bitwarden_revision_ts = ?, bitwarden_updated_at = ? WHERE id = ? AND updated_at = ?",
             )
-            .bind(deploy_path.is_some() as i64)
-            .bind(deploy_path)
-            .bind(Utc::now().to_rfc3339())
+            .bind(&pulled.name)
+            .bind(&pulled.key_type)
+            .bind(&pulled.public_key)
+            .bind(&pulled.private_key_encrypted)
+            .bind(&pulled.fingerprint_sha256)
+            .bind(&pulled.fingerprint_md5)
+            .bind(&pulled.comment)
+            .bind(now.to_rfc3339())
+            .bind(pulled.bitwarden_revision_ts.map(|v| v.to_string()))
+            .bind(now.timestamp_millis().to_string())
+            .bind(id)
+            .bind(&stored)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() != 1 {
+                return Ok(false);
+            }
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    /// Forget a key's Bitwarden link (its item is gone and the key is not
+    /// uploaded, e.g. public-only), so the loss is reported once (fix M9).
+    pub fn clear_key_sync_link(&self, id: &str) -> Result<()> {
+        block(async {
+            sqlx::query(
+                "UPDATE keys SET bitwarden_id = NULL, bitwarden_revision_ts = NULL, \
+                 bitwarden_updated_at = NULL WHERE id = ?",
+            )
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -905,24 +1023,28 @@ impl Database {
         })
     }
 
-    /// Update only Bitwarden sync metadata on a key row (lightweight, no full record needed).
+    /// Update only Bitwarden sync metadata on a key row (lightweight, no full
+    /// record needed). `synced_marker_ms` is the `updated_at` of the row the
+    /// sync pushed or linked (epoch milliseconds), not the time of this write:
+    /// an edit made while the upload was in flight is newer than that marker
+    /// and is still uploaded at the next sync (A7-23).
     pub fn update_key_sync_meta(
         &self,
         id: &str,
         bitwarden_id: &str,
         revision_date: Option<&str>,
+        synced_marker_ms: i64,
     ) -> Result<()> {
         let rev_ts = revision_date
             .and_then(|rd| chrono::DateTime::parse_from_rfc3339(rd).ok())
             .map(|rd| rd.timestamp_millis().to_string());
-        let now_ts = chrono::Utc::now().timestamp_millis().to_string();
         block(async {
             sqlx::query(
                 "UPDATE keys SET bitwarden_id = ?, bitwarden_revision_ts = ?, bitwarden_updated_at = ? WHERE id = ?"
             )
             .bind(bitwarden_id)
             .bind(&rev_ts)
-            .bind(&now_ts)
+            .bind(synced_marker_ms.to_string())
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -1132,63 +1254,56 @@ impl Database {
 
     // ── Bitwarden config ───────────────────────────────────────────────────
 
+    /// Change the sync settings in ONE transaction: `update` gets the settings
+    /// as stored inside that transaction and edits them - or refuses, and
+    /// nothing is written. Every field it leaves set is then written back,
+    /// all or nothing (F1-b). The fields used to be separate autocommit
+    /// statements over a pooled connection, so another connection could read
+    /// a new server URL beside the OLD sealed password, and a save that failed
+    /// part-way kept half its fields; a save that re-wrote a copy read before
+    /// a slow step also put back a password another save had just stored.
+    ///
+    /// `BEGIN IMMEDIATE`: the transaction takes the write lock before it
+    /// reads, so a write held by another connection makes it WAIT (busy
+    /// timeout). A deferred transaction that read first was refused at once
+    /// ("database is locked") when it then tried to write (fix round 3).
+    pub fn update_bitwarden_config(
+        &self,
+        update: impl FnOnce(&mut BitwardenConfig) -> Result<()>,
+    ) -> Result<()> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT key, value FROM bitwarden_config")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let mut config = bitwarden_config_from_rows(rows);
+            update(&mut config)?;
+            write_bitwarden_config(&mut tx, &config).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// Write every set field of `config`, in one transaction (see
+    /// [`Database::update_bitwarden_config`]).
     pub fn save_bitwarden_config(&self, config: &BitwardenConfig) -> Result<()> {
         block(async {
-            let fields: [(&str, Option<String>); 8] = [
-                ("server_url", config.server_url.clone()),
-                ("email", config.email.clone()),
-                ("master_password", config.master_password.clone()),
-                ("folder_name", config.folder_name.clone()),
-                ("servers_folder_name", config.servers_folder_name.clone()),
-                ("device_id", config.device_id.clone()),
-                ("last_sync", config.last_sync.map(|d| d.to_rfc3339())),
-                ("last_result", config.last_result.clone()),
-            ];
-
-            for (key, value) in fields {
-                if let Some(v) = value {
-                    sqlx::query(
-                        "INSERT INTO bitwarden_config (key, value, updated_at) VALUES (?, ?, ?) \
-                         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
-                    )
-                    .bind(key)
-                    .bind(v)
-                    .bind(Utc::now().to_rfc3339())
-                    .execute(&self.pool)
-                    .await?;
-                }
-            }
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            write_bitwarden_config(&mut tx, config).await?;
+            tx.commit().await?;
             Ok(())
         })
     }
 
     pub fn load_bitwarden_config(&self) -> Result<BitwardenConfig> {
         block(async {
-            let rows = sqlx::query("SELECT key, value FROM bitwarden_config")
-                .fetch_all(&self.pool)
-                .await?;
-
-            let mut config = BitwardenConfig::default();
-            for row in rows {
-                let key: String = row.get("key");
-                let value: String = row.get("value");
-                match key.as_str() {
-                    "server_url" => config.server_url = Some(value),
-                    "email" => config.email = Some(value),
-                    "master_password" => config.master_password = Some(value),
-                    "folder_name" => config.folder_name = Some(value),
-                    "servers_folder_name" => config.servers_folder_name = Some(value),
-                    "device_id" => config.device_id = Some(value),
-                    "last_sync" => {
-                        config.last_sync = DateTime::parse_from_rfc3339(&value)
-                            .ok()
-                            .map(|d| d.with_timezone(&Utc))
-                    }
-                    "last_result" => config.last_result = Some(value),
-                    _ => {}
-                }
-            }
-            Ok(config)
+            // One statement: it sees one committed state of the table.
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT key, value FROM bitwarden_config")
+                    .fetch_all(&self.pool)
+                    .await?;
+            Ok(bitwarden_config_from_rows(rows))
         })
     }
 
@@ -1510,7 +1625,10 @@ impl Database {
     /// included, and every root of both scopes for a root (A7-40 / A2-31).
     pub fn delete_category(&self, id: &str) -> Result<Vec<String>> {
         block(async {
-            let mut tx = self.pool.begin().await?;
+            // BEGIN IMMEDIATE: reads the parent and the children, then writes;
+            // a deferred transaction was refused at once while another
+            // connection was writing, instead of waiting (round 4).
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let parent: Option<String> =
                 sqlx::query_scalar("SELECT parent_id FROM categories WHERE id = ?")
                     .bind(id)
@@ -1528,10 +1646,25 @@ impl Database {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+            // The keys losing this category and the servers moved up below
+            // change what the Bitwarden sync uploads (categories travel in
+            // the items' notes): mark them changed (A7-23, fix M5). A rename
+            // or move marks nothing - the ids stay, only the path text
+            // changes, and it reaches the notes with the next upload.
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "UPDATE keys SET updated_at = ? \
+                 WHERE id IN (SELECT key_id FROM key_categories WHERE category_id = ?)",
+            )
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
             // A host category's parent is a host category (create/reparent
             // enforce the scope), so the servers stay correctly filed.
-            sqlx::query("UPDATE servers SET category_id = ? WHERE category_id = ?")
+            sqlx::query("UPDATE servers SET category_id = ?, updated_at = ? WHERE category_id = ?")
                 .bind(&parent)
+                .bind(&now)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
@@ -2013,6 +2146,87 @@ impl Database {
                 .execute(&self.pool)
                 .await?;
             Ok(())
+        })
+    }
+
+    /// Record a Bitwarden link on a server row: its item id, the remote
+    /// revision and the sync marker - nothing else, so an edit made while the
+    /// upload ran is neither reverted nor lost to the next sync (A7-23 / RU5
+    /// hand-off 12). The marker is the pushed row's `updated_at`, or `None`
+    /// when the row's state was never uploaded to this item (a re-link found
+    /// through the item's notes): the next sync then sees the row as changed
+    /// and uploads it (fix round 2, N1).
+    pub fn set_server_sync_meta(
+        &self,
+        id: &str,
+        bitwarden_id: &str,
+        revision_date: Option<&str>,
+        synced_marker: Option<&str>,
+    ) -> Result<()> {
+        block(async {
+            sqlx::query(
+                "UPDATE servers SET bitwarden_id = ?, bitwarden_revision_ts = ?, \
+                 bitwarden_updated_at = ? WHERE id = ?",
+            )
+            .bind(bitwarden_id)
+            .bind(revision_date)
+            .bind(synced_marker)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// Write a server pulled from Bitwarden into its row: what the Login item
+    /// carries, the remote revision and the sync marks. The `.pem` path,
+    /// colour, last connection and the link stay as the row has them (RU5
+    /// hand-off 12).
+    /// Like [`Database::apply_pulled_key`], only while the row is still the
+    /// one the sync read; false otherwise.
+    pub fn apply_pulled_server(
+        &self,
+        id: &str,
+        pulled: &ServerPull,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        block(async {
+            // BEGIN IMMEDIATE: read, then write - see apply_pulled_key.
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT updated_at FROM servers WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(stored) = stored.filter(|s| same_instant(s, expected_updated_at)) else {
+                return Ok(false);
+            };
+            let res = sqlx::query(
+                "UPDATE servers SET name = ?, host = ?, port = ?, username = ?, auth_method = ?, \
+                 key_id = ?, category_id = ?, saved_password = ?, updated_at = ?, \
+                 bitwarden_revision_ts = ?, bitwarden_updated_at = ? WHERE id = ? AND updated_at = ?",
+            )
+            .bind(&pulled.name)
+            .bind(&pulled.host)
+            .bind(pulled.port as i64)
+            .bind(&pulled.username)
+            .bind(&pulled.auth_method)
+            .bind(&pulled.key_id)
+            .bind(&pulled.category_id)
+            .bind(&pulled.saved_password)
+            .bind(&now)
+            .bind(&pulled.bitwarden_revision_ts)
+            .bind(&now)
+            .bind(id)
+            .bind(&stored)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() != 1 {
+                return Ok(false);
+            }
+            tx.commit().await?;
+            Ok(true)
         })
     }
 
@@ -4027,7 +4241,69 @@ fn short_hash(s: &str) -> u32 {
     h
 }
 
-fn get_db_path(_app: &AppHandle) -> Result<PathBuf> {
+/// The sync settings from their `bitwarden_config` rows (key, value).
+fn bitwarden_config_from_rows(rows: Vec<(String, String)>) -> BitwardenConfig {
+    let mut config = BitwardenConfig::default();
+    for (key, value) in rows {
+        match key.as_str() {
+            "server_url" => config.server_url = Some(value),
+            "email" => config.email = Some(value),
+            "master_password" => config.master_password = Some(value),
+            "folder_name" => config.folder_name = Some(value),
+            "servers_folder_name" => config.servers_folder_name = Some(value),
+            "device_id" => config.device_id = Some(value),
+            "last_sync" => {
+                config.last_sync = DateTime::parse_from_rfc3339(&value)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            }
+            "last_result" => config.last_result = Some(value),
+            _ => {}
+        }
+    }
+    config
+}
+
+/// Upsert every set field of `config` inside `tx`.
+async fn write_bitwarden_config(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    config: &BitwardenConfig,
+) -> Result<()> {
+    let fields: [(&str, Option<String>); 8] = [
+        ("server_url", config.server_url.clone()),
+        ("email", config.email.clone()),
+        ("master_password", config.master_password.clone()),
+        ("folder_name", config.folder_name.clone()),
+        ("servers_folder_name", config.servers_folder_name.clone()),
+        ("device_id", config.device_id.clone()),
+        ("last_sync", config.last_sync.map(|d| d.to_rfc3339())),
+        ("last_result", config.last_result.clone()),
+    ];
+    let now = Utc::now().to_rfc3339();
+    for (key, value) in fields {
+        if let Some(v) = value {
+            sqlx::query(
+                "INSERT INTO bitwarden_config (key, value, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            )
+            .bind(key)
+            .bind(v)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+/// Whether a stored RFC 3339 timestamp is the instant `expected` (compared as
+/// instants, so formatting differences do not matter).
+fn same_instant(stored: &str, expected: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(stored).is_ok_and(|t| t.with_timezone(&Utc) == expected)
+}
+
+/// Where the vault database lives (also named in the startup error dialog
+/// when it cannot be opened).
+pub(crate) fn get_db_path(_app: &AppHandle) -> Result<PathBuf> {
     // Dev/test override: SSHSPAN_DB=<path> isolates a dev instance from the
     // real vault (used by the local e2e rig). Compiled only into debug
     // builds: in a release build, any process that can set this variable at
@@ -4042,4 +4318,329 @@ fn get_db_path(_app: &AppHandle) -> Result<PathBuf> {
     let dirs = ProjectDirs::from("org", "sshspan", "SSHSpan")
         .ok_or_else(|| anyhow::anyhow!("Could not determine app data directory"))?;
     Ok(dirs.data_dir().join("sshspan.db"))
+}
+
+#[cfg(test)]
+mod ru5_fix2_tests {
+    use super::*;
+
+    fn temp_db_path() -> PathBuf {
+        std::env::temp_dir().join(format!("sshspan-test-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    /// A database whose pool has ONE connection, so a TEMP trigger created on
+    /// it applies to every statement the database runs.
+    fn single_connection_db(path: &std::path::Path) -> Database {
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let pool = block(async {
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+        })
+        .unwrap();
+        let db = Database {
+            pool,
+            db_path: path.to_path_buf(),
+        };
+        db.migrate().unwrap();
+        db
+    }
+
+    fn settings(url: &str, email: &str, sealed: &str) -> BitwardenConfig {
+        BitwardenConfig {
+            server_url: Some(url.into()),
+            email: Some(email.into()),
+            master_password: Some(sealed.into()),
+            ..BitwardenConfig::default()
+        }
+    }
+
+    fn endpoint(config: &BitwardenConfig) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            config.server_url.clone(),
+            config.email.clone(),
+            config.master_password.clone(),
+        )
+    }
+
+    /// Make every write of the stored master password fail on `db`'s only
+    /// connection.
+    fn refuse_master_password_writes(db: &Database) {
+        for event in ["INSERT", "UPDATE"] {
+            block(
+                sqlx::query(&format!(
+                    "CREATE TEMP TRIGGER refuse_mp_{event} BEFORE {event} ON bitwarden_config \
+                 WHEN NEW.key = 'master_password' \
+                 BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"
+                ))
+                .execute(&db.pool),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_settings_save_that_fails_part_way_changes_nothing() {
+        // F1-b (a): the fields used to be separate autocommit statements, so
+        // a save that failed after the URL kept the NEW URL with the OLD
+        // sealed password.
+        let path = temp_db_path();
+        let db = single_connection_db(&path);
+        db.save_bitwarden_config(&settings("https://a.example", "a@example.com", "sealed-a"))
+            .unwrap();
+        refuse_master_password_writes(&db);
+        let result = db.update_bitwarden_config(|current| {
+            current.server_url = Some("https://b.example".into());
+            current.email = Some("b@example.com".into());
+            current.master_password = Some("sealed-b".into());
+            Ok(())
+        });
+        assert!(result.is_err(), "the refused write must fail the save");
+        let stored = db.load_bitwarden_config().unwrap();
+        assert_eq!(
+            endpoint(&stored),
+            (
+                Some("https://a.example".into()),
+                Some("a@example.com".into()),
+                Some("sealed-a".into())
+            ),
+            "a failed save must leave every field as it was"
+        );
+    }
+
+    #[test]
+    fn readers_never_see_a_mixed_server_account_and_password() {
+        // F1-b (b): a reader on another connection must see either the old
+        // settings or the new ones - never the new URL with the old password.
+        let path = temp_db_path();
+        let writer = single_connection_db(&path);
+        let a = settings("https://a.example", "a@example.com", "sealed-a");
+        let b = settings("https://b.example", "b@example.com", "sealed-b");
+        writer.save_bitwarden_config(&a).unwrap();
+        let reader = Database::open_at(path.clone()).unwrap();
+
+        // Deterministic: a save that fails after its first fields.
+        refuse_master_password_writes(&writer);
+        let next = b.clone();
+        assert!(writer
+            .update_bitwarden_config(move |current| {
+                *current = next;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(
+            endpoint(&reader.load_bitwarden_config().unwrap()),
+            endpoint(&a)
+        );
+        for event in ["INSERT", "UPDATE"] {
+            block(sqlx::query(&format!("DROP TRIGGER refuse_mp_{event}")).execute(&writer.pool))
+                .unwrap();
+        }
+
+        // Concurrent: whole settings switched back and forth while another
+        // connection keeps reading.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let (seen_a, seen_b) = (endpoint(&a), endpoint(&b));
+        let watcher = std::thread::spawn(move || {
+            let mut reads = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let seen = endpoint(&reader.load_bitwarden_config().unwrap());
+                assert!(
+                    seen == seen_a || seen == seen_b,
+                    "a reader saw a mixed tuple: {seen:?}"
+                );
+                reads += 1;
+            }
+            reads
+        });
+        for round in 0..40 {
+            let next = if round % 2 == 0 { b.clone() } else { a.clone() };
+            writer
+                .update_bitwarden_config(move |current| {
+                    *current = next;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(watcher.join().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_settings_write_waits_for_another_connections_write() {
+        // Round 3: the settings transaction read first and wrote second; with
+        // another connection holding a write, SQLite refused the upgrade at
+        // once ("database is locked") instead of waiting, so a finished sync
+        // failed to store its result and Save could fail for nothing.
+        let path = temp_db_path();
+        let db = Database::open_at(path.clone()).unwrap();
+        db.save_bitwarden_config(&settings("https://a.example", "a@example.com", "sealed-a"))
+            .unwrap();
+        let holder = hold_a_write(&path, 300);
+        let started = std::time::Instant::now();
+        db.update_bitwarden_config(|current| {
+            current.last_result = Some("{\"ok\":true}".into());
+            Ok(())
+        })
+        .expect("the settings write must wait for the other write, not fail");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "it waited for the other write: {:?}",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(
+            db.load_bitwarden_config().unwrap().last_result.as_deref(),
+            Some("{\"ok\":true}")
+        );
+    }
+
+    /// Hold a write on ANOTHER connection to the database at `path` for `ms`
+    /// milliseconds; returns once that connection holds the write lock.
+    fn hold_a_write(path: &std::path::Path, ms: u64) -> std::thread::JoinHandle<()> {
+        let other = Database::open_at(path.to_path_buf()).unwrap();
+        let (held, wait_for_hold) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            block(async {
+                let mut conn = other.pool.acquire().await.unwrap();
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "INSERT INTO config (key, value, updated_at) VALUES ('probe', 'x', 'now') \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+            })
+        });
+        wait_for_hold.recv().unwrap();
+        holder
+    }
+
+    /// A fixed instant the pull fixtures were last changed at.
+    fn changed_at() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_790_000_000_000).unwrap()
+    }
+
+    fn pull_fixture_key() -> KeyRecord {
+        KeyRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "before-pull".into(),
+            key_type: "ed25519".into(),
+            public_key: "ssh-ed25519 AAAA before".into(),
+            private_key_encrypted: "sealed-before".into(),
+            fingerprint_sha256: "SHA256:before".into(),
+            fingerprint_md5: "MD5:before".into(),
+            comment: String::new(),
+            created_at: changed_at(),
+            updated_at: changed_at(),
+            deployed: false,
+            deploy_path: None,
+            bitwarden_id: Some("c1".into()),
+            bitwarden_sync: true,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+            category_ids: Vec::new(),
+        }
+    }
+
+    fn pull_fixture_server() -> ServerRecord {
+        ServerRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "web".into(),
+            host: "before.example.com".into(),
+            port: 22,
+            username: "root".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "password".into(),
+            saved_password: None,
+            category_id: None,
+            color: None,
+            last_connected_at: None,
+            created_at: changed_at(),
+            updated_at: changed_at(),
+            bitwarden_id: Some("s1".into()),
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        }
+    }
+
+    #[test]
+    fn a_pull_waits_for_another_connections_write() {
+        // Round 4: apply_pulled_key / apply_pulled_server read the row and then
+        // wrote it in a deferred transaction, so another connection's write
+        // made the pull fail at once ("database is locked") instead of waiting.
+        let path = temp_db_path();
+        let db = Database::open_at(path.clone()).unwrap();
+        let key = pull_fixture_key();
+        db.insert_key(&key).unwrap();
+        let holder = hold_a_write(&path, 300);
+        let started = std::time::Instant::now();
+        let written = db
+            .apply_pulled_key(
+                &key.id,
+                &KeyPull {
+                    name: "pulled".into(),
+                    key_type: "ed25519".into(),
+                    public_key: "ssh-ed25519 AAAA pulled".into(),
+                    private_key_encrypted: "sealed-pulled".into(),
+                    fingerprint_sha256: "SHA256:before".into(),
+                    fingerprint_md5: "MD5:pulled".into(),
+                    comment: String::new(),
+                    bitwarden_revision_ts: Some(1),
+                },
+                key.updated_at,
+            )
+            .expect("the key pull must wait for the other write, not fail");
+        assert!(written);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "it waited for the other write: {:?}",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(db.get_key(&key.id).unwrap().unwrap().name, "pulled");
+
+        let server = pull_fixture_server();
+        db.insert_server(&server).unwrap();
+        let holder = hold_a_write(&path, 300);
+        let started = std::time::Instant::now();
+        let written = db
+            .apply_pulled_server(
+                &server.id,
+                &ServerPull {
+                    name: "web".into(),
+                    host: "pulled.example.com".into(),
+                    port: 2222,
+                    username: "ops".into(),
+                    auth_method: "password".into(),
+                    key_id: None,
+                    category_id: None,
+                    saved_password: None,
+                    bitwarden_revision_ts: None,
+                },
+                server.updated_at,
+            )
+            .expect("the server pull must wait for the other write, not fail");
+        assert!(written);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "it waited for the other write: {:?}",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(
+            db.get_server(&server.id).unwrap().unwrap().host,
+            "pulled.example.com"
+        );
+    }
 }

@@ -106,24 +106,13 @@ pub fn classify_url(raw: &str) -> Result<(String, UrlClass), String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("Server URL must not contain credentials.".into());
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "Server URL has no hostname.".to_string())?
-        .to_lowercase()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    if host.is_empty() {
-        return Err("Server URL has no hostname.".into());
-    }
-    let is_loopback =
-        matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.");
+    let (host, is_loopback) = url_host(&url)?;
     let class = match url.scheme() {
         "https" => UrlClass::Https,
         "http" if is_loopback => UrlClass::LoopbackInsecure,
         "http" => {
             return Err(
-                "Server URL must use https:// (plain http is only allowed for localhost/127.0.0.1/::1)."
+                "Server URL must use https:// (plain http is only allowed for localhost, 127.x addresses or ::1)."
                     .into(),
             )
         }
@@ -140,6 +129,31 @@ pub fn classify_url(raw: &str) -> Result<(String, UrlClass), String> {
         format!("{}://{}{}", url.scheme(), host_port, path)
     };
     Ok((base, class))
+}
+
+/// The host of a parsed URL as it is written back into the stored base, and
+/// whether plain http to it stays on this machine.
+///
+/// Loopback is decided on the PARSED host, never on its spelling: only an
+/// IPv4 address in 127.0.0.0/8, the IPv6 address ::1 and the name
+/// `localhost` qualify. The old string test (`starts_with("127.")`) passed
+/// host names such as `127.evil.example`, so the auth header went in
+/// cleartext to a machine anyone can name that way.
+///
+/// The text is the url crate's own serialization: IPv4 canonical (`127.1` is
+/// `127.0.0.1`), names lower-cased, and IPv6 literals KEPT in brackets - the
+/// base is stored and reused as a URL, and `[::1]:8080` parses as an address
+/// and a port where `::1:8080` does not.
+fn url_host(url: &url::Url) -> Result<(String, bool), String> {
+    use std::net::IpAddr;
+    let is_loopback = match url.host() {
+        Some(url::Host::Domain(name)) if !name.is_empty() => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip).is_loopback(),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).is_loopback(),
+        _ => return Err("Server URL has no hostname.".into()),
+    };
+    let host = url.host_str().unwrap_or_default().to_lowercase();
+    Ok((host, is_loopback))
 }
 
 /// Header names never valid as a static auth header: they override
@@ -2777,6 +2791,64 @@ mod tests {
         assert!(classify_url("https://user:pw@mcp.example.com").is_err());
         assert!(classify_url("ftp://mcp.example.com").is_err());
         assert!(classify_url("not a url").is_err());
+    }
+
+    #[test]
+    fn http_loopback_is_decided_on_the_parsed_address_not_a_name_prefix() {
+        // Host NAMES that only look like loopback: plain http to them would
+        // send the auth header in cleartext to whoever owns the name.
+        for bad in [
+            "http://127.evil.example/mcp",
+            "http://127.0.0.1.nip.io/mcp",
+            "http://127.0.0.1.evil.example:8080",
+            "http://localhost.evil.example/mcp",
+            // IPv4-mapped is not the loopback interface by std's definition.
+            "http://[::ffff:127.0.0.1]/mcp",
+        ] {
+            let err = classify_url(bad).unwrap_err();
+            assert!(err.contains("https"), "{bad} must be refused: {err}");
+        }
+        // Real loopback, however it is spelled, still passes; the url crate
+        // canonicalizes `127.1` to `127.0.0.1`.
+        for (ok, base) in [
+            ("http://127.1/mcp", "http://127.0.0.1/mcp"),
+            ("http://[::1]/mcp", "http://[::1]/mcp"),
+            ("http://127.255.0.9:3000", "http://127.255.0.9:3000"),
+            ("http://LOCALHOST:3000/mcp", "http://localhost:3000/mcp"),
+        ] {
+            let (got, class) = classify_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            assert_eq!(class, UrlClass::LoopbackInsecure, "{ok}");
+            assert_eq!(got, base, "{ok}");
+        }
+    }
+
+    #[test]
+    fn ipv6_literals_keep_their_brackets_in_the_stored_base() {
+        for (raw, want, want_class) in [
+            (
+                "http://[::1]:8080/mcp",
+                "http://[::1]:8080/mcp",
+                UrlClass::LoopbackInsecure,
+            ),
+            (
+                "https://[2001:db8::1]/mcp",
+                "https://[2001:db8::1]/mcp",
+                UrlClass::Https,
+            ),
+        ] {
+            let (base, class) = classify_url(raw).unwrap();
+            assert_eq!(base, want, "{raw}");
+            assert_eq!(class, want_class, "{raw}");
+            // Round trip: the stored base is a URL for the same address and
+            // classifies to itself.
+            let reparsed = url::Url::parse(&base).expect("the stored base must parse");
+            assert_eq!(
+                reparsed.host(),
+                url::Url::parse(raw).unwrap().host(),
+                "{raw}"
+            );
+            assert_eq!(classify_url(&base).unwrap().0, base, "{raw}");
+        }
     }
 
     // ── Header name validation ──────────────────────────────────────────
