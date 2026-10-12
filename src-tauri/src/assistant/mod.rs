@@ -93,29 +93,61 @@ fn level_permits_typing(level: &str) -> bool {
 /// line, not a file.
 const MAX_TYPED_CHARS: usize = 4096;
 
-/// Characters that are invisible or change the text direction, so a
-/// suggestion card could show the user something other than what gets
-/// typed: bidi embeddings/overrides/isolates and marks, zero-width spaces
-/// and joiners, line/paragraph separators, invisible operators, the BOM,
-/// interlinear annotation and tag characters ("ASCII smuggling").
-const DISGUISING_CHARS: [(char, char); 11] = [
-    ('\u{00AD}', '\u{00AD}'),
-    ('\u{061C}', '\u{061C}'),
-    ('\u{180E}', '\u{180E}'),
-    ('\u{200B}', '\u{200F}'),
-    ('\u{2028}', '\u{2029}'),
-    ('\u{202A}', '\u{202E}'),
-    ('\u{2060}', '\u{2064}'),
-    ('\u{2066}', '\u{2069}'),
-    ('\u{FEFF}', '\u{FEFF}'),
-    ('\u{FFF9}', '\u{FFFB}'),
-    ('\u{E0000}', '\u{E007F}'),
+/// Characters that are invisible, change the text direction or change how
+/// the text around them is drawn, so a suggestion or Approve card could show
+/// the user something other than what gets typed or run (item 10): every
+/// Unicode general-category Cf (format) code point - bidi embeddings,
+/// overrides, isolates and marks, zero-width spaces and joiners, invisible
+/// operators, the BOM, prepended number signs, interlinear annotation,
+/// format controls of historic scripts and music, tag characters ("ASCII
+/// smuggling") - checked against Unicode 15.1; every
+/// Default_Ignorable_Code_Point - the combining grapheme joiner, the Hangul
+/// fillers, the Khmer inherent vowels, the variation selectors and the code
+/// points reserved as default-ignorable, which a renderer draws as nothing;
+/// and the line and paragraph separators. A sorted table of inclusive
+/// ranges, searched by bisection; shared by typing and running
+/// ([`forbidden_terminal_char`]).
+const DISGUISING_CHARS: [(char, char); 26] = [
+    ('\u{00AD}', '\u{00AD}'),   // soft hyphen
+    ('\u{034F}', '\u{034F}'),   // combining grapheme joiner
+    ('\u{0600}', '\u{0605}'),   // Arabic number signs
+    ('\u{061C}', '\u{061C}'),   // Arabic letter mark
+    ('\u{06DD}', '\u{06DD}'),   // Arabic end of ayah
+    ('\u{070F}', '\u{070F}'),   // Syriac abbreviation mark
+    ('\u{0890}', '\u{0891}'),   // Arabic pound and piastre marks above
+    ('\u{08E2}', '\u{08E2}'),   // Arabic disputed end of ayah
+    ('\u{115F}', '\u{1160}'),   // Hangul choseong and jungseong fillers
+    ('\u{17B4}', '\u{17B5}'),   // Khmer inherent vowels
+    ('\u{180B}', '\u{180F}'),   // Mongolian variation selectors, vowel separator
+    ('\u{200B}', '\u{200F}'),   // zero-width space and joiners, LRM, RLM
+    ('\u{2028}', '\u{2029}'),   // line and paragraph separators
+    ('\u{202A}', '\u{202E}'),   // bidi embeddings and overrides
+    ('\u{2060}', '\u{206F}'),   // word joiner, invisible operators, isolates
+    ('\u{3164}', '\u{3164}'),   // Hangul filler
+    ('\u{FE00}', '\u{FE0F}'),   // variation selectors
+    ('\u{FEFF}', '\u{FEFF}'),   // zero-width no-break space (BOM)
+    ('\u{FFA0}', '\u{FFA0}'),   // halfwidth Hangul filler
+    ('\u{FFF0}', '\u{FFFB}'),   // reserved, interlinear annotation
+    ('\u{110BD}', '\u{110BD}'), // Kaithi number sign
+    ('\u{110CD}', '\u{110CD}'), // Kaithi number sign above
+    ('\u{13430}', '\u{1343F}'), // Egyptian hieroglyph format controls
+    ('\u{1BCA0}', '\u{1BCA3}'), // shorthand format controls
+    ('\u{1D173}', '\u{1D17A}'), // musical symbol format controls
+    ('\u{E0000}', '\u{E0FFF}'), // tags, variation selectors supplement
 ];
 
 fn is_disguising(c: char) -> bool {
     DISGUISING_CHARS
-        .iter()
-        .any(|&(first, last)| (first..=last).contains(&c))
+        .binary_search_by(|&(first, last)| {
+            if last < c {
+                std::cmp::Ordering::Less
+            } else if first > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Whether the assistant may type `text` into a terminal at `level`
@@ -231,18 +263,48 @@ pub fn assistant_get_config(app: AppHandle) -> CmdResult<serde_json::Value> {
         .db
         .load_assistant_config()
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({
-        "provider": config.provider,
-        "base_url": config.base_url,
-        "model": config.model,
-        // The sealed key never crosses the IPC boundary; the renderer only
-        // needs to know whether one is stored.
-        "has_api_key": config.api_key.is_some(),
-    }))
+    Ok(config_view(&config))
 }
 
+/// The settings as the renderer gets them. The sealed key never crosses the
+/// IPC boundary - only whether one is stored - and neither does a user name
+/// or password inside a base URL saved before that was refused: the URL comes
+/// back without them (so saving the form again stores it clean), while a chat
+/// refuses the saved one until then ([`resolve_provider`]).
+fn config_view(config: &crate::db::AssistantConfig) -> serde_json::Value {
+    serde_json::json!({
+        "provider": config.provider,
+        "base_url": config.base_url.as_deref().map(without_credentials),
+        "model": config.model,
+        "has_api_key": config.api_key.is_some(),
+    })
+}
+
+/// `url` without a user name or password; unchanged when it has none or is
+/// not a URL at all.
+fn without_credentials(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            // Both only fail for URLs that cannot have credentials.
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            let clean = parsed.to_string();
+            // `Url` adds a "/" to a bare origin; the saved form has none.
+            if url.ends_with('/') {
+                clean
+            } else {
+                clean.trim_end_matches('/').to_string()
+            }
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// Save the provider settings. Async, with the work on the blocking pool
+/// (RU6b item 8): a new API key is sealed with Argon2id, and as a
+/// synchronous command that ran on the main thread and froze the window.
 #[tauri::command]
-pub fn assistant_save_config(
+pub async fn assistant_save_config(
     app: AppHandle,
     provider: String,
     base_url: Option<String>,
@@ -257,10 +319,58 @@ pub fn assistant_save_config(
     // provider or base-URL origin (see `check_key_reuse`).
     reuse_key_at_new_origin: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
-    // Seals the API key with the master password: not while that is being
-    // changed (C1).
-    let _rotation = crate::commands::rotation_shared(&app)?;
-    let pw = vault_password(&app)?;
+    crate::commands::run_blocking(move || {
+        // Seals the API key with the master password: not while that is
+        // being changed (C1).
+        let _rotation = crate::commands::rotation_shared(&app)?;
+        save_config(
+            &app.state::<crate::AppState>().db,
+            app.state::<crate::commands::VaultPasswordStore>().inner(),
+            ConfigArgs {
+                provider,
+                base_url,
+                model,
+                // Wrapped at once: the plaintext key is wiped when the save
+                // is done, not left as freed heap.
+                api_key: api_key.map(Zeroizing::new),
+                clear_api_key: clear_api_key.unwrap_or(false),
+                reuse_key_at_new_origin: reuse_key_at_new_origin.unwrap_or(false),
+            },
+        )
+    })
+    .await
+}
+
+/// The arguments of [`assistant_save_config`].
+struct ConfigArgs {
+    provider: String,
+    base_url: Option<String>,
+    model: String,
+    api_key: Option<Zeroizing<String>>,
+    clear_api_key: bool,
+    reuse_key_at_new_origin: bool,
+}
+
+/// [`assistant_save_config`] without the `AppHandle`. The caller holds the
+/// rotation guard. The stored settings are read, checked
+/// ([`check_key_reuse`]) and written in one transaction
+/// ([`crate::db::Database::update_assistant_config`]); a new key is sealed
+/// before it, so Argon2id never runs while the write lock is held. A failed
+/// audit row after the commit is a `warning`, not an error.
+fn save_config(
+    db: &crate::db::Database,
+    vault: &crate::commands::VaultPasswordStore,
+    args: ConfigArgs,
+) -> CmdResult<serde_json::Value> {
+    let ConfigArgs {
+        provider,
+        base_url,
+        model,
+        api_key,
+        clear_api_key,
+        reuse_key_at_new_origin,
+    } = args;
+    let pw = vault.get().unwrap_or_default();
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
@@ -283,43 +393,50 @@ pub fn assistant_save_config(
         .filter(|s| !s.is_empty())
         .map(|u| normalize_base_url(&u))
         .transpose()?;
-
-    let db = &app.state::<crate::AppState>().db;
-    let mut config = db.load_assistant_config().map_err(|e| e.to_string())?;
-    let api_key = api_key.filter(|s| !s.trim().is_empty());
-    let clear_api_key = clear_api_key.unwrap_or(false);
-    let key_moved = check_key_reuse(
-        &config,
-        &provider,
-        base_url.as_deref(),
-        api_key.is_some(),
-        clear_api_key,
-        reuse_key_at_new_origin.unwrap_or(false),
-    )?;
-    config.provider = Some(provider);
-    config.base_url = base_url;
-    config.model = Some(model);
-    if let Some(key) = api_key {
-        // Wrap immediately: the plaintext key must be wiped from this frame
-        // once sealed, not left as freed heap (secret-wiping hardening).
-        let key = Zeroizing::new(key);
-        config.api_key = Some(
-            crate::crypto::vault::seal(&pw, key.trim().as_bytes()).map_err(|e| e.to_string())?,
-        );
-    } else if clear_api_key {
-        // save_assistant_config's None => DELETE removes the sealed row.
-        config.api_key = None;
-    }
-    db.save_assistant_config(&config)
+    let sealed_key = api_key
+        .as_ref()
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| crate::crypto::vault::seal(&pw, key.trim().as_bytes()))
+        .transpose()
         .map_err(|e| e.to_string())?;
+
+    let key_moved = db
+        .update_assistant_config(|config| {
+            let key_moved = check_key_reuse(
+                config,
+                &provider,
+                base_url.as_deref(),
+                sealed_key.is_some(),
+                clear_api_key,
+                reuse_key_at_new_origin,
+            )
+            .map_err(CmdError)?;
+            config.provider = Some(provider);
+            config.base_url = base_url;
+            config.model = Some(model);
+            if let Some(sealed) = sealed_key {
+                config.api_key = Some(sealed);
+            } else if clear_api_key {
+                // None deletes the sealed row.
+                config.api_key = None;
+            }
+            Ok(key_moved)
+        })
+        .map_err(CmdError::from)?;
     let detail = if key_moved {
         "saved (stored API key reused at a new provider or base URL, as confirmed)"
     } else {
         "saved"
     };
-    db.add_audit("assistant.config", None, detail)
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
+    // The settings are stored: a failed audit row is a warning.
+    let warning = crate::commands::audit_or_warn(
+        db,
+        "assistant.config",
+        None,
+        detail,
+        "The settings were saved, but their audit row could not be written",
+    );
+    Ok(serde_json::json!({ "ok": true, "warning": warning }))
 }
 
 /// The default base URL for a provider when none is stored.
@@ -449,13 +566,34 @@ fn load_provider(app: &AppHandle) -> CmdResult<ResolvedProvider> {
         .db
         .load_assistant_config()
         .map_err(|e| e.to_string())?;
+    resolve_provider(config, &pw)
+}
+
+/// What a chat or a connection test refuses when the saved base URL breaks
+/// today's rules ([`normalize_base_url`]). Nothing from the URL is quoted:
+/// it may carry a user name or password.
+const SAVED_BASE_URL_REFUSED: &str =
+    "The saved assistant URL is no longer accepted - open Assistant settings and save it again.";
+
+/// The provider a chat or a connection test talks to, from the saved
+/// settings. The saved base URL is checked again against today's rules (RU2
+/// leftover): one saved before them - with a user name or password in it, or
+/// plain http to a public host - is refused here, before the key is
+/// unsealed, instead of being sent the key.
+fn resolve_provider(
+    config: crate::db::AssistantConfig,
+    pw: &Zeroizing<String>,
+) -> CmdResult<ResolvedProvider> {
+    if let Some(saved) = config.base_url.as_deref() {
+        normalize_base_url(saved.trim()).map_err(|_| CmdError(SAVED_BASE_URL_REFUSED.into()))?;
+    }
     let provider = config.provider.ok_or_else(|| {
         "AI assistant is not configured - open Settings > AI assistant.".to_string()
     })?;
     let sealed = config
         .api_key
         .ok_or_else(|| "No API key stored - save one in Settings > AI assistant.".to_string())?;
-    let key_bytes = crate::crypto::vault::unseal(&pw, &sealed).map_err(|e| e.to_string())?;
+    let key_bytes = crate::crypto::vault::unseal(pw, &sealed).map_err(|e| e.to_string())?;
     let api_key = Zeroizing::new(
         String::from_utf8(key_bytes)
             .map_err(|_| "Stored API key is not valid UTF-8.".to_string())?,
@@ -1141,6 +1279,21 @@ pub fn assistant_type_text(
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
+/// Helpers shared by the assistant and MCP tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Make every audit write on `db` fail from now on (a schema trigger, so
+    /// on every connection). Runs on its own thread and connection, so async
+    /// tests can call it too.
+    pub(crate) fn refuse_audit_rows(db: &crate::db::Database) {
+        crate::db::test_support::execute(
+            db,
+            "CREATE TRIGGER refuse_audit BEFORE INSERT ON audit_log \
+             BEGIN SELECT RAISE(ABORT, 'audit refused by the test'); END",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1562,6 +1715,113 @@ mod tests {
         assert!(check_typed_text("draft", "cd /var/log\t").is_ok());
     }
 
+    /// Every invisible or format character, range by range (item 10): each
+    /// Unicode general-category Cf code point (Unicode 15.1, checked against
+    /// Python's unicodedata) and every Default_Ignorable_Code_Point -
+    /// invisible combining marks, Hangul fillers, variation selectors and the
+    /// code points reserved as default-ignorable. Both ends of every range
+    /// are refused by typing and by running; the code points just outside a
+    /// range are not (unless the next range starts there).
+    const EXPECTED_DISGUISING_RANGES: [(u32, u32, &str); 26] = [
+        (0x00AD, 0x00AD, "soft hyphen"),
+        (0x034F, 0x034F, "combining grapheme joiner"),
+        (0x0600, 0x0605, "Arabic number signs"),
+        (0x061C, 0x061C, "Arabic letter mark"),
+        (0x06DD, 0x06DD, "Arabic end of ayah"),
+        (0x070F, 0x070F, "Syriac abbreviation mark"),
+        (0x0890, 0x0891, "Arabic pound and piastre marks above"),
+        (0x08E2, 0x08E2, "Arabic disputed end of ayah"),
+        (0x115F, 0x1160, "Hangul choseong and jungseong fillers"),
+        (0x17B4, 0x17B5, "Khmer inherent vowels"),
+        (
+            0x180B,
+            0x180F,
+            "Mongolian variation selectors and vowel separator",
+        ),
+        (0x200B, 0x200F, "zero-width space and joiners, LRM, RLM"),
+        (0x2028, 0x2029, "line and paragraph separators"),
+        (0x202A, 0x202E, "bidi embeddings and overrides"),
+        (0x2060, 0x206F, "word joiner, invisible operators, isolates"),
+        (0x3164, 0x3164, "Hangul filler"),
+        (0xFE00, 0xFE0F, "variation selectors"),
+        (0xFEFF, 0xFEFF, "zero-width no-break space"),
+        (0xFFA0, 0xFFA0, "halfwidth Hangul filler"),
+        (0xFFF0, 0xFFFB, "reserved, interlinear annotation"),
+        (0x110BD, 0x110BD, "Kaithi number sign"),
+        (0x110CD, 0x110CD, "Kaithi number sign above"),
+        (0x13430, 0x1343F, "Egyptian hieroglyph format controls"),
+        (0x1BCA0, 0x1BCA3, "shorthand format controls"),
+        (0x1D173, 0x1D17A, "musical symbol format controls"),
+        (0xE0000, 0xE0FFF, "tags, variation selectors supplement"),
+    ];
+
+    fn refused_by_both_gates(c: char) -> bool {
+        let text = format!("ls{c}x");
+        let typed = check_typed_text("draft", &text)
+            .is_err_and(|e| e.contains("invisible or text-direction"));
+        let run = check_exec_command("execute", &text)
+            .is_err_and(|e| e.contains("invisible or text-direction"));
+        typed && run
+    }
+
+    #[test]
+    fn every_invisible_or_format_range_is_refused_at_both_ends() {
+        let in_any = |cp: u32| {
+            EXPECTED_DISGUISING_RANGES
+                .iter()
+                .any(|&(first, last, _)| (first..=last).contains(&cp))
+        };
+        for &(first, last, what) in &EXPECTED_DISGUISING_RANGES {
+            for cp in [first, last] {
+                let c = char::from_u32(cp).unwrap();
+                assert!(
+                    refused_by_both_gates(c),
+                    "U+{cp:04X} ({what}) must be refused"
+                );
+            }
+            for cp in [first - 1, last + 1] {
+                let Some(c) = char::from_u32(cp) else {
+                    continue;
+                };
+                if !in_any(cp) && !c.is_control() {
+                    assert!(
+                        !refused_by_both_gates(c),
+                        "U+{cp:04X} next to {what} is visible text"
+                    );
+                }
+            }
+        }
+        // Ordinary text in many scripts still types and runs.
+        for ok in [
+            "ls -la",
+            "echo 'héllo ✓'",
+            "cat 日本語.txt",
+            "echo مرحبا",
+            "echo 😀",
+        ] {
+            assert!(check_typed_text("draft", ok).is_ok(), "{ok:?}");
+            assert!(check_exec_command("execute", ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn the_disguising_table_is_sorted_and_its_ranges_do_not_overlap() {
+        assert!(DISGUISING_CHARS.iter().all(|&(first, last)| first <= last));
+        assert!(
+            DISGUISING_CHARS.windows(2).all(|w| w[0].1 < w[1].0),
+            "sorted, without overlaps"
+        );
+        let table: Vec<(u32, u32)> = DISGUISING_CHARS
+            .iter()
+            .map(|&(first, last)| (first as u32, last as u32))
+            .collect();
+        let expected: Vec<(u32, u32)> = EXPECTED_DISGUISING_RANGES
+            .iter()
+            .map(|&(first, last, _)| (first, last))
+            .collect();
+        assert_eq!(table, expected);
+    }
+
     #[test]
     fn exec_still_needs_execute_or_yolo() {
         for level in ["read", "draft", "", "admin"] {
@@ -1719,6 +1979,149 @@ mod tests {
         }
         let err = normalize_base_url("http://api.openai.com/v1").unwrap_err();
         assert!(err.contains("http://"), "{err}");
+    }
+
+    // ── A saved base URL is checked again when it is used (item 4) ──────
+
+    const SAVED_URL_REFUSED: &str =
+        "The saved assistant URL is no longer accepted - open Assistant settings and save it again.";
+
+    fn saved_config(base: Option<&str>, pw: &Zeroizing<String>) -> crate::db::AssistantConfig {
+        crate::db::AssistantConfig {
+            provider: Some("openai".into()),
+            base_url: base.map(String::from),
+            model: Some("m".into()),
+            api_key: Some(crate::crypto::vault::seal(pw, b"sk-test-123").unwrap()),
+        }
+    }
+
+    /// A base URL saved before today's rules (RU2: no user name or password,
+    /// plain http only to local addresses) is refused when a chat or a test
+    /// would use it - the saved key would otherwise travel with it - and the
+    /// message carries nothing from the URL.
+    #[test]
+    fn a_saved_base_url_that_todays_rules_refuse_is_not_used() {
+        let pw = Zeroizing::new("vault-master".to_string());
+        for bad in [
+            "https://user:secret-pass@api.openai.com/v1",
+            "https://sk-in-the-url@api.example.com/v1",
+            "http://api.openai.com/v1",
+            "ftp://api.example.com",
+            "not a url",
+        ] {
+            let err = match resolve_provider(saved_config(Some(bad), &pw), &pw) {
+                Ok(_) => panic!("{bad} must be refused"),
+                Err(e) => e.0,
+            };
+            assert_eq!(err, SAVED_URL_REFUSED, "{bad}");
+        }
+        for ok in [
+            Some("https://api.openai.com/v1"),
+            Some("http://localhost:11434/v1"),
+            None,
+        ] {
+            let resolved = resolve_provider(saved_config(ok, &pw), &pw)
+                .unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+            assert_eq!(resolved.api_key.as_str(), "sk-test-123");
+            assert_eq!(
+                resolved.base_url,
+                ok.unwrap_or(OPENAI_DEFAULT_BASE),
+                "{ok:?}"
+            );
+        }
+    }
+
+    /// The settings view never hands the renderer the user name or password
+    /// of a legacy base URL (secrets never cross IPC).
+    #[test]
+    fn the_settings_view_drops_credentials_from_a_saved_base_url() {
+        let pw = Zeroizing::new("vault-master".to_string());
+        let view = config_view(&saved_config(
+            Some("https://user:secret-pass@api.openai.com/v1"),
+            &pw,
+        ));
+        assert_eq!(view["base_url"], "https://api.openai.com/v1");
+        assert!(!view.to_string().contains("secret-pass"), "{view}");
+        assert_eq!(view["has_api_key"], true);
+        let plain = config_view(&saved_config(Some("http://localhost:11434/v1"), &pw));
+        assert_eq!(plain["base_url"], "http://localhost:11434/v1");
+        assert_eq!(
+            config_view(&saved_config(None, &pw))["base_url"],
+            serde_json::Value::Null
+        );
+    }
+
+    // ── Saving the settings (item 8 seam, item 3 class) ─────────────────
+
+    fn config_db() -> crate::db::Database {
+        crate::db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-ai-{}.sqlite", uuid::Uuid::new_v4())),
+        )
+        .unwrap()
+    }
+
+    fn unlocked() -> crate::commands::VaultPasswordStore {
+        let vault = crate::commands::VaultPasswordStore::new();
+        vault.set("vault-master".into());
+        vault
+    }
+
+    fn config_args(base: Option<&str>, key: Option<&str>) -> ConfigArgs {
+        ConfigArgs {
+            provider: "openai".into(),
+            base_url: base.map(String::from),
+            model: "gpt-test".into(),
+            api_key: key.map(|k| Zeroizing::new(k.to_string())),
+            clear_api_key: false,
+            reuse_key_at_new_origin: false,
+        }
+    }
+
+    #[test]
+    fn saving_the_settings_seals_the_key_and_keeps_the_origin_binding() {
+        let db = config_db();
+        let vault = unlocked();
+        let out = save_config(&db, &vault, config_args(None, Some(" sk-new "))).unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["warning"], serde_json::Value::Null);
+        let stored = db.load_assistant_config().unwrap();
+        let pw = Zeroizing::new("vault-master".to_string());
+        let key = crate::crypto::vault::unseal(&pw, stored.api_key.as_deref().unwrap()).unwrap();
+        assert_eq!(key, b"sk-new");
+        // A new origin without a new key is still refused, and changes
+        // nothing.
+        let err = save_config(
+            &db,
+            &vault,
+            config_args(Some("http://localhost:11434/v1"), None),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("API key"), "{}", err.0);
+        assert_eq!(db.load_assistant_config().unwrap().base_url, None);
+        // Locked: refused before anything is read or sealed.
+        let err = save_config(
+            &db,
+            &crate::commands::VaultPasswordStore::new(),
+            config_args(None, Some("k")),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "Vault is locked.");
+    }
+
+    #[test]
+    fn saved_settings_whose_audit_row_fails_are_reported_as_saved_with_a_warning() {
+        let db = config_db();
+        test_support::refuse_audit_rows(&db);
+        let out = save_config(&db, &unlocked(), config_args(None, Some("sk-new")))
+            .expect("the settings are stored - the call must not report a failure");
+        assert!(
+            out["warning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("audit"),
+            "{out}"
+        );
+        assert!(db.load_assistant_config().unwrap().api_key.is_some());
     }
 
     // ── A stored key does not follow a new endpoint (A4-13) ─────────────

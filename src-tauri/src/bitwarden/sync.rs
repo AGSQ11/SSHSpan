@@ -73,9 +73,9 @@ enum Plan<'a> {
     Update { cipher: &'a str, conflict: bool },
     /// Only the remote copy changed: pull `cipher` into the local row.
     Pull { cipher: &'a str },
-    /// Only the remote copy changed, and overwriting local data was not
-    /// allowed for this run.
-    SkipRemoteChange,
+    /// Only the remote copy `cipher` changed, and overwriting local data was
+    /// not allowed for this run.
+    SkipRemoteChange { cipher: &'a str },
     /// Nothing changed on either side.
     InSync,
     /// The linked item now belongs to an organization: SSHSpan syncs personal
@@ -103,7 +103,7 @@ fn plan_matched<'a>(
             conflict,
         },
         (false, true) if allow_remote_overwrite => Plan::Pull { cipher: &cipher.id },
-        (false, true) => Plan::SkipRemoteChange,
+        (false, true) => Plan::SkipRemoteChange { cipher: &cipher.id },
     }
 }
 
@@ -251,19 +251,83 @@ fn own_item_of<'a>(
     remote_logins: &[&'a SyncCipher],
     names: &ServerNames,
 ) -> OwnItem<'a> {
-    let candidates: Vec<&'a SyncCipher> = remote_logins
+    match own_item_candidates(sv, remote_logins, names).as_slice() {
+        [] => OwnItem::Missing,
+        [item] => OwnItem::Found(item),
+        several => OwnItem::Ambiguous(several.len()),
+    }
+}
+
+/// The items that could be `sv`'s own ([`own_item_of`]): their notes name
+/// `sv`, and no other local server is linked to them.
+fn own_item_candidates<'a>(
+    sv: &ServerRecord,
+    remote_logins: &[&'a SyncCipher],
+    names: &ServerNames,
+) -> Vec<&'a SyncCipher> {
+    remote_logins
         .iter()
         .copied()
         .filter(|c| {
             names.named.get(&c.id).is_some_and(|id| *id == sv.id)
                 && !names.linked_to_another(&c.id, &sv.id)
         })
+        .collect()
+}
+
+/// How many of the items naming one server [`ambiguous_server_error`] lists
+/// by name; the rest are counted.
+const MAX_LISTED_ITEMS: usize = 5;
+
+/// Longest item title [`ambiguous_server_error`] quotes, in characters.
+const MAX_LISTED_TITLE_CHARS: usize = 60;
+
+/// The error for a server that several unowned items name (round 4): which
+/// items they are - title and id, at most [`MAX_LISTED_ITEMS`], titles
+/// shortened and stripped of control characters - and what to do without
+/// losing data. "Delete the extra copies" (the old advice) discarded a clone
+/// that was a legitimate second server, and deleting the server's own copy
+/// made SSHSpan link to the clone and overwrite it with this server's data
+/// on the next sync. So: delete only true duplicates; for an item that is a
+/// different server, remove the `serverId` entry from its notes (it is then
+/// offered as a new server) or move it out of the servers folder.
+fn ambiguous_server_error(
+    client: &BitwardenClient,
+    sv: &ServerRecord,
+    candidates: &[&SyncCipher],
+) -> String {
+    let mut listed: Vec<String> = candidates
+        .iter()
+        .take(MAX_LISTED_ITEMS)
+        .map(|item| {
+            let title: String = item_display_name(client, item)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            let shown = if title.chars().count() > MAX_LISTED_TITLE_CHARS {
+                let cut: String = title.chars().take(MAX_LISTED_TITLE_CHARS).collect();
+                format!("{cut}...")
+            } else {
+                title
+            };
+            let id: String = item.id.chars().filter(|c| !c.is_control()).collect();
+            format!("\"{shown}\" (id {id})")
+        })
         .collect();
-    match candidates.as_slice() {
-        [] => OwnItem::Missing,
-        [item] => OwnItem::Found(item),
-        several => OwnItem::Ambiguous(several.len()),
+    if candidates.len() > MAX_LISTED_ITEMS {
+        listed.push(format!("and {} more", candidates.len() - MAX_LISTED_ITEMS));
     }
+    format!(
+        "{count} Bitwarden items name server '{name}': {items}. SSHSpan cannot tell which one \
+         is this server's, so it changed none of them. In Bitwarden, delete only the items that \
+         are true duplicates of this server; if one of them is a different server, remove \
+         \"serverId\": \"{id}\" from its notes (it is then offered as a new server) or move it \
+         out of the SSHSpan servers folder. Then sync again.",
+        count = candidates.len(),
+        name = sv.name,
+        items = listed.join(", "),
+        id = sv.id,
+    )
 }
 
 /// What the second pass makes of an item whose notes name a local server,
@@ -563,9 +627,95 @@ struct SyncReport {
     skipped_server_new: usize,
     renamed: Vec<serde_json::Value>,
     errors: Vec<serde_json::Value>,
+    /// The remote changes this run left alone until the user allows them,
+    /// one entry each ([`pending_server_entry`] / [`pending_key_entry`]),
+    /// at most [`MAX_PENDING_ENTRIES`] per list (`pending_truncated` when
+    /// more were left).
+    pending_servers: Vec<serde_json::Value>,
+    pending_keys: Vec<serde_json::Value>,
+    pending_truncated: bool,
+}
+
+/// Most entries one list of pending remote changes carries; past that only
+/// `pendingTruncated` says there were more (the skip counts stay exact).
+const MAX_PENDING_ENTRIES: usize = 50;
+
+/// Longest text a pending entry quotes from a vault item, in characters.
+const MAX_PENDING_TEXT_CHARS: usize = 200;
+
+/// Text from a vault item for a pending entry: control characters dropped,
+/// at most [`MAX_PENDING_TEXT_CHARS`] characters.
+fn pending_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PENDING_TEXT_CHARS)
+        .collect()
+}
+
+/// One server the run did not overwrite (`kind` "overwrite": `name` is the
+/// local server, `incomingName` the item's name, `host`/`port` where the
+/// item would point it, `localHost`/`localPort` where it points now) or did
+/// not import ("new": `name`, `host`, `port` of the item). The confirm prompt
+/// used to show only counts, so a Bitwarden item rewritten to another host
+/// was approved blind (JU5 security review). Names and addresses only - no
+/// user name, password or key.
+fn pending_server_entry(
+    kind: &str,
+    name: &str,
+    incoming_name: Option<&str>,
+    incoming: Option<(String, u16)>,
+    local: Option<(&str, u16)>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "name": pending_text(name),
+        "incomingName": incoming_name.map(pending_text),
+        "host": incoming.as_ref().map(|(host, _)| pending_text(host)),
+        "port": incoming.map(|(_, port)| port),
+        "localHost": local.map(|(host, _)| pending_text(host)),
+        "localPort": local.map(|(_, port)| port),
+    })
+}
+
+/// One key the run did not overwrite ("overwrite": `name` is the local key,
+/// `incomingName` the item's name, `fingerprint` the item's key,
+/// `localFingerprint` the local one) or did not import ("new": the item's
+/// `name` and `fingerprint`). Fingerprints only - never key material.
+fn pending_key_entry(
+    kind: &str,
+    name: &str,
+    incoming_name: Option<&str>,
+    fingerprint: Option<&str>,
+    local_fingerprint: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "name": pending_text(name),
+        "incomingName": incoming_name.map(pending_text),
+        "fingerprint": fingerprint.map(pending_text),
+        "localFingerprint": local_fingerprint.map(pending_text),
+    })
 }
 
 impl SyncReport {
+    /// Note a server change left for the user's approval (bounded).
+    fn pending_server(&mut self, entry: serde_json::Value) {
+        if self.pending_servers.len() < MAX_PENDING_ENTRIES {
+            self.pending_servers.push(entry);
+        } else {
+            self.pending_truncated = true;
+        }
+    }
+
+    /// Note a key change left for the user's approval (bounded).
+    fn pending_key(&mut self, entry: serde_json::Value) {
+        if self.pending_keys.len() < MAX_PENDING_ENTRIES {
+            self.pending_keys.push(entry);
+        } else {
+            self.pending_truncated = true;
+        }
+    }
+
     /// One `errors` entry: `{<what>: <name>, error}`, `what` being `name`
     /// (a key), `server`, `folder` or `cipher_id`.
     fn error(&mut self, what: &str, name: &str, error: impl std::fmt::Display) {
@@ -602,6 +752,15 @@ impl SyncReport {
         });
         if let Some(reason) = aborted {
             summary["aborted"] = reason.into();
+        }
+        if !self.pending_servers.is_empty() {
+            summary["pendingServers"] = self.pending_servers.clone().into();
+        }
+        if !self.pending_keys.is_empty() {
+            summary["pendingKeys"] = self.pending_keys.clone().into();
+        }
+        if self.pending_truncated {
+            summary["pendingTruncated"] = true.into();
         }
         summary
     }
@@ -778,7 +937,10 @@ impl SyncRun<'_> {
             }
             let plan = plan_key_row(row, live, &remote_ssh, &fp_by_cipher_id, allow);
             match plan {
-                Plan::Create { .. } | Plan::OrgOwned | Plan::SkipRemoteChange | Plan::InSync => {}
+                Plan::Create { .. }
+                | Plan::OrgOwned
+                | Plan::SkipRemoteChange { .. }
+                | Plan::InSync => {}
                 Plan::Link { cipher } | Plan::Update { cipher, .. } | Plan::Pull { cipher } => {
                     matched_remote.insert(cipher.to_string());
                 }
@@ -864,7 +1026,17 @@ impl SyncRun<'_> {
                         report.error("name", &row.name, "internal: the item to pull is missing");
                     }
                 },
-                Plan::SkipRemoteChange => report.skipped_overwrites += 1,
+                Plan::SkipRemoteChange { cipher } => {
+                    report.skipped_overwrites += 1;
+                    let item = live.get(cipher).copied();
+                    report.pending_key(pending_key_entry(
+                        "overwrite",
+                        &row.name,
+                        item.map(|item| item_display_name(client, item)).as_deref(),
+                        fp_by_cipher_id.get(cipher).map(String::as_str),
+                        Some(&row.fingerprint_sha256),
+                    ));
+                }
                 Plan::OrgOwned => report.error("name", &row.name, ORG_OWNED),
                 Plan::InSync => {}
             }
@@ -886,9 +1058,17 @@ impl SyncRun<'_> {
                 continue;
             }
             // Confirm-first: until the run allows remote data in, a new item
-            // is only counted for the prompt - nothing is decrypted for it.
+            // is only listed for the prompt - its name and fingerprint, never
+            // its key.
             if !allow {
                 report.skipped_new += 1;
+                report.pending_key(pending_key_entry(
+                    "new",
+                    &item_display_name(client, cipher),
+                    None,
+                    fp_by_cipher_id.get(&cipher.id).map(String::as_str),
+                    None,
+                ));
                 continue;
             }
             match pull_new_key(client, cipher, db, self.vault_password).await {
@@ -931,17 +1111,14 @@ impl SyncRun<'_> {
             (self.check)()?;
             let plan = match plan_server_row(sv, live, &remote_logins, &names, allow) {
                 ServerPlan::Plan(plan) => plan,
-                ServerPlan::Ambiguous(count) => {
+                ServerPlan::Ambiguous(_) => {
                     // Not guessed: no link, no upload this run (round 4).
                     ambiguous.insert(sv.id.as_str());
+                    let candidates = own_item_candidates(sv, &remote_logins, &names);
                     report.error(
                         "server",
                         &sv.name,
-                        format!(
-                            "{count} Bitwarden items name server '{}' - delete the extra \
-                             copies in Bitwarden, then sync again.",
-                            sv.name
-                        ),
+                        ambiguous_server_error(client, sv, &candidates),
                     );
                     continue;
                 }
@@ -1026,7 +1203,17 @@ impl SyncRun<'_> {
                         report.error("server", &sv.name, "internal: the item to pull is missing");
                     }
                 },
-                Plan::SkipRemoteChange => report.skipped_server_overwrites += 1,
+                Plan::SkipRemoteChange { cipher } => {
+                    report.skipped_server_overwrites += 1;
+                    let item = live.get(cipher).copied();
+                    report.pending_server(pending_server_entry(
+                        "overwrite",
+                        &sv.name,
+                        item.map(|item| item_display_name(client, item)).as_deref(),
+                        item.and_then(|item| uri_host_port(client, item).ok().flatten()),
+                        Some((&sv.host, sv.port)),
+                    ));
+                }
                 Plan::OrgOwned => report.error("server", &sv.name, ORG_OWNED),
                 Plan::InSync => {}
             }
@@ -1095,9 +1282,16 @@ impl SyncRun<'_> {
                 }
             }
             // Confirm-first, as for keys (A2-47): a new remote server is only
-            // counted until the run allows remote data in.
+            // listed - name and address - until the run allows remote data in.
             if !allow {
                 report.skipped_server_new += 1;
+                report.pending_server(pending_server_entry(
+                    "new",
+                    &item_display_name(client, cipher),
+                    None,
+                    uri_host_port(client, cipher).ok().flatten(),
+                    None,
+                ));
                 continue;
             }
             match pull_new_server(client, cipher, db, self.vault_password).await {
@@ -2295,7 +2489,7 @@ mod tests {
         );
         assert_eq!(
             plan_key(&clean, &[&newer], &fps, false),
-            Plan::SkipRemoteChange
+            Plan::SkipRemoteChange { cipher: "c1" }
         );
     }
 
@@ -2308,7 +2502,7 @@ mod tests {
         let clean = server_row("a", Some("s1"), synced_at(T0, T0));
         assert_eq!(
             plan_server(&clean, &[&newer], false),
-            Plan::SkipRemoteChange
+            Plan::SkipRemoteChange { cipher: "s1" }
         );
         assert_eq!(
             plan_server(&clean, &[&newer], true),
@@ -3157,8 +3351,14 @@ mod tests {
         db.insert_server(&web).unwrap();
         let older = login_naming_at(&client, "s1", &web.id, Some(T0));
         let newer = login_naming_at(&client, "s2", &web.id, Some(T0 + 1_000));
-        let expected = "2 Bitwarden items name server 'web' - delete the extra copies in \
-                        Bitwarden, then sync again.";
+        let expected = format!(
+            "2 Bitwarden items name server 'web': \"web\" (id s1), \"web\" (id s2). SSHSpan \
+             cannot tell which one is this server's, so it changed none of them. In Bitwarden, \
+             delete only the items that are true duplicates of this server; if one of them is a \
+             different server, remove \"serverId\": \"{}\" from its notes (it is then offered as \
+             a new server) or move it out of the SSHSpan servers folder. Then sync again.",
+            web.id
+        );
         for run in 1..=2 {
             let report = run_server_pass(&db, &mut client, &[&older, &newer], true).await;
             assert_eq!(report.linked, 0, "run {run}: {report:?}");
@@ -3166,13 +3366,237 @@ mod tests {
             assert_eq!(report.servers_pulled, 0, "run {run}: {report:?}");
             assert_eq!(report.errors.len(), 1, "run {run}: {report:?}");
             assert_eq!(report.errors[0]["server"], "web", "run {run}");
-            assert_eq!(report.errors[0]["error"], expected, "run {run}");
+            assert_eq!(report.errors[0]["error"], expected.as_str(), "run {run}");
             assert_eq!(stored_link(&db, &web), None, "run {run}");
             assert_eq!(db.list_servers().unwrap().len(), 1, "run {run}");
         }
         let report = run_server_pass(&db, &mut client, &[&newer], true).await;
         assert_eq!(report.linked, 1, "{report:?}");
         assert_eq!(stored_link(&db, &web).as_deref(), Some("s2"));
+    }
+
+    // ── Item 15: what the "allow remote changes" prompt will apply ──────
+
+    /// Run the key pass offline over `items` (all in the keys folder).
+    async fn run_key_pass(
+        db: &Database,
+        client: &mut BitwardenClient,
+        items: &[&SyncCipher],
+        allow_remote_overwrite: bool,
+    ) -> SyncReport {
+        let remote = crate::bitwarden::SyncResponse {
+            profile: None,
+            folders: Vec::new(),
+            ciphers: items.iter().map(|c| (*c).clone()).collect(),
+        };
+        let live = live_of(items);
+        let check = || -> Result<()> { Ok(()) };
+        let run = SyncRun {
+            db,
+            vault_password: TEST_PW,
+            allow_remote_overwrite,
+            check: &check,
+        };
+        let mut report = SyncReport::default();
+        run.key_pass(client, &remote, &live, "keys", &mut report)
+            .await
+            .unwrap();
+        report
+    }
+
+    /// The linked item of "prod-db" was rewritten to another host (as a
+    /// compromised Bitwarden account could), and a server SSHSpan does not
+    /// have appeared. Neither may be applied unseen.
+    fn rewritten_and_new_servers(
+        db: &Database,
+        client: &BitwardenClient,
+    ) -> (SyncCipher, SyncCipher) {
+        let mut prod = named_server("prod-db", Some("s1"), synced_at(T0, T0));
+        prod.host = "10.0.0.5".into();
+        db.insert_server(&prod).unwrap();
+        let mut rewritten = login_item(client, "s1", None);
+        rewritten.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        rewritten.name = Some(enc(client, "prod-db"));
+        rewritten.login.as_mut().unwrap().uris = Some(vec![crate::bitwarden::LoginUri {
+            uri: Some(enc(client, "ssh://evil.example.com:2222")),
+        }]);
+        (rewritten, login_item(client, "s2", None))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skipped_server_changes_are_listed_with_the_hosts_they_would_set() {
+        let db = test_db();
+        let mut client = offline_client();
+        let (rewritten, fresh) = rewritten_and_new_servers(&db, &client);
+        let report = run_server_pass(&db, &mut client, &[&rewritten, &fresh], false).await;
+        assert_eq!(report.skipped_server_overwrites, 1, "{report:?}");
+        assert_eq!(report.skipped_server_new, 1, "{report:?}");
+        let summary = report.summary(None);
+        assert_eq!(
+            summary["pendingServers"],
+            serde_json::json!([
+                {
+                    "kind": "overwrite", "name": "prod-db", "incomingName": "prod-db",
+                    "host": "evil.example.com", "port": 2222,
+                    "localHost": "10.0.0.5", "localPort": 22,
+                },
+                {
+                    "kind": "new", "name": "web", "incomingName": null,
+                    "host": "web.example.com", "port": 2222,
+                    "localHost": null, "localPort": null,
+                },
+            ]),
+            "{summary}"
+        );
+        assert!(summary.get("pendingTruncated").is_none(), "{summary}");
+        // Remote changes allowed: applied, nothing pending.
+        let db = test_db();
+        let (rewritten, fresh) = rewritten_and_new_servers(&db, &client);
+        let summary = run_server_pass(&db, &mut client, &[&rewritten, &fresh], true)
+            .await
+            .summary(None);
+        assert!(summary.get("pendingServers").is_none(), "{summary}");
+        assert!(summary.get("pendingKeys").is_none(), "{summary}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skipped_key_changes_are_listed_with_their_fingerprints() {
+        let db = test_db();
+        let mut client = offline_client();
+        let local = key_row("k1", Some("c1"), synced_at(T0, T0));
+        db.insert_key(&local).unwrap();
+        // The linked item now holds another key; and a key SSHSpan lacks.
+        let mut replaced = cipher("c1", 5, Some("keys"), Some(T0 + 5_000));
+        replaced.name = Some(enc(&client, "deploy"));
+        replaced.ssh_key = Some(crate::bitwarden::SshKeyBlock {
+            private_key: None,
+            public_key: None,
+            key_fingerprint: Some(enc(&client, "SHA256:incoming")),
+        });
+        let (fresh, fresh_fp) = ssh_item(&client, "c2", "fresh");
+        let report = run_key_pass(&db, &mut client, &[&replaced, &fresh], false).await;
+        assert_eq!(report.skipped_overwrites, 1, "{report:?}");
+        assert_eq!(report.skipped_new, 1, "{report:?}");
+        let summary = report.summary(None);
+        assert_eq!(
+            summary["pendingKeys"],
+            serde_json::json!([
+                {
+                    "kind": "overwrite", "name": "key-k1", "incomingName": "deploy",
+                    "fingerprint": "SHA256:incoming", "localFingerprint": "SHA256:fp-k1",
+                },
+                {
+                    "kind": "new", "name": "fresh", "incomingName": null,
+                    "fingerprint": fresh_fp, "localFingerprint": null,
+                },
+            ]),
+            "{summary}"
+        );
+        let text = summary.to_string();
+        assert!(
+            !text.contains("PRIVATE KEY") && !text.contains("sealed"),
+            "no key material: {text}"
+        );
+        // Allowed: nothing pending.
+        let db = test_db();
+        db.insert_key(&local).unwrap();
+        let summary = run_key_pass(&db, &mut client, &[&replaced, &fresh], true)
+            .await
+            .summary(None);
+        assert!(summary.get("pendingKeys").is_none(), "{summary}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pending_lists_are_bounded_and_cleaned() {
+        let db = test_db();
+        let mut client = offline_client();
+        let long_name = format!("srv\u{7}\u{1b}[31m{}", "x".repeat(500));
+        let items: Vec<SyncCipher> = (0..60)
+            .map(|n| {
+                let mut item = login_item(&client, &format!("s{n}"), None);
+                item.name = Some(enc(&client, &long_name));
+                item
+            })
+            .collect();
+        let refs: Vec<&SyncCipher> = items.iter().collect();
+        let summary = run_server_pass(&db, &mut client, &refs, false)
+            .await
+            .summary(None);
+        let pending = summary["pendingServers"].as_array().unwrap();
+        assert_eq!(pending.len(), 50, "at most 50 entries");
+        assert_eq!(summary["pendingTruncated"], true);
+        assert_eq!(summary["skippedServerNew"], 60, "the count stays exact");
+        let name = pending[0]["name"].as_str().unwrap();
+        assert_eq!(name.chars().count(), 200, "{name}");
+        assert!(
+            name.starts_with("srv[31mxxx"),
+            "control characters stripped: {name:?}"
+        );
+        assert!(!name.chars().any(char::is_control));
+    }
+
+    /// RU5 final review: the error never named the items, and its advice -
+    /// "delete the extra copies" - lost data when one of them was a
+    /// legitimate clone (deleting the clone discarded it; deleting the
+    /// server's own copy made SSHSpan link to the clone and overwrite it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ambiguous_server_error_names_every_item_and_does_not_say_to_delete_them_all() {
+        let db = test_db();
+        let mut client = offline_client();
+        let web = named_server("web", None, never_synced());
+        db.insert_server(&web).unwrap();
+        let own = login_naming_at(&client, "item-1", &web.id, Some(T0));
+        let mut clone = login_naming_at(&client, "item-2", &web.id, Some(T0 + 1_000));
+        clone.name = Some(enc(&client, "web\u{7}-staging\r\n"));
+        let report = run_server_pass(&db, &mut client, &[&own, &clone], true).await;
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert_eq!(report.errors[0]["server"], "web");
+        let text = report.errors[0]["error"].as_str().unwrap();
+        assert!(text.contains("\"web\" (id item-1)"), "{text}");
+        assert!(
+            text.contains("\"web-staging\" (id item-2)"),
+            "control characters stripped: {text}"
+        );
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        assert!(!text.contains("delete the extra copies"), "{text}");
+        assert!(text.contains("only"), "delete only true duplicates: {text}");
+        assert!(
+            text.contains(&format!("\"serverId\": \"{}\"", web.id)),
+            "a different server loses its serverId entry instead: {text}"
+        );
+        assert!(text.contains("move it out of"), "{text}");
+        assert_eq!(stored_link(&db, &web), None, "still nothing guessed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ambiguous_server_error_stays_bounded() {
+        let db = test_db();
+        let mut client = offline_client();
+        let web = named_server("web", None, never_synced());
+        db.insert_server(&web).unwrap();
+        let long_title = "x".repeat(500);
+        let items: Vec<SyncCipher> = (0..8)
+            .map(|n| {
+                let mut item = login_naming_at(&client, &format!("item-{n}"), &web.id, Some(T0));
+                item.name = Some(enc(&client, &long_title));
+                item
+            })
+            .collect();
+        let refs: Vec<&SyncCipher> = items.iter().collect();
+        let report = run_server_pass(&db, &mut client, &refs, true).await;
+        let text = report.errors[0]["error"].as_str().unwrap();
+        assert!(
+            text.starts_with("8 Bitwarden items name server 'web'"),
+            "{text}"
+        );
+        assert!(text.contains("(id item-4)"), "{text}");
+        assert!(
+            !text.contains("(id item-5)"),
+            "at most five are listed: {text}"
+        );
+        assert!(text.contains("and 3 more"), "{text}");
+        assert!(!text.contains(&long_title), "titles are shortened: {text}");
+        assert!(text.chars().count() < 1500, "{}", text.chars().count());
     }
 
     #[tokio::test(flavor = "multi_thread")]

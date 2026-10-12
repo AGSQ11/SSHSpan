@@ -305,11 +305,13 @@ pub fn run() {
         // killed, SFTP and edit registries cleared (staged copies of remote
         // files deleted), the transfer queue paused, MCP sessions torn down,
         // the master password cleared and `vault.lock` audited (A6-09 / A7-47
-        // / A8-23). The MCP DELETE requests are started, not awaited, so one
-        // can be cut off by the exit. Tauri v2's desktop run loop does NOT
-        // expose OS suspend/lock events (WindowEvent::Suspended/Resumed are
-        // mobile-only), so an OS suspend that leaves the process alive is not
-        // covered; that would need a platform-specific crate.
+        // / A8-23) - and the MCP session teardowns still running (each
+        // unseals its own credential, then sends its DELETE) are waited for,
+        // 2 s at most, instead of being cut off (RU6b item 7). Tauri v2's
+        // desktop run loop does NOT expose OS suspend/lock events
+        // (WindowEvent::Suspended/Resumed are mobile-only), so an OS suspend
+        // that leaves the process alive is not covered; that would need a
+        // platform-specific crate.
         .run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 exit_teardown(app_handle);
@@ -361,10 +363,20 @@ fn app_quit(app: tauri::AppHandle) -> Result<serde_json::Value, commands::CmdErr
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// How long an exit waits at most for the MCP session DELETEs still running:
+/// long enough for a server that answers, short enough that a hung one never
+/// holds the exit.
+const EXIT_TEARDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The teardown for an exit: the vault lock path, once, and only when there
 /// is something to tear down - after a completed setup (a failed one manages
 /// no state) and while the vault is unlocked (a lock already tore everything
-/// down).
+/// down). Then the MCP session teardowns that lock started - and any still
+/// running from an earlier lock or a server edit - are waited for,
+/// [`EXIT_TEARDOWN_BUDGET`] at most, the unsealing of their credentials
+/// included (the lock path no longer does it before returning): they used
+/// to be started and forgotten, so the exit could cut them off and leave the
+/// sessions open on the servers.
 fn exit_teardown(app: &tauri::AppHandle) {
     let unlocked = app
         .try_state::<commands::VaultPasswordStore>()
@@ -372,6 +384,28 @@ fn exit_teardown(app: &tauri::AppHandle) {
     if unlocked && first_time(&EXIT_TEARDOWN_DONE) {
         commands::lock_vault_internal(app);
     }
+    if let Some(mcp) = app.try_state::<assistant::mcp::McpState>() {
+        finish_mcp_teardowns(&mcp, EXIT_TEARDOWN_BUDGET);
+    }
+}
+
+/// Wait for the MCP session teardowns `mcp` still tracks, `budget` at most.
+/// False when some were still running as it ran out: the exit cuts those off.
+/// Runs on the main thread (the exit's event), outside the async runtime.
+fn finish_mcp_teardowns(mcp: &assistant::mcp::McpState, budget: std::time::Duration) -> bool {
+    let pending = mcp.take_teardowns();
+    if pending.is_empty() {
+        return true;
+    }
+    let finished =
+        tauri::async_runtime::block_on(assistant::mcp::wait_for_teardowns(pending, budget));
+    if !finished {
+        log::warn!(
+            "[sshspan] exit: MCP session teardowns still running after {} s were cut off",
+            budget.as_secs()
+        );
+    }
+    finished
 }
 
 /// While setup has failed nothing is managed, and a command would panic on
@@ -487,6 +521,38 @@ mod tests {
         assert!(first_time(&flag));
         assert!(!first_time(&flag));
         assert!(!first_time(&flag));
+    }
+
+    /// Item 7: the exit waits for the MCP session DELETEs still running -
+    /// and never longer than its budget.
+    #[test]
+    fn the_exit_waits_for_mcp_teardowns_but_never_past_its_budget() {
+        use std::time::{Duration, Instant};
+        let mcp = assistant::mcp::McpState::new();
+        assert!(
+            finish_mcp_teardowns(&mcp, Duration::from_secs(2)),
+            "nothing to wait for"
+        );
+        // One that answers is waited for.
+        let (done, finished) = std::sync::mpsc::channel();
+        mcp.track_teardowns(vec![tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = done.send(());
+        })]);
+        assert!(finish_mcp_teardowns(&mcp, Duration::from_secs(2)));
+        assert!(finished.try_recv().is_ok(), "the teardown had finished");
+        // One that hangs is cut off at the budget.
+        mcp.track_teardowns(vec![tauri::async_runtime::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        })]);
+        let started = Instant::now();
+        assert!(!finish_mcp_teardowns(&mcp, Duration::from_millis(300)));
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
+        assert!(mcp.take_teardowns().is_empty(), "each is waited for once");
     }
 
     #[test]

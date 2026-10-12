@@ -1780,7 +1780,37 @@ struct SyncRetry {
     /// new content). It is removed before the next attempt makes another, so
     /// an edit never leaves more than one.
     kept_temp: std::sync::Mutex<Option<String>>,
+    /// When the periodic check tries failed content again on its own.
+    quiet: std::sync::Mutex<QuietRetry>,
 }
+
+/// When the periodic check tries content whose sync failed again without a
+/// save (see [`EditSync::on_change`]): `first` after the failure, then twice
+/// as long after each failed retry, `max` at most.
+struct QuietRetry {
+    first: std::time::Duration,
+    max: std::time::Duration,
+    /// The wait before the retry that is due now.
+    wait: std::time::Duration,
+    due: Option<std::time::Instant>,
+}
+
+impl Default for QuietRetry {
+    fn default() -> Self {
+        Self {
+            first: EDIT_QUIET_RETRY_FIRST,
+            max: EDIT_QUIET_RETRY_MAX,
+            wait: std::time::Duration::ZERO,
+            due: None,
+        }
+    }
+}
+
+/// How long after a failed sync-back the periodic check first tries it again.
+const EDIT_QUIET_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest wait between two quiet retries of one failed sync-back.
+const EDIT_QUIET_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// The remote file of an edit as one STAT found it.
 enum RemoteNow {
@@ -2195,11 +2225,17 @@ impl EditSync {
     /// overwritten (SFTP v3 has no conditional write).
     ///
     /// A sync that fails is reported once. A rescan (the periodic check, or
-    /// a watcher overflow) tries only content that has been neither synced
-    /// nor tried: it used to retry a failing save every half minute, with an
+    /// a watcher overflow) tries content that has been neither synced nor
+    /// tried, and content whose attempt failed only once a quiet retry is due
+    /// ([`QuietRetry`]: a minute, then twice as long each time, 15 minutes at
+    /// most). It used to retry a failing save every half minute, with an
     /// error event each time - and, when the swap was refused, another full
-    /// temporary copy on the server each time. A save the watcher saw always
-    /// gets its attempt (and its event).
+    /// temporary copy on the server each time; then (RU6a) never again, so a
+    /// save the watcher missed stayed unsynced after its cause was gone
+    /// (RU6b P2-g). A quiet retry reports only a changed outcome - it went in,
+    /// or a conflict - never the same failure again, and removes the
+    /// temporary file the last attempt kept before making another. A save the
+    /// watcher saw always gets its attempt (and its event).
     async fn on_change(self: Arc<Self>) {
         let Some(generation) = self.debounce.settle().await else {
             return; // a newer change will upload
@@ -2221,18 +2257,19 @@ impl EditSync {
             Ok(hash) => hash,
             Err(e) => {
                 let why = format!("could not read the saved file: {e}");
-                return self.failed(saved, None, why);
+                return self.failed(saved, false, None, why);
             }
         };
         if self.synced.lock().unwrap().as_deref() == Some(local_hash.as_str()) {
             return;
         }
-        if !saved && self.already_failed(&local_hash) {
+        let quiet = !saved && self.already_failed(&local_hash);
+        if quiet && !self.quiet_retry_due() {
             return;
         }
         match self.check_remote().await {
             Check::Agrees => {}
-            Check::Failed(why) => return self.failed(saved, Some(local_hash), why),
+            Check::Failed(why) => return self.failed(saved, quiet, Some(local_hash), why),
             Check::Differs(differs) => {
                 log::info!(
                     "[sshspan-sftp] {} {} on the server since it was opened on {}; not syncing",
@@ -2251,8 +2288,18 @@ impl EditSync {
         }
         match self.upload(local_hash.clone()).await {
             Ok(()) => self.report(&SyncOutcome::Uploaded),
-            Err(e) => self.failed(saved, Some(local_hash), e),
+            Err(e) => self.failed(saved, quiet, Some(local_hash), e),
         }
+    }
+
+    /// Whether the quiet retry of the failed content is due.
+    fn quiet_retry_due(&self) -> bool {
+        self.retry
+            .quiet
+            .lock()
+            .unwrap()
+            .due
+            .is_some_and(|due| std::time::Instant::now() >= due)
     }
 
     /// Whether `local_hash` is the content of the last failed attempt.
@@ -2265,18 +2312,33 @@ impl EditSync {
             .is_some_and(|f| f.local.as_deref() == Some(local_hash))
     }
 
-    /// A sync-back that did not go through: remembered, and reported -
-    /// unless a rescan met exactly the failure already reported. A save the
-    /// watcher saw (`saved`) always reports.
-    fn failed(&self, saved: bool, local: Option<String>, error: String) {
+    /// A sync-back that did not go through: remembered, a quiet retry
+    /// scheduled (the wait doubles while the same content keeps failing), and
+    /// reported - unless a rescan met exactly the failure already reported,
+    /// or it was a quiet retry (`quiet`), which reports only a changed
+    /// outcome (the failure text names a fresh temporary file every time, so
+    /// "the same failure" cannot be told by its text). A save the watcher saw
+    /// (`saved`) always reports.
+    fn failed(&self, saved: bool, quiet: bool, local: Option<String>, error: String) {
         let failure = FailedSync { local, error };
-        let repeat = {
+        let (repeat, same_content) = {
             let mut last = self.retry.failure.lock().unwrap();
             let repeat = last.as_ref() == Some(&failure);
+            let same_content =
+                failure.local.is_some() && last.as_ref().is_some_and(|f| f.local == failure.local);
             *last = Some(failure.clone());
-            repeat
+            (repeat, same_content)
         };
-        if saved || !repeat {
+        {
+            let mut retry = self.retry.quiet.lock().unwrap();
+            retry.wait = if same_content {
+                (retry.wait * 2).max(retry.first).min(retry.max)
+            } else {
+                retry.first
+            };
+            retry.due = Some(std::time::Instant::now() + retry.wait);
+        }
+        if saved || (!quiet && !repeat) {
             self.report(&SyncOutcome::Failed(failure.error));
         }
     }
@@ -2440,6 +2502,11 @@ impl EditSync {
                 *self.synced.lock().unwrap() = Some(local_hash);
                 *self.pending.lock().unwrap() = None;
                 *self.retry.failure.lock().unwrap() = None;
+                {
+                    let mut retry = self.retry.quiet.lock().unwrap();
+                    retry.wait = std::time::Duration::ZERO;
+                    retry.due = None;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -5425,30 +5492,74 @@ fn refuse_holding_folder(
     }
 }
 
+/// Serializes the local pane's renames and new folders - each checks that
+/// its target name is free, then takes it. Off the main thread, two renames
+/// to one name both passed the check, and the second replaced what the first
+/// had put there (`std::fs::rename` replaces an existing file, and on Unix an
+/// empty folder). Never held across an await.
+static LOCAL_NAME_CHANGES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_local_names() -> std::sync::MutexGuard<'static, ()> {
+    LOCAL_NAME_CHANGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Create a directory on the LOCAL filesystem (dual-pane counterpart to
-/// `sftp_mkdir`, which only ever creates remote directories).
+/// `sftp_mkdir`, which only ever creates remote directories). Async, with
+/// the path checks and the mkdir on the blocking pool (RU6b P2-e): file I/O -
+/// a slow or network drive included - ran on the main thread.
 #[tauri::command]
-pub fn sftp_local_mkdir(app: AppHandle, path: String) -> CmdResult<serde_json::Value> {
-    let dir = validate_local_mutation(&app, &path)?;
-    if dir.exists() {
-        return Err(CmdError(format!("Already exists: {}", dir.display())).into());
-    }
-    std::fs::create_dir(&dir).map_err(|e| CmdError(format!("Could not create folder: {e}")))?;
-    Ok(serde_json::json!({ "ok": true }))
+pub async fn sftp_local_mkdir(app: AppHandle, path: String) -> CmdResult<serde_json::Value> {
+    super::run_blocking(move || {
+        let dir = validate_local_mutation(&app, &path)?;
+        let _names = lock_local_names();
+        if dir.exists() {
+            return Err(CmdError(format!("Already exists: {}", dir.display())));
+        }
+        std::fs::create_dir(&dir).map_err(|e| CmdError(format!("Could not create folder: {e}")))?;
+        Ok(serde_json::json!({ "ok": true }))
+    })
+    .await
 }
 
 /// Rename or move a LOCAL file/directory. Both endpoints are validated, so a
 /// rename cannot be used to move a file INTO the app data directory either.
+/// Async, with the path checks and the rename on the blocking pool (RU6b
+/// P2-e): file I/O - a slow or network drive included - ran on the main
+/// thread.
 #[tauri::command]
-pub fn sftp_local_rename(app: AppHandle, from: String, to: String) -> CmdResult<serde_json::Value> {
+pub async fn sftp_local_rename(
+    app: AppHandle,
+    from: String,
+    to: String,
+) -> CmdResult<serde_json::Value> {
     require_unlocked(&app)?;
-    let (src, dst) = validate_local_rename_with(&from, &to, &SensitiveLocations::current())?;
+    super::run_blocking(move || {
+        local_rename_with(&from, &to, &SensitiveLocations::current(), &|| {})
+    })
+    .await
+}
+
+/// [`sftp_local_rename`] on its blocking worker: the checks that the source
+/// exists and the destination is free, and the rename, as one step under
+/// [`LOCAL_NAME_CHANGES`]. `checked` runs between the destination check and
+/// the rename (a test seam).
+fn local_rename_with(
+    from: &str,
+    to: &str,
+    sensitive: &SensitiveLocations,
+    checked: &dyn Fn(),
+) -> CmdResult<serde_json::Value> {
+    let (src, dst) = validate_local_rename_with(from, to, sensitive)?;
+    let _names = lock_local_names();
     if !src.exists() {
-        return Err(CmdError(format!("Not found: {}", src.display())).into());
+        return Err(CmdError(format!("Not found: {}", src.display())));
     }
     if dst.exists() {
-        return Err(CmdError(format!("Already exists: {}", dst.display())).into());
+        return Err(CmdError(format!("Already exists: {}", dst.display())));
     }
+    checked();
     std::fs::rename(&src, &dst).map_err(|e| CmdError(format!("Rename failed: {e}")))?;
     Ok(serde_json::json!({ "ok": true }))
 }
@@ -11094,6 +11205,171 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         let error = events[0]["error"].as_str().unwrap_or_default();
         assert!(error.contains("could not read the saved file"), "{error}");
+    }
+
+    // ─── RU6b (RU6a review follow-ups) ───────────────────────────────────────
+
+    /// P2-f: on a server that leaves the type bits out and refuses the folder
+    /// probe on a file, a temp this app wrote is accepted on its size - so the
+    /// size check is what keeps a short write or someone else's file out, and
+    /// the link checks (READLINK, else REALPATH identity) what keep a link
+    /// out. Removing the size check fails here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6b_an_untyped_temp_counts_as_written_only_at_its_size_and_never_as_a_link() {
+        use russh_sftp::protocol::StatusCode;
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        {
+            let mut knobs = fx.knobs.lock().unwrap();
+            knobs.untyped_modes = true;
+            knobs.opendir_file_status = Some(StatusCode::PermissionDenied);
+        }
+        fx.write("/d/t.tmp", b"12345");
+        // Exactly the bytes written: accepted.
+        regular_file_attrs(&sftp, "/d/t.tmp", Some(5))
+            .await
+            .expect("the written temp");
+        // Another size (a short write, or not this app's file): refused.
+        let err = regular_file_attrs(&sftp, "/d/t.tmp", Some(4))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not known to be a regular file"), "{err}");
+        // Nothing written by this app: never accepted on its size.
+        assert!(regular_file_attrs(&sftp, "/d/t.tmp", None).await.is_err());
+        // A link - even to a file of exactly that size: refused.
+        fx.write("/d/victim", b"12345");
+        fx.symlink("victim", "/d/link.tmp");
+        let err = regular_file_attrs(&sftp, "/d/link.tmp", Some(5))
+            .await
+            .unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        // READLINK fails for everything: REALPATH identity decides. The temp
+        // resolves to itself and is accepted at its size only; the link
+        // resolves elsewhere and is still refused.
+        fx.knobs.lock().unwrap().readlink_status = Some(StatusCode::Failure);
+        regular_file_attrs(&sftp, "/d/t.tmp", Some(5))
+            .await
+            .expect("it resolves to itself");
+        assert!(regular_file_attrs(&sftp, "/d/t.tmp", Some(6))
+            .await
+            .is_err());
+        let err = regular_file_attrs(&sftp, "/d/link.tmp", Some(5))
+            .await
+            .unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+    }
+
+    /// P2-g: a save the watcher missed is tried by the periodic check. When
+    /// that attempt failed, no later check tried it again - even once the
+    /// cause was gone - until the next real save. It is retried quietly now,
+    /// after a growing wait: nothing before it is due, a retry that fails
+    /// again adds no event (and leaves one temporary file at most), and the
+    /// outcome that changes - here, it goes in - is reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ru6b_a_failed_sync_the_watcher_missed_is_retried_quietly_after_a_wait() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        fx.knobs
+            .lock()
+            .unwrap()
+            .remove_refused
+            .push("/srv/app.conf".to_string());
+        let local = LocalDir::new();
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, events) =
+            edit_sync_with(sftp, &staged, "/srv/app.conf", None, Some(b"v1")).await;
+        {
+            let mut quiet = sync.retry.quiet.lock().unwrap();
+            quiet.first = std::time::Duration::from_millis(300);
+            quiet.max = std::time::Duration::from_millis(600);
+        }
+        let seen = || events.lock().unwrap().clone();
+        let attempts = || fx.ops().iter().filter(|op| op.starts_with("open ")).count();
+
+        // The watcher missed the save: the periodic check finds it and tries.
+        std::fs::write(&staged, b"my edit").unwrap();
+        sync.clone().react(WatchVerdict::Rescan).await;
+        assert_eq!(seen().len(), 1, "{:?}", seen());
+        assert_eq!(seen()[0]["ok"], false, "{:?}", seen());
+        let tried = attempts();
+        // Not due yet: not tried again.
+        sync.clone().react(WatchVerdict::Rescan).await;
+        assert_eq!(attempts(), tried, "{:?}", fx.ops());
+        // Due, and still failing: tried quietly.
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        sync.clone().react(WatchVerdict::Rescan).await;
+        assert!(attempts() > tried, "retried once due: {:?}", fx.ops());
+        assert_eq!(seen().len(), 1, "no second event: {:?}", seen());
+        assert!(
+            temps_in(&fx, "/srv").len() <= 1,
+            "{:?}",
+            temps_in(&fx, "/srv")
+        );
+        // The cause is gone: the next due retry goes in, and says so.
+        fx.knobs.lock().unwrap().remove_refused.clear();
+        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+        sync.clone().react(WatchVerdict::Rescan).await;
+        assert_eq!(fx.read("/srv/app.conf"), b"my edit", "{:?}", seen());
+        assert_eq!(seen().len(), 2, "{:?}", seen());
+        assert_eq!(seen()[1]["ok"], true, "{:?}", seen());
+        assert!(
+            temps_in(&fx, "/srv").is_empty(),
+            "{:?}",
+            temps_in(&fx, "/srv")
+        );
+    }
+
+    /// RU6b fix round 1: off the main thread, two local renames to one name
+    /// both passed "the destination is free" before either renamed - and the
+    /// second silently replaced what the first had moved there.
+    #[cfg(unix)]
+    #[test]
+    fn ru6b_two_local_renames_to_one_name_never_replace_each_other() {
+        let local = LocalDir::new();
+        let base = canonical(&local);
+        let sensitive = std::sync::Arc::new(sensitive_fixture(&base));
+        for (name, content) in [("a.txt", "from a"), ("b.txt", "from b")] {
+            std::fs::write(base.join(name), content).unwrap();
+        }
+        let target = base.join("taken.txt").display().to_string();
+        // Each rename, once past its check, waits (half a second at most)
+        // for the other to get past its own.
+        let checked =
+            std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        let renames: Vec<_> = ["a.txt", "b.txt"]
+            .into_iter()
+            .map(|name| {
+                let from = base.join(name).display().to_string();
+                let (to, sensitive, checked) = (target.clone(), sensitive.clone(), checked.clone());
+                std::thread::spawn(move || {
+                    local_rename_with(&from, &to, &sensitive, &|| {
+                        let (count, both) = &*checked;
+                        let mut past = count.lock().unwrap();
+                        *past += 1;
+                        both.notify_all();
+                        let _ = both
+                            .wait_timeout_while(past, std::time::Duration::from_millis(500), |n| {
+                                *n < 2
+                            })
+                            .unwrap();
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<CmdResult<serde_json::Value>> =
+            renames.into_iter().map(|r| r.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        let refused = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+        assert!(refused.0.starts_with("Already exists"), "{}", refused.0);
+        let moved = std::fs::read_to_string(base.join("taken.txt")).unwrap();
+        let left = if moved == "from a" { "b.txt" } else { "a.txt" };
+        assert!(base.join(left).exists(), "the refused rename moved nothing");
     }
 
     /// Item 2: on a server that reports neither size nor time, the re-check

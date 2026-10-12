@@ -54,8 +54,12 @@ pub fn server_list(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// non-empty value replaces it. `clearSavedPassword: true` removes it (and wins
 /// over a value sent with it), and a server saved as `publickey` never keeps
 /// one.
+///
+/// Async, with the work on the blocking pool (RU6b P2-e): a saved password is
+/// sealed with Argon2id, which as a synchronous command ran on the main
+/// thread and froze the window on every save.
 #[tauri::command]
-pub fn server_save(
+pub async fn server_save(
     app: AppHandle,
     id: Option<String>,
     name: String,
@@ -70,27 +74,30 @@ pub fn server_save(
     category_id: Option<String>,
     color: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    server_save_in(
-        &app.state::<AppState>().db,
-        &app.state::<super::VaultPasswordStore>(),
-        &app.state::<super::VaultRotationLock>(),
-        SaveServerRequest {
-            id,
-            name,
-            host,
-            port,
-            username,
-            auth_method,
-            key_id,
-            pem_path,
-            // Wrapped at once: every return below, early ones included,
-            // wipes it.
-            saved_password: saved_password.map(zeroize::Zeroizing::new),
-            clear_saved_password,
-            category_id,
-            color,
-        },
-    )
+    let request = SaveServerRequest {
+        id,
+        name,
+        host,
+        port,
+        username,
+        auth_method,
+        key_id,
+        pem_path,
+        // Wrapped at once: every return below, early ones included, wipes it.
+        saved_password: saved_password.map(zeroize::Zeroizing::new),
+        clear_saved_password,
+        category_id,
+        color,
+    };
+    super::run_blocking(move || {
+        server_save_in(
+            &app.state::<AppState>().db,
+            &app.state::<super::VaultPasswordStore>(),
+            &app.state::<super::VaultRotationLock>(),
+            request,
+        )
+    })
+    .await
 }
 
 /// The IPC values as one request, so tests exercise the same save operation

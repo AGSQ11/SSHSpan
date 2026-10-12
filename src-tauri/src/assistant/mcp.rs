@@ -49,8 +49,8 @@ use tauri::{AppHandle, Manager};
 use zeroize::Zeroizing;
 
 use crate::commands::{
-    capture_vault_generation, require_generation_current, vault_password, CmdError,
-    VaultPasswordStore,
+    audit_or_log, audit_or_warn, capture_vault_generation, require_generation_current,
+    vault_password, CmdError, VaultPasswordStore,
 };
 
 pub type CmdResult<T> = Result<T, CmdError>;
@@ -99,12 +99,18 @@ pub enum UrlClass {
 /// http is allowed only when the host is a loopback literal or "localhost"
 /// (self-hosted local servers are a first-class use case). Everything else
 /// is rejected. No credentials in the URL, ever. Returns the normalized
-/// base (scheme + host[:port] + path, no trailing slash).
+/// base (scheme + host[:port] + path, no trailing slash) - so a `?query` or
+/// `#fragment` is refused rather than silently dropped (A4-23): a token or a
+/// route in it would vanish and the server would then fail for no visible
+/// reason. The settings form applies the same rule.
 pub fn classify_url(raw: &str) -> Result<(String, UrlClass), String> {
     let trimmed = raw.trim();
     let url = url::Url::parse(trimmed).map_err(|_| "Server URL is not a valid URL.".to_string())?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err("Server URL must not contain credentials.".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("MCP server URLs cannot contain ?query or #fragment parts.".into());
     }
     let (host, is_loopback) = url_host(&url)?;
     let class = match url.scheme() {
@@ -570,43 +576,206 @@ pub fn guarded_client() -> CmdResult<reqwest::Client> {
 /// One live MCP session: the negotiated protocol version (echoed back as
 /// MCP-Protocol-Version on every later request) and the server-issued
 /// session id.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpSession {
     pub session_id: Option<String>,
     pub protocol_version: String,
+}
+
+/// The settings a session was set up with: the server record's URL and auth
+/// configuration at that moment - what [`same_connection`] compares, the
+/// secret as sealed. The server knows the session under these settings only,
+/// so it is used only for a record that has them, and ended only at this URL
+/// with this credential: an edit that lands while a session is being set up
+/// must not hand that session - or the old credential - to the new endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectionBinding {
+    url: String,
+    auth_type: String,
+    auth_header_name: Option<String>,
+    auth_secret: Option<String>,
+    auth_env_var: Option<String>,
+}
+
+impl ConnectionBinding {
+    fn of(record: &crate::db::McpServerRecord) -> Self {
+        Self {
+            url: record.url.clone(),
+            auth_type: record.auth_type.clone(),
+            auth_header_name: record.auth_header_name.clone(),
+            auth_secret: record.auth_secret.clone(),
+            auth_env_var: record.auth_env_var.clone(),
+        }
+    }
+
+    /// The auth header these settings send, a stored secret unsealed with
+    /// `pw` - an Argon2id derivation, so never on the main thread. `None`
+    /// when they send none, the vault is locked (`pw` empty) or the header
+    /// cannot be resolved: a teardown then goes out without it. The value is
+    /// Zeroizing.
+    fn auth_header(&self, pw: &Zeroizing<String>) -> Option<(String, Zeroizing<String>)> {
+        if pw.is_empty() {
+            return None;
+        }
+        resolve_auth_header(
+            &self.auth_type,
+            self.auth_header_name.as_deref(),
+            self.auth_secret.as_deref(),
+            self.auth_env_var.as_deref(),
+            pw,
+        )
+        .ok()
+        .flatten()
+    }
+}
+
+/// A registered session, the settings it belongs to, and the server's name
+/// (for messages about it).
+#[derive(Debug, Clone)]
+struct LiveSession {
+    session: McpSession,
+    /// The settings it was set up with. `None` only for a session registered
+    /// through [`McpState::set_session`] (a test seam): it counts as
+    /// belonging to the server's record as stored.
+    binding: Option<ConnectionBinding>,
+    server_name: String,
+}
+
+impl LiveSession {
+    /// Whether a request for `record` may use this session: it was set up
+    /// with `record`'s URL and auth settings (or registered without them).
+    fn belongs_to(&self, record: &crate::db::McpServerRecord) -> bool {
+        self.binding
+            .as_ref()
+            .is_none_or(|binding| *binding == ConnectionBinding::of(record))
+    }
+
+    /// Whether this session is known to be set up with `record`'s URL and
+    /// auth settings.
+    fn bound_to(&self, record: &crate::db::McpServerRecord) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| *binding == ConnectionBinding::of(record))
+    }
 }
 
 /// Last-known connect status for one server (status, error, enabled-tool
 /// count); absent from the map = "unknown".
 type ServerStatus = (String, Option<String>, usize);
 
-/// App-managed in-memory state for MCP: live sessions and last-known
-/// connect statuses, keyed by server id. Cleared on vault lock
-/// (`McpState::teardown_all`).
+/// App-managed in-memory state for MCP: live sessions - each with the
+/// settings it was set up with - and last-known connect statuses, keyed by
+/// server id - cleared on vault lock ([`teardown_all`]) - and the session
+/// teardowns (HTTP DELETEs) still running, so an exit can wait for them
+/// ([`McpState::take_teardowns`]).
 #[derive(Default)]
 pub struct McpState {
-    sessions: Mutex<HashMap<String, McpSession>>,
+    sessions: Mutex<HashMap<String, LiveSession>>,
     statuses: Mutex<HashMap<String, ServerStatus>>,
+    teardowns: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl McpState {
     pub fn new() -> Self {
         Self::default()
     }
+    /// The session registered for `server_id`, whatever settings it belongs
+    /// to - for looking at the state. A request takes its session from
+    /// [`McpState::session_for`].
     pub fn get_session(&self, server_id: &str) -> Option<McpSession> {
-        self.sessions.lock().unwrap().get(server_id).cloned()
-    }
-    pub fn set_session(&self, server_id: &str, session: McpSession) {
         self.sessions
             .lock()
             .unwrap()
-            .insert(server_id.to_string(), session);
+            .get(server_id)
+            .map(|live| live.session.clone())
     }
-    pub fn remove_session(&self, server_id: &str) -> Option<McpSession> {
+    /// Register `session` for `server_id` WITHOUT the settings it was set up
+    /// with: it then counts as belonging to the server's record as stored.
+    /// The integration tests' seam - the app registers every session it sets
+    /// up through [`McpState::bind_session`].
+    #[doc(hidden)]
+    pub fn set_session(&self, server_id: &str, session: McpSession) {
+        self.insert(
+            server_id,
+            LiveSession {
+                session,
+                binding: None,
+                server_name: server_id.to_string(),
+            },
+        );
+    }
+    /// Register `session`, set up with `record`'s current URL and auth
+    /// settings.
+    pub(crate) fn bind_session(&self, record: &crate::db::McpServerRecord, session: McpSession) {
+        self.insert(
+            &record.id,
+            LiveSession {
+                session,
+                binding: Some(ConnectionBinding::of(record)),
+                server_name: record.name.clone(),
+            },
+        );
+    }
+    fn insert(&self, server_id: &str, live: LiveSession) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(server_id.to_string(), live);
+    }
+    /// The session a request for `record` may use: only one set up with
+    /// `record`'s URL and auth settings.
+    pub(crate) fn session_for(&self, record: &crate::db::McpServerRecord) -> Option<McpSession> {
+        self.live_session(&record.id)
+            .filter(|live| live.belongs_to(record))
+            .map(|live| live.session)
+    }
+    fn live_session(&self, server_id: &str) -> Option<LiveSession> {
+        self.sessions.lock().unwrap().get(server_id).cloned()
+    }
+    /// Remove and return the session of `server_id` - only if `take` says so
+    /// of the one registered at that moment.
+    fn take_session_if(
+        &self,
+        server_id: &str,
+        take: impl FnOnce(&LiveSession) -> bool,
+    ) -> Option<LiveSession> {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.get(server_id).is_some_and(take) {
+            sessions.remove(server_id)
+        } else {
+            None
+        }
+    }
+    fn take_session(&self, server_id: &str) -> Option<LiveSession> {
         self.sessions.lock().unwrap().remove(server_id)
     }
-    fn take_sessions(&self) -> Vec<(String, McpSession)> {
+    fn take_sessions(&self) -> Vec<(String, LiveSession)> {
         self.sessions.lock().unwrap().drain().collect()
+    }
+    /// After a committed master-password change: every live session bound to
+    /// a secret the change re-sealed (`before` -> `after`, by server id) is
+    /// bound to its new seal. The secret is the same, only sealed with the
+    /// new password - without this every session would look set up for other
+    /// settings from then on, and be ended at its next use with no
+    /// credential (the old seal no longer opens).
+    pub(crate) fn follow_resealed_secrets(
+        &self,
+        before: &HashMap<String, String>,
+        after: &HashMap<String, String>,
+    ) {
+        let mut sessions = self.sessions.lock().unwrap();
+        for (server_id, live) in sessions.iter_mut() {
+            let (Some(binding), Some(old), Some(new)) = (
+                live.binding.as_mut(),
+                before.get(server_id),
+                after.get(server_id),
+            ) else {
+                continue;
+            };
+            if binding.auth_secret.as_deref() == Some(old.as_str()) {
+                binding.auth_secret = Some(new.clone());
+            }
+        }
     }
     pub fn record_status(
         &self,
@@ -630,6 +799,19 @@ impl McpState {
     }
     fn clear_statuses(&self) {
         self.statuses.lock().unwrap().clear();
+    }
+    /// Keep session teardown tasks until they finish, for the exit to wait
+    /// for; finished ones are dropped here.
+    pub(crate) fn track_teardowns(&self, started: Vec<tauri::async_runtime::JoinHandle<()>>) {
+        let mut teardowns = self.teardowns.lock().unwrap();
+        teardowns.retain(|handle| !handle.inner().is_finished());
+        teardowns.extend(started);
+    }
+    /// The session teardowns started so far that may still be running (the
+    /// lock path's, a stale session's after a URL or auth edit): the exit
+    /// waits for them ([`wait_for_teardowns`]) instead of cutting them off.
+    pub fn take_teardowns(&self) -> Vec<tauri::async_runtime::JoinHandle<()>> {
+        std::mem::take(&mut *self.teardowns.lock().unwrap())
     }
 }
 
@@ -1070,14 +1252,54 @@ fn load_server_context(
         record.auth_env_var.as_deref(),
         pw,
     )?;
+    let session = usable_session(
+        app.state::<McpState>().inner(),
+        &app.state::<crate::AppState>().db,
+        &record,
+        pw,
+    );
     Ok(ServerContext {
-        session: app.state::<McpState>().get_session(&record.id),
+        session,
         url,
         client: origin_client()?,
         record,
         auth,
         generation,
     })
+}
+
+/// The registered session a request for `record` may use: only one set up
+/// with `record`'s URL and auth settings. It used to be looked up by server
+/// id alone, so a session set up with settings an edit had replaced meanwhile
+/// (the edit landed while it was being set up) was sent to the NEW endpoint,
+/// and the old endpoint never heard of it again.
+///
+/// A session set up with other settings is not used. If those settings are
+/// gone from the stored record too, the session is stale: it is removed and
+/// ended in the background at the endpoint it belongs to, with the
+/// credential it was set up with (unsealed by the teardown task, from a copy
+/// of `pw`). If the stored record still has them, it is the caller's
+/// snapshot that is old: the session is left alone.
+fn usable_session(
+    state: &McpState,
+    db: &crate::db::Database,
+    record: &crate::db::McpServerRecord,
+    pw: &Zeroizing<String>,
+) -> Option<McpSession> {
+    let live = state.live_session(&record.id)?;
+    if live.belongs_to(record) {
+        return Some(live.session);
+    }
+    // Unknown when the record cannot be read: then nothing is ended.
+    let stored = db.get_mcp_server(&record.id).ok()?;
+    let stale = state.take_session_if(&record.id, |now| {
+        now.session == live.session && stored.as_ref().is_none_or(|s| !now.belongs_to(s))
+    })?;
+    let password = Some(std::sync::Arc::new(pw.clone()));
+    if let (Some(job), Ok(client)) = (session_end(stale, None, password), origin_client()) {
+        state.track_teardowns(spawn_teardown_jobs(db.clone(), client, vec![job]));
+    }
+    None
 }
 
 /// The initialize request/response, returning the live session. Negotiates
@@ -1175,6 +1397,11 @@ async fn send_initialized(
     session: &McpSession,
 ) -> CmdResult<()> {
     ctx.checked(app)?;
+    send_initialized_unchecked(ctx, session).await
+}
+
+/// [`send_initialized`] without the generation check - the caller runs it.
+async fn send_initialized_unchecked(ctx: &ServerContext, session: &McpSession) -> CmdResult<()> {
     let body = json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
@@ -1262,15 +1489,220 @@ async fn request_with_session(
         return Ok(outcome);
     }
     // 404: re-initialize once, then retry the request with the new session.
-    ctx.checked(app)?;
-    let (new_session, _) = initialize(app, ctx).await?;
-    send_initialized(app, ctx, &new_session).await?;
-    ctx.session = Some(new_session.clone());
-    app.state::<McpState>()
-        .set_session(&ctx.record.id, new_session);
+    // A tools/list_changed with the initialize answer needs nothing here:
+    // this is a connect's or a refresh's own tools/list fetch.
+    let generation = ctx.generation;
+    establish_session(app.state::<McpState>().inner(), ctx, &|| {
+        require_generation_current(app, generation)
+    })
+    .await?;
     request_once(app, ctx, body)
         .await?
         .ok_or_else(|| CmdError("MCP session could not be re-established.".into()))
+}
+
+/// Initialize a new session for `ctx` and register it in `state`, bound to
+/// `ctx`'s settings: initialize, then `notifications/initialized`. `guard`
+/// (the vault generation check in production) runs before each request and
+/// before the session is registered - a lock during initialize must not
+/// leave a live session behind - and before every request the exchange makes
+/// on its own. True when the initialize answer announced a
+/// tools/list_changed: the server's tool definitions changed since they were
+/// last fetched (while SSHSpan was closed, say).
+async fn establish_session(
+    state: &McpState,
+    ctx: &mut ServerContext,
+    guard: &(dyn Fn() -> CmdResult<()> + Sync),
+) -> CmdResult<bool> {
+    guard()?;
+    let (session, outcome) = initialize_unchecked(ctx, guard).await?;
+    guard()?;
+    state.bind_session(&ctx.record, session.clone());
+    ctx.session = Some(session.clone());
+    guard()?;
+    send_initialized_unchecked(ctx, &session).await?;
+    Ok(outcome.list_changed)
+}
+
+/// What became of one `tools/call` ([`run_tool_call`]).
+#[derive(Debug)]
+enum CallSent {
+    /// The request went out. `approval` is who let it run and `level` the
+    /// tab's access level it was checked at, both from the last gate check
+    /// before it (for the audit row); `called` is its answer - the result,
+    /// and whether a tools/list_changed came with it or with the initialize
+    /// answer of a session it set up - or why there is none (the tool may
+    /// still have run).
+    Sent {
+        approval: &'static str,
+        level: String,
+        called: CmdResult<(Value, bool)>,
+    },
+    /// The gate, checked again right before the request at `level`, refused
+    /// it: the reason. Nothing was sent, and a session this call set up was
+    /// ended.
+    Refused { reason: String, level: String },
+}
+
+/// One check of the call gate right before `tools/call` ([`regate_call`]):
+/// the tab's access level it checked, and its verdict - who lets the call
+/// run ([`call_gate`]'s label), or why it may not.
+#[derive(Debug)]
+struct GateCheck {
+    level: String,
+    verdict: Result<&'static str, String>,
+}
+
+/// The network part of [`mcp_call_tool`], without the `AppHandle`: set up a
+/// session if there is none, then send `tools/call` - re-initializing once
+/// and retrying if the server no longer knows the session (404). `guard` is
+/// the vault-generation check; `regate` re-reads the server record and the
+/// tab's level and runs the call gate again ([`regate_call`]).
+///
+/// The gate is run again right before every `tools/call` that goes out -
+/// after the session set-up and after a re-initialize - not only before the
+/// set-up: those round trips can take seconds, and a tool revoked or changed
+/// meanwhile (or a tab disarmed from YOLO) was still called. A refusal there
+/// is [`CallSent::Refused`]: nothing was sent, and a session this call set up
+/// is ended ([`gate_before_call`]). The level that check passed at is the
+/// one the call is audited at.
+///
+/// A tools/list_changed announced with the answer to an initialize this call
+/// sent counts as the call's own: the server's definitions changed since
+/// they were fetched - while SSHSpan was closed, say - so the tool list is
+/// refreshed after the call (see `finish_tool_call`), which disables a
+/// changed tool. It used to be dropped, and a changed tool stayed enabled.
+async fn run_tool_call(
+    state: &McpState,
+    db: &crate::db::Database,
+    ctx: &mut ServerContext,
+    body: &Value,
+    guard: &(dyn Fn() -> CmdResult<()> + Sync),
+    regate: &(dyn Fn() -> GateCheck + Sync),
+) -> CmdResult<CallSent> {
+    let mut announced = false;
+    let set_up = ctx.session.is_none();
+    if set_up {
+        announced = establish_session(state, ctx, guard).await?;
+    }
+    let (mut approval, mut level) = match gate_before_call(state, db, ctx, set_up, regate()) {
+        Ok(passed) => passed,
+        Err(refused) => return Ok(refused),
+    };
+    let first = match guard() {
+        Ok(()) => request_once_unchecked(ctx, body, guard).await,
+        Err(e) => Err(e),
+    };
+    let answered = match first {
+        Ok(None) => {
+            // 404: the session expired before the call ran. Re-initialize
+            // once, check the gate again, retry.
+            match establish_session(state, ctx, guard).await {
+                Ok(changed) => announced |= changed,
+                Err(e) => {
+                    return Ok(CallSent::Sent {
+                        approval,
+                        level,
+                        called: Err(e),
+                    })
+                }
+            }
+            (approval, level) = match gate_before_call(state, db, ctx, true, regate()) {
+                Ok(passed) => passed,
+                Err(refused) => return Ok(refused),
+            };
+            match guard() {
+                Ok(()) => request_once_unchecked(ctx, body, guard).await,
+                Err(e) => Err(e),
+            }
+        }
+        other => other,
+    };
+    let called = answered.and_then(|outcome| {
+        let outcome =
+            outcome.ok_or_else(|| CmdError("MCP session could not be re-established.".into()))?;
+        guard()?;
+        let list_changed = outcome.list_changed || announced;
+        Ok((rpc_result(outcome.result)?, list_changed))
+    });
+    Ok(CallSent::Sent {
+        approval,
+        level,
+        called,
+    })
+}
+
+/// [`run_tool_call`]'s gate check right before a `tools/call`: who lets the
+/// call run and at which level - or the refusal. A refused call ends the
+/// session it registered itself (`set_up`): that session was set up for this
+/// call, possibly with the very settings an edit just replaced, and was
+/// otherwise left registered - the next call sent its id to the new endpoint.
+fn gate_before_call(
+    state: &McpState,
+    db: &crate::db::Database,
+    ctx: &ServerContext,
+    set_up: bool,
+    check: GateCheck,
+) -> Result<(&'static str, String), CallSent> {
+    match check.verdict {
+        Ok(approval) => Ok((approval, check.level)),
+        Err(reason) => {
+            if set_up {
+                end_ctx_session(state, db, ctx);
+            }
+            Err(CallSent::Refused {
+                reason,
+                level: check.level,
+            })
+        }
+    }
+}
+
+/// The call gate run again on the record as stored NOW, for the call about to
+/// go out (`tool` on the server `started_from` was read as, at access
+/// `level`, with the user's `approved`). The gate was first checked before
+/// the session set-up, which can take seconds: a tool revoked, re-approved
+/// with other Auto-approve, changed on the server (refreshed definition) or a
+/// tab disarmed from YOLO meanwhile is caught here, with the gate's own
+/// messages. A server removed meanwhile, or one whose URL or auth settings
+/// changed (the session belongs to the old ones), is refused too.
+fn regate_call(
+    db: &crate::db::Database,
+    started_from: &crate::db::McpServerRecord,
+    tool: &str,
+    level: &str,
+    approved: bool,
+) -> GateCheck {
+    GateCheck {
+        level: level.to_string(),
+        verdict: gate_as_stored_now(db, started_from, tool, level, approved),
+    }
+}
+
+/// [`regate_call`]'s verdict.
+fn gate_as_stored_now(
+    db: &crate::db::Database,
+    started_from: &crate::db::McpServerRecord,
+    tool: &str,
+    level: &str,
+    approved: bool,
+) -> Result<&'static str, String> {
+    let now = db
+        .get_mcp_server(&started_from.id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "MCP server not found.".to_string())?;
+    if !same_connection(started_from, &now) {
+        return Err(
+            "This MCP server's URL or auth settings changed meanwhile - test the connection again."
+                .into(),
+        );
+    }
+    let entry = now
+        .tools
+        .iter()
+        .find(|t| t.name == tool)
+        .ok_or_else(|| format!("Tool '{tool}' not found on this MCP server."))?;
+    call_gate(level, approved, now.confirmed, entry)
 }
 
 /// Fetch the full tool list with cursor pagination; servers above the
@@ -1409,12 +1841,11 @@ async fn fetch_tools_once(
 /// auth header nor write session/DB state afterward.
 ///
 /// After the network round trips it re-reads the record and writes the
-/// whole row back with the fetched tools merged in ([`merge_into_stored`]),
-/// so the CALLER must hold read access to the `VaultRotationLock` from
-/// before it read `record` until this returns (C1): a master-password change
-/// committing in between would otherwise get an old-sealed secret written
-/// back over the re-sealed one (or unseal `record`'s secret with the wrong
-/// password).
+/// whole row back with the fetched tools merged in, in one transaction
+/// ([`store_fetched_tools`]). The CALLER holds read access to the
+/// `VaultRotationLock` from before it read `record` until this returns (C1):
+/// `record`'s secret must not be unsealed with a password that is being
+/// replaced.
 async fn connect_server(
     app: &AppHandle,
     record: crate::db::McpServerRecord,
@@ -1435,7 +1866,7 @@ async fn connect_server(
     // must not leave a live session in state.
     require_generation_current(app, generation)?;
     app.state::<McpState>()
-        .set_session(&record.id, session.clone());
+        .bind_session(&record, session.clone());
     ctx.session = Some(session);
     // Note: a list_changed arriving WITH the initialize stream needs no
     // special handling here - the very next step is a fresh tools/list
@@ -1450,18 +1881,70 @@ async fn connect_server(
     // Re-read the record now, after the round trips, and merge into that
     // (A7-49). The caller's rotation guard still covers read and write.
     let db = &app.state::<crate::AppState>().db;
-    let stored_now = db.get_mcp_server(&record.id).map_err(|e| e.to_string())?;
-    let (updated, changed) =
-        merge_into_stored(&record, stored_now, &tool_defs).inspect_err(|_| {
-            // The session belongs to settings that are gone: never reuse it.
-            app.state::<McpState>().remove_session(&record.id);
-        })?;
-    db.save_mcp_server(&updated).map_err(|e| e.to_string())?;
+    store_fetched_tools(db, &record, &tool_defs).inspect_err(|_| {
+        // The session belongs to settings that are gone: never reuse it.
+        end_ctx_session(app.state::<McpState>().inner(), db, &ctx);
+    })
+}
+
+/// Remove the session `ctx` set up from `state` - only if it is still the one
+/// registered (another request may have set up a newer one meanwhile) - and
+/// end it in the background where `ctx` set it up: at `ctx`'s URL with
+/// `ctx`'s credential, the pair it belongs to. It used to be removed by
+/// server id alone, which could drop a newer session, and was never ended.
+fn end_ctx_session(state: &McpState, db: &crate::db::Database, ctx: &ServerContext) {
+    let Some(mine) = ctx.session.as_ref() else {
+        return;
+    };
+    let Some(live) = state.take_session_if(&ctx.record.id, |live| live.session == *mine) else {
+        return;
+    };
+    let Some(session_id) = live.session.session_id else {
+        return;
+    };
+    let job = TeardownJob {
+        url: ctx.url.clone(),
+        session_id,
+        protocol_version: live.session.protocol_version,
+        auth: TeardownAuth::Resolved(ctx.auth.clone()),
+        server_name: ctx.record.name.clone(),
+    };
+    state.track_teardowns(spawn_teardown_jobs(
+        db.clone(),
+        ctx.client.clone(),
+        vec![job],
+    ));
+}
+
+/// Store the tools a connect (or a call's refresh) fetched: re-read the
+/// record and merge them into it ([`merge_into_stored`]) inside ONE
+/// transaction with the write (A7-49). The re-read and the save used to be
+/// two statements, so a toggle committed between them was overwritten - a
+/// revoked approval came back - and a server removed between them was
+/// re-created. Each enabled tool the fetch found changed is audited
+/// (`mcp.tool_definition_changed`, after the commit). The caller holds the
+/// rotation guard.
+fn store_fetched_tools(
+    db: &crate::db::Database,
+    started_from: &crate::db::McpServerRecord,
+    fetched: &[Value],
+) -> CmdResult<(crate::db::McpServerRecord, Vec<String>)> {
+    let (updated, changed) = db
+        .modify_mcp_servers(|all| {
+            let stored_now = all.iter().find(|r| r.id == started_from.id).cloned();
+            let (updated, changed) = merge_into_stored(started_from, stored_now, fetched)?;
+            Ok((
+                crate::db::McpWrite::Update(updated.clone()),
+                (updated, changed),
+            ))
+        })
+        .map_err(CmdError::from)?;
     for tool in &changed {
-        let _ = db.add_audit(
+        audit_or_log(
+            db,
             "mcp.tool_definition_changed",
-            Some(&record.id),
-            &format!("server={} tool={}", record.name, tool),
+            Some(&started_from.id),
+            &format!("server={} tool={}", started_from.name, tool),
         );
     }
     Ok((updated, changed))
@@ -1469,11 +1952,12 @@ async fn connect_server(
 
 /// The record a connect (or a call's tool-list refresh) saves after its
 /// network round trips, and the enabled tools whose definition changed. The
-/// fetched tools are merged into the record AS STORED NOW - re-read right
-/// before this - not into the snapshot the connect started from, so a tool
-/// toggled or a name edited during a slow connect is not reverted (A7-49).
-/// Nothing is saved when the server was removed meanwhile, or its URL or
-/// auth settings changed: the tools came from the old configuration.
+/// fetched tools are merged into the record AS STORED NOW - read in the same
+/// transaction as the write ([`store_fetched_tools`]) - not into the
+/// snapshot the connect started from, so a tool toggled or a name edited
+/// during a slow connect is not reverted (A7-49). Nothing is saved when the
+/// server was removed meanwhile, or its URL or auth settings changed: the
+/// tools came from the old configuration.
 fn merge_into_stored(
     started_from: &crate::db::McpServerRecord,
     stored_now: Option<crate::db::McpServerRecord>,
@@ -1495,13 +1979,9 @@ fn merge_into_stored(
 }
 
 /// Whether two snapshots of a server record send the same requests: the
-/// same URL and the same auth configuration.
+/// same URL and the same auth configuration ([`ConnectionBinding`]).
 fn same_connection(a: &crate::db::McpServerRecord, b: &crate::db::McpServerRecord) -> bool {
-    a.url == b.url
-        && a.auth_type == b.auth_type
-        && a.auth_header_name == b.auth_header_name
-        && a.auth_secret == b.auth_secret
-        && a.auth_env_var == b.auth_env_var
+    ConnectionBinding::of(a) == ConnectionBinding::of(b)
 }
 
 /// Whether a stored tool's live definition differs from the one the user
@@ -1592,32 +2072,13 @@ pub fn changed_enabled_tools(
 
 // ─── Teardown on vault lock ─────────────────────────────────────────────────
 
-/// Resolve the auth header for a record from the vault password alone (safe
-/// to call mid-lock, after the generation bump but before the password store
-/// clears). `None` when the vault is locked or the header cannot be
-/// resolved: a teardown then goes out without it. The value is Zeroizing.
-fn resolve_auth_with_password(
-    pw: Option<Zeroizing<String>>,
-    record: &crate::db::McpServerRecord,
-) -> Option<(String, Zeroizing<String>)> {
-    let pw = pw.filter(|p| !p.is_empty())?;
-    resolve_auth_header(
-        &record.auth_type,
-        record.auth_header_name.as_deref(),
-        record.auth_secret.as_deref(),
-        record.auth_env_var.as_deref(),
-        &pw,
-    )
-    .ok()
-    .flatten()
-}
-
 /// Send the HTTP DELETE that ends a session, with the static auth header
-/// attached (the server may require it even for DELETE). The credentials are
-/// resolved BEFORE the vault store clears. Only 405 ("method not allowed" -
-/// valid per spec for servers that manage sessions differently) is ignored;
-/// a 401 means the session tear-down was refused, and any transport failure
-/// is reported - never silently swallowed, and never retried with secrets.
+/// attached (the server may require it even for DELETE). The header is
+/// resolved first ([`TeardownAuth::resolve`]). Only 405 ("method not
+/// allowed" - valid per spec for servers that manage sessions differently) is
+/// ignored; a 401 means the session tear-down was refused, and any transport
+/// failure is reported - never silently swallowed, and never retried with
+/// secrets.
 async fn delete_session(
     client: &reqwest::Client,
     url: &str,
@@ -1652,82 +2113,207 @@ async fn delete_session(
     Ok(())
 }
 
-/// One pending authenticated session teardown: everything the DELETE needs,
-/// resolved while the vault password is still available.
+/// One pending session teardown: everything the DELETE needs.
 struct TeardownJob {
     url: String,
     session_id: String,
     protocol_version: String,
-    auth: Option<(String, Zeroizing<String>)>,
+    auth: TeardownAuth,
     server_name: String,
 }
 
-/// Tear down every live MCP session. Called from `lock_vault_internal`
-/// AFTER the generation bump but BEFORE the password store clears, so the
-/// static auth header for each server can still be resolved (with a safe
-/// snapshot of the record) and attached to the DELETE. Decrypted secrets
-/// are zeroized by their Zeroizing wrappers when the task ends; nothing
-/// session-scoped is cached. The lock path itself stays nonblocking: the
-/// in-memory session map is drained synchronously (no new request can use
-/// a session) and the DELETEs run on the Tauri async runtime.
-pub fn teardown_all(app: &AppHandle) {
-    let all = app.state::<McpState>().take_sessions();
-    app.state::<McpState>().clear_statuses();
-    let client = match origin_client() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    // Resolve URL + auth while the vault password is still available.
-    let mut jobs: Vec<TeardownJob> = Vec::new();
-    for (server_id, session) in all {
-        let Some(sid) = session.session_id else {
-            continue;
-        };
-        let Ok(Some(rec)) = app.state::<crate::AppState>().db.get_mcp_server(&server_id) else {
-            continue;
-        };
-        let Ok((url, _)) = classify_url(&rec.url) else {
-            continue;
-        };
-        // BEFORE the store clear; the resolved value is Zeroizing.
-        let auth = resolve_auth_with_password(vault_password(app).ok(), &rec);
-        jobs.push(TeardownJob {
-            url,
-            session_id: sid,
-            protocol_version: session.protocol_version,
-            auth,
-            server_name: rec.name,
-        });
-    }
-    let app = app.clone();
-    // Fire-and-forget on the Tauri runtime: the lock path must not block on
-    // network I/O. The in-memory session map is already drained, so no new
-    // request can use a session. Failures (other than 405) are audited -
-    // a refused teardown must not disappear silently.
-    tauri::async_runtime::spawn(async move {
-        for job in jobs {
-            if let Err(e) = delete_session(
-                &client,
-                &job.url,
-                &job.session_id,
-                &job.protocol_version,
-                job.auth.as_ref().map(|(n, v)| (n.as_str(), v)),
-                &job.server_name,
-            )
+/// Where the auth header of a session teardown comes from.
+enum TeardownAuth {
+    /// Resolved already (`None`: the session's settings send none) - by the
+    /// request that set the session up, say.
+    Resolved(Option<(String, Zeroizing<String>)>),
+    /// Resolved by the teardown itself, on the blocking pool, from the
+    /// settings the session was set up with and `password` - a copy of the
+    /// vault password taken while it was still there (before a lock cleared
+    /// it). A stored secret is an Argon2id derivation to unseal (about 0.75 s
+    /// in a release build): it must not run on the thread that ends the
+    /// session, which for a lock is the main thread.
+    Unseal {
+        binding: ConnectionBinding,
+        password: Option<std::sync::Arc<Zeroizing<String>>>,
+    },
+}
+
+impl TeardownAuth {
+    /// The header the DELETE carries. Every copy of the password this held
+    /// is gone when it returns: the shared copy is released as soon as the
+    /// header is resolved - before the DELETE goes out - and is wiped when
+    /// the last teardown that shares it has resolved its own.
+    async fn resolve(self) -> Option<(String, Zeroizing<String>)> {
+        match self {
+            Self::Resolved(auth) => auth,
+            Self::Unseal {
+                binding,
+                password: Some(password),
+            } => tauri::async_runtime::spawn_blocking(move || {
+                let header = binding.auth_header(&password);
+                drop(password);
+                header
+            })
             .await
-            {
-                if let Err(audit_err) = app.state::<crate::AppState>().db.add_audit(
-                    "mcp.session_teardown_failed",
-                    None,
-                    &e,
-                ) {
-                    log::warn!(
-                        "[sshspan-mcp] could not audit a failed MCP session teardown: {audit_err}"
-                    );
-                }
-            }
+            .ok()
+            .flatten(),
+            // Locked: no secret can be unsealed.
+            Self::Unseal { password: None, .. } => None,
         }
-    });
+    }
+}
+
+/// The DELETE that ends `live` where it was set up: at the URL of its
+/// settings, with their credential (unsealed by the teardown from
+/// `password`) - never at a server record's current settings, which an edit
+/// may have pointed at another endpoint since. A session registered without
+/// its settings (the integration tests' [`McpState::set_session`]) is ended
+/// at `fallback`'s. `None` when there is no session id to end, no settings,
+/// or the URL no longer parses.
+fn session_end(
+    live: LiveSession,
+    fallback: Option<&crate::db::McpServerRecord>,
+    password: Option<std::sync::Arc<Zeroizing<String>>>,
+) -> Option<TeardownJob> {
+    let binding = live
+        .binding
+        .or_else(|| fallback.map(ConnectionBinding::of))?;
+    let session_id = live.session.session_id?;
+    let (url, _) = classify_url(&binding.url).ok()?;
+    // Settings without auth need no password: the copy is not passed on.
+    let password = password.filter(|_| binding.auth_type != "none");
+    Some(TeardownJob {
+        url,
+        session_id,
+        protocol_version: live.session.protocol_version,
+        auth: TeardownAuth::Unseal { binding, password },
+        server_name: live.server_name,
+    })
+}
+
+/// Tear down every live MCP session. Called from `lock_vault_internal`
+/// AFTER the generation bump but BEFORE the password store clears. The lock
+/// path itself never waits for a server or for a secret: the in-memory
+/// session map is drained at once (no new request can use a session), a copy
+/// of the vault password is taken while it is still there, and each session
+/// is ended by a task of its own on the Tauri async runtime
+/// ([`end_sessions`]).
+pub fn teardown_all(app: &AppHandle) {
+    let state = app.state::<McpState>();
+    let sessions = state.take_sessions();
+    state.clear_statuses();
+    // A copy of the password, taken BEFORE the lock clears the store.
+    let password = vault_password(app)
+        .ok()
+        .filter(|pw| !pw.is_empty())
+        .map(std::sync::Arc::new);
+    end_sessions(
+        state.inner(),
+        app.state::<crate::AppState>().db.clone(),
+        password,
+        sessions,
+    );
+}
+
+/// End `sessions` - one teardown task each ([`spawn_teardown_jobs`]), kept in
+/// `state` until it finishes so an exit can wait for it - each where it was
+/// set up ([`session_end`]), its header resolved by its own task from
+/// `password` ([`TeardownAuth::Unseal`]). Returns at once.
+///
+/// The lock path used to unseal every live session's secret before it
+/// returned - one Argon2id derivation per session, on the main thread for
+/// the Lock button, the tray's Lock and the exit - so two connected servers
+/// froze the window for about 1.5 s, and an exit spent that before its 2 s
+/// wait for the DELETEs even began. Each session also used to be ended at
+/// its record's CURRENT settings, which an edit may have pointed at another
+/// endpoint since.
+fn end_sessions(
+    state: &McpState,
+    db: crate::db::Database,
+    password: Option<std::sync::Arc<Zeroizing<String>>>,
+    sessions: Vec<(String, LiveSession)>,
+) {
+    let Ok(client) = origin_client() else {
+        return;
+    };
+    let jobs: Vec<TeardownJob> = sessions
+        .into_iter()
+        .filter_map(|(server_id, live)| {
+            // Only a session registered without its settings needs the
+            // record (a test seam); the app binds every session it sets up.
+            let fallback = match live.binding {
+                Some(_) => None,
+                None => db.get_mcp_server(&server_id).ok().flatten(),
+            };
+            session_end(live, fallback.as_ref(), password.clone())
+        })
+        .collect();
+    // This copy goes now; the teardowns hold theirs until resolved.
+    drop(password);
+    state.track_teardowns(spawn_teardown_jobs(db, client, jobs));
+}
+
+/// End one session: resolve its header, then send the DELETE.
+async fn run_teardown(client: &reqwest::Client, job: TeardownJob) -> Result<(), String> {
+    let TeardownJob {
+        url,
+        session_id,
+        protocol_version,
+        auth,
+        server_name,
+    } = job;
+    let auth = auth.resolve().await;
+    delete_session(
+        client,
+        &url,
+        &session_id,
+        &protocol_version,
+        auth.as_ref().map(|(n, v)| (n.as_str(), v)),
+        &server_name,
+    )
+    .await
+}
+
+/// Start each session teardown as its own task on the Tauri runtime and hand
+/// back the handles. One task per session: a hung server neither delays the
+/// other DELETEs nor holds an exit beyond its budget (they used to run one
+/// after another in a single detached task, so one hung server kept the rest
+/// from ever being sent). A refused or failed DELETE (other than 405) is
+/// audited - a refused teardown must not disappear silently.
+fn spawn_teardown_jobs(
+    db: crate::db::Database,
+    client: reqwest::Client,
+    jobs: Vec<TeardownJob>,
+) -> Vec<tauri::async_runtime::JoinHandle<()>> {
+    jobs.into_iter()
+        .map(|job| {
+            let (db, client) = (db.clone(), client.clone());
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = run_teardown(&client, job).await {
+                    audit_or_log(&db, "mcp.session_teardown_failed", None, &e);
+                }
+            })
+        })
+        .collect()
+}
+
+/// Wait for session teardown tasks ([`McpState::take_teardowns`]), `budget`
+/// in total at most - the exit waits here and must never hang on a server.
+/// True when all of them finished in time; the rest are left to run until
+/// the process ends.
+pub async fn wait_for_teardowns(
+    handles: Vec<tauri::async_runtime::JoinHandle<()>>,
+    budget: Duration,
+) -> bool {
+    tokio::time::timeout(budget, async {
+        for handle in handles {
+            // A task that panicked is finished too.
+            let _ = handle.await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 // ─── Result shaping (pure, unit-tested) ─────────────────────────────────────
@@ -1836,7 +2422,7 @@ pub fn mcp_list_servers(app: AppHandle) -> CmdResult<Value> {
             server_view(
                 r,
                 state.status_of(&r.id),
-                state.get_session(&r.id).map(|s| s.protocol_version),
+                state.session_for(r).map(|s| s.protocol_version),
             )
         })
         .collect();
@@ -1896,8 +2482,15 @@ pub fn enable_collision_error(records: &[crate::db::McpServerRecord]) -> Option<
     build_name_map(&registry).err()
 }
 
+/// Save (add or edit) an MCP server. Async, with the work on the blocking
+/// pool (RU6b item 8): a new secret is sealed with Argon2id, and as a
+/// synchronous command that ran on the main thread and froze the window; the
+/// transactional write may also wait for another connection's write. When
+/// the URL or the auth settings changed, the live session is dropped once
+/// the save has committed, and ended at the OLD endpoint with the OLD
+/// credential in the background ([`session_end`]).
 #[tauri::command(rename_all = "snake_case")]
-pub fn mcp_save_server(
+pub async fn mcp_save_server(
     app: AppHandle,
     id: Option<String>,
     name: String,
@@ -1907,22 +2500,49 @@ pub fn mcp_save_server(
     auth_secret: Option<String>,
     auth_env_var: Option<String>,
 ) -> CmdResult<Value> {
-    // Seals the auth secret and rewrites the whole record: not while a
-    // master-password change is re-encrypting the vault (C1).
-    let _rotation = crate::commands::rotation_shared(&app)?;
-    save_server(
-        &app.state::<crate::AppState>().db,
-        app.state::<VaultPasswordStore>().inner(),
-        SaveServerArgs {
-            id,
-            name,
-            url,
-            auth_type,
-            auth_header_name,
-            auth_secret,
-            auth_env_var,
-        },
-    )
+    let worker = app.clone();
+    let saved = crate::commands::run_blocking(move || {
+        // Seals the auth secret and rewrites the whole record: not while a
+        // master-password change is re-encrypting the vault (C1).
+        let _rotation = crate::commands::rotation_shared(&worker)?;
+        save_server(
+            &worker.state::<crate::AppState>().db,
+            worker.state::<McpState>().inner(),
+            worker.state::<VaultPasswordStore>().inner(),
+            SaveServerArgs {
+                id,
+                name,
+                url,
+                auth_type,
+                auth_header_name,
+                auth_secret,
+                auth_env_var,
+            },
+        )
+    })
+    .await?;
+    if let Some(job) = saved.teardown {
+        // Best effort and not awaited: the save is done, and the old server
+        // may well be the unreachable one the user is moving away from. A
+        // failure is audited (`mcp.session_teardown_failed`); an exit waits
+        // for it like for the lock path's teardowns.
+        match origin_client() {
+            Ok(client) => {
+                let db = app.state::<crate::AppState>().db.clone();
+                let started = spawn_teardown_jobs(db, client, vec![job]);
+                app.state::<McpState>().track_teardowns(started);
+            }
+            Err(e) => log::warn!("[sshspan-mcp] could not end a stale MCP session: {e}"),
+        }
+    }
+    Ok(saved.view)
+}
+
+/// What [`save_server`] did: the command's answer, and the teardown of the
+/// live session the save made stale.
+struct SavedServer {
+    view: Value,
+    teardown: Option<TeardownJob>,
 }
 
 /// The arguments of [`mcp_save_server`]. For `auth_header_name`,
@@ -2111,11 +2731,28 @@ fn name_collision<'a>(
 
 /// [`mcp_save_server`] without the `AppHandle`, so its rules run against a
 /// real database in tests. The caller holds the rotation guard.
+///
+/// The record is read, checked (auth plan, name collisions) and written in
+/// ONE transaction ([`crate::db::Database::modify_mcp_servers`], A7-49): a
+/// tool toggled while the save ran is kept, and a server removed meanwhile is
+/// not re-created. A new secret is sealed BEFORE that transaction (Argon2id
+/// must not run while the write lock is held).
+///
+/// When the save changes the URL or the auth settings, the server's live
+/// session belongs to the old ones. It is dropped once the save has
+/// committed - it used to be dropped inside the transaction, so a write that
+/// then failed left the old settings in place without their session, which
+/// was never ended - and the DELETE that ends it at the old endpoint, with
+/// the old credential, comes back as `teardown` (RU2 leftover). A session set
+/// up with the NEW settings in the meantime is kept. Until it is dropped, no
+/// request for the new settings uses the old session ([`usable_session`]). A
+/// failed audit row after the commit is a `warning`, not an error.
 fn save_server(
     db: &crate::db::Database,
+    state: &McpState,
     vault: &VaultPasswordStore,
     args: SaveServerArgs,
-) -> CmdResult<Value> {
+) -> CmdResult<SavedServer> {
     let SaveServerArgs {
         id,
         name,
@@ -2131,6 +2768,92 @@ fn save_server(
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
+    let fields = check_save_fields(&name, &url, &auth_type)?;
+    let existing_id = id.filter(|s| !s.is_empty());
+    let header_arg = TextArg::from_arg(auth_header_name.as_deref());
+    let secret_arg = SecretArg::from_arg(auth_secret.as_deref().map(String::as_str));
+    let env_arg = TextArg::from_arg(auth_env_var.as_deref());
+    let sealed_secret = match secret_arg {
+        SecretArg::New => {
+            let secret = auth_secret.as_deref().map_or("", |s| s.trim());
+            Some(crate::crypto::vault::seal(&pw, secret.as_bytes()).map_err(|e| e.to_string())?)
+        }
+        SecretArg::Absent | SecretArg::Clear => None,
+    };
+
+    let (record, previous) = db
+        .modify_mcp_servers(|all| {
+            let stored = match existing_id.as_deref() {
+                Some(existing) => Some(
+                    all.iter()
+                        .find(|r| r.id == existing)
+                        .cloned()
+                        .ok_or_else(|| CmdError("MCP server not found.".into()))?,
+                ),
+                None => None,
+            };
+            let plan = plan_auth(
+                stored.as_ref(),
+                &fields.url,
+                &fields.auth_type,
+                header_arg,
+                secret_arg,
+                env_arg,
+            )
+            .map_err(CmdError)?;
+            if let Some(other) = name_collision(all, existing_id.as_deref(), &fields.name) {
+                return Err(CmdError(format!(
+                    "An MCP server named '{}' already exists and '{}' would share its model-facing tool names - choose a different name.",
+                    other.name, fields.name
+                ))
+                .into());
+            }
+            let record = saved_record(stored.as_ref(), fields, plan, sealed_secret);
+            let write = if stored.is_some() {
+                crate::db::McpWrite::Update(record.clone())
+            } else {
+                crate::db::McpWrite::Insert(record.clone())
+            };
+            Ok((write, (record, stored)))
+        })
+        .map_err(CmdError::from)?;
+
+    // Committed: a session the new settings made stale is dropped now.
+    let teardown = previous
+        .as_ref()
+        .filter(|old| !same_connection(old, &record))
+        .and_then(|old| {
+            let stale = state.take_session_if(&old.id, |live| !live.bound_to(&record))?;
+            session_end(stale, Some(old), Some(std::sync::Arc::new(pw.clone())))
+        });
+    let action = if previous.is_some() {
+        "mcp.server_updated"
+    } else {
+        "mcp.server_added"
+    };
+    let warning = audit_or_warn(
+        db,
+        action,
+        Some(&record.id),
+        &record.name,
+        "The server was saved, but its audit row could not be written",
+    );
+    Ok(SavedServer {
+        view: json!({ "ok": true, "id": record.id, "warning": warning }),
+        teardown,
+    })
+}
+
+/// The name, URL and auth type a save writes, checked: the trimmed name, the
+/// normalized URL and the trimmed auth type.
+struct SaveFields {
+    name: String,
+    url: String,
+    auth_type: String,
+}
+
+/// Check the name, URL and auth type of a save ([`save_server`]).
+fn check_save_fields(name: &str, url: &str, auth_type: &str) -> CmdResult<SaveFields> {
     let name = name.trim().to_string();
     // The rule is RFC 7230 token syntax (`is_token`), so say exactly that.
     if !is_token(&name) {
@@ -2139,71 +2862,54 @@ fn save_server(
                 .into(),
         );
     }
-    let (normalized_url, _class) = classify_url(&url)?;
+    let (url, _class) = classify_url(url)?;
     let auth_type = auth_type.trim().to_string();
     if !matches!(auth_type.as_str(), "none" | "bearer" | "custom_header") {
         return Err("Auth type must be 'none', 'bearer' or 'custom_header'.".into());
     }
-    let existing_id = id.filter(|s| !s.is_empty());
-    let stored = match existing_id.as_deref() {
-        Some(existing) => {
-            let mut r = db
-                .get_mcp_server(existing)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| CmdError("MCP server not found.".into()))?;
-            r.id = existing.to_string();
-            Some(r)
-        }
-        None => None,
-    };
-    let plan = plan_auth(
-        stored.as_ref(),
-        &normalized_url,
-        &auth_type,
-        TextArg::from_arg(auth_header_name.as_deref()),
-        SecretArg::from_arg(auth_secret.as_deref().map(String::as_str)),
-        TextArg::from_arg(auth_env_var.as_deref()),
-    )
-    .map_err(CmdError)?;
-    let all = db.list_mcp_servers().map_err(|e| e.to_string())?;
-    if let Some(other) = name_collision(&all, existing_id.as_deref(), &name) {
-        return Err(CmdError(format!(
-            "An MCP server named '{}' already exists and '{name}' would share its model-facing tool names - choose a different name.",
-            other.name
-        )));
-    }
+    Ok(SaveFields {
+        name,
+        url,
+        auth_type,
+    })
+}
 
+/// The record a save writes: `stored` (a new one for an add) with the checked
+/// `fields` and the auth `plan` applied, a new secret already sealed. Saving
+/// from the UI IS the user's re-confirmation of the URL and the auth source:
+/// a backup-restored entry becomes connectable only through here.
+fn saved_record(
+    stored: Option<&crate::db::McpServerRecord>,
+    fields: SaveFields,
+    plan: AuthPlan,
+    sealed_secret: Option<String>,
+) -> crate::db::McpServerRecord {
     let now = chrono::Utc::now();
-    let is_new = stored.is_none();
-    let mut record = stored.unwrap_or_else(|| crate::db::McpServerRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: String::new(),
-        url: String::new(),
-        auth_type: String::new(),
-        auth_header_name: None,
-        auth_secret: None,
-        auth_env_var: None,
-        confirmed: false,
-        tools: Vec::new(),
-        created_at: now,
-        updated_at: now,
-    });
-    let record_id = record.id.clone();
-    record.name = name;
-    record.url = normalized_url;
-    record.auth_type = auth_type;
+    let mut record = stored
+        .cloned()
+        .unwrap_or_else(|| crate::db::McpServerRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: String::new(),
+            url: String::new(),
+            auth_type: String::new(),
+            auth_header_name: None,
+            auth_secret: None,
+            auth_env_var: None,
+            confirmed: false,
+            tools: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        });
+    record.name = fields.name;
+    record.url = fields.url;
+    record.auth_type = fields.auth_type;
     record.auth_header_name = plan.header_name;
     record.auth_secret = match plan.secret {
         SecretPlan::Keep => record.auth_secret.take(),
         SecretPlan::Drop => None,
-        SecretPlan::Seal => {
-            let secret = auth_secret.as_deref().map_or("", |s| s.trim());
-            Some(crate::crypto::vault::seal(&pw, secret.as_bytes()).map_err(|e| e.to_string())?)
-        }
+        SecretPlan::Seal => sealed_secret,
     };
     record.auth_env_var = plan.env_var;
-    // Saving from the UI IS the user's re-confirmation of URL + auth source
-    // (backup-restored entries become connectable only through here).
     record.confirmed = true;
     // Belt-and-suspenders on the exclusive-source invariant.
     debug_assert!(
@@ -2211,15 +2917,7 @@ fn save_server(
         "a stored secret and an env-var binding must never coexist"
     );
     record.updated_at = now;
-    db.save_mcp_server(&record).map_err(|e| e.to_string())?;
-    let action = if is_new {
-        "mcp.server_added"
-    } else {
-        "mcp.server_updated"
-    };
-    db.add_audit(action, Some(&record_id), &record.name)
-        .map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true, "id": record_id }))
+    record
 }
 
 #[tauri::command]
@@ -2266,46 +2964,58 @@ pub async fn remove_server(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| CmdError("MCP server not found.".into()))?;
     let mut warning = None;
-    if let Some(session) = state.remove_session(id) {
-        if let (Some(sid), Ok((url, _))) = (session.session_id, classify_url(&record.url)) {
-            // Resolved BEFORE the record (and its sealed secret) is deleted;
-            // the value is Zeroizing.
-            let auth = resolve_auth_with_password(vault.get(), &record);
-            let failure = match origin_client() {
-                Err(e) => Some(e.0),
-                Ok(client) => {
-                    let teardown = delete_session(
-                        &client,
-                        &url,
-                        &sid,
-                        &session.protocol_version,
-                        auth.as_ref().map(|(n, v)| (n.as_str(), v)),
-                        &record.name,
-                    );
-                    match tokio::time::timeout(teardown_timeout, teardown).await {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e),
-                        Err(_) => Some(format!(
-                            "MCP session teardown for '{}' timed out after {} s.",
-                            record.name,
-                            teardown_timeout.as_secs()
-                        )),
-                    }
+    // Ended where it was set up ([`session_end`]): for a session set up with
+    // settings an edit has replaced since, not at the record's current URL.
+    let password = vault.get().map(std::sync::Arc::new);
+    let ending = state
+        .take_session(id)
+        .and_then(|live| session_end(live, Some(&record), password));
+    if let Some(job) = ending {
+        let failure = match origin_client() {
+            Err(e) => Some(e.0),
+            Ok(client) => {
+                // Resolved BEFORE the record (and its sealed secret) is
+                // deleted, and outside the DELETE's time limit; the value is
+                // Zeroizing.
+                let auth = job.auth.resolve().await;
+                let teardown = delete_session(
+                    &client,
+                    &job.url,
+                    &job.session_id,
+                    &job.protocol_version,
+                    auth.as_ref().map(|(n, v)| (n.as_str(), v)),
+                    &job.server_name,
+                );
+                match tokio::time::timeout(teardown_timeout, teardown).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(_) => Some(format!(
+                        "MCP session teardown for '{}' timed out after {} s.",
+                        record.name,
+                        teardown_timeout.as_secs()
+                    )),
                 }
-            };
-            if let Some(e) = failure {
-                if let Err(audit_err) = db.add_audit("mcp.session_teardown_failed", Some(id), &e) {
-                    log::warn!(
-                        "[sshspan-mcp] could not audit a failed MCP session teardown: {audit_err}"
-                    );
-                }
-                warning = Some(e);
             }
+        };
+        if let Some(e) = failure {
+            audit_or_log(db, "mcp.session_teardown_failed", Some(id), &e);
+            warning = Some(e);
         }
     }
     db.delete_mcp_server(id).map_err(|e| e.to_string())?;
-    db.add_audit("mcp.server_removed", Some(id), &record.name)
-        .map_err(|e| e.to_string())?;
+    // The server is gone: a failed audit row is a warning, not an error.
+    if let Some(note) = audit_or_warn(
+        db,
+        "mcp.server_removed",
+        Some(id),
+        &record.name,
+        "The server was removed, but its audit row could not be written",
+    ) {
+        warning = Some(match warning {
+            Some(teardown) => format!("{teardown} {note}"),
+            None => note,
+        });
+    }
     Ok(json!({ "ok": true, "warning": warning }))
 }
 
@@ -2333,8 +3043,12 @@ pub async fn mcp_test_connection(app: AppHandle, id: String) -> CmdResult<Value>
     }))
 }
 
+/// Enable, disable or set Auto-approve on one tool ([`set_tool_state`]).
+/// Async, with the work on the blocking pool (RU6b item 8): its transaction
+/// takes the write lock and may wait for another connection's write, which
+/// a synchronous command did on the main thread.
 #[tauri::command(rename_all = "snake_case")]
-pub fn mcp_set_tool_state(
+pub async fn mcp_set_tool_state(
     app: AppHandle,
     id: String,
     tool: String,
@@ -2342,18 +3056,21 @@ pub fn mcp_set_tool_state(
     auto_approve: bool,
     expected_hash: Option<String>,
 ) -> CmdResult<Value> {
-    // Rewrites the whole record: not while a master-password change could
-    // re-seal its secret in between (C1).
-    let _rotation = crate::commands::rotation_shared(&app)?;
-    set_tool_state(
-        &app.state::<crate::AppState>().db,
-        app.state::<VaultPasswordStore>().inner(),
-        &id,
-        &tool,
-        enabled,
-        auto_approve,
-        expected_hash.as_deref(),
-    )
+    crate::commands::run_blocking(move || {
+        // Rewrites the whole record: not while a master-password change
+        // could re-seal its secret in between (C1).
+        let _rotation = crate::commands::rotation_shared(&app)?;
+        set_tool_state(
+            &app.state::<crate::AppState>().db,
+            app.state::<VaultPasswordStore>().inner(),
+            &id,
+            &tool,
+            enabled,
+            auto_approve,
+            expected_hash.as_deref(),
+        )
+    })
+    .await
 }
 
 /// What enabling a tool says when the definition the user reviewed is no
@@ -2374,6 +3091,17 @@ const DEFINITION_NOT_NAMED: &str = "This approval does not say which tool defini
 /// refresh that replaced the definition while the settings panel showed the
 /// old one would let a click (with Auto-approve ticked) approve a definition
 /// the user never saw. Disabling needs no hash.
+///
+/// The check and the write are ONE transaction
+/// ([`crate::db::Database::modify_mcp_servers`]): the hash is compared with
+/// the record as stored at the moment of the write, so a refresh that commits
+/// a new definition while the toggle runs makes the enable fail - a lost race
+/// never approves anything (RU2 leftover). The record used to be read, then
+/// written back whole as a separate statement: such a refresh was overwritten
+/// and its definition approved unseen, and a server removed meanwhile came
+/// back. A failed `mcp.tool_approved` audit row after the commit is a
+/// `warning` next to `ok: true`, never an error for an approval that is
+/// stored.
 fn set_tool_state(
     db: &crate::db::Database,
     vault: &VaultPasswordStore,
@@ -2388,10 +3116,53 @@ fn set_tool_state(
     if !vault.is_set() {
         return Err("Vault is locked.".into());
     }
-    let mut record = db
-        .get_mcp_server(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| CmdError("MCP server not found.".into()))?;
+    db.modify_mcp_servers(|all| {
+        let mut record = all
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+            .ok_or_else(|| CmdError("MCP server not found.".into()))?;
+        apply_tool_state(&mut record, tool, enabled, auto_approve, expected_hash)?;
+        if enabled {
+            let registry: Vec<crate::db::McpServerRecord> = all
+                .iter()
+                .map(|r| {
+                    if r.id == id {
+                        record.clone()
+                    } else {
+                        r.clone()
+                    }
+                })
+                .collect();
+            check_enabled_registry(&registry, tool)?;
+        }
+        Ok((crate::db::McpWrite::Update(record), ()))
+    })
+    .map_err(CmdError::from)?;
+    let warning = if enabled {
+        audit_or_warn(
+            db,
+            "mcp.tool_approved",
+            Some(id),
+            &format!("tool={tool}"),
+            "The tool was approved, but its audit row could not be written",
+        )
+    } else {
+        None
+    };
+    Ok(json!({ "ok": true, "warning": warning }))
+}
+
+/// One toggle of `tool` on `record`: the definition compare-and-swap of an
+/// enable (see [`set_tool_state`]), the pin, and Auto-approve exactly as
+/// passed.
+fn apply_tool_state(
+    record: &mut crate::db::McpServerRecord,
+    tool: &str,
+    enabled: bool,
+    auto_approve: bool,
+    expected_hash: Option<&str>,
+) -> CmdResult<()> {
     let entry = record
         .tools
         .iter_mut()
@@ -2423,45 +3194,34 @@ fn set_tool_state(
     // an Auto-approve granted to an older definition.
     entry.auto_approve = auto_approve && enabled;
     record.updated_at = chrono::Utc::now();
-    if enabled {
-        // ── Collision authority, BEFORE any exposure (item 6): run the
-        // name map over the full registry with this enable applied. An
-        // ambiguous model-facing name set is refused outright - one
-        // approval must never silently cover another tool.
-        let mut all = db.list_mcp_servers().map_err(|e| e.to_string())?;
-        if let Some(slot) = all.iter_mut().find(|r| r.id == id) {
-            *slot = record.clone();
-        }
-        if let Some(err) = enable_collision_error(&all) {
-            return Err(CmdError(err));
-        }
-        // ── Aggregate cap (item 5), computed and enforced INSIDE the same
-        // SQLite transaction as the write: the count and the update commit
-        // (or roll back) together, so two concurrent toggles can never both
-        // pass an individually-stale check. The renderer offers
-        // {BUILTIN_TOOL_COUNT} built-in tools first and fills the remaining
-        // slots with MCP tools, so more than MAX_MCP_TOOLS enabled MCP
-        // tools could never all be exposed and would silently drop the
-        // overflow - refuse (and roll back) instead.
-        match db
-            .save_mcp_server_capped(&record, MAX_MCP_TOOLS)
-            .map_err(|e| e.to_string())?
-        {
-            crate::db::McpCapOutcome::Committed { .. } => {}
-            crate::db::McpCapOutcome::OverCap { enabled_total } => {
-                return Err(CmdError(format!(
-                    "Enabling '{tool}' would expose {enabled_total} MCP tools across all servers; the assistant keeps {BUILTIN_TOOL_COUNT} built-in tools and the model-facing list is capped at {MAX_EXPOSED_TOOLS}. Disable another tool first."
-                )));
-            }
-        }
-    } else {
-        db.save_mcp_server(&record).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Whether the whole registry, with an enable of `tool` applied, may be
+/// exposed - checked inside the enable's transaction, so two concurrent
+/// toggles can never both pass an individually stale check:
+/// - collision authority, BEFORE any exposure: an ambiguous model-facing
+///   name set is refused outright - one approval must never silently cover
+///   another tool;
+/// - aggregate cap: the renderer offers [`BUILTIN_TOOL_COUNT`] built-in
+///   tools first and fills the remaining slots with MCP tools, so more than
+///   [`MAX_MCP_TOOLS`] enabled MCP tools could never all be exposed and
+///   would silently drop the overflow - refused instead.
+fn check_enabled_registry(registry: &[crate::db::McpServerRecord], tool: &str) -> CmdResult<()> {
+    if let Some(err) = enable_collision_error(registry) {
+        return Err(CmdError(err));
     }
-    if enabled {
-        db.add_audit("mcp.tool_approved", Some(id), &format!("tool={tool}"))
-            .map_err(|e| e.to_string())?;
+    let enabled_total = registry
+        .iter()
+        .flat_map(|r| &r.tools)
+        .filter(|t| t.enabled)
+        .count();
+    if enabled_total > MAX_MCP_TOOLS {
+        return Err(CmdError(format!(
+            "Enabling '{tool}' would expose {enabled_total} MCP tools across all servers; the assistant keeps {BUILTIN_TOOL_COUNT} built-in tools and the model-facing list is capped at {MAX_EXPOSED_TOOLS}. Disable another tool first."
+        )));
     }
-    Ok(json!({ "ok": true }))
+    Ok(())
 }
 
 #[tauri::command]
@@ -2495,20 +3255,21 @@ pub async fn mcp_call_tool(
         .map_err(|_| CmdError("Tool arguments are not valid JSON.".into()))?;
     let fingerprint = arguments_fingerprint(&arguments_json);
 
-    let approval = match call_gate(&level, approved, record.confirmed, entry) {
-        Ok(approval) => approval,
-        Err(reason) => {
-            let _ = db.add_audit(
-                "mcp.tool_call",
-                Some(&id),
-                &format!(
-                    "server={} tool={} args_sha256={} level={} outcome=denied reason={}",
-                    record.name, tool, fingerprint, level, reason
-                ),
-            );
-            return Err(CmdError(reason));
-        }
+    let denied = |level: &str, reason: &str| {
+        audit_or_log(
+            db,
+            "mcp.tool_call",
+            Some(&id),
+            &format!(
+                "server={} tool={} args_sha256={} level={} outcome=denied reason={}",
+                record.name, tool, fingerprint, level, reason
+            ),
+        );
     };
+    if let Err(reason) = call_gate(&level, approved, record.confirmed, entry) {
+        denied(&level, &reason);
+        return Err(CmdError(reason));
+    }
 
     // A tools/list_changed refresh after the call rewrites the whole record:
     // a master-password change must not commit in between (C1).
@@ -2523,15 +3284,6 @@ pub async fn mcp_call_tool(
         return Err("Vault is locked.".into());
     }
     let mut ctx = load_server_context(&app, record.clone(), &pw, generation)?;
-    if ctx.session.is_none() {
-        ctx.checked(&app)?;
-        let (session, _) = initialize(&app, &ctx).await?;
-        require_generation_current(&app, generation)?;
-        app.state::<McpState>()
-            .set_session(&record.id, session.clone());
-        ctx.session = Some(session);
-        send_initialized(&app, &ctx, ctx.session.as_ref().unwrap()).await?;
-    }
     let rpc_id = Value::String(uuid::Uuid::new_v4().to_string());
     let body = json!({
         "jsonrpc": "2.0",
@@ -2542,21 +3294,43 @@ pub async fn mcp_call_tool(
             "arguments": args_value,
         },
     });
+    // The gate again, on the record as stored and the tab's level as set
+    // right before the request goes out (the session set-up can take
+    // seconds).
+    let level_now = || {
+        app.state::<crate::assistant::AssistantLevels>()
+            .get(&tab_id)
+    };
+    let regate = || regate_call(db, &record, &tool, &level_now(), approved);
+    let sent = run_tool_call(
+        app.state::<McpState>().inner(),
+        db,
+        &mut ctx,
+        &body,
+        &|| require_generation_current(&app, generation),
+        &regate,
+    )
+    .await?;
     // From here on the call may reach the server, so every outcome is
-    // audited (see finish_tool_call).
-    let called = async {
-        let outcome = request_with_session(&app, &mut ctx, &body).await?;
-        require_generation_current(&app, generation)?;
-        let list_changed = outcome.list_changed;
-        Ok::<_, CmdError>((rpc_result(outcome.result)?, list_changed))
-    }
-    .await;
+    // audited (see finish_tool_call) - at the level the gate checked right
+    // before the request, not whatever the tab is set to once it answers.
+    let (approval, level_sent, called) = match sent {
+        CallSent::Refused { reason, level } => {
+            denied(&level, &reason);
+            return Err(CmdError(reason));
+        }
+        CallSent::Sent {
+            approval,
+            level,
+            called,
+        } => (approval, level, called),
+    };
     let audit = CallAudit {
         server_id: &id,
         server_name: &record.name,
         tool: &tool,
         args_sha256: &fingerprint,
-        level: &level,
+        level: &level_sent,
         approval,
     };
     finish_tool_call(db, &audit, called, || {
@@ -2710,16 +3484,7 @@ async fn refresh_tools_after_call(
 ) -> CmdResult<()> {
     let refreshed = fetch_tools(ctx, app).await?;
     require_generation_current(app, generation)?;
-    let stored_now = db.get_mcp_server(&record.id).map_err(|e| e.to_string())?;
-    let (next, changed) = merge_into_stored(record, stored_now, &refreshed)?;
-    db.save_mcp_server(&next).map_err(|e| e.to_string())?;
-    for t in changed {
-        let _ = db.add_audit(
-            "mcp.tool_definition_changed",
-            Some(&record.id),
-            &format!("server={} tool={}", record.name, t),
-        );
-    }
+    store_fetched_tools(db, record, &refreshed)?;
     Ok(())
 }
 
@@ -3567,6 +4332,15 @@ mod tests {
         out["id"].as_str().expect("save returns the id").to_string()
     }
 
+    /// `save_server` with no live sessions, returning the command's answer.
+    fn save(
+        db: &crate::db::Database,
+        vault: &VaultPasswordStore,
+        args: SaveServerArgs,
+    ) -> CmdResult<Value> {
+        save_server(db, &McpState::new(), vault, args).map(|saved| saved.view)
+    }
+
     // ── Rug-pull guard the UI can show (R6: A4-05, A7-29, A8-15) ────────
 
     #[test]
@@ -3797,7 +4571,7 @@ mod tests {
     fn the_server_name_rule_is_described_as_it_is_checked() {
         let db = temp_db();
         let vault = unlocked_vault();
-        let err = save_server(
+        let err = save(
             &db,
             &vault,
             save_args(None, "my server", "https://a.example.com", "none"),
@@ -3808,7 +4582,7 @@ mod tests {
             "Server name must be non-empty and use only letters, digits and ! # $ % & ' * + - . ^ _ ` | ~ (no spaces)."
         );
         // Characters the message lists are accepted.
-        save_server(
+        save(
             &db,
             &vault,
             save_args(None, "a.b~c!", "https://a.example.com", "none"),
@@ -3856,9 +4630,9 @@ mod tests {
         let vault = unlocked_vault();
         let mut args = save_args(None, "gh", "https://mcp.example.com/mcp", "bearer");
         args.auth_env_var = Some("GITHUB_TOKEN".into());
-        let id = saved_id(save_server(&db, &vault, args).unwrap());
+        let id = saved_id(save(&db, &vault, args).unwrap());
         // Rename only: the form sends no env var (absent) - the binding stays.
-        save_server(
+        save(
             &db,
             &vault,
             save_args(Some(&id), "github", "https://mcp.example.com/mcp", "bearer"),
@@ -3871,10 +4645,10 @@ mod tests {
         // no auth source is refused.
         let mut clear = save_args(Some(&id), "github", "https://mcp.example.com/mcp", "bearer");
         clear.auth_env_var = Some(String::new());
-        let err = save_server(&db, &vault, clear).unwrap_err();
+        let err = save(&db, &vault, clear).unwrap_err();
         assert!(err.0.contains("environment variable"), "{}", err.0);
         // Switching to auth "none" drops it legitimately.
-        save_server(
+        save(
             &db,
             &vault,
             save_args(Some(&id), "github", "https://mcp.example.com/mcp", "none"),
@@ -3890,8 +4664,8 @@ mod tests {
         let mut args = save_args(None, "kb", "https://kb.example.com/mcp", "custom_header");
         args.auth_header_name = Some("X-Api-Key".into());
         args.auth_env_var = Some("KB_TOKEN".into());
-        let id = saved_id(save_server(&db, &vault, args).unwrap());
-        save_server(
+        let id = saved_id(save(&db, &vault, args).unwrap());
+        save(
             &db,
             &vault,
             save_args(
@@ -3911,7 +4685,7 @@ mod tests {
     fn a_bearer_or_custom_header_server_needs_an_auth_source() {
         let db = temp_db();
         let vault = unlocked_vault();
-        let err = save_server(
+        let err = save(
             &db,
             &vault,
             save_args(None, "a", "https://a.example.com", "bearer"),
@@ -3924,7 +4698,7 @@ mod tests {
         );
         let mut custom = save_args(None, "b", "https://b.example.com", "custom_header");
         custom.auth_header_name = Some("X-Key".into());
-        assert!(save_server(&db, &vault, custom).is_err());
+        assert!(save(&db, &vault, custom).is_err());
         assert!(
             db.list_mcp_servers().unwrap().is_empty(),
             "nothing was saved"
@@ -3933,8 +4707,8 @@ mod tests {
         // new entered the save is refused and changes nothing.
         let mut env = save_args(None, "c", "https://c.example.com", "bearer");
         env.auth_env_var = Some("TOKEN".into());
-        let id = saved_id(save_server(&db, &vault, env).unwrap());
-        let err = save_server(
+        let id = saved_id(save(&db, &vault, env).unwrap());
+        let err = save(
             &db,
             &vault,
             save_args(Some(&id), "c", "https://elsewhere.example.com", "bearer"),
@@ -3952,7 +4726,7 @@ mod tests {
         let db = temp_db();
         let vault = unlocked_vault();
         let id = saved_id(
-            save_server(
+            save(
                 &db,
                 &vault,
                 save_args(None, "my-srv", "https://a.example.com", "none"),
@@ -3960,7 +4734,7 @@ mod tests {
             .unwrap(),
         );
         for clash in ["my_srv", "My.Srv", "MY-SRV"] {
-            let err = save_server(
+            let err = save(
                 &db,
                 &vault,
                 save_args(None, clash, "https://b.example.com", "none"),
@@ -3970,13 +4744,13 @@ mod tests {
         }
         // The same server re-saved under its own name is fine, and so is a
         // distinct name.
-        save_server(
+        save(
             &db,
             &vault,
             save_args(Some(&id), "my-srv", "https://a.example.com", "none"),
         )
         .unwrap();
-        save_server(
+        save(
             &db,
             &vault,
             save_args(None, "other", "https://b.example.com", "none"),
@@ -4247,6 +5021,715 @@ mod tests {
         );
     }
 
+    // ── RU6b helpers ────────────────────────────────────────────────────
+
+    /// Change the stored record `id` on ANOTHER connection - write `change`
+    /// over it, or delete it when `None` - inside `BEGIN IMMEDIATE`, and hold
+    /// that write open for `ms` milliseconds before committing: a concurrent
+    /// toggle, refresh or removal caught mid-commit. Returns once the write
+    /// lock is held.
+    fn hold_mcp_change(
+        db: &crate::db::Database,
+        id: &str,
+        change: Option<&crate::db::McpServerRecord>,
+        ms: u64,
+    ) -> std::thread::JoinHandle<()> {
+        let statement = match change {
+            Some(record) => (
+                "UPDATE mcp_servers SET value = ? WHERE key = ?".to_string(),
+                vec![serde_json::to_string(record).unwrap(), id.to_string()],
+            ),
+            None => (
+                "DELETE FROM mcp_servers WHERE key = ?".to_string(),
+                vec![id.to_string()],
+            ),
+        };
+        crate::db::test_support::hold_write_bound(db, vec![statement], ms)
+    }
+
+    /// How long a test waits for a teardown that unseals a stored secret
+    /// first: one Argon2id derivation takes several seconds in a debug build
+    /// while the whole suite runs in parallel.
+    const UNSEALING_TEARDOWN_WAIT: Duration = Duration::from_secs(30);
+
+    /// A live session with id `id`.
+    fn session(id: &str) -> McpSession {
+        McpSession {
+            session_id: Some(id.into()),
+            protocol_version: "2025-06-18".into(),
+        }
+    }
+
+    use crate::assistant::test_support::refuse_audit_rows;
+
+    /// A local HTTP endpoint that hands each request head to the returned
+    /// receiver and answers 200 after `delay`.
+    fn http_sink(delay: Duration) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (seen, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { return };
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    let _ = seen.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    std::thread::sleep(delay);
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    fn teardown_job(url: &str, session_id: &str) -> TeardownJob {
+        TeardownJob {
+            url: url.into(),
+            session_id: session_id.into(),
+            protocol_version: "2025-06-18".into(),
+            auth: TeardownAuth::Resolved(None),
+            server_name: format!("srv-{session_id}"),
+        }
+    }
+
+    /// `s1` with one tool `t`, approved (enabled, pinned to `def`).
+    fn approved_server(db: &crate::db::Database, def: &Value) -> crate::db::McpServerRecord {
+        let mut record = record_with_tools("s1", "srv", &[]);
+        record.tools = vec![tool_pinned_to(def, true)];
+        db.save_mcp_server(&record).unwrap();
+        record
+    }
+
+    // ── MCP URLs: no silently dropped query or fragment (A4-23) ─────────
+
+    #[test]
+    fn mcp_urls_with_a_query_or_fragment_are_refused() {
+        for bad in [
+            "https://mcp.example.com/mcp?key=abc",
+            "https://mcp.example.com/mcp#section",
+            "https://mcp.example.com/mcp?",
+            "http://localhost:3000/?route=a",
+        ] {
+            assert_eq!(
+                classify_url(bad).unwrap_err(),
+                "MCP server URLs cannot contain ?query or #fragment parts.",
+                "{bad}"
+            );
+        }
+        let db = temp_db();
+        let err = save(
+            &db,
+            &unlocked_vault(),
+            save_args(None, "q", "https://mcp.example.com/mcp?token=1", "none"),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("?query"), "{}", err.0);
+        assert!(db.list_mcp_servers().unwrap().is_empty(), "nothing saved");
+        // A path is still kept, and an encoded ? in it is part of the path.
+        assert_eq!(
+            classify_url("https://mcp.example.com/a%3Fb").unwrap().0,
+            "https://mcp.example.com/a%3Fb"
+        );
+    }
+
+    // ── Read-modify-write of MCP records is one transaction (A7-49) ─────
+
+    /// RU2 leftover: the enable read the record, then wrote it whole. A
+    /// refresh committing a new definition in between was overwritten, and
+    /// the stale record went in enabled - the new definition approved
+    /// without review.
+    #[test]
+    fn an_enable_racing_a_definition_change_never_approves_the_new_definition() {
+        let db = temp_db();
+        let old = json!({ "name": "t", "description": "old" });
+        let new = json!({ "name": "t", "description": "new" });
+        tool_whose_definition_moved(&db, &old, &old, false);
+        let mut refreshed = db.get_mcp_server("s1").unwrap().unwrap();
+        refreshed.tools = merge_tools(&refreshed.tools, std::slice::from_ref(&new));
+        let holder = hold_mcp_change(&db, "s1", Some(&refreshed), 300);
+        let shown = tool_definition_hash(&old);
+        let result = set_tool_state(&db, &unlocked_vault(), "s1", "t", true, true, Some(&shown));
+        holder.join().unwrap();
+        let t = stored_tool_t(&db);
+        assert!(
+            !t.enabled && !t.auto_approve,
+            "the definition changed under the click: nothing may be approved ({t:?})"
+        );
+        assert_eq!(
+            t.current_hash.as_deref(),
+            Some(tool_definition_hash(&new).as_str()),
+            "the refresh is not lost"
+        );
+        assert_eq!(result.unwrap_err().0, REAPPROVE);
+    }
+
+    /// A toggle that read the record before a removal committed wrote it
+    /// back with an upsert - the removed server (and its sealed secret) came
+    /// back.
+    #[test]
+    fn a_tool_toggle_racing_a_removal_does_not_bring_the_server_back() {
+        let db = temp_db();
+        approved_server(&db, &json!({ "name": "t", "description": "d" }));
+        let holder = hold_mcp_change(&db, "s1", None, 300);
+        let result = set_tool_state(&db, &unlocked_vault(), "s1", "t", false, false, None);
+        holder.join().unwrap();
+        assert!(
+            db.get_mcp_server("s1").unwrap().is_none(),
+            "a removed server stays removed"
+        );
+        assert_eq!(result.unwrap_err().0, "MCP server not found.");
+    }
+
+    /// A save (here a rename) wrote back the whole record it had read: a
+    /// tool revoked while it ran came back enabled.
+    #[test]
+    fn a_save_keeps_a_tool_revoke_that_committed_while_it_ran() {
+        let db = temp_db();
+        let record = approved_server(&db, &json!({ "name": "t", "description": "d" }));
+        let mut revoked = record.clone();
+        revoked.tools[0].enabled = false;
+        revoked.tools[0].pin_hash = None;
+        let holder = hold_mcp_change(&db, "s1", Some(&revoked), 300);
+        let result = save(
+            &db,
+            &unlocked_vault(),
+            save_args(Some("s1"), "renamed", "https://mcp.example.com", "none"),
+        );
+        holder.join().unwrap();
+        result.unwrap();
+        let stored = db.get_mcp_server("s1").unwrap().unwrap();
+        assert_eq!(stored.name, "renamed");
+        assert!(
+            !stored.tools[0].enabled && stored.tools[0].pin_hash.is_none(),
+            "the revoke made meanwhile stays: {:?}",
+            stored.tools[0]
+        );
+    }
+
+    /// The connect (and a call's refresh) re-read the record and saved it as
+    /// two statements: a revoke committing in between was overwritten.
+    #[test]
+    fn a_connect_keeps_a_revoke_that_committed_while_it_stored_the_tools() {
+        let db = temp_db();
+        let def = json!({ "name": "t", "description": "d" });
+        let started_from = approved_server(&db, &def);
+        let mut revoked = started_from.clone();
+        revoked.tools[0].enabled = false;
+        revoked.tools[0].pin_hash = None;
+        let holder = hold_mcp_change(&db, "s1", Some(&revoked), 300);
+        let stored = store_fetched_tools(&db, &started_from, std::slice::from_ref(&def));
+        holder.join().unwrap();
+        stored.unwrap();
+        let t = stored_tool_t(&db);
+        assert!(!t.enabled && t.pin_hash.is_none(), "{t:?}");
+    }
+
+    // ── An approval that committed is not reported as failed (RU2) ──────
+
+    #[test]
+    fn an_approval_whose_audit_row_fails_is_reported_as_done_with_a_warning() {
+        let db = temp_db();
+        let def = json!({ "name": "t", "description": "d" });
+        tool_whose_definition_moved(&db, &def, &def, false);
+        refuse_audit_rows(&db);
+        let shown = tool_definition_hash(&def);
+        let out = set_tool_state(&db, &unlocked_vault(), "s1", "t", true, false, Some(&shown))
+            .expect("the approval is stored - the call must not report a failure");
+        assert_eq!(out["ok"], true);
+        let warning = out["warning"].as_str().unwrap_or_default();
+        assert!(warning.contains("audit"), "{out}");
+        assert!(stored_tool_t(&db).enabled);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_or_removal_whose_audit_row_fails_still_reports_success() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        refuse_audit_rows(&db);
+        let saved = save(
+            &db,
+            &vault,
+            save_args(None, "srv", "https://mcp.example.com", "none"),
+        )
+        .expect("the server is saved - the call must not report a failure");
+        assert!(
+            saved["warning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("audit"),
+            "{saved}"
+        );
+        let id = saved_id(saved);
+        assert!(db.get_mcp_server(&id).unwrap().is_some());
+        let removed = remove_server(&db, &McpState::new(), &vault, &id, REMOVE_TEARDOWN_TIMEOUT)
+            .await
+            .expect("the server is removed - the call must not report a failure");
+        assert!(
+            removed["warning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("audit"),
+            "{removed}"
+        );
+        assert!(db.get_mcp_server(&id).unwrap().is_none());
+    }
+
+    // ── A URL or auth edit ends the old session (RU2 leftover) ──────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_a_new_url_or_auth_ends_the_old_session_at_the_old_endpoint() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let (old_url, requests) = http_sink(Duration::ZERO);
+        let mut args = save_args(None, "srv", &old_url, "bearer");
+        args.auth_secret = Some("old-token".into());
+        let id = saved_id(save_server(&db, &state, &vault, args).unwrap().view);
+        state.bind_session(&db.get_mcp_server(&id).unwrap().unwrap(), session("sess-1"));
+        let mut moved = save_args(Some(&id), "srv", "https://new.example.com/mcp", "bearer");
+        moved.auth_secret = Some("new-token".into());
+        let saved = save_server(&db, &state, &vault, moved).unwrap();
+        assert!(
+            state.get_session(&id).is_none(),
+            "the next call negotiates against the new endpoint"
+        );
+        let job = saved.teardown.expect("the old session is torn down");
+        assert_eq!(job.url, old_url);
+        assert_eq!(job.session_id, "sess-1");
+        // The teardown unseals the old credential itself.
+        let handles = spawn_teardown_jobs(db.clone(), client_for_tests(), vec![job]);
+        assert!(wait_for_teardowns(handles, UNSEALING_TEARDOWN_WAIT).await);
+        let head = requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the DELETE reached the old endpoint")
+            .to_lowercase();
+        assert!(head.starts_with("delete "), "{head}");
+        assert!(head.contains("mcp-session-id: sess-1"), "{head}");
+        assert!(
+            head.contains("authorization: old-token"),
+            "the old credential goes to the old origin only: {head}"
+        );
+        assert!(!head.contains("new-token"), "{head}");
+    }
+
+    #[test]
+    fn a_rename_keeps_the_live_session() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let id = saved_id(
+            save(
+                &db,
+                &vault,
+                save_args(None, "srv", "https://a.example.com", "none"),
+            )
+            .unwrap(),
+        );
+        state.bind_session(&db.get_mcp_server(&id).unwrap().unwrap(), session("sess-1"));
+        let saved = save_server(
+            &db,
+            &state,
+            &vault,
+            save_args(Some(&id), "renamed", "https://a.example.com", "none"),
+        )
+        .unwrap();
+        assert!(saved.teardown.is_none());
+        assert!(state.get_session(&id).is_some());
+        // The session still belongs to the renamed record: the next request
+        // uses it.
+        let renamed = db.get_mcp_server(&id).unwrap().unwrap();
+        assert!(state.session_for(&renamed).is_some());
+    }
+
+    fn client_for_tests() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    // ── The exit waits for the session teardowns, within a budget ───────
+
+    /// The lock path started the DELETEs and returned nothing to wait for,
+    /// so an exit could cut them off. Every teardown now runs as its own
+    /// task: a hung server neither delays the others nor holds the exit
+    /// past the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_exit_wait_covers_every_teardown_and_ends_at_its_budget() {
+        let db = temp_db();
+        let (hung_url, hung_requests) = http_sink(Duration::from_secs(120));
+        let (slow_url, slow_requests) = http_sink(Duration::from_millis(300));
+        let handles = spawn_teardown_jobs(
+            db.clone(),
+            client_for_tests(),
+            vec![teardown_job(&hung_url, "a"), teardown_job(&slow_url, "b")],
+        );
+        let started = std::time::Instant::now();
+        let all_done = wait_for_teardowns(handles, Duration::from_millis(1500)).await;
+        let waited = started.elapsed();
+        assert!(!all_done, "the hung teardown is not done");
+        assert!(
+            waited >= Duration::from_millis(1400) && waited < Duration::from_secs(4),
+            "the wait ends at its budget: {waited:?}"
+        );
+        assert!(hung_requests.try_recv().is_ok(), "the hung DELETE was sent");
+        assert!(
+            slow_requests.try_recv().is_ok(),
+            "the other DELETE did not wait behind the hung one"
+        );
+        // Without a hung server the wait ends as soon as the DELETEs answer.
+        let (url, requests) = http_sink(Duration::from_millis(300));
+        let handles = spawn_teardown_jobs(
+            db.clone(),
+            client_for_tests(),
+            vec![teardown_job(&url, "c"), teardown_job(&url, "d")],
+        );
+        let started = std::time::Instant::now();
+        assert!(wait_for_teardowns(handles, Duration::from_secs(2)).await);
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "it waited for the answers: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(requests.try_iter().count(), 2);
+    }
+
+    // ── The call gate is checked again right before tools/call ──────────
+
+    /// A local MCP server for the call path: it reports the JSON-RPC method
+    /// of every request (a session DELETE as `DELETE <session id>`), holds
+    /// each `initialize` until the test releases it (so the test can change
+    /// the stored record while the session is being set up), answers
+    /// `notifications/initialized` with 202 and `tools/call` as [`Script`]
+    /// says, and a DELETE with 200.
+    struct ScriptedMcp {
+        url: String,
+        methods: std::sync::mpsc::Receiver<String>,
+        release_initialize: std::sync::mpsc::Sender<()>,
+    }
+
+    /// How [`scripted_mcp_with`] answers.
+    #[derive(Default, Clone, Copy)]
+    struct Script {
+        /// `tools/call` is answered 404 the first time (an expired session).
+        expire_first_call: bool,
+        /// `tools/call` is answered after this long.
+        call_delay: Duration,
+        /// `initialize` is answered as an event stream that first announces a
+        /// tools/list_changed.
+        announce_list_changed: bool,
+    }
+
+    fn scripted_mcp(expire_first_call: bool) -> ScriptedMcp {
+        scripted_mcp_with(Script {
+            expire_first_call,
+            ..Script::default()
+        })
+    }
+
+    fn scripted_mcp_with(script: Script) -> ScriptedMcp {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (seen, methods) = std::sync::mpsc::channel::<String>();
+        let (release_initialize, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Arc::new(Mutex::new(released));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { return };
+                let (seen, released, calls) = (seen.clone(), released.clone(), calls.clone());
+                std::thread::spawn(move || {
+                    // The request head, then a Content-Length body.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let (head_end, length, head) = loop {
+                        let n = sock.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                            let length = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (end + 4, length, head);
+                        }
+                    };
+                    if head.starts_with("delete ") {
+                        let session = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("mcp-session-id:"))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        let _ = seen.send(format!("DELETE {session}"));
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        return;
+                    }
+                    while buf.len() < head_end + length {
+                        let n = sock.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let request: Value =
+                        serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                    let method = request["method"].as_str().unwrap_or_default().to_string();
+                    let _ = seen.send(method.clone());
+                    let json_reply = |body: Value, extra: &str| {
+                        let body = body.to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra}\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let status_reply = |code: u16| {
+                        format!(
+                            "HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    };
+                    let reply = match method.as_str() {
+                        "initialize" => {
+                            let _ = released
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10));
+                            let answer = json!({ "jsonrpc": "2.0", "id": request["id"],
+                                "result": { "protocolVersion": "2025-06-18", "capabilities": {} } });
+                            if script.announce_list_changed {
+                                let changed = json!({ "jsonrpc": "2.0",
+                                    "method": "notifications/tools/list_changed" });
+                                let body = format!(
+                                    "event: message\ndata: {changed}\n\nevent: message\ndata: {answer}\n\n"
+                                );
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                     Mcp-Session-Id: sess-new\r\nContent-Length: {}\r\n\
+                                     Connection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else {
+                                json_reply(answer, "Mcp-Session-Id: sess-new\r\n")
+                            }
+                        }
+                        "notifications/initialized" => status_reply(202),
+                        "tools/call"
+                            if script.expire_first_call
+                                && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+                        {
+                            status_reply(404)
+                        }
+                        "tools/call" => {
+                            std::thread::sleep(script.call_delay);
+                            json_reply(
+                                json!({ "jsonrpc": "2.0", "id": request["id"], "result": {
+                                    "content": [{ "type": "text", "text": "ran" }] } }),
+                                "",
+                            )
+                        }
+                        _ => status_reply(400),
+                    };
+                    let _ = sock.write_all(reply.as_bytes());
+                });
+            }
+        });
+        ScriptedMcp {
+            url,
+            methods,
+            release_initialize,
+        }
+    }
+
+    /// `s1` with tool `t` approved, pointing at `url`; the context a call
+    /// starts from (no generation check: `u64::MAX` marks a test context).
+    fn call_fixture(
+        db: &crate::db::Database,
+        url: &str,
+        session: Option<McpSession>,
+    ) -> (crate::db::McpServerRecord, ServerContext) {
+        let mut record = record_with_tools("s1", "srv", &[]);
+        record.url = url.into();
+        record.tools = vec![tool_pinned_to(
+            &json!({ "name": "t", "description": "d" }),
+            true,
+        )];
+        db.save_mcp_server(&record).unwrap();
+        let ctx = ServerContext {
+            record: record.clone(),
+            url: url.into(),
+            client: client_for_tests(),
+            session,
+            auth: None,
+            generation: u64::MAX,
+        };
+        (record, ctx)
+    }
+
+    fn tool_call_body() -> Value {
+        json!({ "jsonrpc": "2.0", "id": "call-1", "method": "tools/call",
+                "params": { "name": "t", "arguments": {} } })
+    }
+
+    /// Wait (without blocking the runtime) until the server has seen `method`.
+    async fn wait_for_method(server: &ScriptedMcp, method: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if server.methods.try_iter().any(|m| m == method) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{method} never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The gate was checked before the session set-up only: a tool revoked
+    /// while `initialize` was in flight was still called.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_revoked_while_the_session_is_set_up_is_never_called() {
+        let db = temp_db();
+        let server = scripted_mcp(false);
+        let (record, mut ctx) = call_fixture(&db, &server.url, None);
+        let state = McpState::new();
+        // Approved on the card at Execute: the gate passes when the call starts.
+        let regate = || regate_call(&db, &record, "t", "execute", true);
+        let body = tool_call_body();
+        let unchecked = || -> CmdResult<()> { Ok(()) };
+        let call = run_tool_call(&state, &db, &mut ctx, &body, &unchecked, &regate);
+        let revoke = async {
+            wait_for_method(&server, "initialize").await;
+            set_tool_state(&db, &unlocked_vault(), "s1", "t", false, false, None).unwrap();
+            server.release_initialize.send(()).unwrap();
+        };
+        let (sent, ()) = tokio::join!(call, revoke);
+        let later: Vec<String> = server.methods.try_iter().collect();
+        assert!(
+            !later.iter().any(|m| m == "tools/call"),
+            "a revoked tool must not be called: {later:?}"
+        );
+        match sent {
+            Ok(CallSent::Refused { reason, level }) => {
+                assert!(reason.contains("not enabled"), "{reason}");
+                assert_eq!(level, "execute");
+            }
+            other => panic!("refused before the call: {other:?}"),
+        }
+    }
+
+    /// The same for the re-initialize after a 404 (the session had expired):
+    /// a definition the server changed meanwhile is not called on the retry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_changed_while_an_expired_session_is_renewed_is_not_called_again() {
+        let db = temp_db();
+        let server = scripted_mcp(true);
+        let (record, mut ctx) = call_fixture(&db, &server.url, Some(session("sess-old")));
+        let state = McpState::new();
+        let regate = || regate_call(&db, &record, "t", "yolo", false);
+        let body = tool_call_body();
+        let unchecked = || -> CmdResult<()> { Ok(()) };
+        let call = run_tool_call(&state, &db, &mut ctx, &body, &unchecked, &regate);
+        let change = async {
+            wait_for_method(&server, "initialize").await;
+            let mut changed = db.get_mcp_server("s1").unwrap().unwrap();
+            changed.tools[0].current_hash = Some("a definition nobody approved".into());
+            db.save_mcp_server(&changed).unwrap();
+            server.release_initialize.send(()).unwrap();
+        };
+        let (sent, ()) = tokio::join!(call, change);
+        let later: Vec<String> = server.methods.try_iter().collect();
+        assert!(
+            !later.iter().any(|m| m == "tools/call"),
+            "only the expired call went out: {later:?}"
+        );
+        match sent {
+            Ok(CallSent::Refused { reason, .. }) => {
+                assert!(reason.contains("changed on the server"), "{reason}")
+            }
+            other => panic!("refused before the retry: {other:?}"),
+        }
+    }
+
+    /// Unchanged state: the call goes out once and its answer comes back, with
+    /// the label of who let it run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unchanged_tool_is_called_after_the_session_is_set_up() {
+        let db = temp_db();
+        let server = scripted_mcp(false);
+        let (record, mut ctx) = call_fixture(&db, &server.url, None);
+        let state = McpState::new();
+        server.release_initialize.send(()).unwrap();
+        let regate = || regate_call(&db, &record, "t", "execute", true);
+        let sent = run_tool_call(
+            &state,
+            &db,
+            &mut ctx,
+            &tool_call_body(),
+            &|| Ok(()),
+            &regate,
+        )
+        .await
+        .unwrap();
+        match sent {
+            CallSent::Sent {
+                approval,
+                level,
+                called: Ok((result, false)),
+            } => {
+                assert_eq!((approval, level.as_str()), ("approved", "execute"));
+                assert_eq!(shape_tool_result(&result).0, "ran");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            state
+                .get_session("s1")
+                .and_then(|s| s.session_id)
+                .as_deref(),
+            Some("sess-new")
+        );
+        let seen: Vec<String> = server.methods.try_iter().collect();
+        assert_eq!(
+            seen,
+            ["initialize", "notifications/initialized", "tools/call"]
+        );
+    }
+
+    /// What the exit waits for: every teardown task still running - the lock
+    /// path's and a stale session's - kept in McpState; finished ones are
+    /// dropped, and each is handed out once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_teardowns_are_kept_for_the_exit_and_finished_ones_dropped() {
+        let state = McpState::new();
+        let finished = tauri::async_runtime::spawn(async {});
+        while !finished.inner().is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        state.track_teardowns(vec![finished]);
+        let running = tauri::async_runtime::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        state.track_teardowns(vec![running]);
+        let pending = state.take_teardowns();
+        assert_eq!(pending.len(), 1, "the finished teardown was dropped");
+        assert!(state.take_teardowns().is_empty(), "handed out once");
+        assert!(!wait_for_teardowns(pending, Duration::from_millis(100)).await);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_call_is_still_audited() {
         let db = temp_db();
@@ -4261,5 +5744,380 @@ mod tests {
         assert!(err.0.contains("timed out"));
         let rows = tool_call_rows(&db);
         assert!(rows.iter().any(|d| d.contains("result=failed")), "{rows:?}");
+    }
+
+    // ── RU6b fix round 1: a session belongs to the settings it was set up with
+
+    /// Review demo: a URL edit that landed while a call set up its session
+    /// left that session - the OLD endpoint's - registered for the server
+    /// after the re-check refused the call; the next call sent its id to the
+    /// NEW endpoint, and it was never ended. A refused call ends the session
+    /// it set up, at the endpoint the session belongs to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_refused_after_an_edit_ends_the_session_it_set_up_at_the_old_endpoint() {
+        let db = temp_db();
+        let server = scripted_mcp(false);
+        let (record, mut ctx) = call_fixture(&db, &server.url, None);
+        let state = McpState::new();
+        let regate = || regate_call(&db, &record, "t", "execute", true);
+        let body = tool_call_body();
+        let unchecked = || -> CmdResult<()> { Ok(()) };
+        let call = run_tool_call(&state, &db, &mut ctx, &body, &unchecked, &regate);
+        let edit = async {
+            wait_for_method(&server, "initialize").await;
+            let saved = save_server(
+                &db,
+                &state,
+                &unlocked_vault(),
+                save_args(Some("s1"), "srv", "https://new.example.com/mcp", "none"),
+            )
+            .unwrap();
+            assert!(
+                saved.teardown.is_none(),
+                "no session existed when the save ran"
+            );
+            server.release_initialize.send(()).unwrap();
+        };
+        let (sent, ()) = tokio::join!(call, edit);
+        match sent {
+            Ok(CallSent::Refused { reason, .. }) => {
+                assert!(reason.contains("URL or auth settings changed"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            state.get_session("s1").is_none(),
+            "the old endpoint's session is not left for the next call"
+        );
+        assert!(wait_for_teardowns(state.take_teardowns(), Duration::from_secs(5)).await);
+        let seen: Vec<String> = server.methods.try_iter().collect();
+        assert!(
+            seen.iter().any(|m| m == "DELETE sess-new"),
+            "ended at the old endpoint: {seen:?}"
+        );
+    }
+
+    /// The next request took a server's session by server id alone, so a
+    /// session set up with settings the server no longer has (an edit raced
+    /// its set-up) went to the new endpoint. A request uses only a session
+    /// set up with its own settings; a stale one is ended where it belongs,
+    /// with its own credential.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_set_up_with_other_settings_is_never_used_and_is_ended_where_it_belongs() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let (old_url, old_requests) = http_sink(Duration::ZERO);
+        let mut args = save_args(None, "srv", &old_url, "bearer");
+        args.auth_secret = Some("old-token".into());
+        let id = saved_id(save(&db, &vault, args).unwrap());
+        let old = db.get_mcp_server(&id).unwrap().unwrap();
+        // The edit commits first; the session set up with the old settings
+        // registers after it.
+        let mut moved = save_args(Some(&id), "srv", "https://new.example.com/mcp", "bearer");
+        moved.auth_secret = Some("new-token".into());
+        save(&db, &vault, moved).unwrap();
+        state.bind_session(&old, session("sess-old"));
+        let new = db.get_mcp_server(&id).unwrap().unwrap();
+        let pw = vault.get().unwrap();
+        assert!(
+            usable_session(&state, &db, &new, &pw).is_none(),
+            "never used for the new settings"
+        );
+        assert!(state.get_session(&id).is_none(), "and not left registered");
+        assert!(wait_for_teardowns(state.take_teardowns(), UNSEALING_TEARDOWN_WAIT).await);
+        let head = old_requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ended at the old endpoint")
+            .to_lowercase();
+        assert!(head.starts_with("delete "), "{head}");
+        assert!(head.contains("mcp-session-id: sess-old"), "{head}");
+        assert!(
+            head.contains("authorization: old-token"),
+            "with the old credential: {head}"
+        );
+        // A session of the stored settings is used. A request that still
+        // holds an OLDER snapshot neither uses it nor ends it.
+        state.bind_session(&new, session("sess-new"));
+        assert_eq!(
+            usable_session(&state, &db, &new, &pw).and_then(|s| s.session_id),
+            Some("sess-new".to_string())
+        );
+        assert!(usable_session(&state, &db, &old, &pw).is_none());
+        assert_eq!(
+            state.get_session(&id).and_then(|s| s.session_id),
+            Some("sess-new".to_string())
+        );
+    }
+
+    /// The settings of `s1`: first `old_url` with bearer `old-token`, then -
+    /// after a session was set up with those - `new_url` with `new-token`.
+    fn server_moved_after_set_up(
+        db: &crate::db::Database,
+        vault: &VaultPasswordStore,
+        state: &McpState,
+        old_url: &str,
+        new_url: &str,
+    ) -> String {
+        let mut args = save_args(None, "srv", old_url, "bearer");
+        args.auth_secret = Some("old-token".into());
+        let id = saved_id(save(db, vault, args).unwrap());
+        state.bind_session(
+            &db.get_mcp_server(&id).unwrap().unwrap(),
+            session("sess-old"),
+        );
+        let mut moved = save_args(Some(&id), "srv", new_url, "bearer");
+        moved.auth_secret = Some("new-token".into());
+        save(db, vault, moved).unwrap();
+        id
+    }
+
+    /// Removing a server ended its session at the record's CURRENT URL with
+    /// its current credential - for a session set up with older settings the
+    /// wrong endpoint, which never knew it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_server_ends_its_session_where_it_was_set_up() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let (old_url, old_requests) = http_sink(Duration::ZERO);
+        let (new_url, new_requests) = http_sink(Duration::ZERO);
+        let id = server_moved_after_set_up(&db, &vault, &state, &old_url, &new_url);
+        let out = remove_server(&db, &state, &vault, &id, REMOVE_TEARDOWN_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(out["warning"].is_null(), "{out}");
+        let head = old_requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ended at the old endpoint")
+            .to_lowercase();
+        assert!(head.contains("mcp-session-id: sess-old"), "{head}");
+        assert!(head.contains("authorization: old-token"), "{head}");
+        assert!(
+            new_requests.try_recv().is_err(),
+            "the new endpoint never knew the session"
+        );
+    }
+
+    /// The same for the lock: each session went to its record's current URL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lock_ends_each_session_where_it_was_set_up() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let (old_url, old_requests) = http_sink(Duration::ZERO);
+        let (new_url, new_requests) = http_sink(Duration::ZERO);
+        server_moved_after_set_up(&db, &vault, &state, &old_url, &new_url);
+        let password = vault.get().map(std::sync::Arc::new);
+        end_sessions(&state, db.clone(), password, state.take_sessions());
+        assert!(wait_for_teardowns(state.take_teardowns(), UNSEALING_TEARDOWN_WAIT).await);
+        let head = old_requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ended at the old endpoint")
+            .to_lowercase();
+        assert!(head.contains("mcp-session-id: sess-old"), "{head}");
+        assert!(head.contains("authorization: old-token"), "{head}");
+        assert!(new_requests.try_recv().is_err());
+    }
+
+    /// A connect whose settings changed meanwhile removed the server's
+    /// session by server id alone - possibly a newer one another request had
+    /// set up - and never ended the one it had set up itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_connect_ends_only_the_session_it_set_up() {
+        let db = temp_db();
+        let (url, requests) = http_sink(Duration::ZERO);
+        let state = McpState::new();
+        let (record, mut ctx) = call_fixture(&db, &url, Some(session("sess-mine")));
+        ctx.auth = Some(("Authorization".into(), Zeroizing::new("tok".into())));
+        // Another request registered a newer session meanwhile: it stays.
+        state.bind_session(&record, session("sess-newer"));
+        end_ctx_session(&state, &db, &ctx);
+        assert_eq!(
+            state.get_session("s1").and_then(|s| s.session_id),
+            Some("sess-newer".to_string())
+        );
+        assert!(wait_for_teardowns(state.take_teardowns(), Duration::from_secs(5)).await);
+        assert!(requests.try_recv().is_err(), "nothing was ended");
+        // Its own session is removed, and ended where it was set up, with
+        // its credential.
+        state.bind_session(&record, session("sess-mine"));
+        end_ctx_session(&state, &db, &ctx);
+        assert!(state.get_session("s1").is_none());
+        assert!(wait_for_teardowns(state.take_teardowns(), Duration::from_secs(5)).await);
+        let head = requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the session was ended")
+            .to_lowercase();
+        assert!(head.contains("mcp-session-id: sess-mine"), "{head}");
+        assert!(head.contains("authorization: tok"), "{head}");
+    }
+
+    /// The lock unsealed every live session's secret before it returned - an
+    /// Argon2id derivation each (about 0.75 s in a release build), on the
+    /// main thread - so Lock froze the window, and an exit spent that time
+    /// before its 2 s wait began. Each teardown task now unseals its own, on
+    /// a copy of the password that goes as soon as the header is resolved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lock_returns_before_any_secret_is_unsealed_and_lets_go_of_its_password_copy() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        // The DELETE is still unanswered when the sink reports it.
+        let (url, requests) = http_sink(Duration::from_secs(2));
+        let mut args = save_args(None, "srv", &url, "bearer");
+        args.auth_secret = Some("the-token".into());
+        let id = saved_id(save(&db, &vault, args).unwrap());
+        let record = db.get_mcp_server(&id).unwrap().unwrap();
+        state.bind_session(&record, session("sess-1"));
+        let pw = vault.get().unwrap();
+        let started = std::time::Instant::now();
+        assert!(ConnectionBinding::of(&record).auth_header(&pw).is_some());
+        let one_unseal = started.elapsed();
+        let password = std::sync::Arc::new(pw);
+        let copy = std::sync::Arc::downgrade(&password);
+        let started = std::time::Instant::now();
+        end_sessions(&state, db.clone(), Some(password), state.take_sessions());
+        let returned = started.elapsed();
+        assert!(
+            returned * 3 < one_unseal,
+            "the lock does not wait for the unseal: returned after {returned:?}, one unseal takes {one_unseal:?}"
+        );
+        let head =
+            tokio::task::spawn_blocking(move || requests.recv_timeout(UNSEALING_TEARDOWN_WAIT))
+                .await
+                .unwrap()
+                .expect("the DELETE went out")
+                .to_lowercase();
+        assert!(head.contains("mcp-session-id: sess-1"), "{head}");
+        assert!(
+            head.contains("authorization: the-token"),
+            "with its credential: {head}"
+        );
+        assert!(
+            copy.upgrade().is_none(),
+            "the password copy is gone once the header is resolved"
+        );
+        assert!(wait_for_teardowns(state.take_teardowns(), Duration::from_secs(10)).await);
+    }
+
+    /// The tool-call audit row took the tab's level read AFTER the call
+    /// answered: a YOLO call that ended after a switch to Read (or a lock)
+    /// was logged as `level=read outcome=yolo`. It is the level the gate
+    /// checked right before the request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_is_audited_at_the_level_the_gate_checked_before_it() {
+        let db = temp_db();
+        let server = scripted_mcp_with(Script {
+            call_delay: Duration::from_millis(300),
+            ..Script::default()
+        });
+        let (record, mut ctx) = call_fixture(&db, &server.url, None);
+        let state = McpState::new();
+        server.release_initialize.send(()).unwrap();
+        let tab_level = Mutex::new("yolo".to_string());
+        let regate = || {
+            let level = tab_level.lock().unwrap().clone();
+            regate_call(&db, &record, "t", &level, false)
+        };
+        let body = tool_call_body();
+        let unchecked = || -> CmdResult<()> { Ok(()) };
+        let call = run_tool_call(&state, &db, &mut ctx, &body, &unchecked, &regate);
+        let switch = async {
+            wait_for_method(&server, "tools/call").await;
+            *tab_level.lock().unwrap() = "read".into();
+        };
+        let (sent, ()) = tokio::join!(call, switch);
+        match sent {
+            Ok(CallSent::Sent {
+                approval,
+                level,
+                called: Ok(_),
+            }) => assert_eq!((approval, level.as_str()), ("yolo", "yolo")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Security review: a tools/list_changed that came with the initialize
+    /// answer was dropped on the call path, so a definition change announced
+    /// while SSHSpan was closed was never acted on - no refresh after the
+    /// call, the changed tool still enabled. It counts as the call's own now,
+    /// on the first set-up and on a renewal after a 404 alike.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_list_change_announced_with_the_initialize_answer_brings_the_refresh() {
+        for expired in [false, true] {
+            let db = temp_db();
+            let server = scripted_mcp_with(Script {
+                announce_list_changed: true,
+                expire_first_call: expired,
+                ..Script::default()
+            });
+            let existing = expired.then(|| session("sess-old"));
+            let (record, mut ctx) = call_fixture(&db, &server.url, existing);
+            let state = McpState::new();
+            server.release_initialize.send(()).unwrap();
+            let regate = || regate_call(&db, &record, "t", "execute", true);
+            let sent = run_tool_call(
+                &state,
+                &db,
+                &mut ctx,
+                &tool_call_body(),
+                &|| Ok(()),
+                &regate,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    sent,
+                    CallSent::Sent {
+                        called: Ok((_, true)),
+                        ..
+                    }
+                ),
+                "expired session: {expired}, {sent:?}"
+            );
+        }
+    }
+
+    /// Security review: a save dropped the live session INSIDE its
+    /// transaction. When the write then failed, the old settings stayed - and
+    /// their session was gone, and never ended. It is dropped only once the
+    /// save has committed.
+    #[test]
+    fn a_save_that_does_not_commit_keeps_the_live_session() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let id = saved_id(
+            save(
+                &db,
+                &vault,
+                save_args(None, "srv", "https://a.example.com/mcp", "none"),
+            )
+            .unwrap(),
+        );
+        state.bind_session(&db.get_mcp_server(&id).unwrap().unwrap(), session("sess-1"));
+        crate::db::test_support::execute(
+            &db,
+            "CREATE TRIGGER refuse_mcp_update BEFORE UPDATE ON mcp_servers \
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+        );
+        let result = save_server(
+            &db,
+            &state,
+            &vault,
+            save_args(Some(&id), "srv", "https://b.example.com/mcp", "none"),
+        );
+        assert!(result.is_err(), "the refused write fails the save");
+        assert_eq!(
+            db.get_mcp_server(&id).unwrap().unwrap().url,
+            "https://a.example.com/mcp"
+        );
+        assert_eq!(
+            state.get_session(&id).and_then(|s| s.session_id),
+            Some("sess-1".to_string()),
+            "the session of the settings that stayed is kept"
+        );
     }
 }

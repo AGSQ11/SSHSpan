@@ -255,14 +255,14 @@ pub struct McpToolRecord {
     pub annotations: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpCapOutcome {
-    /// The record was committed; `enabled_total` MCP tools are now enabled
-    /// across all servers.
-    Committed { enabled_total: usize },
-    /// The write was ROLLED BACK because the post-write enabled total
-    /// exceeded the cap; `enabled_total` is the refused total.
-    OverCap { enabled_total: usize },
+/// What one MCP read-modify-write ([`Database::modify_mcp_servers`]) writes.
+#[derive(Debug, Clone)]
+pub enum McpWrite {
+    /// A new record. Inserted - never over an existing row.
+    Insert(McpServerRecord),
+    /// A record of the snapshot, replaced whole. Never re-creates a record
+    /// that is not stored.
+    Update(McpServerRecord),
 }
 
 /// A configured MCP server (Streamable HTTP transport). `auth_secret` holds
@@ -1128,6 +1128,47 @@ impl Database {
         })
     }
 
+    /// Store the master-password verifier of a NEW vault under `hash_key`, and
+    /// when it was created under `created_key` - in one `BEGIN IMMEDIATE`
+    /// transaction, and only if no (non-empty) verifier is stored yet: `false`
+    /// when a vault already exists, nothing written. As a check followed by
+    /// separate writes, two creates at once (possible since `vault_create`
+    /// runs off the main thread) both passed the check, and the second
+    /// verifier replaced the first while the first password stayed in memory.
+    pub fn create_vault_verifier(
+        &self,
+        hash_key: &str,
+        hash: &str,
+        created_key: &str,
+        created_at: &str,
+    ) -> Result<bool> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let existing: Option<String> =
+                sqlx::query_scalar("SELECT value FROM config WHERE key = ?")
+                    .bind(hash_key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if existing.is_some_and(|v| !v.is_empty()) {
+                return Ok(false);
+            }
+            let now = Utc::now().to_rfc3339();
+            for (key, value) in [(hash_key, hash), (created_key, created_at)] {
+                sqlx::query(
+                    "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                )
+                .bind(key)
+                .bind(value)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
         block(async {
             let row = sqlx::query("SELECT value FROM config WHERE key = ?")
@@ -1309,15 +1350,45 @@ impl Database {
 
     // ── AI assistant config ────────────────────────────────────────────────
 
+    /// Write every field of `config` (`None` deletes the row), all or nothing
+    /// (see [`Database::update_assistant_config`]).
     pub fn save_assistant_config(&self, config: &AssistantConfig) -> Result<()> {
-        block(async {
-            let fields: [(&str, Option<String>); 4] = [
-                ("provider", config.provider.clone()),
-                ("base_url", config.base_url.clone()),
-                ("model", config.model.clone()),
-                ("api_key", config.api_key.clone()),
-            ];
+        let config = config.clone();
+        self.update_assistant_config(move |stored| {
+            *stored = config;
+            Ok(())
+        })
+    }
 
+    /// Change the assistant settings in ONE `BEGIN IMMEDIATE` transaction:
+    /// `update` gets them as stored inside it and edits them - or refuses,
+    /// and nothing is written - and every field is then written back, all or
+    /// nothing (`None` deletes the row: clearing the provider must not leave
+    /// its key behind). The fields used to be four autocommit statements, so
+    /// a save that failed part-way kept a new provider and base URL beside
+    /// the OLD sealed key, and a chat reading mid-save could see that mix -
+    /// either way the key went to an endpoint it was not saved for (RU6b
+    /// item 13 audit, the F1-b pattern of the Bitwarden settings). The write
+    /// lock is taken before the read, so a concurrent writer makes it wait.
+    pub fn update_assistant_config<T>(
+        &self,
+        update: impl FnOnce(&mut AssistantConfig) -> Result<T>,
+    ) -> Result<T> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT key, value FROM assistant_config")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let mut config = assistant_config_from_rows(rows);
+            let out = update(&mut config)?;
+            let fields: [(&str, Option<String>); 4] = [
+                ("provider", config.provider),
+                ("base_url", config.base_url),
+                ("model", config.model),
+                ("api_key", config.api_key),
+            ];
+            let now = Utc::now().to_rfc3339();
             for (key, value) in fields {
                 if let Some(v) = value {
                     sqlx::query(
@@ -1326,50 +1397,39 @@ impl Database {
                     )
                     .bind(key)
                     .bind(v)
-                    .bind(Utc::now().to_rfc3339())
-                    .execute(&self.pool)
+                    .bind(&now)
+                    .execute(&mut *tx)
                     .await?;
                 } else {
-                    // None means "clear this row" - the bitwarden table keeps
-                    // stale values on None, which is fine for folder names but
-                    // wrong for a sealed secret: clearing the provider must
-                    // not leave its key behind.
                     sqlx::query("DELETE FROM assistant_config WHERE key = ?")
                         .bind(key)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await?;
                 }
             }
-            Ok(())
+            tx.commit().await?;
+            Ok(out)
         })
     }
 
     pub fn load_assistant_config(&self) -> Result<AssistantConfig> {
         block(async {
-            let rows = sqlx::query("SELECT key, value FROM assistant_config")
-                .fetch_all(&self.pool)
-                .await?;
-
-            let mut config = AssistantConfig::default();
-            for row in rows {
-                let key: String = row.get("key");
-                let value: String = row.get("value");
-                match key.as_str() {
-                    "provider" => config.provider = Some(value),
-                    "base_url" => config.base_url = Some(value),
-                    "model" => config.model = Some(value),
-                    "api_key" => config.api_key = Some(value),
-                    _ => {}
-                }
-            }
-            Ok(config)
+            // One statement: it sees one committed state of the table.
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT key, value FROM assistant_config")
+                    .fetch_all(&self.pool)
+                    .await?;
+            Ok(assistant_config_from_rows(rows))
         })
     }
 
     // ── MCP servers ────────────────────────────────────────────────────────
 
     /// Upsert one MCP server record (the whole record, tools included, as
-    /// JSON). `key` is the record id.
+    /// JSON). `key` is the record id. Not for read-modify-write: a record
+    /// read earlier and written back here replaces whatever was stored
+    /// meanwhile - and re-creates a removed one. Changes to a stored record
+    /// go through [`Database::modify_mcp_servers`].
     pub fn save_mcp_server(&self, record: &McpServerRecord) -> Result<()> {
         block(async {
             let value = serde_json::to_string(record)?;
@@ -1422,54 +1482,68 @@ impl Database {
         })
     }
 
-    /// Write one server record AND count the enabled MCP tools across ALL
-    /// servers inside a single SQLite transaction, so the count reads the
-    /// post-write state that no concurrent toggle can interleave with. When
-    /// the post-write enabled total exceeds `max_enabled`, the write is
-    /// ROLLED BACK (the record keeps its previous state) and `OverCap` is
-    /// returned; otherwise the transaction commits and `Committed` carries
-    /// the new enabled total. Used by `mcp_set_tool_state`'s aggregate cap.
-    pub fn save_mcp_server_capped(
+    /// One read-modify-write of the MCP server records, as ONE `BEGIN
+    /// IMMEDIATE` transaction (A7-49): `modify` gets every stored record as
+    /// it is at that moment and says what to write - or refuses (`Err`), and
+    /// nothing is written. Its decision and the write commit together. A
+    /// save, a tool toggle, a connect or a call's tool refresh used to read
+    /// the record, decide, then write the whole record back as a separate
+    /// statement, so a change committed in between was lost: a revoked
+    /// approval came back, a refreshed definition was replaced by the stale
+    /// one - and the upsert re-created a server removed meanwhile.
+    ///
+    /// The write lock is taken before the read, so a write held by another
+    /// connection makes this one WAIT (busy timeout) instead of failing, and
+    /// `modify` always sees the latest committed state. `modify` runs while
+    /// the lock is held: it must be quick and must not touch the database
+    /// (seal a secret before, audit after).
+    pub fn modify_mcp_servers<T>(
         &self,
-        record: &McpServerRecord,
-        max_enabled: usize,
-    ) -> Result<McpCapOutcome> {
+        modify: impl FnOnce(&[McpServerRecord]) -> Result<(McpWrite, T)>,
+    ) -> Result<T> {
         block(async {
-            let mut tx = self.pool.begin().await?;
-            let value = serde_json::to_string(record)?;
-            sqlx::query(
-                "INSERT INTO mcp_servers (key, value, confirmed, updated_at) VALUES (?, ?, ?, ?) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
-                   confirmed = excluded.confirmed, updated_at = excluded.updated_at",
-            )
-            .bind(&record.id)
-            .bind(value)
-            .bind(record.confirmed as i64)
-            .bind(Utc::now().to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
-            // Count enabled tools from the rows INSIDE the transaction (the
-            // just-written record is read back from the table, not from
-            // memory), so the count is the committed state. json_each over
-            // a missing/null $.tools yields no rows, which counts as 0.
-            let count: i64 = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM mcp_servers AS s, \
-                   json_each(json_extract(s.value, '$.tools')) AS t \
-                 WHERE json_extract(t.value, '$.enabled') = 1",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            if count > max_enabled as i64 {
-                // Over the cap: return WITHOUT committing - the tx is
-                // dropped here and the write rolls back.
-                return Ok(McpCapOutcome::OverCap {
-                    enabled_total: count as usize,
-                });
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let values: Vec<String> =
+                sqlx::query_scalar("SELECT value FROM mcp_servers ORDER BY key ASC")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let records = values
+                .iter()
+                .map(|value| serde_json::from_str(value))
+                .collect::<Result<Vec<McpServerRecord>, _>>()?;
+            let (write, out) = modify(&records)?;
+            let now = Utc::now().to_rfc3339();
+            match write {
+                McpWrite::Insert(record) => {
+                    sqlx::query(
+                        "INSERT INTO mcp_servers (key, value, confirmed, updated_at) \
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(&record.id)
+                    .bind(serde_json::to_string(&record)?)
+                    .bind(record.confirmed as i64)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                McpWrite::Update(record) => {
+                    let res = sqlx::query(
+                        "UPDATE mcp_servers SET value = ?, confirmed = ?, updated_at = ? \
+                         WHERE key = ?",
+                    )
+                    .bind(serde_json::to_string(&record)?)
+                    .bind(record.confirmed as i64)
+                    .bind(&now)
+                    .bind(&record.id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if res.rows_affected() != 1 {
+                        anyhow::bail!("MCP server not found.");
+                    }
+                }
             }
             tx.commit().await?;
-            Ok(McpCapOutcome::Committed {
-                enabled_total: count as usize,
-            })
+            Ok(out)
         })
     }
 
@@ -1611,6 +1685,49 @@ impl Database {
             .bind(&c.id)
             .execute(&self.pool)
             .await?;
+            Ok(())
+        })
+    }
+
+    /// Move category `id` under `parent` (`None`: the top level) and, when
+    /// given, to position `sort_index` - those columns and `updated_at`, in
+    /// ONE `BEGIN IMMEDIATE` transaction whose `check` sees every category as
+    /// stored inside it and may refuse the move (`Err`, nothing written). The
+    /// check and a whole-row write used to be separate steps: two moves at
+    /// once (possible since `category_reparent` runs off the main thread)
+    /// could each pass the check and together make a parent loop, and a
+    /// rename made meanwhile was written back.
+    pub fn move_category(
+        &self,
+        id: &str,
+        parent: Option<&str>,
+        sort_index: Option<i64>,
+        check: impl FnOnce(&[Category]) -> Result<()>,
+    ) -> Result<()> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let rows = sqlx::query(
+                "SELECT id, name, parent_id, scope, color, sort_index, created_at, updated_at \
+                 FROM categories",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let all: Vec<Category> = rows.into_iter().map(Self::row_to_category).collect();
+            check(&all)?;
+            let res = sqlx::query(
+                "UPDATE categories SET parent_id = ?, sort_index = COALESCE(?, sort_index), \
+                 updated_at = ? WHERE id = ?",
+            )
+            .bind(parent)
+            .bind(sort_index)
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() != 1 {
+                anyhow::bail!("Category not found.");
+            }
+            tx.commit().await?;
             Ok(())
         })
     }
@@ -1862,21 +1979,30 @@ impl Database {
         }
     }
 
-    /// Walk parent chain and return the slash-joined category path.
+    /// The slash-joined path of category `id`, top first - the path the
+    /// Bitwarden sync writes into an item's notes. Bounded by
+    /// [`category_chain`]: on a parent loop (a restored vault can hold one)
+    /// it is the categories walked, each once. Empty when `id` does not
+    /// exist or the categories cannot be read.
     pub fn category_path_string(&self, id: &str) -> String {
-        let mut out = Vec::new();
-        let mut cur: Option<String> = Some(id.to_string());
-        while let Some(cid) = cur {
-            match self.get_category(&cid) {
-                Ok(Some(c)) => {
-                    out.push(c.name);
-                    cur = c.parent_id;
-                }
-                _ => break,
+        let all = match self.list_categories() {
+            Ok(all) => all,
+            Err(e) => {
+                log::warn!("[sshspan-db] could not read the categories for a path: {e}");
+                return String::new();
             }
-        }
-        out.reverse();
-        out.join("/")
+        };
+        let name_of: HashMap<&str, &str> = all
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str()))
+            .collect();
+        let mut names: Vec<&str> = category_chain(&all, id)
+            .ids()
+            .iter()
+            .filter_map(|cid| name_of.get(cid.as_str()).copied())
+            .collect();
+        names.reverse();
+        names.join("/")
     }
 
     /// Ensure a category chain for the given slash-joined path exists locally.
@@ -2053,9 +2179,14 @@ impl Database {
     /// opening everything and the user simply tries again. (The commands that
     /// write sealed data are also locked out while a rotation runs; this is
     /// the backstop.)
+    ///
+    /// `BEGIN IMMEDIATE`: the transaction reads (which rows hold sealed
+    /// values) between its writes - on a vault without keys it read first -
+    /// and a deferred transaction was refused at once ("database is locked")
+    /// while another connection was writing.
     pub fn apply_vault_rotation(&self, rotation: &VaultRotation) -> Result<()> {
         block(async {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             for key in &rotation.keys {
                 let res = sqlx::query(
                     "UPDATE keys SET private_key_encrypted = ? \
@@ -2295,12 +2426,15 @@ impl Database {
 
     /// Rewrite every stored host-key fingerprint to the current form (see the
     /// call in `migrate()`). Idempotent: a second run finds nothing to change.
+    /// The rows are read inside the (`BEGIN IMMEDIATE`) transaction that
+    /// rewrites them: read outside it, a pin replaced in between got the
+    /// fingerprint of the key it replaced.
     async fn migrate_known_host_fingerprints(&self) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<(String, String, String)> =
             sqlx::query_as("SELECT host, host_key, fingerprint_sha256 FROM known_hosts")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
-        let mut tx = self.pool.begin().await?;
         for (host, host_key, stored) in rows {
             let current = crate::ssh_client::known_host_fingerprint(&host_key, &stored);
             if current != stored {
@@ -2330,12 +2464,15 @@ impl Database {
     ///   rather than colliding: the existing qualified row is the newer, more
     ///   specific pin, and keeping the orphan would only confuse a later run.
     /// * Idempotent: a second call finds nothing left to do.
+    /// * One `BEGIN IMMEDIATE` transaction, the rows read inside it: it checks
+    ///   whether a name is taken before it writes, and a deferred transaction
+    ///   was refused at once ("database is locked") while another connection
+    ///   was writing.
     async fn migrate_known_hosts_port_qualify(&self) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<String> = sqlx::query_scalar::<_, String>("SELECT host FROM known_hosts")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
-
-        let mut tx = self.pool.begin().await?;
         for old in rows {
             let Some(new) = qualify_legacy_known_host(&old) else {
                 continue; // already qualified
@@ -2365,22 +2502,28 @@ impl Database {
 
     /// Insert a newly-seen host key. Returns false if the host already exists
     /// with a DIFFERENT key (the caller should treat that as a mismatch).
+    ///
+    /// The check and the insert are one `BEGIN IMMEDIATE` transaction: as two
+    /// statements, two first connections to one new host both saw no pin and
+    /// the second failed its insert on the primary key instead of comparing
+    /// the keys (RU6b item 13).
     pub fn add_known_host(&self, host: &str, host_key: &str, fingerprint: &str) -> Result<bool> {
         block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let existing =
                 sqlx::query_scalar::<_, String>("SELECT host_key FROM known_hosts WHERE host = ?")
                     .bind(host)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *tx)
                     .await?;
             match existing {
-                Some(current) if current == host_key => Ok(true),
-                Some(_) => Ok(false),
+                Some(current) => Ok(current == host_key),
                 None => {
                     sqlx::query(
                         "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen, source) VALUES (?, ?, ?, ?, 'connection')"
                     )
                     .bind(host).bind(host_key).bind(fingerprint).bind(chrono::Utc::now().to_rfc3339())
-                    .execute(&self.pool).await?;
+                    .execute(&mut *tx).await?;
+                    tx.commit().await?;
                     Ok(true)
                 }
             }
@@ -2597,9 +2740,14 @@ impl Database {
     /// held SQLite's write lock: each rename after the first write waited out
     /// the 5 s busy timeout, failed with "database is locked", and the row was
     /// dropped.
+    ///
+    /// `BEGIN IMMEDIATE`: the restore reads (category and known-host checks)
+    /// between its writes - a payload whose first entry is such a check read
+    /// first - and a deferred transaction was refused at once ("database is
+    /// locked") while another connection was writing.
     pub fn restore_backup(&self, data: &serde_json::Value) -> Result<serde_json::Value> {
         let (counts, renamed) = block(async {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let (mut keys_n, mut cats_n, mut kc_n) = (0u32, 0u32, 0u32);
             let (mut servers_n, mut hosts_n, mut settings_n) = (0u32, 0u32, 0u32);
             let mut renamed: Vec<(String, String)> = Vec::new();
@@ -2947,6 +3095,57 @@ impl Database {
 /// Config-key prefix of the per-server SFTP bookmark lists (one row per
 /// server id), as `sftp_bookmarks_list` / `sftp_bookmarks_save` spell it.
 pub const SFTP_BOOKMARKS_PREFIX: &str = "sftp.bookmarks.";
+
+/// How many parents a walk up a category's chain follows at most: far
+/// beyond any tree a person builds, and a bound even on a corrupt one.
+pub const MAX_CATEGORY_DEPTH: usize = 256;
+
+/// Where a category's chain of parents leads ([`category_chain`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CategoryChain {
+    /// It reaches a top-level category - or a parent that no longer exists,
+    /// which the tree shows at the top level.
+    Rooted(Vec<String>),
+    /// It has no top: it runs in a loop (a restored vault can hold one,
+    /// A2-45), or on past [`MAX_CATEGORY_DEPTH`].
+    NoRoot(Vec<String>),
+}
+
+impl CategoryChain {
+    /// The ids walked, from the start upwards, each once.
+    pub fn ids(&self) -> &[String] {
+        match self {
+            Self::Rooted(ids) | Self::NoRoot(ids) => ids,
+        }
+    }
+}
+
+/// Walk up from category `start` through `categories`, visiting each
+/// category at most once and at most [`MAX_CATEGORY_DEPTH`] of them. `start`
+/// is the first id walked; an id that is not stored ends the walk at the top
+/// level (so an unknown `start` is an empty, rooted chain). The walks this
+/// replaces had no visited set: a parent loop never ended them - one of them
+/// ran on the main thread and froze the window (JU4 review N1).
+pub fn category_chain(categories: &[Category], start: &str) -> CategoryChain {
+    let parent_of: HashMap<&str, Option<&str>> = categories
+        .iter()
+        .map(|c| (c.id.as_str(), c.parent_id.as_deref()))
+        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut current = Some(start);
+    while let Some(id) = current {
+        let Some(&parent) = parent_of.get(id) else {
+            return CategoryChain::Rooted(ids);
+        };
+        if ids.len() >= MAX_CATEGORY_DEPTH || !seen.insert(id) {
+            return CategoryChain::NoRoot(ids);
+        }
+        ids.push(id.to_string());
+        current = parent;
+    }
+    CategoryChain::Rooted(ids)
+}
 
 /// A key's Bitwarden revision metadata as a backup carries it. `KeyRecord`
 /// serializes both fields as JSON numbers, but restore read them with
@@ -4146,7 +4345,7 @@ mod tests {
         let _ = std::fs::remove_file(&db.db_path);
     }
 
-    // ── MCP aggregate tool cap (transactional) ───────────────────────────
+    // ── MCP read-modify-write (transactional) ────────────────────────────
 
     fn mcp_db() -> Database {
         let db_path =
@@ -4183,52 +4382,45 @@ mod tests {
         }
     }
 
-    /// The capped save commits a within-cap enable and reports the true
-    /// aggregate enabled total across ALL servers.
+    /// The closure sees every stored record, and what it returns is written
+    /// in the same transaction; a refusal writes nothing.
     #[test]
-    fn save_mcp_server_capped_commits_within_cap() {
+    fn modify_mcp_servers_writes_what_the_closure_decides_or_nothing() {
         let db = mcp_db();
-        db.save_mcp_server(&mcp_record("a", &[("t1", true), ("t2", false)]))
+        db.save_mcp_server(&mcp_record("a", &[("t1", false)]))
             .unwrap();
-        // Enabling t2 on server "a": 2 enabled in total, cap 2.
-        let rec = mcp_record("a", &[("t1", true), ("t2", true)]);
-        match db.save_mcp_server_capped(&rec, 2).unwrap() {
-            McpCapOutcome::Committed { enabled_total } => assert_eq!(enabled_total, 2),
-            McpCapOutcome::OverCap { .. } => panic!("2 of 2 must commit"),
-        }
-        // A second server's enable counts across servers.
-        db.save_mcp_server(&mcp_record("b", &[("u1", false)]))
+        let seen = db
+            .modify_mcp_servers(|all| {
+                let mut a = all[0].clone();
+                a.tools[0].enabled = true;
+                Ok((McpWrite::Update(a), all.len()))
+            })
             .unwrap();
-        let rec = mcp_record("b", &[("u1", true)]);
-        match db.save_mcp_server_capped(&rec, 2).unwrap() {
-            // 3 enabled total (t1, t2, u1) > cap 2 -> must roll back.
-            McpCapOutcome::OverCap { enabled_total } => assert_eq!(enabled_total, 3),
-            McpCapOutcome::Committed { .. } => panic!("3 of 2 must be over cap"),
-        }
+        assert_eq!(seen, 1);
+        assert!(db.get_mcp_server("a").unwrap().unwrap().tools[0].enabled);
+        let refused =
+            db.modify_mcp_servers(|_| -> Result<(McpWrite, ())> { anyhow::bail!("refused") });
+        assert_eq!(refused.unwrap_err().to_string(), "refused");
+        assert!(db.get_mcp_server("a").unwrap().unwrap().tools[0].enabled);
+        db.modify_mcp_servers(|_| Ok((McpWrite::Insert(mcp_record("b", &[])), ())))
+            .unwrap();
+        assert_eq!(db.list_mcp_servers().unwrap().len(), 2);
     }
 
-    /// An over-cap enable is ROLLED BACK: the stored record keeps its
-    /// previous (pre-enable) state, so the refused toggle leaves nothing
-    /// behind - the exact property mcp_set_tool_state relies on.
+    /// An insert never replaces a stored record, and an update never
+    /// re-creates a removed one.
     #[test]
-    fn save_mcp_server_capped_rolls_back_over_cap_writes() {
+    fn modify_mcp_servers_never_upserts() {
         let db = mcp_db();
         db.save_mcp_server(&mcp_record("a", &[("t1", true)]))
             .unwrap();
-        // Try to enable two more on a second server with cap 2.
-        db.save_mcp_server(&mcp_record("b", &[("u1", false), ("u2", false)]))
-            .unwrap();
-        let rec = mcp_record("b", &[("u1", true), ("u2", true)]);
-        match db.save_mcp_server_capped(&rec, 2).unwrap() {
-            McpCapOutcome::OverCap { enabled_total } => assert_eq!(enabled_total, 3),
-            McpCapOutcome::Committed { .. } => panic!("3 of 2 must be over cap"),
-        }
-        // The write was rolled back: server b is stored still disabled.
-        let stored = db.get_mcp_server("b").unwrap().unwrap();
-        assert!(
-            stored.tools.iter().all(|t| !t.enabled),
-            "an over-cap enable must not persist"
-        );
+        let clash = db
+            .modify_mcp_servers(|_| Ok((McpWrite::Insert(mcp_record("a", &[("t1", false)])), ())));
+        assert!(clash.is_err(), "an insert over a stored id fails");
+        assert!(db.get_mcp_server("a").unwrap().unwrap().tools[0].enabled);
+        let gone = db.modify_mcp_servers(|_| Ok((McpWrite::Update(mcp_record("gone", &[])), ())));
+        assert_eq!(gone.unwrap_err().to_string(), "MCP server not found.");
+        assert!(db.get_mcp_server("gone").unwrap().is_none());
     }
 }
 
@@ -4258,6 +4450,21 @@ fn bitwarden_config_from_rows(rows: Vec<(String, String)>) -> BitwardenConfig {
                     .map(|d| d.with_timezone(&Utc))
             }
             "last_result" => config.last_result = Some(value),
+            _ => {}
+        }
+    }
+    config
+}
+
+/// The assistant settings from their `assistant_config` rows (key, value).
+fn assistant_config_from_rows(rows: Vec<(String, String)>) -> AssistantConfig {
+    let mut config = AssistantConfig::default();
+    for (key, value) in rows {
+        match key.as_str() {
+            "provider" => config.provider = Some(value),
+            "base_url" => config.base_url = Some(value),
+            "model" => config.model = Some(value),
+            "api_key" => config.api_key = Some(value),
             _ => {}
         }
     }
@@ -4642,5 +4849,501 @@ mod ru5_fix2_tests {
             db.get_server(&server.id).unwrap().unwrap().host,
             "pulled.example.com"
         );
+    }
+}
+
+/// Helpers for the tests of every module that writes through [`Database`].
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Run `statements` - SQL and its text binds - on ANOTHER connection to
+    /// `db`'s file inside `BEGIN IMMEDIATE`, and keep that write open for
+    /// `ms` milliseconds before committing: a concurrent writer caught
+    /// mid-commit. Returns once the write lock is held. The connection is a
+    /// plain one (`open_at` would run the migrations), on a thread and
+    /// runtime of its own, so sync and async tests can both use it.
+    pub(crate) fn hold_write_bound(
+        db: &Database,
+        statements: Vec<(String, Vec<String>)>,
+        ms: u64,
+    ) -> std::thread::JoinHandle<()> {
+        let url = format!("sqlite:{}?mode=rwc", db.db_path.display());
+        let (held, wait_for_hold) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let pool = SqlitePool::connect(&url).await.unwrap();
+                let mut conn = pool.acquire().await.unwrap();
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+                for (sql, binds) in &statements {
+                    let mut query = sqlx::query(sql);
+                    for bind in binds {
+                        query = query.bind(bind.as_str());
+                    }
+                    query.execute(&mut *conn).await.unwrap();
+                }
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+                drop(conn);
+                pool.close().await;
+            });
+        });
+        wait_for_hold.recv().unwrap();
+        holder
+    }
+
+    /// [`hold_write_bound`] for statements without binds.
+    pub(crate) fn hold_write(
+        db: &Database,
+        statements: &[&str],
+        ms: u64,
+    ) -> std::thread::JoinHandle<()> {
+        let statements = statements
+            .iter()
+            .map(|sql| (sql.to_string(), Vec::new()))
+            .collect();
+        hold_write_bound(db, statements, ms)
+    }
+
+    /// Run `sql` once, on another connection to `db`'s file - a schema
+    /// change, such as a trigger that refuses writes, then holds for every
+    /// connection.
+    pub(crate) fn execute(db: &Database, sql: &str) {
+        hold_write(db, &[sql], 0).join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ru6b_tests {
+    use super::test_support::hold_write;
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn temp_path() -> PathBuf {
+        std::env::temp_dir().join(format!("sshspan-ru6b-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    const PROBE_WRITE: &str =
+        "INSERT INTO config (key, value, updated_at) VALUES ('probe', 'x', 'now') \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
+    fn assert_waited(started: Instant) {
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "it waited for the other write: {:?}",
+            started.elapsed()
+        );
+    }
+
+    // ── Item 13: read-then-write transactions take the write lock first ───
+
+    /// A restore whose first statement is a read (a server's category
+    /// check) used a deferred transaction: with another connection writing,
+    /// SQLite refused its first write at once ("database is locked").
+    #[test]
+    fn a_restore_that_reads_first_waits_for_another_connections_write() {
+        let db = Database::open_at(temp_path()).unwrap();
+        let payload = serde_json::json!({
+            "servers": [{
+                "id": "s1", "name": "web", "host": "web.example.com", "port": 22,
+                "username": "root", "category_id": "c1",
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            }],
+        });
+        let holder = hold_write(&db, &[PROBE_WRITE], 300);
+        let started = Instant::now();
+        let counts = db
+            .restore_backup(&payload)
+            .expect("the restore must wait for the other write, not fail");
+        assert_waited(started);
+        holder.join().unwrap();
+        assert_eq!(counts["servers"], 1);
+        assert!(db.get_server("s1").unwrap().is_some());
+    }
+
+    /// A master-password change on a vault with no keys read first (the
+    /// key-id check) and wrote second, in a deferred transaction.
+    #[test]
+    fn a_rotation_without_keys_waits_for_another_connections_write() {
+        let db = Database::open_at(temp_path()).unwrap();
+        let mut server = ServerRecord {
+            id: "s1".into(),
+            name: "web".into(),
+            host: "web.example.com".into(),
+            port: 22,
+            username: "root".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "password".into(),
+            saved_password: Some("sealed-old".into()),
+            category_id: None,
+            color: None,
+            last_connected_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            bitwarden_id: None,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        };
+        db.insert_server(&server).unwrap();
+        let rotation = VaultRotation {
+            server_passwords: vec![ResealedSecret {
+                id: "s1".into(),
+                old: "sealed-old".into(),
+                new: "sealed-new".into(),
+            }],
+            master_hash: "$argon2id$new".into(),
+            ..VaultRotation::default()
+        };
+        let holder = hold_write(&db, &[PROBE_WRITE], 300);
+        let started = Instant::now();
+        db.apply_vault_rotation(&rotation)
+            .expect("the rotation must wait for the other write, not fail");
+        assert_waited(started);
+        holder.join().unwrap();
+        server.saved_password = Some("sealed-new".into());
+        assert_eq!(
+            db.get_server("s1").unwrap().unwrap().saved_password,
+            server.saved_password
+        );
+    }
+
+    /// The known_hosts port migration checks whether the qualified name is
+    /// taken (a read) before it renames a row (a write).
+    #[test]
+    fn the_known_hosts_port_migration_waits_for_another_connections_write() {
+        let db = Database::open_at(temp_path()).unwrap();
+        block(async {
+            sqlx::query(
+                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
+                 VALUES ('legacy.example', 'AAAA', 'SHA256:x', 'now')",
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+        let holder = hold_write(&db, &[PROBE_WRITE], 300);
+        let started = Instant::now();
+        block(db.migrate_known_hosts_port_qualify())
+            .expect("the migration must wait for the other write, not fail");
+        assert_waited(started);
+        holder.join().unwrap();
+        assert!(db.get_known_host("legacy.example:22").unwrap().is_some());
+    }
+
+    /// The fingerprint migration read the rows OUTSIDE its transaction, so a
+    /// pin rewritten in between got the fingerprint of the key it replaced.
+    #[test]
+    fn the_fingerprint_migration_reads_the_rows_it_rewrites_inside_its_transaction() {
+        use base64ct::Encoding;
+        let db = Database::open_at(temp_path()).unwrap();
+        let old_key = base64ct::Base64::encode_string(b"old host key");
+        let new_key = base64ct::Base64::encode_string(b"new host key");
+        let new_fp = crate::ssh_client::known_host_fingerprint(&new_key, "");
+        block(async {
+            sqlx::query(
+                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen) \
+                 VALUES ('h:22', ?, 'legacy-form', 'now')",
+            )
+            .bind(&old_key)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        });
+        // Another connection re-pins the host while the migration starts.
+        let repin = format!(
+            "UPDATE known_hosts SET host_key = '{new_key}', fingerprint_sha256 = '{new_fp}' \
+             WHERE host = 'h:22'"
+        );
+        let holder = hold_write(&db, &[&repin], 300);
+        block(db.migrate_known_host_fingerprints()).unwrap();
+        holder.join().unwrap();
+        let pin = db.get_known_host("h:22").unwrap().unwrap();
+        assert_eq!(pin.host_key, new_key);
+        let stored: String = block(async {
+            sqlx::query_scalar("SELECT fingerprint_sha256 FROM known_hosts WHERE host = 'h:22'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(stored, new_fp, "the stored fingerprint is the new key's");
+    }
+
+    /// The assistant settings were written as four separate statements, so a
+    /// save that failed part-way kept the new provider and base URL beside
+    /// the OLD sealed key - which a chat then sent to an endpoint it was not
+    /// saved for (and a concurrent reader could see that mix mid-save).
+    #[test]
+    fn an_assistant_settings_save_that_fails_part_way_changes_nothing() {
+        let db = Database::open_at(temp_path()).unwrap();
+        db.save_assistant_config(&AssistantConfig {
+            provider: Some("openai".into()),
+            base_url: Some("https://a.example.com/v1".into()),
+            model: Some("m-a".into()),
+            api_key: Some("sealed-a".into()),
+        })
+        .unwrap();
+        for event in ["INSERT", "UPDATE"] {
+            block(
+                sqlx::query(&format!(
+                    "CREATE TRIGGER refuse_key_{event} BEFORE {event} ON assistant_config \
+                     WHEN NEW.key = 'api_key' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"
+                ))
+                .execute(&db.pool),
+            )
+            .unwrap();
+        }
+        let result = db.save_assistant_config(&AssistantConfig {
+            provider: Some("anthropic".into()),
+            base_url: Some("https://b.example.com".into()),
+            model: Some("m-b".into()),
+            api_key: Some("sealed-b".into()),
+        });
+        assert!(result.is_err(), "the refused key write fails the save");
+        let stored = db.load_assistant_config().unwrap();
+        assert_eq!(
+            (
+                stored.provider.as_deref(),
+                stored.base_url.as_deref(),
+                stored.model.as_deref(),
+                stored.api_key.as_deref()
+            ),
+            (
+                Some("openai"),
+                Some("https://a.example.com/v1"),
+                Some("m-a"),
+                Some("sealed-a")
+            ),
+            "a failed save leaves every field as it was"
+        );
+    }
+
+    /// The assistant settings save reads the stored settings, then writes
+    /// them back: in a deferred transaction another connection's write made
+    /// it fail at once ("database is locked") - and had it waited, it would
+    /// have written its stale read over that write. It takes the write lock
+    /// first, waits, and edits what the other write committed.
+    #[test]
+    fn an_assistant_settings_save_waits_for_another_connections_write() {
+        let db = Database::open_at(temp_path()).unwrap();
+        db.save_assistant_config(&AssistantConfig {
+            provider: Some("openai".into()),
+            base_url: None,
+            model: Some("m-a".into()),
+            api_key: Some("sealed-a".into()),
+        })
+        .unwrap();
+        let holder = hold_write(
+            &db,
+            &["UPDATE assistant_config SET value = 'sealed-b' WHERE key = 'api_key'"],
+            300,
+        );
+        let started = Instant::now();
+        db.update_assistant_config(|config| {
+            config.model = Some("m-b".into());
+            Ok(())
+        })
+        .expect("the save must wait for the other write, not fail");
+        assert_waited(started);
+        holder.join().unwrap();
+        let stored = db.load_assistant_config().unwrap();
+        assert_eq!(stored.model.as_deref(), Some("m-b"));
+        assert_eq!(
+            stored.api_key.as_deref(),
+            Some("sealed-b"),
+            "the other connection's write is kept"
+        );
+    }
+
+    /// A new vault's verifier is stored only if none is: the check and the
+    /// write are one transaction that takes the write lock first. Deferred,
+    /// another connection's write (a second create) made it fail at once.
+    #[test]
+    fn a_vault_create_waits_for_another_connections_write() {
+        let db = Database::open_at(temp_path()).unwrap();
+        let holder = hold_write(
+            &db,
+            &["INSERT INTO config (key, value, updated_at) VALUES ('master.hash', 'first', 'now')"],
+            300,
+        );
+        let started = Instant::now();
+        let created = db
+            .create_vault_verifier("master.hash", "second", "vault.created", "now")
+            .expect("the create must wait for the other write, not fail");
+        assert_waited(started);
+        holder.join().unwrap();
+        assert!(!created, "a vault created meanwhile is not replaced");
+        assert_eq!(
+            db.get_config("master.hash").unwrap().as_deref(),
+            Some("first")
+        );
+        // With no vault yet, it is created.
+        let fresh = Database::open_at(temp_path()).unwrap();
+        assert!(fresh
+            .create_vault_verifier("master.hash", "only", "vault.created", "now")
+            .unwrap());
+        assert_eq!(
+            fresh.get_config("master.hash").unwrap().as_deref(),
+            Some("only")
+        );
+    }
+
+    /// Two first connections to one new host: the second saw no pin (the
+    /// first was not committed yet), then failed its INSERT on the primary
+    /// key instead of comparing the keys.
+    #[test]
+    fn a_host_key_pinned_meanwhile_by_another_connection_is_compared_not_duplicated() {
+        let db = Database::open_at(temp_path()).unwrap();
+        let holder = hold_write(
+            &db,
+            &[
+                "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen, source) \
+               VALUES ('h:22', 'KEY-B', 'SHA256:b', 'now', 'connection')",
+            ],
+            300,
+        );
+        let started = Instant::now();
+        let matches = db
+            .add_known_host("h:22", "KEY-A", "SHA256:a")
+            .expect("the pin must wait for the other write and compare, not fail");
+        assert_waited(started);
+        holder.join().unwrap();
+        assert!(!matches, "a different key pinned meanwhile is a mismatch");
+        assert_eq!(
+            db.get_known_host("h:22").unwrap().unwrap().host_key,
+            "KEY-B"
+        );
+        // The same key pinned meanwhile is a match.
+        assert!(db.add_known_host("h:22", "KEY-B", "SHA256:b").unwrap());
+        // A host nobody pinned is pinned.
+        assert!(db.add_known_host("other:22", "KEY-C", "SHA256:c").unwrap());
+        assert_eq!(
+            db.get_known_host("other:22").unwrap().unwrap().host_key,
+            "KEY-C"
+        );
+    }
+
+    // ── Item 12: category walks are bounded ───────────────────────────────
+
+    fn category(id: &str, parent: Option<&str>) -> Category {
+        Category {
+            id: id.into(),
+            name: format!("cat-{id}"),
+            parent_id: parent.map(String::from),
+            scope: "key".into(),
+            color: None,
+            sort_index: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// `category_path_string` for `id`, or a failure if it does not finish
+    /// within two seconds (an unbounded walk never does).
+    fn path_within_two_seconds(db: &Database, id: &str) -> String {
+        let (done, result) = std::sync::mpsc::channel();
+        let (db, id) = (db.clone(), id.to_string());
+        std::thread::spawn(move || {
+            let _ = done.send(db.category_path_string(&id));
+        });
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the category path walk must end (parent loop)")
+    }
+
+    /// A restored vault can hold parent loops (A2-45). The Bitwarden notes
+    /// path of a category in one - or under one - walked them forever.
+    #[test]
+    fn a_category_path_ends_on_a_self_loop_a_two_node_loop_and_a_loop_above_it() {
+        let db = Database::open_at(temp_path()).unwrap();
+        for c in [
+            category("self", Some("self")),
+            category("a", Some("b")),
+            category("b", Some("a")),
+            category("n", Some("a")),
+            category("root", None),
+            category("leaf", Some("root")),
+        ] {
+            db.insert_category(&c).unwrap();
+        }
+        assert_eq!(path_within_two_seconds(&db, "self"), "cat-self");
+        assert_eq!(path_within_two_seconds(&db, "a"), "cat-b/cat-a");
+        // Reached through a category that is not part of the loop.
+        assert_eq!(path_within_two_seconds(&db, "n"), "cat-b/cat-a/cat-n");
+        // A normal chain is unchanged.
+        assert_eq!(path_within_two_seconds(&db, "leaf"), "cat-root/cat-leaf");
+        assert_eq!(path_within_two_seconds(&db, "missing"), "");
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The shared walk says whether a chain has a top, and visits each
+    /// category once - a self-loop, a two-node loop and a loop reached
+    /// through a category outside it all end, with no root.
+    #[test]
+    fn a_category_chain_ends_and_says_whether_it_has_a_top() {
+        let cats = [
+            category("self", Some("self")),
+            category("a", Some("b")),
+            category("b", Some("a")),
+            category("n", Some("a")),
+            category("root", None),
+            category("leaf", Some("root")),
+            category("orphan", Some("deleted-parent")),
+        ];
+        assert_eq!(
+            category_chain(&cats, "self"),
+            CategoryChain::NoRoot(ids(&["self"]))
+        );
+        assert_eq!(
+            category_chain(&cats, "a"),
+            CategoryChain::NoRoot(ids(&["a", "b"]))
+        );
+        assert_eq!(
+            category_chain(&cats, "n"),
+            CategoryChain::NoRoot(ids(&["n", "a", "b"]))
+        );
+        assert_eq!(
+            category_chain(&cats, "leaf"),
+            CategoryChain::Rooted(ids(&["leaf", "root"]))
+        );
+        // A parent that no longer exists is shown at the top level.
+        assert_eq!(
+            category_chain(&cats, "orphan"),
+            CategoryChain::Rooted(ids(&["orphan"]))
+        );
+        assert_eq!(
+            category_chain(&cats, "missing"),
+            CategoryChain::Rooted(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_category_chain_stops_at_the_depth_cap() {
+        let cats: Vec<Category> = (0..MAX_CATEGORY_DEPTH + 10)
+            .map(|n| {
+                let parent = n.checked_sub(1).map(|p| format!("c{p}"));
+                category(&format!("c{n}"), parent.as_deref())
+            })
+            .collect();
+        let deepest = format!("c{}", MAX_CATEGORY_DEPTH + 9);
+        let chain = category_chain(&cats, &deepest);
+        assert!(matches!(chain, CategoryChain::NoRoot(_)), "{chain:?}");
+        assert_eq!(chain.ids().len(), MAX_CATEGORY_DEPTH);
+        let shallow = format!("c{}", MAX_CATEGORY_DEPTH - 1);
+        assert!(matches!(
+            category_chain(&cats, &shallow),
+            CategoryChain::Rooted(_)
+        ));
     }
 }

@@ -275,6 +275,11 @@ fn require_unlocked(vault: &VaultPasswordStore) -> CmdResult<()> {
 /// from the IPC path that the DB file does not offer offline.
 pub struct UnlockThrottle {
     state: std::sync::Mutex<ThrottleState>,
+    /// Held for a whole password guess (check, verify, record) - an unlock or
+    /// a master-password change's current password: guesses run one after
+    /// another, as unlocks did on the main thread. Off it, guesses sent at
+    /// once all passed `check` before any failure was counted.
+    attempt: std::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -287,7 +292,17 @@ impl UnlockThrottle {
     pub fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(ThrottleState::default()),
+            attempt: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Exclusive for one whole password guess - an unlock, or the current
+    /// password of a master-password change; see the `attempt` field. A
+    /// poisoned lock (an attempt that panicked) still serializes.
+    fn one_attempt(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Err while the throttle is cooling down after repeated failures.
@@ -403,68 +418,126 @@ pub fn vault_status(app: AppHandle) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({ "hasVault": has_vault, "unlocked": unlocked }))
 }
 
-/// Create a new vault. Stores an Argon2id verification hash and unlocks in one step.
+/// Create a new vault. Stores an Argon2id verification hash and unlocks in one
+/// step. Async, with the work on the blocking pool (A5-12(c)): the Argon2id
+/// hash ran on the main thread and froze the window.
 #[tauri::command]
-pub fn vault_create(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
-    if !master_password_long_enough(&password) {
+pub async fn vault_create(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
+    let password = zeroize::Zeroizing::new(password);
+    run_blocking(move || {
+        vault_create_in(
+            &app.state::<AppState>().db,
+            &app.state::<VaultPasswordStore>(),
+            &password,
+        )
+    })
+    .await
+}
+
+/// [`vault_create`] without the `AppHandle`. The verifier is stored only if
+/// no vault exists at that moment ([`db::Database::create_vault_verifier`]):
+/// off the main thread two creates can overlap (a double click), and the
+/// second used to replace the first's verifier while the first's password
+/// stayed in memory - every key sealed from then on was unreadable after the
+/// next lock.
+fn vault_create_in(
+    db: &db::Database,
+    store: &VaultPasswordStore,
+    password: &str,
+) -> CmdResult<serde_json::Value> {
+    const EXISTS: &str = "A vault already exists on this machine.";
+    if !master_password_long_enough(password) {
         return Err("Master password must be at least 8 characters.".into());
     }
-    if app
-        .state::<AppState>()
-        .db
+    // A quick answer before the (slow) hash; decided again atomically below.
+    if db
         .get_config(MASTER_HASH_KEY)
         .map(|h| h.as_ref().map_or(false, |s| !s.is_empty()))
         .unwrap_or(false)
     {
-        return Err("A vault already exists on this machine.".into());
+        return Err(EXISTS.into());
     }
-
-    let db = &app.state::<AppState>().db;
-    let hashed = hash_master_password(&password).map_err(CmdError::from)?;
-    db.set_config(MASTER_HASH_KEY, &hashed)
-        .map_err(|e| e.to_string())?;
-    db.set_config("vault.created", &now())
-        .map_err(|e| e.to_string())?;
-    db.add_audit("vault.created", None, "Vault created")
-        .map_err(|e| e.to_string())?;
+    let hashed = hash_master_password(password).map_err(CmdError::from)?;
+    if !db
+        .create_vault_verifier(MASTER_HASH_KEY, &hashed, "vault.created", &now())
+        .map_err(|e| e.to_string())?
+    {
+        return Err(EXISTS.into());
+    }
+    // The vault exists now: a failed audit row does not undo that.
+    audit_or_log(db, "vault.created", None, "Vault created");
 
     // Vault is immediately unlocked after creation
-    app.state::<VaultPasswordStore>().set(password);
+    store.set(password.to_owned());
 
     Ok(serde_json::json!({ "ok": true }))
 }
 
 /// Unlock an existing vault by verifying the password against the stored
 /// Argon2id hash (or upgrading a legacy plaintext verifier in place).
-/// Consecutive failures engage the [`UnlockThrottle`] backoff.
+/// Consecutive failures engage the [`UnlockThrottle`] backoff. Async, with the
+/// work on the blocking pool (A5-12(c)): the Argon2id verify ran on the main
+/// thread and froze the window.
 #[tauri::command]
-pub fn vault_unlock(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
-    let throttle = app.state::<UnlockThrottle>();
+pub async fn vault_unlock(app: AppHandle, password: String) -> CmdResult<serde_json::Value> {
+    let password = zeroize::Zeroizing::new(password);
+    let generation = app.state::<VaultGeneration>().current();
+    run_blocking(move || {
+        vault_unlock_in(
+            &app.state::<AppState>().db,
+            &app.state::<UnlockThrottle>(),
+            &app.state::<VaultPasswordStore>(),
+            app.state::<VaultRotationLock>().inner(),
+            &|| app.state::<VaultGeneration>().current() == generation,
+            &password,
+        )
+    })
+    .await
+}
+
+/// [`vault_unlock`] without the `AppHandle`. `still_current` says whether no
+/// lock happened since the unlock began.
+///
+/// Off the main thread three things changed: attempts could run side by
+/// side - guesses sent at once all passed the throttle's check before any
+/// failure was counted - so a whole attempt now holds the throttle's attempt
+/// lock; a lock (the tray's Lock Vault) could land while the password is
+/// being verified - the lock wins: the password is set, and cleared again
+/// with an error if the generation moved meanwhile (a lock bumps the
+/// generation BEFORE it clears the store, so this cannot leave the vault
+/// unlocked); and an unlock with the OLD password that verified before a
+/// master-password change committed stored that password after it, over a
+/// vault re-sealed with the new one - so an unlock is refused while a change
+/// runs ([`VAULT_REENCRYPTING`]), like every command that works with the
+/// master password, and holds the guard until the password is stored.
+fn vault_unlock_in(
+    db: &db::Database,
+    throttle: &UnlockThrottle,
+    store: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    still_current: &dyn Fn() -> bool,
+    password: &str,
+) -> CmdResult<serde_json::Value> {
+    let _rotation = rotation.try_shared()?;
+    let _attempt = throttle.one_attempt();
     throttle.check().map_err(CmdError::from)?;
-    let stored = app
-        .state::<AppState>()
-        .db
-        .get_config(MASTER_HASH_KEY)
-        .unwrap_or_default();
+    let stored = db.get_config(MASTER_HASH_KEY).unwrap_or_default();
     if stored.as_ref().map_or(true, |s| s.is_empty()) {
         return Err("No vault exists. Create one first.".into());
     }
-    let ok = verify_master_password(&app.state::<AppState>().db, &password)
-        .map_err(|e| e.to_string())?;
+    let ok = verify_master_password(db, password).map_err(|e| e.to_string())?;
     if !ok {
         throttle.record_failure();
-        app.state::<AppState>()
-            .db
-            .add_audit("vault.unlock_failed", None, "Failed attempt")
-            .map_err(|e| e.to_string())?;
+        audit_or_log(db, "vault.unlock_failed", None, "Failed attempt");
         return Err("Incorrect master password.".into());
     }
     throttle.record_success();
-    app.state::<AppState>()
-        .db
-        .add_audit("vault.unlock", None, "")
-        .map_err(|e| e.to_string())?;
-    app.state::<VaultPasswordStore>().set(password);
+    store.set(password.to_owned());
+    if !still_current() {
+        store.clear();
+        return Err("Vault was locked while the operation was in progress.".into());
+    }
+    audit_or_log(db, "vault.unlock", None, "");
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -496,11 +569,12 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) {
     crate::sftp::queue::pause_all(app);
     app.state::<crate::assistant::AssistantLevels>().clear();
     // MCP sessions die with the vault too: HTTP DELETE with Mcp-Session-Id,
-    // carrying the static auth header resolved BEFORE the password store
-    // clears below (405 is valid per spec - ignored; other refusals are
-    // audited, never swallowed). Session + status state is dropped
-    // synchronously; the DELETEs themselves run on the async runtime so the
-    // lock path stays nonblocking.
+    // carrying the static auth header (405 is valid per spec - ignored;
+    // other refusals are audited, never swallowed). Session + status state
+    // is dropped synchronously, and a copy of the password is taken BEFORE
+    // the store clears below; each teardown task unseals its own credential
+    // from it on the blocking pool and sends its DELETE, so the lock path
+    // never waits for an Argon2id derivation or a server.
     crate::assistant::mcp::teardown_all(app);
     app.state::<VaultPasswordStore>().clear();
     let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
@@ -628,6 +702,7 @@ pub async fn vault_change_password(
             lock: worker.state::<VaultRotationLock>().inner(),
             store: worker.state::<VaultPasswordStore>().inner(),
             generations: worker.state::<VaultGeneration>().inner(),
+            mcp: worker.state::<crate::assistant::mcp::McpState>().inner(),
             lock_wait: ROTATION_LOCK_WAIT,
         };
         change_master_password(
@@ -648,6 +723,9 @@ struct RotationContext<'a> {
     lock: &'a VaultRotationLock,
     store: &'a VaultPasswordStore,
     generations: &'a VaultGeneration,
+    /// The live MCP sessions: each is bound to the settings it was set up
+    /// with, its secret as sealed - and the change re-seals every secret.
+    mcp: &'a crate::assistant::mcp::McpState,
     /// How long to wait for running sealed-data writers before giving up.
     lock_wait: std::time::Duration,
 }
@@ -681,10 +759,25 @@ fn change_master_password(
     new_password: zeroize::Zeroizing<String>,
 ) -> CmdResult<u32> {
     let _exclusive = vault.lock.exclusive_within(vault.lock_wait)?;
+    // The MCP secrets as sealed before the change, and after it: nothing
+    // else writes them while the write lock is held.
+    let sealed_before = mcp_secret_seals(db)?;
     let summary =
         rotate_master_password(db, vault.throttle, current_password, &new_password, &|| {
             vault.generations.current() == captured_generation
         })?;
+    // Committed. Live MCP sessions follow their secret to its new seal
+    // before any request can look at them; a failed read leaves them looking
+    // set up with other settings - each is then ended at its next use.
+    match mcp_secret_seals(db) {
+        Ok(sealed_after) => vault
+            .mcp
+            .follow_resealed_secrets(&sealed_before, &sealed_after),
+        Err(e) => log::warn!(
+            "[sshspan-vault] could not read the re-sealed MCP secrets; live MCP sessions will be renewed: {}",
+            e.0
+        ),
+    }
     install_rotated_password(
         vault.store,
         vault.generations,
@@ -706,6 +799,16 @@ fn change_master_password(
     Ok(summary.keys)
 }
 
+/// Each stored MCP server's sealed auth secret, by server id.
+fn mcp_secret_seals(db: &db::Database) -> CmdResult<std::collections::HashMap<String, String>> {
+    Ok(db
+        .list_mcp_servers()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|record| record.auth_secret.map(|sealed| (record.id, sealed)))
+        .collect())
+}
+
 /// What a committed master-password change re-sealed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RotationSummary {
@@ -713,9 +816,11 @@ struct RotationSummary {
     server_passwords: u32,
 }
 
-/// Run vault work that is too slow for the main thread - Argon2id once per
-/// record, file I/O - on Tauri's blocking pool, and hand back its result.
-async fn run_blocking<T, F>(work: F) -> CmdResult<T>
+/// Run work that must not hold the main thread - Argon2id, file I/O, a
+/// database write that may wait for the lock - on Tauri's blocking pool, and
+/// hand back its result. Shared by every command that moved off the main
+/// thread (the vault, keys, servers, local files, the assistant and MCP).
+pub(crate) async fn run_blocking<T, F>(work: F) -> CmdResult<T>
 where
     F: FnOnce() -> CmdResult<T> + Send + 'static,
     T: Send + 'static,
@@ -739,19 +844,7 @@ fn rotate_master_password(
     new_password: &str,
     still_current: &dyn Fn() -> bool,
 ) -> CmdResult<RotationSummary> {
-    // The current-password check is a password guess too - throttle it with
-    // the same counter as unlock attempts.
-    throttle.check().map_err(CmdError::from)?;
-    let stored = db.get_config(MASTER_HASH_KEY).unwrap_or_default();
-    if stored.as_ref().map_or(true, |s| s.is_empty()) {
-        return Err("No vault exists. Create one first.".into());
-    }
-    let ok = verify_master_password(db, current_password).map_err(|e| e.to_string())?;
-    if !ok {
-        throttle.record_failure();
-        return Err("Current master password is incorrect.".into());
-    }
-    throttle.record_success();
+    verify_current_password(db, throttle, current_password)?;
 
     let keys = db.list_keys().map_err(|e| e.to_string())?;
     let servers = db.list_servers().map_err(|e| e.to_string())?;
@@ -850,6 +943,32 @@ fn rotate_master_password(
         keys: rotation.keys.len() as u32,
         server_passwords: rotation.server_passwords.len() as u32,
     })
+}
+
+/// A master-password change's check of the current password. It is a
+/// password guess too - and a correct one unlocks a locked vault (the change
+/// installs the new password) - so it is throttled with the same counter as
+/// the unlock, and takes the same attempt lock: without it the change was a
+/// second stream of guesses beside the unlocks, all of them past the check
+/// before any failure was counted.
+fn verify_current_password(
+    db: &db::Database,
+    throttle: &UnlockThrottle,
+    current_password: &str,
+) -> CmdResult<()> {
+    let _attempt = throttle.one_attempt();
+    throttle.check().map_err(CmdError::from)?;
+    let stored = db.get_config(MASTER_HASH_KEY).unwrap_or_default();
+    if stored.as_ref().map_or(true, |s| s.is_empty()) {
+        return Err("No vault exists. Create one first.".into());
+    }
+    let ok = verify_master_password(db, current_password).map_err(|e| e.to_string())?;
+    if !ok {
+        throttle.record_failure();
+        return Err("Current master password is incorrect.".into());
+    }
+    throttle.record_success();
+    Ok(())
 }
 
 /// Make the new master password the unlocked one after a committed rotation -
@@ -2730,6 +2849,7 @@ mod tests {
             lock: &lock,
             store: &store,
             generations: &generations,
+            mcp: &crate::assistant::mcp::McpState::new(),
             lock_wait: ROTATION_LOCK_WAIT,
         };
         let reencrypted = change_master_password(
@@ -2796,6 +2916,7 @@ mod tests {
             lock: &lock,
             store: &store,
             generations: &generations,
+            mcp: &crate::assistant::mcp::McpState::new(),
             lock_wait: std::time::Duration::from_millis(200),
         };
         let running_sync = lock.try_shared().unwrap();
@@ -2876,6 +2997,7 @@ mod tests {
             lock: &lock,
             store: &store,
             generations: &generations,
+            mcp: &crate::assistant::mcp::McpState::new(),
             lock_wait: ROTATION_LOCK_WAIT,
         };
         let result = change_master_password(
@@ -3750,8 +3872,12 @@ impl DialogPathStore {
 /// desktop, group-WRITABLE under umask 002). The backup no longer comes
 /// through here at all - `vault_backup_export_to_file` writes it from Rust, so
 /// the sealed document never crosses IPC.
+///
+/// Async, with the write on the blocking pool (item 8 audit): a file write -
+/// on Windows with two helper processes that restrict its ACL - ran on the
+/// main thread.
 #[tauri::command]
-pub fn system_write_text_file(
+pub async fn system_write_text_file(
     app: AppHandle,
     path: String,
     contents: String,
@@ -3760,12 +3886,15 @@ pub fn system_write_text_file(
     if !app.state::<DialogPathStore>().consume(&path) {
         return Err("Write target must be a path chosen in a save dialog this session.".into());
     }
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    crate::ssh::write_secret_file(std::path::Path::new(&path), contents.as_bytes())
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
+    run_blocking(move || {
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        crate::ssh::write_secret_file(std::path::Path::new(&path), contents.as_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "ok": true }))
+    })
+    .await
 }
 
 /// Component-wise, path-aware prefix test used by every local-target guard.
@@ -4083,23 +4212,32 @@ fn write_with_free_key_name<T>(
     write().map_err(|e| CmdError(e.to_string()))
 }
 
+/// Import a private key. Async, with the work on the blocking pool
+/// (A5-12(c)): sealing the key is an Argon2id derivation (64 MiB, t=3, p=4),
+/// and as a synchronous command it froze the window on every import. The key
+/// text and the passphrase are wiped when the import is done.
 #[tauri::command]
-pub fn key_import(
+pub async fn key_import(
     app: AppHandle,
     pem: String,
     name: Option<String>,
     comment: Option<String>,
     passphrase: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    key_import_in(
-        &app.state::<AppState>().db,
-        &app.state::<VaultPasswordStore>(),
-        app.state::<VaultRotationLock>().inner(),
-        &pem,
-        name,
-        comment,
-        passphrase.as_deref(),
-    )
+    let pem = zeroize::Zeroizing::new(pem);
+    let passphrase = passphrase.map(zeroize::Zeroizing::new);
+    run_blocking(move || {
+        key_import_in(
+            &app.state::<AppState>().db,
+            &app.state::<VaultPasswordStore>(),
+            app.state::<VaultRotationLock>().inner(),
+            &pem,
+            name,
+            comment,
+            passphrase.as_deref().map(String::as_str),
+        )
+    })
+    .await
 }
 
 /// [`key_import`] without the `AppHandle`. Reads only OpenSSH private keys
@@ -4140,14 +4278,9 @@ fn key_import_in(
     let fingerprint = keys::compute_fingerprint_sha256(&key_data.public_key);
     let fingerprint_md5 = keys::compute_fingerprint_md5(&key_data.public_key);
 
-    // Dedupe by fingerprint so the same key can't be imported twice.
-    let existing = db.list_keys().map_err(|e| e.to_string())?;
-    if let Some(dup) = existing
-        .iter()
-        .find(|k| k.fingerprint_sha256 == fingerprint)
-    {
-        return Err(format!("This key already exists in the vault as \"{}\".", dup.name).into());
-    }
+    // Dedupe by fingerprint so the same key can't be imported twice: a quick
+    // answer before the (slow) seal, decided again under the lock below.
+    ensure_key_not_stored(db, &fingerprint).map_err(|e| CmdError(e.to_string()))?;
 
     let name_str = name.unwrap_or_else(|| format!("imported-{}", &Uuid::new_v4().to_string()[..8]));
     // Names become Host aliases in ~/.ssh/config - reject anything that could
@@ -4179,10 +4312,30 @@ fn key_import_in(
         category_ids: Vec::new(),
     };
 
-    write_with_free_key_name(db, &key_record.name, None, || db.insert_key(&key_record))?;
-    db.add_audit("keys.imported", Some(&key_record.id), &key_record.name)?;
+    // Off the main thread two imports of one key (a double click) both
+    // passed the check above while sealing: it is repeated under the name
+    // lock, together with the insert.
+    write_with_free_key_name(db, &key_record.name, None, || {
+        ensure_key_not_stored(db, &key_record.fingerprint_sha256)?;
+        db.insert_key(&key_record)
+    })?;
+    // The key is stored: a failed audit row does not turn that into an error.
+    audit_or_log(db, "keys.imported", Some(&key_record.id), &key_record.name);
 
     Ok(serde_json::json!({ "ok": true, "id": key_record.id }))
+}
+
+/// Refuse a key the vault already holds (the same SHA-256 fingerprint),
+/// naming the key that has it.
+fn ensure_key_not_stored(db: &db::Database, fingerprint: &str) -> anyhow::Result<()> {
+    let existing = db.list_keys()?;
+    match existing
+        .iter()
+        .find(|k| k.fingerprint_sha256 == fingerprint)
+    {
+        Some(dup) => anyhow::bail!("This key already exists in the vault as \"{}\".", dup.name),
+        None => Ok(()),
+    }
 }
 
 /// Export a key's PUBLIC material to the renderer. PRIVATE formats are
@@ -4190,33 +4343,60 @@ fn key_import_in(
 /// through the WebView (it would live in renderer memory and any renderer
 /// compromise could read it). Use [`key_export_to_file`], which serializes
 /// straight to a user-chosen file without the data ever entering IPC.
+///
+/// Async, with the work on the blocking pool (item 8 audit): the
+/// "public-pem" format unseals the key (Argon2id), which as a synchronous
+/// command ran on the main thread.
 #[tauri::command]
-pub fn key_export(
+pub async fn key_export(
     app: AppHandle,
     id: String,
     format: String,
     passphrase: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    let pw = vault_password(&app)?;
+    // Public formats take no passphrase; the parameter is kept so the
+    // renderer's export payload shape is unchanged across formats.
+    drop(passphrase.map(zeroize::Zeroizing::new));
+    run_blocking(move || {
+        key_export_in(
+            &app.state::<AppState>().db,
+            app.state::<VaultPasswordStore>().inner(),
+            app.state::<VaultRotationLock>().inner(),
+            &id,
+            &format,
+        )
+    })
+    .await
+}
+
+/// [`key_export`] without the `AppHandle`. The "public-pem" format unseals
+/// the key, so it takes read access to the [`VaultRotationLock`] first (C1):
+/// during a master-password change it answers "being re-encrypted" instead
+/// of failing to decrypt.
+fn key_export_in(
+    db: &db::Database,
+    store: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    id: &str,
+    format: &str,
+) -> CmdResult<serde_json::Value> {
+    let _rotation = if format == "public-pem" {
+        Some(rotation.try_shared()?)
+    } else {
+        None
+    };
+    let pw = store.get().unwrap_or_default();
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
 
-    let key = app
-        .state::<AppState>()
-        .db
-        .get_key(&id)
-        .map_err(|e| e.to_string())?;
+    let key = db.get_key(id).map_err(|e| e.to_string())?;
     let key = key.ok_or_else(|| "Key not found.".to_string())?;
 
-    // Public formats take no passphrase; the parameter is kept so the
-    // renderer's export payload shape is unchanged across formats.
-    let _ = passphrase;
-
     if format != "public" && format != "authorized_keys" && format != "public-pem" {
-        let _ = app.state::<AppState>().db.add_audit(
+        let _ = db.add_audit(
             "keys.export_refused",
-            Some(&id),
+            Some(id),
             &format!("private format {format} requested via renderer export IPC"),
         );
         return Err(CmdError(
@@ -4226,7 +4406,7 @@ pub fn key_export(
         ));
     }
 
-    let data = match format.as_str() {
+    let data = match format {
         // Re-checked (A7-45): a line stored before import-time comment
         // cleaning could carry a second, injected key line.
         "public" | "authorized_keys" => keys::sanitize_public_line(&key.public_key),
@@ -4237,9 +4417,9 @@ pub fn key_export(
         _ => unreachable!("format restricted above"),
     };
 
-    let _ = app.state::<AppState>().db.add_audit(
+    let _ = db.add_audit(
         "keys.exported",
-        Some(&id),
+        Some(id),
         &format!("public material, format {format}"),
     );
 
@@ -4453,13 +4633,34 @@ fn key_rename_in(
     Ok(serde_json::json!({ "ok": true, "name": name }))
 }
 
-/// Write an audit row for something that already happened. A failure cannot
-/// undo the action, so it does not fail the command - but it is logged, not
-/// dropped without a trace.
-fn audit_or_warn(db: &db::Database, action: &str, key_id: Option<&str>, details: &str) {
+/// Write the audit row of something that has already happened. A failure
+/// cannot undo it, so it fails nothing - but it is logged, not dropped
+/// without a trace. Shared by every command module (keys, vault, MCP, the
+/// assistant).
+pub(crate) fn audit_or_log(db: &db::Database, action: &str, key_id: Option<&str>, details: &str) {
     if let Err(e) = db.add_audit(action, key_id, details) {
-        log::warn!("[sshspan-keys] could not write the audit row {action}: {e}");
+        log_unwritten_audit(action, &e);
     }
+}
+
+/// [`audit_or_log`] for a command whose answer can carry a `warning`: the
+/// warning to give when the row could not be written - `warning` (what was
+/// done, and that its audit row could not be written), then the error.
+pub(crate) fn audit_or_warn(
+    db: &db::Database,
+    action: &str,
+    key_id: Option<&str>,
+    details: &str,
+    warning: &str,
+) -> Option<String> {
+    db.add_audit(action, key_id, details).err().map(|e| {
+        log_unwritten_audit(action, &e);
+        format!("{warning}: {e}")
+    })
+}
+
+fn log_unwritten_audit(action: &str, error: &anyhow::Error) {
+    log::warn!("[sshspan-audit] could not write the {action} audit row: {error}");
 }
 
 /// The keys of a deploy request, each once, in request order. An empty
@@ -4506,8 +4707,12 @@ fn plan_key_deploy(
 /// exactly the stanza text the deploy writes into the managed config, by the
 /// same code. The deploy sheet shows this instead of building its own guess
 /// (A2-05 / A7-04 / A8-01 / A5-04). Nothing is decrypted.
+///
+/// Async, with the work on the blocking pool (item 8 audit): it reads the
+/// managed config and the user's ~/.ssh/config, which as a synchronous
+/// command ran on the main thread on every change in the deploy sheet.
 #[tauri::command]
-pub fn key_deploy_preview(
+pub async fn key_deploy_preview(
     app: AppHandle,
     ids: Vec<String>,
     host_alias: Option<String>,
@@ -4519,7 +4724,8 @@ pub fn key_deploy_preview(
     let fields = DeployHostFields::parse(host_alias, hostname, user, port, strict_host_key)
         .map_err(CmdError)?;
     let target = DeployTarget::user_default().map_err(|e| CmdError(e.to_string()))?;
-    key_deploy_preview_in(&app.state::<AppState>().db, &target, &ids, &fields)
+    run_blocking(move || key_deploy_preview_in(&app.state::<AppState>().db, &target, &ids, &fields))
+        .await
 }
 
 /// [`key_deploy_preview`] without the `AppHandle`.
@@ -4646,7 +4852,7 @@ fn key_deploy_in(
     }
     if !outcome.deployed.is_empty() {
         let files: Vec<&str> = outcome.deployed.iter().map(|d| d.file.as_str()).collect();
-        audit_or_warn(
+        audit_or_log(
             db,
             "keys.deployed",
             None,
@@ -4655,7 +4861,7 @@ fn key_deploy_in(
     }
     if !outcome.errors.is_empty() {
         let names: Vec<&str> = outcome.errors.iter().map(|e| e.name.as_str()).collect();
-        audit_or_warn(
+        audit_or_log(
             db,
             "keys.deploy_failed",
             None,
@@ -4683,16 +4889,23 @@ fn key_deploy_in(
 /// the key stays marked as deployed - this used to drop every file error
 /// (`let _ = fs::remove_file`) and clear the record anyway, with the secret
 /// still on disk, and it never touched the stanza.
+///
+/// Async, with the work on the blocking pool (RU6b item 8 audit): it deletes
+/// files in ~/.ssh and rewrites the managed config, which as a synchronous
+/// command ran on the main thread.
 #[tauri::command]
-pub fn key_remove_deployed(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
+pub async fn key_remove_deployed(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
     let target = DeployTarget::user_default().map_err(|e| CmdError(e.to_string()))?;
-    key_remove_deployed_in(
-        &app.state::<AppState>().db,
-        &app.state::<VaultPasswordStore>(),
-        app.state::<VaultRotationLock>().inner(),
-        &target,
-        &id,
-    )
+    run_blocking(move || {
+        key_remove_deployed_in(
+            &app.state::<AppState>().db,
+            &app.state::<VaultPasswordStore>(),
+            app.state::<VaultRotationLock>().inner(),
+            &target,
+            &id,
+        )
+    })
+    .await
 }
 
 /// [`key_remove_deployed`] without the `AppHandle`.
@@ -4724,7 +4937,7 @@ fn key_remove_deployed_in(
             removed = match SshService::remove_key(target, deploy_path) {
                 Ok(done) => done,
                 Err(e) => {
-                    audit_or_warn(db, "keys.undeploy_failed", Some(id), &e);
+                    audit_or_log(db, "keys.undeploy_failed", Some(id), &e);
                     return Err(CmdError(e));
                 }
             };
@@ -4733,7 +4946,7 @@ fn key_remove_deployed_in(
             log::warn!(
                 "[sshspan-keys] key_remove_deployed: refusing to delete {deploy_path} (not a file SSHSpan deploys); clearing the deployment record only"
             );
-            audit_or_warn(
+            audit_or_log(
                 db,
                 "keys.undeploy_refused",
                 Some(id),
@@ -4750,7 +4963,7 @@ fn key_remove_deployed_in(
         db.set_key_deployment(id, None).map_err(|e| e.to_string())?;
     }
     if undeployed_files {
-        audit_or_warn(
+        audit_or_log(
             db,
             "keys.undeployed",
             Some(id),
@@ -4900,24 +5113,42 @@ fn category_rename_in(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Move a category under another one (or to the top level). Async, with the
+/// work on the blocking pool (item 12): it used to run on the main thread,
+/// where a walk that never ended froze the whole window.
 #[tauri::command]
-pub fn category_reparent(
+pub async fn category_reparent(
     app: AppHandle,
     id: String,
     new_parent_id: Option<String>,
     sort_index: Option<i64>,
 ) -> CmdResult<serde_json::Value> {
-    category_reparent_in(
-        &app.state::<AppState>().db,
-        &app.state::<VaultPasswordStore>(),
-        id,
-        new_parent_id,
-        sort_index,
-    )
+    run_blocking(move || {
+        category_reparent_in(
+            &app.state::<AppState>().db,
+            &app.state::<VaultPasswordStore>(),
+            id,
+            new_parent_id,
+            sort_index,
+        )
+    })
+    .await
 }
 
-/// [`category_reparent`] without the `AppHandle`, so its lock gate is
-/// testable.
+/// Said when the new parent's own chain of parents runs in a loop.
+const CATEGORY_LOOP_REFUSAL: &str =
+    "That category is part of a loop - move one of its categories to the top level first.";
+
+/// [`category_reparent`] without the `AppHandle`, so its rules are testable.
+///
+/// The new parent's chain of parents is walked with [`db::category_chain`] -
+/// each category once, [`db::MAX_CATEGORY_DEPTH`] at most - and the move is
+/// refused when the chain contains the category ("That move would create a
+/// cycle.") or has no top (a parent loop a restored vault can hold). The walk
+/// it replaces had no visited set: a destination inside a loop that does not
+/// contain the moved category never returned (JU4 review N1). The checks and
+/// the write are one transaction ([`db::Database::move_category`]), which
+/// writes the parent and the position only.
 fn category_reparent_in(
     db: &db::Database,
     vault: &VaultPasswordStore,
@@ -4926,42 +5157,35 @@ fn category_reparent_in(
     sort_index: Option<i64>,
 ) -> CmdResult<serde_json::Value> {
     require_unlocked(vault)?;
-    let mut c = db
-        .get_category(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Category not found.".to_string())?;
-    // Cycle check: walk up from new_parent_id; reject if we encounter `id`.
-    if let Some(np) = &new_parent_id {
-        if np == &id {
-            return Err("A category cannot be its own parent.".into());
+    db.move_category(&id, new_parent_id.as_deref(), sort_index, |all| {
+        let moved = all
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or_else(|| CmdError("Category not found.".into()))?;
+        let Some(parent_id) = new_parent_id.as_deref() else {
+            return Ok(());
+        };
+        if parent_id == id {
+            return Err(CmdError("A category cannot be its own parent.".into()).into());
         }
-        let mut cur: Option<String> = Some(np.clone());
-        let cats = db.list_categories().map_err(|e| e.to_string())?;
-        let by_id: std::collections::HashMap<String, db::Category> =
-            cats.into_iter().map(|c| (c.id.clone(), c)).collect();
-        while let Some(cur_id) = cur {
-            if cur_id == id {
-                return Err("That move would create a cycle.".into());
-            }
-            cur = by_id.get(&cur_id).and_then(|c| c.parent_id.clone());
+        let chain = db::category_chain(all, parent_id);
+        if chain.ids().contains(&id) {
+            return Err(CmdError("That move would create a cycle.".into()).into());
         }
-    }
-    if let Some(parent) = new_parent_id.as_deref() {
-        if db
-            .get_category(parent)
-            .map_err(|e| e.to_string())?
-            .map(|p| p.scope != c.scope)
-            .unwrap_or(true)
+        if matches!(chain, db::CategoryChain::NoRoot(_)) {
+            return Err(CmdError(CATEGORY_LOOP_REFUSAL.into()).into());
+        }
+        if !all
+            .iter()
+            .any(|p| p.id == parent_id && p.scope == moved.scope)
         {
-            return Err("A category cannot be moved across key/host scopes.".into());
+            return Err(
+                CmdError("A category cannot be moved across key/host scopes.".into()).into(),
+            );
         }
-    }
-    c.parent_id = new_parent_id;
-    if let Some(si) = sort_index {
-        c.sort_index = si;
-    }
-    c.updated_at = chrono::Utc::now();
-    db.update_category(&c).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .map_err(CmdError::from)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -5603,7 +5827,7 @@ pub async fn bitwarden_sync(
         Ok(result) => result,
         Err(e) => {
             let message = e.to_string();
-            audit_or_warn(
+            audit_or_log(
                 &db,
                 "sync.error",
                 None,
@@ -5613,7 +5837,7 @@ pub async fn bitwarden_sync(
         }
     };
     for (action, details) in crate::bitwarden::sync::sync_audit_rows(&result) {
-        audit_or_warn(&db, action, None, &details);
+        audit_or_log(&db, action, None, &details);
     }
 
     // Store the sync result - only those two fields, in one transaction, so a
@@ -6311,4 +6535,480 @@ fn read_picked_text_file(path: &std::path::Path, cap: u64) -> CmdResult<String> 
     }
     String::from_utf8(bytes)
         .map_err(|_| CmdError("That file is not a text file (it is not valid UTF-8).".into()))
+}
+
+#[cfg(test)]
+mod ru6b_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    /// Hold `statement` as a write on ANOTHER connection to `db` for `ms`
+    /// milliseconds ([`db::test_support::hold_write`]).
+    fn hold_write(db: &db::Database, statement: &str, ms: u64) -> std::thread::JoinHandle<()> {
+        db::test_support::hold_write(db, &[statement], ms)
+    }
+
+    fn test_db() -> db::Database {
+        db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-ru6b-cmd-{}.db", Uuid::new_v4())),
+        )
+        .expect("open test db")
+    }
+
+    fn unlocked() -> VaultPasswordStore {
+        let vault = VaultPasswordStore::new();
+        vault.set("ru6b-master-pw".into());
+        vault
+    }
+
+    // ── Item 12: moving a category never walks a parent loop forever ─────
+
+    fn category(id: &str, parent: Option<&str>) -> db::Category {
+        db::Category {
+            id: id.into(),
+            name: format!("cat-{id}"),
+            parent_id: parent.map(String::from),
+            scope: "key".into(),
+            color: None,
+            sort_index: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    const LOOP_REFUSAL: &str =
+        "That category is part of a loop - move one of its categories to the top level first.";
+    const CYCLE_REFUSAL: &str = "That move would create a cycle.";
+
+    /// `category_reparent_in`, or a failure when it does not return within
+    /// two seconds (the walk it replaces never did on a parent loop - on the
+    /// main thread, freezing the window).
+    fn reparent_within_two_seconds(
+        db: &db::Database,
+        id: &str,
+        parent: Option<&str>,
+    ) -> CmdResult<serde_json::Value> {
+        let (done, result) = std::sync::mpsc::channel();
+        let (db, id, parent) = (db.clone(), id.to_string(), parent.map(String::from));
+        std::thread::spawn(move || {
+            let _ = done.send(category_reparent_in(&db, &unlocked(), id, parent, None));
+        });
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("category_reparent must return (parent loop)")
+    }
+
+    #[test]
+    fn a_move_under_a_parent_loop_is_refused_and_returns() {
+        let db = test_db();
+        for c in [
+            category("self", Some("self")),
+            category("a", Some("b")),
+            category("b", Some("a")),
+            category("n", Some("a")),
+            category("x", None),
+            category("root", None),
+            category("child", Some("root")),
+        ] {
+            db.insert_category(&c).unwrap();
+        }
+        // A self-loop, a two-node loop, and a loop reached through a
+        // category that is not part of it: none of them has a top.
+        for dest in ["self", "a", "n"] {
+            let err = reparent_within_two_seconds(&db, "x", Some(dest)).unwrap_err();
+            assert_eq!(err.0, LOOP_REFUSAL, "under {dest}");
+        }
+        assert_eq!(db.get_category("x").unwrap().unwrap().parent_id, None);
+        // Under its own descendant, or into a loop that contains it: a cycle.
+        let err = reparent_within_two_seconds(&db, "root", Some("child")).unwrap_err();
+        assert_eq!(err.0, CYCLE_REFUSAL);
+        let err = reparent_within_two_seconds(&db, "a", Some("n")).unwrap_err();
+        assert_eq!(err.0, CYCLE_REFUSAL);
+        // The repair moves work: a loop member to the top level, or under a
+        // category that has a top.
+        reparent_within_two_seconds(&db, "b", None).unwrap();
+        reparent_within_two_seconds(&db, "self", Some("root")).unwrap();
+        assert_eq!(
+            db.get_category("self")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("root")
+        );
+        // The loop is gone, so moving under its old members works again.
+        reparent_within_two_seconds(&db, "x", Some("n")).unwrap();
+        assert_eq!(
+            db.get_category("x").unwrap().unwrap().parent_id.as_deref(),
+            Some("n")
+        );
+    }
+
+    /// Off the main thread two moves can overlap: "a under b" checked the
+    /// tree before "b under a" committed, and the two together made a loop.
+    /// The check and the move are one transaction now.
+    #[test]
+    fn two_opposite_moves_at_once_do_not_make_a_loop() {
+        let db = test_db();
+        db.insert_category(&category("a", None)).unwrap();
+        db.insert_category(&category("b", None)).unwrap();
+        let holder = hold_write(
+            &db,
+            "UPDATE categories SET parent_id = 'a' WHERE id = 'b'",
+            300,
+        );
+        let result = reparent_within_two_seconds(&db, "a", Some("b"));
+        holder.join().unwrap();
+        assert_eq!(
+            db.get_category("a").unwrap().unwrap().parent_id,
+            None,
+            "a stays at the top: {result:?}"
+        );
+        assert_eq!(result.unwrap_err().0, CYCLE_REFUSAL);
+    }
+
+    /// A move writes the parent and the position only: a rename that
+    /// committed while it checked the tree is kept.
+    #[test]
+    fn a_move_keeps_a_rename_made_meanwhile() {
+        let db = test_db();
+        db.insert_category(&category("a", None)).unwrap();
+        db.insert_category(&category("root", None)).unwrap();
+        let holder = hold_write(
+            &db,
+            "UPDATE categories SET name = 'renamed' WHERE id = 'a'",
+            300,
+        );
+        reparent_within_two_seconds(&db, "a", Some("root")).unwrap();
+        holder.join().unwrap();
+        let a = db.get_category("a").unwrap().unwrap();
+        assert_eq!(a.name, "renamed");
+        assert_eq!(a.parent_id.as_deref(), Some("root"));
+    }
+
+    // ── Item 8: the vault commands are safe to run off the main thread ───
+
+    /// Off the main thread, two creates can overlap (a double click): the
+    /// second wrote its verifier over the first's while the first's password
+    /// stayed in memory - every key sealed from then on was unreadable after
+    /// the next lock.
+    #[test]
+    fn a_vault_create_racing_another_create_does_not_replace_its_verifier() {
+        let db = test_db();
+        let store = VaultPasswordStore::new();
+        let holder = hold_write(
+            &db,
+            "INSERT INTO config (key, value, updated_at) VALUES ('master.hash', 'the-first-create', 'now')",
+            300,
+        );
+        let result = vault_create_in(&db, &store, "second-password-123");
+        holder.join().unwrap();
+        assert_eq!(
+            db.get_config(MASTER_HASH_KEY).unwrap().as_deref(),
+            Some("the-first-create"),
+            "the first create's verifier stays"
+        );
+        assert!(!store.is_set(), "the losing create unlocks nothing");
+        assert_eq!(
+            result.unwrap_err().0,
+            "A vault already exists on this machine."
+        );
+    }
+
+    #[test]
+    fn creating_a_vault_stores_the_verifier_and_unlocks() {
+        let db = test_db();
+        let store = VaultPasswordStore::new();
+        vault_create_in(&db, &store, "first-password-123").unwrap();
+        assert!(store.is_set());
+        assert!(verify_master_password(&db, "first-password-123").unwrap());
+        assert!(db.get_config("vault.created").unwrap().is_some());
+        let err = vault_create_in(&db, &store, "another-password-1").unwrap_err();
+        assert_eq!(err.0, "A vault already exists on this machine.");
+        let err = vault_create_in(&test_db(), &VaultPasswordStore::new(), "short").unwrap_err();
+        assert!(err.0.contains("at least 8"), "{}", err.0);
+    }
+
+    /// On the main thread, unlock attempts ran one after another. Off it,
+    /// guesses sent at once all passed the throttle's check before any
+    /// failure was counted: the backoff after five failures never engaged.
+    #[test]
+    fn unlock_guesses_sent_at_once_still_meet_the_throttle() {
+        let db = test_db();
+        vault_create_in(&db, &VaultPasswordStore::new(), "right-password-1").unwrap();
+        let throttle = Arc::new(UnlockThrottle::new());
+        let store = Arc::new(VaultPasswordStore::new());
+        let start = Arc::new(Barrier::new(8));
+        let guesses: Vec<_> = (0..8)
+            .map(|n| {
+                let (db, throttle, store, start) =
+                    (db.clone(), throttle.clone(), store.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    vault_unlock_in(
+                        &db,
+                        &throttle,
+                        &store,
+                        &VaultRotationLock::new(),
+                        &|| true,
+                        &format!("wrong-guess-{n}"),
+                    )
+                    .unwrap_err()
+                    .0
+                })
+            })
+            .collect();
+        let answers: Vec<String> = guesses.into_iter().map(|g| g.join().unwrap()).collect();
+        let checked = answers
+            .iter()
+            .filter(|a| *a == "Incorrect master password.")
+            .count();
+        let throttled = answers
+            .iter()
+            .filter(|a| a.starts_with("Too many failed attempts"))
+            .count();
+        assert_eq!((checked, throttled), (5, 3), "{answers:?}");
+        assert!(!store.is_set());
+    }
+
+    /// A lock that lands while the unlock verifies the password wins: the
+    /// vault is not left unlocked behind it.
+    #[test]
+    fn a_lock_during_an_unlock_wins() {
+        let db = test_db();
+        vault_create_in(&db, &VaultPasswordStore::new(), "right-password-1").unwrap();
+        let store = VaultPasswordStore::new();
+        let err = vault_unlock_in(
+            &db,
+            &UnlockThrottle::new(),
+            &store,
+            &VaultRotationLock::new(),
+            &|| false,
+            "right-password-1",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            "Vault was locked while the operation was in progress."
+        );
+        assert!(!store.is_set(), "the lock stays");
+        // Without a lock the same unlock works.
+        vault_unlock_in(
+            &db,
+            &UnlockThrottle::new(),
+            &store,
+            &VaultRotationLock::new(),
+            &|| true,
+            "right-password-1",
+        )
+        .unwrap();
+        assert!(store.is_set());
+    }
+
+    // ── RU6b fix round 1 ─────────────────────────────────────────────────
+
+    /// Security review: an unlock with the OLD password that verified before
+    /// a master-password change committed stored that password after it -
+    /// over a vault re-sealed with the new one, so nothing could be unsealed
+    /// until the next lock. An unlock is refused while a change runs, like
+    /// every command that works with the master password.
+    #[test]
+    fn an_unlock_is_refused_while_the_vault_is_being_re_encrypted() {
+        let db = test_db();
+        vault_create_in(&db, &VaultPasswordStore::new(), "right-password-1").unwrap();
+        let (throttle, store, rotation) = (
+            UnlockThrottle::new(),
+            VaultPasswordStore::new(),
+            VaultRotationLock::new(),
+        );
+        let change = rotation.exclusive_within(Duration::from_secs(5)).unwrap();
+        let err = vault_unlock_in(
+            &db,
+            &throttle,
+            &store,
+            &rotation,
+            &|| true,
+            "right-password-1",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, VAULT_REENCRYPTING);
+        assert!(!store.is_set(), "nothing was unlocked");
+        drop(change);
+        vault_unlock_in(
+            &db,
+            &throttle,
+            &store,
+            &rotation,
+            &|| true,
+            "right-password-1",
+        )
+        .unwrap();
+        assert!(store.is_set());
+    }
+
+    /// A master-password change checks the current password against the
+    /// same throttle as an unlock - and a correct guess there unlocks a
+    /// locked vault too - but its guesses did not take the attempt lock: a
+    /// second stream that ran beside the unlocks, all of it past the check
+    /// before any failure was counted.
+    #[test]
+    fn guesses_split_between_unlock_and_a_password_change_still_meet_the_throttle() {
+        let db = test_db();
+        vault_create_in(&db, &VaultPasswordStore::new(), "right-password-1").unwrap();
+        let throttle = Arc::new(UnlockThrottle::new());
+        let start = Arc::new(Barrier::new(12));
+        let guesses: Vec<_> = (0..12)
+            .map(|n| {
+                let (db, throttle, start) = (db.clone(), throttle.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let guess = format!("wrong-guess-{n}");
+                    start.wait();
+                    let answer = if n % 2 == 0 {
+                        rotate_master_password(&db, &throttle, &guess, "new-password-12", &|| true)
+                            .map(|_| ())
+                    } else {
+                        vault_unlock_in(
+                            &db,
+                            &throttle,
+                            &VaultPasswordStore::new(),
+                            &VaultRotationLock::new(),
+                            &|| true,
+                            &guess,
+                        )
+                        .map(|_| ())
+                    };
+                    answer.unwrap_err().0
+                })
+            })
+            .collect();
+        let answers: Vec<String> = guesses.into_iter().map(|g| g.join().unwrap()).collect();
+        let checked = answers
+            .iter()
+            .filter(|a| {
+                *a == "Incorrect master password." || *a == "Current master password is incorrect."
+            })
+            .count();
+        let throttled = answers
+            .iter()
+            .filter(|a| a.starts_with("Too many failed attempts"))
+            .count();
+        assert_eq!((checked, throttled), (5, 7), "{answers:?}");
+    }
+
+    /// A live MCP session is bound to the settings it was set up with, the
+    /// secret as sealed - and a master-password change re-seals every
+    /// secret. The session follows its secret to the new seal: otherwise
+    /// every session would look set up for other settings after a change,
+    /// and be ended at its next use.
+    #[test]
+    fn a_master_password_change_keeps_live_mcp_sessions_usable() {
+        let db = test_db();
+        let (old_pw, new_pw) = ("ru6b-old-password", "ru6b-new-password");
+        vault_create_in(&db, &VaultPasswordStore::new(), old_pw).unwrap();
+        let record = db::McpServerRecord {
+            id: "s1".into(),
+            name: "srv".into(),
+            url: "https://mcp.example.com/mcp".into(),
+            auth_type: "bearer".into(),
+            auth_header_name: None,
+            auth_secret: Some(crate::crypto::vault::seal(old_pw, b"the-token").unwrap()),
+            auth_env_var: None,
+            confirmed: true,
+            tools: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db.save_mcp_server(&record).unwrap();
+        let mcp = crate::assistant::mcp::McpState::new();
+        mcp.bind_session(
+            &record,
+            crate::assistant::mcp::McpSession {
+                session_id: Some("sess-1".into()),
+                protocol_version: "2025-06-18".into(),
+            },
+        );
+        let (throttle, lock, store, generations) = (
+            UnlockThrottle::new(),
+            VaultRotationLock::new(),
+            VaultPasswordStore::new(),
+            VaultGeneration::new(),
+        );
+        store.set(old_pw.into());
+        let vault = RotationContext {
+            throttle: &throttle,
+            lock: &lock,
+            store: &store,
+            generations: &generations,
+            mcp: &mcp,
+            lock_wait: ROTATION_LOCK_WAIT,
+        };
+        change_master_password(
+            &db,
+            &vault,
+            generations.current(),
+            old_pw,
+            new_pw.to_string().into(),
+        )
+        .unwrap();
+        let resealed = db.get_mcp_server("s1").unwrap().unwrap();
+        assert_ne!(resealed.auth_secret, record.auth_secret, "re-sealed");
+        assert!(
+            mcp.session_for(&resealed).is_some(),
+            "the live session is still used"
+        );
+        assert!(mcp.session_for(&record).is_none(), "bound to the new seal");
+    }
+
+    /// An OpenSSH private key file.
+    fn openssh_key(comment: &str) -> String {
+        let mut key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        key.set_comment(comment);
+        key.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string()
+    }
+
+    /// Off the main thread, two imports of one key (a double click) both
+    /// passed the same-key check - made before the slow seal and outside the
+    /// name lock - and the key was stored twice.
+    #[test]
+    fn two_imports_of_one_key_at_once_store_it_once() {
+        let db = test_db();
+        let pem = openssh_key("twice");
+        let start = Arc::new(Barrier::new(2));
+        let imports: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let (db, pem, start) = (db.clone(), pem.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    key_import_in(
+                        &db,
+                        &unlocked(),
+                        &VaultRotationLock::new(),
+                        &pem,
+                        Some(name.to_string()),
+                        None,
+                        None,
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<CmdResult<serde_json::Value>> =
+            imports.into_iter().map(|i| i.join().unwrap()).collect();
+        assert_eq!(db.list_keys().unwrap().len(), 1, "stored once: {results:?}");
+        let refused: Vec<&str> = results
+            .iter()
+            .filter_map(|r| r.as_ref().err().map(|e| e.0.as_str()))
+            .collect();
+        assert_eq!(refused.len(), 1, "{results:?}");
+        assert!(
+            refused[0].starts_with("This key already exists in the vault as"),
+            "{}",
+            refused[0]
+        );
+    }
 }
