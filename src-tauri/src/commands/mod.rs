@@ -93,8 +93,8 @@ pub(crate) fn vault_password(app: &AppHandle) -> CmdResult<zeroize::Zeroizing<St
 /// lock bumps the counter BEFORE tearing anything down, so an in-progress
 /// operation that crosses the lock observes a changed generation and aborts
 /// instead of registering a session or exporting a secret into the locked
-/// state. This closes the race the audit's F2 describes: clearing the
-/// password store alone does not revoke copies a pending task already holds.
+/// state. This closes a race: clearing the password store alone does not
+/// revoke copies a pending task already holds.
 pub struct VaultGeneration(std::sync::atomic::AtomicU64);
 
 impl VaultGeneration {
@@ -186,7 +186,7 @@ pub(crate) const VAULT_REENCRYPTING: &str =
     "The vault is being re-encrypted - try again when it finishes.";
 
 /// Serialises a master-password change against every other write of sealed
-/// vault data (C1).
+/// vault data.
 ///
 /// The change re-seals a snapshot of every key, saved server password, MCP
 /// secret and stored credential, then commits them with the new verifier. Off
@@ -244,6 +244,15 @@ impl VaultRotationLock {
         waiter
             .block_on(async { tokio::time::timeout(limit, self.0.write()).await })
             .map_err(|_| CmdError(ROTATION_LOCK_BUSY.into()))
+    }
+
+    /// The write side as a master-password change holds it, for tests outside
+    /// this module (the lock must be free).
+    #[cfg(test)]
+    pub(crate) fn hold_like_a_password_change(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.0
+            .try_write()
+            .expect("nothing else holds the rotation lock in this test")
     }
 }
 
@@ -541,43 +550,75 @@ fn vault_unlock_in(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Lock the vault. `alreadyLocked: true` when it was locked already (the
+/// tray's Lock got there first): there was nothing to lock, and no second
+/// `vault.lock` audit row is written.
 #[tauri::command]
 pub fn vault_lock(app: AppHandle) -> CmdResult<serde_json::Value> {
-    lock_vault_internal(&app);
-    Ok(serde_json::json!({ "ok": true }))
+    let was_unlocked = lock_vault_internal(&app);
+    Ok(serde_json::json!({ "ok": true, "alreadyLocked": !was_unlocked }))
 }
 
 /// Shared teardown for manual lock and the backend idle watchdog: kill every
 /// live interactive SSH session BEFORE clearing the master password; sessions
 /// that survive into a locked vault would otherwise be using unsealed key
-/// material with no way to re-derive it.
-pub(crate) fn lock_vault_internal(app: &AppHandle) {
+/// material with no way to re-derive it. True when the vault was unlocked;
+/// only then is `vault.lock` audited.
+pub(crate) fn lock_vault_internal(app: &AppHandle) -> bool {
+    lock_vault_with(
+        app.state::<VaultGeneration>().inner(),
+        app.state::<VaultPasswordStore>().inner(),
+        &app.state::<AppState>().db,
+        &|| {
+            app.state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
+                .kill_all();
+            app.state::<crate::sftp::EditRegistry>().stop_all();
+            app.state::<crate::sftp::KeepaliveRegistry>().stop_all();
+            // SFTP runs on its own channel per session, so killing the shell
+            // registry does not close it. Without this the registry kept live
+            // handles and every sftp_* command carried on working against a
+            // "locked" vault - and the transfer queue carried on writing files.
+            app.state::<crate::sftp::SftpRegistry>().clear();
+            crate::sftp::queue::pause_all(app);
+            app.state::<crate::assistant::AssistantLevels>().clear();
+            // MCP sessions die with the vault too: HTTP DELETE with
+            // Mcp-Session-Id, carrying the static auth header (405 is valid
+            // per spec - ignored; other refusals are audited, never
+            // swallowed). Session + status state is dropped synchronously,
+            // and a copy of the password is taken BEFORE the store clears;
+            // each teardown task unseals its own credential from it on the
+            // blocking pool and sends its DELETE, so the lock path never
+            // waits for an Argon2id derivation or a server.
+            crate::assistant::mcp::teardown_all(app);
+        },
+    )
+}
+
+/// [`lock_vault_internal`] without the `AppHandle`: `teardown` ends every
+/// live session, watch and transfer while the password is still in the
+/// store. True when the vault was unlocked.
+fn lock_vault_with(
+    generations: &VaultGeneration,
+    store: &VaultPasswordStore,
+    db: &db::Database,
+    teardown: &dyn Fn(),
+) -> bool {
     // Bump the generation FIRST, before any teardown. An in-progress connect,
     // SFTP open, export, or sync that captured the old generation observes the
     // bump at its next commit boundary and aborts, so a pending operation can
     // never register a session or spend a secret into the now-locked vault.
-    app.state::<VaultGeneration>().bump();
-    app.state::<std::sync::Arc<crate::ssh_client::SessionRegistry>>()
-        .kill_all();
-    app.state::<crate::sftp::EditRegistry>().stop_all();
-    app.state::<crate::sftp::KeepaliveRegistry>().stop_all();
-    // SFTP runs on its own channel per session, so killing the shell registry
-    // does not close it. Without this the registry kept live handles and every
-    // sftp_* command carried on working against a "locked" vault - and the
-    // transfer queue carried on writing files.
-    app.state::<crate::sftp::SftpRegistry>().clear();
-    crate::sftp::queue::pause_all(app);
-    app.state::<crate::assistant::AssistantLevels>().clear();
-    // MCP sessions die with the vault too: HTTP DELETE with Mcp-Session-Id,
-    // carrying the static auth header (405 is valid per spec - ignored;
-    // other refusals are audited, never swallowed). Session + status state
-    // is dropped synchronously, and a copy of the password is taken BEFORE
-    // the store clears below; each teardown task unseals its own credential
-    // from it on the blocking pool and sends its DELETE, so the lock path
-    // never waits for an Argon2id derivation or a server.
-    crate::assistant::mcp::teardown_all(app);
-    app.state::<VaultPasswordStore>().clear();
-    let _ = app.state::<AppState>().db.add_audit("vault.lock", None, "");
+    generations.bump();
+    let was_unlocked = store.is_set();
+    teardown();
+    store.clear();
+    // One lock, one audit row: the tray's Lock locks, then the renderer asks
+    // `vault_lock` again - that second request finds nothing to lock (it
+    // still bumped the generation and ran the teardown, which are cheap and
+    // make a lock request win over an unlock running at that moment).
+    if was_unlocked {
+        audit_or_log(db, "vault.lock", None, "");
+    }
+    was_unlocked
 }
 
 /// When the user last did something, as reported by the `heartbeat` IPC. The
@@ -673,7 +714,7 @@ pub(crate) fn spawn_auto_lock_watchdog(app: AppHandle) {
 /// Async on purpose (A7-13): that is two Argon2id derivations (64 MiB, t=3)
 /// per record, and as a synchronous command it all ran on the main thread, so
 /// with a hundred keys the window froze for tens of seconds. The work now runs
-/// on a blocking worker, under the [`VaultRotationLock`] write lock (C1): the
+/// on a blocking worker, under the [`VaultRotationLock`] write lock: the
 /// rest of the app stays usable, but nothing can seal or rewrite vault data
 /// until the change is committed and the new password installed. If another
 /// vault operation (a Bitwarden sync, an MCP call, a backup export or restore,
@@ -744,8 +785,8 @@ const ROTATION_LOCK_BUSY: &str =
 /// `AppHandle`. The write lock is taken before the current-password check
 /// and the snapshot (giving up after `lock_wait` with [`ROTATION_LOCK_BUSY`]
 /// while a sync or MCP call holds it) and held until the new password is
-/// installed, so nothing sealed with the old password can slip in between
-/// (C1). Once the rotation has committed nothing can fail the change: the
+/// installed, so nothing sealed with the old password can slip in
+/// between. Once the rotation has committed nothing can fail the change: the
 /// new password is installed FIRST and the audit row is written afterwards,
 /// best-effort - a failed audit write used to return an error before the
 /// install, leaving the store on the old password over a vault sealed with
@@ -825,9 +866,376 @@ where
     F: FnOnce() -> CmdResult<T> + Send + 'static,
     T: Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(work)
+    spawn_on_pool(work)
         .await
         .map_err(|e| CmdError(format!("Background task failed: {e}")))?
+}
+
+/// Start `work` on Tauri's blocking pool. Everything that runs an Argon2id
+/// derivation for an async caller goes through here ([`run_blocking`],
+/// [`seal_off_thread`], [`unseal_off_thread`], the MCP teardowns): in tests
+/// the thread is marked, so [`seal_on_pool`] and [`unseal_on_pool`] can check
+/// that they never run on an async worker.
+pub(crate) fn spawn_on_pool<T, F>(work: F) -> tauri::async_runtime::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(test)]
+        let _mark = PoolMark::enter();
+        work()
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread is running work handed to the blocking pool.
+    static ON_BLOCKING_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the current thread as running blocking-pool work while alive (tests
+/// only).
+#[cfg(test)]
+struct PoolMark(bool);
+
+#[cfg(test)]
+impl PoolMark {
+    fn enter() -> Self {
+        Self(ON_BLOCKING_POOL.with(|on| on.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for PoolMark {
+    fn drop(&mut self) {
+        let before = self.0;
+        ON_BLOCKING_POOL.with(|on| on.set(before));
+    }
+}
+
+/// Run `work` as if on the blocking pool: for a test that times one Argon2id
+/// derivation inline on purpose.
+#[cfg(test)]
+pub(crate) fn as_if_on_pool<T>(work: impl FnOnce() -> T) -> T {
+    let _mark = PoolMark::enter();
+    work()
+}
+
+/// How many [`seal_on_pool`] / [`unseal_on_pool`] calls ran (tests only): a
+/// test that checks where they run also checks that they ran at all.
+#[cfg(test)]
+pub(crate) static POOL_CRYPTO_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// In tests: fail when an Argon2id derivation is about to run anywhere but on
+/// the blocking pool. A no-op otherwise.
+fn on_pool_only(what: &str) {
+    #[cfg(test)]
+    {
+        POOL_CRYPTO_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            ON_BLOCKING_POOL.with(|on| on.get()),
+            "an Argon2id {what} ran on an async worker, not on the blocking pool"
+        );
+    }
+    #[cfg(not(test))]
+    let _ = what;
+}
+
+/// [`crate::crypto::vault::seal`] for code that runs it on the blocking pool
+/// (Argon2id: 64 MiB and most of a second, which an async worker must never
+/// spend). Tests check where it runs.
+pub(crate) fn seal_on_pool(password: &str, plain: &[u8]) -> anyhow::Result<String> {
+    on_pool_only("seal");
+    crate::crypto::vault::seal(password, plain)
+}
+
+/// [`crate::crypto::vault::unseal`] for code that runs it on the blocking
+/// pool (see [`seal_on_pool`]).
+pub(crate) fn unseal_on_pool(password: &str, sealed: &str) -> anyhow::Result<Vec<u8>> {
+    on_pool_only("unseal");
+    crate::crypto::vault::unseal(password, sealed)
+}
+
+/// Seal `plain` with `password` on the blocking pool, for an async caller.
+/// Both are copied into wiped buffers for the trip.
+pub(crate) async fn seal_off_thread(password: &str, plain: &[u8]) -> anyhow::Result<String> {
+    let password = zeroize::Zeroizing::new(password.to_string());
+    let plain = zeroize::Zeroizing::new(plain.to_vec());
+    spawn_on_pool(move || seal_on_pool(&password, &plain))
+        .await
+        .map_err(|e| anyhow::anyhow!("background task failed: {e}"))?
+}
+
+/// Unseal `sealed` with `password` on the blocking pool, for an async caller.
+/// The plaintext comes back in a wiped buffer.
+pub(crate) async fn unseal_off_thread(
+    password: &str,
+    sealed: &str,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let password = zeroize::Zeroizing::new(password.to_string());
+    let sealed = sealed.to_string();
+    spawn_on_pool(move || unseal_on_pool(&password, &sealed).map(zeroize::Zeroizing::new))
+        .await
+        .map_err(|e| anyhow::anyhow!("background task failed: {e}"))?
+}
+
+/// A question SSHSpan asks in a NATIVE dialog before a stored credential is
+/// sent somewhere it was not bound to before: an MCP secret or environment
+/// variable bound to a new server address, the assistant's API key moved to
+/// a new provider address. The webview can neither answer, forge nor
+/// suppress it - the answer comes from the OS dialog, not from a renderer
+/// flag. Production asks with
+/// [`ask_native_confirmation`]; tests answer with a closure
+/// ([`ConfirmCredential`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredentialPrompt {
+    pub title: String,
+    pub message: String,
+}
+
+/// How a [`CredentialPrompt`] was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialAnswer {
+    /// "Allow", clicked at least [`CREDENTIAL_MIN_ANSWER_DELAY`] after the
+    /// question opened.
+    Allowed,
+    /// "Don't allow", "Cancel", Esc, or the dialog closed.
+    NotAllowed,
+    /// "Allow" sooner than [`CREDENTIAL_MIN_ANSWER_DELAY`] after the question
+    /// opened: counted as "Don't allow".
+    TooQuick,
+}
+
+/// Who answers a [`CredentialPrompt`] - the native dialog in the app, a
+/// closure in tests. It blocks until answered, so it is only ever called on
+/// the blocking pool.
+pub(crate) type ConfirmCredential<'a> = &'a dyn Fn(&CredentialPrompt) -> CredentialAnswer;
+
+/// The labels of a credential question's buttons ([`credential_buttons`]).
+pub(crate) const CREDENTIAL_DONT_ALLOW: &str = "Don't allow";
+pub(crate) const CREDENTIAL_ALLOW: &str = "Allow";
+const CREDENTIAL_CANCEL: &str = "Cancel";
+
+/// An "Allow" that comes sooner than this after the question opened is not
+/// taken as the user's decision: a compromised renderer can open the question
+/// while the user is typing, and the next key would answer it.
+pub(crate) const CREDENTIAL_MIN_ANSWER_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+/// A credential question's buttons, in the order the dialog shows them:
+/// "Don't allow" first - the default button that Enter (Windows, macOS) and
+/// a stray keypress hit - then "Allow", then "Cancel", which Esc and closing
+/// the dialog also answer. (With OK/Cancel the first button, "Allow", was the
+/// default: a renderer that opened the question while the user typed got an
+/// "Allow" from the next Enter.)
+pub(crate) fn credential_buttons() -> tauri_plugin_dialog::MessageDialogButtons {
+    tauri_plugin_dialog::MessageDialogButtons::YesNoCancelCustom(
+        CREDENTIAL_DONT_ALLOW.to_string(),
+        CREDENTIAL_ALLOW.to_string(),
+        CREDENTIAL_CANCEL.to_string(),
+    )
+}
+
+/// What the dialog's `result`, answered `elapsed` after it opened, means:
+/// only the "Allow" button itself allows - tauri-plugin-dialog reports every
+/// custom button by its label - and only once the question has been open for
+/// [`CREDENTIAL_MIN_ANSWER_DELAY`]. Any other button, Esc, closing the
+/// dialog or a plain OK/Yes from a dialog that fell back to standard buttons
+/// does not.
+pub(crate) fn credential_answer(
+    result: &tauri_plugin_dialog::MessageDialogResult,
+    elapsed: std::time::Duration,
+) -> CredentialAnswer {
+    use tauri_plugin_dialog::MessageDialogResult;
+    match result {
+        MessageDialogResult::Custom(label) if label == CREDENTIAL_ALLOW => {
+            if elapsed >= CREDENTIAL_MIN_ANSWER_DELAY {
+                CredentialAnswer::Allowed
+            } else {
+                CredentialAnswer::TooQuick
+            }
+        }
+        _ => CredentialAnswer::NotAllowed,
+    }
+}
+
+/// Ask `prompt` in the native message dialog (tauri-plugin-dialog), parented
+/// to the main window, and read the answer ([`timed_question`],
+/// [`credential_answer`]). It waits for the answer, so this runs on the
+/// blocking pool only: on the main thread it would wait for itself, and on
+/// an async worker it would hold that worker for as long as the user thinks.
+pub(crate) fn ask_native_confirmation(
+    app: &AppHandle,
+    prompt: &CredentialPrompt,
+) -> CredentialAnswer {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    let mut dialog = app
+        .dialog()
+        .message(dialog_message_safe(&prompt.message))
+        .title(dialog_message_safe(&prompt.title))
+        .kind(MessageDialogKind::Warning)
+        .buttons(credential_buttons());
+    if let Some(main) = app.get_webview_window("main") {
+        dialog = dialog.parent(&main);
+    }
+    let main_thread = app.clone();
+    timed_question(
+        move |task| main_thread.run_on_main_thread(task).is_ok(),
+        // Called on the main thread. On Windows and macOS the plugin then
+        // creates the dialog at once (tauri runs a main-thread task
+        // immediately when it is already there). On Linux, rfd creates the
+        // GTK dialog from an idle callback, so a flooded main loop can still
+        // delay it after the clock has started - an accepted residual;
+        // "Don't allow" stays the Enter default.
+        move |answered| dialog.show_with_result(answered),
+    )
+}
+
+/// The answer a credential question gets: `answered` hands the dialog's
+/// result back from wherever the dialog reports it.
+pub(crate) type DialogAnswered = Box<dyn FnOnce(tauri_plugin_dialog::MessageDialogResult) + Send>;
+
+/// Put a credential question on screen and read its answer. `on_main` runs
+/// a task on the main thread (the app's `run_on_main_thread`; a stand-in in
+/// tests); `show`, called in that task, creates the dialog and hands its
+/// result to the callback it gets. The answer is timed for
+/// [`credential_answer`] from the moment the dialog is created - on the main
+/// thread, right before `show` - to the answer, so a busy main thread (a
+/// flood of synchronous IPC delays every task there) cannot use up the
+/// second before the dialog is even on screen (the clock used to start
+/// before the hop to the main thread). That holds on Windows and macOS; on
+/// Linux the GTK dialog is shown from an idle callback after `show`, which
+/// a flooded main loop can delay ([`ask_native_confirmation`]). If `on_main`
+/// cannot run the task, or the dialog goes away without an answer, the
+/// answer is "not allowed".
+pub(crate) fn timed_question(
+    on_main: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+    show: impl FnOnce(DialogAnswered) + Send + 'static,
+) -> CredentialAnswer {
+    timed_question_by(std::time::Instant::now, on_main, show)
+}
+
+/// [`timed_question`] on the clock `now`: the app's is `Instant::now`; a
+/// test moves its own by hand, so a loaded machine cannot stretch the time
+/// between the dialog and the answer.
+fn timed_question_by(
+    now: impl Fn() -> std::time::Instant + Send + 'static,
+    on_main: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+    show: impl FnOnce(DialogAnswered) + Send + 'static,
+) -> CredentialAnswer {
+    let (answered, answer) = std::sync::mpsc::sync_channel(1);
+    let task = Box::new(move || {
+        // On the main thread, right before the dialog is created.
+        let opened = now();
+        show(Box::new(move |result| {
+            let _ = answered.send((result, now().saturating_duration_since(opened)));
+        }));
+    });
+    if !on_main(task) {
+        return CredentialAnswer::NotAllowed;
+    }
+    match answer.recv() {
+        Ok((result, elapsed)) => credential_answer(&result, elapsed),
+        Err(_) => CredentialAnswer::NotAllowed,
+    }
+}
+
+/// One credential question at a time, app-wide. Two saves that each would
+/// ask - two Save clicks, or a renderer stacking questions so that one
+/// keystroke answers several - may not both: the second is refused while the
+/// first question is open, and the question's turn lasts until its answer is
+/// written, so a later "Don't allow" can never be undone by an earlier
+/// "Allow".
+#[derive(Default)]
+pub struct CredentialQuestions(std::sync::Mutex<()>);
+
+/// The turn of one credential question ([`CredentialQuestions::begin`]): no
+/// other question is asked while it is held.
+pub(crate) struct QuestionTurn<'a> {
+    _held: std::sync::MutexGuard<'a, ()>,
+}
+
+impl CredentialQuestions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The turn to ask a question, or `None` while another one is open.
+    /// Never waits: a second question is refused, not stacked behind the
+    /// first.
+    pub(crate) fn begin(&self) -> Option<QuestionTurn<'_>> {
+        match self.0.try_lock() {
+            Ok(held) => Some(QuestionTurn { _held: held }),
+            // A turn that ended in a panic still ended.
+            Err(std::sync::TryLockError::Poisoned(held)) => Some(QuestionTurn {
+                _held: held.into_inner(),
+            }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+/// What a save that would ask a credential question says while another
+/// question is still open.
+pub(crate) const CREDENTIAL_QUESTION_OPEN: &str =
+    "Another question about sending a credential is still open - answer it, then save again.";
+
+/// Text from settings or a vault item for a dialog or a list: control, format
+/// and text-direction characters dropped (everything
+/// [`crate::assistant::is_disguising`] names), every run of whitespace one
+/// space, the ends trimmed, and at most `max_chars` characters, the last an
+/// ellipsis when it was cut. Text that anyone else wrote must not reorder,
+/// hide or add to what the user is asked.
+pub(crate) fn dialog_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            gap = !out.is_empty();
+        } else if !c.is_control() && !crate::assistant::is_disguising(c) {
+            if gap {
+                out.push(' ');
+                gap = false;
+            }
+            out.push(c);
+        }
+    }
+    if out.chars().count() > max_chars {
+        let cut: String = out.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}\u{2026}", cut.trim_end())
+    } else {
+        out
+    }
+}
+
+/// The last guard before a message reaches the OS dialog: line breaks stay
+/// (the message's own paragraphs), other whitespace becomes a space, and
+/// every other control, format or text-direction character goes. A NUL cut
+/// the message short on Windows, and made GTK panic inside a C callback,
+/// which aborts the process.
+pub(crate) fn dialog_message_safe(message: &str) -> String {
+    message
+        .chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            c if c.is_whitespace() => Some(' '),
+            c if c.is_control() || crate::assistant::is_disguising(c) => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// How a dialog names the host of `url`: the host as the URL parser holds it
+/// (an international name in its ASCII form, an IPv6 address in brackets),
+/// with the port when the URL gives one.
+pub(crate) fn host_label(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
 }
 
 /// The rotation itself (the caller holds the write lock): verify the current
@@ -854,7 +1262,7 @@ fn rotate_master_password(
 
     // The stored Bitwarden master password is sealed with the SAME vault
     // password, so it must be re-sealed too - otherwise sync silently strands
-    // on the old password after a rotation (F6). Re-seal it in memory here so
+    // on the old password after a rotation. Re-seal it in memory here so
     // it commits in the same transaction below. A missing/unconfigured
     // credential is fine (None); an unsealable one aborts the whole change.
     let bw_config = db.load_bitwarden_config().map_err(|e| e.to_string())?;
@@ -933,10 +1341,10 @@ fn rotate_master_password(
         return Err("Vault was locked while the operation was in progress.".into());
     }
     // Single transaction: every re-sealed value, the credentials and the
-    // verifier commit together or not at all (F3). A crash or I/O error
+    // verifier commit together or not at all. A crash or I/O error
     // part-way rolls back to the complete old state instead of leaving the
     // vault split across two passwords; so does a row that changed since the
-    // snapshot (C1).
+    // snapshot.
     db.apply_vault_rotation(&rotation)
         .map_err(|e| e.to_string())?;
     Ok(RotationSummary {
@@ -1002,7 +1410,7 @@ struct VaultMigration {
 /// failure aborts the whole migration (nothing is persisted by this function).
 /// Each plaintext lives in a `Zeroizing` buffer, wiped as soon as it has been
 /// re-sealed (A6-11). The blob that was read is kept beside its replacement:
-/// the commit only writes where it is still in place (C1).
+/// the commit only writes where it is still in place.
 fn migrate_vault_records(
     keys: Vec<KeyRecord>,
     servers: Vec<db::ServerRecord>,
@@ -1320,7 +1728,7 @@ mod tests {
         )));
     }
 
-    /// RU6a: a Windows path prefix compares by its plain spelling. dunce
+    /// A Windows path prefix compares by its plain spelling. dunce
     /// keeps `\\?\C:\...` for a path longer than 260 characters, and the
     /// textual comparison judged such a path to be outside the folder it is
     /// in. Pure, so it runs on every platform.
@@ -1336,8 +1744,8 @@ mod tests {
         assert_eq!(comparable_prefix(r"\\.\COM1"), r"\\.\com1");
     }
 
-    /// RU6a, on Windows itself: a deep verbatim path is inside its plain
-    /// folder and the other way round; another drive is not.
+    /// On Windows itself: a deep verbatim path is inside its plain folder
+    /// and the other way round; another drive is not.
     #[cfg(target_os = "windows")]
     #[test]
     fn ru6a_a_deep_verbatim_path_is_inside_its_plain_folder() {
@@ -1527,7 +1935,7 @@ mod tests {
         assert_eq!(db.get_key("k1").unwrap().unwrap().name, "KEY-K1");
     }
 
-    // ── RU3: key generation, import and export ──
+    // ── Key generation, import and export ──
 
     const PW: &str = "test-master-pw"; // what unlocked_vault() holds
 
@@ -1694,7 +2102,7 @@ mod tests {
         assert!(private_export_passphrase("public", None).is_err());
     }
 
-    // ── RU3: deploy writes what it shows (R3) ──
+    // ── Deploy writes what it shows (R3) ──
 
     fn deploy_target(tag: &str) -> (std::path::PathBuf, crate::ssh::DeployTarget) {
         let root = scratch_dir(&format!("deploy-{tag}"));
@@ -1828,7 +2236,7 @@ mod tests {
         assert!(!db.get_key("k2").unwrap().unwrap().deployed);
     }
 
-    /// RU6a: the preview carries the plan's warnings and the `Host` lines of
+    /// The preview carries the plan's warnings and the `Host` lines of
     /// the user's own ssh config that name a host the deploy writes.
     #[test]
     fn ru6a_the_deploy_preview_reports_warnings_and_legacy_host_lines() {
@@ -1990,7 +2398,8 @@ mod tests {
     }
 
     /// A recorded path that is not one of SSHSpan's own files in the managed
-    /// directory is never deleted (a pre-F9 restore could have planted one);
+    /// directory is never deleted (a backup restored by an older version
+    /// could have planted one);
     /// the record is cleared and the result says why.
     #[test]
     fn remove_deployed_never_deletes_a_file_sshspan_did_not_write() {
@@ -2050,7 +2459,7 @@ mod tests {
             .any(|a| a.action.starts_with("keys.undeploy")));
     }
 
-    /// RU1 leftover: the busy message is also what a restore, an export or
+    /// The busy message is also what a restore, an export or
     /// another password change produces, so it must not name only two of them.
     #[test]
     fn rotation_busy_message_names_any_vault_operation() {
@@ -2674,7 +3083,7 @@ mod tests {
         );
     }
 
-    // ── C1: nothing sealed or rewritten meanwhile may be stranded or lost ──
+    // ── Nothing sealed or rewritten meanwhile may be stranded or lost ──
 
     /// A key sealed with the OLD password while the rotation runs - inserted
     /// here behind every guard's back - must not be stranded: the rotation
@@ -2724,9 +3133,7 @@ mod tests {
 
         let reencrypted =
             rotate_master_password(&db, &UnlockThrottle::new(), old_pw, new_pw, &|| {
-                let mut key = db.get_key("k1").unwrap().unwrap();
-                key.name = "renamed-meanwhile".into();
-                db.update_key(&key).unwrap();
+                db.rename_key("k1", "renamed-meanwhile").unwrap();
                 true
             })
             .unwrap();
@@ -2870,7 +3277,7 @@ mod tests {
             .any(|a| a.action == "vault.password_changed"));
     }
 
-    /// Fix 2, MUST B: the export seals the backup with the master password,
+    /// The export seals the backup with the master password,
     /// so while a change holds the lock it is refused at once and writes no
     /// file; afterwards it works again.
     #[test]
@@ -2896,7 +3303,7 @@ mod tests {
         assert_eq!(exported.unwrap()["counts"]["keys"], 1);
     }
 
-    /// Fix 2, SHOULD 1: a sync or MCP call that keeps its read guard makes the
+    /// A sync or MCP call that keeps its read guard makes the
     /// change give up after the wait, with a message - and before the
     /// current-password check: a wrong password here is never looked at and
     /// costs no throttle failure.
@@ -2951,12 +3358,13 @@ mod tests {
     fn a_waiting_password_change_refuses_new_writers() {
         let lock = VaultRotationLock::new();
         let running_sync = lock.try_shared().unwrap();
+        // Both limits only bound a failure, wide for a loaded machine.
         std::thread::scope(|scope| {
             let change = scope.spawn(|| {
-                lock.exclusive_within(std::time::Duration::from_secs(10))
+                lock.exclusive_within(std::time::Duration::from_secs(60))
                     .map(|_| ())
             });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while lock.try_shared().is_ok() {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -2971,7 +3379,7 @@ mod tests {
         assert!(lock.try_shared().is_ok());
     }
 
-    /// Fix 2, MUST A: once the rotation has committed, the new password must
+    /// Once the rotation has committed, the new password must
     /// be installed even if writing the audit row fails - otherwise the store
     /// keeps the OLD password over a vault sealed with the new one, and the
     /// next seal strands its record. Here the audit table is gone.
@@ -3097,142 +3505,11 @@ mod tests {
     }
 }
 
-/// NOT REGISTERED in `generate_handler!`, deliberately.
-///
-/// It returns every key's `private_key_encrypted` blob to the webview. The
-/// blobs are sealed with the master password, so this is not plaintext key
-/// material - but it hands a compromised renderer the entire keystore to
-/// attack offline, and nothing in the shipped UI ever called it. Registering
-/// it again needs a reason and a review; `vault_backup_export_to_file` is the
-/// supported export path and keeps the material in the backend.
-#[tauri::command]
-pub fn vault_export(app: AppHandle) -> CmdResult<serde_json::Value> {
-    let _pw = vault_password(&app)?;
-    let keys = app
-        .state::<AppState>()
-        .db
-        .list_keys()
-        .map_err(|e| e.to_string())?;
-    let exported: Vec<serde_json::Value> = keys
-        .iter()
-        .map(|k| {
-            serde_json::json!({
-                "id": k.id, "name": k.name, "key_type": k.key_type,
-                "public_key": k.public_key, "private_key_encrypted": k.private_key_encrypted,
-                "fingerprint_sha256": k.fingerprint_sha256, "comment": k.comment,
-            })
-        })
-        .collect();
-    Ok(serde_json::json!({ "keys": exported }))
-}
-
-/// NOT REGISTERED in `generate_handler!`, deliberately - the counterpart to
-/// `vault_export`, and likewise never called by the shipped UI. It writes
-/// caller-supplied key records straight into the vault;
-/// `vault_backup_restore_from_file` is the reviewed import path.
-#[tauri::command]
-pub fn vault_import(app: AppHandle, keys: Vec<serde_json::Value>) -> CmdResult<serde_json::Value> {
-    let _rotation = rotation_shared(&app)?;
-    let _pw = vault_password(&app)?;
-    let mut imported = 0;
-    for item in &keys {
-        // Imported names become Host aliases in ~/.ssh/config - a name that
-        // can't be a single Host token is sanitized instead of rejecting the
-        // whole import (same mapping the Bitwarden sync uses).
-        let raw_name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("imported")
-            .to_string();
-        let name = if keys::validate_key_name(&raw_name).is_ok() {
-            raw_name
-        } else {
-            let sanitized = keys::sanitize_key_name(&raw_name);
-            let _ = app.state::<AppState>().db.add_audit(
-                "keys.name_sanitized",
-                None,
-                &format!("{raw_name:?} -> {sanitized:?}"),
-            );
-            sanitized
-        };
-        let key_record = KeyRecord {
-            id: item
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            name,
-            key_type: item
-                .get("key_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("rsa")
-                .to_string(),
-            public_key: item
-                .get("public_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            private_key_encrypted: item
-                .get("private_key_encrypted")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            fingerprint_sha256: item
-                .get("fingerprint_sha256")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            fingerprint_md5: item
-                .get("fingerprint_md5")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            comment: item
-                .get("comment")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            deployed: false,
-            deploy_path: None,
-            bitwarden_id: None,
-            bitwarden_sync: false,
-            bitwarden_revision_ts: None,
-            bitwarden_updated_at: None,
-            category_ids: Vec::new(),
-        };
-        if app.state::<AppState>().db.insert_key(&key_record).is_ok() {
-            imported += 1;
-        }
-    }
-    Ok(serde_json::json!({ "ok": true, "imported": imported }))
-}
-
 // ─── Vault backup / restore ────────────────────────────────────────────────
-
-/// NOT REGISTERED in `generate_handler!`, deliberately (A6-03 / A2-48, ruling
-/// R5).
-///
-/// It returns the whole sealed backup document to the webview - every sealed
-/// key, saved server password and MCP secret under ONE Argon2id envelope -
-/// which is the exposure `vault_export` was de-registered for: a compromised
-/// renderer could take it for an offline attack on the master password with
-/// one call. `vault_backup_export_to_file` builds the same document and writes
-/// it to the file the user picks without it ever crossing IPC.
-#[tauri::command]
-pub fn vault_backup_create(app: AppHandle) -> CmdResult<serde_json::Value> {
-    let pw = vault_password(&app)?;
-    if pw.is_empty() {
-        return Err("Vault is locked.".into());
-    }
-    let db = &app.state::<AppState>().db;
-    let backup = build_backup_document(db, &pw)?;
-    let _ = db.add_audit("vault.backup_created", None, &backup.counts.to_string());
-    Ok(serde_json::json!({
-        "json": backup.document, "filename": backup.filename, "counts": backup.counts,
-    }))
-}
+//
+// Backups are written and read by Rust behind native dialogs
+// (`vault_backup_export_to_file`, `vault_backup_restore_from_file`): the
+// sealed document never crosses IPC.
 
 /// A sealed vault backup, built in memory and not yet written anywhere.
 pub struct BackupDocument {
@@ -3365,7 +3642,7 @@ pub async fn vault_backup_export_to_file(app: AppHandle) -> CmdResult<serde_json
 }
 
 /// The export worker's body. Read access to the [`VaultRotationLock`] comes
-/// FIRST and is held until the file is written (C1, fix 2): the export reads
+/// FIRST and is held until the file is written: the export reads
 /// the master password, lists every sealed row and seals the document with
 /// that password, so a master-password change committing in between would
 /// produce a backup sealed with the old password around blobs sealed with
@@ -3441,7 +3718,7 @@ pub async fn vault_backup_restore_from_file(
     // means nothing is restored into the locked vault.
     let generation = capture_vault_generation(&app)?;
     // A restore writes sealed rows, so it and a master-password change
-    // exclude each other (C1): read access to the rotation lock is held from
+    // exclude each other: read access to the rotation lock is held from
     // here until the restore has committed. It is taken after the dialog
     // (never across it - the user may take any time there) and, on a retry,
     // BEFORE the single-use grant is spent, so a busy refusal does not cost
@@ -3510,38 +3787,6 @@ fn restore_backup_file(
     let doc: serde_json::Value =
         serde_json::from_str(&text).map_err(|_| CmdError("Not an SSHSpan backup file.".into()))?;
     apply_restore(db, &doc, pw, backup_password, still_current)
-}
-
-/// NOT REGISTERED in `generate_handler!`, deliberately (A6-03 / A2-48, ruling
-/// R5) - the counterpart of `vault_backup_create`. It took the backup's text
-/// from the webview, which the restore flow only had because
-/// `system_select_file` had read the file into it.
-/// `vault_backup_restore_from_file` reads the file in Rust instead.
-#[tauri::command]
-pub fn vault_backup_restore(
-    app: AppHandle,
-    payload_json: String,
-    backup_password: Option<String>,
-) -> CmdResult<serde_json::Value> {
-    let _rotation = rotation_shared(&app)?;
-    let pw = vault_password(&app)?;
-    if pw.is_empty() {
-        return Err("Vault is locked.".into());
-    }
-    let doc: serde_json::Value = serde_json::from_str(&payload_json).map_err(|e| e.to_string())?;
-    match apply_restore(
-        &app.state::<AppState>().db,
-        &doc,
-        &pw,
-        backup_password.as_deref(),
-        &|| Ok(()),
-    )? {
-        RestoreOutcome::Restored(result) => Ok(result),
-        RestoreOutcome::NeedsPassword => Err(
-            "This backup was created with a different master password. Enter that password to restore it."
-                .into(),
-        ),
-    }
 }
 
 /// What a restore attempt came to.
@@ -3736,7 +3981,7 @@ pub fn apply_restore(
     })))
 }
 
-// ─── File save helpers (backup export / generic) ───────────────────────────
+// ─── File save helpers (public-key and audit-log exports, "Download as") ───
 
 /// Native save-file dialog; returns the chosen path (or canceled). The chosen
 /// path is registered in the `DialogPathStore` so that `system_write_text_file`
@@ -3758,7 +4003,7 @@ pub async fn system_pick_save_path(
         .dialog()
         .file()
         .set_title(title.unwrap_or_else(|| "Save file".into()))
-        .set_file_name(default_name.as_deref().unwrap_or("file.txt"))
+        .set_file_name(save_dialog_file_name(default_name.as_deref()))
         .blocking_save_file();
     match result {
         Some(path) => {
@@ -3767,6 +4012,23 @@ pub async fn system_pick_save_path(
             Ok(serde_json::json!({ "canceled": false, "path": path_str }))
         }
         None => Ok(serde_json::json!({ "canceled": true })),
+    }
+}
+
+/// The name the save dialog suggests for `default_name` (the renderer's):
+/// its last part only - after the last `/`, `\` or `:` - cleaned of control
+/// and invisible characters, else "file.txt". A whole path opened the dialog
+/// in that folder, so a single click on Save granted a write into, say,
+/// SSHSpan's install folder.
+pub(crate) fn save_dialog_file_name(default_name: Option<&str>) -> String {
+    let last = default_name
+        .and_then(|name| name.rsplit(['/', '\\', ':']).next())
+        .unwrap_or_default();
+    let name = dialog_text(last, 200);
+    if name.is_empty() || name == "." || name == ".." {
+        "file.txt".to_string()
+    } else {
+        name
     }
 }
 
@@ -3866,16 +4128,17 @@ impl DialogPathStore {
 /// always a human-approved dialog choice.
 ///
 /// The write goes through `write_secret_file` (0600 at create time, replace
-/// rather than truncate, fail-closed Windows ACL). Its caller is the audit-log
-/// CSV export. It used to be the vault backup's writer too, which is why the
-/// helper matters: `fs::write` left files at `0666 & ~umask` (0644 on a normal
-/// desktop, group-WRITABLE under umask 002). The backup no longer comes
-/// through here at all - `vault_backup_export_to_file` writes it from Rust, so
-/// the sealed document never crosses IPC.
+/// rather than truncate, fail-closed Windows ACL). Its callers are the
+/// public-key export and the audit-log CSV export. It used to be the vault
+/// backup's writer too, which is why the helper matters: `fs::write` left
+/// files at `0666 & ~umask` (0644 on a normal desktop, group-WRITABLE under
+/// umask 002). The backup no longer comes through here at all -
+/// `vault_backup_export_to_file` writes it from Rust, so the sealed document
+/// never crosses IPC.
 ///
-/// Async, with the write on the blocking pool (item 8 audit): a file write -
-/// on Windows with two helper processes that restrict its ACL - ran on the
-/// main thread.
+/// Async, with the write on the blocking pool (A5-12): a file write - on
+/// Windows with two helper processes that restrict its ACL - ran on the main
+/// thread.
 #[tauri::command]
 pub async fn system_write_text_file(
     app: AppHandle,
@@ -4144,16 +4407,6 @@ fn parse_openssh_public_line(line: &str) -> Result<Vec<u8>, String> {
     base64ct::Base64::decode_vec(b64).map_err(|e| format!("Malformed stored public key: {e}"))
 }
 
-/// [`unseal_key_data`] for callers that hold an `AppHandle` (the terminal's
-/// connect path); the handle is not needed.
-fn load_private_key_data(
-    _app: &AppHandle,
-    key: &KeyRecord,
-    vault_pw: &str,
-) -> Result<keys::PrivateKeyData, String> {
-    unseal_key_data(key, vault_pw)
-}
-
 /// Reconstruct a `PrivateKeyData` for a stored key, decrypting the private
 /// half with the (already-verified) vault password.
 fn unseal_key_data(key: &KeyRecord, vault_pw: &str) -> Result<keys::PrivateKeyData, String> {
@@ -4176,7 +4429,7 @@ static KEY_NAME_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Hold [`KEY_NAME_WRITES`] around a name check and the write that takes the
 /// name - also from the Bitwarden sync, which stores pulled keys under a free
-/// name (RU5 hand-off 10). Never held across an await.
+/// name. Never held across an await.
 pub(crate) fn lock_key_names() -> std::sync::MutexGuard<'static, ()> {
     KEY_NAME_WRITES
         .lock()
@@ -4252,7 +4505,7 @@ fn key_import_in(
     comment: Option<String>,
     passphrase: Option<&str>,
 ) -> CmdResult<serde_json::Value> {
-    // Seals with the master password: not while it is being changed (C1).
+    // Seals with the master password: not while it is being changed.
     let _rotation = rotation.try_shared()?;
     let pw = store.get().unwrap_or_default();
     if pw.is_empty() {
@@ -4344,7 +4597,7 @@ fn ensure_key_not_stored(db: &db::Database, fingerprint: &str) -> anyhow::Result
 /// compromise could read it). Use [`key_export_to_file`], which serializes
 /// straight to a user-chosen file without the data ever entering IPC.
 ///
-/// Async, with the work on the blocking pool (item 8 audit): the
+/// Async, with the work on the blocking pool: the
 /// "public-pem" format unseals the key (Argon2id), which as a synchronous
 /// command ran on the main thread.
 #[tauri::command]
@@ -4370,7 +4623,7 @@ pub async fn key_export(
 }
 
 /// [`key_export`] without the `AppHandle`. The "public-pem" format unseals
-/// the key, so it takes read access to the [`VaultRotationLock`] first (C1):
+/// the key, so it takes read access to the [`VaultRotationLock`] first:
 /// during a master-password change it answers "being re-encrypted" instead
 /// of failing to decrypt.
 fn key_export_in(
@@ -4570,7 +4823,8 @@ pub fn key_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value> {
     )
 }
 
-/// [`key_delete`] without the `AppHandle`, so its lock gate is testable.
+/// [`key_delete`] without the `AppHandle`, so its lock gate is testable. The
+/// key is gone once `delete_key` returns: a failed audit row is a `warning`.
 fn key_delete_in(
     db: &db::Database,
     vault: &VaultPasswordStore,
@@ -4578,8 +4832,14 @@ fn key_delete_in(
 ) -> CmdResult<serde_json::Value> {
     require_unlocked(vault)?;
     db.delete_key(id).map_err(|e| e.to_string())?;
-    db.add_audit("keys.deleted", Some(id), "")?;
-    Ok(serde_json::json!({ "ok": true }))
+    let warning = audit_or_warn(
+        db,
+        "keys.deleted",
+        Some(id),
+        "",
+        "The key was deleted, but its audit row could not be written",
+    );
+    Ok(serde_json::json!({ "ok": true, "warning": warning }))
 }
 
 /// Rename a stored key. There was previously no way to change a key's name
@@ -4611,7 +4871,7 @@ fn key_rename_in(
 ) -> CmdResult<serde_json::Value> {
     require_unlocked(vault)?;
     // A vault write like the others: not while a master-password change
-    // runs (C1). The rename itself touches only the name (`rename_key`), so
+    // runs. The rename itself touches only the name (`rename_key`), so
     // it can no longer write back a stale row - a deployment recorded by a
     // deploy running off the main thread used to be erased that way.
     let _rotation = rotation.try_shared()?;
@@ -4629,8 +4889,14 @@ fn key_rename_in(
     // Another key's name, in any case, is refused (A2-46 / A5-25); a change
     // of case to the key's own name is not a clash.
     write_with_free_key_name(db, &name, Some(id), || db.rename_key(id, &name))?;
-    db.add_audit("keys.renamed", Some(id), &format!("{} -> {name}", key.name))?;
-    Ok(serde_json::json!({ "ok": true, "name": name }))
+    let warning = audit_or_warn(
+        db,
+        "keys.renamed",
+        Some(id),
+        &format!("{} -> {name}", key.name),
+        "The key was renamed, but its audit row could not be written",
+    );
+    Ok(serde_json::json!({ "ok": true, "name": name, "warning": warning }))
 }
 
 /// Write the audit row of something that has already happened. A failure
@@ -4708,7 +4974,7 @@ fn plan_key_deploy(
 /// same code. The deploy sheet shows this instead of building its own guess
 /// (A2-05 / A7-04 / A8-01 / A5-04). Nothing is decrypted.
 ///
-/// Async, with the work on the blocking pool (item 8 audit): it reads the
+/// Async, with the work on the blocking pool: it reads the
 /// managed config and the user's ~/.ssh/config, which as a synchronous
 /// command ran on the main thread on every change in the deploy sheet.
 #[tauri::command]
@@ -4811,7 +5077,7 @@ fn key_deploy_in(
     still_current: &dyn Fn() -> CmdResult<()>,
 ) -> CmdResult<serde_json::Value> {
     // Unseals with the master password and records the deployment: taken
-    // before the first read, not while a master-password change runs (C1).
+    // before the first read, not while a master-password change runs.
     let _rotation = rotation.try_shared()?;
     let pw = store.get().unwrap_or_default();
     if pw.is_empty() {
@@ -4890,7 +5156,7 @@ fn key_deploy_in(
 /// (`let _ = fs::remove_file`) and clear the record anyway, with the secret
 /// still on disk, and it never touched the stanza.
 ///
-/// Async, with the work on the blocking pool (RU6b item 8 audit): it deletes
+/// Async, with the work on the blocking pool: it deletes
 /// files in ~/.ssh and rewrites the managed config, which as a synchronous
 /// command ran on the main thread.
 #[tauri::command]
@@ -4919,7 +5185,7 @@ fn key_remove_deployed_in(
     // Deleting local files is a privileged side effect; refuse while locked.
     require_unlocked(vault)?;
     // Rewrites the key's deployment columns: taken before the first read,
-    // not while a master-password change runs (C1).
+    // not while a master-password change runs.
     let _rotation = rotation.try_shared()?;
     let key = db
         .get_key(id)
@@ -4931,8 +5197,9 @@ fn key_remove_deployed_in(
     if let Some(deploy_path) = key.deploy_path.as_deref() {
         // Only a file a deploy writes - `sshspan_*` directly in the managed
         // SSH directory - is ever deleted. The stored path is normally the
-        // deploy's own, but a pre-F9 backup restore or a tampered database
-        // could point it anywhere, the user's own keys in ~/.ssh included.
+        // deploy's own, but a backup restored by an older version or a
+        // tampered database could point it anywhere, the user's own keys in
+        // ~/.ssh included.
         if SshService::is_managed_deploy_path(target, deploy_path) {
             removed = match SshService::remove_key(target, deploy_path) {
                 Ok(done) => done,
@@ -5020,7 +5287,7 @@ pub fn category_create(
     parent_id: Option<String>,
     color: Option<String>,
     scope: Option<String>,
-) -> CmdResult<db::Category> {
+) -> CmdResult<serde_json::Value> {
     category_create_in(
         &app.state::<AppState>().db,
         &app.state::<VaultPasswordStore>(),
@@ -5032,6 +5299,7 @@ pub fn category_create(
 }
 
 /// [`category_create`] without the `AppHandle`, so its lock gate is testable.
+/// The answer is the new category's fields.
 fn category_create_in(
     db: &db::Database,
     vault: &VaultPasswordStore,
@@ -5039,7 +5307,7 @@ fn category_create_in(
     parent_id: Option<String>,
     color: Option<String>,
     scope: Option<String>,
-) -> CmdResult<db::Category> {
+) -> CmdResult<serde_json::Value> {
     require_unlocked(vault)?;
     let scope = scope.unwrap_or_else(|| "key".to_string());
     if scope != "key" && scope != "host" {
@@ -5076,26 +5344,43 @@ fn category_create_in(
         updated_at: now,
     };
     db.insert_category(&cat).map_err(|e| e.to_string())?;
-    db.add_audit(
+    // The category exists: a failed audit row is a warning next to it.
+    let warning = audit_or_warn(
+        db,
         "category.created",
         None,
         &format!("{} ({})", cat.name, cat.id),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(cat)
+        "The category was created, but its audit row could not be written",
+    );
+    let mut answer = serde_json::to_value(&cat).map_err(|e| CmdError(e.to_string()))?;
+    answer["warning"] = serde_json::json!(warning);
+    Ok(answer)
 }
 
+/// Rename a category. Async, with the work on the blocking pool: its
+/// transaction may wait for another connection's write, which a synchronous
+/// command did on the main thread.
 #[tauri::command]
-pub fn category_rename(app: AppHandle, id: String, name: String) -> CmdResult<serde_json::Value> {
-    category_rename_in(
-        &app.state::<AppState>().db,
-        &app.state::<VaultPasswordStore>(),
-        &id,
-        name,
-    )
+pub async fn category_rename(
+    app: AppHandle,
+    id: String,
+    name: String,
+) -> CmdResult<serde_json::Value> {
+    run_blocking(move || {
+        category_rename_in(
+            &app.state::<AppState>().db,
+            &app.state::<VaultPasswordStore>(),
+            &id,
+            name,
+        )
+    })
+    .await
 }
 
 /// [`category_rename`] without the `AppHandle`, so its lock gate is testable.
+/// Writes the name only - a move committed meanwhile stays - and marks what
+/// is filed under the category changed for the Bitwarden sync, in one
+/// transaction ([`db::Database::rename_category`]).
 fn category_rename_in(
     db: &db::Database,
     vault: &VaultPasswordStore,
@@ -5103,18 +5388,14 @@ fn category_rename_in(
     name: String,
 ) -> CmdResult<serde_json::Value> {
     require_unlocked(vault)?;
-    let mut c = db
-        .get_category(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Category not found.".to_string())?;
-    c.name = name;
-    c.updated_at = chrono::Utc::now();
-    db.update_category(&c).map_err(|e| e.to_string())?;
+    if !db.rename_category(id, &name).map_err(|e| e.to_string())? {
+        return Err("Category not found.".into());
+    }
     Ok(serde_json::json!({ "ok": true }))
 }
 
 /// Move a category under another one (or to the top level). Async, with the
-/// work on the blocking pool (item 12): it used to run on the main thread,
+/// work on the blocking pool: it used to run on the main thread,
 /// where a walk that never ended froze the whole window.
 #[tauri::command]
 pub async fn category_reparent(
@@ -5135,6 +5416,106 @@ pub async fn category_reparent(
     .await
 }
 
+/// Number the categories `ordered_ids` - siblings in the tree, in the order
+/// shown - `sort_index` 0, 1, 2, ... ([`category_set_order_in`]).
+#[tauri::command]
+pub async fn category_set_order(
+    app: AppHandle,
+    parent_id: Option<String>,
+    ordered_ids: Vec<String>,
+) -> CmdResult<serde_json::Value> {
+    run_blocking(move || {
+        category_set_order_in(
+            &app.state::<AppState>().db,
+            &app.state::<VaultPasswordStore>(),
+            app.state::<VaultRotationLock>().inner(),
+            parent_id,
+            ordered_ids,
+        )
+    })
+    .await
+}
+
+/// [`category_set_order`] without the `AppHandle`: `sort_index` = position
+/// for exactly the categories `ordered_ids`, never a parent, in one
+/// transaction ([`db::Database::set_category_order`]). The only other way to
+/// change an order was a move, which walks the parents and refuses a loop -
+/// so next to the categories of a parent loop (a restored vault can hold
+/// one; the tree shows them at the top level) nothing could be reordered.
+///
+/// `parent_id` names the list the renderer shows, and every category in it
+/// must be in that list: a category of `parent_id` (and of one scope).
+/// The top level (`None`) is where the tree shows a category whose saved
+/// parent no longer exists or whose chain of parents never reaches the top
+/// (a member of a parent loop, or a category below one): those count as
+/// top-level here too. Refused - nothing written - for a category that does
+/// not exist, one named twice, a list mixing parents or scopes, or one that
+/// leaves out a category of its list (the renderer sends the whole list as
+/// shown; one left out kept a position another now had). Lock- and
+/// rotation-gated like the other category writes.
+fn category_set_order_in(
+    db: &db::Database,
+    vault: &VaultPasswordStore,
+    rotation: &VaultRotationLock,
+    parent_id: Option<String>,
+    ordered_ids: Vec<String>,
+) -> CmdResult<serde_json::Value> {
+    require_unlocked(vault)?;
+    let _rotation = rotation.try_shared()?;
+    db.set_category_order(&ordered_ids, |all| {
+        let mut named = std::collections::HashSet::new();
+        if !ordered_ids.iter().all(|id| named.insert(id.as_str())) {
+            return Err(CmdError("The list names a category twice.".into()).into());
+        }
+        let by_id: std::collections::HashMap<&str, &db::Category> =
+            all.iter().map(|c| (c.id.as_str(), c)).collect();
+        let mut listed = Vec::with_capacity(ordered_ids.len());
+        for id in &ordered_ids {
+            let category = by_id
+                .get(id.as_str())
+                .ok_or_else(|| CmdError("That category no longer exists.".into()))?;
+            listed.push(*category);
+        }
+        let shown_at_top = |c: &db::Category| match c.parent_id.as_deref() {
+            None => true,
+            Some(parent) => {
+                !by_id.contains_key(parent)
+                    || matches!(db::category_chain(all, &c.id), db::CategoryChain::NoRoot(_))
+            }
+        };
+        let in_list = |c: &db::Category| match parent_id.as_deref() {
+            Some(parent) => c.parent_id.as_deref() == Some(parent),
+            None => shown_at_top(c),
+        };
+        let one_scope = listed.windows(2).all(|pair| pair[0].scope == pair[1].scope);
+        if !one_scope || !listed.iter().all(|c| in_list(c)) {
+            return Err(CmdError(
+                "Those categories do not share a parent - reload the categories and try again."
+                    .into(),
+            )
+            .into());
+        }
+        // The whole list: every category of that parent and scope. One left
+        // out kept its old position - another one's now.
+        if let Some(scope) = listed.first().map(|c| c.scope.as_str()) {
+            let left_out = all
+                .iter()
+                .any(|c| c.scope == scope && in_list(c) && !named.contains(c.id.as_str()));
+            if left_out {
+                return Err(CmdError(CATEGORY_ORDER_INCOMPLETE.into()).into());
+            }
+        }
+        Ok(())
+    })
+    .map_err(CmdError::from)?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// What `category_set_order` refuses when its list leaves out a category of
+/// that list.
+const CATEGORY_ORDER_INCOMPLETE: &str =
+    "The new order must name every category under that parent - reload the categories and try again.";
+
 /// Said when the new parent's own chain of parents runs in a loop.
 const CATEGORY_LOOP_REFUSAL: &str =
     "That category is part of a loop - move one of its categories to the top level first.";
@@ -5146,7 +5527,7 @@ const CATEGORY_LOOP_REFUSAL: &str =
 /// refused when the chain contains the category ("That move would create a
 /// cycle.") or has no top (a parent loop a restored vault can hold). The walk
 /// it replaces had no visited set: a destination inside a loop that does not
-/// contain the moved category never returned (JU4 review N1). The checks and
+/// contain the moved category never returned. The checks and
 /// the write are one transaction ([`db::Database::move_category`]), which
 /// writes the parent and the position only.
 fn category_reparent_in(
@@ -5206,9 +5587,14 @@ fn category_delete_in(
 ) -> CmdResult<serde_json::Value> {
     require_unlocked(vault)?;
     let reassigned = db.delete_category(id).map_err(|e| e.to_string())?;
-    db.add_audit("category.deleted", None, id)
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true, "reassigned": reassigned }))
+    let warning = audit_or_warn(
+        db,
+        "category.deleted",
+        None,
+        id,
+        "The category was deleted, but its audit row could not be written",
+    );
+    Ok(serde_json::json!({ "ok": true, "reassigned": reassigned, "warning": warning }))
 }
 
 #[tauri::command]
@@ -5256,18 +5642,22 @@ fn key_set_categories_in(
     db.set_key_categories(key_id, category_ids)
         .map_err(|e| e.to_string())?;
     // Categories travel in the Bitwarden item's notes but live in no key
-    // column: a real change has to mark the key changed or it never syncs
-    // (A7-23). Saving the same set again is not a change.
+    // column: a real change is marked for the sync or it never uploads
+    // (A7-23) - as a category change, so it never uploads the key's other
+    // fields over newer ones in Bitwarden. Saving the same set again is not
+    // a change.
     if before != after {
-        db.mark_key_changed(key_id).map_err(|e| e.to_string())?;
+        db.mark_key_categories_changed(key_id)
+            .map_err(|e| e.to_string())?;
     }
-    db.add_audit(
+    let warning = audit_or_warn(
+        db,
         "key.categories_set",
         Some(key_id),
         &category_ids.len().to_string(),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
+        "The key's categories were saved, but their audit row could not be written",
+    );
+    Ok(serde_json::json!({ "ok": true, "warning": warning }))
 }
 
 /// A New Key request, checked before any generation starts.
@@ -5371,7 +5761,7 @@ fn create_key_in(
     let key_data = keys::generate_key_pair(request.key_type, request.bits, request.comment)
         .map_err(|e| e.to_string())?;
 
-    // Seals with the master password: not while it is being changed (C1).
+    // Seals with the master password: not while it is being changed.
     let _rotation = rotation.try_shared()?;
     let pw = store.get().unwrap_or_default();
     if pw.is_empty() {
@@ -5405,30 +5795,28 @@ fn create_key_in(
     write_with_free_key_name(db, &key_record.name, None, || {
         db.insert_key_with_categories(&key_record, &request.category_ids)
     })?;
-    db.add_audit("keys.created", Some(&key_record.id), &key_record.name)?;
-    Ok(serde_json::json!({ "ok": true, "id": key_record.id, "fingerprint": fingerprint }))
+    // The key is stored: a failed audit row must not read as a failure - a
+    // retry would then be refused with "already exists".
+    let warning = audit_or_warn(
+        db,
+        "keys.created",
+        Some(&key_record.id),
+        &key_record.name,
+        "The key was created, but its audit row could not be written",
+    );
+    Ok(serde_json::json!({
+        "ok": true,
+        "id": key_record.id,
+        "fingerprint": fingerprint,
+        "warning": warning,
+    }))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  SSH CONFIG commands
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// NOT REGISTERED in `generate_handler!`, deliberately.
-///
-/// `SshConfig::parse` round-trips unknown directives through `extra`, so this
-/// let a caller write ANY ssh_config directive - ProxyCommand, IdentityFile,
-/// StrictHostKeyChecking no - into the managed config, with no vault gate at
-/// all. The UI writes that file only through `key_deploy`, which validates
-/// what it interpolates.
-#[tauri::command]
-pub fn ssh_config_write(content: String) -> CmdResult<serde_json::Value> {
-    let config = crate::config::SshConfig::parse(&content);
-    let config_service = SshConfigService::new().map_err(|e| e.to_string())?;
-    config_service.write(&config).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
-}
-
-/// Hosts for the server dialog's "Config" import (R4). `source`:
+/// Hosts for the server dialog's "Config" import. `source`:
 /// - `"user"` (the default): the user's own `~/.ssh/config`, read-only -
 ///   `Include` followed one level, `Match` blocks and wildcard or negated
 ///   `Host` patterns skipped (see `config::read_user_ssh_config`);
@@ -5605,7 +5993,7 @@ pub async fn bitwarden_save_config(
         return Err("Vault is locked.".into());
     }
     // Seals the Bitwarden password with the master password: not while that
-    // is being changed (C1).
+    // is being changed.
     let _rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
 
@@ -5620,7 +6008,7 @@ pub async fn bitwarden_save_config(
 
     // SSRF-validate the server URL and seal a new password off the main
     // thread; then ONE transaction re-reads the settings, keeps a stored
-    // password only for its own server and account (F1 / F1-b) and writes.
+    // password only for its own server and account and writes.
     let prepare = run_blocking(move || {
         let server_url = crate::bitwarden::ssrf::resolve_safe_server_url(&server_url)
             .map_err(|e| CmdError(e.to_string()))?;
@@ -5641,12 +6029,27 @@ pub async fn bitwarden_save_config(
             servers_folder_name,
         })
     });
-    crate::bitwarden::save_bitwarden_settings(&db, async move { prepare.await.map_err(|e| e.0) })
+    save_bitwarden_config_in(&db, async move { prepare.await.map_err(|e| e.0) }).await
+}
+
+/// The write and the audit row of [`bitwarden_save_config`], without the
+/// `AppHandle`: `prepare` is the slow part (URL check, seal).
+async fn save_bitwarden_config_in(
+    db: &db::Database,
+    prepare: impl std::future::Future<Output = Result<crate::bitwarden::BitwardenSave, String>>,
+) -> CmdResult<serde_json::Value> {
+    crate::bitwarden::save_bitwarden_settings(db, prepare)
         .await
         .map_err(CmdError)?;
-    db.add_audit("sync.config", None, "saved")
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
+    // The settings are stored: a failed audit row is a warning.
+    let warning = audit_or_warn(
+        db,
+        "sync.config",
+        None,
+        "saved",
+        "The sync settings were saved, but their audit row could not be written",
+    );
+    Ok(serde_json::json!({ "ok": true, "warning": warning }))
 }
 
 /// Log in to a vault and list what it holds, without changing anything. Each
@@ -5664,7 +6067,7 @@ pub async fn bitwarden_test_connection(
 ) -> CmdResult<serde_json::Value> {
     let master_password = master_password.map(zeroize::Zeroizing::new);
     // Reads - and may unseal - the stored Bitwarden password: not while a
-    // master-password change re-encrypts it (C1 / F2). Held until the unseal
+    // master-password change re-encrypts it. Held until the unseal
     // is done.
     let rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
@@ -5677,7 +6080,7 @@ pub async fn bitwarden_test_connection(
         .load_bitwarden_config()
         .map_err(|e| e.to_string())?;
     // The URL check (a blocking DNS lookup) and the Argon2id unseal run on
-    // the blocking pool, not on an async worker (A7-48 / F2).
+    // the blocking pool, not on an async worker (A7-48).
     let saved = config.clone();
     let target = run_blocking(move || {
         crate::bitwarden::resolve_test_target(
@@ -5748,13 +6151,22 @@ pub async fn bitwarden_test_connection(
 /// or one `sync.error` when the sync fails before comparing anything (login,
 /// vault fetch) - names, ids and error messages only, never secrets. A run
 /// that stops part-way (vault locked, an error mid-run) returns, stores and
-/// audits its counts so far with `ok: false` and `aborted: <reason>` (M7).
+/// audits its counts so far with `ok: false` and `aborted: <reason>`.
+///
+/// Remote changes (newer Bitwarden copies, new items) are only listed -
+/// `pendingServers` / `pendingKeys` with an `approvalToken` - until a run
+/// comes with `allowRemoteOverwrite: true` AND that token: then they are
+/// applied if this run's own fetch finds exactly the changes the token was
+/// issued for, and otherwise nothing is applied and the new list comes back
+/// with `approvalStale: true`. `allowRemoteOverwrite` alone applies
+/// nothing.
 #[tauri::command]
 pub async fn bitwarden_sync(
     app: AppHandle,
     allow_remote_overwrite: Option<bool>,
+    approval_token: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    // Held for the whole run (C1): the sync seals pulled keys and server
+    // Held for the whole run: the sync seals pulled keys and server
     // passwords with the master password it reads below, between network
     // round trips, and rewrites key/server rows - a master-password change
     // must neither start in the middle nor be running when it starts.
@@ -5783,12 +6195,13 @@ pub async fn bitwarden_sync(
 
     let pw = vault_password(&app)?;
     // Zeroizing: the decrypted Bitwarden master password is wiped on drop.
+    // Argon2id, on the blocking pool.
+    let mut plain = unseal_off_thread(&pw, &mp_sealed)
+        .await
+        .map_err(|_| "Failed to decrypt stored Bitwarden password.".to_string())?;
     let master_password = zeroize::Zeroizing::new(
-        String::from_utf8(
-            crate::crypto::vault::unseal(&pw, &mp_sealed)
-                .map_err(|_| "Failed to decrypt stored Bitwarden password.".to_string())?,
-        )
-        .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())?,
+        String::from_utf8(std::mem::take(&mut *plain))
+            .map_err(|_| "Stored Bitwarden password is corrupted.".to_string())?,
     );
 
     let device_id = config
@@ -5807,6 +6220,12 @@ pub async fn bitwarden_sync(
     let app_for_cancel = app.clone();
     let cancelled = move || require_generation_current(&app_for_cancel, generation).is_err();
 
+    let remote_changes = match approval_token.as_deref() {
+        Some(token) if allow_remote_overwrite == Some(true) => {
+            crate::bitwarden::sync::RemoteChanges::ApproveIf(token)
+        }
+        _ => crate::bitwarden::sync::RemoteChanges::Ask,
+    };
     // run_sync is async (network + DB). The DB layer internally hops onto a
     // blocking thread when called from within the async runtime, so awaiting
     // it directly here is safe and does not nest a tokio runtime.
@@ -5819,7 +6238,7 @@ pub async fn bitwarden_sync(
         &servers_folder_name,
         &db,
         &pw,
-        allow_remote_overwrite.unwrap_or(false),
+        remote_changes,
         &cancelled,
     )
     .await
@@ -5909,15 +6328,17 @@ mod ru5_tests {
             .unwrap()
             .unwrap();
         key_set_categories_in(&db, &unlocked(), &key.id, std::slice::from_ref(&prod)).unwrap();
-        let changed = db.get_key(&key.id).unwrap().unwrap();
-        assert!(
-            changed.updated_at > long_ago,
-            "a category change must mark the key changed"
-        );
+        let marked = db
+            .category_mark("key", &key.id)
+            .unwrap()
+            .expect("a category change must mark the key for the sync");
+        // As a category change: the key itself is untouched, so the sync
+        // never uploads its other fields over newer ones for it.
+        assert_eq!(db.get_key(&key.id).unwrap().unwrap().updated_at, long_ago);
         // Saving the same set again is not a change.
+        db.clear_category_mark("key", &key.id, marked).unwrap();
         key_set_categories_in(&db, &unlocked(), &key.id, &[prod]).unwrap();
-        let again = db.get_key(&key.id).unwrap().unwrap();
-        assert_eq!(again.updated_at, changed.updated_at);
+        assert_eq!(db.category_mark("key", &key.id).unwrap(), None);
     }
 
     #[test]
@@ -6352,13 +6773,13 @@ pub fn system_open_external(url: String) -> CmdResult<serde_json::Value> {
     }
     // Enforce the inert-extension policy AT THE OPENER, not just in the
     // staging flow. The staging flow names files safely, but the renderer
-    // controls which staged path it passes here: without this check a
-    // compromised renderer could `sftp_stage_path` + `sftp_download` remote
-    // bytes into `<staging>/x.exe` and have the OS shell EXECUTE it via this
-    // command. Only extensions whose OS handler is an editor/viewer (the
-    // staging allowlist) may be handed to the shell; everything else is
-    // refused before any OS call. This is the backend-owned boundary the
-    // audit's executable-staging chain broke through.
+    // controls which path it passes here: without this check a compromised
+    // renderer could `sftp_download` remote bytes into `<staging>/x.exe` and
+    // have the OS shell EXECUTE it via this command. Only extensions whose OS
+    // handler is an editor/viewer (the staging allowlist) may be handed to
+    // the shell; everything else is refused before any OS call. This is the
+    // backend-owned boundary the audit's executable-staging chain broke
+    // through.
     if !crate::sftp::path_has_inert_extension(&resolved) {
         return Err(
             "system_open_external refuses to open non-text staged files (possible executable)."
@@ -6562,7 +6983,7 @@ mod ru6b_tests {
         vault
     }
 
-    // ── Item 12: moving a category never walks a parent loop forever ─────
+    // ── Moving a category never walks a parent loop forever ─────
 
     fn category(id: &str, parent: Option<&str>) -> db::Category {
         db::Category {
@@ -6581,10 +7002,11 @@ mod ru6b_tests {
         "That category is part of a loop - move one of its categories to the top level first.";
     const CYCLE_REFUSAL: &str = "That move would create a cycle.";
 
-    /// `category_reparent_in`, or a failure when it does not return within
-    /// two seconds (the walk it replaces never did on a parent loop - on the
-    /// main thread, freezing the window).
-    fn reparent_within_two_seconds(
+    /// `category_reparent_in`, or a failure when it does not return (the
+    /// walk it replaces never did on a parent loop - on the main thread,
+    /// freezing the window). The limit is wide for a loaded machine: a walk
+    /// that never ends fails it all the same.
+    fn reparent_that_returns(
         db: &db::Database,
         id: &str,
         parent: Option<&str>,
@@ -6595,7 +7017,7 @@ mod ru6b_tests {
             let _ = done.send(category_reparent_in(&db, &unlocked(), id, parent, None));
         });
         result
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(30))
             .expect("category_reparent must return (parent loop)")
     }
 
@@ -6616,19 +7038,19 @@ mod ru6b_tests {
         // A self-loop, a two-node loop, and a loop reached through a
         // category that is not part of it: none of them has a top.
         for dest in ["self", "a", "n"] {
-            let err = reparent_within_two_seconds(&db, "x", Some(dest)).unwrap_err();
+            let err = reparent_that_returns(&db, "x", Some(dest)).unwrap_err();
             assert_eq!(err.0, LOOP_REFUSAL, "under {dest}");
         }
         assert_eq!(db.get_category("x").unwrap().unwrap().parent_id, None);
         // Under its own descendant, or into a loop that contains it: a cycle.
-        let err = reparent_within_two_seconds(&db, "root", Some("child")).unwrap_err();
+        let err = reparent_that_returns(&db, "root", Some("child")).unwrap_err();
         assert_eq!(err.0, CYCLE_REFUSAL);
-        let err = reparent_within_two_seconds(&db, "a", Some("n")).unwrap_err();
+        let err = reparent_that_returns(&db, "a", Some("n")).unwrap_err();
         assert_eq!(err.0, CYCLE_REFUSAL);
         // The repair moves work: a loop member to the top level, or under a
         // category that has a top.
-        reparent_within_two_seconds(&db, "b", None).unwrap();
-        reparent_within_two_seconds(&db, "self", Some("root")).unwrap();
+        reparent_that_returns(&db, "b", None).unwrap();
+        reparent_that_returns(&db, "self", Some("root")).unwrap();
         assert_eq!(
             db.get_category("self")
                 .unwrap()
@@ -6638,7 +7060,7 @@ mod ru6b_tests {
             Some("root")
         );
         // The loop is gone, so moving under its old members works again.
-        reparent_within_two_seconds(&db, "x", Some("n")).unwrap();
+        reparent_that_returns(&db, "x", Some("n")).unwrap();
         assert_eq!(
             db.get_category("x").unwrap().unwrap().parent_id.as_deref(),
             Some("n")
@@ -6658,7 +7080,7 @@ mod ru6b_tests {
             "UPDATE categories SET parent_id = 'a' WHERE id = 'b'",
             300,
         );
-        let result = reparent_within_two_seconds(&db, "a", Some("b"));
+        let result = reparent_that_returns(&db, "a", Some("b"));
         holder.join().unwrap();
         assert_eq!(
             db.get_category("a").unwrap().unwrap().parent_id,
@@ -6680,14 +7102,14 @@ mod ru6b_tests {
             "UPDATE categories SET name = 'renamed' WHERE id = 'a'",
             300,
         );
-        reparent_within_two_seconds(&db, "a", Some("root")).unwrap();
+        reparent_that_returns(&db, "a", Some("root")).unwrap();
         holder.join().unwrap();
         let a = db.get_category("a").unwrap().unwrap();
         assert_eq!(a.name, "renamed");
         assert_eq!(a.parent_id.as_deref(), Some("root"));
     }
 
-    // ── Item 8: the vault commands are safe to run off the main thread ───
+    // ── The vault commands are safe to run off the main thread ───
 
     /// Off the main thread, two creates can overlap (a double click): the
     /// second wrote its verifier over the first's while the first's password
@@ -6806,9 +7228,9 @@ mod ru6b_tests {
         assert!(store.is_set());
     }
 
-    // ── RU6b fix round 1 ─────────────────────────────────────────────────
+    // ── Unlock and password-change races, concurrent imports ─────────────
 
-    /// Security review: an unlock with the OLD password that verified before
+    /// An unlock with the OLD password that verified before
     /// a master-password change committed stored that password after it -
     /// over a vault re-sealed with the new one, so nothing could be unsealed
     /// until the next lock. An unlock is refused while a change runs, like
@@ -7010,5 +7432,791 @@ mod ru6b_tests {
             "{}",
             refused[0]
         );
+    }
+}
+
+/// Audit rows after committed writes, the rotation lock on a blocking-pool
+/// thread, categories for the Bitwarden sync, their order next to a parent
+/// loop, and a lock of a locked vault.
+#[cfg(test)]
+mod rw_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const MASTER: &str = "rw-master";
+
+    fn test_db() -> db::Database {
+        db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-rw-cmd-{}.db", Uuid::new_v4())),
+        )
+        .expect("open test db")
+    }
+
+    fn unlocked() -> VaultPasswordStore {
+        let vault = VaultPasswordStore::new();
+        vault.set(MASTER.into());
+        vault
+    }
+
+    fn key(id: &str, name: &str) -> KeyRecord {
+        KeyRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            key_type: "ed25519".into(),
+            public_key: format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI{id} test"),
+            private_key_encrypted: crate::crypto::vault::seal(MASTER, b"fake-private-key").unwrap(),
+            fingerprint_sha256: format!("SHA256:{id}"),
+            fingerprint_md5: format!("MD5:{id}"),
+            comment: String::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deployed: false,
+            deploy_path: None,
+            bitwarden_id: None,
+            bitwarden_sync: false,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+            category_ids: Vec::new(),
+        }
+    }
+
+    fn category(id: &str, parent: Option<&str>, scope: &str) -> db::Category {
+        db::Category {
+            id: id.into(),
+            name: format!("cat-{id}"),
+            parent_id: parent.map(String::from),
+            scope: scope.into(),
+            color: None,
+            sort_index: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    // ── A committed change is reported as done, even when its audit row
+    //    cannot be written ─────────────────────────────────────────────────
+
+    /// Each of these wrote its change, then failed on the audit row with
+    /// `?`: the user saw an error for something that had happened, and a
+    /// retry failed with "already exists". Now `{ok, warning}`, as the rest.
+    #[test]
+    fn rw_b1_a_committed_change_whose_audit_row_fails_reports_success_with_a_warning() {
+        let db = test_db();
+        let vault = unlocked();
+        let rotation = VaultRotationLock::new();
+        db.insert_key(&key("k1", "first")).unwrap();
+        db.insert_key(&key("k2", "second")).unwrap();
+        db.insert_category(&category("c1", None, "key")).unwrap();
+        db.insert_category(&category("c2", None, "key")).unwrap();
+        crate::assistant::test_support::refuse_audit_rows(&db);
+        let mut failed: Vec<String> = Vec::new();
+        let mut check = |what: &str, result: CmdResult<serde_json::Value>| match result {
+            Ok(out)
+                if out["warning"]
+                    .as_str()
+                    .is_some_and(|w| w.contains("audit row could not be written")) => {}
+            Ok(out) => failed.push(format!("{what}: no warning in {out}")),
+            Err(e) => failed.push(format!("{what}: {}", e.0)),
+        };
+        check(
+            "rename",
+            key_rename_in(&db, &vault, &rotation, "k1", "renamed"),
+        );
+        check(
+            "set categories",
+            key_set_categories_in(&db, &vault, "k1", &["c1".to_string()]),
+        );
+        check(
+            "create category",
+            category_create_in(&db, &vault, "made".into(), None, None, Some("key".into())),
+        );
+        check("delete category", category_delete_in(&db, &vault, "c2"));
+        check("delete key", key_delete_in(&db, &vault, "k2"));
+        let request = NewKey::parse("ed25519", None, Some("generated".into()), None, None).unwrap();
+        check("create key", create_key_in(&db, &vault, &rotation, request));
+        let save = crate::bitwarden::BitwardenSave {
+            server_url: "https://vault.example.com".into(),
+            email: "me@example.com".into(),
+            sealed_password: Some(crate::crypto::vault::seal(MASTER, b"bw").unwrap()),
+            folder_name: "SSHSpan_Keys".into(),
+            servers_folder_name: "SSHSpan_Servers".into(),
+        };
+        check(
+            "save sync settings",
+            tauri::async_runtime::block_on(save_bitwarden_config_in(&db, async {
+                Ok::<_, String>(save)
+            })),
+        );
+        assert!(failed.is_empty(), "{failed:#?}");
+        // Every change is stored.
+        assert_eq!(db.get_key("k1").unwrap().unwrap().name, "renamed");
+        assert_eq!(
+            db.list_categories_for_key("k1").unwrap(),
+            vec!["c1".to_string()]
+        );
+        assert!(db.get_category("c2").unwrap().is_none());
+        assert!(db.get_key("k2").unwrap().is_none());
+        let names: Vec<String> = db
+            .list_keys()
+            .unwrap()
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        assert!(names.contains(&"generated".to_string()), "{names:?}");
+        assert!(db
+            .list_categories()
+            .unwrap()
+            .iter()
+            .any(|c| c.name == "made"));
+        assert_eq!(
+            db.load_bitwarden_config().unwrap().email.as_deref(),
+            Some("me@example.com")
+        );
+    }
+
+    // ── The password change's lock wait on a blocking-pool thread ─
+
+    /// `exclusive_within` builds its own small runtime to wait with a time
+    /// limit, which is only allowed off the async runtime's threads: this
+    /// runs it exactly where `vault_change_password` does, on the blocking
+    /// pool through `run_blocking`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_b7_the_rotation_lock_is_taken_and_given_up_on_a_blocking_pool_thread() {
+        let lock = std::sync::Arc::new(VaultRotationLock::new());
+        let free = lock.clone();
+        run_blocking(move || {
+            free.exclusive_within(Duration::from_secs(1))
+                .map(|_held| ())
+        })
+        .await
+        .expect("a free lock is taken");
+        let reader = lock.try_shared().unwrap();
+        let busy = lock.clone();
+        let started = std::time::Instant::now();
+        let err = run_blocking(move || {
+            busy.exclusive_within(Duration::from_millis(300))
+                .map(|_held| ())
+        })
+        .await
+        .expect_err("a held lock is given up on after the limit");
+        assert_eq!(err.0, ROTATION_LOCK_BUSY);
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        drop(reader);
+    }
+
+    // ── Renaming or moving a category ──────────────────────────
+
+    const OLD: &str = "2020-01-01T00:00:00+00:00";
+
+    /// Mark every key and server as uploaded long ago, with no category
+    /// change pending.
+    fn age_everything(db: &db::Database) {
+        let keys = format!("UPDATE keys SET updated_at = '{OLD}'");
+        let servers = format!("UPDATE servers SET updated_at = '{OLD}'");
+        db::test_support::hold_write(
+            db,
+            &[
+                keys.as_str(),
+                servers.as_str(),
+                "DELETE FROM sync_category_marks",
+            ],
+            0,
+        )
+        .join()
+        .unwrap();
+    }
+
+    fn old() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(OLD)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Whether the key's category path is marked for upload - as a category
+    /// change: the row itself is untouched, so the sync never uploads its
+    /// other fields over newer ones for it.
+    fn key_changed(db: &db::Database, id: &str) -> bool {
+        assert_eq!(db.get_key(id).unwrap().unwrap().updated_at, old());
+        db.category_mark("key", id).unwrap().is_some()
+    }
+
+    /// [`key_changed`] for a server.
+    fn server_changed(db: &db::Database, id: &str) -> bool {
+        assert_eq!(db.get_server(id).unwrap().unwrap().updated_at, old());
+        db.category_mark("server", id).unwrap().is_some()
+    }
+
+    /// A key's (and a server's) category path travels in its Bitwarden
+    /// item's notes, so renaming or moving a category changes what the sync
+    /// uploads for everything under it - and nothing was marked: the notes
+    /// kept the old path, and a pull filed the keys under it again.
+    #[test]
+    fn rw_b7_renaming_or_moving_a_category_marks_what_is_under_it_changed() {
+        let db = test_db();
+        let vault = unlocked();
+        for c in [
+            category("root", None, "key"),
+            category("child", Some("root"), "key"),
+            category("other", None, "key"),
+            category("hosts", None, "host"),
+            category("rack", Some("hosts"), "host"),
+        ] {
+            db.insert_category(&c).unwrap();
+        }
+        db.insert_key(&key("under", "under")).unwrap();
+        db.set_key_categories("under", &["child".to_string()])
+            .unwrap();
+        db.insert_key(&key("elsewhere", "elsewhere")).unwrap();
+        db.set_key_categories("elsewhere", &["other".to_string()])
+            .unwrap();
+        let now = chrono::Utc::now();
+        db.insert_server(&db::ServerRecord {
+            id: "s1".into(),
+            name: "srv".into(),
+            host: "srv.example".into(),
+            port: 22,
+            username: "u".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "publickey".into(),
+            saved_password: None,
+            category_id: Some("rack".into()),
+            color: None,
+            last_connected_at: None,
+            created_at: now,
+            updated_at: now,
+            bitwarden_id: None,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        })
+        .unwrap();
+
+        age_everything(&db);
+        category_rename_in(&db, &vault, "root", "renamed".into()).unwrap();
+        assert!(
+            key_changed(&db, "under"),
+            "a key below the renamed category"
+        );
+        assert!(!key_changed(&db, "elsewhere"), "a key elsewhere");
+
+        age_everything(&db);
+        category_rename_in(&db, &vault, "root", "renamed".into()).unwrap();
+        assert!(!key_changed(&db, "under"), "the same name is no change");
+
+        age_everything(&db);
+        category_reparent_in(&db, &vault, "child".into(), Some("other".into()), None).unwrap();
+        assert!(key_changed(&db, "under"), "a key in the moved category");
+        assert!(!key_changed(&db, "elsewhere"), "a key of the new parent");
+
+        age_everything(&db);
+        category_reparent_in(&db, &vault, "child".into(), Some("other".into()), Some(3)).unwrap();
+        assert!(
+            !key_changed(&db, "under"),
+            "a new position under the same parent"
+        );
+
+        age_everything(&db);
+        category_rename_in(&db, &vault, "hosts", "racks".into()).unwrap();
+        assert!(
+            server_changed(&db, "s1"),
+            "a server below the renamed host category"
+        );
+    }
+
+    /// What a rename or a move marks is walked with a visited set: a parent
+    /// loop (a restored vault can hold one) ends the walk.
+    #[test]
+    fn rw_b7_the_marked_subtree_ends_on_a_parent_loop() {
+        let all = [
+            category("a", Some("b"), "key"),
+            category("b", Some("a"), "key"),
+            category("c", Some("b"), "key"),
+            category("x", None, "key"),
+        ];
+        let mut below_a = db::category_subtree(&all, "a");
+        below_a.sort();
+        assert_eq!(below_a, ["a", "b", "c"]);
+        assert_eq!(db::category_subtree(&all, "x"), ["x"]);
+        let db = test_db();
+        for c in &all {
+            db.insert_category(c).unwrap();
+        }
+        category_rename_in(&db, &unlocked(), "a", "renamed".into()).unwrap();
+        assert_eq!(db.get_category("a").unwrap().unwrap().name, "renamed");
+    }
+
+    /// The rename wrote the whole category row it had read, so a move that
+    /// committed meanwhile (moves run off the main thread) was undone.
+    #[test]
+    fn rw_b7_a_rename_keeps_a_move_that_commits_meanwhile() {
+        let db = test_db();
+        let vault = unlocked();
+        db.insert_category(&category("a", None, "key")).unwrap();
+        db.insert_category(&category("b", None, "key")).unwrap();
+        let mover = db::test_support::hold_write(
+            &db,
+            &["UPDATE categories SET parent_id = 'b' WHERE id = 'a'"],
+            300,
+        );
+        category_rename_in(&db, &vault, "a", "renamed".into()).unwrap();
+        mover.join().unwrap();
+        let a = db.get_category("a").unwrap().unwrap();
+        assert_eq!(a.name, "renamed");
+        assert_eq!(
+            a.parent_id.as_deref(),
+            Some("b"),
+            "the move that committed meanwhile is kept"
+        );
+        assert_eq!(
+            category_rename_in(&db, &vault, "missing", "x".into())
+                .unwrap_err()
+                .0,
+            "Category not found."
+        );
+    }
+
+    // ── The order of categories next to a parent loop ────────────────
+
+    fn sort_and_parent(db: &db::Database, id: &str) -> (i64, Option<String>) {
+        let c = db.get_category(id).unwrap().unwrap();
+        (c.sort_index, c.parent_id)
+    }
+
+    /// A vault restored with a parent loop shows the loop's categories at
+    /// the top level, and the renderer could not reorder rows next to them:
+    /// its only write was a move, which walks parents and refuses loops.
+    /// `category_set_order` numbers exactly the categories given and never
+    /// touches a parent.
+    #[test]
+    fn rw_s7_categories_are_renumbered_next_to_loop_roots_without_a_parent_change() {
+        let db = test_db();
+        let vault = unlocked();
+        let rotation = VaultRotationLock::new();
+        for c in [
+            category("r1", None, "key"),
+            category("r2", None, "key"),
+            category("a", Some("b"), "key"),
+            category("b", Some("a"), "key"),
+            category("orphan", Some("deleted-parent"), "key"),
+            category("child", Some("r1"), "key"),
+            category("c2", Some("r1"), "key"),
+        ] {
+            db.insert_category(&c).unwrap();
+        }
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        category_set_order_in(
+            &db,
+            &vault,
+            &rotation,
+            None,
+            ids(&["b", "r2", "orphan", "a", "r1"]),
+        )
+        .unwrap();
+        assert_eq!(sort_and_parent(&db, "b"), (0, Some("a".to_string())));
+        assert_eq!(sort_and_parent(&db, "r2"), (1, None));
+        assert_eq!(
+            sort_and_parent(&db, "orphan"),
+            (2, Some("deleted-parent".to_string()))
+        );
+        assert_eq!(sort_and_parent(&db, "a"), (3, Some("b".to_string())));
+        assert_eq!(sort_and_parent(&db, "r1"), (4, None));
+        // Children of one parent, with it named.
+        category_set_order_in(
+            &db,
+            &vault,
+            &rotation,
+            Some("r1".into()),
+            ids(&["c2", "child"]),
+        )
+        .unwrap();
+        assert_eq!(sort_and_parent(&db, "c2"), (0, Some("r1".to_string())));
+        assert_eq!(sort_and_parent(&db, "child"), (1, Some("r1".to_string())));
+        // Refused, and nothing written: an unknown id, a list mixing parents,
+        // a category twice.
+        let before: Vec<i64> = db
+            .list_categories()
+            .unwrap()
+            .iter()
+            .map(|c| c.sort_index)
+            .collect();
+        let refused = |parent: Option<&str>, list: &[&str]| {
+            category_set_order_in(&db, &vault, &rotation, parent.map(String::from), ids(list))
+                .unwrap_err()
+                .0
+        };
+        assert_eq!(
+            refused(None, &["r2", "gone", "r1"]),
+            "That category no longer exists."
+        );
+        assert!(refused(None, &["r1", "child"]).contains("parent"));
+        assert!(refused(Some("r1"), &["child", "r2"]).contains("parent"));
+        assert!(refused(None, &["r1", "r1"]).contains("twice"));
+        let after: Vec<i64> = db
+            .list_categories()
+            .unwrap()
+            .iter()
+            .map(|c| c.sort_index)
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn rw_s7_category_order_is_refused_while_locked_or_re_encrypting() {
+        let db = test_db();
+        db.insert_category(&category("r1", None, "key")).unwrap();
+        let rotation = VaultRotationLock::new();
+        let locked = VaultPasswordStore::new();
+        assert_eq!(
+            category_set_order_in(&db, &locked, &rotation, None, vec!["r1".into()])
+                .unwrap_err()
+                .0,
+            "Vault is locked."
+        );
+        let change = rotation.exclusive_within(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            category_set_order_in(&db, &unlocked(), &rotation, None, vec!["r1".into()])
+                .unwrap_err()
+                .0,
+            VAULT_REENCRYPTING
+        );
+        drop(change);
+    }
+
+    // ── Locking a locked vault ────────────────────────────────────────
+
+    /// The tray's Lock locks the vault, then the renderer asks `vault_lock`
+    /// again: a second `vault.lock` audit row for one lock.
+    #[test]
+    fn rw_a1_locking_a_locked_vault_writes_no_second_audit_row() {
+        let db = test_db();
+        let vault = unlocked();
+        let generations = VaultGeneration::new();
+        let teardowns = std::sync::atomic::AtomicUsize::new(0);
+        let teardown = || {
+            teardowns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        assert!(
+            lock_vault_with(&generations, &vault, &db, &teardown),
+            "it was unlocked"
+        );
+        assert!(
+            !lock_vault_with(&generations, &vault, &db, &teardown),
+            "already locked"
+        );
+        let rows = db
+            .list_audit(50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.action == "vault.lock")
+            .count();
+        assert_eq!(rows, 1, "one lock, one audit row");
+        assert!(!vault.is_set());
+        // A lock request still bumps the generation (an unlock running at
+        // that moment must lose) and ends whatever could be left over.
+        assert_eq!(generations.current(), 2);
+        assert_eq!(teardowns.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // ── Credential questions: the default button, early answers, one at a
+    //    time, and the text they show ─────────────────────────────────────
+
+    /// "Don't allow" is the first button - the default that Enter (Windows,
+    /// macOS) and a stray keypress hit - and "Allow" never is. A compromised
+    /// renderer can open the question while the user is typing.
+    #[test]
+    fn rw_fix1_the_credential_question_defaults_to_dont_allow() {
+        use tauri_plugin_dialog::MessageDialogButtons;
+        match credential_buttons() {
+            MessageDialogButtons::YesNoCancelCustom(first, second, third) => assert_eq!(
+                (first.as_str(), second.as_str(), third.as_str()),
+                (CREDENTIAL_DONT_ALLOW, CREDENTIAL_ALLOW, "Cancel")
+            ),
+            other => panic!("the first button must be Don't allow: {other:?}"),
+        }
+    }
+
+    /// Only "Allow" itself allows - any other button, Esc or closing the
+    /// dialog does not - and only once the question has been open for a
+    /// second.
+    #[test]
+    fn rw_fix1_only_a_deliberate_allow_allows() {
+        use tauri_plugin_dialog::MessageDialogResult as Answer;
+        let late = Duration::from_millis(1500);
+        let early = Duration::from_millis(300);
+        let allow = Answer::Custom(CREDENTIAL_ALLOW.into());
+        assert_eq!(credential_answer(&allow, late), CredentialAnswer::Allowed);
+        assert_eq!(credential_answer(&allow, early), CredentialAnswer::TooQuick);
+        for other in [
+            Answer::Custom(CREDENTIAL_DONT_ALLOW.into()),
+            Answer::Custom("Cancel".into()),
+            Answer::Custom("allow".into()),
+            Answer::Cancel,
+            Answer::Ok,
+            Answer::Yes,
+            Answer::No,
+        ] {
+            assert_eq!(
+                credential_answer(&other, late),
+                CredentialAnswer::NotAllowed,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// The second is counted from the moment the dialog is created on the
+    /// main thread. A main thread kept busy - a flood of synchronous IPC -
+    /// delays the dialog; the clock used to start before that delay, so the
+    /// dialog could appear with the second already over and a stray click
+    /// would allow. Here the main thread is busy for 1.2 s: an "Allow" 0.1 s
+    /// after the dialog appears is too quick, one 1.1 s after it is not. The
+    /// time passes on a clock the test moves by hand (it used to sleep, and
+    /// a loaded machine could stretch the 0.1 s past the second).
+    #[test]
+    fn rw_fix2_the_second_starts_when_the_dialog_is_on_screen() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tauri_plugin_dialog::MessageDialogResult as Answer;
+        let start = std::time::Instant::now();
+        let passed_ms = std::sync::Arc::new(AtomicU64::new(0));
+        let clock = {
+            let passed_ms = passed_ms.clone();
+            move || start + Duration::from_millis(passed_ms.load(Ordering::SeqCst))
+        };
+        let pass = move |ms: u64| {
+            passed_ms.fetch_add(ms, Ordering::SeqCst);
+        };
+        // The main thread runs the task on a thread of its own, after 1.2 s.
+        let busy_main_thread = || {
+            let pass = pass.clone();
+            move |task: Box<dyn FnOnce() + Send>| {
+                std::thread::spawn(move || {
+                    pass(1200);
+                    task();
+                });
+                true
+            }
+        };
+        let allow_after = |ms: u64| {
+            let pass = pass.clone();
+            move |answered: DialogAnswered| {
+                pass(ms);
+                answered(Answer::Custom(CREDENTIAL_ALLOW.into()));
+            }
+        };
+        assert_eq!(
+            timed_question_by(clock.clone(), busy_main_thread(), allow_after(100)),
+            CredentialAnswer::TooQuick
+        );
+        assert_eq!(
+            timed_question_by(clock.clone(), busy_main_thread(), allow_after(999)),
+            CredentialAnswer::TooQuick
+        );
+        assert_eq!(
+            timed_question_by(clock.clone(), busy_main_thread(), allow_after(1000)),
+            CredentialAnswer::Allowed
+        );
+        assert_eq!(
+            timed_question_by(clock, busy_main_thread(), allow_after(1100)),
+            CredentialAnswer::Allowed
+        );
+        // No main thread (the app is closing): nothing shown, not allowed.
+        assert_eq!(
+            timed_question(|_| false, |_: DialogAnswered| panic!("not shown")),
+            CredentialAnswer::NotAllowed
+        );
+        // A dialog that goes away without an answer: not allowed.
+        let at_once = |task: Box<dyn FnOnce() + Send>| {
+            task();
+            true
+        };
+        assert_eq!(
+            timed_question(at_once, |answered: DialogAnswered| drop(answered)),
+            CredentialAnswer::NotAllowed
+        );
+    }
+
+    /// One credential question at a time: while one is open a second gets
+    /// no turn (it is refused, not stacked), and once it ends the next does.
+    #[test]
+    fn rw_fix1_one_credential_question_at_a_time() {
+        let questions = CredentialQuestions::new();
+        let first = questions.begin().expect("the first question gets its turn");
+        assert!(
+            questions.begin().is_none(),
+            "no second question while one is open"
+        );
+        drop(first);
+        assert!(questions.begin().is_some());
+    }
+
+    /// Text quoted in a dialog loses control, format and text-direction
+    /// characters, collapses its whitespace and is capped.
+    #[test]
+    fn rw_fix1_dialog_text_is_clean_and_capped() {
+        assert_eq!(
+            dialog_text(
+                "  a\u{202e}b\u{200b}c \u{a0}\u{2003}\u{3000}d\u{2028}e\u{feff}\u{61c}f\t\n",
+                80
+            ),
+            "abc d ef"
+        );
+        assert_eq!(dialog_text("x\u{0}y\r\nz", 80), "xy z");
+        let cut = dialog_text(&"a".repeat(100), 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('\u{2026}'), "{cut}");
+    }
+
+    /// The last guard before the OS dialog: the message's own line breaks
+    /// stay, every other control or invisible character goes - a NUL above
+    /// all, which cut the Windows message and aborted the process under GTK.
+    #[test]
+    fn rw_fix1_a_dialog_message_keeps_its_lines_and_loses_every_nul() {
+        assert_eq!(
+            dialog_message_safe("Send it?\n\nTo a\u{0}b\u{202e}c.\tOK"),
+            "Send it?\n\nTo abc. OK"
+        );
+    }
+
+    /// The save dialog suggests only a file name: the renderer fills it in,
+    /// and a whole path opened the dialog in that folder - one click on Save
+    /// granted a write into SSHSpan's install folder.
+    #[test]
+    fn rw_fix1_the_save_dialog_suggests_only_a_file_name() {
+        for (given, suggested) in [
+            (
+                Some(r"C:\Users\u\AppData\Local\SSHSpan\version.dll"),
+                "version.dll",
+            ),
+            (Some("/opt/SSHSpan/libssh.so"), "libssh.so"),
+            (Some(r"..\..\notes.txt"), "notes.txt"),
+            (Some("report.csv"), "report.csv"),
+            (Some("version.dll:stream"), "stream"),
+            (Some("C:"), "file.txt"),
+            (Some("folder/"), "file.txt"),
+            (Some(".."), "file.txt"),
+            (Some("   "), "file.txt"),
+            (Some("a\u{202e}b\u{0}.txt"), "ab.txt"),
+            (None, "file.txt"),
+        ] {
+            assert_eq!(save_dialog_file_name(given), suggested, "{given:?}");
+        }
+    }
+
+    // ── Argon2id only through the pool helpers ───────────────────────────
+
+    /// The part of `source` before its test module.
+    fn production(source: &'static str) -> &'static str {
+        source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(source)
+    }
+
+    /// The code lines of `source`, numbered from 1: whole-line comments
+    /// dropped (the docs name the calls they forbid).
+    fn code_lines(source: &str) -> Vec<(usize, &str)> {
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .map(|(n, line)| (n + 1, line))
+            .collect()
+    }
+
+    /// The item of `source` that starts at `signature`, up to the first line
+    /// that closes it at column 0.
+    fn item_body(source: &'static str, signature: &str) -> &'static str {
+        let start = source.find(signature).expect(signature);
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |end| end + 3);
+        &rest[..end]
+    }
+
+    /// A seal or an unseal is an Argon2id derivation (64 MiB, most of a
+    /// second). In the sync and in MCP connect, call and teardown they run
+    /// only through the helpers that hop to the blocking pool
+    /// (`seal_off_thread`, `unseal_off_thread`) or that check, in tests, that
+    /// they already run there (`seal_on_pool`, `unseal_on_pool`). That check
+    /// fires only inside those helpers: a direct `crypto::vault` call - one
+    /// moved back inline onto an async worker - got past every test. This
+    /// scan does not let one through: no direct call in the production code
+    /// of the sync or of MCP, and no pool-bound call in the sync, which is
+    /// async from end to end.
+    #[test]
+    fn rw_fix2_argon2_runs_only_through_the_pool_helpers_in_the_sync_and_mcp_code() {
+        let direct = |code: &str| code.contains("crypto::vault");
+        // Also matches `unseal_on_pool(`.
+        let pool_bound = |code: &str| code.contains("seal_on_pool(");
+        let mut found = Vec::new();
+        for (n, line) in code_lines(production(include_str!("../bitwarden/sync.rs"))) {
+            if direct(line) || pool_bound(line) {
+                found.push(format!("bitwarden/sync.rs:{n}: {}", line.trim()));
+            }
+        }
+        for (n, line) in code_lines(production(include_str!("../assistant/mcp.rs"))) {
+            if direct(line) {
+                found.push(format!("assistant/mcp.rs:{n}: {}", line.trim()));
+            }
+        }
+        let sync_command = item_body(include_str!("mod.rs"), "pub async fn bitwarden_sync(");
+        for (n, line) in code_lines(sync_command) {
+            if direct(line) || pool_bound(line) {
+                found.push(format!("bitwarden_sync, line {n}: {}", line.trim()));
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "Argon2id outside the pool helpers:\n{}",
+            found.join("\n")
+        );
+    }
+
+    // ── The order of categories: the whole list ──────────────────────────
+
+    /// The renderer sends the whole list the tree shows (one parent, one
+    /// scope): a list that leaves one out is refused and writes nothing - it
+    /// used to leave the missing one at a position another now had.
+    #[test]
+    fn rw_fix1_a_category_order_must_name_every_category_of_its_list() {
+        let db = test_db();
+        let vault = unlocked();
+        let rotation = VaultRotationLock::new();
+        for c in [
+            category("p", None, "key"),
+            category("x", Some("p"), "key"),
+            category("y", Some("p"), "key"),
+            category("z", Some("p"), "key"),
+            category("h", Some("p"), "host"),
+        ] {
+            db.insert_category(&c).unwrap();
+        }
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let before: Vec<(String, i64)> = db
+            .list_categories()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.sort_index))
+            .collect();
+        let err = category_set_order_in(&db, &vault, &rotation, Some("p".into()), ids(&["z", "x"]))
+            .unwrap_err();
+        assert!(err.0.contains("every category"), "{}", err.0);
+        let after: Vec<(String, i64)> = db
+            .list_categories()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.sort_index))
+            .collect();
+        assert_eq!(before, after, "nothing written");
+        // The whole key list: the host category under the same parent is
+        // another list.
+        category_set_order_in(
+            &db,
+            &vault,
+            &rotation,
+            Some("p".into()),
+            ids(&["z", "x", "y"]),
+        )
+        .unwrap();
+        assert_eq!(sort_and_parent(&db, "z"), (0, Some("p".to_string())));
+        assert_eq!(sort_and_parent(&db, "y"), (2, Some("p".to_string())));
     }
 }

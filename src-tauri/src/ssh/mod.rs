@@ -424,7 +424,8 @@ pub struct LegacyHostLine {
     pub file: String,
     /// 1-based line number.
     pub line: usize,
-    /// The line as written (trimmed, control characters removed).
+    /// The line as written: trimmed, control characters removed, and cut
+    /// after 300 characters with "…" (`quoted_config_line`).
     pub text: String,
     /// The vault key whose host it names.
     pub key: String,
@@ -784,7 +785,7 @@ impl SshService {
     /// Whether `deploy_path` is a file a deploy writes: a `sshspan_*` file
     /// directly in the managed SSH directory. Only those are ever deleted on
     /// undeploy - a recorded path is not trusted on its own (a backup
-    /// restored before F9, or a hand-edited database, could point it at the
+    /// restored by an older version, or a hand-edited database, could point it at the
     /// user's own `id_ed25519`, which used to pass because it is inside
     /// `~/.ssh`).
     pub fn is_managed_deploy_path(target: &DeployTarget, deploy_path: &str) -> bool {
@@ -858,7 +859,7 @@ fn find_legacy_host_lines(
             found.push(LegacyHostLine {
                 file: file.clone(),
                 line: line.line,
-                text: line.text.chars().filter(|c| !c.is_control()).collect(),
+                text: quoted_config_line(&line.text),
                 key: key.clone(),
                 unreadable: line.patterns.is_none(),
                 written_by_sshspan: line.identity_files.iter().any(|f| is_sshspan_key_file(f)),
@@ -866,6 +867,26 @@ fn find_legacy_host_lines(
         }
     }
     found
+}
+
+/// How many characters of a line in the user's ssh config the deploy
+/// preview quotes.
+const QUOTED_LINE_MAX_CHARS: usize = 300;
+
+/// A line of the user's ssh config as the deploy preview quotes it - in
+/// `legacyHostLines` and in the warning about it: control characters
+/// dropped, and at most [`QUOTED_LINE_MAX_CHARS`] characters, followed by
+/// "…" when the line was longer (cut between characters). Format and
+/// text-direction characters stay: the renderer spells them out, so the user
+/// can find them in the file. A 50,000-character line came back whole.
+fn quoted_config_line(line: &str) -> String {
+    let mut kept = line.chars().filter(|c| !c.is_control());
+    let quoted: String = kept.by_ref().take(QUOTED_LINE_MAX_CHARS).collect();
+    if kept.next().is_some() {
+        format!("{quoted}\u{2026}")
+    } else {
+        quoted
+    }
 }
 
 /// Write one key's private file (owner-only) and its `.pub`; a failure
@@ -1415,7 +1436,7 @@ mod deploy_tests {
         );
     }
 
-    // ── RU3 fix 1: nothing a deploy writes may stop ssh from parsing ──
+    // ── Nothing a deploy writes may stop ssh from parsing ──
 
     /// Key names the vault accepts can hold characters ssh_config reads as
     /// quotes, escapes, comments or patterns (`Host bob's-key` -> "invalid
@@ -1635,7 +1656,7 @@ mod deploy_tests {
         assert!(s.config().contains("Host web\n"));
     }
 
-    // ── RU6a item 11 ──
+    // ── HostName and User values OpenSSH would rewrite ──
 
     /// What OpenSSH would rewrite is refused, like the other HostName / User
     /// refusals: a leading `=` is eaten as the keyword separator (`HostName
@@ -1826,7 +1847,7 @@ mod deploy_tests {
         );
     }
 
-    /// RU6a fix round 1, item 12: every Host line naming the alias or the key
+    /// Every Host line naming the alias or the key
     /// was blamed on "an older SSHSpan" with the advice to remove it - on a
     /// hand-written `Host github` block that deletes the user's own config.
     /// Only a block whose IdentityFile is an `sshspan_*` file is SSHSpan's;
@@ -1863,6 +1884,44 @@ mod deploy_tests {
         assert!(github.contains("your own"), "{github}");
         let web = warnings.iter().find(|w| w.contains("line 5")).unwrap();
         assert!(web.contains("older SSHSpan"), "{web}");
+    }
+
+    /// A 50,000-character Host line in the user's own config came back
+    /// whole - in `legacyHostLines` and quoted in its warning. Both quote
+    /// at most 300 characters and "…" now, cut between characters; format
+    /// and direction characters stay (the renderer spells them out).
+    #[test]
+    fn rw_fix4_a_very_long_host_line_is_quoted_capped() {
+        let s = Scratch::new("long-line");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        let long = format!("Host web {}", "\u{202e}é".repeat(25_000));
+        fs::write(s.target.ssh_dir.join("config"), format!("{long}\n")).unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        let lines = p.legacy_host_lines();
+        assert_eq!(lines.len(), 1, "{:?}", lines.len());
+        let text = &lines[0].text;
+        assert_eq!(text.chars().count(), 301, "300 characters and the ellipsis");
+        assert!(text.ends_with('\u{2026}'), "cut, and says so");
+        assert!(long.starts_with(text.trim_end_matches('\u{2026}')));
+        assert!(text.contains('\u{202e}'), "direction characters stay");
+        let json = serde_json::to_value(p.legacy_host_lines()).unwrap();
+        assert_eq!(json[0]["text"].as_str(), Some(text.as_str()));
+        let warnings = p.preview_warnings();
+        let quoting = warnings
+            .iter()
+            .find(|w| w.contains("line 1"))
+            .expect("a warning about the line");
+        assert!(quoting.contains(text.as_str()), "the same capped text");
+        assert!(
+            quoting.chars().count() < 1_000,
+            "{}",
+            quoting.chars().count()
+        );
+        // A line within the cap is quoted as it is.
+        let short = "Host web other";
+        fs::write(s.target.ssh_dir.join("config"), format!("{short}\n")).unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        assert_eq!(p.legacy_host_lines()[0].text, short);
     }
 
     #[test]

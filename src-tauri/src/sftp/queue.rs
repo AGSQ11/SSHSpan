@@ -261,7 +261,7 @@ async fn local_part_offset(lpart: &str, total: u64) -> Result<u64, String> {
 /// server-copy target leg). A missing `.part` yields Ok(0). Only a REGULAR
 /// file is continued: it is examined with LSTAT, never STAT - STAT follows a
 /// link planted at `<remote>.part`, and the upload was then appended to the
-/// link's target (F1).
+/// link's target.
 async fn remote_part_offset(
     sftp: &russh_sftp::client::SftpSession,
     rpart: &str,
@@ -292,7 +292,7 @@ async fn remote_part_offset(
 /// `from` must be a REGULAR file, checked with LSTAT before anything is
 /// renamed or removed: a temporary file swapped for a symbolic link (in a
 /// folder others can write to) used to pass - STAT follows the link - and the
-/// retry then deleted the real `to` and put the link in its place (F1). A
+/// retry then deleted the real `to` and put the link in its place. A
 /// residual window remains between that check and the RENAME (SFTP v3 has no
 /// check-and-rename); the names are unpredictable or created exclusively, so
 /// something has to be swapped in during it.
@@ -1830,27 +1830,7 @@ async fn run_server_copy<RT: tauri::Runtime>(
                 "reopening source for verification: {e}"
             ))),
         };
-        let target_hash = crate::commands::sftp::remote_sha256(
-            &target_sftp,
-            &target.remote_path,
-            Some(cancel.as_ref()),
-        )
-        .await;
-        match (source_hash, target_hash) {
-            (Ok(sh), Ok(th)) if sh == th => {}
-            (Ok(sh), Ok(th)) => {
-                let _ = target_sftp.remove_file(&target.remote_path).await;
-                return Err(format!(
-                    "checksum mismatch: source {sh} != target {th} (copy removed)"
-                ));
-            }
-            (Err(e), _) => {
-                return Err(format!("checksum mismatch: could not hash source: {e}"));
-            }
-            (_, Err(e)) => {
-                return Err(format!("checksum mismatch: could not hash target: {e}"));
-            }
-        }
+        verify_copy(source_hash, &target_sftp, &target.remote_path, &cancel).await?;
     }
     // Preserve timestamps (after the rename finalizes the destination): stat
     // the STAGED file (its data equals the remote source) and push its mtime
@@ -1972,38 +1952,10 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         rename_over(&sftp, &rpart, &remote, Some(lsize))
                             .await
                             .map_err(|d| format!("final rename failed: {d}"))?;
-                        // Opt-in verification: hash the local source and the
-                        // now-renamed remote destination and compare. A
-                        // mismatch removes the remote file rather than
-                        // leaving a corrupt upload that looks complete.
+                        // Opt-in verification ([`verify_upload`]).
                         if verify {
-                            let local_hash =
-                                local_sha256(std::path::Path::new(&local), cancel.clone()).await;
-                            let remote_hash = crate::commands::sftp::remote_sha256(
-                                &sftp,
-                                &remote,
-                                Some(cancel.as_ref()),
-                            )
-                            .await;
-                            match (local_hash, remote_hash) {
-                                (Ok(lh), Ok(rh)) if lh == rh => {}
-                                (Ok(lh), Ok(rh)) => {
-                                    let _ = sftp.remove_file(&remote).await;
-                                    return Err(format!(
-                                        "checksum mismatch: local {lh} != remote {rh} (upload removed)"
-                                    ));
-                                }
-                                (Err(e), _) => {
-                                    return Err(format!(
-                                        "checksum mismatch: could not hash local file: {e}"
-                                    ));
-                                }
-                                (_, Err(e)) => {
-                                    return Err(format!(
-                                        "checksum mismatch: could not hash remote file: {e}"
-                                    ));
-                                }
-                            }
+                            verify_upload(&sftp, std::path::Path::new(&local), &remote, &cancel)
+                                .await?;
                         }
                         // Preserve timestamps (after the rename finalizes the
                         // destination): stat the local source mtime and setstat
@@ -2151,38 +2103,10 @@ async fn run_job<RT: tauri::Runtime + 'static>(
                         tokio::fs::rename(&lpart, &local)
                             .await
                             .map_err(|e| format!("final rename failed: {e}"))?;
-                        // Opt-in verification: hash the now-renamed local
-                        // file and the remote source and compare. A mismatch
-                        // removes the local file rather than leaving a
-                        // corrupt download that looks complete.
+                        // Opt-in verification ([`verify_download`]).
                         if verify {
-                            let local_hash =
-                                local_sha256(std::path::Path::new(&local), cancel.clone()).await;
-                            let remote_hash = crate::commands::sftp::remote_sha256(
-                                &sftp,
-                                &remote,
-                                Some(cancel.as_ref()),
-                            )
-                            .await;
-                            match (remote_hash, local_hash) {
-                                (Ok(rh), Ok(lh)) if rh == lh => {}
-                                (Ok(rh), Ok(lh)) => {
-                                    let _ = tokio::fs::remove_file(&local).await;
-                                    return Err(format!(
-                                        "checksum mismatch: remote {rh} != local {lh} (download removed)"
-                                    ));
-                                }
-                                (Err(e), _) => {
-                                    return Err(format!(
-                                        "checksum mismatch: could not hash remote file: {e}"
-                                    ));
-                                }
-                                (_, Err(e)) => {
-                                    return Err(format!(
-                                        "checksum mismatch: could not hash local file: {e}"
-                                    ));
-                                }
-                            }
+                            verify_download(&sftp, &remote, std::path::Path::new(&local), &cancel)
+                                .await?;
                         }
                         // Preserve timestamps (A7-36), after the rename and any
                         // verification so nothing later touches the file: stamp
@@ -2255,6 +2179,86 @@ async fn local_sha256(path: &std::path::Path, cancel: Arc<AtomicBool>) -> Result
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// An upload's opt-in verification (`setting.sftpVerifyTransfers`), after
+/// the rename: hash the local source and the remote destination and compare.
+/// A mismatch removes the remote file rather than leaving a corrupt upload
+/// that looks complete.
+async fn verify_upload(
+    sftp: &russh_sftp::client::SftpSession,
+    local: &std::path::Path,
+    remote: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let local_hash = local_sha256(local, cancel.clone()).await;
+    let remote_hash =
+        crate::commands::sftp::remote_sha256(sftp, remote, Some(cancel.as_ref())).await;
+    match (local_hash, remote_hash) {
+        (Ok(lh), Ok(rh)) if lh == rh => Ok(()),
+        (Ok(lh), Ok(rh)) => {
+            let _ = sftp.remove_file(remote).await;
+            Err(format!(
+                "checksum mismatch: local {lh} != remote {rh} (upload removed)"
+            ))
+        }
+        (Err(e), _) => Err(format!("checksum mismatch: could not hash local file: {e}")),
+        (_, Err(e)) => Err(format!(
+            "checksum mismatch: could not hash remote file: {e}"
+        )),
+    }
+}
+
+/// A download's opt-in verification, after the rename: hash the local file
+/// and the remote source and compare. A mismatch removes the local file
+/// rather than leaving a corrupt download that looks complete.
+async fn verify_download(
+    sftp: &russh_sftp::client::SftpSession,
+    remote: &str,
+    local: &std::path::Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let local_hash = local_sha256(local, cancel.clone()).await;
+    let remote_hash =
+        crate::commands::sftp::remote_sha256(sftp, remote, Some(cancel.as_ref())).await;
+    match (remote_hash, local_hash) {
+        (Ok(rh), Ok(lh)) if rh == lh => Ok(()),
+        (Ok(rh), Ok(lh)) => {
+            let _ = tokio::fs::remove_file(local).await;
+            Err(format!(
+                "checksum mismatch: remote {rh} != local {lh} (download removed)"
+            ))
+        }
+        (Err(e), _) => Err(format!(
+            "checksum mismatch: could not hash remote file: {e}"
+        )),
+        (_, Err(e)) => Err(format!("checksum mismatch: could not hash local file: {e}")),
+    }
+}
+
+/// A server-to-server copy's opt-in verification: the source's hash (from
+/// its own channel) against the target's. A mismatch removes the target
+/// file: the copy must not sit there looking successful when it isn't.
+async fn verify_copy(
+    source_hash: Result<String, crate::commands::CmdError>,
+    target_sftp: &russh_sftp::client::SftpSession,
+    target_remote: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let target_hash =
+        crate::commands::sftp::remote_sha256(target_sftp, target_remote, Some(cancel.as_ref()))
+            .await;
+    match (source_hash, target_hash) {
+        (Ok(sh), Ok(th)) if sh == th => Ok(()),
+        (Ok(sh), Ok(th)) => {
+            let _ = target_sftp.remove_file(target_remote).await;
+            Err(format!(
+                "checksum mismatch: source {sh} != target {th} (copy removed)"
+            ))
+        }
+        (Err(e), _) => Err(format!("checksum mismatch: could not hash source: {e}")),
+        (_, Err(e)) => Err(format!("checksum mismatch: could not hash target: {e}")),
+    }
 }
 
 /// Classification of a transfer failure for the auto-retry policy (see
@@ -2817,20 +2821,6 @@ pub fn restore_pending<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> usize {
     n
 }
 
-/// True when the session has active or queued jobs (as source OR as the
-/// target of a server copy).
-pub fn session_busy<RT: tauri::Runtime>(app: &tauri::AppHandle<RT>, session_id: &str) -> bool {
-    app.state::<TransferQueue>()
-        .jobs
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|j| {
-            (j.session_id == session_id || j.target_session_id.as_deref() == Some(session_id))
-                && matches!(j.state, JobState::Queued | JobState::Active)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3023,7 +3013,7 @@ mod tests {
         assert!(!fx.exists("/srv/blocker/deeper"));
     }
 
-    // ── RU6a fix 1, item 1 (F1): a `.part` someone else planted ──────────────
+    // ── A `.part` someone else planted ──────────────
 
     /// Upload `bytes` to `remote` the way the upload leg does (prepare, open,
     /// write, close, rename) and return the `.part` offset it went on from.
@@ -3125,9 +3115,9 @@ mod tests {
         );
     }
 
-    // ── RU6a fix round 2 ─────────────────────────────────────────────────────
+    // ── Uploads to servers without type bits, and `.part` files ─────────────
 
-    /// Item 3: on a server that leaves the type bits out and answers "list
+    /// On a server that leaves the type bits out and answers "list
     /// this folder" on a file with "permission denied", the `.part` could not
     /// be proven to be a file: every upload failed (it worked before round
     /// 1), and the unknown `.part` then blocked the next upload - the
@@ -3157,7 +3147,7 @@ mod tests {
         assert!(!fx.exists("/d/f.bin.part"));
     }
 
-    /// Item 5 (sec N1): a resumed `.part` was protected only by its size,
+    /// A resumed `.part` was protected only by its size,
     /// which whoever planted it controls - a regular `.part` the size of a
     /// victim file, swapped for a link to the victim between our LSTAT and
     /// our OPEN, had the upload appended to the victim. The bytes before the
@@ -3186,7 +3176,7 @@ mod tests {
         assert_eq!(fx.read("/d/f.bin"), b"0123456789abcdefghij");
     }
 
-    /// Item 5: a `.part` whose bytes are not the start of this source (the
+    /// A `.part` whose bytes are not the start of this source (the
     /// local file changed since, or the `.part` is someone else's) was
     /// continued anyway - a corrupt file that passes the size check. It is
     /// started over now; a genuine partial upload is still continued.
@@ -3217,7 +3207,7 @@ mod tests {
         assert_eq!(fx.read("/d/g.bin"), b"0123456789abcdefghij");
     }
 
-    /// RU6a item 2: on a server whose attributes carry no file type, every
+    /// On a server whose attributes carry no file type, every
     /// existing folder looked like "exists but is not a directory", so the
     /// walk gave up at the first level and the upload of a nested file failed
     /// with "No such file". An entry of unknown type is walked through; the
@@ -3238,7 +3228,7 @@ mod tests {
         assert!(!fx.exists("/srv/blocker/deeper"));
     }
 
-    /// RU6a item 7 (Task 10's missing tests): `enqueue` stamps every job with
+    /// `enqueue` stamps every job with
     /// the saved server of its session - and a server copy with its target's
     /// too - and the row it persists keeps them.
     #[test]
@@ -3833,5 +3823,31 @@ mod tests {
             &retrying,
             now + std::time::Duration::from_secs(3)
         ));
+    }
+
+    /// With transfer verification on, a copy from or to a
+    /// server that reports no sizes was compared against the hash of an
+    /// EMPTY remote file - a "checksum mismatch" for every good copy, which
+    /// the verification then deleted. The queue's own checks now pass for a
+    /// good download and a good upload, and both copies are kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_b6_a_good_copy_on_a_server_without_sizes_verifies() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 256) as u8).collect();
+        fx.write("/copy.bin", &payload);
+        fx.knobs.lock().unwrap().strip_size_mtime = true;
+        let local =
+            std::env::temp_dir().join(format!("sshspan-rw-verify-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&local, &payload).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let downloaded = verify_download(&sftp, "/copy.bin", &local, &cancel).await;
+        let kept_locally = local.exists();
+        let uploaded = verify_upload(&sftp, &local, "/copy.bin", &cancel).await;
+        let _ = std::fs::remove_file(&local);
+        assert_eq!(downloaded, Ok(()), "a good download is not a mismatch");
+        assert!(kept_locally, "the good download is kept");
+        assert_eq!(uploaded, Ok(()), "a good upload is not a mismatch");
+        assert!(fx.exists("/copy.bin"), "the good upload is kept");
     }
 }

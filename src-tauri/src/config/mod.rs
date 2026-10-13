@@ -1068,7 +1068,7 @@ mod tests {
         );
     }
 
-    /// RU3 fix 1: a value with whitespace, quotes, a backslash or a leading
+    /// A value with whitespace, quotes, a backslash or a leading
     /// `#` is written quoted and escaped the way ssh_config reads it back - an
     /// unquoted `IdentityFile /home/John Smith/...` stopped every ssh command
     /// once the managed file was Included ("extra arguments at end of
@@ -1117,7 +1117,7 @@ mod tests {
         assert_eq!(sanitize_config_value("a\tb\rc\nd"), "a_b_c_d");
     }
 
-    /// RU6a item 8: a bare `Host` line in the managed file ends the stanza
+    /// A bare `Host` line in the managed file ends the stanza
     /// before it. Its lines used to be filed into that stanza, so a deploy's
     /// rewrite of the file applied them to the previous host.
     #[test]
@@ -1141,7 +1141,7 @@ mod tests {
         );
     }
 
-    /// RU6a item 11: the deploy preview lists `Host` lines with their line
+    /// The deploy preview lists `Host` lines with their line
     /// numbers - including one ssh cannot even split (`Host bob's-key`).
     #[test]
     fn ru6a_host_lines_come_with_line_numbers_even_when_ssh_cannot_split_them() {
@@ -1172,7 +1172,7 @@ mod tests {
     }
 }
 
-/// RU4 / R4: the import reads the user's own ssh config - fixture files in a
+/// R4: the import reads the user's own ssh config - fixture files in a
 /// temp dir stand in for `~` and `~/.ssh`.
 #[cfg(test)]
 mod ru4_user_config_tests {
@@ -1396,7 +1396,7 @@ mod ru4_user_config_tests {
         assert_eq!(host(&hosts, "latin1").user.as_deref(), Some("caf\u{FFFD}"));
     }
 
-    /// Review fix 7: the size cap holds for what is actually read, not for
+    /// The size cap holds for what is actually read, not for
     /// what the file's metadata claimed a moment earlier.
     #[test]
     fn ru4_config_reads_stop_at_the_size_cap() {
@@ -1421,7 +1421,7 @@ mod ru4_user_config_tests {
         assert_eq!(read_capped(small).unwrap(), "Host a\n");
     }
 
-    /// Review fix 6: every wildcard in every `Include` draws on one budget
+    /// Every wildcard in every `Include` draws on one budget
     /// of directory entries for the whole read, not a fresh one per folder.
     #[test]
     fn ru4_include_globs_share_one_scan_budget() {
@@ -1446,7 +1446,7 @@ mod ru4_user_config_tests {
         assert!(hosts.len() < all.len(), "{:?}", names(&hosts));
     }
 
-    /// Review fix 8: a `Host` (or `Match`) line ssh_config cannot parse
+    /// A `Host` (or `Match`) line ssh_config cannot parse
     /// starts a block that applies to nothing - its directives used to land
     /// in the block before it (after `Host *`: every imported host).
     #[test]
@@ -1470,7 +1470,7 @@ mod ru4_user_config_tests {
         assert_eq!(host(&hosts, "later").user, None);
     }
 
-    /// RU6a item 8: a `Host` or `Match` line with NO argument (`Host`,
+    /// A `Host` or `Match` line with NO argument (`Host`,
     /// `Match`, `Host =`) starts a block that applies to nothing. Its lines
     /// used to land in the block before it - after `Host *`: every host.
     #[test]
@@ -1498,7 +1498,7 @@ mod ru4_user_config_tests {
         assert_eq!(host(&hosts, "later").user, None);
     }
 
-    /// RU6a item 8: collecting the literal names used `Vec::contains` for
+    /// Collecting the literal names used `Vec::contains` for
     /// every pattern - quadratic in the number of names, and it only cut the
     /// list to the cap at the end. A config of many short names (a 1 MiB
     /// file holds over 100 000) made the import hang. A set, and the scan
@@ -1552,7 +1552,7 @@ mod ru4_user_config_tests {
         assert!(took < bound, "60 000 names took {took:?}");
     }
 
-    /// RU6a item 10: the caller says "Could not read <path>: <reason>", so the
+    /// The caller says "Could not read <path>: <reason>", so the
     /// reason must not repeat the path ("Could not read /x: /x is larger
     /// than ...").
     #[test]
@@ -1653,7 +1653,7 @@ mod ru4_user_config_tests {
         }
         assert!(problems.is_empty(), "{}\n{text}", problems.join("\n"));
 
-        // RU6a item 8: a bare `Host` / `Match` line. OpenSSH 8.7 and later
+        // A bare `Host` / `Match` line. OpenSSH 8.7 and later
         // refuse the whole file ("no argument after keyword"); older ones take
         // the bare `Host` as a block that matches nothing. Either way ssh never
         // applies the lines under it to another host - and neither may the
@@ -1680,7 +1680,7 @@ mod ru4_user_config_tests {
         }
     }
 
-    /// RU6a fix round 1, item 11: OpenSSH ends a keyword at ` \t\r\n` or `=`
+    /// OpenSSH ends a keyword at ` \t\r\n` or `=`
     /// only, and trims a line of those (and trailing form feeds) only.
     /// `Host\u{a0}a` was imported as host `a` while `ssh -G` refuses the
     /// file: such a line is no Host line now - it starts a block that
@@ -1714,7 +1714,7 @@ mod ru4_user_config_tests {
         assert_eq!(names, [("a", Some("alice"))]);
     }
 
-    /// RU6a fix round 1, item 14: the managed-config parser filed the lines
+    /// The managed-config parser filed the lines
     /// after `Match <criteria>` into the Host before it (`Host a / User alice
     /// / Match host b / HostName evil.example` gave host `a` that HostName -
     /// written back to it on the next save) and skipped `Host=x`. A Match

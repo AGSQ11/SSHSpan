@@ -195,6 +195,29 @@ impl EditRegistry {
             None => false,
         }
     }
+    /// End the edit of `key` only while it is still `sync` - the one a
+    /// caller checked; an edit of the same file opened since is left alone.
+    /// `false` when it was not.
+    pub(crate) fn stop_if_same(
+        &self,
+        key: &str,
+        sync: &Arc<crate::commands::sftp::EditSync>,
+    ) -> bool {
+        let removed = {
+            let mut watches = self.watches.lock().unwrap();
+            match watches.get(key) {
+                Some(watch) if Arc::ptr_eq(&watch.sync, sync) => watches.remove(key),
+                _ => None,
+            }
+        };
+        match removed {
+            Some(watch) => {
+                end_watch(watch);
+                true
+            }
+            None => false,
+        }
+    }
     /// End every edit (vault lock, shutdown): staged copies of edited remote
     /// files must not linger in the temp dir.
     pub fn stop_all(&self) {
@@ -929,7 +952,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The opener-side inert-extension gate (F1 regression): extensions whose
+    /// The opener-side inert-extension gate: extensions whose
     /// OS handler could execute the file must be refused; editor/viewer
     /// extensions pass. This is the predicate `system_open_external` enforces
     /// at launch time, independent of how the staged file was named.
@@ -1348,7 +1371,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── RU6a item 6: a staged copy is deleted after OUR handles close ──
+    // ── A staged copy is deleted after OUR handles close ──
 
     fn scratch_file(tag: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1417,7 +1440,7 @@ mod tests {
         assert_eq!(attempts(1, false), 1, "nothing else is retried");
     }
 
-    /// RU6a fix round 1: Windows' ERROR_SHARING_VIOLATION (32) is a sharing
+    /// Windows' ERROR_SHARING_VIOLATION (32) is a sharing
     /// violation; access denied and errors without an OS code are not.
     /// (Compile-checked on windows-gnu; it runs on Windows.)
     #[cfg(windows)]

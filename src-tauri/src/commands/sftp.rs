@@ -39,10 +39,14 @@ enum LocalAccess {
     /// `~/.ssh` first. (The rule is deliberately by directory, not by guessing
     /// which file names are secret: a private key can be called anything.)
     Read,
-    /// Only the base rules (app data, system directories): for a path a human
-    /// approved in a native dialog, and for revealing a location in the file
-    /// manager.
+    /// Only the base rules (app data, system directories): for revealing a
+    /// location in the file manager.
     Basic,
+    /// A write to a path a human picked in the native save dialog: the base
+    /// rules, and never SSHSpan's own program files - the renderer fills in
+    /// the dialog's suggested name, so a single click on Save must not plant
+    /// a DLL in the install folder.
+    DialogWrite,
 }
 
 /// Shell startup and logout files in the home folder: anything planted there
@@ -270,6 +274,102 @@ fn home_startup_locations(
     (startup, shell)
 }
 
+/// The bundle identifier in `tauri.conf.json`. The webview keeps its profile
+/// (storage, cache) in per-user folders named after it - on Windows the
+/// WebView2 user-data folder is `%LOCALAPPDATA%\<identifier>`.
+const BUNDLE_IDENTIFIER: &str = "org.sshspan.app";
+
+/// Where SSHSpan's program lives ([`app_program_locations`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AppProgram {
+    /// The install folder (or the executable alone), the `.app` bundle, the
+    /// AppImage.
+    files: Vec<PathBuf>,
+    /// Folders where a DLL beside the executable is protected: the
+    /// executable's own folder, when only the executable itself is.
+    dll_dirs: Vec<PathBuf>,
+}
+
+/// Where SSHSpan's program lives, from the running executable `exe` and the
+/// AppImage it was started from (`appimage`, `$APPIMAGE`): the folder the
+/// executable is in - the install folder, where a planted DLL or a replaced
+/// executable runs at the next start - or, on macOS, the whole `.app`
+/// bundle; the AppImage file itself. When the executable runs straight from
+/// the home folder `home`, a folder above it, a drive root, or one of the
+/// user's own folders (`personal`: Downloads, the Desktop, Documents, where
+/// a portable copy is often run from), only the executable is protected,
+/// and on Windows (`windows`) the DLLs beside it, which it would load at its
+/// next start: the whole folder would refuse every ordinary download into
+/// it. A relative path is ignored. Pure so the layout can be unit-tested
+/// anywhere.
+fn app_program_locations(
+    exe: Option<&std::path::Path>,
+    appimage: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    personal: &[PathBuf],
+    windows: bool,
+) -> AppProgram {
+    let mut dll_dirs = Vec::new();
+    let program = exe.filter(|e| e.is_absolute()).map(|exe| {
+        let Some(dir) = exe.parent() else {
+            return exe.to_path_buf();
+        };
+        let named = |p: &std::path::Path, name: &str| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
+        };
+        // <bundle>.app/Contents/MacOS/<exe>
+        if let Some(bundle) = dir
+            .parent()
+            .filter(|contents| named(dir, "MacOS") && named(contents, "Contents"))
+            .and_then(std::path::Path::parent)
+            .filter(|b| {
+                b.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+            })
+        {
+            return bundle.to_path_buf();
+        }
+        // The folder is too wide to protect when it is a drive root, the
+        // home folder or above it, or one of the user's own folders (or
+        // above one).
+        let too_wide = dir.parent().is_none()
+            || home.is_some_and(|home| super::path_starts_with(home, dir))
+            || personal.iter().any(|p| super::path_starts_with(p, dir));
+        if too_wide {
+            if windows {
+                dll_dirs.push(dir.to_path_buf());
+            }
+            exe.to_path_buf()
+        } else {
+            dir.to_path_buf()
+        }
+    });
+    let appimage = appimage
+        .filter(|a| a.is_absolute())
+        .map(std::path::Path::to_path_buf);
+    AppProgram {
+        files: distinct([program, appimage]),
+        dll_dirs,
+    }
+}
+
+/// SSHSpan's local data and cache folders beyond the vault's: its own
+/// (`own`: the local data and cache folders of its project directories) and
+/// the per-user folders named after [`BUNDLE_IDENTIFIER`] under each of
+/// `bases` (the data, local data, cache and config folders) - the webview's
+/// profile among them - plus, under `home`, the folder macOS keeps the
+/// webview's data in. Pure so the layout can be unit-tested anywhere.
+fn app_data_locations(
+    own: &[PathBuf],
+    bases: &[PathBuf],
+    home: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let named = bases.iter().map(|base| base.join(BUNDLE_IDENTIFIER));
+    let webkit = home.map(|h| join_parts(h, "Library/WebKit").join(BUNDLE_IDENTIFIER));
+    distinct(own.iter().cloned().chain(named).chain(webkit).map(Some))
+}
+
 /// The paths given, without the missing ones and without repeats.
 fn distinct(paths: impl IntoIterator<Item = Option<PathBuf>>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
@@ -304,6 +404,14 @@ struct Locations {
     /// git's settings, the editors' startup files, Office's startup folders,
     /// Windows Terminal's settings, ...
     program_files: Vec<PathBuf>,
+    /// SSHSpan's program: the install folder (or the executable), the `.app`
+    /// bundle, the running AppImage ([`app_program_locations`]).
+    app_program: Vec<PathBuf>,
+    /// Folders where a DLL beside the executable is SSHSpan's program too.
+    app_program_dll_dirs: Vec<PathBuf>,
+    /// SSHSpan's data beyond the vault: the local data and cache folders and
+    /// the webview's profile ([`app_data_locations`]).
+    app_data: Vec<PathBuf>,
     /// The system folders (see [`super::system_dirs`]).
     system_dirs: Vec<PathBuf>,
 }
@@ -353,6 +461,40 @@ impl Locations {
                 &terminal,
             ));
         }
+        let exe = std::env::current_exe().ok();
+        let personal: Vec<PathBuf> = [
+            dirs::download_dir(),
+            dirs::desktop_dir(),
+            dirs::document_dir(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let program = app_program_locations(
+            exe.as_deref(),
+            env_dir("APPIMAGE").as_deref(),
+            home.as_deref(),
+            &personal,
+            cfg!(windows),
+        );
+        let own: Vec<PathBuf> = project
+            .iter()
+            .flat_map(|d| {
+                [
+                    d.data_local_dir().to_path_buf(),
+                    d.cache_dir().to_path_buf(),
+                ]
+            })
+            .collect();
+        let bases: Vec<PathBuf> = [
+            dirs::data_dir(),
+            dirs::data_local_dir(),
+            dirs::cache_dir(),
+            dirs::config_dir(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         Self {
             app_data_dir: project.as_ref().map(|d| d.data_dir().to_path_buf()),
             managed_config_dir: project.as_ref().map(|d| d.config_dir().to_path_buf()),
@@ -360,6 +502,9 @@ impl Locations {
             startup_dirs,
             shell_startup,
             program_files,
+            app_program: program.files,
+            app_program_dll_dirs: program.dll_dirs,
+            app_data: app_data_locations(&own, &bases, home.as_deref()),
             system_dirs: super::system_dirs(),
         }
     }
@@ -376,6 +521,9 @@ impl Locations {
             startup_dirs: all(self.startup_dirs),
             shell_startup: all(self.shell_startup),
             program_files: all(self.program_files),
+            app_program: all(self.app_program),
+            app_program_dll_dirs: all(self.app_program_dll_dirs),
+            app_data: all(self.app_data),
             system_dirs: all(self.system_dirs),
         }
     }
@@ -419,6 +567,13 @@ impl Protected {
             .iter()
             .any(|s| super::path_starts_with(s, path))
     }
+
+    /// `path` is this location itself.
+    fn is(&self, path: &std::path::Path) -> bool {
+        self.spellings
+            .iter()
+            .any(|s| super::path_starts_with(path, s) && super::path_starts_with(s, path))
+    }
 }
 
 const VAULT_REFUSAL: &str = "The application data directory is off-limits for SFTP transfers.";
@@ -448,6 +603,14 @@ struct SensitiveLocations {
     startup_dirs: Vec<Protected>,
     shell_startup: Vec<Protected>,
     program_files: Vec<Protected>,
+    /// SSHSpan's program: refused for writes and deletes - a dialog-approved
+    /// write included; reading stays allowed.
+    app_program: Vec<Protected>,
+    /// Folders in which a `.dll` is SSHSpan's program too.
+    app_program_dll_dirs: Vec<Protected>,
+    /// SSHSpan's data and caches: refused for writes and deletes; reading
+    /// stays allowed.
+    app_data: Vec<Protected>,
     /// Refused for every access (the base rules).
     system_dirs: Vec<Protected>,
 }
@@ -486,8 +649,14 @@ impl SensitiveLocations {
     /// comparison only: pass the path in its literal AND its resolved
     /// spelling (see [`Self::path_refusal`]).
     fn refusal(&self, path: &std::path::Path, access: LocalAccess) -> Option<&'static str> {
-        if access == LocalAccess::Basic {
-            return None;
+        match access {
+            LocalAccess::Basic => return None,
+            // A human picked the path - but the renderer suggested it: never
+            // SSHSpan's own program.
+            LocalAccess::DialogWrite => {
+                return self.holds_program(path).then_some(APP_PROGRAM_REFUSAL)
+            }
+            LocalAccess::Write | LocalAccess::Read => {}
         }
         let covered =
             |location: &Option<Protected>| location.as_ref().is_some_and(|l| l.covers(path));
@@ -534,8 +703,27 @@ impl SensitiveLocations {
                     "Your folders on the PATH and settings that run commands (git, vim, emacs, Office, Windows Terminal, ...) are off-limits for SFTP downloads and local changes.",
                 );
             }
+            // A DLL beside the executable, a replaced AppImage or a file in
+            // the webview's profile loads or runs at SSHSpan's next start.
+            if self.holds_program(path) || self.app_data.iter().any(|f| f.covers(path)) {
+                return Some(APP_FILES_REFUSAL);
+            }
         }
         None
+    }
+
+    /// Whether `path` is SSHSpan's program: in the install folder, the
+    /// executable, the AppImage, the `.app` bundle - or a DLL right beside
+    /// the executable where only the executable is protected (Windows loads
+    /// it at the next start).
+    fn holds_program(&self, path: &std::path::Path) -> bool {
+        let beside_as_dll = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+            && path
+                .parent()
+                .is_some_and(|dir| self.app_program_dll_dirs.iter().any(|d| d.is(dir)));
+        beside_as_dll || self.app_program.iter().any(|f| f.covers(path))
     }
 
     /// Why a path - in its literal and its resolved spelling - is off-limits
@@ -609,9 +797,19 @@ impl SensitiveLocations {
         if self.program_files.iter().any(holds) {
             return Some("a folder on your PATH or a settings file that runs commands");
         }
+        if self.app_program.iter().any(holds) || self.app_data.iter().any(holds) {
+            return Some("SSHSpan's own program or data files");
+        }
         None
     }
 }
+
+/// What a write into SSHSpan's own program or data folders is refused with.
+const APP_FILES_REFUSAL: &str = "SSHSpan's own program and data folders (where it is installed, its caches and the webview's profile) are off-limits for SFTP downloads and local changes.";
+
+/// What a download to SSHSpan's own program files, picked in the save
+/// dialog, is refused with.
+const APP_PROGRAM_REFUSAL: &str = "SSHSpan's own program files (where it is installed, its AppImage or app bundle) cannot be replaced by a download - choose another folder.";
 
 /// `dunce::canonicalize` - the one way the local-path rules resolve a path, so
 /// the tests can count how often that happens (each is several syscalls, and
@@ -663,7 +861,10 @@ fn resolved_local_path(p: &std::path::Path) -> PathBuf {
 ///
 /// The target is judged in its literal spelling and resolved through the
 /// deepest part of it that exists: the parent may not exist yet (the queue
-/// path creates it later) and the target may already exist.
+/// path creates it later) and the target may already exist. The commands
+/// pass the locations they resolved ([`validate_sftp_local_path_with`]); this
+/// form, with this machine's locations, is the tests'.
+#[cfg(test)]
 fn validate_sftp_local_path(path: &str, access: LocalAccess) -> CmdResult<()> {
     validate_sftp_local_path_with(path, access, &SensitiveLocations::current())
 }
@@ -680,7 +881,7 @@ fn validate_sftp_local_path_with(
 }
 
 /// Why `p` is refused for `access`, if it is - the rule
-/// [`validate_sftp_local_path`] applies.
+/// [`validate_sftp_local_path_with`] applies.
 fn local_path_refusal(
     p: &std::path::Path,
     access: LocalAccess,
@@ -714,8 +915,8 @@ fn local_path_shape_refusal(p: &std::path::Path) -> Option<&'static str> {
     None
 }
 
-/// Non-erroring form of the read rule for DESCENDANT filtering (F5) and for
-/// a link an upload follows: `validate_sftp_local_path` gates the
+/// Non-erroring form of the read rule for DESCENDANT filtering (A6-02) and
+/// for a link an upload follows: `validate_sftp_local_path_with` gates the
 /// user-selected ROOT of an upload, but a recursive walk enqueues descendants
 /// without re-checking, so an allowed ancestor that CONTAINS app data (or a
 /// symlink to a protected file) would upload the vault database - or, with
@@ -817,15 +1018,16 @@ fn local_write_refusal_with(
 }
 
 /// The rule [`sftp_download`] applies to its target: a path the user picked
-/// in the native save dialog (`granted`) only has to clear the base rules; any
-/// other path is a renderer-supplied string and gets the full write deny-list.
+/// in the native save dialog (`granted`) has to clear the base rules and may
+/// never be SSHSpan's own program ([`LocalAccess::DialogWrite`]); any other
+/// path is a renderer-supplied string and gets the full write deny-list.
 fn check_download_target(
     local: &str,
     granted: bool,
     sensitive: &SensitiveLocations,
 ) -> CmdResult<()> {
     let access = if granted {
-        LocalAccess::Basic
+        LocalAccess::DialogWrite
     } else {
         LocalAccess::Write
     };
@@ -923,11 +1125,22 @@ fn describe_sftp_error(stage: &str, e: russh_sftp::client::error::Error) -> CmdE
 /// message goes through [`sftp_error_detail`] instead of the raw doubled
 /// "Failure: Failure" text.
 pub(crate) fn describe_download_read_error(e: std::io::Error) -> CmdError {
+    describe_sftp_io_error("download", e)
+}
+
+/// [`describe_download_read_error`] for any step on an open SFTP file handle
+/// (`stage` names it): the protocol error inside the `std::io::Error`, said
+/// once through [`sftp_error_detail`].
+fn describe_sftp_io_error(stage: &str, e: std::io::Error) -> CmdError {
     use std::error::Error as _;
     // The client Error enum is private from the protocol module; match on
-    // the Display text is fragile, so walk the source chain and try the
-    // public client error type first, then fall back to the raw message.
-    let mut src: Option<&(dyn std::error::Error + 'static)> = e.source();
+    // the Display text is fragile, so look at the wrapped error and its
+    // source chain for the public client error type first, then fall back
+    // to the raw message.
+    let wrapped = e
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    let mut src: Option<&(dyn std::error::Error + 'static)> = wrapped.or_else(|| e.source());
     let mut detail = None;
     while let Some(err) = src {
         if let Some(status) = err.downcast_ref::<russh_sftp::client::error::Error>() {
@@ -937,8 +1150,8 @@ pub(crate) fn describe_download_read_error(e: std::io::Error) -> CmdError {
         src = err.source();
     }
     match detail {
-        Some(d) => CmdError(format!("download failed: {d}")),
-        None => CmdError(format!("download failed: {e}")),
+        Some(d) => CmdError(format!("{stage} failed: {d}")),
+        None => CmdError(format!("{stage} failed: {e}")),
     }
 }
 
@@ -1015,11 +1228,21 @@ pub async fn sftp_list_dir(
     path: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
+    let entries = list_entries(&sftp, &path).await?;
+    Ok(serde_json::json!({ "ok": true, "entries": entries, "path": path }))
+}
+
+/// The entries of the remote folder `path` for [`sftp_list_dir`]: folders
+/// first, then files, each alphabetical (case-insensitive).
+async fn list_entries(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+) -> CmdResult<Vec<SftpEntry>> {
     let mut entries: Vec<SftpEntry> = Vec::new();
     for entry in sftp
-        .read_dir(&path)
+        .read_dir(path)
         .await
-        .map_err(|e| CmdError(format!("List failed: {e}")))?
+        .map_err(|e| describe_sftp_error("List", e))?
     {
         let name = entry.file_name().to_string();
         if name == "." || name == ".." {
@@ -1046,7 +1269,7 @@ pub async fn sftp_list_dir(
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(serde_json::json!({ "ok": true, "entries": entries, "path": path }))
+    Ok(entries)
 }
 
 /// Resolve what a symlink reported by [`sftp_list_dir`] actually points at.
@@ -1096,10 +1319,17 @@ pub async fn sftp_mkdir(
     path: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
-    sftp.create_dir(&path)
-        .await
-        .map_err(|e| CmdError(format!("mkdir failed: {e}")))?;
+    remote_mkdir(&sftp, &path).await?;
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Create the remote folder `path` ([`sftp_mkdir`]). Like every remote error
+/// here, a failure is said once through [`describe_sftp_error`]: a bare SFTP
+/// failure used to read "mkdir failed: Failure: Failure".
+async fn remote_mkdir(sftp: &russh_sftp::client::SftpSession, path: &str) -> CmdResult<()> {
+    sftp.create_dir(path)
+        .await
+        .map_err(|e| describe_sftp_error("mkdir", e))
 }
 
 #[tauri::command]
@@ -1110,16 +1340,26 @@ pub async fn sftp_remove(
     is_dir: bool,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
+    remote_remove(&sftp, &path, is_dir).await?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Delete the remote file `path`, or the folder `path` with everything in it
+/// ([`sftp_remove`]).
+async fn remote_remove(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    is_dir: bool,
+) -> CmdResult<()> {
     if is_dir {
         // Recursive delete: rmdir only succeeds on an EMPTY directory, so a
         // folder with contents must be emptied depth-first first.
-        remove_remote_tree(&sftp, &path).await.map_err(CmdError)?;
+        remove_remote_tree(sftp, path).await.map_err(CmdError)
     } else {
-        sftp.remove_file(&path)
+        sftp.remove_file(path)
             .await
-            .map_err(|e| CmdError(format!("rm failed: {e}")))?;
+            .map_err(|e| describe_sftp_error("rm", e))
     }
-    Ok(serde_json::json!({ "ok": true }))
 }
 
 /// Delete the remote folder `path` and everything in it (the recursive
@@ -1147,7 +1387,7 @@ fn remove_remote_tree<'a>(
             return sftp
                 .remove_file(path)
                 .await
-                .map_err(|e| format!("rm {path}: {e}"));
+                .map_err(|e| format!("rm {path}: {}", sftp_error_detail(e)));
         }
         remove_tree_below(sftp, path).await
     })
@@ -1167,7 +1407,7 @@ fn remove_tree_below<'a>(
         let mut entries = sftp
             .read_dir(path)
             .await
-            .map_err(|e| format!("list {path}: {e}"))?;
+            .map_err(|e| format!("list {path}: {}", sftp_error_detail(e)))?;
         while let Some(entry) = entries.next() {
             let name = entry.file_name().to_string();
             if name == "." || name == ".." {
@@ -1180,7 +1420,7 @@ fn remove_tree_below<'a>(
                     // A child that vanishes mid-walk (or is unreadable) should
                     // not abort the whole delete - record and keep going.
                     if first_err.is_none() {
-                        first_err = Some(format!("stat {child}: {e}"));
+                        first_err = Some(format!("stat {child}: {}", sftp_error_detail(e)));
                     }
                     continue;
                 }
@@ -1192,7 +1432,7 @@ fn remove_tree_below<'a>(
                 Some(_) => sftp
                     .remove_file(&child)
                     .await
-                    .map_err(|e| format!("rm {child}: {e}")),
+                    .map_err(|e| format!("rm {child}: {}", sftp_error_detail(e))),
                 None => remove_untyped(sftp, &child).await,
             };
             if let Err(e) = res {
@@ -1204,6 +1444,7 @@ fn remove_tree_below<'a>(
         // rmdir regardless, so a partially-emptied dir still goes away when it
         // became empty; surface the first child error only if the dir remains.
         if let Err(e) = sftp.remove_dir(path).await {
+            let e = sftp_error_detail(e);
             return Err(match first_err {
                 Some(fe) => format!("{fe} (rmdir {path}: {e})"),
                 None => format!("rmdir {path}: {e}"),
@@ -1223,7 +1464,7 @@ fn remove_tree_below<'a>(
 async fn remove_untyped(sftp: &russh_sftp::client::SftpSession, child: &str) -> Result<(), String> {
     let refused = match sftp.remove_file(child).await {
         Ok(()) => return Ok(()),
-        Err(e) => format!("rm {child}: {e}"),
+        Err(e) => format!("rm {child}: {}", sftp_error_detail(e)),
     };
     if probe_folder(sftp, child).await != EntryKind::Dir {
         return Err(refused);
@@ -1245,41 +1486,19 @@ pub async fn sftp_rename(
     to: String,
 ) -> CmdResult<serde_json::Value> {
     let sftp = sftp_from_session(&app, &session_id)?;
-    sftp.rename(&from, &to)
-        .await
-        .map_err(|e| CmdError(format!("rename failed: {e}")))?;
+    remote_rename(&sftp, &from, &to).await?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
-/// NOT REGISTERED in `generate_handler!`, deliberately: nothing in the renderer
-/// calls it. The queue applies timestamps itself - the remote mtime on upload
-/// legs, the local one on downloads - when `preserveTs` is passed to
-/// `sftp_queue_add`. Kept, with its contract, for a future non-queue flow.
-///
-/// Set a remote file's mtime (and atime) via SFTP setstat - the remote half
-/// of "preserve timestamps of transferred files". Servers that refuse SETSTAT
-/// surface the error to the caller.
-#[tauri::command]
-pub async fn sftp_set_mtime(
-    app: AppHandle,
-    session_id: String,
-    path: String,
-    mtime_ms: i64,
-) -> CmdResult<serde_json::Value> {
-    let sftp = sftp_from_session(&app, &session_id)?;
-    if mtime_ms < 0 {
-        return Err(CmdError(
-            "mtime must be a Unix timestamp in milliseconds.".into(),
-        ));
-    }
-    let secs = (mtime_ms / 1000) as u32;
-    let mut attrs = russh_sftp::protocol::FileAttributes::default();
-    attrs.mtime = Some(secs);
-    attrs.atime = Some(secs);
-    sftp.set_metadata(&path, attrs)
+/// Rename the remote `from` to `to` ([`sftp_rename`]).
+async fn remote_rename(
+    sftp: &russh_sftp::client::SftpSession,
+    from: &str,
+    to: &str,
+) -> CmdResult<()> {
+    sftp.rename(from, to)
         .await
-        .map_err(|e| CmdError(format!("setstat failed: {e}")))?;
-    Ok(serde_json::json!({ "ok": true, "mtime": secs }))
+        .map_err(|e| describe_sftp_error("rename", e))
 }
 
 /// "Download as...": one remote file to a local path.
@@ -1489,106 +1708,6 @@ impl Drop for PartFileGuard {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-/// NOT REGISTERED in `generate_handler!`, deliberately: nothing calls it. Every
-/// upload goes through `sftp_queue_add`, which creates the remote directories,
-/// stages into `.part`, resumes, verifies and preserves timestamps; this
-/// older single-shot path does none of that and reads a renderer-chosen local
-/// path, so as a registered command it was only surface for a compromised
-/// renderer. Re-register it only together with a caller.
-#[tauri::command]
-pub async fn sftp_upload(
-    app: AppHandle,
-    session_id: String,
-    local: String,
-    remote: String,
-) -> CmdResult<serde_json::Value> {
-    let sftp = sftp_from_session(&app, &session_id)?;
-    validate_sftp_local_path(&local, LocalAccess::Read)?;
-    let local_path = PathBuf::from(&local);
-    let metadata = tokio::fs::metadata(&local_path)
-        .await
-        .map_err(|e| CmdError(format!("local path failed: {e}")))?;
-    let files = if metadata.is_dir() {
-        upload_directory(sftp.clone(), local_path, remote.clone()).await?
-    } else {
-        upload_one_file(sftp.clone(), local_path, remote.clone()).await?;
-        1
-    };
-    Ok(serde_json::json!({ "ok": true, "remote": remote, "files": files }))
-}
-
-async fn upload_one_file(
-    sftp: Arc<russh_sftp::client::SftpSession>,
-    local: PathBuf,
-    remote: String,
-) -> Result<(), CmdError> {
-    let mut local_file = tokio::fs::File::open(&local)
-        .await
-        .map_err(|e| CmdError(format!("local file failed: {e}")))?;
-    let mut remote_file = sftp
-        .create(&remote)
-        .await
-        .map_err(|e| CmdError(format!("remote open failed: {e}")))?;
-    tokio::io::copy(&mut local_file, &mut remote_file)
-        .await
-        .map_err(|e| CmdError(format!("upload failed: {e}")))?;
-    remote_file
-        .close()
-        .await
-        .map_err(|e| CmdError(format!("upload close failed: {e}")))?;
-    Ok(())
-}
-
-fn upload_directory(
-    sftp: Arc<russh_sftp::client::SftpSession>,
-    local_dir: PathBuf,
-    remote_dir: String,
-) -> Pin<Box<dyn Future<Output = Result<usize, CmdError>> + Send>> {
-    Box::pin(async move {
-        sftp.create_dir(&remote_dir)
-            .await
-            .map_err(|e| CmdError(format!("remote mkdir failed: {e}")))?;
-        let mut count = 0;
-        let mut entries = tokio::fs::read_dir(&local_dir)
-            .await
-            .map_err(|e| CmdError(format!("local directory failed: {e}")))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| CmdError(format!("local directory read failed: {e}")))?
-        {
-            let local = entry.path();
-            let remote = format!(
-                "{}/{}",
-                remote_dir.trim_end_matches('/'),
-                entry.file_name().to_string_lossy()
-            );
-            if entry
-                .file_type()
-                .await
-                .map_err(|e| CmdError(format!("local file type failed: {e}")))?
-                .is_dir()
-            {
-                count += upload_directory(sftp.clone(), local, remote).await?;
-            } else {
-                // F5: descendants of a validated root re-pass the source
-                // authorization check, so a broad folder upload cannot lift
-                // the vault DB (or a symlink to it) out of app data.
-                if is_protected_upload_source(&local) {
-                    log::warn!(
-                        "[sshspan-sftp] upload: skipping protected source {}",
-                        local.display()
-                    );
-                    continue;
-                }
-                upload_one_file(sftp.clone(), local, remote).await?;
-                count += 1;
-            }
-        }
-        Ok(count)
-    })
 }
 
 // ─── "edit in system editor": download, watch, sync back (A7-19) ───────────
@@ -1952,7 +2071,7 @@ struct EditUpload {
 /// used to be the fixed `<target>.sshspan-tmp`, opened with CREATE|TRUNCATE,
 /// so a link planted there by another user of a shared folder was written
 /// THROUGH (into its target), a planted file was truncated, and the rename
-/// then deleted the real file and put the link in its place (F1).
+/// then deleted the real file and put the link in its place.
 ///
 /// On any failure before the swap the temporary file this call created is
 /// removed (if the server refuses even that, the error says where the
@@ -2178,6 +2297,31 @@ impl EditSync {
         self.stopped.load(Ordering::SeqCst)
     }
 
+    /// Whether the staged copy holds anything the server does not have, as
+    /// far as this session knows: its content against the last synced hash
+    /// (what was downloaded, uploaded or reloaded). That covers a save still
+    /// inside the debounce, one that failed or was held back as a conflict,
+    /// and one whose watcher event was lost. `Err` (why) when it cannot be
+    /// told: the copy cannot be read, or what the server holds is not known.
+    /// An edit that has ended has nothing left to keep. The caller holds
+    /// `upload_lock`.
+    async fn unsynced_changes(&self) -> Result<bool, String> {
+        if self.is_stopped() {
+            return Ok(false);
+        }
+        let Some(_open) = self.staged.open_handle() else {
+            return Ok(false);
+        };
+        let local = sha256_file(self.staged.path())
+            .await
+            .map_err(|e| e.to_string())?;
+        let synced = self.synced.lock().unwrap().clone();
+        match synced {
+            Some(synced) => Ok(synced != local),
+            None => Err("what the server holds is not known".to_string()),
+        }
+    }
+
     /// The file name the user sees in messages.
     fn display_name(&self) -> &str {
         self.remote.rsplit('/').next().unwrap_or(&self.remote)
@@ -2230,9 +2374,9 @@ impl EditSync {
     /// ([`QuietRetry`]: a minute, then twice as long each time, 15 minutes at
     /// most). It used to retry a failing save every half minute, with an
     /// error event each time - and, when the swap was refused, another full
-    /// temporary copy on the server each time; then (RU6a) never again, so a
-    /// save the watcher missed stayed unsynced after its cause was gone
-    /// (RU6b P2-g). A quiet retry reports only a changed outcome - it went in,
+    /// temporary copy on the server each time; then never again, so a
+    /// save the watcher missed stayed unsynced after its cause was gone. A
+    /// quiet retry reports only a changed outcome - it went in,
     /// or a conflict - never the same failure again, and removes the
     /// temporary file the last attempt kept before making another. A save the
     /// watcher saw always gets its attempt (and its event).
@@ -2942,17 +3086,84 @@ async fn periodic_rescan(sync: std::sync::Weak<EditSync>, every: std::time::Dura
     }
 }
 
+/// How long "Stop editing" waits for an upload of the file that is running.
+const EDIT_CLOSE_UPLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Stop the edit watch for a (session, remote path) pair and discard the
-/// staged copy.
+/// staged copy - unless the copy holds something the server does not have.
+/// It used to be deleted whatever it held: a save still inside the debounce
+/// or mid-upload, one that failed or was held back as a conflict, or one
+/// whose watcher event was lost (only the 30 s rescan would have found it)
+/// was gone without a word. Without `force` an upload of the file that is
+/// running is waited for first (10 s at most); then a copy with changes the
+/// server does not have - or one that cannot be checked - closes nothing,
+/// and the answer
+/// `{ ok: false, unsynced: true, error }` asks the user. `force` closes at
+/// once, as before.
 #[tauri::command]
-pub fn sftp_close_edit(
+pub async fn sftp_close_edit(
     app: AppHandle,
     session_id: String,
     remote: String,
+    force: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     let key = format!("{session_id}:{remote}");
-    app.state::<EditRegistry>().stop(&key);
-    Ok(serde_json::json!({ "ok": true }))
+    close_edit_in(
+        &app.state::<EditRegistry>(),
+        &key,
+        force.unwrap_or(false),
+        EDIT_CLOSE_UPLOAD_WAIT,
+    )
+    .await
+}
+
+/// [`sftp_close_edit`] without the `AppHandle`: `key` is
+/// `{sessionId}:{remote}`, `upload_wait` how long a running upload is waited
+/// for. Accepted race: a save that lands in the instant between the check
+/// and the close is not seen (the same as the check-then-upload of a save).
+async fn close_edit_in(
+    registry: &EditRegistry,
+    key: &str,
+    force: bool,
+    upload_wait: std::time::Duration,
+) -> CmdResult<serde_json::Value> {
+    let closed = serde_json::json!({ "ok": true });
+    if force {
+        registry.stop(key);
+        return Ok(closed);
+    }
+    let Some(sync) = registry.live_for_key(key) else {
+        return Ok(closed);
+    };
+    let name = sync.display_name().to_string();
+    // The edit's turn: an upload (or a Reload) running now finishes first,
+    // and none starts while this decides.
+    let Ok(_turn) = tokio::time::timeout(upload_wait, sync.upload_lock.lock()).await else {
+        return Ok(edit_kept(format!(
+            "{name} is still being uploaded. Stop editing and lose any changes that do not \
+             reach the server?"
+        )));
+    };
+    match sync.unsynced_changes().await {
+        Ok(false) => {
+            registry.stop_if_same(key, &sync);
+            Ok(closed)
+        }
+        Ok(true) => Ok(edit_kept(format!(
+            "{name} has changes that are not on the server. Stop editing and lose them?"
+        ))),
+        Err(why) => Ok(edit_kept(format!(
+            "Could not tell whether the server has everything in {name} ({why}). Stop editing \
+             and lose any changes that are not on it?"
+        ))),
+    }
+}
+
+/// What a "Stop editing" that closed nothing answers: the local copy holds -
+/// or may hold - changes the server does not have, and `question` asks the
+/// user whether to lose them (`force`).
+fn edit_kept(question: String) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "unsynced": true, "error": question })
 }
 
 /// Close the SFTP subsystem for a session (also stops edit watches).
@@ -3916,7 +4127,7 @@ fn join_local(root: &std::path::Path, rel: &[String]) -> Option<PathBuf> {
 /// (and therefore followed, if it is a link: the user chose it); everything
 /// below it comes from the listings.
 ///
-/// Test-only since RU6a: `sftp_queue_add` runs the two halves itself
+/// Test-only: `sftp_queue_add` runs the two halves itself
 /// ([`prepare_download`] for every item first, then [`materialize_download`])
 /// so one failing item cannot leave local folders behind for the others.
 /// (Its tests need the unix-only in-process SFTP server.)
@@ -5507,7 +5718,7 @@ fn lock_local_names() -> std::sync::MutexGuard<'static, ()> {
 
 /// Create a directory on the LOCAL filesystem (dual-pane counterpart to
 /// `sftp_mkdir`, which only ever creates remote directories). Async, with
-/// the path checks and the mkdir on the blocking pool (RU6b P2-e): file I/O -
+/// the path checks and the mkdir on the blocking pool: file I/O -
 /// a slow or network drive included - ran on the main thread.
 #[tauri::command]
 pub async fn sftp_local_mkdir(app: AppHandle, path: String) -> CmdResult<serde_json::Value> {
@@ -5525,9 +5736,8 @@ pub async fn sftp_local_mkdir(app: AppHandle, path: String) -> CmdResult<serde_j
 
 /// Rename or move a LOCAL file/directory. Both endpoints are validated, so a
 /// rename cannot be used to move a file INTO the app data directory either.
-/// Async, with the path checks and the rename on the blocking pool (RU6b
-/// P2-e): file I/O - a slow or network drive included - ran on the main
-/// thread.
+/// Async, with the path checks and the rename on the blocking pool: file
+/// I/O - a slow or network drive included - ran on the main thread.
 #[tauri::command]
 pub async fn sftp_local_rename(
     app: AppHandle,
@@ -5650,7 +5860,7 @@ pub async fn sftp_get_permissions(
     let md = sftp
         .metadata(&path)
         .await
-        .map_err(|e| CmdError(format!("stat failed: {e}")))?;
+        .map_err(|e| describe_sftp_error("stat", e))?;
     Ok(serde_json::json!({ "ok": true, "mode": md.permissions }))
 }
 
@@ -5672,8 +5882,8 @@ async fn chmod_one(
 /// download or of a "Send to": STAT's type (a link is followed, like
 /// `chmod -R` on a command-line link: the user chose it), else LSTAT's, else
 /// whether it opens as a folder. A server whose STAT omits the type bits used
-/// to get a silent root-only chmod that ignored the files/dirs scope (JU1
-/// review), and a folder it downloaded as if it were a file.
+/// to get a silent root-only chmod that ignored the files/dirs scope, and a
+/// folder it downloaded as if it were a file.
 async fn picked_root_kind(
     sftp: &russh_sftp::client::SftpSession,
     path: &str,
@@ -5732,7 +5942,7 @@ async fn chmod_path(
     let md = sftp
         .metadata(path)
         .await
-        .map_err(|e| format!("stat failed: {e}"))?;
+        .map_err(|e| describe_sftp_error("stat", e).0)?;
     let root = if recursive {
         picked_root_kind(sftp, path, &md).await
     } else {
@@ -5756,8 +5966,8 @@ async fn chmod_path(
             chmod_one(sftp, path, mode).await?;
             changed += 1;
         }
-        // Special bits go to folders only (JU1's policy, now the backend's
-        // own): a 2775 shared folder must not make every file below it
+        // Special bits go to folders only (the renderer's policy, now the
+        // backend's own): a 2775 shared folder must not make every file below it
         // setgid, nor a 4755 one every file setuid. The renderer splits such
         // a mode only when the root's STAT reports a folder; this holds for a
         // server that leaves the type out as well.
@@ -5811,10 +6021,10 @@ pub async fn sftp_touch(
     let f = sftp
         .create(&path)
         .await
-        .map_err(|e| CmdError(format!("create failed: {e}")))?;
+        .map_err(|e| describe_sftp_error("create", e))?;
     f.close()
         .await
-        .map_err(|e| CmdError(format!("close failed: {e}")))?;
+        .map_err(|e| describe_sftp_io_error("close", e))?;
     Ok(serde_json::json!({ "ok": true, "path": path }))
 }
 
@@ -5847,7 +6057,7 @@ pub async fn sftp_fs_info(
             }))
         }
         Ok(None) => Ok(serde_json::json!({ "ok": true, "supported": false })),
-        Err(e) => Err(CmdError(format!("statvfs failed: {e}"))),
+        Err(e) => Err(describe_sftp_error("statvfs", e)),
     }
 }
 
@@ -5956,17 +6166,22 @@ pub async fn sftp_dir_size(
 // ─── remote SHA-256 ────────────────────────────────────────────────────────
 
 /// Stream a remote file through SHA-256 without ever holding it whole in
-/// memory, so a job can verify a large transfer without ballooning RSS.
-/// Shared by the on-demand [`sftp_file_sha256`] command below and by the
-/// transfer queue's opt-in post-transfer verification (which hashes both the
-/// source and destination legs on their own channels).
+/// memory, so a job can verify a large transfer without ballooning RSS. Used
+/// by the transfer queue's opt-in post-transfer verification (which hashes
+/// both the source and destination legs on their own channels).
 ///
 /// Reads are clamped to the file's stated size in 256 KiB chunks - the same
 /// clamp [`download_to`] uses - so the final read never crosses EOF (some
 /// SFTP servers answer an over-read with SSH_FX_FAILURE instead of a short
-/// read, which would otherwise fail a hash on the very last chunk).
-/// `cancel`, when given, is polled between chunks so a cancelled queue job
-/// stops hashing promptly instead of running to completion first.
+/// read, which would otherwise fail a hash on the very last chunk). A server
+/// that states no size gets the file read to its end - in the same chunks,
+/// with no byte limit, as the transfer itself read it: an unknown size used
+/// to count as 0, so the hash was that of an EMPTY file and every good copy
+/// from or to such a server failed verification and was deleted. On such a
+/// server a read that fails at the end is an error, never the
+/// digest of a part. `cancel`, when given, is polled between chunks so a
+/// cancelled queue job stops hashing promptly instead of running to
+/// completion first.
 pub(crate) async fn remote_sha256(
     sftp: &russh_sftp::client::SftpSession,
     path: &str,
@@ -5975,12 +6190,12 @@ pub(crate) async fn remote_sha256(
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt;
 
+    // `None`: the server did not say - read to the end.
     let size = sftp
         .metadata(path)
         .await
         .map_err(|e| describe_sftp_error("stat", e))?
-        .size
-        .unwrap_or(0);
+        .size;
 
     let mut remote_file = sftp
         .open(path)
@@ -5990,11 +6205,12 @@ pub(crate) async fn remote_sha256(
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut done: u64 = 0;
-    while done < size {
+    while size.is_none_or(|size| done < size) {
         if cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
             return Err(CmdError("hash cancelled".into()));
         }
-        let want = ((size - done) as usize).min(buf.len());
+        let left = size.map_or(u64::MAX, |size| size - done);
+        let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
         let n = remote_file
             .read(&mut buf[..want])
             .await
@@ -6051,23 +6267,6 @@ async fn remote_sha256_capped(
     Ok(digest)
 }
 
-/// NOT REGISTERED in `generate_handler!`, deliberately: the renderer has no
-/// "verify" action that calls it (the queue's opt-in verification uses
-/// [`remote_sha256`] directly). Kept for the day it gets one.
-///
-/// On-demand single-file SHA-256, for a "verify" action outside the transfer
-/// queue's own opt-in post-transfer verification.
-#[tauri::command]
-pub async fn sftp_file_sha256(
-    app: AppHandle,
-    session_id: String,
-    path: String,
-) -> CmdResult<serde_json::Value> {
-    let sftp = sftp_from_session(&app, &session_id)?;
-    let hex = remote_sha256(&sftp, &path, None).await?;
-    Ok(serde_json::json!({ "ok": true, "sha256": hex }))
-}
-
 // ─── keep-alive ────────────────────────────────────────────────────────────
 
 /// Start a 30 s keep-alive loop for the session's SFTP channel: a cheap
@@ -6105,22 +6304,6 @@ pub async fn sftp_keepalive_start(
     });
     app.state::<KeepaliveRegistry>().insert(session_id, stopped);
     Ok(serde_json::json!({ "ok": true }))
-}
-
-/// NOT REGISTERED in `generate_handler!`, deliberately: nothing calls it ("Send
-/// to" stages its temp file inside the worker, `run_server_copy`), and handing
-/// the renderer a staging path is the first half of the `sftp_stage_path` +
-/// `sftp_download` chain that `system_open_external`'s inert-extension gate
-/// exists to survive.
-///
-/// Staging path for cross-server "Send to" transfers (Rust temp dir).
-/// The staged file can hold secret remote contents, so its name carries a
-/// random component (audit hardening; see [`staged_file_name`]).
-#[tauri::command]
-pub fn sftp_stage_path(name: String) -> CmdResult<serde_json::Value> {
-    Ok(
-        serde_json::json!({ "path": edit_temp_dir().join(staged_file_name(&name)).display().to_string() }),
-    )
 }
 
 #[cfg(test)]
@@ -6258,7 +6441,7 @@ mod tests {
             Some(EntryKind::Other)
         );
         // Permission bits without any type bits say nothing: the walk asks
-        // (RU4; they used to be taken for files).
+        // (they used to be taken for files).
         assert_eq!(classify_attrs(&attrs(Some(0o644))), None);
         // No mode at all: the listing did not say, the caller must ask.
         assert_eq!(classify_attrs(&attrs(None)), None);
@@ -7022,7 +7205,7 @@ mod tests {
         assert_eq!(outcome.failed.total, 0);
     }
 
-    // ─── RU4: chmod on a server that does not report file types ─────────────
+    // ─── Chmod on a server that does not report file types ─────────────
 
     #[cfg(unix)]
     fn set_mode(fx: &crate::sftp::testkit::Fixture, virt: &str, mode: u32) {
@@ -7055,7 +7238,7 @@ mod tests {
         (sftp, fx)
     }
 
-    /// JU1 follow-up: the root's STAT has no type bits, so the old code saw
+    /// The root's STAT has no type bits, so the old code saw
     /// "not a folder", changed `/t` alone with a FILE mode and reported
     /// `changed: 1`. The root and every entry are now told apart (LSTAT,
     /// READLINK, opening as a folder) and the files-only scope is honoured.
@@ -7116,7 +7299,7 @@ mod tests {
             .await
             .unwrap_err();
         // The renderer shows "<path>: <message>" and labels the option
-        // "Recurse into subdirectories" (review fix 9).
+        // "Recurse into subdirectories".
         assert!(!err.starts_with("/t/d"), "{err}");
         assert!(err.contains("Recurse into subdirectories"), "{err}");
         assert_eq!(fx.mode("/t/d"), 0o755, "nothing was changed");
@@ -7127,7 +7310,7 @@ mod tests {
         assert_eq!(fx.mode("/t/d"), 0o700);
     }
 
-    /// Review fix 1: a recursive change never puts setuid/setgid/sticky on a
+    /// A recursive change never puts setuid/setgid/sticky on a
     /// walked file or other non-folder - folders get the full mode, the rest
     /// `mode & 0o777` - whether or not the server reports types. (The
     /// renderer splits such a mode only when the root's STAT says "folder";
@@ -7158,7 +7341,7 @@ mod tests {
         }
     }
 
-    /// Review fixes 2 and 3: what a READLINK or a folder probe answer means
+    /// What a READLINK or a folder probe answer means
     /// is never guessed. OpenSSH's sftp-server answers READLINK on a non-link
     /// with SSH_FX_BAD_MESSAGE (EINVAL) and OPENDIR on a file with
     /// SSH_FX_NO_SUCH_FILE (ENOTDIR); anything else unexplained is Unknown.
@@ -7166,7 +7349,7 @@ mod tests {
     fn ru4_probe_answers_are_never_guessed() {
         use russh_sftp::protocol::StatusCode as S;
         assert!(readlink_says_not_a_link(&status_err(S::BadMessage, "")));
-        // RU6a fix round 1 (item 8): "failure" and "no such file" are not
+        // "failure" and "no such file" are not
         // conclusive - a server that answers every READLINK with "failure"
         // says it of a link too. Those go to the REALPATH check.
         for code in [
@@ -7205,7 +7388,7 @@ mod tests {
         assert_eq!(folder_probe_kind(Err(timeout)), EntryKind::Unknown);
     }
 
-    /// Review fix 3: an untyped entry whose LSTAT fails is left alone like
+    /// An untyped entry whose LSTAT fails is left alone like
     /// any other entry of unknown type (it used to be `Other`, which a
     /// recursive chmod changes with the files' mode).
     #[cfg(unix)]
@@ -7250,7 +7433,7 @@ mod tests {
         assert!(out["failed"].to_string().contains("/t/d"), "{out}");
     }
 
-    // ─── RU6a fix 1, item 1 (F1): the edit's temporary remote file ──────────
+    // ─── The edit's temporary remote file ──────────
 
     /// Names in the test server's `dir` that are edit temp files.
     #[cfg(unix)]
@@ -7386,7 +7569,7 @@ mod tests {
         assert_eq!(fx.read("/srv/app.conf"), b"v2, longer");
     }
 
-    // ─── RU6a item 6: the remote temp file of a failed edit upload ───────────
+    // ─── The remote temp file of a failed edit upload ───────────
 
     /// A server on Windows (Win32-OpenSSH) will not delete a file that is
     /// still open. A failed upload deleted its temp file while our handle
@@ -7581,8 +7764,9 @@ mod tests {
 
         // The directory watch must report a save; wait for it rather than for a
         // fixed time (the positive half is the one a slow machine could fail).
+        // The limit only bounds a failure, wide for a loaded machine.
         let mut dir_events: Vec<notify::Event> = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline
             && !dir_events.iter().any(|e| is_edit_trigger(e, &name))
         {
@@ -7635,7 +7819,7 @@ mod tests {
         );
     }
 
-    /// RU6a item 12: the event names its edit session, and a conflict says
+    /// The event names its edit session, and a conflict says
     /// what the server holds now.
     #[test]
     fn edit_sync_events_report_success_failure_conflict_and_reload() {
@@ -7753,6 +7937,27 @@ mod tests {
         mode: Option<u32>,
         synced_content: Option<&[u8]>,
     ) -> (Arc<EditSync>, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        edit_sync_settling_in(
+            sftp,
+            local,
+            target,
+            mode,
+            synced_content,
+            std::time::Duration::from_millis(80),
+        )
+        .await
+    }
+
+    /// [`edit_sync_with`] whose saves settle after `window` (80 ms there).
+    #[cfg(unix)]
+    async fn edit_sync_settling_in(
+        sftp: russh_sftp::client::SftpSession,
+        local: &std::path::Path,
+        target: &str,
+        mode: Option<u32>,
+        synced_content: Option<&[u8]>,
+        window: std::time::Duration,
+    ) -> (Arc<EditSync>, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
         use sha2::{Digest, Sha256};
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = events.clone();
@@ -7772,7 +7977,7 @@ mod tests {
             mode,
             emit: Arc::new(move |payload| sink.lock().unwrap().push(payload)),
             stopped: std::sync::atomic::AtomicBool::new(false),
-            debounce: EditDebounce::new(std::time::Duration::from_millis(80)),
+            debounce: EditDebounce::new(window),
             upload_lock: tokio::sync::Mutex::new(()),
             baseline: std::sync::Mutex::new(baseline),
             synced: std::sync::Mutex::new(synced),
@@ -8069,7 +8274,7 @@ mod tests {
         assert_eq!(fx.read("/srv/app.conf"), b"old");
     }
 
-    // ─── RU6a item 5: a watcher overflow is a rescan ─────────────────────────
+    // ─── A watcher overflow is a rescan ─────────────────────────
 
     /// notify 7 reports a queue overflow as an EVENT carrying the Rescan flag
     /// (`Ok`, not `Err`), and the old code took it for an unrelated event: a
@@ -8131,7 +8336,7 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
     }
 
-    // ─── RU6a item 12: a remote change since the download is a conflict ──────
+    // ─── A remote change since the download is a conflict ──────
 
     /// An edit session opened on `v1`, then the server's copy changed by
     /// someone else and the local copy edited: (sync, events, fixture, the
@@ -8280,7 +8485,7 @@ mod tests {
             .expect("a conflict event with an id")
     }
 
-    // ─── RU6a fix 1, item 3: resolve needs a pending conflict ────────────────
+    // ─── Resolve needs a pending conflict ────────────────
 
     /// Overwrite/Reload used to be accepted with no conflict reported at all:
     /// a resolve is refused unless it names the conflict that is pending.
@@ -8352,7 +8557,7 @@ mod tests {
             .is_err());
     }
 
-    // ─── RU6a fix 1, item 4: a file deleted on the server while edited ──────
+    // ─── A file deleted on the server while edited ──────
 
     /// Every save used to report "Could not check ... No such file ... Save
     /// again to retry" - forever. It is a conflict ("deleted"), and Overwrite
@@ -8394,7 +8599,7 @@ mod tests {
         assert_eq!(fx.read("/srv/app.conf"), b"my edit");
     }
 
-    // ─── RU6a fix 1, item 5: Reload records the bytes it downloaded ─────────
+    // ─── Reload records the bytes it downloaded ─────────
 
     /// An editor save landing right after Reload's rename was hashed as if it
     /// were the server's content - recorded as synced, never uploaded.
@@ -8419,7 +8624,7 @@ mod tests {
         assert_eq!(fx.read("/srv/app.conf"), b"typed during the reload");
     }
 
-    // ─── RU6a fix 1, item 6: the open-time baseline ──────────────────────────
+    // ─── The open-time baseline ──────────────────────────
 
     /// The baseline came from a separate STAT whose failure was swallowed
     /// (`.ok()`): a STAT that failed once left a blank baseline, so the next
@@ -8493,7 +8698,7 @@ mod tests {
         assert_eq!(last["conflict"], true, "{last}");
     }
 
-    // ─── RU6a fix 1, item 13: a periodic look at the staged copy ────────────
+    // ─── A periodic look at the staged copy ────────────
 
     /// notify's Windows backend never reports an overflow, so a save whose
     /// events were lost there was never uploaded. A periodic check of the
@@ -8514,7 +8719,8 @@ mod tests {
         ));
 
         std::fs::write(&staged, b"saved, but no event arrived").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Both limits only bound a failure, wide for a loaded machine.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while fx.read("/srv/app.conf") != b"saved, but no event arrived"
             && std::time::Instant::now() < deadline
         {
@@ -8523,7 +8729,7 @@ mod tests {
         assert_eq!(fx.read("/srv/app.conf"), b"saved, but no event arrived");
         // Ending the edit ends the check.
         sync.end();
-        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
             .expect("the periodic check stops with the edit")
             .unwrap();
@@ -8601,7 +8807,7 @@ mod tests {
         );
     }
 
-    // ─── RU6a item 6: ending an edit discards its staged copy ────────────────
+    // ─── Ending an edit discards its staged copy ────────────────
 
     /// Closing an edit, closing its session and locking the vault each end the
     /// session (found by its id until then) and discard its staged copy.
@@ -8673,7 +8879,7 @@ mod tests {
         })
     }
 
-    // ─── RU6a fix 1, item 18: two opens of one file ──────────────────────────
+    // ─── Two opens of one file ──────────────────────────
 
     /// Two `sftp_open_for_edit` calls for the same file: the second insert
     /// dropped the first watch without ending it - its staged copy lingered and
@@ -8716,6 +8922,287 @@ mod tests {
             Some("edit-2".into())
         );
         assert!(registry.find("edit-1").is_none());
+    }
+
+    // ─── "Stop editing" never drops a change the server does not have ─────
+
+    /// The registry key of an [`edit_sync_with`] edit (session `sess`,
+    /// `/link.conf`).
+    #[cfg(unix)]
+    const EDIT_KEY: &str = "sess:/link.conf";
+
+    /// An edit of `/srv/app.conf` that agrees with the server (`v1` on both
+    /// sides), registered the way `sftp_open_for_edit` leaves one but with
+    /// no watcher - each test makes its saves, and loses its events, itself.
+    /// Its saves settle after `window`.
+    #[cfg(unix)]
+    async fn registered_edit(
+        local: &LocalDir,
+        window: std::time::Duration,
+    ) -> (
+        EditRegistry,
+        Arc<EditSync>,
+        crate::sftp::testkit::Fixture,
+        PathBuf,
+    ) {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.write("/srv/app.conf", b"v1");
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, _events) =
+            edit_sync_settling_in(sftp, &staged, "/srv/app.conf", None, Some(b"v1"), window).await;
+        let registry = EditRegistry::new();
+        registry.insert(
+            EDIT_KEY.into(),
+            EditWatch {
+                session_id: "sess".into(),
+                watcher: None,
+                sync: sync.clone(),
+            },
+        );
+        (registry, sync, fx, staged)
+    }
+
+    /// The edit is still open: registered, running, its copy in place.
+    #[cfg(unix)]
+    fn still_open(registry: &EditRegistry, sync: &Arc<EditSync>, staged: &std::path::Path) -> bool {
+        registry
+            .live_for_key(EDIT_KEY)
+            .is_some_and(|live| Arc::ptr_eq(&live, sync))
+            && !sync.is_stopped()
+            && staged.exists()
+    }
+
+    /// The edit is closed: gone from the registry, ended, its copy deleted.
+    #[cfg(unix)]
+    fn closed(registry: &EditRegistry, sync: &Arc<EditSync>, staged: &std::path::Path) -> bool {
+        registry.live_for_key(EDIT_KEY).is_none() && sync.is_stopped() && !staged.exists()
+    }
+
+    /// "Stop editing" without `force`.
+    #[cfg(unix)]
+    async fn stop_editing(registry: &EditRegistry) -> serde_json::Value {
+        close_edit_in(
+            registry,
+            EDIT_KEY,
+            false,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn assert_kept(answer: &serde_json::Value, says: &str) {
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert_eq!(answer["unsynced"], true, "{answer}");
+        assert_eq!(answer["error"].as_str(), Some(says), "{answer}");
+    }
+
+    /// The message for a copy with changes the server does not have.
+    #[cfg(unix)]
+    const NOT_ON_THE_SERVER: &str =
+        "link.conf has changes that are not on the server. Stop editing and lose them?";
+
+    /// "Stop editing" right after a save - still inside the debounce, so not
+    /// uploaded yet - deleted the copy and the save with it, silently. It
+    /// asks now, and closes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_fix4_stop_editing_keeps_a_save_still_inside_the_debounce() {
+        let local = LocalDir::new();
+        // A window no test outlasts: the save is pending all along.
+        let (registry, sync, fx, staged) =
+            registered_edit(&local, std::time::Duration::from_secs(600)).await;
+        std::fs::write(&staged, b"my edit").unwrap();
+        let pending = tokio::spawn(sync.clone().react(WatchVerdict::Save));
+        let answer = stop_editing(&registry).await;
+        assert_kept(&answer, NOT_ON_THE_SERVER);
+        assert!(still_open(&registry, &sync, &staged), "nothing was closed");
+        assert_eq!(fx.read("/srv/app.conf"), b"v1");
+        pending.abort();
+    }
+
+    /// A save whose upload failed, or that was held back as a conflict,
+    /// exists only in the local copy: closing deleted it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_fix4_stop_editing_keeps_a_save_that_failed_or_conflicted() {
+        for conflicted in [false, true] {
+            let local = LocalDir::new();
+            let (registry, sync, fx, staged) =
+                registered_edit(&local, std::time::Duration::from_millis(80)).await;
+            if conflicted {
+                fx.write("/srv/app.conf", b"changed by someone else meanwhile");
+            } else {
+                fx.knobs.lock().unwrap().write_fail_at = Some(0);
+            }
+            std::fs::write(&staged, b"my edit").unwrap();
+            sync.clone().react(WatchVerdict::Save).await;
+            assert_ne!(fx.read("/srv/app.conf"), b"my edit", "nothing went in");
+            let answer = stop_editing(&registry).await;
+            assert_kept(&answer, NOT_ON_THE_SERVER);
+            assert!(
+                still_open(&registry, &sync, &staged),
+                "conflicted={conflicted}: nothing was closed"
+            );
+        }
+    }
+
+    /// A save whose watcher event was lost (Windows reports no overflow;
+    /// only the 30 s rescan would have found it): the copy changed and
+    /// nothing was told. Closing deleted it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_fix4_stop_editing_keeps_a_save_whose_watcher_event_was_lost() {
+        let local = LocalDir::new();
+        let (registry, sync, _fx, staged) =
+            registered_edit(&local, std::time::Duration::from_millis(80)).await;
+        std::fs::write(&staged, b"saved, but no event arrived").unwrap();
+        let answer = stop_editing(&registry).await;
+        assert_kept(&answer, NOT_ON_THE_SERVER);
+        assert!(still_open(&registry, &sync, &staged));
+    }
+
+    /// A copy the server has - untouched, or saved and uploaded - closes
+    /// without a question, as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_fix4_stop_editing_closes_a_copy_the_server_has_without_asking() {
+        for saved in [false, true] {
+            let local = LocalDir::new();
+            let (registry, sync, fx, staged) =
+                registered_edit(&local, std::time::Duration::from_millis(80)).await;
+            if saved {
+                std::fs::write(&staged, b"my edit").unwrap();
+                sync.clone().react(WatchVerdict::Save).await;
+                assert_eq!(fx.read("/srv/app.conf"), b"my edit", "the save went in");
+            }
+            assert_eq!(
+                stop_editing(&registry).await,
+                serde_json::json!({ "ok": true }),
+                "saved={saved}"
+            );
+            assert!(closed(&registry, &sync, &staged), "saved={saved}");
+        }
+        // No edit open for the file: nothing to close, nothing to ask.
+        let registry = EditRegistry::new();
+        assert_eq!(
+            stop_editing(&registry).await,
+            serde_json::json!({ "ok": true })
+        );
+    }
+
+    /// `force` closes at once, changes or not - the choice the question
+    /// offers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_fix4_stop_editing_with_force_closes_at_once() {
+        let local = LocalDir::new();
+        let (registry, sync, _fx, staged) =
+            registered_edit(&local, std::time::Duration::from_secs(600)).await;
+        std::fs::write(&staged, b"my edit").unwrap();
+        let pending = tokio::spawn(sync.clone().react(WatchVerdict::Save));
+        let answer = close_edit_in(
+            &registry,
+            EDIT_KEY,
+            true,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, serde_json::json!({ "ok": true }));
+        assert!(closed(&registry, &sync, &staged));
+        pending.abort();
+    }
+
+    /// An upload of the file that is running: "Stop editing" waits for it,
+    /// then decides - and while it runs past the wait, the edit stays open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_fix4_stop_editing_waits_for_an_upload_that_is_running() {
+        use sha2::{Digest, Sha256};
+        let local = LocalDir::new();
+        let (registry, sync, _fx, staged) =
+            registered_edit(&local, std::time::Duration::from_millis(80)).await;
+        std::fs::write(&staged, b"my edit").unwrap();
+        // The upload holds the edit's turn until the server has the save.
+        let turn = sync.upload_lock.lock().await;
+        let upload = async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            *sync.synced.lock().unwrap() = Some(format!("{:x}", Sha256::digest(b"my edit")));
+            drop(turn);
+        };
+        let (answer, ()) = tokio::join!(stop_editing(&registry), upload);
+        assert_eq!(
+            answer,
+            serde_json::json!({ "ok": true }),
+            "waited, then closed"
+        );
+        assert!(closed(&registry, &sync, &staged));
+
+        // One that does not end within the wait.
+        let local = LocalDir::new();
+        let (registry, sync, _fx, staged) =
+            registered_edit(&local, std::time::Duration::from_millis(80)).await;
+        std::fs::write(&staged, b"my edit").unwrap();
+        let _uploading = sync.upload_lock.lock().await;
+        let answer = close_edit_in(
+            &registry,
+            EDIT_KEY,
+            false,
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        assert_kept(
+            &answer,
+            "link.conf is still being uploaded. Stop editing and lose any changes that do not \
+             reach the server?",
+        );
+        assert!(still_open(&registry, &sync, &staged));
+    }
+
+    /// When it cannot tell - the local copy cannot be read, or what the
+    /// server holds is not known - it asks; it never deletes silently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_fix4_stop_editing_never_closes_a_copy_it_cannot_check() {
+        let local = LocalDir::new();
+        let (registry, sync, _fx, staged) =
+            registered_edit(&local, std::time::Duration::from_millis(80)).await;
+        // The copy is no longer a file anyone can read.
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        let answer = stop_editing(&registry).await;
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert_eq!(answer["unsynced"], true, "{answer}");
+        let says = answer["error"].as_str().unwrap_or_default();
+        assert!(
+            says.starts_with("Could not tell whether the server has everything in link.conf (")
+                && says.ends_with("). Stop editing and lose any changes that are not on it?"),
+            "{answer}"
+        );
+        assert!(registry.live_for_key(EDIT_KEY).is_some() && !sync.is_stopped());
+
+        // Nothing known to be on the server.
+        let local = LocalDir::new();
+        let (sftp, _fx) = crate::sftp::testkit::serve().await;
+        let staged = local.0.join("staged.conf");
+        std::fs::write(&staged, b"v1").unwrap();
+        let (sync, _events) = edit_sync_with(sftp, &staged, "/srv/app.conf", None, None).await;
+        let registry = EditRegistry::new();
+        registry.insert(
+            EDIT_KEY.into(),
+            EditWatch {
+                session_id: "sess".into(),
+                watcher: None,
+                sync: sync.clone(),
+            },
+        );
+        let answer = stop_editing(&registry).await;
+        assert_eq!(answer["unsynced"], true, "{answer}");
+        assert!(still_open(&registry, &sync, &staged));
     }
 
     // ─── local pane commands off the main thread (A7-48) ─────────────────────
@@ -9127,7 +9614,7 @@ mod tests {
             );
         }
         // (`.vimrc` was the example here; it is an editor startup file that
-        // is refused too since RU6a fix round 2.)
+        // is refused too.)
         let other = home.join("notes.txt").display().to_string();
         assert!(validate_sftp_local_path(&other, LocalAccess::Write).is_ok());
     }
@@ -9157,6 +9644,13 @@ mod tests {
             startup_dirs: windows_startup_dirs(Some(&base.join("AppData")), None),
             shell_startup: vec![base.join("home/.bashrc")],
             program_files: vec![base.join("home/.gitconfig")],
+            app_program: vec![
+                base.join("opt/SSHSpan"),
+                base.join("home/Apps/SSHSpan.AppImage"),
+                base.join("home/Downloads/sshspan.exe"),
+            ],
+            app_program_dll_dirs: vec![base.join("home/Downloads")],
+            app_data: vec![base.join("local").join(BUNDLE_IDENTIFIER)],
             app_data_dir: Some(base.join("data")),
             system_dirs: crate::commands::system_dirs(),
         }
@@ -9328,25 +9822,22 @@ mod tests {
     }
 
     #[test]
-    fn stage_path_sanitizes_separators_and_randomizes() {
-        let r = sftp_stage_path("a/b\\c".into()).unwrap();
-        let p = r["path"].as_str().unwrap();
-        let name = p.rsplit(std::path::MAIN_SEPARATOR).next().unwrap();
+    fn staged_file_names_flatten_separators_and_are_random() {
+        let name = staged_file_name("a/b\\c");
         assert!(
             !name.contains('/') && !name.contains('\\'),
-            "path separators must be flattened: {p}"
+            "path separators must be flattened: {name}"
         );
         // Base name must survive sanitization...
         assert!(
             name.starts_with("a_b_c"),
-            "sanitized base must be preserved: {p}"
+            "sanitized base must be preserved: {name}"
         );
         // ...plus carry a random component.
-        let r2 = sftp_stage_path("a/b\\c".into()).unwrap();
         assert_ne!(
-            p,
-            r2["path"].as_str().unwrap(),
-            "staged paths must not be predictable"
+            name,
+            staged_file_name("a/b\\c"),
+            "staged names must not be predictable"
         );
     }
 
@@ -9435,7 +9926,7 @@ mod tests {
             Some("trailing".to_string())
         );
         // Control characters cannot appear in Windows file names. (NUL is
-        // refused outright - RU6a, item 1.)
+        // refused outright.)
         assert_eq!(
             sanitize_remote_name("a\tb\u{1}c"),
             Some("a_b_c".to_string())
@@ -9739,7 +10230,7 @@ mod tests {
         assert!(validate_sftp_local_path("relative/path", LocalAccess::Write).is_err());
     }
 
-    // ─── RU6a item 1: every derived local path, and local deletes (A6-02) ────
+    // ─── Every derived local path, and local deletes (A6-02) ────
 
     /// The canonical form of a scratch directory (the fixtures compare
     /// resolved paths).
@@ -10025,7 +10516,7 @@ mod tests {
         assert!(rename(base.join("home/docs/a"), base.join("home/docs/b")).is_ok());
     }
 
-    // ─── RU6a item 2: no type bits is not "a file" ───────────────────────────
+    // ─── No type bits is not "a file" ───────────────────────────
 
     /// The folder the user PICKED was judged by its STAT alone: on a server
     /// that leaves the type bits out it was queued as one file - a read of a
@@ -10091,8 +10582,10 @@ mod tests {
             .unwrap()
             .success());
         let local = LocalDir::new();
+        // A download blocked on the pipe never ends; the limit is wide for a
+        // loaded machine.
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(30),
             download_to(&sftp, "/d/pipe", &local.file("pipe")),
         )
         .await;
@@ -10210,13 +10703,13 @@ mod tests {
         assert!(fx.exists("/outside"), "a link's target is never touched");
     }
 
-    // ─── RU6a item 3 ─────────────────────────────────────────────────────────
+    // ─── A download is synced to disk before its rename ──────────────────────
 
     /// The staged download is fsynced before it is renamed over the
     /// destination, like the queue's download leg - otherwise a crash right
     /// after the rename can leave an empty or partial file under the final
     /// name. Durability itself cannot be observed from a test; the steps a
-    /// real download goes through can (fix 1: this used to grep the source,
+    /// real download goes through can (this test used to grep the source,
     /// which a comment could satisfy).
     #[cfg(unix)]
     #[tokio::test]
@@ -10232,7 +10725,7 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap().len(), 300_000);
     }
 
-    // ─── RU6a item 4: per-item results ───────────────────────────────────────
+    // ─── Per-item results ───────────────────────────────────────
 
     #[cfg(unix)]
     fn batch() -> BatchCtx<'static> {
@@ -10378,7 +10871,7 @@ mod tests {
         assert!(missing.contains("missing.txt"), "{missing}");
     }
 
-    // ─── RU6a item 7: Task 10's missing tests ────────────────────────────────
+    // ─── Download targets, remote names and download folders ────
 
     /// `sftp_download`'s grant branch: a path the user picked in the save
     /// dialog may sit in a sensitive place (they chose it); the same path as a
@@ -10401,7 +10894,7 @@ mod tests {
         }
     }
 
-    /// Item 1: remote names with a NUL are refused, not flattened into a
+    /// Remote names with a NUL are refused, not flattened into a
     /// writable name; Windows' extra reserved device spellings are refused too.
     #[test]
     fn ru6a_remote_names_with_nul_or_windows_reserved_devices_are_refused() {
@@ -10416,7 +10909,7 @@ mod tests {
         }
     }
 
-    /// Item 1: a local link outside the destination is refused BEFORE mkdir
+    /// A local link outside the destination is refused BEFORE mkdir
     /// touches anything through it (checking only after mkdir was too late).
     #[cfg(unix)]
     #[tokio::test]
@@ -10438,7 +10931,7 @@ mod tests {
         );
     }
 
-    /// Item 2: an unknown path is never opened on the assumption it is a file.
+    /// An unknown path is never opened on the assumption it is a file.
     /// On an untyped server a folder's OPENDIR can be refused too; the file
     /// open would read a folder, or worse a pipe.
     #[cfg(unix)]
@@ -10462,7 +10955,7 @@ mod tests {
         );
     }
 
-    /// Item 4: a picked item whose final local path is refused is an ERROR,
+    /// A picked item whose final local path is refused is an ERROR,
     /// not a "queued: 0" success; an acceptable pick still queues.
     #[cfg(unix)]
     #[tokio::test]
@@ -10491,7 +10984,7 @@ mod tests {
         assert_eq!(out.jobs.len(), 1);
     }
 
-    /// Item 12: a modification time change alone is a conflict too (the other
+    /// A modification time change alone is a conflict too (the other
     /// save can have exactly the same length).
     #[cfg(unix)]
     #[tokio::test]
@@ -10517,10 +11010,10 @@ mod tests {
         assert_eq!(e["remoteModifiedMs"], 1_600_000_000_000i64);
     }
 
-    // ─── RU6a item 10 ────────────────────────────────────────────────────────
+    // ─── An entry whose type could not be checked says why ───────────────────
 
     /// An entry whose type the server leaves out and whose LSTAT then fails
-    /// is left alone (RU4) - and the note now says why, instead of hiding the
+    /// is left alone - and the note now says why, instead of hiding the
     /// cause behind "does not say whether it is a file or a folder".
     #[cfg(unix)]
     #[tokio::test]
@@ -10553,7 +11046,7 @@ mod tests {
         );
     }
 
-    // ─── RU6a fix round 1, group B: the local-path policy ────────────────────
+    // ─── The local-path policy ────────────────────
 
     /// A download plan made up locally: the picked folder `pick`, `folders`
     /// folders in it and `files` files spread over all of them.
@@ -10582,7 +11075,7 @@ mod tests {
         plan
     }
 
-    /// Item 2: the deny-list check of a folder download resolved every
+    /// The deny-list check of a folder download resolved every
     /// protected location again for every FILE (about 50 resolutions per
     /// file: 4 s for 10,000 files on Linux, about 90 s on Windows, before
     /// anything was queued). The locations are resolved once now, and a file
@@ -10614,7 +11107,7 @@ mod tests {
         );
     }
 
-    /// Item 2, the upload side: every file of a picked folder went through
+    /// The upload side: every file of a picked folder went through
     /// the full read check (its own resolution plus every protected
     /// location's).
     #[cfg(unix)]
@@ -10647,7 +11140,7 @@ mod tests {
         );
     }
 
-    /// Item 2, job start: every queued download re-checks its final path
+    /// Job start: every queued download re-checks its final path
     /// when it starts (+9 ms per job on Windows). The protected locations are
     /// reused between checks now, so only the job's own path is resolved.
     #[cfg(unix)]
@@ -10668,7 +11161,7 @@ mod tests {
         );
     }
 
-    /// Item 7: item errors shared the 25-entry warnings cap with the notes of
+    /// Item errors shared the 25-entry warnings cap with the notes of
     /// the walks, so 30 skipped links hid the `/locked` error. Item errors
     /// come first now and are never dropped.
     #[cfg(unix)]
@@ -10713,7 +11206,7 @@ mod tests {
         );
     }
 
-    /// Item 2, the commands/mod.rs half: the system folders were resolved
+    /// The commands/mod.rs half: the system folders were resolved
     /// again for every check (on Windows up to seven folders, per file). They
     /// are resolved with the other protected locations now, so checking an
     /// existing folder resolves that folder and nothing else.
@@ -10735,7 +11228,7 @@ mod tests {
         assert_eq!(spent, 1, "path resolutions to check one existing folder");
     }
 
-    /// Item 15: the name sanitizer was not idempotent (`notes\u{3000}.` gave
+    /// The name sanitizer was not idempotent (`notes\u{3000}.` gave
     /// `notes\u{3000}`, which the plain-name check then refused because a
     /// second pass trims it to `notes`). Property: every output is a fixed
     /// point - over every name of up to four characters from the characters
@@ -10781,7 +11274,7 @@ mod tests {
         }
     }
 
-    /// Item 15, end to end: a remote name the sanitizer changes is accepted
+    /// End to end: a remote name the sanitizer changes is accepted
     /// by the plain-name check in its sanitized form.
     #[cfg(unix)]
     #[test]
@@ -10799,7 +11292,7 @@ mod tests {
         }
     }
 
-    /// Item 17: an upload pick that adds nothing - a link to a folder - and
+    /// An upload pick that adds nothing - a link to a folder - and
     /// the protected files a folder upload leaves out were only logged. Both
     /// are the item's warnings now (and in the batch's warnings).
     #[cfg(unix)]
@@ -10842,7 +11335,7 @@ mod tests {
             "{:?}",
             home.warnings
         );
-        // RU6a fix round 2 (nit): a pick that adds nothing at all is an
+        // A pick that adds nothing at all is an
         // error, as for downloads.
         let linked = &out.outcomes[1];
         assert_eq!((linked.status, linked.added), (ItemStatus::Error, 0));
@@ -10858,7 +11351,7 @@ mod tests {
         );
     }
 
-    /// Item 19: more places where a written file runs at login or when a
+    /// More places where a written file runs at login or when a
     /// shell starts. Writing there is refused; reading (dotfile syncing) is
     /// still allowed, and the neighbours stay writable.
     #[test]
@@ -10920,7 +11413,7 @@ mod tests {
         }
     }
 
-    /// Item 19, the layout: the XDG folders the environment moves are
+    /// The layout: the XDG folders the environment moves are
     /// covered as well as `~/.config` and `~/.local/share`, and the Windows
     /// PowerShell profiles sit in the real Documents folder and in
     /// `~/Documents`.
@@ -10982,7 +11475,7 @@ mod tests {
             .is_none());
     }
 
-    // ─── RU6a fix round 1, group C: servers without type bits (item 8) ───────
+    // ─── Servers without type bits ───────
 
     /// `/t` holds `f`, `d/g`, `flink` (a link to `f`) and `link` (a link to
     /// `/keep`, whose `precious` must survive whatever is done to `/t`), on
@@ -11010,7 +11503,7 @@ mod tests {
         (sftp, fx)
     }
 
-    /// Item 8: with READLINK unsupported, deleting a folder left every plain
+    /// With READLINK unsupported, deleting a folder left every plain
     /// file ("could not tell whether it is a file or a folder"). REMOVE is
     /// tried first now - it never follows a link - so files and links go,
     /// folders are emptied and removed, and nothing outside is touched.
@@ -11027,7 +11520,7 @@ mod tests {
         assert_eq!(fx.read("/keep/precious"), b"keep me");
     }
 
-    /// Item 8 (sec F2): a server whose READLINK answers "failure" for a link
+    /// A server whose READLINK answers "failure" for a link
     /// too. The link was taken for "not a link", opened as a folder - which
     /// follows it - and everything it pointed to was deleted. Even when the
     /// link itself cannot be removed, it is not followed now: it opens as a
@@ -11053,7 +11546,7 @@ mod tests {
         assert_eq!(fx.read("/keep/precious"), b"keep me");
     }
 
-    /// Item 8, the folder the user picked: a link to a folder handed to a
+    /// The folder the user picked: a link to a folder handed to a
     /// recursive delete is unlinked - the folder it points to is never
     /// emptied - whether or not the server reports types.
     #[cfg(unix)]
@@ -11076,7 +11569,7 @@ mod tests {
         }
     }
 
-    /// Item 8, the same guard for the walks (download, chmod): with READLINK
+    /// The same guard for the walks (download, chmod): with READLINK
     /// answering "failure" a link was walked as a folder - a folder download
     /// fetched what it points to - and with READLINK unsupported nothing at
     /// all could be told apart. An entry counts as a folder or a file only
@@ -11121,9 +11614,9 @@ mod tests {
         }
     }
 
-    // ─── RU6a fix round 2 ────────────────────────────────────────────────────
+    // ─── A save that keeps failing is reported once ──────────────────────────
 
-    /// Item 1: a save whose swap the server refuses (a sticky shared folder,
+    /// A save whose swap the server refuses (a sticky shared folder,
     /// a Windows file held open, an immutable file) was tried again by every
     /// periodic check - another `ok:false` event and another full copy left
     /// as a temporary file each time - for as long as the edit stayed open.
@@ -11183,7 +11676,7 @@ mod tests {
         assert_eq!(seen().last().unwrap()["ok"], true, "{:?}", seen());
     }
 
-    /// Item 1: with the staged copy gone, every check reported the same read
+    /// With the staged copy gone, every check reported the same read
     /// error again (five events in 1.3 s at a short period). Once is enough.
     #[cfg(unix)]
     #[tokio::test]
@@ -11207,9 +11700,9 @@ mod tests {
         assert!(error.contains("could not read the saved file"), "{error}");
     }
 
-    // ─── RU6b (RU6a review follow-ups) ───────────────────────────────────────
+    // ─── Edit saves, local renames and write-protected program folders ───────
 
-    /// P2-f: on a server that leaves the type bits out and refuses the folder
+    /// On a server that leaves the type bits out and refuses the folder
     /// probe on a file, a temp this app wrote is accepted on its size - so the
     /// size check is what keeps a short write or someone else's file out, and
     /// the link checks (READLINK, else REALPATH identity) what keep a link
@@ -11259,7 +11752,7 @@ mod tests {
         assert!(err.contains("symbolic link"), "{err}");
     }
 
-    /// P2-g: a save the watcher missed is tried by the periodic check. When
+    /// A save the watcher missed is tried by the periodic check. When
     /// that attempt failed, no later check tried it again - even once the
     /// cause was gone - until the next real save. It is retried quietly now,
     /// after a growing wait: nothing before it is due, a retry that fails
@@ -11321,7 +11814,7 @@ mod tests {
         );
     }
 
-    /// RU6b fix round 1: off the main thread, two local renames to one name
+    /// Off the main thread, two local renames to one name
     /// both passed "the destination is free" before either renamed - and the
     /// second silently replaced what the first had moved there.
     #[cfg(unix)]
@@ -11372,7 +11865,7 @@ mod tests {
         assert!(base.join(left).exists(), "the refused rename moved nothing");
     }
 
-    /// Item 2: on a server that reports neither size nor time, the re-check
+    /// On a server that reports neither size nor time, the re-check
     /// before an Overwrite compared size and time only - always empty - so it
     /// overwrote a second remote change (Bob's v3). The conflict was found by
     /// content, so it is checked by content again.
@@ -11411,10 +11904,10 @@ mod tests {
         assert_eq!(fx.read("/srv/app.conf"), b"my edit");
     }
 
-    /// Item 3: on a server that leaves the type bits out and answers "list
+    /// On a server that leaves the type bits out and answers "list
     /// this folder" on a file with "permission denied", the temporary file
-    /// could not be proven to be a file, so every save failed (before round 1
-    /// they worked). A temp that is not a link and holds exactly the bytes
+    /// could not be proven to be a file, so every save failed (an earlier
+    /// version saved them). A temp that is not a link and holds exactly the bytes
     /// just written is accepted - with READLINK working or not.
     #[cfg(unix)]
     #[tokio::test]
@@ -11441,7 +11934,7 @@ mod tests {
         }
     }
 
-    /// Item 4: two `sftp_open_for_edit` calls for the same file at the same
+    /// Two `sftp_open_for_edit` calls for the same file at the same
     /// time both downloaded it, then the second ended the first - whose
     /// caller had already handed its copy to an editor (deleted, its saves
     /// never synced, no event). One session survives and both callers get it.
@@ -11486,7 +11979,7 @@ mod tests {
         registry.stop_all();
     }
 
-    /// Item 6 (sec N2): places where a written file runs when a program is
+    /// Places where a written file runs when a program is
     /// next used: user folders on the PATH, git's settings, the PAM
     /// environment and the editors' startup files (SSHSpan's edit flow starts
     /// the system editor). Writing there is refused; reading stays allowed.
@@ -11536,7 +12029,7 @@ mod tests {
         }
     }
 
-    /// Item 6, the layout: every PATH folder inside the home folder counts
+    /// The layout: every PATH folder inside the home folder counts
     /// (not the home folder itself, nor folders elsewhere), and on Windows
     /// the WindowsApps folder, Office's startup folders and template, and
     /// Windows Terminal's settings in each of its package folders. (Unix
@@ -11592,7 +12085,7 @@ mod tests {
         assert!(windows_program_locations(None, None, &[]).is_empty());
     }
 
-    /// Item 6: Windows Terminal's package folders are found by name (stable,
+    /// Windows Terminal's package folders are found by name (stable,
     /// preview, canary), and nothing else in the folder is taken for one.
     #[cfg(unix)]
     #[test]
@@ -11618,5 +12111,377 @@ mod tests {
             ]
         );
         assert!(windows_terminal_packages(&local.0.join("missing")).is_empty());
+    }
+
+    // ── SSHSpan's own program and data folders ──────────────────────────────
+
+    /// A DLL planted beside the executable, a replaced AppImage or a file
+    /// written into the webview's profile runs (or loads) at SSHSpan's next
+    /// start: writing and deleting there is refused; reading stays allowed.
+    #[test]
+    fn rw_s3_the_install_folder_appimage_and_webview_profile_are_refused_for_writes() {
+        let base = std::path::PathBuf::from("/fixture");
+        let s = sensitive_fixture(&base);
+        let profile = base
+            .join("local")
+            .join(BUNDLE_IDENTIFIER)
+            .join("EBWebView/Default/Preferences");
+        for p in [
+            base.join("opt/SSHSpan/version.dll"),
+            base.join("opt/SSHSpan/sshspan"),
+            base.join("home/Apps/SSHSpan.AppImage"),
+            profile.clone(),
+        ] {
+            assert!(
+                s.refusal(&p, LocalAccess::Write).is_some(),
+                "{} must not be writable",
+                p.display()
+            );
+            assert!(
+                s.refusal(&p, LocalAccess::Read).is_none(),
+                "{} may be read",
+                p.display()
+            );
+        }
+        // Deleting or moving a folder that holds one of them is refused too.
+        for p in [base.join("opt"), base.join("home/Apps"), base.join("local")] {
+            assert!(
+                s.held_by(&p).is_some(),
+                "{} holds SSHSpan's files",
+                p.display()
+            );
+        }
+        // Neighbours stay writable.
+        for p in [
+            base.join("opt/Other/tool.dll"),
+            base.join("home/Apps/Other.AppImage"),
+            base.join("local/org.sshspan.app.bak/x"),
+        ] {
+            assert!(
+                s.refusal(&p, LocalAccess::Write).is_none(),
+                "{} stays writable",
+                p.display()
+            );
+        }
+    }
+
+    /// The same through the real rules on this machine: beside the running
+    /// executable (the test binary here) and in the webview's per-user
+    /// folders.
+    #[test]
+    fn rw_s3_the_real_program_and_webview_folders_are_refused_for_writes() {
+        let exe = std::env::current_exe().unwrap();
+        let beside = exe.parent().unwrap().join("planted.dll");
+        assert!(
+            validate_sftp_local_path(&beside.display().to_string(), LocalAccess::Write).is_err(),
+            "{} must not be writable",
+            beside.display()
+        );
+        assert!(
+            validate_sftp_local_path(&exe.display().to_string(), LocalAccess::Read).is_ok(),
+            "the executable may be read"
+        );
+        for base in [dirs::data_local_dir(), dirs::cache_dir()]
+            .into_iter()
+            .flatten()
+        {
+            let p = base
+                .join(BUNDLE_IDENTIFIER)
+                .join("EBWebView")
+                .join("Local State");
+            assert!(
+                validate_sftp_local_path(&p.display().to_string(), LocalAccess::Write).is_err(),
+                "{} must not be writable",
+                p.display()
+            );
+        }
+    }
+
+    /// The layout: the folder the executable runs from, or on macOS its
+    /// `.app` bundle; only the executable when it runs straight from the home
+    /// folder, above it or from a drive root; the AppImage file; relative
+    /// spellings ignored. (Unix spellings.)
+    #[cfg(unix)]
+    #[test]
+    fn rw_s3_the_program_locations_follow_the_executable() {
+        use std::path::Path;
+        let home = Some(Path::new("/home/u"));
+        let at = |exe: &str, appimage: Option<&str>| {
+            app_program_locations(
+                Some(Path::new(exe)),
+                appimage.map(Path::new),
+                home,
+                &[],
+                false,
+            )
+            .files
+        };
+        assert_eq!(
+            at("/opt/SSHSpan/sshspan", None),
+            vec![PathBuf::from("/opt/SSHSpan")]
+        );
+        assert_eq!(
+            at("/Applications/SSHSpan.app/Contents/MacOS/sshspan", None),
+            vec![PathBuf::from("/Applications/SSHSpan.app")]
+        );
+        assert_eq!(
+            at("/home/u/sshspan", None),
+            vec![PathBuf::from("/home/u/sshspan")],
+            "not the whole home folder"
+        );
+        assert_eq!(at("/sshspan", None), vec![PathBuf::from("/sshspan")]);
+        assert_eq!(
+            at(
+                "/tmp/.mount_SSHSpaX/usr/bin/sshspan",
+                Some("/home/u/Apps/SSHSpan.AppImage")
+            ),
+            vec![
+                PathBuf::from("/tmp/.mount_SSHSpaX/usr/bin"),
+                PathBuf::from("/home/u/Apps/SSHSpan.AppImage")
+            ]
+        );
+        assert_eq!(
+            at("/opt/SSHSpan/sshspan", Some("relative.AppImage")),
+            vec![PathBuf::from("/opt/SSHSpan")]
+        );
+        assert!(app_program_locations(None, None, home, &[], false)
+            .files
+            .is_empty());
+        let data = app_data_locations(
+            &[PathBuf::from("/home/u/.cache/sshspan")],
+            &[
+                PathBuf::from("/home/u/.local/share"),
+                PathBuf::from("/home/u/.cache"),
+            ],
+            home,
+        );
+        for p in [
+            "/home/u/.cache/sshspan",
+            "/home/u/.local/share/org.sshspan.app",
+            "/home/u/.cache/org.sshspan.app",
+            "/home/u/Library/WebKit/org.sshspan.app",
+        ] {
+            assert!(data.contains(&PathBuf::from(p)), "{p}: {data:?}");
+        }
+    }
+
+    /// The identifier the webview's folders are named after is the one the
+    /// app is built with.
+    #[test]
+    fn rw_s3_the_bundle_identifier_is_the_one_in_tauri_conf() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"], BUNDLE_IDENTIFIER);
+    }
+
+    /// A copy run straight from Downloads, the Desktop or Documents protects
+    /// only the executable - and, on Windows, the DLLs beside it, which it
+    /// loads at its next start - not the whole folder, which refused every
+    /// ordinary download there. Its own folder below one of them (an
+    /// extracted portable copy) is protected whole. (Unix spellings.)
+    #[cfg(unix)]
+    #[test]
+    fn rw_fix1_an_executable_in_a_personal_folder_protects_only_itself() {
+        use std::path::Path;
+        let home = Path::new("/home/u");
+        let personal = [
+            home.join("Downloads"),
+            home.join("Desktop"),
+            home.join("Documents"),
+        ];
+        for dir in &personal {
+            let exe = dir.join("sshspan");
+            let program = app_program_locations(Some(&exe), None, Some(home), &personal, false);
+            assert_eq!(program.files, vec![exe.clone()], "{}", dir.display());
+            assert!(program.dll_dirs.is_empty());
+            let windows = app_program_locations(Some(&exe), None, Some(home), &personal, true);
+            assert_eq!(windows.files, vec![exe.clone()], "{}", dir.display());
+            assert_eq!(windows.dll_dirs, vec![dir.clone()]);
+        }
+        let own = home.join("Downloads/SSHSpan/sshspan");
+        let program = app_program_locations(Some(&own), None, Some(home), &personal, true);
+        assert_eq!(program.files, vec![home.join("Downloads/SSHSpan")]);
+        assert!(program.dll_dirs.is_empty());
+        let in_home = home.join("sshspan");
+        let program = app_program_locations(Some(&in_home), None, Some(home), &personal, true);
+        assert_eq!(program.files, vec![in_home]);
+        assert_eq!(program.dll_dirs, vec![home.to_path_buf()]);
+    }
+
+    /// The same with Windows paths: a portable copy in Downloads, Desktop or
+    /// Documents, and an installed one under Program Files.
+    #[cfg(windows)]
+    #[test]
+    fn rw_fix1_windows_personal_folders_protect_only_the_executable_and_its_dlls() {
+        use std::path::{Path, PathBuf};
+        let home = Path::new(r"C:\Users\u");
+        let personal = [
+            PathBuf::from(r"C:\Users\u\Downloads"),
+            PathBuf::from(r"C:\Users\u\Desktop"),
+            PathBuf::from(r"C:\Users\u\Documents"),
+        ];
+        for dir in &personal {
+            let exe = dir.join("SSHSpan.exe");
+            let program = app_program_locations(Some(&exe), None, Some(home), &personal, true);
+            assert_eq!(program.files, vec![exe.clone()], "{}", dir.display());
+            assert_eq!(program.dll_dirs, vec![dir.clone()]);
+        }
+        let installed = PathBuf::from(r"C:\Program Files\SSHSpan\SSHSpan.exe");
+        let program = app_program_locations(Some(&installed), None, Some(home), &personal, true);
+        assert_eq!(
+            program.files,
+            vec![PathBuf::from(r"C:\Program Files\SSHSpan")]
+        );
+        assert!(program.dll_dirs.is_empty());
+        let portable = PathBuf::from(r"C:\Users\u\Downloads\SSHSpan\SSHSpan.exe");
+        let program = app_program_locations(Some(&portable), None, Some(home), &personal, true);
+        assert_eq!(
+            program.files,
+            vec![PathBuf::from(r"C:\Users\u\Downloads\SSHSpan")]
+        );
+    }
+
+    /// Through the deny-list: an ordinary download next to a portable copy in
+    /// Downloads is fine; the executable and a DLL right beside it are not.
+    #[test]
+    fn rw_fix1_downloads_next_to_a_portable_copy_are_refused_only_for_its_files() {
+        let base = std::path::PathBuf::from("/fixture");
+        let s = sensitive_fixture(&base);
+        let downloads = base.join("home/Downloads");
+        for fine in [
+            downloads.join("report.pdf"),
+            downloads.join("sub/version.dll"),
+        ] {
+            assert!(
+                s.refusal(&fine, LocalAccess::Write).is_none(),
+                "{} stays writable",
+                fine.display()
+            );
+        }
+        for p in [
+            downloads.join("sshspan.exe"),
+            downloads.join("version.dll"),
+            downloads.join("VERSION.DLL"),
+        ] {
+            assert_eq!(
+                s.refusal(&p, LocalAccess::Write),
+                Some(APP_FILES_REFUSAL),
+                "{}",
+                p.display()
+            );
+        }
+    }
+
+    /// A path picked in the native save dialog skipped the deny-list - and
+    /// the renderer fills in the dialog's suggested name, so one click on
+    /// Save could plant a DLL in the install folder. SSHSpan's program is
+    /// refused even then; everything else a human picks stays allowed.
+    #[test]
+    fn rw_fix1_a_dialog_picked_download_never_writes_the_program_files() {
+        let base = std::path::PathBuf::from("/fixture");
+        let s = sensitive_fixture(&base);
+        for p in [
+            base.join("opt/SSHSpan/version.dll"),
+            base.join("home/Apps/SSHSpan.AppImage"),
+            base.join("home/Downloads/version.dll"),
+        ] {
+            let err = check_download_target(&p.display().to_string(), true, &s)
+                .expect_err("SSHSpan's program is never a download target");
+            assert!(err.0.contains("SSHSpan's own program"), "{}", err.0);
+        }
+        for p in [
+            base.join("home/Downloads/report.pdf"),
+            base.join("home/.bashrc"),
+            base.join("local")
+                .join(BUNDLE_IDENTIFIER)
+                .join("picked-by-hand.txt"),
+        ] {
+            assert!(
+                check_download_target(&p.display().to_string(), true, &s).is_ok(),
+                "{} was picked by a human",
+                p.display()
+            );
+        }
+    }
+
+    // ── SFTP errors say what failed, once ───────────────────────────────
+
+    /// A bare SFTP failure read "mkdir failed: Failure: Failure" (the status
+    /// name twice and nothing else); every remote list, mkdir, remove and
+    /// rename error now goes through `sftp_error_detail`, which names the
+    /// status and its code once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_b5_remote_errors_name_the_status_once() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        fx.mkdir("/exists");
+        fx.write("/a", b"a");
+        fx.write("/b", b"b");
+        fx.write("/full/kept", b"k");
+        fx.knobs.lock().unwrap().remove_refused = vec!["/full/kept".into()];
+        let errors = [
+            ("mkdir", remote_mkdir(&sftp, "/exists").await.unwrap_err().0),
+            (
+                "rename",
+                remote_rename(&sftp, "/a", "/b").await.unwrap_err().0,
+            ),
+            (
+                "remove",
+                remote_remove(&sftp, "/missing", false).await.unwrap_err().0,
+            ),
+            (
+                "remove a folder",
+                remote_remove(&sftp, "/full", true).await.unwrap_err().0,
+            ),
+            (
+                "list",
+                list_entries(&sftp, "/missing").await.err().unwrap().0,
+            ),
+        ];
+        for (what, message) in errors {
+            assert!(message.contains("(code "), "{what}: {message}");
+            for name in ["Failure", "No such file", "Permission denied"] {
+                assert!(
+                    !message.contains(&format!("{name}: {name}")),
+                    "{what}: {message}"
+                );
+            }
+        }
+    }
+
+    // ── A remote file of unknown size is hashed to its end ─────────────
+
+    #[cfg(unix)]
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// A server that reports no size used to be hashed as an EMPTY file, so
+    /// with transfer verification on every copy from or to it was a
+    /// "checksum mismatch" - and the fresh copy was deleted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rw_b6_a_file_of_unknown_size_is_hashed_to_its_end() {
+        let (sftp, fx) = crate::sftp::testkit::serve().await;
+        let payload: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        fx.write("/big.bin", &payload);
+        fx.knobs.lock().unwrap().strip_size_mtime = true;
+        assert_eq!(
+            remote_sha256(&sftp, "/big.bin", None).await.unwrap(),
+            sha256_hex(&payload)
+        );
+        // A server that fails the read at the end (instead of answering
+        // end-of-file) yields an error - never the digest of a part, which
+        // would read as a mismatch.
+        fx.knobs.lock().unwrap().read_fail_at = Some(payload.len() as u64);
+        assert!(remote_sha256(&sftp, "/big.bin", None).await.is_err());
+        // With the size known the reads stop at it, as before: the failing
+        // end is never reached.
+        fx.knobs.lock().unwrap().strip_size_mtime = false;
+        assert_eq!(
+            remote_sha256(&sftp, "/big.bin", None).await.unwrap(),
+            sha256_hex(&payload)
+        );
     }
 }

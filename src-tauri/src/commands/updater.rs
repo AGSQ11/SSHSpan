@@ -741,7 +741,7 @@ pub async fn update_download_and_run(
     let mut current_url = validate_initial_asset_url(&url)?;
     // Preserve the repo-pinned release URL before the redirect loop mutates
     // `current_url` into the CDN object URL: the `.minisig` sibling must be
-    // resolved from THIS release-asset URL, not the redirected one (F7).
+    // resolved from THIS release-asset URL, not the redirected one.
     let original_release_url = current_url.clone();
 
     // Rollback guard. `update_check` compares versions, but this command takes
@@ -958,7 +958,7 @@ fn release_version_bound_to_url(release_url: &url::Url, version: &str) -> CmdRes
 
 /// Start the verified installer at `installer` the way `plan` says.
 ///
-/// Accepted risk (security review F5): the installer is started by path from
+/// Accepted risk: the installer is started by path from
 /// a folder the user can write to (the temp folder, or the AppImage's folder),
 /// re-opened after its digest and signature were checked. Another process
 /// running as the same user could swap the file in between. That process can
@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn initial_url_must_be_exactly_a_release_asset() {
-        // F4: a fragment or query changed the launch plan and the .minisig
+        // A fragment or query changed the launch plan and the .minisig
         // URL, which were derived from the raw string.
         for url in [
             "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/SSHSpan_1.10.0_x64-setup.exe#.AppImage",
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn staged_installer_names_match_only_the_generated_shape() {
-        // F3: the old prefix test matched files that are not ours.
+        // The old prefix test matched files that are not ours.
         for foreign in [
             "sshspan-notes-update-2026.txt",
             "sshspan--update-",

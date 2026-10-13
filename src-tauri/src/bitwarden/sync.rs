@@ -34,12 +34,16 @@ fn epoch_ms(rfc3339: Option<&str>) -> Option<i64> {
 /// The change marks of one local row, in epoch milliseconds: when it last
 /// changed (`updated`), and what the last push or pull recorded - the row's
 /// change marker as of then (`synced`) and the remote copy's revision then
-/// (`revision`).
+/// (`revision`) - and when its category path last changed without the row
+/// changing (`category`: a category renamed, moved or deleted, its
+/// categories set; see [`crate::db::Database::category_marks`]), until that
+/// has been uploaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SyncMarks {
     updated: i64,
     synced: Option<i64>,
     revision: Option<i64>,
+    category: Option<i64>,
 }
 
 impl SyncMarks {
@@ -48,6 +52,7 @@ impl SyncMarks {
             updated: row.updated_at.timestamp_millis(),
             synced: row.bitwarden_updated_at,
             revision: row.bitwarden_revision_ts,
+            category: None,
         }
     }
 
@@ -56,6 +61,7 @@ impl SyncMarks {
             updated: sv.updated_at.timestamp_millis(),
             synced: epoch_ms(sv.bitwarden_updated_at.as_deref()),
             revision: epoch_ms(sv.bitwarden_revision_ts.as_deref()),
+            category: None,
         }
     }
 }
@@ -84,6 +90,14 @@ enum Plan<'a> {
 }
 
 /// The plan for a row matched to the live remote copy `cipher`.
+///
+/// A category change alone (`marks.category`) is uploaded only while the
+/// remote copy is unchanged - the row then holds exactly what Bitwarden
+/// holds, plus the new path. When the remote copy changed too, the remote
+/// change wins as any other (listed for approval; the pull keeps the local
+/// category), and the category goes up at a later run. It used to count as a
+/// local edit, and "local wins" uploaded the row's older fields - a saved
+/// password Bitwarden had rotated - over the newer ones, unasked.
 fn plan_matched<'a>(
     link: Option<&str>,
     cipher: &'a SyncCipher,
@@ -97,6 +111,10 @@ fn plan_matched<'a>(
     let remote_changed = epoch_ms(cipher.revision_date.as_deref())
         .is_some_and(|revision| revision > marks.revision.unwrap_or(0));
     match (local_changed, remote_changed) {
+        (false, false) if marks.category.is_some() => Plan::Update {
+            cipher: &cipher.id,
+            conflict: false,
+        },
         (false, false) => Plan::InSync,
         (true, conflict) => Plan::Update {
             cipher: &cipher.id,
@@ -113,7 +131,7 @@ enum Linked<'a> {
     /// No link stored.
     Unlinked,
     /// A live personal item of the row's type - in any folder: an item the
-    /// user moved out of the sync folder is still the same item (I3).
+    /// user moved out of the sync folder is still the same item.
     Personal(&'a SyncCipher),
     /// The item now belongs to an organization: left alone, reported.
     OrgOwned,
@@ -177,7 +195,9 @@ fn fingerprint_match<'a>(
     })
 }
 
-/// The plan for one local key with private material.
+/// The plan for one local key with private material, with no category
+/// change pending.
+#[cfg(test)]
 fn plan_key_row<'a>(
     row: &'a KeyRecord,
     live: &HashMap<&str, &'a SyncCipher>,
@@ -185,12 +205,36 @@ fn plan_key_row<'a>(
     fp_by_cipher_id: &HashMap<String, String>,
     allow_remote_overwrite: bool,
 ) -> Plan<'a> {
+    plan_key_row_marked(
+        row,
+        live,
+        remote_ssh,
+        fp_by_cipher_id,
+        allow_remote_overwrite,
+        None,
+    )
+}
+
+/// The plan for one local key with private material; `category`: when its
+/// category path changed without the key changing, if that is still to be
+/// uploaded.
+fn plan_key_row_marked<'a>(
+    row: &'a KeyRecord,
+    live: &HashMap<&str, &'a SyncCipher>,
+    remote_ssh: &[&'a SyncCipher],
+    fp_by_cipher_id: &HashMap<String, String>,
+    allow_remote_overwrite: bool,
+    category: Option<i64>,
+) -> Plan<'a> {
     let link = row.bitwarden_id.as_deref();
     plan_row(
         link,
         linked_item(link, live, 5),
         fingerprint_match(row, remote_ssh, fp_by_cipher_id),
-        SyncMarks::of_key(row),
+        SyncMarks {
+            category,
+            ..SyncMarks::of_key(row)
+        },
         allow_remote_overwrite,
     )
 }
@@ -243,9 +287,9 @@ enum OwnItem<'a> {
 /// `sv`'s own Login item in the servers folder, found through the server id
 /// in the items' notes - a server whose link was never stored (the upload
 /// worked, the app quit before the link was saved) is found again instead of
-/// duplicated (M6). An item ANOTHER local server is linked to is that
+/// duplicated. An item ANOTHER local server is linked to is that
 /// server's, never `sv`'s: a Bitwarden clone copies the notes, so an imported
-/// clone still names the original's server (fix round 4).
+/// clone still names the original's server.
 fn own_item_of<'a>(
     sv: &ServerRecord,
     remote_logins: &[&'a SyncCipher],
@@ -282,7 +326,7 @@ const MAX_LISTED_ITEMS: usize = 5;
 /// Longest item title [`ambiguous_server_error`] quotes, in characters.
 const MAX_LISTED_TITLE_CHARS: usize = 60;
 
-/// The error for a server that several unowned items name (round 4): which
+/// The error for a server that several unowned items name: which
 /// items they are - title and id, at most [`MAX_LISTED_ITEMS`], titles
 /// shortened and stripped of control characters - and what to do without
 /// losing data. "Delete the extra copies" (the old advice) discarded a clone
@@ -370,19 +414,32 @@ fn classify_named_item(item: &SyncCipher, reference: Option<&SyncCipher>) -> Nam
 enum ServerPlan<'a> {
     Plan(Plan<'a>),
     /// Unlinked (or its item gone) and this many items name it: nothing is
-    /// guessed this run - no link, no upload - and the server is reported
-    /// (fix round 4).
+    /// guessed this run - no link, no upload - and the server is reported.
     Ambiguous(usize),
 }
 
-/// The plan for one local server: by its link, else by its own item found
-/// through the items' notes ([`own_item_of`]).
+/// The plan for one local server with no category change pending.
+#[cfg(test)]
 fn plan_server_row<'a>(
     sv: &'a ServerRecord,
     live: &HashMap<&str, &'a SyncCipher>,
     remote_logins: &[&'a SyncCipher],
     names: &ServerNames,
     allow_remote_overwrite: bool,
+) -> ServerPlan<'a> {
+    plan_server_row_marked(sv, live, remote_logins, names, allow_remote_overwrite, None)
+}
+
+/// The plan for one local server: by its link, else by its own item found
+/// through the items' notes ([`own_item_of`]); `category` as for
+/// [`plan_key_row_marked`].
+fn plan_server_row_marked<'a>(
+    sv: &'a ServerRecord,
+    live: &HashMap<&str, &'a SyncCipher>,
+    remote_logins: &[&'a SyncCipher],
+    names: &ServerNames,
+    allow_remote_overwrite: bool,
+    category: Option<i64>,
 ) -> ServerPlan<'a> {
     let link = sv.bitwarden_id.as_deref();
     let linked = linked_item(link, live, 1);
@@ -398,7 +455,10 @@ fn plan_server_row<'a>(
         link,
         linked,
         fallback,
-        SyncMarks::of_server(sv),
+        SyncMarks {
+            category,
+            ..SyncMarks::of_server(sv)
+        },
         allow_remote_overwrite,
     ))
 }
@@ -604,8 +664,7 @@ fn redact_key_material(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// What a sync run did - kept outside the passes so a run that stops early
-/// (vault locked, an error mid-run) still reports and audits its counts
-/// (M7).
+/// (vault locked, an error mid-run) still reports and audits its counts.
 #[derive(Debug, Default)]
 struct SyncReport {
     pushed: usize,
@@ -628,43 +687,139 @@ struct SyncReport {
     renamed: Vec<serde_json::Value>,
     errors: Vec<serde_json::Value>,
     /// The remote changes this run left alone until the user allows them,
-    /// one entry each ([`pending_server_entry`] / [`pending_key_entry`]),
-    /// at most [`MAX_PENDING_ENTRIES`] per list (`pending_truncated` when
-    /// more were left).
-    pending_servers: Vec<serde_json::Value>,
-    pending_keys: Vec<serde_json::Value>,
-    pending_truncated: bool,
+    /// one each ([`pending_server_entry`] / [`pending_key_entry`]), all of
+    /// them: the summary shows at most [`MAX_PENDING_ENTRIES`] per list, and
+    /// the approval token covers every one ([`SyncReport::approval_token`]).
+    pending_servers: Vec<PendingChange>,
+    pending_keys: Vec<PendingChange>,
+    /// An approval came with the run, but the remote changes found are not
+    /// the ones it was issued for: nothing was applied.
+    approval_stale: bool,
+}
+
+/// One remote change a run left alone until the user allows it: what the
+/// prompt shows, what an approval binds, and what applying it does.
+#[derive(Debug, Clone)]
+struct PendingChange {
+    /// The entry the prompt shows.
+    entry: serde_json::Value,
+    /// The item the change comes from as the vault served it: its id, its
+    /// revision date and a digest of the whole item - every encrypted field
+    /// - so an approval issued for this list approves exactly these bytes.
+    cipher: String,
+    revision: Option<String>,
+    cipher_digest: String,
+    /// Whether it changes anything the pull writes. Shown first, so revision
+    /// bumps that change nothing cannot push a real change past the cap.
+    real: bool,
+    pull: RemotePull,
+}
+
+/// What applying an approved remote change does.
+#[derive(Debug, Clone)]
+enum RemotePull {
+    /// Pull the newer copy `cipher` into the local key `row`.
+    Key { row: KeyRecord, cipher: String },
+    /// Import the item `cipher` as a new key.
+    NewKey { cipher: String },
+    /// Pull the newer copy `cipher` into the local server `row`.
+    Server { row: ServerRecord, cipher: String },
+    /// Import the item `cipher` as a new server.
+    NewServer { cipher: String },
+}
+
+/// SHA-256 (hex) of `cipher` as the vault served it - every field, the
+/// encrypted ones included.
+fn cipher_digest(cipher: &SyncCipher) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(cipher).unwrap_or_default();
+    hex::encode(Sha256::digest(bytes))
+}
+
+impl PendingChange {
+    fn new(entry: serde_json::Value, item: &SyncCipher, real: bool, pull: RemotePull) -> Self {
+        Self {
+            entry,
+            cipher: item.id.clone(),
+            revision: item.revision_date.clone(),
+            cipher_digest: cipher_digest(item),
+            real,
+            pull,
+        }
+    }
+
+    /// What an approval binds for this change.
+    fn bound(&self, list: &str) -> serde_json::Value {
+        serde_json::json!({
+            "list": list,
+            "cipher": self.cipher,
+            "revision": self.revision,
+            "cipherDigest": self.cipher_digest,
+            "entry": self.entry,
+        })
+    }
+}
+
+/// The entries the prompt shows from `changes`: the real changes first (in
+/// the order found), at most [`MAX_PENDING_ENTRIES`]; true when some were
+/// left out.
+fn shown_entries(changes: &[PendingChange]) -> (Vec<serde_json::Value>, bool) {
+    let mut ordered: Vec<&PendingChange> = changes.iter().collect();
+    ordered.sort_by_key(|change| !change.real);
+    let shown = ordered
+        .iter()
+        .take(MAX_PENDING_ENTRIES)
+        .map(|change| change.entry.clone())
+        .collect();
+    (shown, changes.len() > MAX_PENDING_ENTRIES)
 }
 
 /// Most entries one list of pending remote changes carries; past that only
-/// `pendingTruncated` says there were more (the skip counts stay exact).
-const MAX_PENDING_ENTRIES: usize = 50;
+/// `pendingTruncated` says there were more (the skip counts stay exact) -
+/// and nothing can be approved: an approval would apply entries nobody saw
+/// ([`SyncReport::too_many_changes`]).
+const MAX_PENDING_ENTRIES: usize = 500;
 
-/// Longest text a pending entry quotes from a vault item, in characters.
-const MAX_PENDING_TEXT_CHARS: usize = 200;
+/// Longest text a pending entry quotes from a vault item - and longest name
+/// a server pulled from the vault is stored with - in characters.
+const MAX_PENDING_TEXT_CHARS: usize = 80;
 
-/// Text from a vault item for a pending entry: control characters dropped,
-/// at most [`MAX_PENDING_TEXT_CHARS`] characters.
+/// Text from a vault item for a pending entry ([`clean_item_text`]).
 fn pending_text(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_PENDING_TEXT_CHARS)
-        .collect()
+    clean_item_text(text)
+}
+
+/// Text from a vault item, as SSHSpan shows or stores it: control, format
+/// and text-direction characters dropped (everything
+/// [`crate::assistant::is_disguising`] names - U+061C, U+200B-200F,
+/// U+202A-202E, U+2060-2069, U+FEFF among them), every run of whitespace
+/// (U+00A0, U+2000-200A, U+2028/2029 and U+3000 included) one space, the ends
+/// trimmed, and at most [`MAX_PENDING_TEXT_CHARS`] characters, the last an
+/// ellipsis when it was cut ([`crate::commands::dialog_text`]). Anyone who
+/// can edit the item writes this text; it used to lose only its control
+/// characters, so a name could reverse or hide part of what the approval
+/// prompt showed.
+fn clean_item_text(text: &str) -> String {
+    crate::commands::dialog_text(text, MAX_PENDING_TEXT_CHARS)
 }
 
 /// One server the run did not overwrite (`kind` "overwrite": `name` is the
 /// local server, `incomingName` the item's name, `host`/`port` where the
-/// item would point it, `localHost`/`localPort` where it points now) or did
-/// not import ("new": `name`, `host`, `port` of the item). The confirm prompt
-/// used to show only counts, so a Bitwarden item rewritten to another host
-/// was approved blind (JU5 security review). Names and addresses only - no
-/// user name, password or key.
+/// item would point it, `localHost`/`localPort` where it points now, and
+/// `changes` which of its settings the pull would change - see
+/// [`server_changes`]) or did not import ("new": `name`, `host`, `port` of
+/// the item, `changes` null). The confirm prompt used to show only counts,
+/// so a Bitwarden item rewritten to another host was approved blind; then
+/// only the address, while a pull also replaces the user name, the saved
+/// password, the auth method and the linked key. Names, addresses and the
+/// names of changed settings only - no user name, password or key.
 fn pending_server_entry(
     kind: &str,
     name: &str,
     incoming_name: Option<&str>,
     incoming: Option<(String, u16)>,
     local: Option<(&str, u16)>,
+    changes: Option<&[&str]>,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": kind,
@@ -674,6 +829,7 @@ fn pending_server_entry(
         "port": incoming.map(|(_, port)| port),
         "localHost": local.map(|(host, _)| pending_text(host)),
         "localPort": local.map(|(_, port)| port),
+        "changes": changes,
     })
 }
 
@@ -698,22 +854,58 @@ fn pending_key_entry(
 }
 
 impl SyncReport {
-    /// Note a server change left for the user's approval (bounded).
-    fn pending_server(&mut self, entry: serde_json::Value) {
-        if self.pending_servers.len() < MAX_PENDING_ENTRIES {
-            self.pending_servers.push(entry);
-        } else {
-            self.pending_truncated = true;
-        }
+    /// Note a server change left for the user's approval.
+    fn pending_server(&mut self, change: PendingChange) {
+        self.pending_servers.push(change);
     }
 
-    /// Note a key change left for the user's approval (bounded).
-    fn pending_key(&mut self, entry: serde_json::Value) {
-        if self.pending_keys.len() < MAX_PENDING_ENTRIES {
-            self.pending_keys.push(entry);
-        } else {
-            self.pending_truncated = true;
+    /// Note a key change left for the user's approval.
+    fn pending_key(&mut self, change: PendingChange) {
+        self.pending_keys.push(change);
+    }
+
+    /// How many remote changes are pending, when a list is too long to show
+    /// whole ([`MAX_PENDING_ENTRIES`]): then none can be approved.
+    fn too_many_changes(&self) -> Option<usize> {
+        (self.pending_servers.len() > MAX_PENDING_ENTRIES
+            || self.pending_keys.len() > MAX_PENDING_ENTRIES)
+            .then(|| self.pending_servers.len() + self.pending_keys.len())
+    }
+
+    /// The token that approves exactly the remote changes this run found,
+    /// `None` when there are none - or when a list is too long to show whole
+    /// ([`SyncReport::too_many_changes`]): SHA-256 (hex) over every pending
+    /// change, each with its item's id, revision date, the digest of the
+    /// item as served and every field the prompt shows, in a fixed order.
+    /// The approving run applies its changes only when its own fetch gives
+    /// the same token: a vault that serves something else the second time -
+    /// another host, a rolled-back key, an older ciphertext replayed under
+    /// the same revision date - gets nothing applied.
+    fn approval_token(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        if self.pending_servers.is_empty() && self.pending_keys.is_empty() {
+            return None;
         }
+        if self.too_many_changes().is_some() {
+            return None;
+        }
+        let mut bound: Vec<String> = self
+            .pending_servers
+            .iter()
+            .map(|change| change.bound("servers").to_string())
+            .chain(
+                self.pending_keys
+                    .iter()
+                    .map(|change| change.bound("keys").to_string()),
+            )
+            .collect();
+        bound.sort();
+        let mut hasher = Sha256::new();
+        for part in &bound {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        Some(hex::encode(hasher.finalize()))
     }
 
     /// One `errors` entry: `{<what>: <name>, error}`, `what` being `name`
@@ -753,17 +945,49 @@ impl SyncReport {
         if let Some(reason) = aborted {
             summary["aborted"] = reason.into();
         }
-        if !self.pending_servers.is_empty() {
-            summary["pendingServers"] = self.pending_servers.clone().into();
+        let (servers, servers_cut) = shown_entries(&self.pending_servers);
+        let (keys, keys_cut) = shown_entries(&self.pending_keys);
+        if !servers.is_empty() {
+            summary["pendingServers"] = servers.into();
         }
-        if !self.pending_keys.is_empty() {
-            summary["pendingKeys"] = self.pending_keys.clone().into();
+        if !keys.is_empty() {
+            summary["pendingKeys"] = keys.into();
         }
-        if self.pending_truncated {
+        if servers_cut || keys_cut {
             summary["pendingTruncated"] = true.into();
+        }
+        if let Some(total) = self.too_many_changes() {
+            summary["approvalRefused"] = format!(
+                "Too many changes to review at once ({total}) - nothing from Bitwarden was applied. \
+                 SSHSpan can show at most {MAX_PENDING_ENTRIES} server and {MAX_PENDING_ENTRIES} \
+                 key changes for approval: bring the new or changed items in Bitwarden below \
+                 that, then sync again."
+            )
+            .into();
+        }
+        if let Some(token) = self.approval_token() {
+            summary["approvalToken"] = token.into();
+        }
+        if self.approval_stale {
+            summary["approvalStale"] = true.into();
         }
         summary
     }
+}
+
+/// What a sync run may do with the remote changes it finds.
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteChanges<'a> {
+    /// List them for the user's approval, with the token that approves
+    /// exactly them; nothing is applied.
+    Ask,
+    /// Apply them - if they are exactly the changes this approval token was
+    /// issued for ([`SyncReport::approval_token`]); otherwise apply nothing,
+    /// list them again with their new token, and say the approval was stale.
+    ApproveIf(&'a str),
+    /// Apply whatever is found: the tests of the passes only.
+    #[cfg(test)]
+    ApproveAll,
 }
 
 /// The sync's abort check: evaluated at each mutation boundary.
@@ -773,10 +997,12 @@ type AbortCheck<'a> = &'a (dyn Fn() -> Result<()> + Send + Sync);
 ///
 /// `cancelled` is polled before every remote/local mutation; when it reports
 /// true (the vault was locked mid-sync) the sync stops instead of spending
-/// more secrets or writing into the locked vault (the audit's F2). A failure
-/// before anything was compared (login, the vault fetch) is an error; once
-/// the passes run, a stop returns the counts so far with `ok: false` and
-/// `aborted: <reason>`.
+/// more secrets or writing into the locked vault. A failure before anything
+/// was compared (login, the vault fetch) is an error; once the passes run, a
+/// stop returns the counts so far with `ok: false` and `aborted: <reason>`.
+/// Remote changes are applied only as `remote_changes` says: listed with
+/// their approval token, or applied when they are exactly the ones a token
+/// was issued for ([`RemoteChanges`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sync(
     server_url: &str,
@@ -787,7 +1013,7 @@ pub async fn run_sync(
     servers_folder_name: &str,
     db: &Database,
     vault_password: &str,
-    allow_remote_overwrite: bool,
+    remote_changes: RemoteChanges<'_>,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<serde_json::Value> {
     let check = || -> Result<()> {
@@ -805,7 +1031,7 @@ pub async fn run_sync(
     let run = SyncRun {
         db,
         vault_password,
-        allow_remote_overwrite,
+        remote_changes,
         check: &check,
     };
     let outcome = run
@@ -828,7 +1054,7 @@ pub async fn run_sync(
 struct SyncRun<'a> {
     db: &'a Database,
     vault_password: &'a str,
-    allow_remote_overwrite: bool,
+    remote_changes: RemoteChanges<'a>,
     check: AbortCheck<'a>,
 }
 
@@ -872,7 +1098,7 @@ impl SyncRun<'_> {
             };
         // Every live (not trashed) item by id: a linked item the user moved
         // to another folder, or that became organization-owned, is still
-        // there and must not be treated as deleted (I3).
+        // there and must not be treated as deleted.
         let live: HashMap<&str, &SyncCipher> = remote
             .ciphers
             .iter()
@@ -887,7 +1113,112 @@ impl SyncRun<'_> {
             self.server_pass(client, remote, &live, folder_id, report)
                 .await?;
         }
+        self.settle_remote_changes(client, &live, report).await
+    }
+
+    /// After both passes: apply the remote changes they found - every one,
+    /// in the order found - when this run may ([`RemoteChanges`]); otherwise
+    /// leave them listed. The passes only plan: a remote change is never
+    /// applied before the whole list is known, so an approval can be checked
+    /// against all of it.
+    async fn settle_remote_changes(
+        &self,
+        client: &mut BitwardenClient,
+        live: &HashMap<&str, &SyncCipher>,
+        report: &mut SyncReport,
+    ) -> Result<()> {
+        let approved = match self.remote_changes {
+            RemoteChanges::Ask => false,
+            RemoteChanges::ApproveIf(token) => match report.approval_token() {
+                Some(found) if found == token => true,
+                Some(_) => {
+                    report.approval_stale = true;
+                    false
+                }
+                None => false,
+            },
+            #[cfg(test)]
+            RemoteChanges::ApproveAll => true,
+        };
+        if !approved {
+            return Ok(());
+        }
+        // Applied, not skipped.
+        report.skipped_overwrites = 0;
+        report.skipped_new = 0;
+        report.skipped_server_overwrites = 0;
+        report.skipped_server_new = 0;
+        let keys = std::mem::take(&mut report.pending_keys);
+        let servers = std::mem::take(&mut report.pending_servers);
+        for change in keys.into_iter().chain(servers) {
+            (self.check)()?; // abort promptly if the vault was locked mid-sync
+            self.apply_pull(client, live, change.pull, report).await;
+        }
         Ok(())
+    }
+
+    /// Apply one approved remote change, counting and reporting it as the
+    /// passes count their own work.
+    async fn apply_pull(
+        &self,
+        client: &mut BitwardenClient,
+        live: &HashMap<&str, &SyncCipher>,
+        pull: RemotePull,
+        report: &mut SyncReport,
+    ) {
+        const MISSING: &str = "internal: the item to pull is missing";
+        let (db, vault_password) = (self.db, self.vault_password);
+        // A category change of the row that is still to be uploaded wins over
+        // the item's categories: the pull takes every other field.
+        let local_category =
+            |kind: &str, id: &str| db.category_mark(kind, id).ok().flatten().is_some();
+        match pull {
+            RemotePull::Key { row, cipher } => match live.get(cipher.as_str()) {
+                Some(item) => {
+                    let keep = local_category("key", &row.id);
+                    match pull_remote_item(client, item, &row, db, vault_password, keep).await {
+                        Ok(PullOutcome::Written { rename }) => {
+                            report.updated_local += 1;
+                            report.renamed.extend(rename);
+                        }
+                        Ok(PullOutcome::ChangedMeanwhile) => {
+                            report.error("name", &row.name, CHANGED_MEANWHILE)
+                        }
+                        Err(e) => report.error("name", &row.name, e),
+                    }
+                }
+                None => report.error("name", &row.name, MISSING),
+            },
+            RemotePull::NewKey { cipher } => match live.get(cipher.as_str()) {
+                Some(item) => match pull_new_key(client, item, db, vault_password).await {
+                    Ok(PulledKey::Inserted { rename }) => {
+                        report.pulled += 1;
+                        report.renamed.extend(rename);
+                    }
+                    Ok(PulledKey::Duplicate) => {}
+                    Err(e) => report.error("cipher_id", &cipher, e),
+                },
+                None => report.error("cipher_id", &cipher, MISSING),
+            },
+            RemotePull::Server { row, cipher } => match live.get(cipher.as_str()) {
+                Some(item) => {
+                    let keep = local_category("server", &row.id);
+                    match pull_remote_server(client, item, &row, db, vault_password, keep).await {
+                        Ok(true) => report.servers_updated_local += 1,
+                        Ok(false) => report.error("server", &row.name, CHANGED_MEANWHILE),
+                        Err(e) => report.error("server", &row.name, e),
+                    }
+                }
+                None => report.error("server", &row.name, MISSING),
+            },
+            RemotePull::NewServer { cipher } => match live.get(cipher.as_str()) {
+                Some(item) => match pull_new_server(client, item, db, vault_password).await {
+                    Ok(()) => report.servers_pulled += 1,
+                    Err(e) => report.error("cipher_id", &cipher, e),
+                },
+                None => report.error("cipher_id", &cipher, MISSING),
+            },
+        }
     }
 
     /// Keys: local -> remote (with links and pulls), then new remote items.
@@ -899,7 +1230,7 @@ impl SyncRun<'_> {
         folder_id: &str,
         report: &mut SyncReport,
     ) -> Result<()> {
-        let (db, allow) = (self.db, self.allow_remote_overwrite);
+        let db = self.db;
         let remote_ssh: Vec<&SyncCipher> = remote
             .ciphers
             .iter()
@@ -907,20 +1238,27 @@ impl SyncRun<'_> {
                 c.cipher_type == 5 && c.deleted_date.is_none() && c.organization_id.is_none()
             })
             .collect();
-        // Decrypt remote fingerprints for matching
+        // Each item's fingerprint, derived from the private key it holds -
+        // never its own `keyFingerprint` field ([`remote_key`]). An item whose
+        // key cannot be read, or that claims another fingerprint or public
+        // key, is matched to nothing, offered for nothing and reported where
+        // a change of it would be applied.
         let mut fp_by_cipher_id = HashMap::new();
+        let mut unusable: HashMap<String, String> = HashMap::new();
         for c in &remote_ssh {
-            if let Some(fp_enc) = c
-                .ssh_key
-                .as_ref()
-                .and_then(|sk| sk.key_fingerprint.as_ref())
-            {
-                if let Ok(fp) = client.decrypt_field(fp_enc) {
-                    fp_by_cipher_id.insert(c.id.clone(), fp);
+            match remote_key(client, c) {
+                Ok(key) => {
+                    fp_by_cipher_id.insert(c.id.clone(), key.fingerprint);
+                }
+                Err(why) => {
+                    unusable.insert(c.id.clone(), why);
                 }
             }
         }
         let local_keys = db.list_keys()?;
+        let category_marks = db.category_marks("key")?;
+        // Read once for every comparison of this pass.
+        let index = SyncIndex::load(db).await?;
         let mut matched_remote = std::collections::HashSet::new();
 
         for row in &local_keys {
@@ -928,14 +1266,18 @@ impl SyncRun<'_> {
             let link = row.bitwarden_id.as_deref();
             if row.private_key_encrypted.is_empty() {
                 // Public-only: never uploaded. A link to an item that is gone
-                // is cleared, so it is reported once, not on every run (M9).
+                // is cleared, so it is reported once, not on every run.
                 if matches!(linked_item(link, live, 5), Linked::Gone) {
                     db.clear_key_sync_link(&row.id)?;
                     report.remote_deleted += 1;
                 }
                 continue;
             }
-            let plan = plan_key_row(row, live, &remote_ssh, &fp_by_cipher_id, allow);
+            let mark = category_marks.get(&row.id).copied();
+            // Planned as if remote changes were not allowed: they are listed
+            // here and applied after the passes, once all of them are known
+            // ([`SyncRun::settle_remote_changes`]).
+            let plan = plan_key_row_marked(row, live, &remote_ssh, &fp_by_cipher_id, false, mark);
             match plan {
                 Plan::Create { .. }
                 | Plan::OrgOwned
@@ -965,6 +1307,7 @@ impl SyncRun<'_> {
                             if relink {
                                 report.recreated_remote += 1;
                             }
+                            category_uploaded(db, "key", &row.id, mark);
                         }
                         Err(e) => {
                             if relink {
@@ -992,7 +1335,7 @@ impl SyncRun<'_> {
                     }
                 }
                 Plan::Update { cipher, conflict } => {
-                    // An item the user moved keeps its folder (I3).
+                    // An item the user moved keeps its folder.
                     let folder = live.get(cipher).and_then(|c| c.folder_id.as_deref());
                     match push_local_key(client, row, folder, Some(cipher), db, self.vault_password)
                         .await
@@ -1002,39 +1345,45 @@ impl SyncRun<'_> {
                             if conflict {
                                 report.conflicts += 1; // local won
                             }
+                            category_uploaded(db, "key", &row.id, mark);
                         }
                         Err(e) => report.error("name", &row.name, e),
                     }
                 }
-                Plan::Pull { cipher } => match live.get(cipher) {
-                    Some(remote_copy) => {
-                        match pull_remote_item(client, remote_copy, row, db, self.vault_password)
-                            .await
-                        {
-                            Ok(PullOutcome::Written { rename }) => {
-                                report.updated_local += 1;
-                                report.renamed.extend(rename);
-                            }
-                            Ok(PullOutcome::ChangedMeanwhile) => {
-                                report.error("name", &row.name, CHANGED_MEANWHILE)
-                            }
-                            Err(e) => report.error("name", &row.name, e),
-                        }
+                // Only the remote copy changed: listed for the user's
+                // approval (planned with remote changes not allowed, so no
+                // Pull comes here).
+                Plan::Pull { cipher } | Plan::SkipRemoteChange { cipher } => {
+                    if let Some(why) = unusable.get(cipher) {
+                        report.error("name", &row.name, why);
+                        continue;
                     }
-                    None => {
-                        debug_assert!(false, "a planned pull names an item outside the snapshot");
+                    let Some(item) = live.get(cipher).copied() else {
                         report.error("name", &row.name, "internal: the item to pull is missing");
-                    }
-                },
-                Plan::SkipRemoteChange { cipher } => {
+                        continue;
+                    };
                     report.skipped_overwrites += 1;
-                    let item = live.get(cipher).copied();
-                    report.pending_key(pending_key_entry(
-                        "overwrite",
-                        &row.name,
-                        item.map(|item| item_display_name(client, item)).as_deref(),
-                        fp_by_cipher_id.get(cipher).map(String::as_str),
-                        Some(&row.fingerprint_sha256),
+                    let incoming_name = item_display_name(client, item);
+                    let incoming_fp = fp_by_cipher_id.get(cipher).map(String::as_str);
+                    // A pending local category change is kept by the pull:
+                    // the item's categories change nothing then.
+                    let real = incoming_fp != Some(row.fingerprint_sha256.as_str())
+                        || incoming_name != row.name
+                        || (mark.is_none() && key_categories_differ(client, item, row, &index));
+                    report.pending_key(PendingChange::new(
+                        pending_key_entry(
+                            "overwrite",
+                            &row.name,
+                            Some(&incoming_name),
+                            incoming_fp,
+                            Some(&row.fingerprint_sha256),
+                        ),
+                        item,
+                        real,
+                        RemotePull::Key {
+                            row: row.clone(),
+                            cipher: cipher.to_string(),
+                        },
                     ));
                 }
                 Plan::OrgOwned => report.error("name", &row.name, ORG_OWNED),
@@ -1048,6 +1397,10 @@ impl SyncRun<'_> {
             if matched_remote.contains(&cipher.id) {
                 continue;
             }
+            if let Some(why) = unusable.get(&cipher.id) {
+                report.error("cipher_id", &cipher.id, why);
+                continue;
+            }
             // The same key is already in the vault without a link to this
             // item (a public-only copy, or a second item holding the same
             // key): it is not new.
@@ -1057,28 +1410,24 @@ impl SyncRun<'_> {
             {
                 continue;
             }
-            // Confirm-first: until the run allows remote data in, a new item
-            // is only listed for the prompt - its name and fingerprint, never
-            // its key.
-            if !allow {
-                report.skipped_new += 1;
-                report.pending_key(pending_key_entry(
+            // Confirm-first: a new item is listed for the prompt - its name
+            // and fingerprint, never its key - and imported only after an
+            // approval of the whole list.
+            report.skipped_new += 1;
+            report.pending_key(PendingChange::new(
+                pending_key_entry(
                     "new",
                     &item_display_name(client, cipher),
                     None,
                     fp_by_cipher_id.get(&cipher.id).map(String::as_str),
                     None,
-                ));
-                continue;
-            }
-            match pull_new_key(client, cipher, db, self.vault_password).await {
-                Ok(PulledKey::Inserted { rename }) => {
-                    report.pulled += 1;
-                    report.renamed.extend(rename);
-                }
-                Ok(PulledKey::Duplicate) => {}
-                Err(e) => report.error("cipher_id", &cipher.id, e),
-            }
+                ),
+                cipher,
+                true,
+                RemotePull::NewKey {
+                    cipher: cipher.id.clone(),
+                },
+            ));
         }
         Ok(())
     }
@@ -1093,7 +1442,7 @@ impl SyncRun<'_> {
         folder_id: &str,
         report: &mut SyncReport,
     ) -> Result<()> {
-        let (db, allow) = (self.db, self.allow_remote_overwrite);
+        let db = self.db;
         let remote_logins = server_logins_in(&remote.ciphers, Some(folder_id));
         let local_servers = db.list_servers()?;
         let names = ServerNames::new(
@@ -1106,13 +1455,19 @@ impl SyncRun<'_> {
         let mut server_matched = std::collections::HashSet::new();
         // Servers whose own item could not be told apart this run (reported).
         let mut ambiguous = std::collections::HashSet::new();
+        let category_marks = db.category_marks("server")?;
+        // Read once for every comparison of this pass.
+        let index = SyncIndex::load(db).await?;
 
         for sv in &local_servers {
             (self.check)()?;
-            let plan = match plan_server_row(sv, live, &remote_logins, &names, allow) {
+            let mark = category_marks.get(&sv.id).copied();
+            // Planned as if remote changes were not allowed, as in the key
+            // pass: they are applied after the passes.
+            let plan = match plan_server_row_marked(sv, live, &remote_logins, &names, false, mark) {
                 ServerPlan::Plan(plan) => plan,
                 ServerPlan::Ambiguous(_) => {
-                    // Not guessed: no link, no upload this run (round 4).
+                    // Not guessed: no link, no upload this run.
                     ambiguous.insert(sv.id.as_str());
                     let candidates = own_item_candidates(sv, &remote_logins, &names);
                     report.error(
@@ -1148,6 +1503,7 @@ impl SyncRun<'_> {
                             if relink {
                                 report.servers_recreated_remote += 1;
                             }
+                            category_uploaded(db, "server", &sv.id, mark);
                         }
                         Err(e) => report.error("server", &sv.name, e),
                     }
@@ -1156,7 +1512,7 @@ impl SyncRun<'_> {
                     // Found by the server id in the item's notes: adopt it.
                     // No local marker: the row may have been edited since the
                     // upload whose link was lost, so the next sync compares it
-                    // as changed and local wins (N1).
+                    // as changed and local wins.
                     let revision = live.get(cipher).and_then(|c| c.revision_date.as_deref());
                     match db.set_server_sync_meta(&sv.id, cipher, revision, None) {
                         Ok(()) => report.linked += 1,
@@ -1184,34 +1540,43 @@ impl SyncRun<'_> {
                             if conflict {
                                 report.conflicts += 1; // local won
                             }
+                            category_uploaded(db, "server", &sv.id, mark);
                         }
                         Err(e) => report.error("server", &sv.name, e),
                     }
                 }
-                Plan::Pull { cipher } => match live.get(cipher) {
-                    Some(remote_copy) => {
-                        match pull_remote_server(client, remote_copy, sv, db, self.vault_password)
-                            .await
-                        {
-                            Ok(true) => report.servers_updated_local += 1,
-                            Ok(false) => report.error("server", &sv.name, CHANGED_MEANWHILE),
-                            Err(e) => report.error("server", &sv.name, e),
-                        }
-                    }
-                    None => {
-                        debug_assert!(false, "a planned pull names an item outside the snapshot");
+                // Only the remote copy changed: listed for the user's
+                // approval with every setting the pull would change.
+                Plan::Pull { cipher } | Plan::SkipRemoteChange { cipher } => {
+                    let Some(item) = live.get(cipher).copied() else {
                         report.error("server", &sv.name, "internal: the item to pull is missing");
-                    }
-                },
-                Plan::SkipRemoteChange { cipher } => {
+                        continue;
+                    };
                     report.skipped_server_overwrites += 1;
-                    let item = live.get(cipher).copied();
-                    report.pending_server(pending_server_entry(
-                        "overwrite",
-                        &sv.name,
-                        item.map(|item| item_display_name(client, item)).as_deref(),
-                        item.and_then(|item| uri_host_port(client, item).ok().flatten()),
-                        Some((&sv.host, sv.port)),
+                    let changes = server_changes(
+                        client,
+                        item,
+                        sv,
+                        &index,
+                        self.vault_password,
+                        mark.is_some(),
+                    )
+                    .await;
+                    report.pending_server(PendingChange::new(
+                        pending_server_entry(
+                            "overwrite",
+                            &sv.name,
+                            Some(&item_display_name(client, item)),
+                            uri_host_port(client, item).ok().flatten(),
+                            Some((&sv.host, sv.port)),
+                            Some(&changes),
+                        ),
+                        item,
+                        !changes.is_empty(),
+                        RemotePull::Server {
+                            row: sv.clone(),
+                            cipher: cipher.to_string(),
+                        },
                     ));
                 }
                 Plan::OrgOwned => report.error("server", &sv.name, ORG_OWNED),
@@ -1227,9 +1592,9 @@ impl SyncRun<'_> {
             // An item whose notes name a local server is compared with that
             // server's own item - the one it is linked to, or the one item
             // naming it that no other server is linked to (pass 1 linked it)
-            // - by creation date (fix round 3: the server's CURRENT link alone
-            // made every older copy look like a clone once the server was
-            // linked again).
+            // - by creation date (comparing with the server's CURRENT link
+            // alone made every older copy look like a clone once the server
+            // was linked again).
             if let Some(named) = names
                 .named
                 .get(&cipher.id)
@@ -1277,27 +1642,29 @@ impl SyncRun<'_> {
                         );
                         continue;
                     }
-                    // A clone: new, behind the confirm prompt below (N2).
+                    // A clone: new, behind the confirm prompt below.
                     NamedItem::Clone => {}
                 }
             }
-            // Confirm-first, as for keys (A2-47): a new remote server is only
-            // listed - name and address - until the run allows remote data in.
-            if !allow {
-                report.skipped_server_new += 1;
-                report.pending_server(pending_server_entry(
+            // Confirm-first, as for keys (A2-47): a new remote server is
+            // listed - name and address - and imported only after an
+            // approval of the whole list.
+            report.skipped_server_new += 1;
+            report.pending_server(PendingChange::new(
+                pending_server_entry(
                     "new",
                     &item_display_name(client, cipher),
                     None,
                     uri_host_port(client, cipher).ok().flatten(),
                     None,
-                ));
-                continue;
-            }
-            match pull_new_server(client, cipher, db, self.vault_password).await {
-                Ok(()) => report.servers_pulled += 1,
-                Err(e) => report.error("cipher_id", &cipher.id, e),
-            }
+                    None,
+                ),
+                cipher,
+                true,
+                RemotePull::NewServer {
+                    cipher: cipher.id.clone(),
+                },
+            ));
         }
         Ok(())
     }
@@ -1348,7 +1715,7 @@ async fn find_or_create_folder(
 /// exist but a legacy "SSHSpan" folder does, that folder is renamed rather
 /// than a second one created beside it. (The rename used to run after a new
 /// folder had already been created, which left two folders with one name.)
-/// A failed rename is reported, not swallowed (M12), and a new folder is
+/// A failed rename is reported, not swallowed, and a new folder is
 /// created instead.
 async fn resolve_keys_folder(
     client: &mut BitwardenClient,
@@ -1394,6 +1761,88 @@ fn folder_error(name: &str, what: &str, error: &anyhow::Error) -> serde_json::Va
     })
 }
 
+/// The key a remote SSH item really holds: its decrypted private key and the
+/// fingerprint and public key derived from it.
+struct RemoteKey {
+    data: crate::crypto::keys::PrivateKeyData,
+    fingerprint: String,
+    public_openssh: String,
+}
+
+/// Read the key `cipher` holds ([`RemoteKey`]). Its `keyFingerprint` and
+/// `publicKey` fields are text anyone who can edit the item can set: they
+/// used to be taken as they were, so an item whose private key was swapped
+/// for an attacker's but whose fingerprint field was kept read as "no
+/// change" - and after Apply the local key held the attacker's key under the
+/// old fingerprint. Now both are derived from the private key; an item
+/// that claims another fingerprint or another public key is refused, and so
+/// is one whose private key cannot be read. The refusal names the item.
+fn remote_key(
+    client: &BitwardenClient,
+    cipher: &SyncCipher,
+) -> std::result::Result<RemoteKey, String> {
+    use crate::crypto::keys;
+    let name = pending_text(&item_display_name(client, cipher));
+    let ssh = cipher
+        .ssh_key
+        .as_ref()
+        .ok_or_else(|| format!("{name} holds no SSH key - not imported."))?;
+    let private_enc = ssh
+        .private_key
+        .as_ref()
+        .ok_or_else(|| format!("{name} holds no private key - not imported."))?;
+    let private_pem = zeroize::Zeroizing::new(client.decrypt_field(private_enc).map_err(|e| {
+        format!("{name}: its private key could not be decrypted ({e}) - not imported.")
+    })?);
+    // Only an OpenSSH private key can be stored.
+    if !private_pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
+        return Err(format!(
+            "{name} does not hold an OpenSSH private key - not imported."
+        ));
+    }
+    let data = keys::import_openssh_private(&private_pem, None)
+        .map_err(|e| format!("{name}: its private key could not be read ({e}) - not imported."))?;
+    let fingerprint = keys::compute_fingerprint_sha256(&data.public_key);
+    let public_openssh = keys::export_public_key(&data, keys::KeyFormat::OpenSsh).map_err(|e| {
+        format!("{name}: its public key could not be written ({e}) - not imported.")
+    })?;
+    let claimed = |field: Option<&String>| {
+        field
+            .map(|enc| client.decrypt_field(enc).map_err(|_| ()))
+            .transpose()
+    };
+    match claimed(ssh.key_fingerprint.as_ref()) {
+        Ok(None) => {}
+        Ok(Some(fp)) if same_fingerprint(&fp, &fingerprint) => {}
+        _ => {
+            return Err(format!(
+                "{name} claims a fingerprint that does not match its key - not imported."
+            ))
+        }
+    }
+    match claimed(ssh.public_key.as_ref()) {
+        Ok(None) => {}
+        Ok(Some(line)) if parse_openssh_public_line(&line).is_ok_and(|b| b == data.public_key) => {}
+        _ => {
+            return Err(format!(
+                "{name} claims a public key that does not match its key - not imported."
+            ))
+        }
+    }
+    Ok(RemoteKey {
+        data,
+        fingerprint,
+        public_openssh,
+    })
+}
+
+/// Whether two SHA-256 fingerprint texts name the same key (spaces around
+/// and base64 padding aside).
+fn same_fingerprint(a: &str, b: &str) -> bool {
+    let plain = |s: &str| s.trim().trim_end_matches('=').to_string();
+    plain(a) == plain(b)
+}
+
 /// What pulling one new remote SSH item did.
 enum PulledKey {
     /// Stored as a new key; `rename` reports a name that had to change.
@@ -1402,42 +1851,21 @@ enum PulledKey {
     Duplicate,
 }
 
-/// Import one remote SSH item that matches no local key: decrypt, re-seal
-/// with the vault password, store under a free name, and resolve its SSHSpan
-/// category metadata.
+/// Import one remote SSH item that matches no local key: read its key (the
+/// fingerprint and public key derived from it, [`remote_key`]), re-seal it
+/// with the vault password, store it under a free name, and resolve its
+/// SSHSpan category metadata.
 async fn pull_new_key(
     client: &mut BitwardenClient,
     cipher: &SyncCipher,
     db: &Database,
     vault_password: &str,
 ) -> Result<PulledKey> {
-    let ssh = cipher.ssh_key.as_ref();
-    let priv_key_enc = ssh
-        .and_then(|sk| sk.private_key.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("no privateKey in sshKey block"))?;
-    let priv_pem = zeroize::Zeroizing::new(
-        client
-            .decrypt_field(priv_key_enc)
-            .map_err(|e| anyhow::anyhow!("privateKey decrypt failed: {e}"))?,
-    );
-    let pub_key = ssh
-        .and_then(|sk| sk.public_key.as_ref())
-        .map(|e| client.decrypt_field(e))
-        .transpose()
-        .unwrap_or_default();
-    let fp = ssh
-        .and_then(|sk| sk.key_fingerprint.as_ref())
-        .map(|e| client.decrypt_field(e))
-        .transpose()
-        .unwrap_or_default();
-
-    let key_data = crate::crypto::keys::import_openssh_private(&priv_pem, None)
-        .map_err(|e| anyhow::anyhow!("OpenSSH private key import failed: {e}"))?;
-    let public_openssh =
-        crate::crypto::keys::export_public_key(&key_data, crate::crypto::keys::KeyFormat::OpenSsh)
-            .unwrap_or_default();
-    let fingerprint_sha256 =
-        fp.unwrap_or_else(|| crate::crypto::keys::compute_fingerprint_sha256(&key_data.public_key));
+    let RemoteKey {
+        data: key_data,
+        fingerprint: fingerprint_sha256,
+        public_openssh,
+    } = remote_key(client, cipher).map_err(anyhow::Error::msg)?;
     // Check for duplicate by fingerprint (another item holding the same key
     // may have been pulled earlier in this run).
     if db
@@ -1447,7 +1875,7 @@ async fn pull_new_key(
     {
         return Ok(PulledKey::Duplicate);
     }
-    let sealed = seal_private_key(vault_password, &key_data.private_key)?;
+    let sealed = seal_private_key(vault_password, &key_data.private_key).await?;
 
     // Remote cipher names are arbitrary text but become Host aliases in
     // ~/.ssh/config on deploy - sanitize rather than skipping the item, and
@@ -1466,7 +1894,7 @@ async fn pull_new_key(
         id: uuid::Uuid::new_v4().to_string(),
         name: wanted.clone(),
         key_type: key_data.key_type.db_tag().to_string(),
-        public_key: pub_key.unwrap_or(public_openssh),
+        public_key: public_openssh,
         private_key_encrypted: sealed,
         fingerprint_sha256,
         fingerprint_md5: crate::crypto::keys::compute_fingerprint_md5(&key_data.public_key),
@@ -1477,7 +1905,7 @@ async fn pull_new_key(
         deploy_path: None,
         bitwarden_id: Some(cipher.id.clone()),
         bitwarden_sync: true,
-        // Stored as synced (I2): without these marks the next sync saw the
+        // Stored as synced: without these marks the next sync saw the
         // new key as changed on both sides, re-uploaded it and counted a
         // conflict.
         bitwarden_revision_ts: epoch_ms(cipher.revision_date.as_deref()),
@@ -1566,7 +1994,7 @@ async fn push_local_key(
 ) -> Result<()> {
     // Decrypt the private key. A failed unseal must abort the push - the
     // sealed ciphertext is never valid key material.
-    let private_bytes = unseal_private_key(vault_password, &row.private_key_encrypted)?;
+    let private_bytes = unseal_private_key(vault_password, &row.private_key_encrypted).await?;
 
     // Export as OpenSSH
     let key_type = crate::crypto::keys::KeyType::from_db_tag(&row.key_type)?;
@@ -1688,52 +2116,30 @@ fn record_pushed_server(
 }
 
 /// Write a pulled key into its row - only the columns the pull owns, so a
-/// deployment recorded while the sync ran survives (hand-off 12), and only if
+/// deployment recorded while the sync ran survives, and only if
 /// the row is still the one the sync read: false when it was edited or
-/// deleted meanwhile (M4).
+/// deleted meanwhile.
 fn store_pulled_key(db: &Database, row: &KeyRecord, pulled: &crate::db::KeyPull) -> Result<bool> {
     db.apply_pulled_key(&row.id, pulled, row.updated_at)
 }
 
 /// Pull a remote cipher into a local row (overwrite with newer remote data).
 /// Reports a remote name taken by another key, and a row that changed while
-/// the sync ran (then nothing is written, M4).
+/// the sync ran (then nothing is written). `keep_local_categories`: the key's
+/// own category change is still to be uploaded - it wins over the item's.
 async fn pull_remote_item(
     client: &mut BitwardenClient,
     cipher: &crate::bitwarden::SyncCipher,
     row: &KeyRecord,
     db: &Database,
     vault_password: &str,
+    keep_local_categories: bool,
 ) -> Result<PullOutcome> {
-    let ssh = cipher
-        .ssh_key
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No sshKey block"))?;
-    let priv_enc = ssh
-        .private_key
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No privateKey"))?;
-    let priv_pem = zeroize::Zeroizing::new(client.decrypt_field(priv_enc)?);
-    let pub_key = ssh
-        .public_key
-        .as_ref()
-        .map(|e| client.decrypt_field(e))
-        .transpose()
-        .unwrap_or_default();
-    let fp = ssh
-        .key_fingerprint
-        .as_ref()
-        .map(|e| client.decrypt_field(e))
-        .transpose()
-        .unwrap_or_default();
-
-    // Only an OpenSSH private key can be stored. Anything else used to be
-    // skipped silently and still counted as "updated locally".
-    if !priv_pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
-        anyhow::bail!("the Bitwarden copy is not an OpenSSH private key; nothing was pulled");
-    }
-    let kd = crate::crypto::keys::import_openssh_private(&priv_pem, None)
-        .map_err(|e| anyhow::anyhow!("OpenSSH private key import failed: {e}"))?;
+    // The key it holds, its fingerprint and public key derived from it
+    // ([`remote_key`]). Anything but an OpenSSH private key is refused: it
+    // used to be skipped silently and still counted as "updated locally".
+    let key = remote_key(client, cipher).map_err(anyhow::Error::msg)?;
+    let kd = &key.data;
 
     // Remote cipher names are arbitrary text but become Host aliases in
     // ~/.ssh/config on deploy - sanitize rather than failing the item. And
@@ -1745,17 +2151,13 @@ async fn pull_remote_item(
         .and_then(|n| client.decrypt_field(n).ok())
         .unwrap_or_else(|| row.name.clone());
     let wanted = sanitize_sync_name(db, &remote_name);
-    let sealed = seal_private_key(vault_password, &kd.private_key)?;
+    let sealed = seal_private_key(vault_password, &kd.private_key).await?;
     let mut pulled = crate::db::KeyPull {
         name: wanted.clone(),
         key_type: kd.key_type.db_tag().to_string(),
-        public_key: pub_key.unwrap_or_else(|| {
-            crate::crypto::keys::export_public_key(&kd, crate::crypto::keys::KeyFormat::OpenSsh)
-                .unwrap_or_default()
-        }),
+        public_key: key.public_openssh.clone(),
         private_key_encrypted: sealed,
-        fingerprint_sha256: fp
-            .unwrap_or_else(|| crate::crypto::keys::compute_fingerprint_sha256(&kd.public_key)),
+        fingerprint_sha256: key.fingerprint.clone(),
         fingerprint_md5: crate::crypto::keys::compute_fingerprint_md5(&kd.public_key),
         comment: kd.comment.clone(),
         bitwarden_revision_ts: epoch_ms(cipher.revision_date.as_deref()),
@@ -1773,8 +2175,11 @@ async fn pull_remote_item(
     if !written {
         return Ok(PullOutcome::ChangedMeanwhile);
     }
-    // Resolve SSHSpan category metadata from the cipher's `notes`.
-    db.set_key_categories(&row.id, &categories_from_notes(client, cipher, db))?;
+    // Resolve SSHSpan category metadata from the cipher's `notes` - unless
+    // the key's own new categories are still to be uploaded.
+    if !keep_local_categories {
+        db.set_key_categories(&row.id, &categories_from_notes(client, cipher, db))?;
+    }
     let name = pulled.name;
     Ok(PullOutcome::Written {
         rename: (name != wanted).then(|| report_rename(db, &wanted, &name)),
@@ -1810,20 +2215,26 @@ fn sanitize_sync_name(db: &Database, raw: &str) -> String {
 /// Seal a private key for local storage. Never substitutes a placeholder:
 /// a seal failure propagates so callers skip the item or abort with a
 /// clear error instead of persisting an empty ciphertext.
-fn seal_private_key(vault_password: &str, private_key: &[u8]) -> Result<String> {
-    crate::crypto::vault::seal(vault_password, private_key)
+/// Argon2id, on the blocking pool ([`crate::commands::seal_off_thread`]).
+async fn seal_private_key(vault_password: &str, private_key: &[u8]) -> Result<String> {
+    crate::commands::seal_off_thread(vault_password, private_key)
+        .await
         .map_err(|e| anyhow::anyhow!("vault seal failed during sync; refusing to store key: {e}"))
 }
 
 /// Unseal a stored private key. Never falls back to the sealed ciphertext:
 /// if the entry cannot be decrypted with the vault password, the error
-/// propagates so the key is neither pushed nor overwritten.
-fn unseal_private_key(vault_password: &str, sealed: &str) -> Result<Vec<u8>> {
-    crate::crypto::vault::unseal(vault_password, sealed).map_err(|e| {
-        anyhow::anyhow!(
-            "vault unseal failed during sync; refusing to use sealed ciphertext as key: {e}"
-        )
-    })
+/// propagates so the key is neither pushed nor overwritten. Argon2id, on the
+/// blocking pool ([`crate::commands::unseal_off_thread`]).
+async fn unseal_private_key(vault_password: &str, sealed: &str) -> Result<Vec<u8>> {
+    let mut plain = crate::commands::unseal_off_thread(vault_password, sealed)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "vault unseal failed during sync; refusing to use sealed ciphertext as key: {e}"
+            )
+        })?;
+    Ok(std::mem::take(&mut *plain))
 }
 
 /// Parse an authorized_keys line back into raw SSH wire-format public key bytes.
@@ -1885,7 +2296,7 @@ fn server_notes(
         "sshspan": {
             // The local server id: finds this item again when its link was
             // never stored (the upload worked, the app quit before the link
-            // was saved) instead of uploading a duplicate (M6).
+            // was saved) instead of uploading a duplicate.
             "serverId": sv.id,
             "authMethod": sv.auth_method,
             "keyFingerprint": key_fp,
@@ -1910,9 +2321,13 @@ async fn push_local_server(
     let user_enc = client.encrypt_field(&sv.username)?;
     let password_enc = match &sv.saved_password {
         Some(sealed) => {
-            let plain = crate::crypto::vault::unseal(vault_password, sealed)
+            // Argon2id, on the blocking pool.
+            let mut plain = crate::commands::unseal_off_thread(vault_password, sealed)
+                .await
                 .map_err(|e| anyhow::anyhow!("saved password unseal failed: {e}"))?;
-            let plain_str = String::from_utf8(plain).unwrap_or_default();
+            let plain_str = zeroize::Zeroizing::new(
+                String::from_utf8(std::mem::take(&mut *plain)).unwrap_or_default(),
+            );
             if plain_str.is_empty() {
                 None
             } else {
@@ -1948,21 +2363,280 @@ async fn push_local_server(
 }
 
 /// notes -> (auth_method, key_fingerprint, category_id)
+/// The `sshspan` object of an item's notes (written by [`server_notes`]),
+/// when the notes decrypt and hold one.
+fn sshspan_notes(
+    client: &BitwardenClient,
+    cipher: &crate::bitwarden::SyncCipher,
+) -> Option<serde_json::Value> {
+    let plain = client.decrypt_field(cipher.notes.as_ref()?).ok()?;
+    let mut v: serde_json::Value = serde_json::from_str(&plain).ok()?;
+    Some(v.get_mut("sshspan")?.take())
+}
+
+/// The auth method and the linked key's fingerprint an item's notes name -
+/// read only, nothing created.
+fn notes_auth_and_key(
+    client: &BitwardenClient,
+    cipher: &crate::bitwarden::SyncCipher,
+) -> (Option<String>, Option<String>) {
+    let Some(ss) = sshspan_notes(client, cipher) else {
+        return (None, None);
+    };
+    let text = |field: &str| ss.get(field).and_then(|v| v.as_str()).map(String::from);
+    (text("authMethod"), text("keyFingerprint"))
+}
+
+/// Which of `sv`'s settings pulling `item` into it would change - "name",
+/// "host", "port", "user", "password", "authMethod", "linkedKey",
+/// "category", in that order - by the rules [`pull_remote_server`] writes
+/// them with. The prompt used to show only the address while the pull also
+/// replaced the user name, the saved password, the auth method and the
+/// linked key; and a remote rename or a move to another category counted as
+/// a mere revision bump. A field that does not decrypt counts as changing
+/// (the pull would refuse the item). The saved password is compared by
+/// unsealing it, on the blocking pool; nothing is written - a category the
+/// pull would create is not created here. The linked key and the category
+/// are looked up in `index`, read once for the whole pass.
+/// `keep_local_category`: the server's own category change is still to be
+/// uploaded, and the pull keeps it.
+async fn server_changes(
+    client: &BitwardenClient,
+    item: &SyncCipher,
+    sv: &ServerRecord,
+    index: &SyncIndex,
+    vault_password: &str,
+    keep_local_category: bool,
+) -> Vec<&'static str> {
+    let mut changes = Vec::new();
+    match decrypt_present(client, item.name.as_ref(), "name") {
+        Ok(Some(name)) => {
+            let name = clean_item_text(&name);
+            if !name.is_empty() && name != sv.name {
+                changes.push("name");
+            }
+        }
+        Ok(None) => {}
+        Err(_) => changes.push("name"),
+    }
+    match uri_host_port(client, item) {
+        Ok(Some((host, port))) => {
+            if host != sv.host {
+                changes.push("host");
+            }
+            if port != sv.port {
+                changes.push("port");
+            }
+        }
+        Ok(None) => {}
+        Err(_) => changes.extend(["host", "port"]),
+    }
+    let login = item.login.as_ref();
+    match decrypt_present(client, login.and_then(|l| l.username.as_ref()), "user name") {
+        Ok(Some(user)) if user != sv.username => changes.push("user"),
+        Ok(_) => {}
+        Err(_) => changes.push("user"),
+    }
+    let incoming = decrypt_present(client, login.and_then(|l| l.password.as_ref()), "password")
+        .map(|p| p.map(zeroize::Zeroizing::new).filter(|p| !p.is_empty()));
+    let password_changes = match incoming {
+        Err(_) => true,
+        // The pull clears a saved password the item does not have.
+        Ok(None) => sv.saved_password.is_some(),
+        Ok(Some(new)) => match sv.saved_password.as_deref() {
+            None => true,
+            Some(sealed) => crate::commands::unseal_off_thread(vault_password, sealed)
+                .await
+                .map_or(true, |old| old.as_slice() != new.as_bytes()),
+        },
+    };
+    if password_changes {
+        changes.push("password");
+    }
+    let (auth_method, key_fp) = notes_auth_and_key(client, item);
+    if auth_method.is_some_and(|method| method != sv.auth_method) {
+        changes.push("authMethod");
+    }
+    let key_id = key_fp
+        .as_ref()
+        .and_then(|fp| index.key_by_fingerprint.get(fp).cloned())
+        .or_else(|| sv.key_id.clone());
+    if key_id != sv.key_id {
+        changes.push("linkedKey");
+    }
+    if !keep_local_category
+        && notes_category_differs(client, item, sv.category_id.as_deref(), index)
+    {
+        changes.push("category");
+    }
+    changes
+}
+
+/// What the comparisons of a pass's pending changes look up
+/// ([`server_changes`], [`notes_category_differs`],
+/// [`key_categories_differ`]), read ONCE per pass, on the blocking pool:
+/// every category (its scope by id, its id by scope and path), every key's
+/// categories and every key's fingerprint. Comparing used to read the whole
+/// category table again for every category of every lookup - 357 s for 300
+/// pending servers and 150 categories in a debug build, every query on an
+/// async worker, while the sync held the rotation lock. Nothing in a pass
+/// changes these: only an approved pull, after the passes, creates
+/// categories or keys.
+struct SyncIndex {
+    scope_of: HashMap<String, String>,
+    by_path: HashMap<(String, String), String>,
+    key_categories: HashMap<String, std::collections::HashSet<String>>,
+    key_by_fingerprint: HashMap<String, String>,
+}
+
+impl SyncIndex {
+    /// Read the index on the blocking pool.
+    async fn load(db: &Database) -> Result<Self> {
+        let db = db.clone();
+        crate::commands::spawn_on_pool(move || Self::read(&db))
+            .await
+            .map_err(|e| anyhow::anyhow!("background task failed: {e}"))?
+    }
+
+    fn read(db: &Database) -> Result<Self> {
+        let all = db.list_categories()?;
+        let paths = crate::db::category_paths(&all);
+        let mut scope_of = HashMap::new();
+        let mut by_path = HashMap::new();
+        // In the order the categories are listed: of several with one path,
+        // the first is the one a lookup by path always found.
+        for category in &all {
+            scope_of.insert(category.id.clone(), category.scope.clone());
+            if let Some(path) = paths.get(&category.id) {
+                by_path
+                    .entry((category.scope.clone(), path.clone()))
+                    .or_insert_with(|| category.id.clone());
+            }
+        }
+        let key_categories = db
+            .all_key_categories()?
+            .into_iter()
+            .map(|(key, categories)| (key, categories.into_iter().collect()))
+            .collect();
+        let mut key_by_fingerprint = HashMap::new();
+        // Newest first, as listed: the first key with a fingerprint is the
+        // one a lookup by fingerprint always found.
+        for key in db.list_keys()? {
+            key_by_fingerprint
+                .entry(key.fingerprint_sha256)
+                .or_insert(key.id);
+        }
+        Ok(Self {
+            scope_of,
+            by_path,
+            key_categories,
+            key_by_fingerprint,
+        })
+    }
+
+    /// Whether this vault has category `id` - of `scope`, when one is given.
+    fn has_category(&self, id: &str, scope: Option<&str>) -> bool {
+        self.scope_of
+            .get(id)
+            .is_some_and(|found| scope.is_none_or(|wanted| found == wanted))
+    }
+
+    /// The category of `scope` whose path is `path`, if this vault has one.
+    fn category_by_path(&self, scope: &str, path: &str) -> Option<&str> {
+        self.by_path
+            .get(&(scope.to_string(), path.to_string()))
+            .map(String::as_str)
+    }
+}
+
+/// Whether pulling `item` would file its server somewhere other than
+/// `current`, by the rules [`parse_server_notes`] resolves with: the notes
+/// name a host category by an id this vault has, else by a path. Read only
+/// (`index`): a path this vault lacks - the pull would create it - differs;
+/// notes that name no category leave the server where it is.
+fn notes_category_differs(
+    client: &BitwardenClient,
+    item: &SyncCipher,
+    current: Option<&str>,
+    index: &SyncIndex,
+) -> bool {
+    let Some(category) = sshspan_notes(client, item)
+        .and_then(|notes| notes.get("category").cloned())
+        .filter(|c| c.is_object())
+    else {
+        return false;
+    };
+    let id = category.get("id").and_then(|i| i.as_str());
+    let path = category.get("path").and_then(|p| p.as_str());
+    match (id, path) {
+        (Some(id), _) if index.has_category(id, Some("host")) => current != Some(id),
+        (_, Some(path)) => {
+            match index.category_by_path("host", &unprefix_host_category_path(path)) {
+                Some(existing) => current != Some(existing),
+                None => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether pulling `item` would file key `row` in other categories than its
+/// own, by the rules [`categories_from_notes`] resolves with. Read only
+/// (`index`): a path this vault lacks - the pull would create it - differs,
+/// and notes that name none differ from a key that has some (the pull clears
+/// them).
+fn key_categories_differ(
+    client: &BitwardenClient,
+    item: &SyncCipher,
+    row: &KeyRecord,
+    index: &SyncIndex,
+) -> bool {
+    let none = std::collections::HashSet::new();
+    let local = index.key_categories.get(&row.id).unwrap_or(&none);
+    let entries = sshspan_notes(client, item)
+        .and_then(|notes| notes.get("categories").and_then(|c| c.as_array()).cloned())
+        .unwrap_or_default();
+    let mut remote = std::collections::HashSet::new();
+    for entry in &entries {
+        let id = entry.get("id").and_then(|i| i.as_str());
+        let path = entry.get("path").and_then(|p| p.as_str());
+        match (id, path) {
+            (Some(id), _) if index.has_category(id, None) => {
+                remote.insert(id.to_string());
+            }
+            (_, Some(path)) => match index.category_by_path("key", path) {
+                Some(existing) => {
+                    remote.insert(existing.to_string());
+                }
+                None => return true,
+            },
+            _ => {}
+        }
+    }
+    remote != *local
+}
+
+/// A category change of row `id` (`kind` "key" or "server"), marked at
+/// `mark`, is in the item it was just uploaded to: the mark goes - unless it
+/// was renewed meanwhile. A failure only means the next run uploads it again.
+fn category_uploaded(db: &Database, kind: &str, id: &str, mark: Option<i64>) {
+    if let Some(at) = mark {
+        if let Err(e) = db.clear_category_mark(kind, id, at) {
+            log::warn!("[sshspan-sync] could not clear the category mark of a {kind}: {e}");
+        }
+    }
+}
+
+/// notes -> (auth method, key fingerprint, category id). The category is
+/// resolved - created from its path when this vault lacks it - only when
+/// `resolve_category`.
 fn parse_server_notes(
     client: &BitwardenClient,
     cipher: &crate::bitwarden::SyncCipher,
     db: &Database,
+    resolve_category: bool,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let Some(notes_enc) = cipher.notes.as_ref() else {
-        return (None, None, None);
-    };
-    let Ok(plain) = client.decrypt_field(notes_enc) else {
-        return (None, None, None);
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&plain) else {
-        return (None, None, None);
-    };
-    let Some(ss) = v.get("sshspan") else {
+    let Some(ss) = sshspan_notes(client, cipher) else {
         return (None, None, None);
     };
     let auth = ss
@@ -1975,6 +2649,7 @@ fn parse_server_notes(
         .map(String::from);
     let cat = ss
         .get("category")
+        .filter(|_| resolve_category)
         .and_then(|c| c.as_object())
         .and_then(|c| {
             let id = c.get("id").and_then(|i| i.as_str()).map(String::from);
@@ -2014,7 +2689,7 @@ fn notes_server_id(client: &BitwardenClient, cipher: &SyncCipher) -> Option<Stri
 
 /// Decrypt a field the item HAS. A present field that does not decrypt is an
 /// error - the item is left alone - never a silent fallback that erases a
-/// saved password or renames a host (M10).
+/// saved password or renames a host.
 fn decrypt_present(
     client: &BitwardenClient,
     field: Option<&String>,
@@ -2050,17 +2725,23 @@ fn uri_host_port(client: &BitwardenClient, cipher: &SyncCipher) -> Result<Option
 }
 
 /// Pull a newer remote Login into an existing server row. Returns false when
-/// the row changed or vanished while the sync ran (nothing written, M4).
+/// the row changed or vanished while the sync ran (nothing written).
+/// `keep_local_category`: the server's own category change is still to be
+/// uploaded - it wins over the item's.
 async fn pull_remote_server(
     client: &mut BitwardenClient,
     cipher: &crate::bitwarden::SyncCipher,
     sv: &crate::db::ServerRecord,
     db: &Database,
     vault_password: &str,
+    keep_local_category: bool,
 ) -> Result<bool> {
     let login = cipher.login.as_ref();
-    let name =
-        decrypt_present(client, cipher.name.as_ref(), "name")?.unwrap_or_else(|| sv.name.clone());
+    // Stored clean: no format or text-direction characters.
+    let name = decrypt_present(client, cipher.name.as_ref(), "name")?
+        .map(|name| clean_item_text(&name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| sv.name.clone());
     let username = decrypt_present(client, login.and_then(|l| l.username.as_ref()), "user name")?
         .unwrap_or_else(|| sv.username.clone());
     let password_plain =
@@ -2069,7 +2750,8 @@ async fn pull_remote_server(
     // An item without an address keeps the row's (it used to become the
     // item's name on port 22).
     let (host, port) = uri_host_port(client, cipher)?.unwrap_or((sv.host.clone(), sv.port));
-    let (auth_method, key_fp, category_id) = parse_server_notes(client, cipher, db);
+    let (auth_method, key_fp, category_id) =
+        parse_server_notes(client, cipher, db, !keep_local_category);
 
     // Re-link the key by fingerprint if the local vault has a match.
     let key_id = key_fp
@@ -2083,11 +2765,16 @@ async fn pull_remote_server(
         })
         .or_else(|| sv.key_id.clone());
 
+    // Argon2id, on the blocking pool.
     let saved_password = match password_plain {
         Some(p) if !p.is_empty() => Some(
-            crate::crypto::vault::seal(vault_password, p.as_bytes()).map_err(|e| {
-                anyhow::anyhow!("vault seal failed for saved password; refusing to store it: {e}")
-            })?,
+            crate::commands::seal_off_thread(vault_password, p.as_bytes())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "vault seal failed for saved password; refusing to store it: {e}"
+                    )
+                })?,
         ),
         _ => None,
     };
@@ -2101,7 +2788,11 @@ async fn pull_remote_server(
             username,
             auth_method: auth_method.unwrap_or_else(|| sv.auth_method.clone()),
             key_id,
-            category_id: category_id.or_else(|| sv.category_id.clone()),
+            category_id: if keep_local_category {
+                sv.category_id.clone()
+            } else {
+                category_id.or_else(|| sv.category_id.clone())
+            },
             saved_password,
             bitwarden_revision_ts: cipher.revision_date.clone(),
         },
@@ -2109,8 +2800,8 @@ async fn pull_remote_server(
 }
 
 /// Write a pulled server into its row - only what the Login item carries;
-/// the `.pem` path, colour and a connection recorded while the sync ran stay
-/// (hand-off 12) - and only if the row is still the one the sync read (M4).
+/// the `.pem` path, colour and a connection recorded while the sync ran
+/// stay - and only if the row is still the one the sync read.
 fn store_pulled_server(
     db: &Database,
     sv: &ServerRecord,
@@ -2127,7 +2818,10 @@ async fn pull_new_server(
     vault_password: &str,
 ) -> Result<()> {
     let login = cipher.login.as_ref();
-    let name = decrypt_present(client, cipher.name.as_ref(), "name")?;
+    // Stored clean: no format or text-direction characters.
+    let name = decrypt_present(client, cipher.name.as_ref(), "name")?
+        .map(|name| clean_item_text(&name))
+        .filter(|name| !name.is_empty());
     let username = decrypt_present(client, login.and_then(|l| l.username.as_ref()), "user name")?
         .unwrap_or_else(|| "root".to_string());
     let password_plain =
@@ -2142,7 +2836,7 @@ async fn pull_new_server(
         ),
     };
     let name = name.unwrap_or_else(|| host.clone());
-    let (auth_method, key_fp, category_id) = parse_server_notes(client, cipher, db);
+    let (auth_method, key_fp, category_id) = parse_server_notes(client, cipher, db, true);
 
     let key_id = key_fp.as_ref().and_then(|fp| {
         db.list_keys()
@@ -2152,6 +2846,19 @@ async fn pull_new_server(
             .map(|k| k.id)
     });
 
+    // Argon2id, on the blocking pool.
+    let saved_password = match password_plain {
+        Some(p) if !p.is_empty() => Some(
+            crate::commands::seal_off_thread(vault_password, p.as_bytes())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "vault seal failed for saved password; refusing to store it: {e}"
+                    )
+                })?,
+        ),
+        _ => None,
+    };
     let now = chrono::Utc::now();
     let record = crate::db::ServerRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2162,20 +2869,11 @@ async fn pull_new_server(
         key_id,
         pem_path: None,
         auth_method: auth_method.unwrap_or_else(|| "publickey".to_string()),
-        saved_password: match password_plain {
-            Some(p) if !p.is_empty() => Some(
-                crate::crypto::vault::seal(vault_password, p.as_bytes()).map_err(|e| {
-                    anyhow::anyhow!(
-                        "vault seal failed for saved password; refusing to store it: {e}"
-                    )
-                })?,
-            ),
-            _ => None,
-        },
+        saved_password,
         category_id,
         color: None,
         last_connected_at: None,
-        // One instant for the row and its sync marker (I2): two clock reads
+        // One instant for the row and its sync marker: two clock reads
         // could straddle a millisecond and make the new row look edited.
         created_at: now,
         updated_at: now,
@@ -2222,13 +2920,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn seal_private_key_round_trips() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seal_private_key_round_trips() {
         let key = b"raw-ed25519-private-bytes";
-        let sealed =
-            seal_private_key(TEST_PW, key).expect("seal must succeed with a valid password");
+        let sealed = seal_private_key(TEST_PW, key)
+            .await
+            .expect("seal must succeed with a valid password");
         assert!(!sealed.is_empty(), "sealed output must never be empty");
-        let unsealed = unseal_private_key(TEST_PW, &sealed).expect("unseal must succeed");
+        let unsealed = unseal_private_key(TEST_PW, &sealed)
+            .await
+            .expect("unseal must succeed");
         assert_eq!(unsealed, key);
     }
 
@@ -2240,12 +2941,14 @@ mod tests {
     // substitute - is enforced by the type system (Result return, no
     // unwrap_or_default at call sites) and verified by inspection.
 
-    #[test]
-    fn unseal_private_key_never_returns_ciphertext() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unseal_private_key_never_returns_ciphertext() {
         // Wrong password: unseal must fail rather than hand back anything
         // derived from the sealed blob.
-        let sealed = seal_private_key(TEST_PW, b"private-key-bytes").unwrap();
-        let result = unseal_private_key("wrong-password", &sealed);
+        let sealed = seal_private_key(TEST_PW, b"private-key-bytes")
+            .await
+            .unwrap();
+        let result = unseal_private_key("wrong-password", &sealed).await;
         let err = result.expect_err("unseal with a wrong password must fail");
         assert!(
             err.to_string()
@@ -2254,9 +2957,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unseal_private_key_rejects_corrupted_entry() {
-        let result = unseal_private_key(TEST_PW, "not-json-at-all");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unseal_private_key_rejects_corrupted_entry() {
+        let result = unseal_private_key(TEST_PW, "not-json-at-all").await;
         let err = result.expect_err("unseal of a corrupted entry must fail");
         assert!(
             err.to_string()
@@ -2355,6 +3058,7 @@ mod tests {
             updated,
             synced: Some(T0),
             revision: Some(revision),
+            category: None,
         }
     }
 
@@ -2363,6 +3067,7 @@ mod tests {
             updated: T0,
             synced: None,
             revision: None,
+            category: None,
         }
     }
 
@@ -2785,7 +3490,7 @@ mod tests {
     fn pulled_key_name_that_collides_gets_a_numbered_suffix() {
         use crate::crypto::keys::{validate_key_name, MAX_KEY_NAME_LEN};
         assert_eq!(free_key_name("Deploy", names_taken(&[])), "Deploy");
-        // Names are unique without regard to case (RU3); names cannot hold
+        // Names are unique without regard to case; names cannot hold
         // spaces (Host aliases), so the suffix is "-N".
         assert_eq!(
             free_key_name("Deploy", names_taken(&["deploy"])),
@@ -2870,7 +3575,7 @@ mod tests {
             rows.last()
         );
     }
-    // ── Fix round 1 ─────────────────────────────────────────────────────────
+    // ── Item links, pulled rows and runs that stop early ────────────────────
 
     fn live_of<'a>(ciphers: &[&'a SyncCipher]) -> HashMap<&'a str, &'a SyncCipher> {
         ciphers.iter().map(|c| (c.id.as_str(), *c)).collect()
@@ -2878,7 +3583,7 @@ mod tests {
 
     #[test]
     fn linked_items_outside_the_folder_or_owned_by_an_organization_are_not_deleted() {
-        // I3: only the FILTERED lists were searched, so a moved item looked
+        // Only the FILTERED lists were searched, so a moved item looked
         // deleted and was duplicated, private key / saved password included.
         let moved = cipher("s1", 1, Some("another-folder"), Some(T0));
         let sv = server_row("a", Some("s1"), synced_at(T0, T0));
@@ -2913,7 +3618,7 @@ mod tests {
 
     #[test]
     fn server_found_by_its_id_in_the_notes_adopts_the_link() {
-        // M6: the upload worked, but the link was never stored.
+        // The upload worked, but the link was never stored.
         let sv = server_row("local-1", None, never_synced());
         let remote = cipher("s9", 1, Some("servers"), Some(T0));
         let names = ServerNames::new(
@@ -2946,13 +3651,13 @@ mod tests {
         ]);
         let logins = [&own, &clone];
         let live = live_of(&logins);
-        // n7: web's own item, not the clone web2 is linked to.
+        // web's own item, not the clone web2 is linked to.
         let names = ServerNames::new(both_name_web.clone(), &[web.clone(), web2.clone()]);
         assert_eq!(
             plan_server_row(&web, &live, &logins, &names, false),
             ServerPlan::Plan(Plan::Link { cipher: "s1" })
         );
-        // n6: web's item is gone and only web2's clone names it: re-created.
+        // web's item is gone and only web2's clone names it: re-created.
         let web_gone = server_row("web", Some("s0"), synced_at(T0, T0));
         let only_clone = [&clone];
         let names = ServerNames::new(
@@ -3025,7 +3730,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pulled_new_key_is_in_sync_at_the_next_run() {
-        // I2: the new row had no sync marks, so the next sync re-uploaded it,
+        // The new row had no sync marks, so the next sync re-uploaded it,
         // counted a conflict and pushed its de-duplicated name back.
         let db = test_db();
         let mut client = offline_client();
@@ -3069,7 +3774,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_undecryptable_server_field_is_an_error_not_a_fallback() {
-        // M10: the saved password used to be erased silently, or the host
+        // The saved password used to be erased silently, or the host
         // became the item name on port 22.
         let db = test_db();
         let mut client = offline_client();
@@ -3086,7 +3791,7 @@ mod tests {
             synced_at(T0, T0),
         );
         db.insert_server(&sv).unwrap();
-        let err = pull_remote_server(&mut client, &broken, &sv, &db, TEST_PW)
+        let err = pull_remote_server(&mut client, &broken, &sv, &db, TEST_PW, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("password"), "{err}");
@@ -3095,7 +3800,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pull_does_not_overwrite_a_row_changed_meanwhile() {
-        // M4: a rename made while the pull sealed was lost and the next plan
+        // A rename made while the pull sealed was lost and the next plan
         // was InSync; a deleted row still counted as updated.
         let db = test_db();
         let mut client = offline_client();
@@ -3107,7 +3812,7 @@ mod tests {
         );
         db.insert_key(&row).unwrap();
         db.rename_key(&row.id, "renamed-meanwhile").unwrap();
-        let outcome = pull_remote_item(&mut client, &item, &row, &db, TEST_PW)
+        let outcome = pull_remote_item(&mut client, &item, &row, &db, TEST_PW, false)
             .await
             .unwrap();
         assert!(matches!(outcome, PullOutcome::ChangedMeanwhile));
@@ -3124,7 +3829,7 @@ mod tests {
         );
         db.insert_key(&fresh).unwrap();
         let (item2, fp2) = ssh_item(&client, "c2", "pulled-name");
-        let outcome = pull_remote_item(&mut client, &item2, &fresh, &db, TEST_PW)
+        let outcome = pull_remote_item(&mut client, &item2, &fresh, &db, TEST_PW, false)
             .await
             .unwrap();
         assert!(matches!(outcome, PullOutcome::Written { rename: None }));
@@ -3136,7 +3841,7 @@ mod tests {
 
     #[test]
     fn deleting_a_category_marks_its_keys_and_servers_changed() {
-        // M5: the keys lose the category and the servers move up - both are
+        // The keys lose the category and the servers move up - both are
         // changes the sync uploads.
         let db = test_db();
         let key = key_row(
@@ -3164,13 +3869,20 @@ mod tests {
         db.insert_server(&sv).unwrap();
         db.delete_category(&prod).unwrap();
         db.delete_category(&web).unwrap();
-        assert!(db.get_key(&key.id).unwrap().unwrap().updated_at > at_ms(T0));
-        assert!(db.get_server(&sv.id).unwrap().unwrap().updated_at > at_ms(T0));
+        // Marked as category changes - the rows themselves did not change,
+        // so no "local wins" upload of their other fields follows.
+        assert!(db.category_mark("key", &key.id).unwrap().is_some());
+        assert!(db.category_mark("server", &sv.id).unwrap().is_some());
+        assert_eq!(db.get_key(&key.id).unwrap().unwrap().updated_at, at_ms(T0));
+        assert_eq!(
+            db.get_server(&sv.id).unwrap().unwrap().updated_at,
+            at_ms(T0)
+        );
     }
 
     #[test]
     fn an_aborted_run_still_reports_and_audits_its_counts() {
-        // M7: a run stopped by a lock or an error kept nothing.
+        // A run stopped by a lock or an error kept nothing.
         let mut report = SyncReport {
             pushed: 2,
             ..SyncReport::default()
@@ -3200,7 +3912,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn key_pass_counts_only_what_happened() {
-        // M9: a re-link by fingerprint is not a deletion; a public-only key's
+        // A re-link by fingerprint is not a deletion; a public-only key's
         // dead link is cleared and reported once; a failed upload counts no
         // conflict.
         let db = test_db();
@@ -3238,7 +3950,7 @@ mod tests {
         let run = SyncRun {
             db: &db,
             vault_password: TEST_PW,
-            allow_remote_overwrite: false,
+            remote_changes: RemoteChanges::Ask,
             check: &check,
         };
         let mut report = SyncReport::default();
@@ -3279,7 +3991,18 @@ mod tests {
         item
     }
 
-    /// Run the server pass offline over `items` (all in the servers folder).
+    /// What the passes may do with remote changes in a pass test: apply all
+    /// of them, or only list them.
+    fn remote_changes(allow_remote_overwrite: bool) -> RemoteChanges<'static> {
+        if allow_remote_overwrite {
+            RemoteChanges::ApproveAll
+        } else {
+            RemoteChanges::Ask
+        }
+    }
+
+    /// Run the server pass offline over `items` (all in the servers folder),
+    /// then settle its remote changes as a run does.
     async fn run_server_pass(
         db: &Database,
         client: &mut BitwardenClient,
@@ -3296,11 +4019,14 @@ mod tests {
         let run = SyncRun {
             db,
             vault_password: TEST_PW,
-            allow_remote_overwrite,
+            remote_changes: remote_changes(allow_remote_overwrite),
             check: &check,
         };
         let mut report = SyncReport::default();
         run.server_pass(client, &remote, &live, "servers", &mut report)
+            .await
+            .unwrap();
+        run.settle_remote_changes(client, &live, &mut report)
             .await
             .unwrap();
         report
@@ -3340,7 +4066,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn several_items_naming_an_unlinked_server_are_not_guessed_between() {
-        // n3 / round 4: two items name an unlinked server and no other server
+        // Two items name an unlinked server and no other server
         // is linked to either - one may be a clone that was never imported.
         // Nothing is guessed: no link, no upload, nothing imported - on this
         // run or a later one; the server is reported until the extra copy is
@@ -3375,9 +4101,10 @@ mod tests {
         assert_eq!(stored_link(&db, &web).as_deref(), Some("s2"));
     }
 
-    // ── Item 15: what the "allow remote changes" prompt will apply ──────
+    // ── What the "allow remote changes" prompt will apply ──────
 
-    /// Run the key pass offline over `items` (all in the keys folder).
+    /// Run the key pass offline over `items` (all in the keys folder), then
+    /// settle its remote changes as a run does.
     async fn run_key_pass(
         db: &Database,
         client: &mut BitwardenClient,
@@ -3394,11 +4121,14 @@ mod tests {
         let run = SyncRun {
             db,
             vault_password: TEST_PW,
-            allow_remote_overwrite,
+            remote_changes: remote_changes(allow_remote_overwrite),
             check: &check,
         };
         let mut report = SyncReport::default();
         run.key_pass(client, &remote, &live, "keys", &mut report)
+            .await
+            .unwrap();
+        run.settle_remote_changes(client, &live, &mut report)
             .await
             .unwrap();
         report
@@ -3439,11 +4169,13 @@ mod tests {
                     "kind": "overwrite", "name": "prod-db", "incomingName": "prod-db",
                     "host": "evil.example.com", "port": 2222,
                     "localHost": "10.0.0.5", "localPort": 22,
+                    "changes": ["host", "port", "user"],
                 },
                 {
                     "kind": "new", "name": "web", "incomingName": null,
                     "host": "web.example.com", "port": 2222,
                     "localHost": null, "localPort": null,
+                    "changes": null,
                 },
             ]),
             "{summary}"
@@ -3466,24 +4198,33 @@ mod tests {
         let local = key_row("k1", Some("c1"), synced_at(T0, T0));
         db.insert_key(&local).unwrap();
         // The linked item now holds another key; and a key SSHSpan lacks.
-        let mut replaced = cipher("c1", 5, Some("keys"), Some(T0 + 5_000));
-        replaced.name = Some(enc(&client, "deploy"));
-        replaced.ssh_key = Some(crate::bitwarden::SshKeyBlock {
+        let (mut replaced, replaced_fp) = ssh_item(&client, "c1", "deploy");
+        replaced.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        let (fresh, fresh_fp) = ssh_item(&client, "c2", "fresh");
+        // An item with no private key cannot be pulled: reported, not offered.
+        let hollow_row = key_row("k3", Some("c3"), synced_at(T0, T0));
+        db.insert_key(&hollow_row).unwrap();
+        let mut hollow = cipher("c3", 5, Some("keys"), Some(T0 + 5_000));
+        hollow.name = Some(enc(&client, "hollow"));
+        hollow.ssh_key = Some(crate::bitwarden::SshKeyBlock {
             private_key: None,
             public_key: None,
             key_fingerprint: Some(enc(&client, "SHA256:incoming")),
         });
-        let (fresh, fresh_fp) = ssh_item(&client, "c2", "fresh");
-        let report = run_key_pass(&db, &mut client, &[&replaced, &fresh], false).await;
+        let report = run_key_pass(&db, &mut client, &[&replaced, &fresh, &hollow], false).await;
         assert_eq!(report.skipped_overwrites, 1, "{report:?}");
         assert_eq!(report.skipped_new, 1, "{report:?}");
+        assert!(
+            has_error(&report, "hollow holds no private key - not imported."),
+            "{report:?}"
+        );
         let summary = report.summary(None);
         assert_eq!(
             summary["pendingKeys"],
             serde_json::json!([
                 {
                     "kind": "overwrite", "name": "key-k1", "incomingName": "deploy",
-                    "fingerprint": "SHA256:incoming", "localFingerprint": "SHA256:fp-k1",
+                    "fingerprint": replaced_fp, "localFingerprint": "SHA256:fp-k1",
                 },
                 {
                     "kind": "new", "name": "fresh", "incomingName": null,
@@ -3511,7 +4252,7 @@ mod tests {
         let db = test_db();
         let mut client = offline_client();
         let long_name = format!("srv\u{7}\u{1b}[31m{}", "x".repeat(500));
-        let items: Vec<SyncCipher> = (0..60)
+        let items: Vec<SyncCipher> = (0..MAX_PENDING_ENTRIES + 10)
             .map(|n| {
                 let mut item = login_item(&client, &format!("s{n}"), None);
                 item.name = Some(enc(&client, &long_name));
@@ -3523,11 +4264,16 @@ mod tests {
             .await
             .summary(None);
         let pending = summary["pendingServers"].as_array().unwrap();
-        assert_eq!(pending.len(), 50, "at most 50 entries");
+        assert_eq!(pending.len(), MAX_PENDING_ENTRIES, "at most the cap");
         assert_eq!(summary["pendingTruncated"], true);
-        assert_eq!(summary["skippedServerNew"], 60, "the count stays exact");
+        assert_eq!(
+            summary["skippedServerNew"],
+            MAX_PENDING_ENTRIES + 10,
+            "the count stays exact"
+        );
         let name = pending[0]["name"].as_str().unwrap();
-        assert_eq!(name.chars().count(), 200, "{name}");
+        assert_eq!(name.chars().count(), 80, "{name}");
+        assert!(name.ends_with('\u{2026}'), "cut, and says so: {name}");
         assert!(
             name.starts_with("srv[31mxxx"),
             "control characters stripped: {name:?}"
@@ -3535,7 +4281,7 @@ mod tests {
         assert!(!name.chars().any(char::is_control));
     }
 
-    /// RU5 final review: the error never named the items, and its advice -
+    /// The error never named the items, and its advice -
     /// "delete the extra copies" - lost data when one of them was a
     /// legitimate clone (deleting the clone discarded it; deleting the
     /// server's own copy made SSHSpan link to the clone and overwrite it).
@@ -3601,7 +4347,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_server_never_takes_over_the_item_another_server_is_linked_to() {
-        // n6: web was synced as s1; the user cloned s1 in Bitwarden, the clone
+        // web was synced as s1; the user cloned s1 in Bitwarden, the clone
         // (its notes still name web) was imported as web2 (linked s2), then the
         // user deleted s1. The next sync re-linked web to s2 - two servers on
         // one item - and the next upload turned web2 into a copy of web.
@@ -3631,7 +4377,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unlinked_server_finds_its_own_item_not_another_servers_clone() {
-        // n7: web is unlinked; s1 is its own item, s2 a clone of it that was
+        // web is unlinked; s1 is its own item, s2 a clone of it that was
         // imported as web2. Newest-wins linked web to s2 (web2's item) and
         // reported s1 as "an older copy of server 'web'".
         let db = test_db();
@@ -3653,7 +4399,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restored_original_is_an_older_copy_not_a_new_server() {
-        // n4: the user trashed the item, SSHSpan re-created it, then the user
+        // The user trashed the item, SSHSpan re-created it, then the user
         // restored the original from the trash - it was offered as a new
         // server and accepting imported a duplicate.
         let db = test_db();
@@ -3696,7 +4442,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bitwarden_clone_of_a_linked_server_is_new_behind_the_prompt() {
-        // N2: a clone made in Bitwarden copies the notes, so it names a server
+        // A clone made in Bitwarden copies the notes, so it names a server
         // already linked to another live item. It used to be skipped without
         // a word - devices drifted apart. Created AFTER the linked item, it is
         // a new server, behind the same confirm-first prompt as any new item.
@@ -3720,7 +4466,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_edit_made_after_a_lost_link_upload_is_pushed() {
-        // N1: upload, link lost, host edited locally, sync: the notes fallback
+        // Upload, link lost, host edited locally, sync: the notes fallback
         // re-linked the server with its CURRENT change marker, so the edit
         // was never pushed. The re-link stores no local marker, so the next
         // comparison sees the local row as changed and local wins.
@@ -3743,5 +4489,721 @@ mod tests {
             },
             "the local edit must be pushed"
         );
+    }
+
+    // ── Approvals bound to the list shown, key fingerprints, clean text ──
+
+    /// One sync over `items` (keys from the keys folder, servers from the
+    /// servers folder), offline, returning the summary the command returns.
+    /// `approval` is the token the user's "Apply" sends; `None` is a run that
+    /// only lists remote changes.
+    async fn sync_passes(
+        db: &Database,
+        client: &mut BitwardenClient,
+        items: &[&SyncCipher],
+        approval: Option<&str>,
+    ) -> serde_json::Value {
+        let remote = crate::bitwarden::SyncResponse {
+            profile: None,
+            folders: Vec::new(),
+            ciphers: items.iter().map(|c| (*c).clone()).collect(),
+        };
+        let live = live_of(items);
+        let check = || -> Result<()> { Ok(()) };
+        let run = SyncRun {
+            db,
+            vault_password: TEST_PW,
+            remote_changes: approval.map_or(RemoteChanges::Ask, RemoteChanges::ApproveIf),
+            check: &check,
+        };
+        let mut report = SyncReport::default();
+        run.key_pass(client, &remote, &live, "keys", &mut report)
+            .await
+            .unwrap();
+        run.server_pass(client, &remote, &live, "servers", &mut report)
+            .await
+            .unwrap();
+        run.settle_remote_changes(client, &live, &mut report)
+            .await
+            .unwrap();
+        report.summary(None)
+    }
+
+    /// The dry run shows one list; "Apply" re-fetches. A compromised
+    /// account (or a server of its own) could serve something else the
+    /// second time - another host, a rolled-back key. The approval is bound
+    /// to the list shown: if the second fetch differs, nothing is applied
+    /// and the new list comes back to be approved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_s4_an_approval_applies_only_the_list_it_was_issued_for() {
+        let db = test_db();
+        let mut client = offline_client();
+        let (rewritten, fresh) = rewritten_and_new_servers(&db, &client);
+        let shown = sync_passes(&db, &mut client, &[&rewritten, &fresh], None).await;
+        let token = shown["approvalToken"]
+            .as_str()
+            .expect("a list to approve comes with its token")
+            .to_string();
+        assert_eq!(token.len(), 64, "{token}");
+        // The second fetch serves another host for the same item.
+        let mut swapped = rewritten.clone();
+        swapped.login.as_mut().unwrap().uris = Some(vec![crate::bitwarden::LoginUri {
+            uri: Some(enc(&client, "ssh://other-evil.example.com:22")),
+        }]);
+        let stale = sync_passes(&db, &mut client, &[&swapped, &fresh], Some(&token)).await;
+        assert_eq!(stale["approvalStale"], true, "{stale}");
+        assert_eq!(
+            db.list_servers().unwrap().len(),
+            1,
+            "nothing imported: {stale}"
+        );
+        assert_eq!(
+            db.list_servers().unwrap()[0].host,
+            "10.0.0.5",
+            "nothing overwritten"
+        );
+        assert_eq!(stale["pendingServers"][0]["host"], "other-evil.example.com");
+        assert_ne!(stale["approvalToken"].as_str(), Some(token.as_str()));
+        // The same bytes with no visible difference - an item the server
+        // replays with an older ciphertext, say - are not the list shown
+        // either.
+        let mut replayed = rewritten.clone();
+        replayed.favorite = true;
+        let stale = sync_passes(&db, &mut client, &[&replayed, &fresh], Some(&token)).await;
+        assert_eq!(stale["approvalStale"], true, "{stale}");
+        assert_eq!(db.list_servers().unwrap()[0].host, "10.0.0.5");
+        // The list as shown: applied.
+        let applied = sync_passes(&db, &mut client, &[&rewritten, &fresh], Some(&token)).await;
+        assert!(applied.get("approvalStale").is_none(), "{applied}");
+        assert!(applied.get("pendingServers").is_none(), "{applied}");
+        let hosts: Vec<String> = db
+            .list_servers()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.host)
+            .collect();
+        assert!(hosts.contains(&"evil.example.com".to_string()), "{hosts:?}");
+        assert!(hosts.contains(&"web.example.com".to_string()), "{hosts:?}");
+    }
+
+    /// An item holding the key `kd` and claiming `claimed_fp` as its
+    /// fingerprint (and `claimed_public` as its public key).
+    fn ssh_item_claiming(
+        client: &BitwardenClient,
+        id: &str,
+        name: &str,
+        kd: &crate::crypto::keys::PrivateKeyData,
+        claimed_fp: &str,
+        claimed_public: &str,
+    ) -> SyncCipher {
+        use crate::crypto::keys::{self, KeyFormat};
+        let mut item = cipher(id, 5, Some("keys"), Some(T0 + 5_000));
+        item.name = Some(enc(client, name));
+        item.ssh_key = Some(crate::bitwarden::SshKeyBlock {
+            private_key: Some(enc(
+                client,
+                &keys::export_private_key(kd, KeyFormat::OpenSsh, None).unwrap(),
+            )),
+            public_key: Some(enc(client, claimed_public)),
+            key_fingerprint: Some(enc(client, claimed_fp)),
+        });
+        item
+    }
+
+    /// An item's `keyFingerprint` (and `publicKey`) are fields anyone who
+    /// can edit the item can set. A linked item whose private key was swapped
+    /// for an attacker's, its fingerprint field kept, read as "no change"
+    /// (`SHA256:AAAA -> SHA256:AAAA`) - and after Apply the local key held the
+    /// attacker's key under the old fingerprint. The fingerprint and public
+    /// key now come from the private key itself; an item that claims others
+    /// is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_s5_a_key_swapped_behind_its_old_fingerprint_is_refused() {
+        use crate::crypto::keys::{self, KeyFormat, KeyType};
+        let db = test_db();
+        let mut client = offline_client();
+        let mine = keys::generate_key_pair(KeyType::Ed25519, None, "mine".into()).unwrap();
+        let mine_fp = keys::compute_fingerprint_sha256(&mine.public_key);
+        let mine_public = keys::export_public_key(&mine, KeyFormat::OpenSsh).unwrap();
+        let mut row = key_row("k1", Some("c1"), synced_at(T0, T0));
+        row.name = "deploy".into();
+        row.fingerprint_sha256 = mine_fp.clone();
+        row.public_key = mine_public.clone();
+        db.insert_key(&row).unwrap();
+        let attacker = keys::generate_key_pair(KeyType::Ed25519, None, "evil".into()).unwrap();
+        let swapped = ssh_item_claiming(&client, "c1", "deploy", &attacker, &mine_fp, &mine_public);
+        let shown = run_key_pass(&db, &mut client, &[&swapped], false).await;
+        assert!(shown.pending_keys.is_empty(), "not offered: {shown:?}");
+        assert!(
+            has_error(
+                &shown,
+                "deploy claims a fingerprint that does not match its key - not imported."
+            ),
+            "{shown:?}"
+        );
+        let applied = run_key_pass(&db, &mut client, &[&swapped], true).await;
+        assert_eq!(applied.updated_local, 0, "{applied:?}");
+        let stored = db.get_key("k1").unwrap().unwrap();
+        assert_eq!(stored.fingerprint_sha256, mine_fp);
+        assert_eq!(
+            stored.private_key_encrypted, "sealed",
+            "the key is untouched"
+        );
+    }
+
+    /// On import, the stored fingerprint and public key are the ones of the
+    /// private key; claims that differ are refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_s5_an_imported_key_gets_the_fingerprint_and_public_key_of_its_private_key() {
+        use crate::crypto::keys::{self, KeyFormat, KeyType};
+        let db = test_db();
+        let mut client = offline_client();
+        let other = keys::generate_key_pair(KeyType::Ed25519, None, "other".into()).unwrap();
+        let other_fp = keys::compute_fingerprint_sha256(&other.public_key);
+        let other_public = keys::export_public_key(&other, KeyFormat::OpenSsh).unwrap();
+        let held = keys::generate_key_pair(KeyType::Ed25519, None, "held".into()).unwrap();
+        let held_fp = keys::compute_fingerprint_sha256(&held.public_key);
+        let held_public = keys::export_public_key(&held, KeyFormat::OpenSsh).unwrap();
+        for (claimed_fp, claimed_public, what) in [
+            (&other_fp, &held_public, "fingerprint"),
+            (&held_fp, &other_public, "public key"),
+        ] {
+            let item =
+                ssh_item_claiming(&client, "c1", "imported", &held, claimed_fp, claimed_public);
+            let err = match pull_new_key(&mut client, &item, &db, TEST_PW).await {
+                Ok(_) => panic!("a {what} claim that does not match was imported"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(&format!("claims a {what} that does not match its key")),
+                "{err}"
+            );
+            assert!(db.list_keys().unwrap().is_empty());
+        }
+        let honest = ssh_item_claiming(&client, "c1", "imported", &held, &held_fp, &held_public);
+        pull_new_key(&mut client, &honest, &db, TEST_PW)
+            .await
+            .unwrap();
+        let stored = db.list_keys().unwrap().remove(0);
+        assert_eq!(stored.fingerprint_sha256, held_fp);
+        assert_eq!(
+            parse_openssh_public_line(&stored.public_key).unwrap(),
+            held.public_key
+        );
+    }
+
+    /// Text from an item shown in the prompt carries no format or
+    /// text-direction characters, whitespace runs are one space, and each
+    /// value is at most 80 characters.
+    #[test]
+    fn rw_s6_pending_text_drops_disguising_characters_and_collapses_whitespace() {
+        assert_eq!(
+            pending_text(
+                "  a\u{202e}b\u{200b}c \u{00a0}\u{2003}\u{3000}d\u{2028}e\u{feff}\u{061c}f\t\n"
+            ),
+            "abc d ef"
+        );
+        assert_eq!(pending_text("x\u{2066}y\u{2069}z\u{200f}"), "xyz");
+        let long = pending_text(&"w".repeat(500));
+        assert_eq!(long.chars().count(), 80, "{long}");
+        assert!(long.ends_with('\u{2026}'), "{long}");
+        assert_eq!(pending_text("short"), "short");
+    }
+
+    /// Server names stored from Bitwarden are cleaned the same way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_s6_server_names_from_bitwarden_are_stored_clean() {
+        let db = test_db();
+        let mut client = offline_client();
+        let mut item = login_item(&client, "s1", None);
+        item.name = Some(enc(&client, "web\u{202e}\u{200b}  \u{00a0}prod\u{2066}"));
+        pull_new_server(&mut client, &item, &db, TEST_PW)
+            .await
+            .unwrap();
+        assert_eq!(db.list_servers().unwrap()[0].name, "web prod");
+        let sv = server_row(
+            &uuid::Uuid::new_v4().to_string(),
+            Some("s2"),
+            synced_at(T0, T0),
+        );
+        db.insert_server(&sv).unwrap();
+        let mut newer = login_item(&client, "s2", None);
+        newer.name = Some(enc(&client, "db\u{200f}\u{3000}\u{3000}main"));
+        newer.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        assert!(
+            pull_remote_server(&mut client, &newer, &sv, &db, TEST_PW, false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(db.get_server(&sv.id).unwrap().unwrap().name, "db main");
+    }
+
+    /// An overwrite replaces more than the address - the user name,
+    /// the saved password, the auth method and the linked key too - and the
+    /// prompt showed only host:port. Each entry now names what changes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_s6_a_server_overwrite_names_every_setting_the_pull_changes() {
+        let db = test_db();
+        let mut client = offline_client();
+        let mut sv = named_server("prod-db", Some("s1"), synced_at(T0, T0));
+        sv.host = "web.example.com".into();
+        sv.port = 2222;
+        sv.username = "ops".into();
+        sv.saved_password = Some(crate::crypto::vault::seal(TEST_PW, b"old-secret").unwrap());
+        db.insert_server(&sv).unwrap();
+        let mut item = login_item(&client, "s1", Some(enc(&client, "new-secret")));
+        item.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        item.name = Some(enc(&client, "prod-db"));
+        item.login.as_mut().unwrap().username = Some(enc(&client, "root"));
+        item.notes = Some(enc(
+            &client,
+            &serde_json::json!({ "v": 1, "sshspan": { "authMethod": "keyboard-interactive" } })
+                .to_string(),
+        ));
+        let summary = run_server_pass(&db, &mut client, &[&item], false)
+            .await
+            .summary(None);
+        assert_eq!(
+            summary["pendingServers"][0]["changes"],
+            serde_json::json!(["user", "password", "authMethod"]),
+            "{summary}"
+        );
+        // The same name, password, user and method: nothing but the revision
+        // moved.
+        let mut bump = login_item(&client, "s1", Some(enc(&client, "old-secret")));
+        bump.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        bump.name = Some(enc(&client, "prod-db"));
+        let summary = run_server_pass(&db, &mut client, &[&bump], false)
+            .await
+            .summary(None);
+        assert_eq!(
+            summary["pendingServers"][0]["changes"],
+            serde_json::json!([]),
+            "{summary}"
+        );
+    }
+
+    /// Entries that change something come first, ahead of the revision
+    /// bumps that change nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_s6_real_changes_are_listed_before_revision_bumps() {
+        let db = test_db();
+        let mut client = offline_client();
+        let mut items = Vec::new();
+        for n in 0..60 {
+            let mut sv = named_server(
+                &format!("bump-{n}"),
+                Some(&format!("s{n}")),
+                synced_at(T0, T0),
+            );
+            sv.host = "web.example.com".into();
+            sv.port = 2222;
+            sv.username = "ops".into();
+            db.insert_server(&sv).unwrap();
+            let mut item = login_item(&client, &format!("s{n}"), None);
+            item.revision_date = Some(rfc3339_ms(T0 + 5_000));
+            item.name = Some(enc(&client, &format!("bump-{n}")));
+            items.push(item);
+        }
+        let mut real = named_server("real", Some("s-real"), synced_at(T0, T0));
+        real.host = "web.example.com".into();
+        db.insert_server(&real).unwrap();
+        let mut moved = login_item(&client, "s-real", None);
+        moved.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        moved.login.as_mut().unwrap().uris = Some(vec![crate::bitwarden::LoginUri {
+            uri: Some(enc(&client, "ssh://evil.example.com:22")),
+        }]);
+        items.push(moved);
+        let refs: Vec<&SyncCipher> = items.iter().collect();
+        let summary = run_server_pass(&db, &mut client, &refs, false)
+            .await
+            .summary(None);
+        let pending = summary["pendingServers"].as_array().unwrap();
+        assert_eq!(pending.len(), 61);
+        assert!(summary.get("pendingTruncated").is_none(), "{summary}");
+        assert_eq!(pending[0]["name"], "real", "{}", pending[0]);
+        assert_eq!(pending[0]["host"], "evil.example.com");
+    }
+
+    // ── Crypto off the async workers, the change lists, category uploads ──
+
+    /// Server "web" (password auth for ops@web.example.com:2222), linked to
+    /// item "s1" and synced at T0, with `password` saved and filed in a host
+    /// category "Web".
+    fn synced_web_server(db: &Database, password: &[u8]) -> (ServerRecord, String) {
+        let web = db
+            .ensure_category_path_scoped("Web", "host")
+            .unwrap()
+            .unwrap();
+        let mut sv = named_server("web", Some("s1"), synced_at(T0, T0));
+        sv.host = "web.example.com".into();
+        sv.port = 2222;
+        sv.username = "ops".into();
+        sv.saved_password = Some(crate::crypto::vault::seal(TEST_PW, password).unwrap());
+        sv.category_id = Some(web.clone());
+        db.insert_server(&sv).unwrap();
+        (sv, web)
+    }
+
+    /// The SSHSpan notes of `sv`'s item, filing it in `category`.
+    fn web_notes(client: &BitwardenClient, sv: &ServerRecord, category: &str) -> String {
+        enc(
+            client,
+            &serde_json::json!({ "v": 1, "sshspan": {
+                "serverId": sv.id, "authMethod": "password", "keyFingerprint": null,
+                "category": { "id": category, "path": "Hosts-Web" },
+            }})
+            .to_string(),
+        )
+    }
+
+    /// Every seal and unseal of the sync runs on the blocking pool: the
+    /// server pass unseals a saved password to compare it, a push unseals
+    /// what it uploads, an approved pull seals what it stores. Argon2id - 64
+    /// MiB and most of a second each - ran on an async worker, twice per
+    /// pending server per approval round trip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_fix1_the_sync_seals_and_unseals_only_on_the_blocking_pool() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let db = test_db();
+        let mut client = offline_client();
+        let (sv, web) = synced_web_server(&db, b"old-pw");
+        let mut item = login_item(&client, "s1", Some(enc(&client, "new-pw")));
+        item.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        item.notes = Some(web_notes(&client, &sv, &web));
+        let mut fresh = named_server("fresh", None, never_synced());
+        fresh.saved_password = Some(crate::crypto::vault::seal(TEST_PW, b"fresh-pw").unwrap());
+        db.insert_server(&fresh).unwrap();
+        let before = crate::commands::POOL_CRYPTO_CALLS.load(SeqCst);
+        let shown = sync_passes(&db, &mut client, &[&item], None).await;
+        let token = shown["approvalToken"].as_str().unwrap().to_string();
+        let applied = sync_passes(&db, &mut client, &[&item], Some(&token)).await;
+        assert_eq!(applied["serversUpdatedLocal"], 1, "{applied}");
+        assert!(
+            crate::commands::POOL_CRYPTO_CALLS.load(SeqCst) >= before + 3,
+            "the compare, the push and the pull each ran a derivation"
+        );
+        let stored = db.get_server(&sv.id).unwrap().unwrap();
+        assert_eq!(
+            crate::crypto::vault::unseal(TEST_PW, stored.saved_password.as_deref().unwrap())
+                .unwrap(),
+            b"new-pw"
+        );
+    }
+
+    /// A remote rename or a move to another category is a real change: named
+    /// in `changes` ("name" first, "category" last) - it used to count as a
+    /// mere revision bump, which the cap could push out of the list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_fix1_a_server_overwrite_names_a_rename_and_a_new_category() {
+        let db = test_db();
+        let mut client = offline_client();
+        let (sv, _web) = synced_web_server(&db, b"pw");
+        let mut item = login_item(&client, "s1", Some(enc(&client, "pw")));
+        item.revision_date = Some(rfc3339_ms(T0 + 5_000));
+        item.name = Some(enc(&client, "web-renamed"));
+        item.notes = Some(enc(
+            &client,
+            &serde_json::json!({ "v": 1, "sshspan": {
+                "serverId": sv.id, "authMethod": "password",
+                "category": { "id": "remote-only", "path": "Hosts-Elsewhere" },
+            }})
+            .to_string(),
+        ));
+        let summary = run_server_pass(&db, &mut client, &[&item], false)
+            .await
+            .summary(None);
+        assert_eq!(
+            summary["pendingServers"][0]["changes"],
+            serde_json::json!(["name", "category"]),
+            "{summary}"
+        );
+        assert!(
+            db.list_categories()
+                .unwrap()
+                .iter()
+                .all(|c| c.name != "Elsewhere"),
+            "comparing creates no category"
+        );
+    }
+
+    /// A key moved to another category in Bitwarden is a real change too:
+    /// listed before the revision bumps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_fix1_a_key_moved_to_another_category_is_a_real_change() {
+        let db = test_db();
+        let mut client = offline_client();
+        let mut items = Vec::new();
+        for (n, categories) in [(0, None), (1, Some("Ops"))] {
+            let (mut item, fp) = ssh_item(&client, &format!("c{n}"), &format!("key-k{n}"));
+            item.revision_date = Some(rfc3339_ms(T0 + 5_000));
+            item.notes = categories.map(|path| {
+                enc(
+                    &client,
+                    &serde_json::json!({ "v": 1, "sshspan": {
+                        "categories": [{ "id": "remote-only", "path": path }],
+                    }})
+                    .to_string(),
+                )
+            });
+            let mut row = key_row(&format!("k{n}"), Some(&format!("c{n}")), synced_at(T0, T0));
+            row.fingerprint_sha256 = fp;
+            db.insert_key(&row).unwrap();
+            items.push(item);
+        }
+        let refs: Vec<&SyncCipher> = items.iter().collect();
+        let summary = run_key_pass(&db, &mut client, &refs, false)
+            .await
+            .summary(None);
+        let pending = summary["pendingKeys"].as_array().unwrap();
+        assert_eq!(pending.len(), 2, "{summary}");
+        assert_eq!(
+            pending[0]["name"], "key-k1",
+            "the re-categorised key comes first: {summary}"
+        );
+    }
+
+    /// A list longer than the prompt shows cannot be approved: the cap is
+    /// 500 entries per list, and past it no approval token is issued and an
+    /// approval applies nothing - it used to apply the entries nobody saw.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_fix1_an_approval_of_a_list_too_long_to_show_is_refused() {
+        let db = test_db();
+        let mut client = offline_client();
+        let items: Vec<SyncCipher> = (0..501)
+            .map(|n| login_item(&client, &format!("n{n}"), None))
+            .collect();
+        let refs: Vec<&SyncCipher> = items.iter().collect();
+        let shown = sync_passes(&db, &mut client, &refs, None).await;
+        assert_eq!(shown["pendingServers"].as_array().unwrap().len(), 500);
+        assert_eq!(shown["pendingTruncated"], true);
+        assert!(
+            shown.get("approvalToken").is_none(),
+            "no token for a list nobody can see whole"
+        );
+        let refused = shown["approvalRefused"].as_str().unwrap_or_default();
+        assert!(
+            refused.starts_with("Too many changes to review at once (501)"),
+            "{refused}"
+        );
+        let applied = sync_passes(&db, &mut client, &refs, Some("an-old-or-forged-token")).await;
+        assert_eq!(applied["serversPulled"], 0, "{applied}");
+        assert!(db.list_servers().unwrap().is_empty());
+    }
+
+    /// A category rename marks the servers under it for an upload of their
+    /// category - but never pushes their other fields over newer ones in
+    /// Bitwarden. Here the saved password was rotated in Bitwarden and the
+    /// category renamed in SSHSpan: "local wins" uploaded the OLD password
+    /// over the rotated one, with no question asked. Now the remote change
+    /// is listed for approval, the pull keeps the local category, and the
+    /// category goes up on the next run - with the rotated password.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rw_fix1_a_category_rename_never_pushes_a_password_older_than_the_remote() {
+        let db = test_db();
+        let mut client = offline_client();
+        let (sv, web) = synced_web_server(&db, b"old-pw");
+        let mut item = login_item(&client, "s1", Some(enc(&client, "rotated-pw")));
+        item.revision_date = Some(rfc3339_ms(T0 + 60_000));
+        item.notes = Some(web_notes(&client, &sv, &web));
+        db.rename_category(&web, "Production web").unwrap();
+
+        let shown = sync_passes(&db, &mut client, &[&item], None).await;
+        assert_eq!(
+            shown["errors"],
+            serde_json::json!([]),
+            "nothing uploaded: {shown}"
+        );
+        assert_eq!(shown["serversUpdatedRemote"], 0, "{shown}");
+        assert_eq!(shown["pendingServers"][0]["kind"], "overwrite", "{shown}");
+        assert_eq!(
+            shown["pendingServers"][0]["changes"],
+            serde_json::json!(["password"]),
+            "{shown}"
+        );
+
+        let token = shown["approvalToken"].as_str().unwrap().to_string();
+        let applied = sync_passes(&db, &mut client, &[&item], Some(&token)).await;
+        assert_eq!(applied["serversUpdatedLocal"], 1, "{applied}");
+        let stored = db.get_server(&sv.id).unwrap().unwrap();
+        assert_eq!(
+            crate::crypto::vault::unseal(TEST_PW, stored.saved_password.as_deref().unwrap())
+                .unwrap(),
+            b"rotated-pw",
+            "the rotated password is kept"
+        );
+        assert_eq!(stored.category_id.as_deref(), Some(web.as_str()));
+        assert_eq!(
+            db.get_category(&web).unwrap().unwrap().name,
+            "Production web",
+            "the local rename stays"
+        );
+
+        // Next run: the remote is in sync, the category still has to go up.
+        let next = sync_passes(&db, &mut client, &[&item], None).await;
+        assert!(next.get("pendingServers").is_none(), "{next}");
+        assert_eq!(
+            next["errors"][0]["server"], "web",
+            "the upload of the renamed category was attempted (offline here): {next}"
+        );
+    }
+
+    // ── Comparing many pending changes reads the categories once ────────────
+
+    /// Run `work` on a thread of its own and wait for it at most `deadline`:
+    /// a pass that reads the whole category table per lookup took minutes,
+    /// and a test has to say so well before that. The read count is the
+    /// precise check; the deadline only bounds a failure, so it is wide for
+    /// a loaded machine ([`PASS_DEADLINE`]).
+    fn within<T: Send + 'static>(
+        deadline: std::time::Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        finished
+            .recv_timeout(deadline)
+            .unwrap_or_else(|_| panic!("did not finish within {deadline:?}"))
+    }
+
+    /// How long [`within`] waits for one pass of hundreds of items: a few
+    /// seconds in a debug build, far longer on a machine saturated by other
+    /// builds and suites - and the 357 s the per-lookup reads took.
+    const PASS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// A multi-thread runtime for [`within`]'s thread (the database helpers
+    /// need one).
+    fn pass_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A top-level category of `scope` named `name`, with a fresh id - as
+    /// the UI makes them (another device has other ids for the same names).
+    fn new_category(db: &Database, name: &str, scope: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        db.insert_category(&crate::db::Category {
+            id: id.clone(),
+            name: name.into(),
+            parent_id: None,
+            scope: scope.into(),
+            color: None,
+            sort_index: 0,
+            created_at: at_ms(T0),
+            updated_at: at_ms(T0),
+        })
+        .unwrap();
+        id
+    }
+
+    /// 300 servers whose items changed in Bitwarden, each item filing its
+    /// server in one of 150 host categories by path under an id this vault
+    /// does not have (the normal case with more than one device). Comparing
+    /// read the whole category table for every category of every lookup:
+    /// 357 s in a debug build, holding the rotation lock all along. The
+    /// categories are now read once per pass, on the blocking pool.
+    #[test]
+    fn rw_fix2_pending_server_overwrites_read_the_categories_once() {
+        let db = test_db();
+        let client = offline_client();
+        let racks: Vec<String> = (0..150)
+            .map(|n| new_category(&db, &format!("rack-{n}"), "host"))
+            .collect();
+        let mut items = Vec::new();
+        for n in 0..300 {
+            let mut sv = named_server(
+                &format!("srv-{n}"),
+                Some(&format!("s{n}")),
+                synced_at(T0, T0),
+            );
+            sv.host = "web.example.com".into();
+            sv.port = 2222;
+            sv.username = "ops".into();
+            sv.category_id = Some(racks[n % 150].clone());
+            db.insert_server(&sv).unwrap();
+            let mut item = login_item(&client, &format!("s{n}"), None);
+            item.revision_date = Some(rfc3339_ms(T0 + 5_000));
+            item.name = Some(enc(&client, &format!("srv-{n}")));
+            item.notes = Some(enc(
+                &client,
+                &serde_json::json!({ "v": 1, "sshspan": {
+                    "serverId": sv.id,
+                    "category": { "id": format!("remote-{n}"),
+                                  "path": format!("Hosts-rack-{}", n % 150) },
+                }})
+                .to_string(),
+            ));
+            items.push(item);
+        }
+        let before = crate::db::test_support::category_reads(&db);
+        let pass_db = db.clone();
+        let summary = within(PASS_DEADLINE, move || {
+            pass_runtime().block_on(async move {
+                let mut client = offline_client();
+                let refs: Vec<&SyncCipher> = items.iter().collect();
+                run_server_pass(&pass_db, &mut client, &refs, false)
+                    .await
+                    .summary(None)
+            })
+        });
+        let reads = crate::db::test_support::category_reads(&db) - before;
+        assert!(reads <= 2, "{reads} reads of the categories for one pass");
+        let pending = summary["pendingServers"].as_array().unwrap();
+        assert_eq!(pending.len(), 300);
+        assert!(
+            pending
+                .iter()
+                .all(|e| e["changes"] == serde_json::json!([])),
+            "every item names the server's own category by its path: {}",
+            pending[0]
+        );
+    }
+
+    /// The same for keys: 100 keys whose items changed, each filed by path
+    /// in one of 50 key categories under an id this vault does not have.
+    #[test]
+    fn rw_fix2_pending_key_overwrites_read_the_categories_once() {
+        let db = test_db();
+        let client = offline_client();
+        let teams: Vec<String> = (0..50)
+            .map(|n| new_category(&db, &format!("team-{n}"), "key"))
+            .collect();
+        let mut items = Vec::new();
+        for n in 0..100 {
+            let (mut item, fp) = ssh_item(&client, &format!("c{n}"), &format!("key-k{n}"));
+            item.revision_date = Some(rfc3339_ms(T0 + 5_000));
+            item.notes = Some(enc(
+                &client,
+                &serde_json::json!({ "v": 1, "sshspan": { "categories": [
+                    { "id": format!("remote-{n}"), "path": format!("team-{}", n % 50) },
+                ]}})
+                .to_string(),
+            ));
+            let mut row = key_row(&format!("k{n}"), Some(&format!("c{n}")), synced_at(T0, T0));
+            row.fingerprint_sha256 = fp;
+            db.insert_key(&row).unwrap();
+            db.set_key_categories(&row.id, std::slice::from_ref(&teams[n % 50]))
+                .unwrap();
+            items.push(item);
+        }
+        let before = crate::db::test_support::category_reads(&db);
+        let pass_db = db.clone();
+        let summary = within(PASS_DEADLINE, move || {
+            pass_runtime().block_on(async move {
+                let mut client = offline_client();
+                let refs: Vec<&SyncCipher> = items.iter().collect();
+                run_key_pass(&pass_db, &mut client, &refs, false)
+                    .await
+                    .summary(None)
+            })
+        });
+        let reads = crate::db::test_support::category_reads(&db) - before;
+        assert!(reads <= 2, "{reads} reads of the categories for one pass");
+        assert_eq!(summary["pendingKeys"].as_array().unwrap().len(), 100);
     }
 }

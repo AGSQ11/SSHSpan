@@ -55,9 +55,18 @@ pub fn server_list(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// over a value sent with it), and a server saved as `publickey` never keeps
 /// one.
 ///
-/// Async, with the work on the blocking pool (RU6b P2-e): a saved password is
-/// sealed with Argon2id, which as a synchronous command ran on the main
-/// thread and froze the window on every save.
+/// A kept password stays with the account it was saved for: an edit that
+/// changes the host, the port, the user name or the auth method and brings no
+/// new password is refused with [`PASSWORD_FOR_NEW_ACCOUNT`] and writes
+/// nothing. It used to keep the password, so a compromised renderer could
+/// point a saved server at a host of its own and have Test or Connect send
+/// the password there - without a single dialog when that host was already
+/// pinned. Edits that leave the account alone (name, colour, category) keep
+/// it as before.
+///
+/// Async, with the work on the blocking pool: a saved password is sealed
+/// with Argon2id, which as a synchronous command ran on the main thread and
+/// froze the window on every save.
 #[tauri::command]
 pub async fn server_save(
     app: AppHandle,
@@ -100,6 +109,27 @@ pub async fn server_save(
     .await
 }
 
+/// What [`server_save`] refuses when an edit would send the saved password to
+/// another host, port, user name or auth method.
+const PASSWORD_FOR_NEW_ACCOUNT: &str = "Enter the password for the new server or account.";
+
+/// Whether `existing` - the server as stored, with the password it was saved
+/// with - is still the same account after an edit to `host`, `port`,
+/// `username` and `auth_method` (trimmed): the password goes to the same host
+/// and port, for the same user, the same way.
+fn same_account(
+    existing: &ServerRecord,
+    host: &str,
+    port: u16,
+    username: &str,
+    auth_method: &str,
+) -> bool {
+    existing.host.trim() == host
+        && existing.port == port
+        && existing.username.trim() == username
+        && existing.auth_method == auth_method
+}
+
 /// The IPC values as one request, so tests exercise the same save operation
 /// against an isolated database and password store instead of needing an app.
 struct SaveServerRequest {
@@ -125,7 +155,8 @@ fn server_save_in(
 ) -> CmdResult<serde_json::Value> {
     // Seals the saved password and rewrites the whole row: take the guard
     // BEFORE reading the master password or any sealed row, and hold it
-    // through the write (RU1 C1).
+    // through the write, so a master-password change cannot commit in
+    // between.
     let _rotation = rotation.try_shared()?;
     let vault_pw = vault.get().unwrap_or_default();
     let SaveServerRequest {
@@ -210,29 +241,44 @@ fn server_save_in(
 
     let server = match &id {
         Some(existing_id) => {
-            let mut existing = db
-                .get_server(existing_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| CmdError("Server not found.".into()))?;
-            existing.name = trimmed_name;
-            existing.host = trimmed_host;
-            existing.port = port;
-            existing.username = trimmed_user;
-            existing.auth_method = method;
-            existing.key_id = key_clean;
-            existing.pem_path = pem_clean;
-            if drop_password {
-                existing.saved_password = None;
-            } else if replacement.is_some() {
-                existing.saved_password = replacement;
+            // Read, checked and written in ONE transaction: a save racing
+            // another writer used to check the row it had read before that
+            // writer committed, then write over it.
+            let edited = db.modify_server(existing_id, |existing| {
+                // The stored password would be kept: only for its own
+                // account. (Every writer stores a password together with the
+                // account it belongs to, so the row read here pairs them
+                // correctly, and the write keeps that pairing.)
+                let keeps_password =
+                    !drop_password && replacement.is_none() && existing.saved_password.is_some();
+                if keeps_password
+                    && !same_account(existing, &trimmed_host, port, &trimmed_user, &method)
+                {
+                    return Err(CmdError(PASSWORD_FOR_NEW_ACCOUNT.into()).into());
+                }
+                existing.name = trimmed_name;
+                existing.host = trimmed_host;
+                existing.port = port;
+                existing.username = trimmed_user;
+                existing.auth_method = method;
+                existing.key_id = key_clean;
+                existing.pem_path = pem_clean;
+                if drop_password {
+                    existing.saved_password = None;
+                } else if replacement.is_some() {
+                    existing.saved_password = replacement;
+                }
+                existing.category_id = category_id
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty());
+                existing.color = color;
+                existing.updated_at = now;
+                Ok(())
+            });
+            match edited.map_err(CmdError::from)? {
+                Some((server, ())) => server,
+                None => return Err(CmdError("Server not found.".into())),
             }
-            existing.category_id = category_id
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty());
-            existing.color = color;
-            existing.updated_at = now;
-            db.update_server(&existing).map_err(|e| e.to_string())?;
-            existing
         }
         None => {
             let rec = ServerRecord {
@@ -401,7 +447,7 @@ mod ru4_tests {
     }
 
     #[test]
-    fn ru4_password_replacement_is_sealed_and_keyboard_interactive_keeps_it() {
+    fn ru4_password_replacement_is_sealed_and_keyboard_interactive_needs_it_again() {
         let f = Fixture::new();
         let id = saved_id(&f);
         let before = f.record(&id).saved_password;
@@ -419,12 +465,26 @@ mod ru4_tests {
             crate::crypto::vault::unseal("ru4-fixture-master", &after).unwrap(),
             "é€😀 new fixture password".as_bytes()
         );
-        f.save(request(Some(&id), None, None, "keyboard-interactive"))
-            .unwrap();
+        // Another auth method is another account for the saved password: the
+        // switch alone is refused and changes nothing; with the password
+        // entered again it is saved.
+        let err = f
+            .save(request(Some(&id), None, None, "keyboard-interactive"))
+            .unwrap_err();
+        assert_eq!(err.0, PASSWORD_FOR_NEW_ACCOUNT);
+        assert_eq!(f.record(&id).auth_method, "password");
         assert_eq!(
             f.record(&id).saved_password.as_deref(),
             Some(after.as_str())
         );
+        f.save(request(
+            Some(&id),
+            Some("é€😀 new fixture password"),
+            None,
+            "keyboard-interactive",
+        ))
+        .unwrap();
+        assert_eq!(f.record(&id).auth_method, "keyboard-interactive");
     }
 
     #[test]
@@ -500,5 +560,302 @@ mod ru4_tests {
             assert!(f.save(bad).is_err(), "{field}");
         }
         assert!(f.db.list_servers().unwrap().is_empty());
+    }
+}
+
+/// A saved password belongs to the account it was saved for: an edit could
+/// point a server at another host, port or user name - or another auth
+/// method - and keep the password, and the next Test or Connect sent it
+/// there.
+#[cfg(test)]
+mod saved_password_binding_tests {
+    use super::*;
+    use crate::commands::{VaultPasswordStore, VaultRotationLock};
+
+    const MASTER: &str = "rw-fixture-master";
+
+    struct Fixture {
+        db: db::Database,
+        vault: VaultPasswordStore,
+        rotation: VaultRotationLock,
+        path: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("sshspan-rw-server-{}.db", Uuid::new_v4()));
+            let db = db::Database::open_at(path.clone()).unwrap();
+            let vault = VaultPasswordStore::new();
+            vault.set(MASTER.into());
+            Self {
+                db,
+                vault,
+                rotation: VaultRotationLock::new(),
+                path,
+            }
+        }
+
+        fn save(&self, request: SaveServerRequest) -> CmdResult<serde_json::Value> {
+            server_save_in(&self.db, &self.vault, &self.rotation, request)
+        }
+
+        fn record(&self, id: &str) -> ServerRecord {
+            self.db.get_server(id).unwrap().unwrap()
+        }
+
+        fn host_category(&self) -> String {
+            let now = chrono::Utc::now();
+            let category = db::Category {
+                id: Uuid::new_v4().to_string(),
+                name: "hosts".into(),
+                parent_id: None,
+                scope: "host".into(),
+                color: None,
+                sort_index: 0,
+                created_at: now,
+                updated_at: now,
+            };
+            self.db.insert_category(&category).unwrap();
+            category.id
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// `prod-db` as saved: password auth for `dba@prod-db.example:22`.
+    fn prod(id: Option<&str>, password: Option<&str>) -> SaveServerRequest {
+        SaveServerRequest {
+            id: id.map(str::to_string),
+            name: "prod-db".into(),
+            host: "prod-db.example".into(),
+            port: Some(22),
+            username: "dba".into(),
+            auth_method: Some("password".into()),
+            key_id: None,
+            pem_path: None,
+            saved_password: password.map(|p| zeroize::Zeroizing::new(p.to_string())),
+            clear_saved_password: None,
+            category_id: None,
+            color: None,
+        }
+    }
+
+    fn saved_prod(f: &Fixture) -> String {
+        f.save(prod(None, Some("the-prod-password"))).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn unsealed(sealed: &str) -> String {
+        String::from_utf8(crate::crypto::vault::unseal(MASTER, sealed).unwrap()).unwrap()
+    }
+
+    /// Every way to point the saved password elsewhere, each with "keep the
+    /// password" spelled both ways.
+    fn retargets(id: &str) -> Vec<(&'static str, SaveServerRequest)> {
+        let mut out = Vec::new();
+        for keep in [None, Some("")] {
+            let mut host = prod(Some(id), keep);
+            host.host = "attacker.example".into();
+            out.push(("host", host));
+            let mut port = prod(Some(id), keep);
+            port.port = Some(2222);
+            out.push(("port", port));
+            let mut user = prod(Some(id), keep);
+            user.username = "root".into();
+            out.push(("username", user));
+            let mut method = prod(Some(id), keep);
+            method.auth_method = Some("keyboard-interactive".into());
+            out.push(("auth method", method));
+        }
+        out
+    }
+
+    #[test]
+    fn rw_s1_a_retarget_without_a_new_password_is_refused_and_changes_nothing() {
+        let f = Fixture::new();
+        let id = saved_prod(&f);
+        let before = f.record(&id);
+        for (what, request) in retargets(&id) {
+            let err = f
+                .save(request)
+                .expect_err(&format!("a {what} change must not keep the password"));
+            assert_eq!(
+                err.0, "Enter the password for the new server or account.",
+                "{what}"
+            );
+            let after = f.record(&id);
+            assert_eq!(after.host, before.host, "{what}");
+            assert_eq!(after.port, before.port, "{what}");
+            assert_eq!(after.username, before.username, "{what}");
+            assert_eq!(after.auth_method, before.auth_method, "{what}");
+            assert_eq!(after.saved_password, before.saved_password, "{what}");
+            assert_eq!(
+                after.updated_at, before.updated_at,
+                "{what}: nothing written"
+            );
+        }
+    }
+
+    #[test]
+    fn rw_s1_a_retarget_with_a_new_password_is_saved_with_that_password() {
+        let f = Fixture::new();
+        let id = saved_prod(&f);
+        let mut moved = prod(Some(&id), Some("the-new-password"));
+        moved.host = "new-db.example".into();
+        moved.username = "admin".into();
+        f.save(moved).unwrap();
+        let after = f.record(&id);
+        assert_eq!(after.host, "new-db.example");
+        assert_eq!(after.username, "admin");
+        assert_eq!(
+            unsealed(after.saved_password.as_deref().unwrap()),
+            "the-new-password"
+        );
+        // A retarget that drops the password is fine too: nothing is kept.
+        let mut dropped = prod(Some(&id), None);
+        dropped.host = "third.example".into();
+        dropped.clear_saved_password = Some(true);
+        f.save(dropped).unwrap();
+        let after = f.record(&id);
+        assert_eq!(after.host, "third.example");
+        assert_eq!(after.saved_password, None);
+    }
+
+    #[test]
+    fn rw_s1_edits_that_keep_the_account_keep_the_password() {
+        let f = Fixture::new();
+        let id = saved_prod(&f);
+        let before = f.record(&id).saved_password;
+        let category = f.host_category();
+        let mut edit = prod(Some(&id), None);
+        edit.name = "prod-db (primary)".into();
+        edit.color = Some("red".into());
+        edit.category_id = Some(category.clone());
+        // Surrounding spaces are not a different host or user.
+        edit.host = "  prod-db.example ".into();
+        edit.username = " dba".into();
+        f.save(edit).unwrap();
+        let after = f.record(&id);
+        assert_eq!(after.name, "prod-db (primary)");
+        assert_eq!(after.color.as_deref(), Some("red"));
+        assert_eq!(after.category_id.as_deref(), Some(category.as_str()));
+        assert_eq!(
+            after.saved_password, before,
+            "the same sealed password, not resealed"
+        );
+    }
+
+    /// Resolve `id` for a connection the way Connect and Test do.
+    fn resolved(
+        f: &Fixture,
+        id: &str,
+        override_username: Option<&str>,
+    ) -> crate::ssh_client::ResolvedConnection {
+        crate::commands::terminal::resolve_connection(
+            &f.db,
+            &f.vault,
+            &f.rotation,
+            crate::commands::terminal::ConnectRequest {
+                server_id: id.to_string(),
+                override_username: override_username.map(str::to_string),
+                override_key_id: None,
+                prompt_password: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rw_s1_a_retargeted_server_never_spends_the_old_password() {
+        let f = Fixture::new();
+        let id = saved_prod(&f);
+        // Whatever an edit does, the old password is only ever resolved for
+        // the account it was saved for.
+        for (what, request) in retargets(&id) {
+            let _ = f.save(request);
+            let c = resolved(&f, &id, None);
+            let same_account = c.server.host == "prod-db.example"
+                && c.server.port == 22
+                && c.username == "dba"
+                && c.auth_method == "password";
+            let spends_old = c.password.as_deref().map(String::as_str) == Some("the-prod-password");
+            assert!(
+                same_account || !spends_old,
+                "after a {what} edit the old password would go to {}@{}:{} ({})",
+                c.username,
+                c.server.host,
+                c.server.port,
+                c.auth_method
+            );
+        }
+        let connection = resolved(&f, &id, None);
+        assert_eq!(connection.server.host, "prod-db.example");
+        assert_eq!(
+            connection.password.as_deref().map(String::as_str),
+            Some("the-prod-password")
+        );
+        // Connect may not swap the user name under the saved password either:
+        // only a password typed at the prompt goes to another account.
+        let other_user = resolved(&f, &id, Some("root"));
+        assert_eq!(other_user.username, "root");
+        assert!(
+            other_user.password.is_none(),
+            "the saved password is not sent for another user"
+        );
+        assert_eq!(
+            resolved(&f, &id, Some("dba"))
+                .password
+                .as_deref()
+                .map(String::as_str),
+            Some("the-prod-password"),
+            "the saved user name, spelled out, is the same account"
+        );
+        // Retargeted with a new password: only that one is ever used.
+        let mut moved = prod(Some(&id), Some("the-new-password"));
+        moved.host = "new-db.example".into();
+        f.save(moved).unwrap();
+        let connection = resolved(&f, &id, None);
+        assert_eq!(connection.server.host, "new-db.example");
+        assert_eq!(
+            connection.password.as_deref().map(String::as_str),
+            Some("the-new-password")
+        );
+    }
+
+    /// The save reads the row, checks it and writes it in ONE transaction. A
+    /// save racing another writer used to check the row as it was before that
+    /// writer committed, then write over it: here a rename, checked against
+    /// `prod-db.example`, rewrote the row after another save had moved it to
+    /// `new-db.example` - with the old host and the old password.
+    #[test]
+    fn rw_fix1_a_save_checks_the_row_it_writes() {
+        let f = Fixture::new();
+        let id = saved_prod(&f);
+        let sealed_new = crate::crypto::vault::seal(MASTER, b"the-new-db-password").unwrap();
+        let holder = crate::db::test_support::hold_write_bound(
+            &f.db,
+            vec![(
+                "UPDATE servers SET host = ?, saved_password = ? WHERE id = ?".into(),
+                vec!["new-db.example".into(), sealed_new.clone(), id.clone()],
+            )],
+            400,
+        );
+        let mut rename = prod(Some(&id), None);
+        rename.name = "renamed".into();
+        let saved = f.save(rename);
+        holder.join().unwrap();
+        let err = saved.expect_err("the row is another account by the time it is written");
+        assert_eq!(err.0, PASSWORD_FOR_NEW_ACCOUNT);
+        let after = f.record(&id);
+        assert_eq!(after.host, "new-db.example", "the other save's move stands");
+        assert_eq!(after.saved_password.as_deref(), Some(sealed_new.as_str()));
+        assert_eq!(after.name, "prod-db");
     }
 }

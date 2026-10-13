@@ -652,7 +652,7 @@ fn is_saved_endpoint(saved: &crate::db::BitwardenConfig, server_url: &str, email
 /// the server compared and returned is the normalized one. The saved password
 /// is unsealed (`unseal_saved`) only when no password was typed AND the server
 /// and account are the saved ones: a compromised renderer must not be able to
-/// send the saved master password's hash to a server of its choosing (F1).
+/// send the saved master password's hash to a server of its choosing.
 pub fn resolve_test_target(
     saved: &crate::db::BitwardenConfig,
     server_url: Option<String>,
@@ -699,7 +699,7 @@ pub fn resolve_test_target(
 }
 
 /// Whether saving these settings without a new password may keep the stored
-/// one: only for the same server and account (F1). A changed URL or email
+/// one: only for the same server and account. A changed URL or email
 /// with no new password is refused - the old password is never kept for a
 /// different endpoint, and dropping it silently would surprise the user at
 /// the next sync. `server_url` is normalized.
@@ -786,7 +786,7 @@ pub fn apply_bitwarden_save(
 
 /// Save the sync settings: `prepare` does the slow part (the URL check, the
 /// seal) and returns what to write; the write is then ONE transaction that
-/// re-reads the settings and checks the save against them (F1-b) - nothing
+/// re-reads the settings and checks the save against them - nothing
 /// read before the slow part is written back.
 pub async fn save_bitwarden_settings(
     db: &crate::db::Database,
@@ -795,29 +795,6 @@ pub async fn save_bitwarden_settings(
     let save = prepare.await?;
     db.update_bitwarden_config(|current| apply_bitwarden_save(current, save))
         .map_err(|e| e.to_string())
-}
-
-/// Best-effort anonymous server probe used by "Test connection".
-pub async fn probe_server_version(base_url: &str) -> Option<String> {
-    // Same no-redirect policy as the main client (see BitwardenClient::new),
-    // and the same guarded DNS resolver so the rebinding protection applies
-    // to this client as well.
-    let client = HttpClient::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
-        .dns_resolver(ssrf::guarded_resolver())
-        .use_rustls_tls()
-        .build()
-        .ok()?;
-    let url = format!("{}/api/config", base_url);
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data: serde_json::Value = read_body_capped_json(resp).await.ok()?;
-    data.get("version")
-        .and_then(|v| v.as_str())
-        .map(String::from)
 }
 
 // ─── Response hardening helpers ─────────────────────────────────────────
@@ -871,7 +848,7 @@ const MAX_ERROR_DETAIL_CHARS: usize = 300;
 /// A vault server's error body, as it goes into an error message: cut to
 /// [`MAX_ERROR_DETAIL_CHARS`] characters (on a character boundary) with an
 /// ellipsis. The whole body - up to the 50 MiB read cap - used to land in the
-/// error, the sync result's `errors` and the stored last result (F7).
+/// error, the sync result's `errors` and the stored last result.
 fn error_detail(text: &str) -> String {
     let mut chars = text.chars();
     let head: String = chars.by_ref().take(MAX_ERROR_DETAIL_CHARS).collect();
@@ -1141,7 +1118,7 @@ mod tests {
     #[test]
     fn saved_password_is_only_unsealed_for_the_saved_server_and_account() {
         use zeroize::Zeroizing;
-        // F1: a compromised renderer typed its own server (or account) and let
+        // A compromised renderer typed its own server (or account) and let
         // the SAVED master password log in there.
         let saved = saved_config();
         for (url, email) in [
@@ -1185,7 +1162,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_password_less_save_keeps_a_password_stored_meanwhile() {
-        // F1-b (c): the save wrote back the sealed password it had read before
+        // The save wrote back the sealed password it had read before
         // its URL check, over the one another save had just stored.
         let db = fix2_db();
         let other = db.clone();
@@ -1215,7 +1192,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_endpoint_check_uses_the_settings_as_stored_at_write_time() {
-        // F1-b: another save moved the settings to a new server (with its own
+        // Another save moved the settings to a new server (with its own
         // password) while this password-less save of the OLD server ran: the
         // new password must not be kept for the old server.
         let db = fix2_db();
@@ -1250,8 +1227,8 @@ mod tests {
 
     #[test]
     fn a_login_refusal_quotes_at_most_a_short_server_text() {
-        // F7 sibling: token_request put the server's error_description into
-        // the error uncapped.
+        // token_request used to put the server's error_description into the
+        // error uncapped.
         let data = serde_json::json!({ "error_description": "x".repeat(100_000) });
         let message = login_failure_message(reqwest::StatusCode::BAD_REQUEST, &data);
         assert!(message.starts_with("Vault login failed: "), "{message}");
@@ -1266,8 +1243,8 @@ mod tests {
 
     #[test]
     fn a_changed_server_or_account_needs_its_own_password() {
-        // F1, save side: a changed URL or email with no new password must not
-        // keep the old sealed password for the new endpoint.
+        // On save, a changed URL or email with no new password must not keep
+        // the old sealed password for the new endpoint.
         let saved = saved_config();
         assert!(check_save_keeps_password(
             &saved,
@@ -1300,7 +1277,7 @@ mod tests {
 
     #[test]
     fn vault_error_details_are_cut_short() {
-        // F7: a whole response body (up to 50 MiB) went into errors and the
+        // A whole response body (up to 50 MiB) went into errors and the
         // stored last result.
         let long = "é".repeat(5_000);
         let detail = error_detail(&long);

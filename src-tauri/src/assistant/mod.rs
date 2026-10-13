@@ -95,7 +95,7 @@ const MAX_TYPED_CHARS: usize = 4096;
 
 /// Characters that are invisible, change the text direction or change how
 /// the text around them is drawn, so a suggestion or Approve card could show
-/// the user something other than what gets typed or run (item 10): every
+/// the user something other than what gets typed or run: every
 /// Unicode general-category Cf (format) code point - bidi embeddings,
 /// overrides, isolates and marks, zero-width spaces and joiners, invisible
 /// operators, the BOM, prepended number signs, interlinear annotation,
@@ -136,7 +136,11 @@ const DISGUISING_CHARS: [(char, char); 26] = [
     ('\u{E0000}', '\u{E0FFF}'), // tags, variation selectors supplement
 ];
 
-fn is_disguising(c: char) -> bool {
+/// Whether `c` is invisible or changes how the text around it reads (every
+/// format character, the default-ignorables, the line and paragraph
+/// separators - [`DISGUISING_CHARS`]). Also used to clean text from a
+/// Bitwarden item before SSHSpan shows or stores it.
+pub(crate) fn is_disguising(c: char) -> bool {
     DISGUISING_CHARS
         .binary_search_by(|&(first, last)| {
             if last < c {
@@ -221,7 +225,7 @@ fn forbidden_terminal_char(text: &str) -> Option<ForbiddenChar> {
 /// Whether the assistant may run `command` at `level` (`assistant_exec`), and
 /// if not, the refusal the model and the user see: Execute or higher, and -
 /// like typing - no control character other than TAB and nothing invisible
-/// or text-direction (item 17). The Approve card has to show exactly what
+/// or text-direction. The Approve card has to show exactly what
 /// runs: a right-to-left override or a zero-width character displayed the
 /// command reordered or shortened (Trojan Source) while the shell ran it as
 /// written, and an embedded line break ran a second line. Nothing is sent on
@@ -234,7 +238,7 @@ fn check_exec_command(level: &str, command: &str) -> Result<(), String> {
     }
     // TAB is fine to TYPE (completion is wanted there), but in a command it
     // makes readline complete before Enter, so what runs could differ from
-    // what was approved (F6).
+    // what was approved.
     if command.contains('\t') {
         return Err(
             "This command contains a TAB - the shell would complete on it before running, so what runs could differ from what was approved. Nothing was run."
@@ -301,8 +305,10 @@ fn without_credentials(url: &str) -> String {
 }
 
 /// Save the provider settings. Async, with the work on the blocking pool
-/// (RU6b item 8): a new API key is sealed with Argon2id, and as a
-/// synchronous command that ran on the main thread and froze the window.
+/// (A5-12): a new API key is sealed with Argon2id, and as a synchronous
+/// command that ran on the main thread and froze the window. A change that
+/// would send the stored key to another provider address is asked about in a
+/// native dialog first ([`save_config_confirmed`]).
 #[tauri::command]
 pub async fn assistant_save_config(
     app: AppHandle,
@@ -315,30 +321,73 @@ pub async fn assistant_save_config(
     // privacy does not silently destroy it), which otherwise made a stored
     // key impossible to remove.
     clear_api_key: Option<bool>,
-    // The user's confirmation that the stored key may follow a changed
-    // provider or base-URL origin (see `check_key_reuse`).
+    // Accepted from renderers that still send it - and IGNORED: the stored
+    // key moves to a new address only when the user allows it in the native
+    // dialog. A renderer flag is not the user's answer.
     reuse_key_at_new_origin: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     crate::commands::run_blocking(move || {
-        // Seals the API key with the master password: not while that is
-        // being changed (C1).
-        let _rotation = crate::commands::rotation_shared(&app)?;
-        save_config(
+        save_config_from_ipc(
             &app.state::<crate::AppState>().db,
             app.state::<crate::commands::VaultPasswordStore>().inner(),
-            ConfigArgs {
+            app.state::<crate::commands::VaultRotationLock>().inner(),
+            app.state::<crate::commands::CredentialQuestions>().inner(),
+            IpcConfig {
                 provider,
                 base_url,
                 model,
                 // Wrapped at once: the plaintext key is wiped when the save
                 // is done, not left as freed heap.
                 api_key: api_key.map(Zeroizing::new),
-                clear_api_key: clear_api_key.unwrap_or(false),
-                reuse_key_at_new_origin: reuse_key_at_new_origin.unwrap_or(false),
+                clear_api_key,
+                reuse_key_at_new_origin,
             },
+            &|prompt| crate::commands::ask_native_confirmation(&app, prompt),
         )
     })
     .await
+}
+
+/// The arguments of [`assistant_save_config`] as the renderer sent them.
+struct IpcConfig {
+    provider: String,
+    base_url: Option<String>,
+    model: String,
+    api_key: Option<Zeroizing<String>>,
+    clear_api_key: Option<bool>,
+    reuse_key_at_new_origin: Option<bool>,
+}
+
+/// [`assistant_save_config`] without the `AppHandle`: the renderer's
+/// arguments as they arrive, `reuseKeyAtNewOrigin` included - which is read
+/// by nothing. A move of the stored key is asked about in the native dialog
+/// ([`save_config_confirmed`]) whatever the flag says.
+fn save_config_from_ipc(
+    db: &crate::db::Database,
+    vault: &crate::commands::VaultPasswordStore,
+    rotation: &crate::commands::VaultRotationLock,
+    questions: &crate::commands::CredentialQuestions,
+    ipc: IpcConfig,
+    ask: crate::commands::ConfirmCredential<'_>,
+) -> CmdResult<serde_json::Value> {
+    let IpcConfig {
+        provider,
+        base_url,
+        model,
+        api_key,
+        clear_api_key,
+        reuse_key_at_new_origin,
+    } = ipc;
+    // Not the user's answer: a compromised renderer can set it.
+    let _ = reuse_key_at_new_origin;
+    let args = ConfigArgs {
+        provider,
+        base_url,
+        model,
+        api_key,
+        clear_api_key: clear_api_key.unwrap_or(false),
+    };
+    save_config_confirmed(db, vault, rotation, questions, args, ask)
 }
 
 /// The arguments of [`assistant_save_config`].
@@ -348,37 +397,99 @@ struct ConfigArgs {
     model: String,
     api_key: Option<Zeroizing<String>>,
     clear_api_key: bool,
-    reuse_key_at_new_origin: bool,
 }
 
-/// [`assistant_save_config`] without the `AppHandle`. The caller holds the
-/// rotation guard. The stored settings are read, checked
-/// ([`check_key_reuse`]) and written in one transaction
-/// ([`crate::db::Database::update_assistant_config`]); a new key is sealed
-/// before it, so Argon2id never runs while the write lock is held. A failed
-/// audit row after the commit is a `warning`, not an error.
-fn save_config(
+/// What a save refuses when the user did not allow the stored key to go to
+/// the new address.
+const KEY_MOVE_DECLINED: &str = "Enter the API key for the new address.";
+
+/// What a save refuses when the stored settings changed while the user was
+/// deciding: the answer was about another move.
+const KEY_MOVE_CHANGED: &str =
+    "The assistant settings changed while you were deciding - save them again.";
+
+/// What a save refuses when "Allow" came within a second of the question
+/// opening ([`crate::commands::CREDENTIAL_MIN_ANSWER_DELAY`]).
+const KEY_MOVE_TOO_QUICK: &str = "The question about sending the stored API key was answered within a second of opening - too fast to be a decision. Save again to be asked again.";
+
+/// [`assistant_save_config`] without the `AppHandle`, `ask` answering the
+/// native question (blocking: the blocking pool only). A save that would send
+/// the stored key to another provider address with no new key typed is asked
+/// about first: "Send the stored API key to <host>?" - declined (or allowed
+/// within a second of opening), nothing is saved ([`KEY_MOVE_DECLINED`],
+/// [`KEY_MOVE_TOO_QUICK`]); allowed, exactly that move is saved. The
+/// renderer's `reuseKeyAtNewOrigin` used to decide it (A4-13), and a
+/// compromised renderer could set it. One credential question at a time
+/// (`questions`): while another is open the save is refused
+/// ([`crate::commands::CREDENTIAL_QUESTION_OPEN`]), and the turn lasts until
+/// the save is written. The rotation guard is taken for the look at the
+/// stored settings and again for the save - not while the user decides.
+fn save_config_confirmed(
     db: &crate::db::Database,
     vault: &crate::commands::VaultPasswordStore,
+    rotation: &crate::commands::VaultRotationLock,
+    questions: &crate::commands::CredentialQuestions,
     args: ConfigArgs,
+    ask: crate::commands::ConfirmCredential<'_>,
 ) -> CmdResult<serde_json::Value> {
-    let ConfigArgs {
-        provider,
-        base_url,
-        model,
-        api_key,
-        clear_api_key,
-        reuse_key_at_new_origin,
-    } = args;
-    let pw = vault.get().unwrap_or_default();
-    if pw.is_empty() {
-        return Err("Vault is locked.".into());
+    use crate::commands::CredentialAnswer;
+    let key_move = {
+        let _rotation = rotation.try_shared()?;
+        if !vault.is_set() {
+            return Err("Vault is locked.".into());
+        }
+        let stored = db.load_assistant_config().map_err(|e| e.to_string())?;
+        pending_key_move(&stored, &args)?
+    };
+    let Some(key_move) = key_move else {
+        // Seals the API key with the master password: not while that is
+        // being changed.
+        let _rotation = rotation.try_shared()?;
+        return save_config(db, vault, args, None);
+    };
+    let Some(_turn) = questions.begin() else {
+        return Err(crate::commands::CREDENTIAL_QUESTION_OPEN.into());
+    };
+    let answer = ask(&key_move.prompt());
+    if answer != CredentialAnswer::Allowed {
+        let quick = answer == CredentialAnswer::TooQuick;
+        crate::commands::audit_or_log(
+            db,
+            "assistant.key_move_declined",
+            None,
+            &format!(
+                "to {}{}",
+                key_move.to_host,
+                if quick { " answered=too-quickly" } else { "" }
+            ),
+        );
+        return Err(if quick {
+            KEY_MOVE_TOO_QUICK
+        } else {
+            KEY_MOVE_DECLINED
+        }
+        .into());
     }
-    let provider = provider.trim().to_string();
+    let _rotation = rotation.try_shared()?;
+    save_config(db, vault, args, Some(&key_move))
+}
+
+/// The provider, base URL and model a save writes, checked.
+struct CheckedConfig {
+    provider: String,
+    /// `None`: the provider's default address.
+    base_url: Option<String>,
+    model: String,
+}
+
+/// Check what a save writes: a known provider, a model, a base URL that
+/// today's rules accept ([`normalize_base_url`]).
+fn check_config_fields(args: &ConfigArgs) -> CmdResult<CheckedConfig> {
+    let provider = args.provider.trim().to_string();
     if provider != "openai" && provider != "anthropic" {
         return Err("Provider must be 'openai' or 'anthropic'.".into());
     }
-    let model = model.trim().to_string();
+    let model = args.model.trim().to_string();
     if model.is_empty() {
         return Err("Model is required.".into());
     }
@@ -388,11 +499,66 @@ fn save_config(
     // LM Studio) are a first-class use case for this feature - but plain
     // http only to local addresses (normalize_base_url), since the key
     // travels with every request.
-    let base_url = base_url
+    let base_url = args
+        .base_url
+        .as_deref()
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
         .map(|u| normalize_base_url(&u))
         .transpose()?;
+    Ok(CheckedConfig {
+        provider,
+        base_url,
+        model,
+    })
+}
+
+/// Whether the save `args` - checked here first - would send the `stored`
+/// API key to another provider address: no new key typed, the key not being
+/// removed, and the provider or the key's origin changing ([`key_move`]).
+fn pending_key_move(
+    stored: &crate::db::AssistantConfig,
+    args: &ConfigArgs,
+) -> CmdResult<Option<KeyMove>> {
+    let checked = check_config_fields(args)?;
+    let new_key = args.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
+    if stored.api_key.is_none() || new_key || args.clear_api_key {
+        return Ok(None);
+    }
+    Ok(key_move(
+        stored,
+        &checked.provider,
+        checked.base_url.as_deref(),
+    ))
+}
+
+/// [`assistant_save_config`] without the `AppHandle`. The caller holds the
+/// rotation guard. The stored settings are read, checked
+/// ([`check_key_reuse`]: a move of the stored key only as `allowed`) and
+/// written in one transaction
+/// ([`crate::db::Database::update_assistant_config`]); a new key is sealed
+/// before it, so Argon2id never runs while the write lock is held. A failed
+/// audit row after the commit is a `warning`, not an error.
+fn save_config(
+    db: &crate::db::Database,
+    vault: &crate::commands::VaultPasswordStore,
+    args: ConfigArgs,
+    allowed: Option<&KeyMove>,
+) -> CmdResult<serde_json::Value> {
+    let pw = vault.get().unwrap_or_default();
+    if pw.is_empty() {
+        return Err("Vault is locked.".into());
+    }
+    let CheckedConfig {
+        provider,
+        base_url,
+        model,
+    } = check_config_fields(&args)?;
+    let ConfigArgs {
+        api_key,
+        clear_api_key,
+        ..
+    } = args;
     let sealed_key = api_key
         .as_ref()
         .filter(|key| !key.trim().is_empty())
@@ -408,7 +574,7 @@ fn save_config(
                 base_url.as_deref(),
                 sealed_key.is_some(),
                 clear_api_key,
-                reuse_key_at_new_origin,
+                allowed,
             )
             .map_err(CmdError)?;
             config.provider = Some(provider);
@@ -423,17 +589,19 @@ fn save_config(
             Ok(key_moved)
         })
         .map_err(CmdError::from)?;
-    let detail = if key_moved {
-        "saved (stored API key reused at a new provider or base URL, as confirmed)"
-    } else {
-        "saved"
+    let detail = match allowed.filter(|_| key_moved) {
+        Some(key_move) => format!(
+            "saved (stored API key moved to {}, allowed in SSHSpan's confirmation dialog)",
+            key_move.to_host
+        ),
+        None => "saved".to_string(),
     };
     // The settings are stored: a failed audit row is a warning.
     let warning = crate::commands::audit_or_warn(
         db,
         "assistant.config",
         None,
-        detail,
+        &detail,
         "The settings were saved, but their audit row could not be written",
     );
     Ok(serde_json::json!({ "ok": true, "warning": warning }))
@@ -457,7 +625,18 @@ fn default_base_url(provider: &str) -> &'static str {
 /// LM Studio) on such addresses stay a first-class use case; a LAN host
 /// name is not resolved here, so such a server is entered by its address or
 /// served over https.
+///
+/// What comes back - and is stored, asked about and requested - is the
+/// address as parsed, not the raw text: the url crate drops tabs and line
+/// breaks while it parses, so the raw text could carry sentences into the
+/// native question. A control or invisible character is refused outright.
 fn normalize_base_url(raw: &str) -> Result<String, String> {
+    if raw.chars().any(|c| c.is_control() || is_disguising(c)) {
+        return Err(
+            "The base URL contains a control or invisible character - type the address again."
+                .into(),
+        );
+    }
     let url = url::Url::parse(raw).map_err(|_| "Base URL is not a valid URL.".to_string())?;
     // Like the MCP server URL: credentials in it would be echoed back in
     // provider errors and the test-connection detail, unsealed.
@@ -482,7 +661,15 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
             )
         }
     }
-    Ok(raw.to_string())
+    let parsed = url.to_string();
+    // `Url` adds a "/" to a bare origin; the stored form has none.
+    Ok(
+        if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+            parsed.trim_end_matches('/').to_string()
+        } else {
+            parsed
+        },
+    )
 }
 
 /// Whether a URL host is this machine or the local network (see
@@ -517,34 +704,114 @@ fn key_origin(provider: Option<&str>, base_url: Option<&str>) -> Option<String> 
         .map(|u| u.origin().ascii_serialization())
 }
 
+/// The stored API key going to another provider address: the provider and
+/// origin it was saved for, the ones it would go to, and how a dialog names
+/// them. Only the user's "Allow" in the native dialog permits one
+/// ([`save_config_confirmed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyMove {
+    from_provider: Option<String>,
+    from_origin: Option<String>,
+    to_provider: String,
+    to_origin: Option<String>,
+    from_host: String,
+    to_host: String,
+    /// The address the key would be sent to with every request.
+    to_address: String,
+}
+
+/// Longest address a credential question quotes, in characters.
+const MAX_DIALOG_ADDRESS_CHARS: usize = 120;
+
+/// Longest host or provider name a credential question quotes.
+const MAX_DIALOG_NAME_CHARS: usize = 60;
+
+impl KeyMove {
+    /// The question. Every value in it is quoted cleaned and capped
+    /// ([`crate::commands::dialog_text`]): the address and the provider come
+    /// from settings a renderer saved (or a backup restored).
+    fn prompt(&self) -> crate::commands::CredentialPrompt {
+        use crate::commands::dialog_text;
+        let name = |text: &str| dialog_text(text, MAX_DIALOG_NAME_CHARS);
+        crate::commands::CredentialPrompt {
+            title: "SSHSpan - Send the API key?".to_string(),
+            message: format!(
+                "Send the stored API key to {}?\n\nIt was saved for {} ({}). SSHSpan would send it \
+                 with every assistant request to {} ({}). Allow only if you changed the address \
+                 yourself.",
+                name(&self.to_host),
+                name(&self.from_host),
+                name(self.from_provider.as_deref().unwrap_or("no provider")),
+                dialog_text(&self.to_address, MAX_DIALOG_ADDRESS_CHARS),
+                name(&self.to_provider)
+            ),
+        }
+    }
+}
+
+/// The move of `old`'s key that saving `provider` and `base_url` (`None`:
+/// the provider's default) would make, if the provider or the key's origin
+/// changes. A path-only change on the same origin is not a move.
+fn key_move(
+    old: &crate::db::AssistantConfig,
+    provider: &str,
+    base_url: Option<&str>,
+) -> Option<KeyMove> {
+    let from_origin = key_origin(old.provider.as_deref(), old.base_url.as_deref());
+    let to_origin = key_origin(Some(provider), base_url);
+    if old.provider.as_deref() == Some(provider) && from_origin == to_origin {
+        return None;
+    }
+    let host_of = |address: Option<&str>| {
+        address
+            .and_then(|a| url::Url::parse(a).ok())
+            .map(|u| crate::commands::host_label(&u))
+            .unwrap_or_else(|| "an unknown address".to_string())
+    };
+    let from_address = old.base_url.clone().or_else(|| {
+        old.provider
+            .as_deref()
+            .map(|p| default_base_url(p).to_string())
+    });
+    let to_address = base_url
+        .map(str::to_string)
+        .unwrap_or_else(|| default_base_url(provider).to_string());
+    Some(KeyMove {
+        from_provider: old.provider.clone(),
+        from_origin,
+        to_provider: provider.to_string(),
+        to_origin,
+        from_host: host_of(from_address.as_deref()),
+        to_host: host_of(Some(&to_address)),
+        to_address,
+    })
+}
+
 /// Whether a save may keep the stored API key (A4-13). The key was stored
 /// for one provider at one origin; a save that changes either and supplies
-/// no new key would silently send it to the new endpoint, so it is refused
-/// unless the user confirmed reusing it there (`reuse_confirmed`, the
-/// command's `reuse_key_at_new_origin`). `Ok(true)` means the key does move
-/// (with that confirmation), for the audit row; a new key, removing the key,
-/// or no stored key means nothing moves. Pure so the rule is unit-testable.
+/// no new key would send it to the new endpoint, so that is refused
+/// ([`KEY_MOVE_DECLINED`]) unless it is exactly the move the user `allowed`
+/// in the native dialog - another one means the settings changed meanwhile
+/// ([`KEY_MOVE_CHANGED`]). `Ok(true)` means the key does move, for the audit
+/// row; a new key, removing the key, or no stored key means nothing moves.
+/// Pure so the rule is unit-testable.
 fn check_key_reuse(
     old: &crate::db::AssistantConfig,
     provider: &str,
     base_url: Option<&str>,
     new_key: bool,
     clear_key: bool,
-    reuse_confirmed: bool,
+    allowed: Option<&KeyMove>,
 ) -> Result<bool, String> {
     if old.api_key.is_none() || new_key || clear_key {
         return Ok(false);
     }
-    let moved = old.provider.as_deref() != Some(provider)
-        || key_origin(old.provider.as_deref(), old.base_url.as_deref())
-            != key_origin(Some(provider), base_url);
-    if moved && !reuse_confirmed {
-        return Err(
-            "The provider or base URL changed but no new API key was entered - enter the key for the new endpoint, or confirm reusing the stored key there."
-                .into(),
-        );
+    match (key_move(old, provider, base_url), allowed) {
+        (None, _) => Ok(false),
+        (Some(moving), Some(allowed)) if moving == *allowed => Ok(true),
+        (Some(_), Some(_)) => Err(KEY_MOVE_CHANGED.into()),
+        (Some(_), None) => Err(KEY_MOVE_DECLINED.into()),
     }
-    Ok(moved)
 }
 
 // ─── Provider plumbing ──────────────────────────────────────────────────────
@@ -556,16 +823,36 @@ struct ResolvedProvider {
     api_key: Zeroizing<String>,
 }
 
-fn load_provider(app: &AppHandle) -> CmdResult<ResolvedProvider> {
-    let pw = vault_password(app)?;
+/// The saved provider with its key unsealed, on the blocking pool: the
+/// unseal is an Argon2id derivation, which ran on an async worker before.
+async fn load_provider_on_blocking_pool(app: &AppHandle) -> CmdResult<ResolvedProvider> {
+    let app = app.clone();
+    crate::commands::run_blocking(move || {
+        load_provider_in(
+            &app.state::<crate::AppState>().db,
+            app.state::<crate::commands::VaultPasswordStore>().inner(),
+            app.state::<crate::commands::VaultRotationLock>().inner(),
+        )
+    })
+    .await
+}
+
+/// The saved provider with its key unsealed, without the `AppHandle`. It reads
+/// the sealed key and unseals it with the master password, so the rotation guard is taken
+/// before either is read and held until the key is unsealed: during a
+/// master-password change a chat or a test is refused at once. Argon2id: the
+/// commands run it on the blocking pool ([`load_provider_on_blocking_pool`]).
+fn load_provider_in(
+    db: &crate::db::Database,
+    vault: &crate::commands::VaultPasswordStore,
+    rotation: &crate::commands::VaultRotationLock,
+) -> CmdResult<ResolvedProvider> {
+    let _rotation = rotation.try_shared()?;
+    let pw = vault.get().unwrap_or_default();
     if pw.is_empty() {
         return Err("Vault is locked.".into());
     }
-    let config = app
-        .state::<crate::AppState>()
-        .db
-        .load_assistant_config()
-        .map_err(|e| e.to_string())?;
+    let config = db.load_assistant_config().map_err(|e| e.to_string())?;
     resolve_provider(config, &pw)
 }
 
@@ -576,17 +863,21 @@ const SAVED_BASE_URL_REFUSED: &str =
     "The saved assistant URL is no longer accepted - open Assistant settings and save it again.";
 
 /// The provider a chat or a connection test talks to, from the saved
-/// settings. The saved base URL is checked again against today's rules (RU2
-/// leftover): one saved before them - with a user name or password in it, or
-/// plain http to a public host - is refused here, before the key is
-/// unsealed, instead of being sent the key.
+/// settings. The saved base URL is checked again against today's rules: one
+/// saved before them - with a user name or password in it, or plain http to
+/// a public host - is refused here, before the key is unsealed, instead of
+/// being sent the key.
 fn resolve_provider(
     config: crate::db::AssistantConfig,
     pw: &Zeroizing<String>,
 ) -> CmdResult<ResolvedProvider> {
-    if let Some(saved) = config.base_url.as_deref() {
-        normalize_base_url(saved.trim()).map_err(|_| CmdError(SAVED_BASE_URL_REFUSED.into()))?;
-    }
+    // Requested as parsed, like a save stores it now.
+    let saved_base = config
+        .base_url
+        .as_deref()
+        .map(|saved| normalize_base_url(saved.trim()))
+        .transpose()
+        .map_err(|_| CmdError(SAVED_BASE_URL_REFUSED.into()))?;
     let provider = config.provider.ok_or_else(|| {
         "AI assistant is not configured - open Settings > AI assistant.".to_string()
     })?;
@@ -598,9 +889,7 @@ fn resolve_provider(
         String::from_utf8(key_bytes)
             .map_err(|_| "Stored API key is not valid UTF-8.".to_string())?,
     );
-    let base_url = config
-        .base_url
-        .unwrap_or_else(|| default_base_url(&provider).to_string());
+    let base_url = saved_base.unwrap_or_else(|| default_base_url(&provider).to_string());
     let model = config
         .model
         .ok_or_else(|| "No model configured.".to_string())?;
@@ -1089,7 +1378,7 @@ pub async fn assistant_chat(
     tools: Vec<ToolSpec>,
     max_tokens: Option<u32>,
 ) -> CmdResult<serde_json::Value> {
-    let p = load_provider(&app)?;
+    let p = load_provider_on_blocking_pool(&app).await?;
     let max_tokens = max_tokens.unwrap_or(2048);
     let client = http_client(CHAT_TIMEOUT)?;
 
@@ -1138,7 +1427,7 @@ pub async fn assistant_chat(
 
 #[tauri::command]
 pub async fn assistant_test_connection(app: AppHandle) -> CmdResult<serde_json::Value> {
-    let p = load_provider(&app)?;
+    let p = load_provider_on_blocking_pool(&app).await?;
     let client = http_client(TEST_TIMEOUT)?;
 
     let resp = if p.provider == "anthropic" {
@@ -1651,7 +1940,7 @@ mod tests {
         assert!(err.contains("4096"), "{err}");
     }
 
-    // ── AI commands run exactly what the Approve card shows (item 17) ───
+    // ── AI commands run exactly what the Approve card shows ───
 
     /// Trojan Source: a bidi override or an invisible character makes the
     /// Approve card show a command reordered or shortened, while the shell
@@ -1701,7 +1990,7 @@ mod tests {
         }
     }
 
-    /// F6: readline completes on TAB before Enter, so a command with a TAB
+    /// Readline completes on TAB before Enter, so a command with a TAB
     /// can run as something other than what was approved. Typing keeps TAB
     /// (completion is what the user wants there).
     #[test]
@@ -1715,7 +2004,7 @@ mod tests {
         assert!(check_typed_text("draft", "cd /var/log\t").is_ok());
     }
 
-    /// Every invisible or format character, range by range (item 10): each
+    /// Every invisible or format character, range by range: each
     /// Unicode general-category Cf code point (Unicode 15.1, checked against
     /// Python's unicodedata) and every Default_Ignorable_Code_Point -
     /// invisible combining marks, Hangul fillers, variation selectors and the
@@ -1981,7 +2270,7 @@ mod tests {
         assert!(err.contains("http://"), "{err}");
     }
 
-    // ── A saved base URL is checked again when it is used (item 4) ──────
+    // ── A saved base URL is checked again when it is used ──────
 
     const SAVED_URL_REFUSED: &str =
         "The saved assistant URL is no longer accepted - open Assistant settings and save it again.";
@@ -1995,7 +2284,7 @@ mod tests {
         }
     }
 
-    /// A base URL saved before today's rules (RU2: no user name or password,
+    /// A base URL saved before today's rules (no user name or password,
     /// plain http only to local addresses) is refused when a chat or a test
     /// would use it - the saved key would otherwise travel with it - and the
     /// message carries nothing from the URL.
@@ -2051,7 +2340,7 @@ mod tests {
         );
     }
 
-    // ── Saving the settings (item 8 seam, item 3 class) ─────────────────
+    // ── Saving the settings ─────────────────
 
     fn config_db() -> crate::db::Database {
         crate::db::Database::open_at(
@@ -2073,7 +2362,6 @@ mod tests {
             model: "gpt-test".into(),
             api_key: key.map(|k| Zeroizing::new(k.to_string())),
             clear_api_key: false,
-            reuse_key_at_new_origin: false,
         }
     }
 
@@ -2081,7 +2369,7 @@ mod tests {
     fn saving_the_settings_seals_the_key_and_keeps_the_origin_binding() {
         let db = config_db();
         let vault = unlocked();
-        let out = save_config(&db, &vault, config_args(None, Some(" sk-new "))).unwrap();
+        let out = save_config(&db, &vault, config_args(None, Some(" sk-new ")), None).unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(out["warning"], serde_json::Value::Null);
         let stored = db.load_assistant_config().unwrap();
@@ -2094,6 +2382,7 @@ mod tests {
             &db,
             &vault,
             config_args(Some("http://localhost:11434/v1"), None),
+            None,
         )
         .unwrap_err();
         assert!(err.0.contains("API key"), "{}", err.0);
@@ -2103,6 +2392,7 @@ mod tests {
             &db,
             &crate::commands::VaultPasswordStore::new(),
             config_args(None, Some("k")),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.0, "Vault is locked.");
@@ -2112,7 +2402,7 @@ mod tests {
     fn saved_settings_whose_audit_row_fails_are_reported_as_saved_with_a_warning() {
         let db = config_db();
         test_support::refuse_audit_rows(&db);
-        let out = save_config(&db, &unlocked(), config_args(None, Some("sk-new")))
+        let out = save_config(&db, &unlocked(), config_args(None, Some("sk-new")), None)
             .expect("the settings are stored - the call must not report a failure");
         assert!(
             out["warning"]
@@ -2122,6 +2412,268 @@ mod tests {
             "{out}"
         );
         assert!(db.load_assistant_config().unwrap().api_key.is_some());
+    }
+
+    // ── The stored key moves to a new address only when the user allows it
+    //    in a native dialog ──────────────────────────────────────────────
+
+    /// The arguments as a compromised renderer sends them: `args` with the
+    /// "reuse the key at the new address" flag set.
+    fn ipc_with_reuse_flag(args: ConfigArgs) -> IpcConfig {
+        IpcConfig {
+            provider: args.provider,
+            base_url: args.base_url,
+            model: args.model,
+            api_key: args.api_key,
+            clear_api_key: Some(args.clear_api_key),
+            reuse_key_at_new_origin: Some(true),
+        }
+    }
+
+    #[test]
+    fn rw_s2_the_stored_api_key_moves_only_when_the_native_question_allows_it() {
+        use crate::commands::{CredentialAnswer, CredentialPrompt, CredentialQuestions};
+        let db = config_db();
+        let vault = unlocked();
+        let rotation = crate::commands::VaultRotationLock::new();
+        let questions = CredentialQuestions::new();
+        let never = |p: &CredentialPrompt| -> CredentialAnswer {
+            panic!("nothing moves, nothing to ask: {}", p.message)
+        };
+        save_config_confirmed(
+            &db,
+            &vault,
+            &rotation,
+            &questions,
+            config_args(None, Some("sk-old")),
+            &never,
+        )
+        .unwrap();
+        let sealed = db.load_assistant_config().unwrap().api_key;
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let decline = |p: &CredentialPrompt| {
+            asked.lock().unwrap().push(p.message.clone());
+            CredentialAnswer::NotAllowed
+        };
+        let moved = || config_args(Some("https://llm.example.com/v1"), None);
+        // The renderer's flag, through the command's own handling of its
+        // arguments: it decides nothing - the question is asked anyway.
+        let err = save_config_from_ipc(
+            &db,
+            &vault,
+            &rotation,
+            &questions,
+            ipc_with_reuse_flag(moved()),
+            &decline,
+        )
+        .expect_err("the renderer's flag alone must not move the key");
+        assert_eq!(err.0, "Enter the API key for the new address.");
+        let asked = asked.into_inner().unwrap();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(
+            asked[0].starts_with("Send the stored API key to llm.example.com?"),
+            "{}",
+            asked[0]
+        );
+        let stored = db.load_assistant_config().unwrap();
+        assert_eq!(stored.base_url, None, "nothing changed");
+        assert_eq!(stored.api_key, sealed);
+        // Allowed: the key goes along, untouched.
+        let allow = |_: &CredentialPrompt| CredentialAnswer::Allowed;
+        save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &allow).unwrap();
+        let stored = db.load_assistant_config().unwrap();
+        assert_eq!(
+            stored.base_url.as_deref(),
+            Some("https://llm.example.com/v1")
+        );
+        assert_eq!(stored.api_key, sealed);
+        // Nothing moves, nothing is asked: another path on the same address,
+        // a new key with the change, removing the key.
+        save_config_confirmed(
+            &db,
+            &vault,
+            &rotation,
+            &questions,
+            config_args(Some("https://llm.example.com/v2"), None),
+            &never,
+        )
+        .unwrap();
+        save_config_confirmed(
+            &db,
+            &vault,
+            &rotation,
+            &questions,
+            config_args(Some("https://other.example.com/v1"), Some("sk-other")),
+            &never,
+        )
+        .unwrap();
+        let mut remove = config_args(Some("https://third.example.com/v1"), None);
+        remove.clear_api_key = true;
+        save_config_confirmed(&db, &vault, &rotation, &questions, remove, &never).unwrap();
+        assert_eq!(db.load_assistant_config().unwrap().api_key, None);
+    }
+
+    /// An "Allow" within a second of the question opening is not taken as
+    /// the user's decision, and while another credential question is open a
+    /// move of the key is refused without a second question: one stray key
+    /// could otherwise answer a question the user never read.
+    #[test]
+    fn rw_fix1_a_quick_allow_or_an_open_question_never_moves_the_api_key() {
+        use crate::commands::{CredentialAnswer, CredentialPrompt, CredentialQuestions};
+        let db = config_db();
+        let vault = unlocked();
+        let rotation = crate::commands::VaultRotationLock::new();
+        let questions = CredentialQuestions::new();
+        let none = |_: &CredentialPrompt| -> CredentialAnswer { CredentialAnswer::NotAllowed };
+        save_config_confirmed(
+            &db,
+            &vault,
+            &rotation,
+            &questions,
+            config_args(None, Some("sk-old")),
+            &none,
+        )
+        .unwrap();
+        let moved = || config_args(Some("https://llm.example.com/v1"), None);
+        let quick = |_: &CredentialPrompt| CredentialAnswer::TooQuick;
+        let err = save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &quick)
+            .expect_err("a quick Allow moves nothing");
+        assert_eq!(err.0, KEY_MOVE_TOO_QUICK);
+        assert_eq!(db.load_assistant_config().unwrap().base_url, None);
+        // Another question is open: refused, and not asked.
+        let open = questions.begin().expect("no question is open yet");
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let allow = |_: &CredentialPrompt| {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            CredentialAnswer::Allowed
+        };
+        let err = save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &allow)
+            .expect_err("one question at a time");
+        assert_eq!(err.0, crate::commands::CREDENTIAL_QUESTION_OPEN);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(db.load_assistant_config().unwrap().base_url, None);
+        // Once it is answered, the move is asked about - and allowed.
+        drop(open);
+        save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &allow).unwrap();
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The url crate drops tabs and line breaks while it parses, so the raw
+    /// address a renderer saved could carry sentences into the question - and
+    /// a NUL cut the Windows message and aborted the process under GTK. A
+    /// base URL with a control or an invisible character is refused.
+    #[test]
+    fn rw_fix1_a_base_url_with_control_or_invisible_characters_is_refused() {
+        for bad in [
+            "https://llm.example.com/v1\n\nSSHSpan checked this address. Allow",
+            "https://llm.example.com/v1\r\nX",
+            "https://llm.\texample.com/v1",
+            "https://llm.example.com/\u{0}v1",
+            "https://llm.example.com/v1\u{202e}lla",
+            "https://llm.example.com/\u{200b}v1",
+        ] {
+            let err = normalize_base_url(bad).expect_err(bad);
+            assert!(err.contains("control or invisible"), "{bad:?}: {err}");
+        }
+    }
+
+    /// What is stored, asked about and requested is the address as parsed -
+    /// it used to be the raw text the renderer sent.
+    #[test]
+    fn rw_fix1_the_base_url_is_stored_as_parsed() {
+        assert_eq!(
+            normalize_base_url("HTTPS://LLM.Example.COM:443/v1").unwrap(),
+            "https://llm.example.com/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://llm.example.com").unwrap(),
+            "https://llm.example.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://llm.example.com/a b").unwrap(),
+            "https://llm.example.com/a%20b"
+        );
+        let db = config_db();
+        save_config(
+            &db,
+            &unlocked(),
+            config_args(Some("HTTPS://LLM.Example.COM:443/v1/"), Some("sk-new")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_assistant_config().unwrap().base_url.as_deref(),
+            Some("https://llm.example.com/v1")
+        );
+    }
+
+    /// The question quotes every value cleaned and the address capped:
+    /// nothing a renderer or a restored backup put into the settings can
+    /// reorder, hide or add a line to what the user is asked.
+    #[test]
+    fn rw_fix1_the_api_key_question_quotes_a_clean_capped_address() {
+        let old = crate::db::AssistantConfig {
+            provider: Some("open\u{202e}ai\u{0}\nAllow".into()),
+            base_url: None,
+            model: Some("m".into()),
+            api_key: Some("sealed".into()),
+        };
+        let long = format!("https://llm.example.com/{}", "a".repeat(400));
+        let moving = key_move(&old, "openai", Some(&long)).unwrap();
+        let message = moving.prompt().message;
+        assert!(
+            !message
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || is_disguising(c)),
+            "{message:?}"
+        );
+        assert_eq!(
+            message.matches('\n').count(),
+            2,
+            "only the question's own paragraph break: {message:?}"
+        );
+        assert!(
+            message.chars().count() < 450,
+            "the address is capped: {} characters",
+            message.chars().count()
+        );
+        assert!(message.contains('\u{2026}'), "{message}");
+    }
+
+    /// A chat or a connection test unseals the stored key with the master
+    /// password: not while a master-password change re-encrypts the vault -
+    /// it is refused at once, before anything is read. The store holds a
+    /// password that cannot open the key meanwhile, so a refusal that came
+    /// only after an unseal would be another error (the test used to bound
+    /// the refusal at 0.5 s, which a loaded machine could exceed).
+    #[test]
+    fn rw_b2_the_api_key_is_not_unsealed_during_a_password_change() {
+        let db = config_db();
+        let vault = unlocked();
+        let rotation = crate::commands::VaultRotationLock::new();
+        save_config(&db, &vault, config_args(None, Some("sk-test")), None).unwrap();
+        let change = rotation.hold_like_a_password_change();
+        let cannot_open = crate::commands::VaultPasswordStore::new();
+        cannot_open.set("not-the-vault-master".into());
+        let started = std::time::Instant::now();
+        let err = match load_provider_in(&db, &cannot_open, &rotation) {
+            Ok(_) => panic!("unsealed during a password change"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.0,
+            crate::commands::VAULT_REENCRYPTING,
+            "refused before any unseal"
+        );
+        // At once, without waiting for the change (the limit is wide for a
+        // loaded machine).
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        drop(change);
+        let provider = match load_provider_in(&db, &vault, &rotation) {
+            Ok(p) => p,
+            Err(e) => panic!("{}", e.0),
+        };
+        assert_eq!(provider.api_key.as_str(), "sk-test");
     }
 
     // ── A stored key does not follow a new endpoint (A4-13) ─────────────
@@ -2146,7 +2698,7 @@ mod tests {
         ];
         for base in same {
             assert_eq!(
-                check_key_reuse(&old, "openai", base, false, false, false),
+                check_key_reuse(&old, "openai", base, false, false, None),
                 Ok(false),
                 "{base:?}"
             );
@@ -2158,24 +2710,39 @@ mod tests {
             Some("http://localhost:11434/v1"),
             false,
             false,
-            false,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("API key"), "{err}");
-        assert!(check_key_reuse(&old, "anthropic", None, false, false, false).is_err());
-        // ...unless the user confirmed reusing it there (reported so the
-        // audit row says so), or a new key comes with the save, or the key is
-        // being removed.
+        assert!(check_key_reuse(&old, "anthropic", None, false, false, None).is_err());
+        // ...unless it is the move the user allowed in the native dialog
+        // (reported so the audit row says so), or a new key comes with the
+        // save, or the key is being removed.
+        let to_anthropic = key_move(&old, "anthropic", None).unwrap();
+        assert_eq!(to_anthropic.to_host, "api.anthropic.com");
+        assert_eq!(to_anthropic.from_host, "api.openai.com");
         assert_eq!(
-            check_key_reuse(&old, "anthropic", None, false, false, true),
+            check_key_reuse(&old, "anthropic", None, false, false, Some(&to_anthropic)),
             Ok(true)
         );
+        // Another move than the one allowed: the settings changed meanwhile.
         assert_eq!(
-            check_key_reuse(&old, "anthropic", None, true, false, false),
+            check_key_reuse(
+                &old,
+                "openai",
+                Some("https://other.example.com/v1"),
+                false,
+                false,
+                Some(&to_anthropic)
+            ),
+            Err(KEY_MOVE_CHANGED.to_string())
+        );
+        assert_eq!(
+            check_key_reuse(&old, "anthropic", None, true, false, None),
             Ok(false)
         );
         assert_eq!(
-            check_key_reuse(&old, "anthropic", None, false, true, false),
+            check_key_reuse(&old, "anthropic", None, false, true, None),
             Ok(false)
         );
         // Nothing stored: nothing can follow.
@@ -2188,7 +2755,7 @@ mod tests {
                 Some("https://x.example"),
                 false,
                 false,
-                false
+                None
             ),
             Ok(false)
         );

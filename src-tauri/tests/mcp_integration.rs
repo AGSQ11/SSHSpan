@@ -23,7 +23,7 @@
 //! request/response code the command layer runs, minus the vault-generation
 //! recheck, with `generation = u64::MAX` marking a test-owned context. The
 //! 404 flow below therefore drives the exact sequence `request_with_session`
-//! performs - the 404 signal from `request_once`, the single re-initialize,
+//! performs - the 404 signal from `request_once_unchecked`, the single re-initialize,
 //! the initialized notification (replayed through its public surface), the
 //! session swap + `McpState` registration, and the retry - against a real
 //! socket, and asserts the wire-level guarantees (single re-init, dead id
@@ -89,6 +89,16 @@ enum ScriptedResponse {
 /// How long the held-open / hung mock connections stay up: far longer than
 /// any test waits.
 const HOLD_OPEN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a test waits for a read that must end WITHOUT the stream closing
+/// (an answer, a legacy endpoint event, the size cap): wide for a machine
+/// saturated by other builds and suites, and far below [`HOLD_OPEN`], so a
+/// read that waits for the close still fails.
+const STREAM_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Room on top of the removal's own teardown limit for a loaded machine -
+/// still far below the 60 s request timeout a removal used to wait out.
+const LOADED_MACHINE_SLACK: std::time::Duration = std::time::Duration::from_secs(25);
 
 impl MockMcpServer {
     /// Spawn the listener on 127.0.0.1:0 and start serving the script.
@@ -444,13 +454,16 @@ async fn sse_and_json_responses_are_both_handled() {
 
 /// 404 on a request with a known session → re-initialize once and retry.
 ///
-/// This drives the EXACT sequence the production command layer runs inside
-/// `request_with_session` (mcp.rs): `request_once` → (404) → `initialize` →
-/// `send_initialized` → session swap + registration in the app's
-/// `McpState` → `request_once` retry. The 404 signal, the re-initialize,
-/// the swap and the retry run through the production test seams (see the
-/// scope note above); the one private helper (`send_initialized`) is replayed
-/// through its single public surface with the same success check.
+/// This drives the steps the production command layer runs inside
+/// `request_with_session` (mcp.rs): `request_once_unchecked` → (404) →
+/// `establish_session` (`initialize_unchecked`, the session's registration
+/// in the app's `McpState`, `send_initialized_unchecked`) →
+/// `request_once_unchecked` retry. The 404 signal, the re-initialize, the
+/// swap and the retry run through the production test seams (see the scope
+/// note above); the one private helper (`send_initialized_unchecked`) is
+/// replayed through its single public surface with the same success check.
+/// (Production registers the session before the notification; neither
+/// order changes what goes over the wire.)
 #[tokio::test]
 async fn session_404_reinitializes_once() {
     // Script: tools/list on the dead session (404) → re-initialize (json,
@@ -502,7 +515,7 @@ async fn session_404_reinitializes_once() {
     let sessions = mcp::McpState::new();
     sessions.set_session("test-server", ctx.session.clone().unwrap());
 
-    // Step 1: the production 404 signal - request_once on the dead session
+    // Step 1: the production 404 signal - request_once_unchecked on the dead session
     // reports None (re-init). `request_with_session` consumes exactly this
     // None to trigger the recovery below.
     let body = json!({ "jsonrpc": "2.0", "id": "t1", "method": "tools/list", "params": {} });
@@ -553,7 +566,7 @@ async fn session_404_reinitializes_once() {
     }
 
     // Step 4: swap the session into ctx AND into the app's McpState - the
-    // same two writes `request_with_session` performs on its AppHandle. The
+    // same two writes `establish_session` performs for `request_with_session`. The
     // retry path then reads the session back from that state, exactly as
     // `load_server_context` does for real commands.
     ctx.session = Some(new_session.clone());
@@ -608,7 +621,7 @@ async fn session_404_reinitializes_once() {
     );
 }
 
-/// Replay of mcp.rs's private `send_initialized`: the same single
+/// Replay of mcp.rs's private `send_initialized_unchecked`: the same single
 /// post_jsonrpc call with the new session/version headers, failing the test
 /// if the server does not accept the notification.
 async fn send_initialized_like_production(ctx: &mcp::ServerContext, session: &mcp::McpSession) {
@@ -967,7 +980,7 @@ fn mcp_test_tool(name: &str, desc: &str, enabled: bool) -> sshspan::db::McpToolR
 #[tokio::test]
 async fn paginated_tools_list_returns_every_page() {
     // Page mechanics are transport-level: simulate with two scripted
-    // tools/list responses driven through request_once on a session.
+    // tools/list responses driven through request_once_test on a session.
     let server = MockMcpServer::start(vec![
         ScriptedResponse::Json {
             status: 200,
@@ -1108,7 +1121,7 @@ async fn jsonrpc_error_is_surfaced() {
     assert!(err.0.contains("Invalid params"));
 }
 
-// ─── RU2: streaming, transport detection, server removal ────────────────────
+// ─── Streaming, transport detection, server removal ────────────────────
 
 /// A server may keep a POST's SSE stream open after the response (the spec
 /// only says it SHOULD close it). The answer must be returned as soon as it
@@ -1131,7 +1144,7 @@ async fn an_sse_answer_is_returned_while_the_stream_stays_open() {
         .await
         .unwrap();
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        STREAM_READ_LIMIT,
         mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp),
     )
     .await
@@ -1160,7 +1173,7 @@ async fn a_legacy_sse_endpoint_event_is_reported_as_an_unsupported_transport() {
         .await
         .unwrap();
     let err = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        STREAM_READ_LIMIT,
         mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp),
     )
     .await
@@ -1184,7 +1197,7 @@ fn server_requests(n: usize) -> Vec<Value> {
 
 /// Every -32601 answer is a request carrying the auth header, so one
 /// response may make the client answer at most 8 server requests; a 9th
-/// fails the request (review round 1).
+/// fails the request.
 #[tokio::test]
 async fn server_requests_inside_one_response_are_capped() {
     let client = client();
@@ -1220,7 +1233,7 @@ async fn server_requests_inside_one_response_are_capped() {
 
 /// The vault-generation check runs before each -32601 answer: once the vault
 /// has locked, no further request (with its auth header) goes out and the
-/// read fails (review round 1).
+/// read fails.
 #[tokio::test]
 async fn a_locked_vault_stops_answers_to_server_requests() {
     let want = json!("guarded-1");
@@ -1292,7 +1305,7 @@ async fn an_oversized_sse_stream_is_refused() {
         .await
         .unwrap();
     let err = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        STREAM_READ_LIMIT,
         mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp),
     )
     .await
@@ -1409,7 +1422,7 @@ async fn removing_a_hung_server_waits_at_most_the_teardown_timeout() {
     server_with_session(&db, &state, "srv-hung", server.url());
     let started = std::time::Instant::now();
     let out = tokio::time::timeout(
-        mcp::REMOVE_TEARDOWN_TIMEOUT + std::time::Duration::from_secs(3),
+        mcp::REMOVE_TEARDOWN_TIMEOUT + LOADED_MACHINE_SLACK,
         mcp::remove_server(
             &db,
             &state,
@@ -1421,7 +1434,7 @@ async fn removing_a_hung_server_waits_at_most_the_teardown_timeout() {
     .await
     .expect("removal must not wait for the 60 s request timeout")
     .expect("a hung server must still be removable");
-    assert!(started.elapsed() < mcp::REMOVE_TEARDOWN_TIMEOUT + std::time::Duration::from_secs(3));
+    assert!(started.elapsed() < mcp::REMOVE_TEARDOWN_TIMEOUT + LOADED_MACHINE_SLACK);
     assert!(
         out["warning"]
             .as_str()

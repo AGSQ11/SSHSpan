@@ -275,7 +275,9 @@ pub enum McpWrite {
 /// must be re-confirmed in the UI (re-save) before any network traffic can
 /// send its secret toward the stored URL - otherwise a crafted backup makes
 /// the first initialize leak a stored secret or env var to an attacker's
-/// URL.
+/// URL. A save that binds a secret or env var to a place it was not bound to
+/// before is stored with `confirmed = false` too, until the user allows it
+/// in a native dialog (`assistant::mcp::settle_binding`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerRecord {
     pub id: String,
@@ -301,7 +303,7 @@ pub struct Database {
 }
 
 /// The `keys` columns `row_to_key` reads, NAMED for every key query rather
-/// than `SELECT *` (RU1 handoff). A pooled connection whose schema predates
+/// than `SELECT *`. A pooled connection whose schema predates
 /// `migrate()`'s ALTER TABLEs prepares `*` against its stale column list,
 /// SQLite re-prepares with the new one, and sqlx then indexed past its cached
 /// columns ("index out of bounds: the len is 14"). A named column that a stale
@@ -351,18 +353,72 @@ fn cached_runtime() -> &'static tokio::runtime::Runtime {
         .get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create DB tokio runtime"))
 }
 
+/// Reads of the categories table (`list_categories`, `get_category`) per
+/// database file - tests only, so a test can bound how often a pass reads
+/// them. Keyed by file: every test opens a database of its own.
+#[cfg(test)]
+static CATEGORY_READS: std::sync::Mutex<Option<HashMap<PathBuf, usize>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn count_category_read(db_path: &std::path::Path) {
+    let mut reads = CATEGORY_READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *reads
+        .get_or_insert_with(HashMap::new)
+        .entry(db_path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
 /// Run an async block to completion, blocking the current thread.
 ///
-/// When called from inside the Tauri/tokio async runtime (an async command)
-/// it uses `block_in_place` to run the future on the current worker instead
-/// of nesting a runtime. When called from a plain thread (startup, sync
-/// commands, tests) it uses a cached runtime to avoid re-creating one per
-/// call.
+/// When called from inside a task of the Tauri/tokio async runtime (an async
+/// command, the blocking pool) it uses `block_in_place` to run the future on
+/// the current worker instead of nesting a runtime. When called from a plain
+/// thread (startup, sync commands, tests) it uses a cached runtime to avoid
+/// re-creating one per call. When called from the root future of a
+/// `block_on` - a runtime is entered but no task runs, as in the body of a
+/// `#[tokio::test(flavor = "multi_thread")]` - it waits on a parker of its
+/// own ([`block_on_own_parker`]): tokio's nested `block_on` parks on the
+/// very parker of that thread's `block_on`, and used up a wake-up meant for
+/// another part of the root future that came in meanwhile - which then
+/// waited for the next event, forever when there was none (the hung MCP
+/// tests of round 6).
 fn block<F: std::future::Future<Output = T>, T>(f: F) -> T {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
-    } else {
-        cached_runtime().block_on(f)
+    if tokio::runtime::Handle::try_current().is_err() {
+        return cached_runtime().block_on(f);
+    }
+    if tokio::task::try_id().is_none() {
+        return block_on_own_parker(f);
+    }
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// Drive `f` to completion on this thread, parking with std's own thread
+/// parker between polls - not tokio's per-thread one, which the root future
+/// of this thread's `block_on` waits on - so no wake-up meant for that root
+/// future is ever used up here. The runtime stays entered (`f` may use its
+/// timers and spawn), and the coop budget does not apply: `f` runs to the
+/// end, as under `block_in_place`.
+fn block_on_own_parker<F: std::future::Future>(f: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut f = std::pin::pin!(tokio::task::unconstrained(f));
+    loop {
+        if let std::task::Poll::Ready(out) = std::future::Future::poll(f.as_mut(), &mut cx) {
+            return out;
+        }
+        std::thread::park();
     }
 }
 
@@ -782,6 +838,27 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+            // Keys and servers whose category path changed without the row
+            // changing - a category renamed, moved or deleted, a key's
+            // categories set - until the Bitwarden sync has uploaded the new
+            // path ([`Database::category_marks`]). Kept apart from
+            // `updated_at`, which says the row itself changed: that one makes
+            // "local wins" upload every field, and a category change alone
+            // must never upload fields older than Bitwarden's. Machine-local
+            // state: not in backups.
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS sync_category_marks (
+                    kind       TEXT NOT NULL,
+                    id         TEXT NOT NULL,
+                    changed_at INTEGER NOT NULL,
+                    PRIMARY KEY (kind, id)
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+
             Ok::<_, anyhow::Error>(())
         })
     }
@@ -815,39 +892,6 @@ impl Database {
             .bind(key.bitwarden_sync as i64)
             .bind(key.bitwarden_revision_ts.map(|v| v.to_string()))
             .bind(key.bitwarden_updated_at.map(|v| v.to_string()))
-            .execute(&self.pool)
-            .await?;
-            Ok(())
-        })
-    }
-
-    pub fn update_key(&self, key: &KeyRecord) -> Result<()> {
-        block(async {
-            sqlx::query(
-                r#"
-                UPDATE keys SET
-                    name = ?, key_type = ?, public_key = ?, private_key_encrypted = ?,
-                    fingerprint_sha256 = ?, fingerprint_md5 = ?, comment = ?, updated_at = ?,
-                    deployed = ?, deploy_path = ?, bitwarden_id = ?, bitwarden_sync = ?,
-                    bitwarden_revision_ts = ?, bitwarden_updated_at = ?
-                WHERE id = ?
-                "#,
-            )
-            .bind(&key.name)
-            .bind(&key.key_type)
-            .bind(&key.public_key)
-            .bind(&key.private_key_encrypted)
-            .bind(&key.fingerprint_sha256)
-            .bind(&key.fingerprint_md5)
-            .bind(&key.comment)
-            .bind(key.updated_at.to_rfc3339())
-            .bind(key.deployed as i64)
-            .bind(&key.deploy_path)
-            .bind(&key.bitwarden_id)
-            .bind(key.bitwarden_sync as i64)
-            .bind(key.bitwarden_revision_ts.map(|v| v.to_string()))
-            .bind(key.bitwarden_updated_at.map(|v| v.to_string()))
-            .bind(&key.id)
             .execute(&self.pool)
             .await?;
             Ok(())
@@ -909,11 +953,11 @@ impl Database {
     }
 
     /// Record (`Some`) or clear (`None`) where a key is deployed - those two
-    /// columns, nothing else (C1): the deploy commands used to write the whole
+    /// columns, nothing else: the deploy commands used to write the whole
     /// row back, sealed blob included. Not `updated_at` either: that is the
     /// Bitwarden sync's "changed locally" marker, and a deploy or undeploy
     /// changes nothing the sync uploads - bumping it re-uploaded the key on
-    /// the next sync and counted a conflict (A7-23 / RU5 hand-off 11).
+    /// the next sync and counted a conflict (A7-23).
     pub fn set_key_deployment(&self, id: &str, deploy_path: Option<&str>) -> Result<()> {
         block(async {
             sqlx::query("UPDATE keys SET deployed = ?, deploy_path = ? WHERE id = ?")
@@ -926,29 +970,15 @@ impl Database {
         })
     }
 
-    /// Mark a key as changed for the Bitwarden sync (`updated_at` only) - for
-    /// changes the sync uploads that touch no key column, such as its
-    /// categories, which travel in the item's notes (A7-23).
-    pub fn mark_key_changed(&self, id: &str) -> Result<()> {
-        block(async {
-            sqlx::query("UPDATE keys SET updated_at = ? WHERE id = ?")
-                .bind(Utc::now().to_rfc3339())
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
-            Ok(())
-        })
-    }
-
     /// Write a key pulled from Bitwarden into its row: the key material,
     /// name and comment the item carries, the remote revision, and the sync
     /// marks - and nothing else. The sync used to write back the whole row it
     /// had read before its network round trips, which erased a deployment
-    /// recorded meanwhile (RU5 hand-off 12).
+    /// recorded meanwhile.
     /// Written only while the row is still the one the sync read
     /// (`expected_updated_at`): a rename made while the pull sealed, or a row
-    /// deleted meanwhile, is never overwritten - false then, nothing written
-    /// (fix round M4).
+    /// deleted meanwhile, is never overwritten - false then, nothing
+    /// written.
     pub fn apply_pulled_key(
         &self,
         id: &str,
@@ -959,7 +989,7 @@ impl Database {
         block(async {
             // BEGIN IMMEDIATE: the row is read, then written - a deferred
             // transaction was refused at once ("database is locked") when
-            // another connection was writing; this one waits (round 4).
+            // another connection was writing; this one waits.
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let stored: Option<String> =
                 sqlx::query_scalar("SELECT updated_at FROM keys WHERE id = ?")
@@ -997,7 +1027,7 @@ impl Database {
     }
 
     /// Forget a key's Bitwarden link (its item is gone and the key is not
-    /// uploaded, e.g. public-only), so the loss is reported once (fix M9).
+    /// uploaded, e.g. public-only), so the loss is reported once.
     pub fn clear_key_sync_link(&self, id: &str) -> Result<()> {
         block(async {
             sqlx::query(
@@ -1298,7 +1328,7 @@ impl Database {
     /// Change the sync settings in ONE transaction: `update` gets the settings
     /// as stored inside that transaction and edits them - or refuses, and
     /// nothing is written. Every field it leaves set is then written back,
-    /// all or nothing (F1-b). The fields used to be separate autocommit
+    /// all or nothing. The fields used to be separate autocommit
     /// statements over a pooled connection, so another connection could read
     /// a new server URL beside the OLD sealed password, and a save that failed
     /// part-way kept half its fields; a save that re-wrote a copy read before
@@ -1307,7 +1337,7 @@ impl Database {
     /// `BEGIN IMMEDIATE`: the transaction takes the write lock before it
     /// reads, so a write held by another connection makes it WAIT (busy
     /// timeout). A deferred transaction that read first was refused at once
-    /// ("database is locked") when it then tried to write (fix round 3).
+    /// ("database is locked") when it then tried to write.
     pub fn update_bitwarden_config(
         &self,
         update: impl FnOnce(&mut BitwardenConfig) -> Result<()>,
@@ -1326,13 +1356,15 @@ impl Database {
         })
     }
 
-    /// Write every set field of `config`, in one transaction (see
-    /// [`Database::update_bitwarden_config`]).
-    pub fn save_bitwarden_config(&self, config: &BitwardenConfig) -> Result<()> {
-        block(async {
-            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            write_bitwarden_config(&mut tx, config).await?;
-            tx.commit().await?;
+    /// Replace the stored settings with every set field of `config`, through
+    /// [`Database::update_bitwarden_config`]. Tests only: the app changes the
+    /// settings as stored inside one transaction, never by writing back a
+    /// copy read earlier.
+    #[cfg(test)]
+    pub(crate) fn save_bitwarden_config(&self, config: &BitwardenConfig) -> Result<()> {
+        let config = config.clone();
+        self.update_bitwarden_config(move |stored| {
+            *stored = config;
             Ok(())
         })
     }
@@ -1367,8 +1399,8 @@ impl Database {
     /// its key behind). The fields used to be four autocommit statements, so
     /// a save that failed part-way kept a new provider and base URL beside
     /// the OLD sealed key, and a chat reading mid-save could see that mix -
-    /// either way the key went to an endpoint it was not saved for (RU6b
-    /// item 13 audit, the F1-b pattern of the Bitwarden settings). The write
+    /// either way the key went to an endpoint it was not saved for (the
+    /// same pattern the Bitwarden settings had). The write
     /// lock is taken before the read, so a concurrent writer makes it wait.
     pub fn update_assistant_config<T>(
         &self,
@@ -1627,6 +1659,8 @@ impl Database {
 
     /// All categories, ordered for tree display: roots first, then by sibling sort_index, then by name.
     pub fn list_categories(&self) -> Result<Vec<Category>> {
+        #[cfg(test)]
+        count_category_read(&self.db_path);
         block(async {
             let rows = sqlx::query(
                 "SELECT id, name, parent_id, scope, color, sort_index, created_at, updated_at \
@@ -1640,6 +1674,8 @@ impl Database {
     }
 
     pub fn get_category(&self, id: &str) -> Result<Option<Category>> {
+        #[cfg(test)]
+        count_category_read(&self.db_path);
         block(async {
             let row = sqlx::query(
                 "SELECT id, name, parent_id, scope, color, sort_index, created_at, updated_at FROM categories WHERE id = ?"
@@ -1671,24 +1707,6 @@ impl Database {
         })
     }
 
-    pub fn update_category(&self, c: &Category) -> Result<()> {
-        block(async {
-            sqlx::query(
-                "UPDATE categories SET name = ?, parent_id = ?, scope = ?, color = ?, sort_index = ?, updated_at = ? WHERE id = ?"
-            )
-            .bind(&c.name)
-            .bind(&c.parent_id)
-            .bind(&c.scope)
-            .bind(&c.color)
-            .bind(c.sort_index)
-            .bind(c.updated_at.to_rfc3339())
-            .bind(&c.id)
-            .execute(&self.pool)
-            .await?;
-            Ok(())
-        })
-    }
-
     /// Move category `id` under `parent` (`None`: the top level) and, when
     /// given, to position `sort_index` - those columns and `updated_at`, in
     /// ONE `BEGIN IMMEDIATE` transaction whose `check` sees every category as
@@ -1697,6 +1715,12 @@ impl Database {
     /// once (possible since `category_reparent` runs off the main thread)
     /// could each pass the check and together make a parent loop, and a
     /// rename made meanwhile was written back.
+    ///
+    /// A move to another parent changes the category path of everything
+    /// filed in the category or below it, and that path travels in the
+    /// Bitwarden items' notes: those keys and servers are marked changed in
+    /// the same transaction ([`Self::mark_categories_changed`]). A new
+    /// position under the same parent changes no path and marks nothing.
     pub fn move_category(
         &self,
         id: &str,
@@ -1706,28 +1730,207 @@ impl Database {
     ) -> Result<()> {
         block(async {
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            let rows = sqlx::query(
-                "SELECT id, name, parent_id, scope, color, sort_index, created_at, updated_at \
-                 FROM categories",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
-            let all: Vec<Category> = rows.into_iter().map(Self::row_to_category).collect();
+            let all = Self::categories_in(&mut tx).await?;
             check(&all)?;
+            let new_parent = all
+                .iter()
+                .find(|c| c.id == id)
+                .is_some_and(|c| c.parent_id.as_deref() != parent);
+            let now = Utc::now();
             let res = sqlx::query(
                 "UPDATE categories SET parent_id = ?, sort_index = COALESCE(?, sort_index), \
                  updated_at = ? WHERE id = ?",
             )
             .bind(parent)
             .bind(sort_index)
-            .bind(Utc::now().to_rfc3339())
+            .bind(now.to_rfc3339())
             .bind(id)
             .execute(&mut *tx)
             .await?;
             if res.rows_affected() != 1 {
                 anyhow::bail!("Category not found.");
             }
+            if new_parent {
+                Self::mark_categories_changed(
+                    &mut tx,
+                    &category_subtree(&all, id),
+                    now.timestamp_millis(),
+                )
+                .await?;
+            }
             tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// Rename category `id` - the name and `updated_at`, nothing else - and
+    /// mark the keys and servers filed in it or below it changed for the
+    /// Bitwarden sync, in ONE `BEGIN IMMEDIATE` transaction. The rename used
+    /// to write back the whole row it had read, which undid a move that
+    /// committed meanwhile (moves run off the main thread), and it marked
+    /// nothing: the items' notes kept the old path, and a pull filed the keys
+    /// under it again. The same name again writes nothing. False when there
+    /// is no such category.
+    pub fn rename_category(&self, id: &str, name: &str) -> Result<bool> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let all = Self::categories_in(&mut tx).await?;
+            let Some(current) = all.iter().find(|c| c.id == id) else {
+                return Ok(false);
+            };
+            if current.name == name {
+                return Ok(true);
+            }
+            let now = Utc::now();
+            sqlx::query("UPDATE categories SET name = ?, updated_at = ? WHERE id = ?")
+                .bind(name)
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            Self::mark_categories_changed(
+                &mut tx,
+                &category_subtree(&all, id),
+                now.timestamp_millis(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    /// Give the categories `ordered_ids` the positions 0, 1, 2, ... in that
+    /// order (`sort_index` and `updated_at` only - never a parent), in ONE
+    /// `BEGIN IMMEDIATE` transaction whose `check` sees every category as
+    /// stored inside it and may refuse (`Err`, nothing written).
+    pub fn set_category_order(
+        &self,
+        ordered_ids: &[String],
+        check: impl FnOnce(&[Category]) -> Result<()>,
+    ) -> Result<()> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let all = Self::categories_in(&mut tx).await?;
+            check(&all)?;
+            let now = Utc::now().to_rfc3339();
+            for (position, id) in ordered_ids.iter().enumerate() {
+                let res = sqlx::query(
+                    "UPDATE categories SET sort_index = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(position as i64)
+                .bind(&now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                if res.rows_affected() != 1 {
+                    anyhow::bail!("That category no longer exists.");
+                }
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// Every category, read inside `tx`.
+    async fn categories_in(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<Vec<Category>> {
+        let rows = sqlx::query(
+            "SELECT id, name, parent_id, scope, color, sort_index, created_at, updated_at \
+             FROM categories",
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(rows.into_iter().map(Self::row_to_category).collect())
+    }
+
+    /// Mark every key filed in one of `category_ids`, and every server in
+    /// one, as having a new category path for the Bitwarden sync, at
+    /// `now_ms` ([`Self::category_marks`]), in the caller's transaction:
+    /// their category path, which the sync writes into the items' notes,
+    /// changed. Not `updated_at`: that says the row itself changed, and made
+    /// "local wins" upload every field of it - a saved password older than
+    /// the one Bitwarden had - for a category rename.
+    async fn mark_categories_changed(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        category_ids: &[String],
+        now_ms: i64,
+    ) -> Result<()> {
+        let ids = serde_json::to_string(category_ids)?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO sync_category_marks (kind, id, changed_at) \
+             SELECT DISTINCT 'key', key_id, ? FROM key_categories \
+             WHERE category_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(now_ms)
+        .bind(&ids)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO sync_category_marks (kind, id, changed_at) \
+             SELECT 'server', id, ? FROM servers \
+             WHERE category_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(now_ms)
+        .bind(&ids)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark key `id` as having a new category path for the Bitwarden sync
+    /// ([`Self::category_marks`]): its categories were set.
+    pub fn mark_key_categories_changed(&self, id: &str) -> Result<()> {
+        block(async {
+            sqlx::query(
+                "INSERT OR REPLACE INTO sync_category_marks (kind, id, changed_at) \
+                 VALUES ('key', ?, ?)",
+            )
+            .bind(id)
+            .bind(Utc::now().timestamp_millis())
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// The rows of `kind` ("key" or "server") whose category path changed
+    /// without the row changing, and when (epoch ms), until the Bitwarden
+    /// sync has uploaded it ([`Self::clear_category_mark`]).
+    pub fn category_marks(&self, kind: &str) -> Result<std::collections::HashMap<String, i64>> {
+        block(async {
+            let rows: Vec<(String, i64)> =
+                sqlx::query_as("SELECT id, changed_at FROM sync_category_marks WHERE kind = ?")
+                    .bind(kind)
+                    .fetch_all(&self.pool)
+                    .await?;
+            Ok(rows.into_iter().collect())
+        })
+    }
+
+    /// [`Self::category_marks`] for one row.
+    pub fn category_mark(&self, kind: &str, id: &str) -> Result<Option<i64>> {
+        block(async {
+            Ok(sqlx::query_scalar(
+                "SELECT changed_at FROM sync_category_marks WHERE kind = ? AND id = ?",
+            )
+            .bind(kind)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+        })
+    }
+
+    /// The new category path of `id`, marked at `up_to` or before, is
+    /// uploaded: the mark goes - unless the path changed again since.
+    pub fn clear_category_mark(&self, kind: &str, id: &str, up_to: i64) -> Result<()> {
+        block(async {
+            sqlx::query(
+                "DELETE FROM sync_category_marks WHERE kind = ? AND id = ? AND changed_at <= ?",
+            )
+            .bind(kind)
+            .bind(id)
+            .bind(up_to)
+            .execute(&self.pool)
+            .await?;
             Ok(())
         })
     }
@@ -1744,7 +1947,7 @@ impl Database {
         block(async {
             // BEGIN IMMEDIATE: reads the parent and the children, then writes;
             // a deferred transaction was refused at once while another
-            // connection was writing, instead of waiting (round 4).
+            // connection was writing, instead of waiting.
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let parent: Option<String> =
                 sqlx::query_scalar("SELECT parent_id FROM categories WHERE id = ?")
@@ -1758,30 +1961,29 @@ impl Database {
             .bind(id)
             .fetch_all(&mut *tx)
             .await?;
+            // Everything filed in the category or below it gets a new
+            // category path - the keys losing this category, the servers
+            // moved up, the items of the children moved up - which the
+            // Bitwarden sync uploads (categories travel in the items' notes,
+            // A7-23): marked, before anything is moved. A rename or a move
+            // marks what is under the category the same way
+            // (`rename_category`, `move_category`).
+            let all = Self::categories_in(&mut tx).await?;
+            Self::mark_categories_changed(
+                &mut tx,
+                &category_subtree(&all, id),
+                Utc::now().timestamp_millis(),
+            )
+            .await?;
             sqlx::query("UPDATE categories SET parent_id = ? WHERE parent_id = ?")
                 .bind(&parent)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            // The keys losing this category and the servers moved up below
-            // change what the Bitwarden sync uploads (categories travel in
-            // the items' notes): mark them changed (A7-23, fix M5). A rename
-            // or move marks nothing - the ids stay, only the path text
-            // changes, and it reaches the notes with the next upload.
-            let now = Utc::now().to_rfc3339();
-            sqlx::query(
-                "UPDATE keys SET updated_at = ? \
-                 WHERE id IN (SELECT key_id FROM key_categories WHERE category_id = ?)",
-            )
-            .bind(&now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
             // A host category's parent is a host category (create/reparent
             // enforce the scope), so the servers stay correctly filed.
-            sqlx::query("UPDATE servers SET category_id = ?, updated_at = ? WHERE category_id = ?")
+            sqlx::query("UPDATE servers SET category_id = ? WHERE category_id = ?")
                 .bind(&parent)
-                .bind(&now)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
@@ -1992,27 +2194,13 @@ impl Database {
                 return String::new();
             }
         };
-        let name_of: HashMap<&str, &str> = all
-            .iter()
-            .map(|c| (c.id.as_str(), c.name.as_str()))
-            .collect();
-        let mut names: Vec<&str> = category_chain(&all, id)
-            .ids()
-            .iter()
-            .filter_map(|cid| name_of.get(cid.as_str()).copied())
-            .collect();
-        names.reverse();
-        names.join("/")
+        path_in(&parent_map(&all), &name_map(&all), id)
     }
 
-    /// Ensure a category chain for the given slash-joined path exists locally.
-    /// Returns the leaf category's id. If a node along the path is missing,
-    /// it is created with a deterministic id derived from the path so
-    /// re-imports converge to the same uuid.
-    pub fn ensure_category_path(&self, path: &str) -> Result<Option<String>> {
-        self.ensure_category_path_scoped(path, "key")
-    }
-
+    /// Ensure a category chain of `scope` for the given slash-joined path
+    /// exists locally. Returns the leaf category's id. If a node along the
+    /// path is missing, it is created with a deterministic id derived from
+    /// the path so re-imports converge to the same uuid.
     pub fn ensure_category_path_scoped(&self, path: &str, scope: &str) -> Result<Option<String>> {
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if segments.is_empty() {
@@ -2123,25 +2311,64 @@ impl Database {
     }
 
     pub fn update_server(&self, s: &ServerRecord) -> Result<()> {
+        block(async { Self::write_server_row(&self.pool, s).await })
+    }
+
+    /// Read server `id`, let `update` change it - or refuse it (`Err`:
+    /// nothing written) - and write the whole row back, in ONE
+    /// `BEGIN IMMEDIATE` transaction: another writer makes this one wait, and
+    /// `update` checks the row exactly as it is written. A save used to check
+    /// the row it had read before such a writer committed, then wrote over
+    /// it. `Ok(None)` when there is no such server. `update` runs while the
+    /// write lock is held: it must be quick (seal a password before).
+    pub fn modify_server<T>(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut ServerRecord) -> Result<T>,
+    ) -> Result<Option<(ServerRecord, T)>> {
         block(async {
-            sqlx::query(
-                r#"
-                UPDATE servers SET name = ?, host = ?, port = ?, username = ?, key_id = ?, pem_path = ?,
-                    auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?,
-                    bitwarden_id = ?, bitwarden_revision_ts = ?, bitwarden_updated_at = ?
-                WHERE id = ?
-                "#,
-            )
-            .bind(&s.name).bind(&s.host).bind(s.port as i64).bind(&s.username)
-            .bind(&s.key_id).bind(&s.pem_path).bind(&s.auth_method).bind(&s.saved_password)
-            .bind(&s.category_id).bind(&s.color)
-            .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
-            .bind(s.updated_at.to_rfc3339())
-            .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
-            .bind(&s.id)
-            .execute(&self.pool).await?;
-            Ok(())
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let row = sqlx::query(concat!(
+                "SELECT ",
+                server_columns!(),
+                " FROM servers WHERE id = ?"
+            ))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let mut server = Self::row_to_server(row);
+            let out = update(&mut server)?;
+            Self::write_server_row(&mut *tx, &server).await?;
+            tx.commit().await?;
+            Ok(Some((server, out)))
         })
+    }
+
+    /// The UPDATE of a whole server row.
+    async fn write_server_row<'c, E>(executor: E, s: &ServerRecord) -> Result<()>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
+        sqlx::query(
+            r#"
+            UPDATE servers SET name = ?, host = ?, port = ?, username = ?, key_id = ?, pem_path = ?,
+                auth_method = ?, saved_password = ?, category_id = ?, color = ?, last_connected_at = ?, updated_at = ?,
+                bitwarden_id = ?, bitwarden_revision_ts = ?, bitwarden_updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&s.name).bind(&s.host).bind(s.port as i64).bind(&s.username)
+        .bind(&s.key_id).bind(&s.pem_path).bind(&s.auth_method).bind(&s.saved_password)
+        .bind(&s.category_id).bind(&s.color)
+        .bind(s.last_connected_at.map(|d| d.to_rfc3339()))
+        .bind(s.updated_at.to_rfc3339())
+        .bind(&s.bitwarden_id).bind(&s.bitwarden_revision_ts).bind(&s.bitwarden_updated_at)
+        .bind(&s.id)
+        .execute(executor).await?;
+        Ok(())
     }
 
     pub fn delete_server(&self, id: &str) -> Result<()> {
@@ -2157,7 +2384,7 @@ impl Database {
     /// Atomically persist a full vault password rotation.
     ///
     /// Re-encryption happens in memory in the caller; this writes the results.
-    /// The audit's F3/F6: previously each key/server UPDATE was its own
+    /// Previously each key/server UPDATE was its own
     /// pool-backed statement and the master verifier was a third write, so an
     /// I/O error or a crash part-way left some rows sealed under the new
     /// password and the rest (plus the verifier) under the old - a vault that
@@ -2168,7 +2395,7 @@ impl Database {
     /// state or the complete new state, never a split.
     ///
     /// Each statement writes ONLY the sealed value, and only where the row
-    /// still holds the blob the caller re-sealed (C1). The commit used to
+    /// still holds the blob the caller re-sealed. The commit used to
     /// rewrite every column of every key and server it had read and upsert
     /// every MCP record whole, so an edit made while the re-seal ran was
     /// silently reverted - and a record sealed with the old password in the
@@ -2232,7 +2459,7 @@ impl Database {
             Self::rotate_mcp_secrets(&mut tx, &rotation.mcp_secrets).await?;
             // The Bitwarden master password is sealed with the SAME vault
             // password; it must rotate in the same transaction or sync is
-            // stranded on the old password (F6). Same for the AI assistant's
+            // stranded on the old password. Same for the AI assistant's
             // API key: every assistant call would fail at unseal.
             Self::rotate_config_secret(
                 &mut tx,
@@ -2265,7 +2492,7 @@ impl Database {
         })
     }
 
-    /// Stamp `last_connected_at` and nothing else (C1). The SSH connect path
+    /// Stamp `last_connected_at` and nothing else. The SSH connect path
     /// used to write back the whole server row it had read before the
     /// handshake, so a master-password change that committed meanwhile had
     /// its re-sealed `saved_password` overwritten with the old blob.
@@ -2282,11 +2509,11 @@ impl Database {
 
     /// Record a Bitwarden link on a server row: its item id, the remote
     /// revision and the sync marker - nothing else, so an edit made while the
-    /// upload ran is neither reverted nor lost to the next sync (A7-23 / RU5
-    /// hand-off 12). The marker is the pushed row's `updated_at`, or `None`
+    /// upload ran is neither reverted nor lost to the next sync (A7-23). The
+    /// marker is the pushed row's `updated_at`, or `None`
     /// when the row's state was never uploaded to this item (a re-link found
     /// through the item's notes): the next sync then sees the row as changed
-    /// and uploads it (fix round 2, N1).
+    /// and uploads it.
     pub fn set_server_sync_meta(
         &self,
         id: &str,
@@ -2311,8 +2538,7 @@ impl Database {
 
     /// Write a server pulled from Bitwarden into its row: what the Login item
     /// carries, the remote revision and the sync marks. The `.pem` path,
-    /// colour, last connection and the link stay as the row has them (RU5
-    /// hand-off 12).
+    /// colour, last connection and the link stay as the row has them.
     /// Like [`Database::apply_pulled_key`], only while the row is still the
     /// one the sync read; false otherwise.
     pub fn apply_pulled_server(
@@ -2506,7 +2732,7 @@ impl Database {
     /// The check and the insert are one `BEGIN IMMEDIATE` transaction: as two
     /// statements, two first connections to one new host both saw no pin and
     /// the second failed its insert on the primary key instead of comparing
-    /// the keys (RU6b item 13).
+    /// the keys.
     pub fn add_known_host(&self, host: &str, host_key: &str, fingerprint: &str) -> Result<bool> {
         block(async {
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -2651,17 +2877,6 @@ impl Database {
             .bind(&row.target_server_id)
             .execute(&self.pool)
             .await?;
-            Ok(())
-        })
-    }
-
-    /// Delete one job's persisted row.
-    pub fn delete_queue_job(&self, id: i64) -> Result<()> {
-        block(async {
-            sqlx::query("DELETE FROM transfer_queue WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
             Ok(())
         })
     }
@@ -2831,7 +3046,7 @@ impl Database {
                     .bind(s("created_at").unwrap_or(""))
                     .bind(s("updated_at").unwrap_or(""))
                     // Machine-local deployment state is NEVER restored from a
-                    // backup (F9): `deployed`/`deploy_path` describe a
+                    // backup: `deployed`/`deploy_path` describe a
                     // deployment performed on the machine that WROTE the
                     // backup. Restoring them verbatim lets a crafted backup
                     // point `deploy_path` at any user-writable file, after
@@ -3125,12 +3340,58 @@ impl CategoryChain {
 /// is the first id walked; an id that is not stored ends the walk at the top
 /// level (so an unknown `start` is an empty, rooted chain). The walks this
 /// replaces had no visited set: a parent loop never ended them - one of them
-/// ran on the main thread and froze the window (JU4 review N1).
+/// ran on the main thread and froze the window.
 pub fn category_chain(categories: &[Category], start: &str) -> CategoryChain {
-    let parent_of: HashMap<&str, Option<&str>> = categories
+    chain_in(&parent_map(categories), start)
+}
+
+/// Each category's parent, by id.
+fn parent_map(categories: &[Category]) -> HashMap<&str, Option<&str>> {
+    categories
         .iter()
         .map(|c| (c.id.as_str(), c.parent_id.as_deref()))
+        .collect()
+}
+
+/// Each category's name, by id.
+fn name_map(categories: &[Category]) -> HashMap<&str, &str> {
+    categories
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect()
+}
+
+/// The path of category `id`: the names along its chain of parents
+/// ([`category_chain`]), from the top down, joined with "/".
+fn path_in(
+    parent_of: &HashMap<&str, Option<&str>>,
+    name_of: &HashMap<&str, &str>,
+    id: &str,
+) -> String {
+    let chain = chain_in(parent_of, id);
+    let mut names: Vec<&str> = chain
+        .ids()
+        .iter()
+        .filter_map(|cid| name_of.get(cid.as_str()).copied())
         .collect();
+    names.reverse();
+    names.join("/")
+}
+
+/// The path of every category in `categories` - exactly as
+/// [`Database::category_path_string`] spells each one - from maps built once:
+/// no read per category.
+pub fn category_paths(categories: &[Category]) -> HashMap<String, String> {
+    let parent_of = parent_map(categories);
+    let name_of = name_map(categories);
+    categories
+        .iter()
+        .map(|c| (c.id.clone(), path_in(&parent_of, &name_of, &c.id)))
+        .collect()
+}
+
+/// [`category_chain`] over a parent map built once.
+fn chain_in(parent_of: &HashMap<&str, Option<&str>>, start: &str) -> CategoryChain {
     let mut ids: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut current = Some(start);
@@ -3145,6 +3406,29 @@ pub fn category_chain(categories: &[Category], start: &str) -> CategoryChain {
         current = parent;
     }
     CategoryChain::Rooted(ids)
+}
+
+/// Category `root` and every category below it in `categories`, each once:
+/// the categories whose path a rename or a move of `root` changes. A
+/// visited set bounds the walk on a parent loop, which a restored vault can
+/// hold (A2-45).
+pub fn category_subtree(categories: &[Category], root: &str) -> Vec<String> {
+    let mut ids = vec![root.to_string()];
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::from([root]);
+    let mut next = 0;
+    while next < ids.len() {
+        let parent = ids[next].clone();
+        for child in categories
+            .iter()
+            .filter(|c| c.parent_id.as_deref() == Some(parent.as_str()))
+        {
+            if seen.insert(child.id.as_str()) {
+                ids.push(child.id.clone());
+            }
+        }
+        next += 1;
+    }
+    ids
 }
 
 /// A key's Bitwarden revision metadata as a backup carries it. `KeyRecord`
@@ -3343,7 +3627,7 @@ mod tests {
         assert_eq!(kept.host_key, "current-blob");
     }
 
-    // ── RU4 (A7-46): one fingerprint form; named known_hosts columns ────────
+    // ── One fingerprint form; named known_hosts columns (A7-46) ─────────────
 
     fn seed_known_host(db: &Database, host: &str, key: &str, fp: &str, source: &str) {
         block(async {
@@ -3469,7 +3753,7 @@ mod tests {
         );
     }
 
-    /// RU1 handoff for known_hosts: a pooled connection that loaded the
+    /// For known_hosts too: a pooled connection that loaded the
     /// schema before the upgrade added `source` must still read it. With
     /// `SELECT *` such a connection never saw the column, and the reader's
     /// fallback made an unconfirmed backup pin look like a confirmed one.
@@ -3784,7 +4068,7 @@ mod tests {
         assert_eq!(got.target_server_id.as_deref(), Some("srv-9"));
     }
 
-    // ── F3/F6: atomic vault rotation ─────────────────────────────────────────
+    // ── Atomic vault rotation ─────────────────────────────────────────
 
     fn rotation_key(id: &str, pw: &str) -> KeyRecord {
         KeyRecord {
@@ -3808,7 +4092,7 @@ mod tests {
         }
     }
 
-    /// F3/F6 regression: a full rotation (keys + the Bitwarden credential +
+    /// Regression: a full rotation (keys + the Bitwarden credential +
     /// the verifier) commits in one transaction, so after `apply_vault_rotation`
     /// every record unseals under the NEW password and the old password fails.
     #[test]
@@ -3881,7 +4165,7 @@ mod tests {
         let stored = db.get_key("k1").unwrap().unwrap();
         assert!(crate::crypto::vault::unseal(new_pw, &stored.private_key_encrypted).is_ok());
         assert!(crate::crypto::vault::unseal(old_pw, &stored.private_key_encrypted).is_err());
-        // The Bitwarden credential rotated too (F6): NEW unseals, OLD fails.
+        // The Bitwarden credential rotated too: NEW unseals, OLD fails.
         let cfg2 = db.load_bitwarden_config().unwrap();
         let mp = cfg2.master_password.unwrap();
         assert_eq!(
@@ -3916,7 +4200,7 @@ mod tests {
         );
     }
 
-    // ── C1: the rotation commit is conditional and column-precise ───────────
+    // ── The rotation commit is conditional and column-precise ───────────
 
     /// A rotation of the one key `k1` (snapshot taken now), old -> new.
     fn one_key_rotation(db: &Database, old_pw: &str, new_pw: &str) -> VaultRotation {
@@ -3955,7 +4239,15 @@ mod tests {
         db.insert_key(&rotation_key("k1", old_pw)).unwrap();
         let rotation = one_key_rotation(&db, old_pw, new_pw);
         // Meanwhile: the row is rewritten with another old-password blob.
-        db.update_key(&rotation_key("k1", old_pw)).unwrap();
+        let other_blob = rotation_key("k1", old_pw).private_key_encrypted;
+        block(async {
+            sqlx::query("UPDATE keys SET private_key_encrypted = ? WHERE id = ?")
+                .bind(&other_blob)
+                .bind("k1")
+                .execute(&db.pool)
+                .await
+        })
+        .unwrap();
         let err = db.apply_vault_rotation(&rotation).unwrap_err();
         assert_rolled_back(&db, old_pw, err);
     }
@@ -4051,9 +4343,9 @@ mod tests {
         assert_eq!(last.as_deref(), Some(now.to_rfc3339().as_str()));
     }
 
-    // ── F9: restore clears machine-local deployment state ───────────────────
+    // ── Restore clears machine-local deployment state ───────────────────
 
-    /// F9 regression: a backup carrying `deployed`/`deploy_path` must NOT
+    /// Regression: a backup carrying `deployed`/`deploy_path` must NOT
     /// restore them - deployment is machine-local and a crafted path would
     /// otherwise steer `key_remove_deployed` into deleting an arbitrary file.
     #[test]
@@ -4249,7 +4541,7 @@ mod tests {
         assert_eq!(links.get("k1"), Some(&vec!["c1".to_string()]));
     }
 
-    /// RU1 handoff: a pooled connection that loaded the schema before the
+    /// A pooled connection that loaded the schema before the
     /// upgrade added columns must still read key and server rows. With
     /// `SELECT *` sqlx prepares against the stale column list, SQLite
     /// re-prepares with the new one, and sqlx indexed past its cached columns
@@ -4422,6 +4714,58 @@ mod tests {
         assert_eq!(gone.unwrap_err().to_string(), "MCP server not found.");
         assert!(db.get_mcp_server("gone").unwrap().is_none());
     }
+
+    /// A database call made in the root future of a multi-thread runtime's
+    /// `block_on` (the body of a `#[tokio::test(flavor = "multi_thread")]`)
+    /// waited in tokio's nested `block_on`, which parks on the parker of
+    /// that very `block_on`. A wake-up meant for another part of the root
+    /// future that came in during the call was used up there, and the root
+    /// future waited for the next event: here for the 30 s timer, in the MCP
+    /// tests of round 6 forever. The call parks on a parker of its own now,
+    /// and the wake-up is kept.
+    #[test]
+    fn rw_fix6_a_database_call_in_a_block_on_root_keeps_the_wake_ups_of_others() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (seen, took) = runtime.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let calling = std::sync::Arc::new(AtomicBool::new(false));
+            let in_call = calling.clone();
+            // Sends while the "database call" below is waiting.
+            std::thread::spawn(move || {
+                while !in_call.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                let _ = tx.send(());
+            });
+            let started = std::time::Instant::now();
+            let seen = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    biased;
+                    _ = rx => true,
+                    _ = async {
+                        block(async {
+                            calling.store(true, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await
+                        });
+                        std::future::pending::<()>().await
+                    } => false,
+                }
+            })
+            .await;
+            (seen, started.elapsed())
+        });
+        assert!(matches!(seen, Ok(true)), "{seen:?}");
+        assert!(
+            took < std::time::Duration::from_secs(15),
+            "the wake-up was lost: seen only after {took:?} (the 30 s timer)"
+        );
+    }
 }
 
 fn short_hash(s: &str) -> u32 {
@@ -4589,7 +4933,7 @@ mod ru5_fix2_tests {
 
     #[test]
     fn a_settings_save_that_fails_part_way_changes_nothing() {
-        // F1-b (a): the fields used to be separate autocommit statements, so
+        // The fields used to be separate autocommit statements, so
         // a save that failed after the URL kept the NEW URL with the OLD
         // sealed password.
         let path = temp_db_path();
@@ -4618,7 +4962,7 @@ mod ru5_fix2_tests {
 
     #[test]
     fn readers_never_see_a_mixed_server_account_and_password() {
-        // F1-b (b): a reader on another connection must see either the old
+        // A reader on another connection must see either the old
         // settings or the new ones - never the new URL with the old password.
         let path = temp_db_path();
         let writer = single_connection_db(&path);
@@ -4857,6 +5201,17 @@ mod ru5_fix2_tests {
 pub(crate) mod test_support {
     use super::*;
 
+    /// How often `db`'s categories table was read (`list_categories`,
+    /// `get_category`) so far.
+    pub(crate) fn category_reads(db: &Database) -> usize {
+        CATEGORY_READS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|reads| reads.get(&db.db_path).copied())
+            .unwrap_or(0)
+    }
+
     /// Run `statements` - SQL and its text binds - on ANOTHER connection to
     /// `db`'s file inside `BEGIN IMMEDIATE`, and keep that write open for
     /// `ms` milliseconds before committing: a concurrent writer caught
@@ -4943,7 +5298,7 @@ mod ru6b_tests {
         );
     }
 
-    // ── Item 13: read-then-write transactions take the write lock first ───
+    // ── Read-then-write transactions take the write lock first ───
 
     /// A restore whose first statement is a read (a server's category
     /// check) used a deferred transaction: with another connection writing,
@@ -5231,7 +5586,7 @@ mod ru6b_tests {
         );
     }
 
-    // ── Item 12: category walks are bounded ───────────────────────────────
+    // ── Category walks are bounded ───────────────────────────────
 
     fn category(id: &str, parent: Option<&str>) -> Category {
         Category {
@@ -5247,15 +5602,16 @@ mod ru6b_tests {
     }
 
     /// `category_path_string` for `id`, or a failure if it does not finish
-    /// within two seconds (an unbounded walk never does).
-    fn path_within_two_seconds(db: &Database, id: &str) -> String {
+    /// (an unbounded walk never does). The limit is wide for a loaded
+    /// machine: a walk that never ends fails it all the same.
+    fn path_that_ends(db: &Database, id: &str) -> String {
         let (done, result) = std::sync::mpsc::channel();
         let (db, id) = (db.clone(), id.to_string());
         std::thread::spawn(move || {
             let _ = done.send(db.category_path_string(&id));
         });
         result
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the category path walk must end (parent loop)")
     }
 
@@ -5274,13 +5630,13 @@ mod ru6b_tests {
         ] {
             db.insert_category(&c).unwrap();
         }
-        assert_eq!(path_within_two_seconds(&db, "self"), "cat-self");
-        assert_eq!(path_within_two_seconds(&db, "a"), "cat-b/cat-a");
+        assert_eq!(path_that_ends(&db, "self"), "cat-self");
+        assert_eq!(path_that_ends(&db, "a"), "cat-b/cat-a");
         // Reached through a category that is not part of the loop.
-        assert_eq!(path_within_two_seconds(&db, "n"), "cat-b/cat-a/cat-n");
+        assert_eq!(path_that_ends(&db, "n"), "cat-b/cat-a/cat-n");
         // A normal chain is unchanged.
-        assert_eq!(path_within_two_seconds(&db, "leaf"), "cat-root/cat-leaf");
-        assert_eq!(path_within_two_seconds(&db, "missing"), "");
+        assert_eq!(path_that_ends(&db, "leaf"), "cat-root/cat-leaf");
+        assert_eq!(path_that_ends(&db, "missing"), "");
     }
 
     fn ids(list: &[&str]) -> Vec<String> {

@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(stored.comment(), imported.comment);
     }
 
-    /// RU6a item 11: a file whose `Private-MAC` is missing or empty skipped
+    /// A file whose `Private-MAC` is missing or empty skipped
     /// the MAC check entirely, so an edited (or truncated) key imported as if
     /// it were intact - encrypted or not.
     #[test]

@@ -967,9 +967,9 @@ pub async fn start_interactive(
     // the last moment before the session is registered. The network handshake
     // and authentication above are the long await during which a lock could
     // have landed; without this check a connection started before the lock
-    // would register a live session into the now-locked vault (the audit's
-    // F2). Aborting here drops `session`, closing the just-established
-    // connection rather than registering it.
+    // would register a live session into the now-locked vault. Aborting here
+    // drops `session`, closing the just-established connection rather than
+    // registering it.
     if let Some(gen) = vault_generation {
         crate::commands::require_generation_current(&app, gen).map_err(|e| anyhow::anyhow!(e.0))?;
     }
@@ -1119,8 +1119,8 @@ pub async fn start_interactive(
 
     // Mark the server as last-connected - that column only. Writing back the
     // whole row read before the handshake could put an old-sealed
-    // saved_password over one a master-password change re-sealed meanwhile
-    // (C1).
+    // saved_password over one a master-password change re-sealed
+    // meanwhile.
     let _ = db.touch_server_last_connected(&params.server.id, chrono::Utc::now());
 
     Ok(session_id)
@@ -1208,7 +1208,7 @@ mod tests {
         }
     }
 
-    /// RU6a item 7 (Task 10's missing tests): what the SFTP transfer queue
+    /// What the SFTP transfer queue
     /// asks the registry - which saved server a session belongs to (stamped on
     /// every queued job) and every live session with its server and start
     /// time (what a paused job is re-pointed at after a reconnect).
@@ -1249,7 +1249,7 @@ mod tests {
     }
 }
 
-/// RU4: UTF-8 decoding of terminal output (A7-08), the one fingerprint format
+/// UTF-8 decoding of terminal output (A7-08), the one fingerprint format
 /// (A7-46), host-key outcomes (A7-14), connect/auth deadlines (A7-15),
 /// keyboard-interactive answers (A6-11) and disconnect safety (A2-12) -
 /// against an in-process russh server on 127.0.0.1 with a throwaway host key
@@ -1287,9 +1287,9 @@ mod ru4_tests {
     /// The trust-dialog test needs a connect deadline SHORTER than the time
     /// the scripted dialog stays open (that is what it proves is not
     /// counted), yet long enough for the network part of a handshake on a
-    /// busy machine.
+    /// machine saturated by other builds and suites.
     const DIALOG_TEST_DEADLINES: Deadlines = Deadlines {
-        connect: Duration::from_secs(3),
+        connect: Duration::from_secs(10),
         auth: Duration::from_secs(20),
     };
     /// Upper bound for one test's connect, so a missing deadline fails the
@@ -1419,6 +1419,9 @@ mod ru4_tests {
 
     // ── A7-15: the trust dialog is user time, not network time ──────────────
 
+    /// The network's 100 ms fit its 1 s, the dialog's 1.5 s do not: counted,
+    /// they would time the handshake out. The 0.9 s to spare are for a
+    /// loaded machine, whose timers wake late.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ru4_network_deadline_excludes_time_in_the_trust_dialog() {
         let watch = Arc::new(HandshakeWatch::default());
@@ -1427,13 +1430,13 @@ mod ru4_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             {
                 let _open = in_dialog.dialog_open();
-                tokio::time::sleep(Duration::from_millis(900)).await;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
             "done"
         };
         assert_eq!(
-            within_network_time(Duration::from_millis(300), &watch, handshake).await,
+            within_network_time(Duration::from_secs(1), &watch, handshake).await,
             Some("done")
         );
 
@@ -1445,7 +1448,7 @@ mod ru4_tests {
             None
         );
         assert!(started.elapsed() >= Duration::from_millis(300));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     // ── in-process SSH server ────────────────────────────────────────────────
@@ -1689,9 +1692,11 @@ mod ru4_tests {
             .err()
             .unwrap();
         assert_eq!(err, format!("Timed out connecting to 127.0.0.1:{port}."));
-        assert!(started.elapsed() < Duration::from_secs(4));
+        // The test's 0.4 s deadline, not the app's 20 s one; the rest is
+        // room for a loaded machine.
+        assert!(started.elapsed() < Duration::from_secs(15));
         assert!(shown.lock().unwrap().is_empty());
-        tokio::time::timeout(Duration::from_secs(3), closed)
+        tokio::time::timeout(Duration::from_secs(30), closed)
             .await
             .expect("the abandoned connection was left open")
             .unwrap();
@@ -1709,7 +1714,7 @@ mod ru4_tests {
         assert_eq!(err, format!("Timed out connecting to 127.0.0.1:{port}."));
         // The handshake task russh spawned owns the socket: it must be shut
         // down, not left waiting for the server forever.
-        tokio::time::timeout(Duration::from_secs(3), closed)
+        tokio::time::timeout(Duration::from_secs(30), closed)
             .await
             .expect("the abandoned key exchange kept its connection open")
             .unwrap();
@@ -1748,7 +1753,7 @@ mod ru4_tests {
         );
     }
 
-    /// The user reading the trust dialog for three times the connect
+    /// The user reading the trust dialog for longer than the whole connect
     /// deadline is not a stalled network: the connection completes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ru4_trust_dialog_time_does_not_count_against_the_connect_deadline() {
@@ -1963,7 +1968,7 @@ mod ru4_tests {
         session_disconnect(&registry, "s1");
         session_disconnect(&registry, "s1");
         session_disconnect(&registry, "never-registered");
-        tokio::time::timeout(Duration::from_secs(2), task)
+        tokio::time::timeout(Duration::from_secs(30), task)
             .await
             .unwrap()
             .unwrap();

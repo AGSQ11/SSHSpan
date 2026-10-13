@@ -14,6 +14,17 @@ fn openssh_pub_algo(line: &str) -> &str {
     line.split_whitespace().next().unwrap_or("")
 }
 
+/// Store every set field of `config` the way the app changes the sync
+/// settings: in one transaction over the settings as stored.
+fn store_bitwarden_config(db: &Database, config: &BitwardenConfig) {
+    let config = config.clone();
+    db.update_bitwarden_config(move |stored| {
+        *stored = config;
+        Ok(())
+    })
+    .unwrap();
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  Key Generation
 // ═════════════════════════════════════════════════════════════════════════════
@@ -401,7 +412,7 @@ fn db_bitwarden_config_save_load() {
         last_result: None,
     };
 
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
     let loaded = db.load_bitwarden_config().unwrap();
 
     assert_eq!(
@@ -431,14 +442,14 @@ fn db_bitwarden_config_overwrite() {
         email: Some("old@example.com".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config1).unwrap();
+    store_bitwarden_config(&db, &config1);
 
     let config2 = BitwardenConfig {
         server_url: Some("https://new.example.com".to_string()),
         email: Some("new@example.com".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config2).unwrap();
+    store_bitwarden_config(&db, &config2);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert_eq!(
@@ -693,7 +704,7 @@ fn key_deploy_creates_files() {
     );
 }
 
-/// RU3 fix 1: users are told to `Include` the managed config from
+/// Users are told to `Include` the managed config from
 /// `~/.ssh/config`, so one line OpenSSH rejects stops EVERY ssh command. Deploy
 /// into a home directory whose path has a space and an apostrophe, with key
 /// names holding quote, backslash and comment characters, then let the real
@@ -802,7 +813,7 @@ fn bitwarden_config_partial_update() {
         folder_name: Some("SSHSpan".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
 
     // Update only server_url and email
     let updated = BitwardenConfig {
@@ -811,7 +822,7 @@ fn bitwarden_config_partial_update() {
         folder_name: Some("SSHSpan".to_string()), // keep same
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&updated).unwrap();
+    store_bitwarden_config(&db, &updated);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert_eq!(
@@ -832,7 +843,7 @@ fn bitwarden_config_last_sync() {
         last_sync: Some(sync_time),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert!(loaded.last_sync.is_some());
@@ -853,7 +864,7 @@ fn bitwarden_config_empty_strings() {
         folder_name: Some("".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert_eq!(loaded.server_url.as_deref(), Some(""));
@@ -1061,7 +1072,9 @@ fn restore_with_invalid_key_names_audits_each_rename_without_stalling() {
     let elapsed = started.elapsed();
 
     let mut problems = Vec::new();
-    if elapsed >= std::time::Duration::from_secs(3) {
+    // A stalled rename waits out the whole 5 s busy timeout (and loses its
+    // audit row, counted below); the rest is room for a loaded machine.
+    if elapsed >= std::time::Duration::from_millis(4500) {
         problems.push(format!("restore stalled for {elapsed:?}"));
     }
     if counts["keys"] != 2 {

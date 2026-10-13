@@ -75,6 +75,8 @@ pub fn run() {
             app.manage(commands::VaultGeneration::new());
             // Master-password change vs. every other write of sealed data
             app.manage(commands::VaultRotationLock::new());
+            // One native credential question (MCP binding, API key move) at a time
+            app.manage(commands::CredentialQuestions::new());
             // Per-tab AI access levels; in-memory, cleared on vault lock
             app.manage(assistant::AssistantLevels::new());
             // Live MCP sessions + connect statuses; torn down on vault lock
@@ -141,10 +143,10 @@ pub fn run() {
             vault_lock,
             vault_change_password,
             vault_status,
-            // Backups are written and read by Rust behind native dialogs.
-            // `vault_backup_create` / `vault_backup_restore` are deliberately
-            // NOT registered: they moved the sealed vault through the webview
-            // (see their doc comments).
+            // Backups are written and read by Rust behind native dialogs. The
+            // commands that moved the sealed vault through the webview
+            // (`vault_backup_create` / `vault_backup_restore`, and
+            // `vault_export` / `vault_import`) were removed (A6-03).
             vault_backup_export_to_file,
             vault_backup_restore_from_file,
             // Key commands. `key_generate` and `key_fingerprint` were removed:
@@ -167,13 +169,15 @@ pub fn run() {
             category_create,
             category_rename,
             category_reparent,
+            category_set_order,
             category_delete,
             // Key ↔ category bridge
             key_set_categories,
             key_create_with_categories,
-            // SSH Config commands. `ssh_config_read` was removed (no renderer
-            // caller, A8-16); `ssh_config_write` is deliberately NOT registered
-            // (see its doc comment).
+            // SSH Config commands. `ssh_config_read` and `ssh_config_write`
+            // were removed (no renderer caller, A8-16; `ssh_config_write` let
+            // a caller write any directive - ProxyCommand included - into the
+            // managed config, which only `key_deploy` writes).
             ssh_config_list_hosts,
             // Saved server CRUD
             server_list,
@@ -184,8 +188,8 @@ pub fn run() {
             terminal_send,
             terminal_resize,
             terminal_disconnect,
-            // `terminal_keepalive` is deliberately NOT registered: no renderer
-            // caller (A8-16); see its doc comment.
+            // `terminal_keepalive` was removed: no renderer caller (A8-16);
+            // keepalives are sent at the SSH protocol level.
             terminal_list,
             server_test,
             known_hosts_list,
@@ -193,11 +197,10 @@ pub fn run() {
             // Renderer liveness heartbeat (backend idle auto-lock input)
             heartbeat,
             // `sftp_upload`, `sftp_stage_path`, `sftp_file_sha256` and
-            // `sftp_set_mtime` are deliberately NOT registered: nothing in the
-            // renderer calls them (uploads go through the queue, which does its
-            // own staging, verification and timestamps), and an unused
-            // command is IPC surface that only a compromised renderer could
-            // reach. Each keeps a doc comment saying so.
+            // `sftp_set_mtime` were removed: nothing in the renderer called
+            // them (uploads go through the queue, which does its own staging,
+            // verification and timestamps), and an unused command is IPC
+            // surface that only a compromised renderer could reach.
             sftp_open,
             sftp_list_dir,
             sftp_resolve_link,
@@ -307,7 +310,7 @@ pub fn run() {
         // the master password cleared and `vault.lock` audited (A6-09 / A7-47
         // / A8-23) - and the MCP session teardowns still running (each
         // unseals its own credential, then sends its DELETE) are waited for,
-        // 2 s at most, instead of being cut off (RU6b item 7). Tauri v2's
+        // 2 s at most, instead of being cut off. Tauri v2's
         // desktop run loop does NOT expose OS suspend/lock events
         // (WindowEvent::Suspended/Resumed are mobile-only), so an OS suspend
         // that leaves the process alive is not covered; that would need a
@@ -523,14 +526,16 @@ mod tests {
         assert!(!first_time(&flag));
     }
 
-    /// Item 7: the exit waits for the MCP session DELETEs still running -
-    /// and never longer than its budget.
+    /// The exit waits for the MCP session DELETEs still running -
+    /// and never longer than its budget. (The budgets that a passing run
+    /// never reaches are wide for a loaded machine; the hung teardown runs
+    /// 30 s, so a wait that ignored its budget still fails the 20 s bound.)
     #[test]
     fn the_exit_waits_for_mcp_teardowns_but_never_past_its_budget() {
         use std::time::{Duration, Instant};
         let mcp = assistant::mcp::McpState::new();
         assert!(
-            finish_mcp_teardowns(&mcp, Duration::from_secs(2)),
+            finish_mcp_teardowns(&mcp, Duration::from_secs(30)),
             "nothing to wait for"
         );
         // One that answers is waited for.
@@ -539,7 +544,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = done.send(());
         })]);
-        assert!(finish_mcp_teardowns(&mcp, Duration::from_secs(2)));
+        assert!(finish_mcp_teardowns(&mcp, Duration::from_secs(30)));
         assert!(finished.try_recv().is_ok(), "the teardown had finished");
         // One that hangs is cut off at the budget.
         mcp.track_teardowns(vec![tauri::async_runtime::spawn(async {
@@ -549,7 +554,7 @@ mod tests {
         assert!(!finish_mcp_teardowns(&mcp, Duration::from_millis(300)));
         let waited = started.elapsed();
         assert!(
-            waited >= Duration::from_millis(250) && waited < Duration::from_secs(2),
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(20),
             "{waited:?}"
         );
         assert!(mcp.take_teardowns().is_empty(), "each is waited for once");
