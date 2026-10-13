@@ -34,13 +34,26 @@
  * argument names, and reads mcp.js's payloads with this file's parser
  * (`require('./check-ipc-args.js')` exports it; running the file is the CLI).
  *
- * What it cannot read it does not guess at: a payload that is a spread, a
- * parameter, a computed key or a variable that is reassigned, deleted from or
- * shadowed is skipped, and the run says how many call sites that was.
+ * What it cannot read it does not guess at, and it never counts as checked: a
+ * command named by a variable or an expression (`call(cmd, { jobId })`), a
+ * payload that is a spread, a parameter, a variable that is reassigned, deleted
+ * from or shadowed, or that holds a computed key (`[name]: v`) or another key
+ * that is not a plain name, and every other use of a wrapper's name - an alias
+ * (`const c = call`), `.call`/`.apply`, `window.call`, a bracket access
+ * (`tcore['invoke']`), `(0, call)(...)`, a destructured alias, `(window.call
+ * || call)(...)` - through which calls are made that cannot be read. Each such
+ * call site is listed by the run with the reason, and the summary says "every
+ * argument name was checked" only when there is none. A quoted key ('jobId':
+ * v) is read like a plain one; a call with spaces, a line break or `?.`
+ * before its "(" like any other. Comments and the text of strings are never
+ * read as code.
  */
 'use strict';
 const fs = require('fs');
 const path = require('path');
+// The renderer's source as code alone (comments and the text of strings,
+// templates and regular expressions blanked), from the hygiene check's reader.
+const { jsMask, jsCode } = require('./check-renderer-hygiene.js');
 
 const ROOT = path.resolve(__dirname, '..');
 const RUST_DIR = path.join(ROOT, 'src-tauri/src');
@@ -214,39 +227,92 @@ function parseRegisteredCommands(src) {
   return null;
 }
 
+/// The characters after which a `/` starts a regular expression rather than a
+/// division (the walkers below skip a regular expression whole: one can hold a
+/// quote, a bracket or `//`).
+const REGEX_MAY_FOLLOW = /^$|[(,=:[!&|?{};+\-*%<>~^]/;
+
+/// The index of the last character of the regular expression literal that
+/// starts at src[at] (its flags included).
+function endOfRegex(src, at) {
+  let j = at + 1;
+  let inClass = false;
+  for (; j < src.length && src[j] !== '\n'; j++) {
+    const c = src[j];
+    if (c === '\\') { j++; continue; }
+    if (c === '[') inClass = true;
+    else if (c === ']') inClass = false;
+    else if (c === '/' && !inClass) break;
+  }
+  while (j + 1 < src.length && /[a-z]/i.test(src[j + 1])) j++;
+  return j;
+}
+
 /**
  * The top-level keys of the object literal whose `{` is at src[open]. `end` is
  * the index of its closing `}`; `spread` is true when the literal contains a
- * `...`, so not every key can be known statically.
+ * `...`, so not every key can be known statically. A quoted key is the text
+ * between its quotes ('jobId' is jobId), so a misspelled one is caught like a
+ * plain one. A key that cannot be read - computed ([name]), quoted with an
+ * escape in it, a number, an accessor - is never dropped quietly: `unreadable`
+ * says what it was, and the call site is then reported as not checked.
+ * Comments and regular expressions inside the literal are skipped.
  */
 function readObjectKeys(src, open) {
   const keys = [];
-  // Walk the object literal, collecting only depth-0 `key:` tokens.
-  let depth = 0, str = null, tok = '', j = open, skipValue = false;
-  const pushKey = (raw) => {
-    const t = raw.trim();
-    if (/^[A-Za-z_$][\w$]*$/.test(t)) keys.push(t);
+  let unreadable = null;
+  // Walk the object literal, collecting only depth-1 `key:` tokens.
+  let depth = 0, str = null, tok = '', quoted = null, j = open, skipValue = false, prev = '';
+  const cannotRead = (why) => { if (!unreadable) unreadable = why; };
+  const pushKey = () => {
+    const t = tok.trim();
+    if (quoted !== null) {
+      if (t) cannotRead(`a key that is not a plain name ('${quoted}' ${t})`);
+      else if (quoted.includes('\\')) cannotRead(`a quoted key with an escape ('${quoted}')`);
+      else keys.push(quoted);
+    } else if (/^[A-Za-z_$][\w$]*$/.test(t)) {
+      keys.push(t);
+    } else if (t && !t.startsWith('...')) {
+      cannotRead(`a key that is not a plain name (${t.replace(/\s+/g, ' ')})`);
+    }
+    tok = '';
+    quoted = null;
   };
   for (; j < src.length; j++) {
     const c = src[j];
-    if (str) { if (c === '\\') { j++; continue; } if (c === str) str = null; continue; }
-    if (c === "'" || c === '"' || c === '`') { str = c; continue; }
+    if (str) {
+      if (c === '\\') { if (str.key) str.text += c + (src[j + 1] || ''); j++; continue; }
+      if (c === str.q) { if (str.key) quoted = str.text; str = null; prev = c; continue; }
+      if (str.key) str.text += c;
+      continue;
+    }
+    if (c === '/' && src[j + 1] === '/') { const nl = src.indexOf('\n', j); j = nl < 0 ? src.length : nl - 1; continue; }
+    if (c === '/' && src[j + 1] === '*') { const e = src.indexOf('*/', j + 2); j = e < 0 ? src.length : e + 1; continue; }
+    if (c === '/' && REGEX_MAY_FOLLOW.test(prev)) { j = endOfRegex(src, j); prev = '/'; continue; }
+    if (!/\s/.test(c)) prev = c;
+    const atKey = depth === 1 && !skipValue && !tok.trim() && quoted === null;
+    if (c === "'" || c === '"' || c === '`') {
+      // A string where a key starts is the key; anywhere else it is skipped.
+      str = { q: c, key: atKey && c !== '`', text: '' };
+      continue;
+    }
+    if (atKey && c === '[') cannotRead('a computed key ([...])');
     if ('([{'.includes(c)) { depth++; continue; }
     if (')]}'.includes(c)) {
       depth--;
-      if (depth === 0) { if (!skipValue) pushKey(tok); break; }
+      if (depth === 0) { if (!skipValue) pushKey(); break; }
       continue;
     }
     if (depth === 1) {
       // `key: value` and ES6 shorthand `{ key }` both name a key. A
       // shorthand entry is a bare identifier terminated by ',' or the
       // closing brace, so flush on both.
-      if (c === ':') { pushKey(tok); tok = ''; skipValue = true; }
-      else if (c === ',') { if (!skipValue) pushKey(tok); tok = ''; skipValue = false; }
-      else tok += c;
+      if (c === ':' && !skipValue) { pushKey(); skipValue = true; }
+      else if (c === ',') { if (!skipValue) pushKey(); tok = ''; quoted = null; skipValue = false; }
+      else if (!skipValue) tok += c;
     }
   }
-  return { keys, end: j, spread: /\.\.\./.test(src.slice(open, j + 1)) };
+  return { keys, end: j, spread: /\.\.\./.test(src.slice(open, j + 1)), unreadable };
 }
 
 /**
@@ -311,7 +377,7 @@ function variablePayloadKeys(src, argStart) {
   if (/\n\S/.test(src.slice(decl.index, argStart))) return null;
   const open = decl.index + decl[0].length - 1;
   const literal = readObjectKeys(src, open);
-  if (literal.spread) return null;
+  if (literal.spread || literal.unreadable) return null;
   const tail = src.slice(literal.end, argStart);
   if (rebinding(tail, name)) return null;
   if (new RegExp('Object\\.assign\\(\\s*' + name + '\\b').test(tail)) return null;
@@ -322,32 +388,252 @@ function variablePayloadKeys(src, argStart) {
   return keys;
 }
 
-/** The invoke()/call() sites in one source text, with the literal top-level keys they pass. */
+// The ways the renderer calls a command: invoke() itself and the wrappers
+// around it. sftpCall is sftp.js's own; without it here most of that file's
+// IPC calls were never checked at all. aiCall is assistant.js's, and was
+// missing the same way (A8-17). A method of that name on something else
+// (`fn.call(this, ...)`) is not one. Spaces, a line break or `?.` may stand
+// between the name and its "(".
+const WRAPPER_NAMES = ['call', 'sftpCall', 'mcpCall', 'aiCall', 'invoke'];
+const WRAPPER_ALT = WRAPPER_NAMES.join('|');
+const IPC_CALL = new RegExp('(?<![\\w$.])(?:' + WRAPPER_ALT + ')\\s*(?:\\?\\.\\s*)?\\(|\\.\\s*invoke\\s*(?:\\?\\.\\s*)?\\(', 'g');
+/// A wrapper's name as a word of code.
+const WRAPPER_WORD = new RegExp('(?<![\\w$])(' + WRAPPER_ALT + ')(?![\\w$])', 'g');
+/// A wrapper's name as a string in brackets: tcore['invoke'], window["call"].
+const WRAPPER_BRACKET = new RegExp('\\[\\s*([\'"`])(' + WRAPPER_ALT + ')\\1\\s*\\]', 'g');
+
+/**
+ * The bodies of the wrappers declared in `code` (masked: comments and the text
+ * of strings blanked) - `async function call(cmd, args) { return await
+ * invoke(cmd, args ?? {}); }` and the arrow wrappers `const mcpCall = (cmd,
+ * args) => (window.call || call)(cmd, args);`: where a wrapper hands its own
+ * first parameter on to the next layer. That is the wrapper, not a call site,
+ * and the names it uses there are the chain of wrappers, not references.
+ */
+function wrapperBodies(code) {
+  const bodies = [];
+  const blockEnd = (open) => {
+    let depth = 0;
+    let j = open;
+    for (; j < code.length; j++) {
+      if (code[j] === '{') depth++;
+      else if (code[j] === '}' && --depth === 0) break;
+    }
+    return j;
+  };
+  const fnRe = new RegExp('\\bfunction\\s+(' + WRAPPER_ALT + ')\\s*\\(\\s*([A-Za-z_$][\\w$]*)[^)]*\\)\\s*\\{', 'g');
+  for (let m = fnRe.exec(code); m; m = fnRe.exec(code)) {
+    bodies.push({ from: m.index + m[0].length, to: blockEnd(m.index + m[0].length - 1), param: m[2] });
+  }
+  const arrowRe = new RegExp('\\b(?:const|let|var)\\s+(' + WRAPPER_ALT + ')\\s*=\\s*(?:async\\s*)?\\(\\s*([A-Za-z_$][\\w$]*)[^)]*\\)\\s*=>\\s*', 'g');
+  for (let m = arrowRe.exec(code); m; m = arrowRe.exec(code)) {
+    const from = m.index + m[0].length;
+    let to = from;
+    if (code[from] === '{') {
+      to = blockEnd(from);
+    } else {
+      // An expression body: to the `;`, the line break or the bracket that
+      // ends it at its own depth.
+      let depth = 0;
+      for (; to < code.length; to++) {
+        const c = code[to];
+        if ('([{'.includes(c)) depth++;
+        else if (')]}'.includes(c)) { if (depth === 0) break; depth--; }
+        else if ((c === ';' || c === '\n' || c === ',') && depth === 0) break;
+      }
+    }
+    bodies.push({ from, to, param: m[2] });
+  }
+  return bodies;
+}
+
+/// The index of the `{` or `[` that holds `at` in `code` (masked), or -1 when
+/// a `(` holds it first, or nothing does.
+function enclosingOpen(code, at) {
+  let depth = 0;
+  for (let i = at - 1; i >= 0; i--) {
+    const c = code[i];
+    if (')]}'.includes(c)) depth++;
+    else if ('([{'.includes(c)) {
+      if (depth === 0) return c === '(' ? -1 : i;
+      depth--;
+    }
+  }
+  return -1;
+}
+
+/// The index of the `}` or `]` that closes the bracket at `open`, or -1.
+function matchingClose(code, open) {
+  const o = code[open];
+  const c = o === '{' ? '}' : ']';
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    if (code[i] === o) depth++;
+    else if (code[i] === c && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/// Whether the key at `at` sits in a destructuring pattern - `const {
+/// invoke: inv } = ...`, `({ invoke: inv } = ...)`, nested in other object or
+/// array patterns too - rather than in an object literal.
+function inDestructuring(code, at) {
+  let open = enclosingOpen(code, at);
+  for (let level = 0; open >= 0 && level < 8; level++) {
+    const before = code.slice(Math.max(0, open - 40), open);
+    if (/\b(?:const|let|var)\s*$/.test(before)) return true;
+    const close = matchingClose(code, open);
+    if (close >= 0 && /^\s*=(?![=>])/.test(code.slice(close + 1, close + 20))) return true;
+    // Only a pattern inside a pattern goes on outwards: `{ a: { invoke: x } }`,
+    // `[{ invoke: x }]`.
+    if (!/[:,[{]\s*$/.test(before)) return false;
+    open = enclosingOpen(code, open);
+  }
+  return false;
+}
+
+/**
+ * Every use of a wrapper's name in `code` (masked) that is neither a call
+ * (the sites IPC_CALL finds) nor a definition: it hands the wrapper on - an
+ * alias (`const c = call`), `.call`/`.apply` on it, `window.call`, `(0,
+ * call)(...)`, a destructured alias (`{ invoke: inv }`), `(window.call ||
+ * call)(...)`, a bracket access (`tcore['invoke']`, read in `commentFree`:
+ * the source with comments blanked and strings kept) - and the calls made
+ * through it cannot be read. As { at, text }. Not one: a definition
+ * (`function call(...)`, `const mcpCall = ...`, `const { invoke } = ...`),
+ * the names inside a wrapper's own body, and a method of that name on
+ * another object (`handler.call(this, ev)`).
+ */
+function wrapperReferences(code, commentFree, bodies) {
+  const found = [];
+  WRAPPER_WORD.lastIndex = 0;
+  for (let m = WRAPPER_WORD.exec(code); m; m = WRAPPER_WORD.exec(code)) {
+    const at = m.index;
+    const name = m[1];
+    if (bodies.some((w) => at >= w.from && at < w.to)) continue;
+    const before = code.slice(Math.max(0, at - 200), at);
+    const after = code.slice(at + name.length, at + name.length + 40);
+    const called = /^\s*(?:\?\.\s*)?\(/.test(after);
+    const owner = /([A-Za-z_$][\w$]*)?\s*(?:\?\.|\.)\s*$/.exec(before);
+    if (owner) {
+      const onGlobal = /^(?:window|globalThis|self)$/.test(owner[1] || '');
+      if (!onGlobal && (name === 'call' || (name === 'invoke' && called))) continue;
+      found.push({ at, text: (owner[1] ? owner[1] + '.' : '.') + name });
+      continue;
+    }
+    if (called) continue;
+    if (/\bfunction\s*\*?\s*$/.test(before)) continue;
+    if (/\b(?:const|let|var)\s+$/.test(before) && /^\s*=/.test(after)) continue;
+    if (/[{,]\s*$/.test(before) && /^\s*[,}]/.test(after) && /\b(?:const|let|var)\s*\{[^}]*$/.test(before)) continue;
+    // A key named like a wrapper (`{ call: () => 1 }`) is no reference to one
+    // - unless the braces are a destructuring pattern, where `{ invoke: inv }`
+    // renames the wrapper. (After "?" it is a ternary's branch: a reference.)
+    if (/[{,]\s*$/.test(before) && /^\s*:/.test(after) && !inDestructuring(code, at)) continue;
+    found.push({ at, text: name });
+  }
+  WRAPPER_BRACKET.lastIndex = 0;
+  for (let m = WRAPPER_BRACKET.exec(commentFree); m; m = WRAPPER_BRACKET.exec(commentFree)) {
+    if (code[m.index] === '[') found.push({ at: m.index, text: `[${m[1]}${m[2]}${m[1]}]` });
+  }
+  return found;
+}
+
+/**
+ * The first argument of the call whose `(` ends at src[at - 1]: its text up to
+ * the top-level `,` or `)` that ends it, and where that is. `literal` is the
+ * command name when the argument is exactly one string literal; otherwise
+ * null - a variable, a template with a substitution, a concatenation, a
+ * conditional - and the command cannot be read.
+ */
+function firstArgument(src, at) {
+  let i = at;
+  while (i < src.length && /\s/.test(src[i])) i++;
+  const q = src[i];
+  if (q === "'" || q === '"' || q === '`') {
+    let j = i + 1;
+    while (j < src.length && src[j] !== q && src[j] !== '\n') j += src[j] === '\\' ? 2 : 1;
+    let k = j + 1;
+    while (k < src.length && /\s/.test(src[k])) k++;
+    const text = src.slice(i + 1, j);
+    const plain = !text.includes('\\') && !(q === '`' && text.includes('${'));
+    if (plain && (src[k] === ',' || src[k] === ')')) return { literal: text, text: src.slice(i, j + 1), end: k };
+  }
+  let depth = 0;
+  let j = i;
+  for (; j < src.length; j++) {
+    const c = src[j];
+    if (c === "'" || c === '"' || c === '`') {
+      let k = j + 1;
+      while (k < src.length && src[k] !== c) k += src[k] === '\\' ? 2 : 1;
+      j = k;
+      continue;
+    }
+    if ('([{'.includes(c)) depth++;
+    else if (')]}'.includes(c)) { if (depth === 0) break; depth--; }
+    else if (c === ',' && depth === 0) break;
+  }
+  return { literal: null, text: src.slice(i, j).trim(), end: j };
+}
+
+/**
+ * The invoke()/call() sites in one source text, with the top-level keys they
+ * pass. A site whose command name is not a plain string literal (a variable,
+ * a template with a substitution, an expression) cannot be checked at all: it
+ * is kept with `cmd: null`, and the run lists it as not checked. `why` says
+ * why a site is not (fully) checked.
+ */
 function parseCallSitesIn(src, rel) {
   const sites = [];
-  // sftpCall is sftp.js's own wrapper around invoke(); without it here most
-  // of that file's IPC calls were never checked at all. aiCall is
-  // assistant.js's, and was missing the same way (A8-17).
-  const re = /(?:\bcall|sftpCall|mcpCall|aiCall|\.invoke|\binvoke)\(\s*(['"`])([a-z_0-9]+)\1\s*(,|\))/g;
-  let m;
-  while ((m = re.exec(src))) {
-    const line = src.slice(0, m.index).split('\n').length;
-    const site = { cmd: m[2], file: rel, line, keys: [], dynamic: false };
-    if (m[3] === ')') { sites.push(site); continue; }
-    let i = re.lastIndex;
+  // Calls are found in the code alone - a comment or a string that says "a
+  // call (...)" is none - and read from the source at the same place.
+  const code = jsMask(src);
+  const wrappers = wrapperBodies(code);
+  const lineOf = (at) => src.slice(0, at).split('\n').length;
+  IPC_CALL.lastIndex = 0;
+  for (let m = IPC_CALL.exec(code); m; m = IPC_CALL.exec(code)) {
+    // A declaration of the wrapper is no call (`async function call(cmd, args)`).
+    if (/\bfunction\s*\*?\s*$/.test(code.slice(Math.max(0, m.index - 20), m.index))) continue;
+    const after = m.index + m[0].length;
+    const arg = firstArgument(src, after);
+    // `invoke()` with nothing in it is no call.
+    if (!arg.text) continue;
+    if (arg.literal === null && wrappers.some((w) => m.index >= w.from && m.index < w.to && arg.text === w.param)) continue;
+    const line = lineOf(m.index);
+    if (arg.literal === null) {
+      const shown = arg.text.length > 48 ? arg.text.slice(0, 45) + '...' : arg.text;
+      sites.push({ at: m.index, cmd: null, file: rel, line, keys: [], dynamic: true, why: `the command name is not a string literal (${shown})` });
+      continue;
+    }
+    const site = { at: m.index, cmd: arg.literal, file: rel, line, keys: [], dynamic: false };
+    sites.push(site);
+    if (src[arg.end] === ')') continue;
+    let i = arg.end + 1;
     while (i < src.length && /\s/.test(src[i])) i++;
+    if (src[i] === ')') continue;
     if (src[i] !== '{') {
       const viaVariable = variablePayloadKeys(src, i);
-      if (viaVariable) site.keys = viaVariable; else site.dynamic = true;
-      sites.push(site);
+      if (viaVariable) site.keys = viaVariable;
+      else Object.assign(site, { dynamic: true, why: 'the payload is not an object literal or a plainly declared variable' });
       continue;
     }
     const literal = readObjectKeys(src, i);
     site.keys = literal.keys;
-    if (literal.spread) site.dynamic = true;
-    sites.push(site);
+    if (literal.spread) Object.assign(site, { dynamic: true, why: 'the payload has a spread (...)' });
+    else if (literal.unreadable) Object.assign(site, { dynamic: true, why: 'the payload has ' + literal.unreadable });
   }
-  return sites;
+  // The wrapper handed on: one site NOT checked per line that does it.
+  const byLine = new Map();
+  for (const r of wrapperReferences(code, jsCode(src), wrappers)) {
+    const line = lineOf(r.at);
+    const had = byLine.get(line);
+    if (had) had.texts.push(r.text);
+    else byLine.set(line, { at: r.at, texts: [r.text] });
+  }
+  for (const [line, r] of byLine) {
+    sites.push({ at: r.at, cmd: null, file: rel, line, keys: [], dynamic: true,
+      why: `the wrapper is handed on (${r.texts.join(', ')}), so the calls made through it cannot be read` });
+  }
+  return sites.sort((a, b) => a.at - b.at);
 }
 
 /** Find invoke()/call() sites and the literal top-level keys they pass. */
@@ -368,6 +654,7 @@ function parseJsCallSites() {
 function findProblems(sites, cmds, registered) {
   const problems = [];
   for (const s of sites) {
+    if (s.cmd == null) continue; // its command cannot be read: listed as not checked
     const def = cmds[s.cmd];
     if (!def) { problems.push(`${s.file}:${s.line}  unknown command '${s.cmd}'`); continue; }
     if (!registered.has(s.cmd)) {
@@ -397,6 +684,29 @@ function findProblems(sites, cmds, registered) {
     }
   }
   return problems;
+}
+
+/**
+ * The run's summary, which counts as checked only the call sites whose argument
+ * names were compared with the Rust signature. A site whose command name or
+ * payload cannot be read statically (a variable command, a spread, a computed
+ * key, a parameter, a rebound variable) is named with the reason, so it cannot
+ * be taken for one that was checked; only when there is none does the summary
+ * say every argument name was checked.
+ */
+function summaryLines(sites, cmds, registered) {
+  const notChecked = sites.filter((s) => s.cmd == null || (s.dynamic && cmds[s.cmd] && registered.has(s.cmd)));
+  const checked = sites.length - notChecked.length;
+  const lines = [`Checked ${checked} call site${checked === 1 ? '' : 's'} against ${Object.keys(cmds).length} commands (${registered.size} registered).`];
+  if (notChecked.length) {
+    lines.push(notChecked.length === 1
+      ? '1 more call site was NOT checked - its command name or payload cannot be read statically:'
+      : `${notChecked.length} more call sites were NOT checked - their command name or payload cannot be read statically:`);
+    for (const s of notChecked) lines.push(`  ${s.file}:${s.line}  ${s.cmd == null ? '(command unknown)' : s.cmd} - ${s.why || 'the payload cannot be read statically'}`);
+  } else {
+    lines.push('Every call site was read statically, so every argument name was checked.');
+  }
+  return lines;
 }
 
 // ─── self-check: the checker must catch what it exists to catch ─────────────
@@ -650,6 +960,152 @@ function selfCheck() {
   if (JSON.stringify(injectedKeys) !== JSON.stringify(['onEvent', 'qualifiedOnEvent', 'name'])) {
     failed.push(`injected parameters (AppHandle, Window, Webview, WebviewWindow, State, CommandScope, GlobalScope, Request) must be skipped and Channels kept, got ${JSON.stringify(injectedKeys)}`);
   }
+  // A command named by a variable or an expression cannot be checked at all, so it
+  // is a site that is listed as NOT checked - sftp.js's `call(cmd, { jobId })`
+  // (pause, resume, cancel, retry) used to be no site at all. A wrapper handing its
+  // own parameters on (app.js `call`, sftp.js `sftpCall`) is the wrapper, not a
+  // site; its declaration and a comment that mentions invoke() are none either.
+  const variableCommands = parseCallSitesIn([
+    '/** Every IPC call goes through invoke() which returns the result. */',
+    'async function call(cmd, args) {',
+    '  return await invoke(cmd, args ?? {});',
+    '}',
+    'async function sftpCall(cmd, args) {',
+    '  return await sftpCore.invoke(cmd, args);',
+    '}',
+    'function jobButton(cmd, j) {',
+    "  b.addEventListener('click', () => call(cmd, { jobId: j.id }));",
+    '}',
+    'function op(kind, dir) {',
+    '  sftpCall(`sftp_${kind}`, { sessionId });',
+    "  sftpCall('sftp_' + kind, { sessionId });",
+    "  return call(kind === 'a' ? 'cmd_a' : 'cmd_b', { sessionId, path: dir });",
+    '}',
+    "call('literal_cmd', { sessionId });",
+    'handler.call(this, ev); // a method of another object, not the IPC wrapper',
+  ].join('\n'), 'probe.js');
+  const named = variableCommands.map((s) => (s.cmd == null ? '?' : s.cmd) + '@' + s.line);
+  const namedWant = ['?@9', '?@12', '?@13', '?@14', 'literal_cmd@16'];
+  if (JSON.stringify(named) !== JSON.stringify(namedWant)) {
+    failed.push(`call sites with a command in a variable parsed as ${JSON.stringify(named)}, want ${JSON.stringify(namedWant)} (? = not readable)`);
+  }
+  const probeCmds = { literal_cmd: { args: [{ key: 'sessionId', optional: false }], file: 'probe.rs', line: 1 } };
+  const probeRegistered = new Set(['literal_cmd']);
+  const variableProblems = findProblems(variableCommands, probeCmds, probeRegistered);
+  if (variableProblems.length) failed.push(`a site whose command cannot be read is not checked, so it is no problem either, got ${JSON.stringify(variableProblems)}`);
+  // Quoted keys are keys like any other (recorded without their quotes, so a
+  // misspelled one is caught); a computed key, a key with an escape and anything
+  // else that is not a plain name cannot be read, and its site is not checked.
+  const keyed = parseCallSitesIn([
+    "call('quoted_cmd', { 'jobId': 1, \"sessionId\": s, plain });",
+    "call('computed_cmd', { [field]: 1, a: 2 });",
+    "call('escaped_cmd', { 'job\\u0049d': 1 });",
+    'function save() {',
+    "  const payload = { 'name': n, url };",
+    "  return mcpCall('variable_quoted_cmd', payload);",
+    '}',
+    'function computed() {',
+    '  const payload = { [k]: v };',
+    "  return mcpCall('variable_computed_cmd', payload);",
+    '}',
+    "call('numeric_cmd', { 1: x });",
+    "call('accessor_cmd', { get value() { return 1; } });",
+    "call('misnamed_cmd', { 'job_id': 1 });",
+  ].join('\n'), 'probe.js');
+  const keysOf = (cmd) => {
+    const s = keyed.find((x) => x.cmd === cmd);
+    return s ? (s.dynamic ? 'dynamic' : s.keys.join(',')) : 'no such call site';
+  };
+  const keyedWant = {
+    quoted_cmd: 'jobId,sessionId,plain',
+    computed_cmd: 'dynamic',
+    escaped_cmd: 'dynamic',
+    variable_quoted_cmd: 'name,url',
+    variable_computed_cmd: 'dynamic',
+    numeric_cmd: 'dynamic',
+    accessor_cmd: 'dynamic',
+    misnamed_cmd: 'job_id',
+  };
+  for (const [cmd, want] of Object.entries(keyedWant)) {
+    if (keysOf(cmd) !== want) failed.push(`${cmd}'s payload keys parsed as ${keysOf(cmd)}, want ${want}`);
+  }
+  const misnamed = findProblems(keyed.filter((s) => s.cmd === 'misnamed_cmd'),
+    { misnamed_cmd: { args: [{ key: 'jobId', optional: false }], file: 'probe.rs', line: 1 } }, new Set(['misnamed_cmd']));
+  if (!(misnamed.length === 2 && /unexpected arg 'job_id' \(did you mean 'jobId'/.test(misnamed[0]) && /missing required arg 'jobId'/.test(misnamed[1]))) {
+    failed.push(`a misspelled quoted key must be flagged like a plain one, got ${JSON.stringify(misnamed)}`);
+  }
+  // The summary never claims every argument name was checked while a site was not:
+  // each one is named, with the reason.
+  const partial = summaryLines(variableCommands, probeCmds, probeRegistered);
+  const partialText = partial.join('\n');
+  if (/every argument name was checked/i.test(partialText)
+    || !['probe.js:9', 'probe.js:12', 'probe.js:13', 'probe.js:14'].every((at) => partialText.includes(at))
+    || !/^Checked 1 call site against /.test(partial[0])) {
+    failed.push(`with unreadable sites the summary must count only the checked ones and name the rest, got ${JSON.stringify(partial)}`);
+  }
+  const spreadSite = { cmd: 'literal_cmd', file: 'probe.js', line: 30, keys: [], dynamic: true, why: 'the payload has a spread' };
+  const spreadSummary = summaryLines([spreadSite], probeCmds, probeRegistered).join('\n');
+  if (/every argument name was checked/i.test(spreadSummary) || !spreadSummary.includes('probe.js:30')) {
+    failed.push(`a payload that cannot be read must be named as not checked, got ${JSON.stringify(spreadSummary)}`);
+  }
+  const complete = summaryLines(variableCommands.filter((s) => s.cmd === 'literal_cmd'), probeCmds, probeRegistered);
+  if (!/every argument name was checked/i.test(complete.join('\n'))) {
+    failed.push(`with every site read the summary says so, got ${JSON.stringify(complete)}`);
+  }
+  // A call written with spaces, a line break or `?.` before its "(" is read
+  // like any other. Every other use of a wrapper's name hands the wrapper on
+  // to calls that cannot be read - an alias, .call/.apply, window.call, a
+  // bracket access, (0, call)(...), a destructured alias, (window.call ||
+  // call)(...) - so each is a site NOT checked (one per line). Comments,
+  // strings, templates and regular expressions name them freely, and the
+  // definitions - `const { invoke } = ...`, `function call(...)`, an arrow
+  // wrapper handing its own parameter on - are no sites.
+  const shapes = parseCallSitesIn([
+    "call\n  ('spaced_cmd', { sessionId });",
+    "call?.('optional_cmd', { sessionId });",
+    "tcore.invoke ?.('optional_invoke_cmd', { sessionId });",
+    'const c = call;',
+    "call.call(null, 'x_cmd', {});",
+    "invoke.apply(null, ['x_cmd', {}]);",
+    "tcore['invoke']('x_cmd', {});",
+    "window.call('x_cmd', {});",
+    "(0, call)('x_cmd', {});",
+    'const { invoke: inv } = tcore;',
+    "(window.call || call)('x_cmd', {});",
+    '// a call (in a comment) and invoke() mentioned',
+    "const s = 'a call (in a string)' + `and ${'call'} (a template)`;",
+    'handler.call(this, ev); fn.apply(this, args);',
+    'const { invoke } = window.__TAURI__.core;',
+    'const mcpCall = (cmd, args) => (window.call || call)(cmd, args);',
+    'async function call(cmd, args) { return await invoke(cmd, args); }',
+    'const re = /call\\(|invoke\\(/g;',
+    // An object literal's keys named like a wrapper are no reference to one;
+    // a destructuring assignment that renames one is; so is a ternary branch.
+    'const api = { call: () => 1, invoke: 2, mcpCall: 3 };',
+    '({ invoke: inv2 } = tcore);',
+    'const handlers = { call() { return 1; } };',
+    'const pick = fast ? call : sftpCall;',
+    'const [{ invoke: inv3 }] = list;',
+    'const nested = { a: { call: 1 }, b: [{ invoke: 2 }] }; run({ mcpCall: 3 });',
+    'for (const { invoke: inv4 } of list) {}',
+  ].join('\n'), 'probe.js');
+  const shapesGot = shapes.map((s) => (s.cmd == null ? '?' : s.cmd) + '@' + s.line);
+  const shapesWant = ['spaced_cmd@1', 'optional_cmd@3', 'optional_invoke_cmd@4', '?@5', '?@6', '?@7', '?@8', '?@9', '?@10', '?@11', '?@12',
+    '?@21', '?@23', '?@24', '?@26'];
+  if (JSON.stringify(shapesGot) !== JSON.stringify(shapesWant)) {
+    failed.push(`calls with a space or ?. and other uses of a wrapper's name parsed as ${JSON.stringify(shapesGot)}, want ${JSON.stringify(shapesWant)}`);
+  }
+  const shapeCmds = Object.fromEntries(['spaced_cmd', 'optional_cmd', 'optional_invoke_cmd']
+    .map((c) => [c, { args: [{ key: 'sessionId', optional: false }], file: 'probe.rs', line: 1 }]));
+  const shapeRegistered = new Set(Object.keys(shapeCmds));
+  const shapeProblems = findProblems(shapes, shapeCmds, shapeRegistered);
+  if (shapeProblems.length) failed.push(`the readable calls among them pass, got ${JSON.stringify(shapeProblems)}`);
+  const shapeSummary = summaryLines(shapes, shapeCmds, shapeRegistered);
+  if (shapeSummary[0] !== 'Checked 3 call sites against 3 commands (3 registered).'
+    || !/^12 more call sites were NOT checked/.test(shapeSummary[1] || '')
+    || /every argument name was checked/i.test(shapeSummary.join('\n'))) {
+    failed.push(`with the wrapper passed on, the summary must count 3 checked and name 12 not checked, got ${JSON.stringify(shapeSummary)}`);
+  }
   return failed;
 }
 
@@ -670,16 +1126,7 @@ function main() {
   const sites = parseJsCallSites();
   const problems = findProblems(sites, cmds, registered);
 
-  console.log(`Checked ${sites.length} call sites against ${Object.keys(cmds).length} commands (${registered.size} registered).`);
-  // A payload the checker cannot read (a spread, a parameter, a rebound variable) is
-  // counted and named here, so it cannot be mistaken for one whose names were checked.
-  const unchecked = sites.filter((s) => s.dynamic && cmds[s.cmd] && registered.has(s.cmd));
-  if (unchecked.length) {
-    console.log(`${unchecked.length} of them pass a payload that cannot be read statically; their argument names were NOT checked:`);
-    for (const s of unchecked) console.log(`  ${s.file}:${s.line}  ${s.cmd}`);
-  } else {
-    console.log('Every payload was read statically, so every argument name was checked.');
-  }
+  for (const line of summaryLines(sites, cmds, registered)) console.log(line);
   if (problems.length) {
     console.error(`\n${problems.length} IPC problem(s):\n`);
     for (const p of problems) console.error('  ' + p);
@@ -695,6 +1142,6 @@ function main() {
 
 // check-mcp-contract.js reads mcp.js's payloads with the same parser instead of
 // carrying a copy of it.
-module.exports = { INJECTED, parseCommandsIn, parseRegisteredCommands, parseCallSitesIn, readObjectKeys, variablePayloadKeys, rebinding, findProblems };
+module.exports = { INJECTED, parseCommandsIn, parseRegisteredCommands, parseCallSitesIn, readObjectKeys, variablePayloadKeys, rebinding, findProblems, summaryLines };
 
 if (require.main === module) main();

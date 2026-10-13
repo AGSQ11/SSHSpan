@@ -1376,7 +1376,7 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
   min-height: 0;
   position: relative;
 }
-/* The header never clips its controls (fix round 1): with a live tab the
+/* The header never clips its controls: with a live tab the
    actions were wider than the column at the default 1100x720 window, and the
    column hides overflow, so the maximize button and half of Disconnect were
    cut off. The title gives way first (an ellipsis); in a header narrower than
@@ -2197,7 +2197,7 @@ body.pointer-dragging, body.pointer-dragging * { cursor: grabbing !important; us
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
 
-/* ─── directory comparison tints (agent-e) ─────────────────────────────
+/* ─── directory comparison tints ───────────────────────────────────────
    FileZilla-style: yellow = only on this side, red = differs between
    sides, green = identical. Subtle background tint + thin left border,
    consistent with .sftp-entry.selected. */
@@ -2546,7 +2546,7 @@ label.opt-row { flex-direction: row; }
   transition: border-color 0.12s ease;
 }
 .opt-row:hover { border-color: #39445a; }
-/* A passphrase disables saving deployed files as servers (M3). The row needs
+/* A passphrase disables saving deployed files as servers (A7-32). The row needs
    the same visible disabled affordance as a settings toggle, not a live hand. */
 .opt-row:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
 .opt-row input[type="checkbox"] { position: absolute; opacity: 0; pointer-events: none; }
@@ -2589,6 +2589,14 @@ label.opt-row { flex-direction: row; }
 .deploy-plan-name { color: var(--text-dim); font-weight: 600; }
 .deploy-plan-item.refused code { color: var(--text-faint); background: var(--panel-3); text-decoration: line-through; }
 .deploy-plan-refusal { color: var(--danger); }
+/* What the deploy preview warns about, and the Host lines of the user's own
+   config that name these hosts: text in the warning colour, a line that
+   breaks ssh in the danger colour. */
+.deploy-notes { display: flex; flex-direction: column; gap: 4px; }
+.deploy-notes-head { margin: 0; color: var(--warn); font-weight: 600; }
+.deploy-notes ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; color: var(--warn); overflow-wrap: anywhere; }
+.deploy-legacy-what { color: var(--text-dim); }
+.deploy-legacy-what.breaks { color: var(--danger); }
 /* The Include line for ~/.ssh/config, with its Copy button (A5-05). */
 .include-row { display: flex; align-items: center; gap: 8px; }
 .include-row code { flex: 1; min-width: 0; }
@@ -2895,12 +2903,12 @@ label.opt-row { flex-direction: row; }
 /* Long commands wrap rather than scroll sideways: the panel is 380px wide,
    and a one-line command with a long path is the common case. */
 /* A command or its arguments are laid out in the order they are sent, left to
-   right, whatever letters they hold (fix round 1): with every direction
+   right, whatever letters they hold: with every direction
    control escaped, right-to-left letters could still reorder the characters
    around them on screen. */
 .ai-cmd { white-space: pre-wrap; word-break: break-word; unicode-bidi: bidi-override; direction: ltr; }
 /* An invisible or direction-changing character in a command or argument,
-   shown as its code point (JU3 deferral): marked so it cannot pass for text. */
+   shown as its code point: marked so it cannot pass for text. */
 .ai-hidden-char {
   color: var(--warn); background: rgba(var(--warn-rgb), 0.14);
   border-radius: 3px; padding: 0 2px;
@@ -3015,6 +3023,8 @@ label.opt-row { flex-direction: row; }
 /* Status dot reuses the server-dot geometry with an MCP error state. */
 .mcp-dot.err { background: var(--danger); box-shadow: 0 0 0 3px rgba(var(--danger-rgb), 0.15); }
 .mcp-loopback-warn { font-size: 11.5px; color: var(--warn); }
+/* A server SSHSpan keeps switched off until its credential is allowed. */
+.mcp-unconfirmed { font-size: 11.5px; color: var(--warn); }
 .mcp-server-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .mcp-server-actions button { font-size: 11px; padding: 3px 10px; }
 

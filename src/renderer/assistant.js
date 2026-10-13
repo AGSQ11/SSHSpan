@@ -68,7 +68,7 @@ function aiTabState(tabId) {
 
 function aiActiveTabId() { return (window.state && window.state.activeTabId) || null; }
 
-function aiErrText(e) { return (e && (e.message || e.error)) || String(e); }
+// An error becomes text through app.js's errText (it loads first).
 
 // The shared invoke wrapper is a top-level function declaration in app.js
 // (loads first), so it is on window; resolve defensively against load-order
@@ -89,6 +89,10 @@ function assistantToggle() {
   const surface = document.getElementById('sessionSurface');
   if (!panel || !surface) return;
   const opening = panel.hidden;
+  // Closing with the keyboard inside the panel (its X, Ctrl+Shift+A from its
+  // input): the focus would drop to <body> with the panel; it goes back to
+  // the toggle that opens it again (A4-24).
+  const focusWasInside = !opening && panel.contains(document.activeElement);
   panel.hidden = !opening;
   surface.classList.toggle('assistant-open', opening);
   // Let the layout settle, then refit xterm so the terminal keeps its
@@ -100,6 +104,7 @@ function assistantToggle() {
   if (btn) {
     btn.classList.toggle('active', opening);
     btn.setAttribute('aria-pressed', opening ? 'true' : 'false');
+    if (focusWasInside) btn.focus();
   }
   if (opening) {
     const tabId = aiActiveTabId();
@@ -112,6 +117,15 @@ function assistantToggle() {
     const input = document.getElementById('assistantInput');
     if (input) setTimeout(() => input.focus(), 60);
   }
+}
+
+/// The panel's own X: closes it, and the keyboard goes to the toggle - also
+/// where a click does not focus the X (WebKit), so the focus was never inside.
+function assistantClose() {
+  if (!assistantIsOpen()) return;
+  assistantToggle();
+  const btn = document.getElementById('assistantToggleBtn');
+  if (btn && document.activeElement !== btn) btn.focus();
 }
 
 /// The tab's transcript list, created on first use. Only the ACTIVE tab's
@@ -200,7 +214,7 @@ async function aiCommitLevel(tabId, level, prev) {
   } catch (e) {
     if (aiTabs.get(tabId) === s) s.level = prev;
     aiPaintLevel(tabId);
-    toast(aiErrText(e), 'err');
+    toast(errText(e), 'err');
   }
 }
 
@@ -567,6 +581,10 @@ function aiSuggestCard(tabId, command, rationale) {
 /// the focus, so it is found and answered from the keyboard (A4-24) - the
 /// CARD, a named group, not its Approve button: a key-repeat Enter left over
 /// from the user's own Send must never approve. Tab reaches Approve/Deny.
+/// It takes the focus only from the panel itself or from nowhere (<body>):
+/// a card arriving while the user types in a terminal, a dialog or a field
+/// elsewhere leaves the keyboard there - the transcript is a live log, so the
+/// card is announced all the same (aiCardMayTakeFocus).
 function aiApprovalCard(tabId, label, fill) {
   return new Promise((resolve) => {
     const s = aiTabState(tabId);
@@ -601,8 +619,16 @@ function aiApprovalCard(tabId, label, fill) {
     const list = aiEnsureList(tabId, s);
     list.appendChild(row);
     aiScrollBottom(list);
-    if (tabId === aiActiveTabId() && assistantIsOpen()) row.focus();
+    if (tabId === aiActiveTabId() && assistantIsOpen() && aiCardMayTakeFocus()) row.focus();
   });
+}
+
+/// A new card may take the keyboard only from the panel or from <body> -
+/// never from a terminal, a dialog or a field the user is typing in.
+function aiCardMayTakeFocus() {
+  const active = document.activeElement;
+  const panel = assistantPanel();
+  return !active || active === document.body || (!!panel && panel.contains(active));
 }
 
 // Renders an Approve/Deny card and returns a Promise the tool loop awaits.
@@ -620,8 +646,8 @@ function aiConfirmCard(tabId, command) {
 // value, never masked by name. The names are chosen by the MCP server and
 // the model - masking "page_token" or "tokens" would let an injected model
 // carry terminal secrets out under a name the card hides, and the card is
-// the control between the two (R6; JU3 security review). Up to this many
-// characters the arguments are shown as they are.
+// the control between the two (R6). Up to this many characters the
+// arguments are shown as they are.
 const AI_ARGS_INLINE_MAX = 1500;
 // Longer: the shortened view keeps every key, shows the start of each long
 // string and the first items of each long array, each with a marker saying
@@ -858,7 +884,7 @@ async function aiExecCommand(tabId, command) {
     await aiCall('assistant_exec', { sessionId: tab.sessionId, tabId, command });
     return 'executed: ' + command;
   } catch (e) {
-    return 'error: ' + aiErrText(e);
+    return 'error: ' + errText(e);
   }
 }
 
@@ -888,7 +914,7 @@ async function aiTypeText(tabId, text) {
     await aiCall('assistant_type_text', { sessionId: tab.sessionId, tabId, text: t });
     return { ok: true };
   } catch (e) {
-    return { ok: false, message: aiErrText(e) };
+    return { ok: false, message: errText(e) };
   }
 }
 
@@ -1022,7 +1048,7 @@ async function aiRunTool(tabId, tc) {
     } catch (e) {
       // Error bodies are untrusted server text too - wrap them the same way.
       failed = true;
-      text = 'error: ' + aiErrText(e);
+      text = 'error: ' + errText(e);
     }
     event({ label, source, outcome: failed ? 'error' : 'ok', args, result: text, warning });
     // The backend's warning may quote the server: inside the same block, and
@@ -1120,11 +1146,11 @@ function aiFriendlyError(msg) {
   return detail ? m[1] + ': ' + String(detail) : String(msg);
 }
 
-// The backend's answers that mean "not set up yet": load_provider in
+// The backend's answers that mean "not set up yet": load_provider_in in
 // src-tauri/src/assistant/mod.rs ("AI assistant is not configured - open
 // Settings > AI assistant.", "No API key stored - ...", "No model configured."
-// and, since RU6b, "The saved assistant URL is no longer accepted - open
-// Assistant settings and save it again.").
+// and, for a URL saved under older rules, "The saved assistant URL is no
+// longer accepted - open Assistant settings and save it again.").
 const AI_SETUP_ERRORS = /not configured - open Settings|No API key stored|No model configured|saved assistant URL is no longer accepted/;
 
 /// A turn's result for the model when a call never ran: the turn stopped
@@ -1206,7 +1232,7 @@ async function aiRunTurn(tabId) {
           try {
             result = await aiRunTool(tabId, tc);
           } catch (e) {
-            result = 'error: ' + aiErrText(e);
+            result = 'error: ' + errText(e);
           }
           if (!alive()) return true;
           s.messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.name,
@@ -1229,7 +1255,7 @@ async function aiRunTurn(tabId) {
     return true;
   } catch (e) {
     if (!alive()) return true;
-    aiError(tabId, aiFriendlyError(aiErrText(e)));
+    aiError(tabId, aiFriendlyError(errText(e)));
     return replied; // false: nothing came back - aiSend restores the question
   } finally {
     clearTimeout(timeout);
@@ -1421,7 +1447,7 @@ async function aiLoadConfigNow(force) {
   try {
     r = await aiCall('assistant_get_config');
   } catch (e) {
-    aiSetStatus('Could not load the assistant settings: ' + aiErrText(e), 'err');
+    aiSetStatus('Could not load the assistant settings: ' + errText(e), 'err');
     return;
   }
   aiSavedConfig = r || {};
@@ -1441,43 +1467,29 @@ async function aiLoadConfigNow(force) {
 }
 
 /// Save the form as it is on screen; true when it was saved - or, saved with a
-/// warning (RU6b: the audit row could not be written), the warning, already
-/// shown. When the provider or the key's address changed without a new key,
-/// the backend refuses to move the stored key there; the user is asked, and
-/// only a confirmation resends with reuseKeyAtNewOrigin (A4-13).
+/// warning (the audit row could not be written), the warning, already shown.
+/// When the provider or the key's address changed without a new key, the
+/// backend asks in its own native dialog whether the stored key may go there
+/// (A4-13) - a question the page can neither show nor answer, so it sends no
+/// flag of its own. A "no" there is refused with "Enter the API key for the
+/// new address."; an answer given too quickly, settings changed meanwhile and
+/// another question still open have refusals of their own. Each is shown as
+/// the backend words it, and nothing is saved.
 async function aiSaveForm() {
   if (aiSaving) return false;
   aiSaving = true;
-  const req = (reuse) => aiCall('assistant_save_config', {
-    provider: aiField('aiProvider') || 'openai',
-    baseUrl: aiField('aiBaseUrl').trim() || null,
-    model: aiField('aiModel').trim(),
-    apiKey: aiField('aiApiKey') || null,
-    clearApiKey: false,
-    reuseKeyAtNewOrigin: reuse,
-  });
   let saved;
   try {
     aiSetStatus('Saving...', 'info');
-    try {
-      saved = await req(false);
-    } catch (e) {
-      // check_key_reuse's refusal (src-tauri/src/assistant/mod.rs): "The
-      // provider or base URL changed but no new API key was entered - ...".
-      if (!/no new API key was entered/.test(aiErrText(e))) throw e;
-      const where = aiField('aiBaseUrl').trim() || 'the provider\'s default address';
-      const reuse = await confirmModal('Use the stored API key at the new address?',
-        'The provider or base URL changed, but no new API key was entered. Send the stored key to ' + where
-          + '? Cancel to enter the key for the new endpoint instead.',
-        'Reuse the key');
-      if (!reuse) {
-        aiSetStatus('Not saved - enter the API key for the new endpoint, or confirm reusing the stored one.', 'err');
-        return false;
-      }
-      saved = await req(true);
-    }
+    saved = await aiCall('assistant_save_config', {
+      provider: aiField('aiProvider') || 'openai',
+      baseUrl: aiField('aiBaseUrl').trim() || null,
+      model: aiField('aiModel').trim(),
+      apiKey: aiField('aiApiKey') || null,
+      clearApiKey: false,
+    });
   } catch (e) {
-    aiSetStatus('Not saved: ' + aiErrText(e), 'err');
+    aiSetStatus(errText(e), 'err');
     return false;
   } finally {
     aiSaving = false;
@@ -1492,9 +1504,9 @@ async function aiSaveForm() {
   return true;
 }
 
-/// The warning a save answered with (RU6b: `warning`, a sentence that says
-/// what was saved and what went wrong after), shown as it is and not in the
-/// way: the save itself went through. Returns it ('' when there is none).
+/// The warning a save answered with (`warning`, a sentence that says what
+/// was saved and what went wrong after), shown as it is and not in the way:
+/// the save itself went through. Returns it ('' when there is none).
 function aiSaveWarning(r) {
   const warning = r && r.warning ? String(r.warning) : '';
   if (!warning) return '';
@@ -1520,10 +1532,10 @@ async function aiTestConnection() {
       const r = await aiCall('assistant_test_connection');
       aiSetStatus((r && r.detail) || 'Connected.', 'ok');
     } catch (e) {
-      // The backend's words as they are (RU6b: "The saved assistant URL is
-      // no longer accepted - ..." is a whole sentence; a prefix in front of
-      // it only got in the way).
-      aiSetStatus(aiFriendlyError(aiErrText(e)), 'err');
+      // The backend's words as they are ("The saved assistant URL is no
+      // longer accepted - ..." is a whole sentence; a prefix in front of it
+      // only got in the way).
+      aiSetStatus(aiFriendlyError(errText(e)), 'err');
     }
   });
 }
@@ -1545,10 +1557,9 @@ async function aiRemoveKey() {
         model: c.model || '',
         apiKey: null,
         clearApiKey: true,
-        reuseKeyAtNewOrigin: false,
       });
     } catch (e) {
-      aiSetStatus('The key was not removed: ' + aiErrText(e), 'err');
+      aiSetStatus('The key was not removed: ' + errText(e), 'err');
       return;
     }
     aiSavedConfig = Object.assign({}, c, { has_api_key: false });
@@ -1586,7 +1597,7 @@ function aiWire() {
   const stopBtn = document.getElementById('assistantStopBtn');
   if (stopBtn) stopBtn.addEventListener('click', aiStopTurn);
   const closeBtn = document.getElementById('assistantCloseBtn');
-  if (closeBtn) closeBtn.addEventListener('click', assistantToggle);
+  if (closeBtn) closeBtn.addEventListener('click', assistantClose);
   const newChatBtn = document.getElementById('assistantNewChatBtn');
   if (newChatBtn) newChatBtn.addEventListener('click', aiNewChat);
   const setupBtn = document.getElementById('assistantSetupBtn');

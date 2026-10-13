@@ -57,10 +57,10 @@ function terminalSetting(name, fallback) {
 // is by then. It stands down when a dialog is up (the connect password prompt
 // opens at the same moment as the tab; the terminal used to win and typed
 // characters went nowhere), when a menu is open (a menu opened right after a
-// tab switch lost its focus - JU6a), and when the focus moved after the action
-// began (an Enter on a tab's close button reached in those milliseconds went
-// to the shell - JU4). It may come from <body>, from inside the terminals, or
-// from the control that started the action - never out of a text field.
+// tab switch lost its focus), and when the focus moved after the action began
+// (an Enter on a tab's close button reached in those milliseconds went to the
+// shell). It may come from <body>, from inside the terminals, or from the
+// control that started the action - never out of a text field.
 
 function terminalDialogOpen() {
   return !!document.querySelector('.modal-backdrop:not([hidden])');
@@ -248,14 +248,10 @@ function buildKeyCompatibilityHandler(term) {
 // nothing over the data channel for it - a NUL byte it once wrote reached
 // interactive programs as Ctrl-@.
 
-function sendTerminalBytes(rec, data) {
-  if (!rec || !rec.sessionId) return Promise.resolve(false);
-  const encoder = new TextEncoder();
-  return tcore.invoke('terminal_send', {
-    sessionId: rec.sessionId,
-    bytes: Array.from(encoder.encode(data)),
-  }).then(() => true).catch(() => false);
-}
+// Everything typed or pasted reaches the session through one path, the tab's
+// onData subscription (terminalConnectInTab): keys, the compatibility
+// sequences (term.input) and pastes (terminalPaste, term.paste). The assistant
+// types through assistant_type_text, never through the terminal.
 
 function terminalBufferText(rec) {
   if (!rec) return '';
@@ -357,7 +353,7 @@ const TERMINAL_LINK_SHOWN = 300;
 
 /// Open a link from terminal output in the system browser - an OSC 8 link
 /// (xterm's linkHandler) and a plain URL (the web-links addon) alike - after
-/// asking in the app's own dialog (A6-12; fix round 1). An OSC 8 link names
+/// asking in the app's own dialog (A6-12). An OSC 8 link names
 /// its target apart from the text it shows, and a plain one can be long enough
 /// to hide where it really goes. The address is parsed once; what is checked,
 /// shown and opened all come from that parse. Refused outright, with a reason:
@@ -386,11 +382,11 @@ async function terminalOpenLink(uri) {
   try {
     await tcore.invoke('system_open_url', { url: href });
   } catch (e) {
-    if (typeof toast === 'function') toast((e && e.message) || String(e), 'err');
+    if (typeof toast === 'function') toast(errText(e), 'err');
   }
 }
 
-/// What a paste may carry into a session (fix round 1): text, TAB, CR and LF.
+/// What a paste may carry into a session: text, TAB, CR and LF.
 /// Every other C0 and C1 control, and DEL, is dropped: an ESC in the clipboard
 /// could end bracketed paste early ("ESC[201~", or its 8-bit CSI form) and
 /// have the rest of the text run as typed commands, or drive the remote
@@ -681,7 +677,7 @@ function terminalSetStatus(text) {
 }
 
 /// Open the SSH session for a tab. Resolves with the sessionId; rejects with
-/// the backend's message as it is (RU4), or with CONNECT_ABANDONED when the
+/// the backend's message as it is, or with CONNECT_ABANDONED when the
 /// attempt was closed, cancelled or replaced before it finished.
 function terminalConnectInTab(tabId, server, opts) {
   return new Promise(async (resolve, reject) => {
@@ -748,6 +744,12 @@ function terminalConnectInTab(tabId, server, opts) {
       try { t.write(text); } catch (e) {}
     };
 
+    // overrideUsername: the backend spends a server's saved password only on
+    // the server's own user name, so a caller that connects a password or
+    // keyboard-interactive server as another user must ask for the password
+    // and pass it as promptPassword. (No caller does today: the only override
+    // sent is overrideKeyId, from a key's Connect, which lists key-login
+    // servers only.)
     const args = {
       serverId: server.id,
       cols: t.cols || 80,
@@ -839,12 +841,12 @@ function terminalConnectInTab(tabId, server, opts) {
       resolve(sessionId);
     } catch (e) {
       dropSubscription();
-      const msg = e && e.message ? e.message : String(e);
+      const msg = errText(e);
       if (!current()) { reject(new Error(CONNECT_ABANDONED)); return; }
       rec.connecting = false;
       rec.sessionEnded = true;
       rec.sessionId = null;
-      // The backend's own words, as they are (RU4): a host-key mismatch, a
+      // The backend's own words, as they are: a host-key mismatch, a
       // declined key, a timeout - the tab is dead and says why.
       terminalNotice(rec, msg, '1;31');
       reject(new Error(msg));
@@ -885,7 +887,6 @@ window.tabRecord = tabRecord;
 window.terminalConnectInTab = terminalConnectInTab;
 window.terminalCancelConnect = terminalCancelConnect;
 window.terminalFocusTab = (tabId) => terminalFocus(tabRecord(tabId));
-window.terminalSendText = (tabId, text) => sendTerminalBytes(tabRecord(tabId), text);
 window.terminalCopySelection = (tabId) => {
   const rec = tabRecord(tabId);
   if (!rec) return false;

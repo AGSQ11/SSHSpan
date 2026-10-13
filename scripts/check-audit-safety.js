@@ -238,6 +238,29 @@ async function scenarioConfirmContract(browser, server) {
     check('and answered normally', await settled(page, () => window.__g, null, 800), true);
     check('no page errors', app.errors, []);
   });
+  // N1: the second click of a double-click is no answer. A question can open
+  // under the pointer within milliseconds of the click that asked it (a menu
+  // item under the dialog's OK button); the double-click's second half then
+  // lands on OK. A click with detail 2 is ignored; a single click and the
+  // keyboard (a click with detail 0) answer as before.
+  await withApp(browser, server, {}, 'N1 a double-click is no yes', async (app) => {
+    const { page } = app;
+    const clickOk = (detail) => page.evaluate((d) => document.getElementById('confirmOkBtn')
+      .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: d })), detail);
+    await page.evaluate(() => { window.__h = confirmModal('Delete keys', 'Delete 2 keys?', 'Delete'); });
+    yes('(set-up) the question is open', await waitVisible(page, '#confirmModal'));
+    await clickOk(2);
+    check('N1 a click with detail 2 on OK confirms nothing', await settled(page, () => window.__h, null, 300), 'PENDING');
+    yes('N1 and the question stays open', await app.open('confirmModal'));
+    await clickOk(1);
+    check('N1 a later single click confirms', await settled(page, () => window.__h, null, 800), true);
+    await page.evaluate(() => { window.__i = confirmModal('Delete keys', 'Delete 2 keys?', 'Delete'); });
+    yes('(set-up) asked again', await waitVisible(page, '#confirmModal'));
+    await page.focus('#confirmOkBtn');
+    await page.keyboard.press('Enter');
+    check('N1 the keyboard on OK (a click with detail 0) still confirms', await settled(page, () => window.__i, null, 800), true);
+    check('no page errors', app.errors, []);
+  });
 }
 
 /// A5-01: every guard asks in-app, and Cancel / Escape change nothing.
@@ -1699,6 +1722,25 @@ async function scenarioAuditCsv(browser, server) {
     check('A2-32 other cells are unchanged', ['"plain"', '"a=b, ""quoted"""', '"key.created"'].map((cell) => csv.includes(cell)), [true, true, true]);
     check('A2-32 csvField itself', await page.evaluate(() => [csvField('=1+2'), csvField('ok'), csvField(null), csvField('-')]),
       ['"\'=1+2"', '"ok"', '""', '"\'-"']);
+  });
+  await withApp(browser, server, { replies }, 'audit export busy', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      window.__replies.audit_list = { total: 1, rows: [{ ts: '2026-01-01T00:00:00Z', event: 'key.created', keyId: 'k1', detail: 'x' }] };
+      switchView('settings'); showSettingsSection('audit');
+    });
+    await page.waitForTimeout(150); // the section's own list load
+    const listed = await app.count('audit_list');
+    await hold(page, 'system_pick_save_path');
+    await page.evaluate(() => { el('auditExportBtn').click(); el('auditExportBtn').click(); });
+    await page.waitForTimeout(100);
+    check('A2-18 Export as CSV is busy while it runs: a second click starts no second export',
+      [(await app.count('audit_list')) - listed, await page.evaluate(() => [el('auditExportBtn').disabled, el('auditExportBtn').getAttribute('aria-busy')])],
+      [1, [true, 'true']]);
+    await letGo(page, 'system_pick_save_path');
+    await page.waitForTimeout(150);
+    check('and it comes back when the export is done', await page.evaluate(() => [el('auditExportBtn').disabled, el('auditExportBtn').getAttribute('aria-busy')]), [false, null]);
+    check('one file written', await app.count('system_write_text_file'), 1);
   });
 }
 

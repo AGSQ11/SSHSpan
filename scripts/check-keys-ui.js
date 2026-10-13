@@ -581,26 +581,28 @@ async function scenarioCategories(browser, server) {
   const rootsReply = { categories: ROOTS, allKeyCategories: {}, orphans: true, hostOrphans: false };
   await withApp(browser, server, { categories: ROOTS, replies: { category_list: rootsReply } }, 'A2-07 drag and drop', async (app) => {
     const { page } = app;
+    // A parent changes only through category_reparent; the order is written
+    // as one whole list (category_set_order), so no two siblings can share a
+    // position and none the user did not move is moved.
     const moves = async (fn) => {
-      const before = (await app.calls('category_reparent')).length;
+      const r = (await app.calls('category_reparent')).length;
+      const o = (await app.calls('category_set_order')).length;
       await fn();
       await page.waitForTimeout(200);
-      return (await app.calls('category_reparent')).slice(before).map((c) => c.args);
+      return {
+        reparents: (await app.calls('category_reparent')).slice(r).map((c) => c.args),
+        orders: (await app.calls('category_set_order')).slice(o).map((c) => c.args),
+      };
     };
-    check('A2-07 dropped on the top edge of a row, it goes BEFORE it and the siblings are renumbered',
-      await moves(() => dragCategory(page, 'c3', 'c1', 0.1)), [
-        { id: 'c3', newParentId: null, sortIndex: 0 },
-        { id: 'c1', newParentId: null, sortIndex: 1 },
-        { id: 'c2', newParentId: null, sortIndex: 2 },
-      ]);
+    check('A2-07 dropped on the top edge of a row, it goes BEFORE it and the siblings are numbered as shown',
+      await moves(() => dragCategory(page, 'c3', 'c1', 0.1)),
+      { reparents: [], orders: [{ parentId: null, orderedIds: ['c3', 'c1', 'c2'] }] });
     check('A2-07 dropped on the middle of a row, it goes INTO it',
-      await moves(() => dragCategory(page, 'c3', 'c1', 0.5)), [{ id: 'c3', newParentId: 'c1', sortIndex: 0 }]);
+      await moves(() => dragCategory(page, 'c3', 'c1', 0.5)),
+      { reparents: [{ id: 'c3', newParentId: 'c1' }], orders: [{ parentId: 'c1', orderedIds: ['c3'] }] });
     check('A2-07 dropped on the bottom edge, it goes AFTER it, with no two siblings sharing a position',
-      await moves(() => dragCategory(page, 'c1', 'c3', 0.9)), [
-        { id: 'c1', newParentId: null, sortIndex: 2 },
-        { id: 'c2', newParentId: null, sortIndex: 0 },
-        { id: 'c3', newParentId: null, sortIndex: 1 },
-      ]);
+      await moves(() => dragCategory(page, 'c1', 'c3', 0.9)),
+      { reparents: [], orders: [{ parentId: null, orderedIds: ['c2', 'c3', 'c1'] }] });
     check('no page errors', app.errors, []);
   });
 
@@ -1389,15 +1391,49 @@ const loopOpts = () => ({
   replies: { category_list: { categories: LOOPS, allKeyCategories: { k1: ['ca'] }, orphans: false, hostOrphans: false } },
 });
 const reparents = async (app) => (await app.calls('category_reparent')).map((c) => c.args);
-/// A reparent that the stub applies to the next category_list, like the backend.
+const orders = async (app) => (await app.calls('category_set_order')).map((c) => c.args);
+/// Reparents and orders that the stub applies to the next category_list, like
+/// the backend. category_set_order as commands/mod.rs category_set_order_in
+/// runs it: the WHOLE list of one parent - at the top level that includes
+/// every category whose parent is missing or whose chain of parents never
+/// reaches the top (a loop member, or one below a loop) - numbered 0, 1, 2 in
+/// that order; a partial list, a mixed one or an unknown id is refused.
 const applyReparents = (page) => page.evaluate(() => {
+  const list = () => window.__replies.category_list;
+  const put = (categories) => { window.__replies.category_list = { ...list(), categories }; };
   window.__replies.category_reparent = (a) => {
-    const cur = window.__replies.category_list;
-    window.__replies.category_list = { ...cur, categories: cur.categories.map((c) => c.id === a.id
-      ? { ...c, parent_id: a.newParentId, sort_index: a.sortIndex == null ? c.sort_index : a.sortIndex } : c) };
+    put(list().categories.map((c) => c.id === a.id
+      ? { ...c, parent_id: a.newParentId, sort_index: a.sortIndex == null ? c.sort_index : a.sortIndex } : c));
+    return { ok: true };
+  };
+  window.__replies.category_set_order = (a) => {
+    const all = list().categories;
+    const byId = new Map(all.map((c) => [c.id, c]));
+    const rooted = (c) => {
+      const seen = new Set();
+      for (let cur = c; cur; cur = byId.get(cur.parent_id)) {
+        if (seen.has(cur.id)) return false;
+        seen.add(cur.id);
+        if (!cur.parent_id || !byId.has(cur.parent_id)) return true;
+      }
+      return true;
+    };
+    const atTop = (c) => !c.parent_id || !byId.has(c.parent_id) || !rooted(c);
+    const inList = (c) => (a.parentId == null ? atTop(c) : c.parent_id === a.parentId);
+    const named = a.orderedIds.map((id) => byId.get(id));
+    if (named.some((c) => !c)) throw 'That category no longer exists.';
+    if (new Set(a.orderedIds).size !== a.orderedIds.length) throw 'The list names a category twice.';
+    const scope = named.length ? named[0].scope : null;
+    if (!named.every((c) => c.scope === scope && inList(c))) throw 'Those categories do not share a parent - reload the categories and try again.';
+    if (scope && all.some((c) => c.scope === scope && inList(c) && !a.orderedIds.includes(c.id))) {
+      throw 'The new order must name every category under that parent - reload the categories and try again.';
+    }
+    put(all.map((c) => (a.orderedIds.includes(c.id) ? { ...c, sort_index: a.orderedIds.indexOf(c.id) } : c)));
     return { ok: true };
   };
 });
+/// The backend's refusals of a category order the renderer got wrong.
+const ORDER_REFUSALS = /must name every category|do not share a parent|names a category twice|no longer exists/;
 
 async function scenarioFix2Loops(browser, server) {
   for (const [title, from, to, frac] of [
@@ -1418,8 +1454,10 @@ async function scenarioFix2Loops(browser, server) {
     const { page } = app;
     await dragCategory(page, 'root', 'ca', 0.1);
     await page.waitForTimeout(150);
-    check('N1 a drop on the top edge of CycA (shown at top level) is a top-level move of Outside alone: the promoted roots CycA, CycC and Self are not rewritten',
-      await reparents(app), [{ id: 'root', newParentId: null, sortIndex: 0 }]);
+    check('N1 a drop on the top edge of CycA (shown at top level) writes no parent: the promoted roots CycA, CycC and Self keep theirs',
+      await reparents(app), []);
+    check('the top level is numbered as shown, the loop members it shows nested after it',
+      await orders(app), [{ parentId: null, orderedIds: ['root', 'ca', 'cc', 'self', 'cb', 'cd'] }]);
     check('no page errors', app.errors, []);
   });
 
@@ -1457,10 +1495,14 @@ async function scenarioFix2Loops(browser, server) {
 
   await withApp(browser, server, loopOpts(), 'repair by drag to the top level', async (app) => {
     const { page } = app;
+    await applyReparents(page);
     await dragCategory(page, 'cb', 'root', 0.1);
-    await page.waitForTimeout(150);
-    check('N1 dragging loop member CycB above Outside moves it to the top level; only genuine top-level siblings are renumbered',
-      await reparents(app), [{ id: 'cb', newParentId: null, sortIndex: 0 }, { id: 'root', newParentId: null, sortIndex: 1 }]);
+    await page.waitForTimeout(250);
+    check('N1 dragging loop member CycB above Outside moves it to the top level: its parent is the one written',
+      await reparents(app), [{ id: 'cb', newParentId: null }]);
+    check('N1 then the top level, as the repair left it, is numbered with CycB above Outside',
+      [await topOrder(page), await page.evaluate(() => childrenOf('cb').map((c) => c.id))], [['CycB', 'Outside', 'CycC', 'Self'], ['ca']]);
+    check('every write was taken', (await toasts(page)).filter((t) => ORDER_REFUSALS.test(t)), []);
     check('no page errors', app.errors, []);
   });
 }
@@ -1490,7 +1532,7 @@ async function scenarioPointerCategories(browser, server) {
     check('A3-23 the dragged row is marked', seen && seen.dragging, ['c3']);
     await page.waitForTimeout(200);
     check('A3-23 released on the middle of Alpha it is re-parented under Alpha',
-      await reparents(app), [{ id: 'c3', newParentId: 'c1', sortIndex: 0 }]);
+      [await reparents(app), await orders(app)], [[{ id: 'c3', newParentId: 'c1' }], [{ parentId: 'c1', orderedIds: ['c3'] }]]);
     check('the ghost and the marks are gone',
       await page.evaluate(() => document.querySelectorAll('.drag-ghost, .cat-node.dragging, .cat-node.drop-into, .cat-node.drop-before, .cat-node.drop-after').length), 0);
     check('A3-23 the release is not also a click that filters the list', await page.evaluate(() => activeCategoryId()), 'all');
@@ -1607,10 +1649,11 @@ async function scenarioCategoryOrderNoDrag(browser, server) {
     await page.keyboard.press('Alt+ArrowUp');
     await page.waitForTimeout(250);
     check('M2 Alt+ArrowUp moves it back up', await topOrder(page), ['Beta', 'Gamma', 'Alpha']);
-    const sent = (await reparents(app)).length;
+    check('M2 a move among siblings writes no parent', await reparents(app), []);
+    const sent = (await orders(app)).length;
     await page.keyboard.press('Alt+ArrowUp');
     await page.waitForTimeout(250);
-    check('M2 at the top Alt+ArrowUp does nothing', [await topOrder(page), (await reparents(app)).length - sent], [['Beta', 'Gamma', 'Alpha'], 0]);
+    check('M2 at the top Alt+ArrowUp does nothing', [await topOrder(page), (await orders(app)).length - sent], [['Beta', 'Gamma', 'Alpha'], 0]);
     check('no page errors', app.errors, []);
   });
 
@@ -1619,7 +1662,7 @@ async function scenarioCategoryOrderNoDrag(browser, server) {
     await page.evaluate(() => { document.querySelector('#catTree .cat-node[data-id="c3"]').dataset.draggable = 'false'; });
     const seen = await dragCategory(page, 'c3', 'c1', 0.5, { during: () => page.evaluate(() => !!document.querySelector('.drag-ghost')) });
     await page.waitForTimeout(200);
-    check('L7 a row the lock gate marks undraggable does not drag', [seen, (await reparents(app)).length], [false, 0]);
+    check('L7 a row the lock gate marks undraggable does not drag', [seen, (await reparents(app)).length, (await orders(app)).length], [false, 0, 0]);
     const seen2 = await dragCategory(page, 'c2', 'c1', 0.5, {
       during: async () => {
         const g = await page.evaluate(() => !!document.querySelector('.drag-ghost'));
@@ -1630,7 +1673,7 @@ async function scenarioCategoryOrderNoDrag(browser, server) {
     });
     await page.waitForTimeout(200);
     yes('(set-up) the second drag was under way', seen2 === true);
-    check('L7 a drop after the vault locked moves nothing', (await reparents(app)).length, 0);
+    check('L7 a drop after the vault locked moves nothing', [(await reparents(app)).length, (await orders(app)).length], [0, 0]);
     yes('L7 and says why', (await toasts(page)).includes('Unlock the vault to change categories.'), JSON.stringify(await toasts(page)));
     check('no page errors', app.errors, []);
   });
@@ -1655,6 +1698,307 @@ async function scenarioFix2Focus(browser, server) {
     await page.waitForFunction(() => document.getElementById('deployModal').hidden && !document.getElementById('deployConfigBtn').hasAttribute('aria-busy'));
     await page.waitForTimeout(60);
     check('I1 focus moved to a control the action removes ends on the stable search target, not body', await app.focused(), 'searchInput');
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── the deploy preview's warnings and the user's own Host lines ───────────
+
+const LEGACY_FILE = '/home/u/.ssh/config';
+const DEPLOY_WARNINGS = [
+  `${LEGACY_FILE}, line 3: "Host bob's-key" names the host of key "alpha" and cannot be read by ssh (an unbalanced quote), so every ssh command fails while it is there. An older SSHSpan wrote it; SSHSpan never edits this file - remove or fix the line yourself.`,
+  'The managed config path contains a % sign. <img src=x onerror="window.__xss=1"> Write the Include line with a single %.',
+];
+const LEGACY_LINES = [
+  { file: LEGACY_FILE, line: 3, text: "Host bob's-key", key: 'alpha', unreadable: true, writtenBySshspan: true },
+  { file: LEGACY_FILE, line: 7, text: 'Host web', key: 'alpha', unreadable: false, writtenBySshspan: false },
+  { file: LEGACY_FILE, line: 9, text: 'Host alpha', key: 'alpha', unreadable: false, writtenBySshspan: true },
+];
+
+async function scenarioDeployWarnings(browser, server) {
+  await withApp(browser, server, {}, 'A2-05 warnings and Host lines in the deploy sheet', async (app) => {
+    const { page } = app;
+    await stubDeploy(page);
+    await page.evaluate(({ warnings, legacy }) => {
+      const plan = window.__replies.key_deploy_preview;
+      window.__replies.key_deploy_preview = (a) => Object.assign(plan(a), { warnings, legacyHostLines: legacy });
+    }, { warnings: DEPLOY_WARNINGS, legacy: LEGACY_LINES });
+    await openSheet(page, ['k1']);
+    await fillHostFields(page, { alias: 'web', hostname: '10.0.0.5', user: 'deploy', port: '' });
+    const items = (sel) => page.evaluate((s) => [...document.querySelectorAll(s)].map((li) => li.textContent.replace(/\s+/g, ' ').trim()), sel);
+    check('every warning of the preview is listed under the plan, word for word', await items('#deployWarningList li'), DEPLOY_WARNINGS);
+    check('as text: markup in a warning stays text', await page.evaluate(() => [document.querySelectorAll('#deployModal img').length, window.__xss || 0]), [0, 0]);
+    check('each Host line of the user\'s own config is listed as file:line - text, saying what it is', await items('#deployLegacyList li'), [
+      `${LEGACY_FILE}:3 - Host bob's-key - Breaks ssh: ssh cannot read this line, so every ssh command fails until it is fixed. An older SSHSpan wrote it.`,
+      `${LEGACY_FILE}:7 - Host web - Your own entry.`,
+      `${LEGACY_FILE}:9 - Host alpha - An older SSHSpan wrote it.`,
+    ]);
+    check('both lists are on screen', [await shown(page, '#deployWarningList'), await shown(page, '#deployLegacyList')], [true, true]);
+    await page.click('#deployConfigBtn');
+    yes('(set-up) the Deploy question opens', await waitVisible(page, '#confirmModal'));
+    const question = (await page.textContent('#confirmMessage')) || '';
+    yes('the Deploy question repeats every warning', DEPLOY_WARNINGS.every((w) => question.includes(w)), question);
+    await answerConfirm(page, 'cancel');
+    check('Cancel deploys nothing', await app.count('key_deploy'), 0);
+    // Fields whose plan has nothing to warn about: the lists go.
+    await page.evaluate(() => {
+      const plan = window.__replies.key_deploy_preview;
+      window.__replies.key_deploy_preview = (a) => Object.assign(plan(a), { warnings: [], legacyHostLines: [] });
+    });
+    await fillHostFields(page, { alias: 'web2', hostname: '10.0.0.5', user: 'deploy', port: '' });
+    check('nothing to warn about: neither list is shown', [await shown(page, '#deployWarningList'), await shown(page, '#deployLegacyList')], [false, false]);
+    await page.click('#deployConfigBtn');
+    yes('(set-up) asked again', await waitVisible(page, '#confirmModal'));
+    yes('and the question has no warning part then', !/Before you deploy/.test((await page.textContent('#confirmMessage')) || ''), await page.textContent('#confirmMessage'));
+    await answerConfirm(page, 'cancel');
+    check('no page errors', app.errors, []);
+  });
+  // A Host line is the user's own text, and a warning quotes one: a direction
+  // override in it must not turn SSHSpan's verdict around, and a line of
+  // 50,000 characters is not shown whole - in the sheet or in the question.
+  const RLO = '\u{202E}';
+  const ODD_LINES = [
+    { file: LEGACY_FILE, line: 4, text: `Host evil${RLO}yek-s'bob`, key: 'alpha', unreadable: true, writtenBySshspan: false },
+    { file: LEGACY_FILE, line: 5, text: 'Host ' + 'x'.repeat(50000), key: 'alpha', unreadable: false, writtenBySshspan: false },
+  ];
+  const ODD_WARNINGS = [`A Host line ${RLO}desrever si txet siht`, 'W' + 'w'.repeat(50000)];
+  await withApp(browser, server, {}, 'L1 notes that are not what they show, or too long', async (app) => {
+    const { page } = app;
+    await stubDeploy(page);
+    await page.evaluate(({ warnings, legacy }) => {
+      const plan = window.__replies.key_deploy_preview;
+      window.__replies.key_deploy_preview = (a) => Object.assign(plan(a), { warnings, legacyHostLines: legacy });
+    }, { warnings: ODD_WARNINGS, legacy: ODD_LINES });
+    await openSheet(page, ['k1']);
+    await fillHostFields(page, { alias: 'web', hostname: '10.0.0.5', user: 'deploy', port: '' });
+    const lines = await page.evaluate(() => [...document.querySelectorAll('#deployLegacyList li')].map((li) => ({
+      text: li.textContent,
+      parts: [...li.querySelectorAll('bdi')].map((b) => b.textContent),
+      what: (li.querySelector('.deploy-legacy-what') || {}).textContent,
+    })));
+    check('L1 no direction character reaches the Host line list', lines.some((l) => l.text.includes(RLO)), false);
+    check('L1 the file, the line and the text each sit in a <bdi> of their own, spelled out', lines[0] && lines[0].parts,
+      [LEGACY_FILE, '4', 'Host evil<U+202E>yek-s\'bob']);
+    check('L1 the verdict stays as SSHSpan words it', lines[0] && lines[0].what,
+      'Breaks ssh: ssh cannot read this line, so every ssh command fails until it is fixed. Your own entry.');
+    // 300 for a Host line: the backend cuts one there too (and adds "…").
+    // 800 for a warning: the backend's own run to some 600 (a sentence, the
+    // file and a quoted line of up to 301), and none of them is cut.
+    const long = (lines[1] && lines[1].parts[2]) || '';
+    check('L1 a 50,000-character line is cut to 300 characters and an ellipsis', [Array.from(long).length, long.endsWith('…'), long.startsWith('Host xxx')],
+      [301, true, true]);
+    const warns = await page.evaluate(() => [...document.querySelectorAll('#deployWarningList li')].map((li) => li.textContent));
+    check('L1 a warning is spelled out too', warns[0], 'A Host line <U+202E>desrever si txet siht');
+    check('L1 and a 50,000-character warning is cut to 800 and an ellipsis', [Array.from(warns[1] || '').length, (warns[1] || '').endsWith('…')], [801, true]);
+    await page.click('#deployConfigBtn');
+    yes('(set-up) the Deploy question opens', await waitVisible(page, '#confirmModal'));
+    const q = (await page.textContent('#confirmMessage')) || '';
+    check('L1 the Deploy question repeats them spelled out and cut',
+      [q.includes(RLO), q.includes('- A Host line <U+202E>desrever si txet siht'), q.length < 2000], [false, true, true]);
+    // A warning the backend writes about a 300-character line stays whole.
+    const real = `${LEGACY_FILE}, line 3: "${'Host ' + 'y'.repeat(295)}…" is your own entry for the host of key "alpha", and ssh cannot read it (an unbalanced quote), so every ssh command fails while it is there. SSHSpan never edits this file - fix the quoting of that line yourself.`;
+    await answerConfirm(page, 'cancel');
+    await page.evaluate((w) => {
+      const plan = window.__replies.key_deploy_preview;
+      window.__replies.key_deploy_preview = (a) => Object.assign(plan(a), { warnings: [w], legacyHostLines: [] });
+    }, real);
+    await fillHostFields(page, { alias: 'web3', hostname: '10.0.0.5', user: 'deploy', port: '' });
+    check('L1 a real warning quoting a 300-character line is shown whole', await page.evaluate(() =>
+      [...document.querySelectorAll('#deployWarningList li')].map((li) => li.textContent)), [real]);
+    await page.click('#deployConfigBtn');
+    yes('(set-up) asked again', await waitVisible(page, '#confirmModal'));
+    await answerConfirm(page, 'cancel');
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── the Keys view while the vault is locked ───────────────────────────────
+
+async function scenarioLockedKeysView(browser, server) {
+  const card = (page) => page.evaluate(() => {
+    const s = document.getElementById('emptyState');
+    const btn = (id) => { const b = document.getElementById(id); return b && !b.hidden && !b.closest('[hidden]') ? [b.textContent.trim(), b.disabled] : null; };
+    return { shown: !!s && !s.hidden, title: (s.querySelector('h3') || {}).textContent, newKey: btn('emptyNewBtn'), unlock: btn('emptyUnlockBtn') };
+  });
+  await withApp(browser, server, { unlocked: false }, 'a locked vault: the empty Keys view says so, with Unlock', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(150);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    check('locked: the Keys view says the vault is locked and offers Unlock, not the first-run card', await card(page),
+      { shown: true, title: 'The vault is locked', newKey: null, unlock: ['Unlock', false] });
+    check('+ New key is lock-gated like its neighbours', await page.evaluate(() => [el('emptyNewBtn').disabled, el('emptyNewBtn').title]),
+      [true, 'Unlock the vault to create or import keys.']);
+    await page.click('#emptyUnlockBtn');
+    yes('Unlock opens the unlock dialog', await waitVisible(page, '#vaultModal'));
+    check('in its unlock form', await page.evaluate(() => state.vaultMode), 'unlock');
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { hasVault: false, unlocked: false }, 'no vault yet: the empty Keys view offers to create one', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(150);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    check('no vault: the card says so and offers Create vault', await card(page),
+      { shown: true, title: 'No vault yet', newKey: null, unlock: ['Create vault', false] });
+    await page.click('#emptyUnlockBtn');
+    yes('Create vault opens the create dialog', await waitVisible(page, '#vaultModal'));
+    check('in its create form', await page.evaluate(() => state.vaultMode), 'create');
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { keys: [] }, 'unlocked, no keys: the first-run card', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(150);
+    check('unlocked with no keys: "No keys yet" and + New key', await card(page),
+      { shown: true, title: 'No keys yet', newKey: ['+ New key', false], unlock: null });
+    await page.evaluate(() => { window.__backend.unlocked = false; return refreshVaultStatus(); });
+    await page.waitForTimeout(120);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    check('after a lock: the locked card', await card(page),
+      { shown: true, title: 'The vault is locked', newKey: null, unlock: ['Unlock', false] });
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── category order next to promoted loop roots (category_set_order) ───────
+
+async function scenarioCategoryOrderBesideLoops(browser, server) {
+  const LOOP_IDS = ['ca', 'cb', 'cc', 'cd', 'self'];
+  // The reviewer's four probes: each drop lands where it was dropped, every
+  // other row keeps its place, only a real parent change writes a parent, and
+  // the same drop again changes nothing.
+  for (const [title, extra, from, to, frac, want, parentWrites] of [
+    ['Beta at index 6 dropped above Outside', CAT('beta', 'Beta', null, 6), 'beta', 'root', 0.1,
+      ['Beta', 'Outside', 'CycA', 'CycC', 'Self'], []],
+    ['Kid dropped on Outside\'s lower edge', CAT('kid', 'Kid', 'root', 0), 'kid', 'root', 0.9,
+      ['Outside', 'Kid', 'CycA', 'CycC', 'Self'], [{ id: 'kid', newParentId: null }]],
+    ['Zed at index 1 dropped after CycA', CAT('zed', 'Zed', null, 1), 'zed', 'ca', 0.9,
+      ['Outside', 'CycA', 'Zed', 'CycC', 'Self'], []],
+    ['Apple at index 1 dropped before CycA', CAT('apple', 'Apple', null, 1), 'apple', 'ca', 0.1,
+      ['Outside', 'Apple', 'CycA', 'CycC', 'Self'], []],
+  ]) {
+    const cats = [...LOOPS, extra];
+    const opts = { keys: [KEY('k1', 'alpha')], categories: cats,
+      replies: { category_list: { categories: cats, allKeyCategories: {}, orphans: false, hostOrphans: false } } };
+    await withApp(browser, server, opts, `M1 probe: ${title}`, async (app) => {
+      const { page } = app;
+      await applyReparents(page);
+      await dragCategory(page, from, to, frac);
+      await page.waitForTimeout(300);
+      check(`M1 ${title}: the order read back`, await topOrder(page), want);
+      check(`M1 ${title}: a parent is written only for a real parent change`, await reparents(app), parentWrites);
+      check(`M1 ${title}: no loop member's parent is written`, (await reparents(app)).filter((a) => LOOP_IDS.includes(a.id)), []);
+      check(`M1 ${title}: the loops are shown as before`,
+        await page.evaluate(() => [childrenOf('ca').map((c) => c.id), childrenOf('cc').map((c) => c.id)]), [['cb'], ['cd']]);
+      check(`M1 ${title}: every write was taken (the whole list each time)`, (await toasts(page)).filter((t) => ORDER_REFUSALS.test(t)), []);
+      await dragCategory(page, from, to, frac);
+      await page.waitForTimeout(300);
+      check(`M1 ${title}: dropping it there again keeps it there`, await topOrder(page), want);
+      check(`M1 ${title}: and writes no parent again`, await reparents(app), parentWrites);
+      check('no page errors', app.errors, []);
+    });
+  }
+  const loopProbeOpts = () => ({ keys: [KEY('k1', 'alpha')], categories: LOOPS,
+    replies: { category_list: { categories: LOOPS, allKeyCategories: {}, orphans: false, hostOrphans: false } } });
+  // A loop member dragged out beside its own loop's promoted root - the way to
+  // repair the loop: its parent becomes the top level, which nests the root
+  // under it, so the root is no longer a row to drop beside. It lands where
+  // the root was shown (it landed last).
+  for (const [edge, frac] of [['top', 0.1], ['bottom', 0.9]]) {
+    await withApp(browser, server, loopProbeOpts(), `M1 probe: CycB dropped on CycA's ${edge} edge`, async (app) => {
+      const { page } = app;
+      await applyReparents(page);
+      await dragCategory(page, 'cb', 'ca', frac);
+      await page.waitForTimeout(300);
+      const at = `M1 CycB on CycA's ${edge} edge`;
+      check(`${at}: its parent is written once - the top level`, await reparents(app), [{ id: 'cb', newParentId: null }]);
+      check(`${at}: the order written puts it where CycA was shown`, (await orders(app)).map((o) => o.orderedIds),
+        [['root', 'cb', 'cc', 'self', 'cd']]);
+      check(`${at}: the order read back`, await topOrder(page), ['Outside', 'CycB', 'CycC', 'Self']);
+      check(`${at}: CycA is under CycB now, the other loop as before`,
+        await page.evaluate(() => [childrenOf('cb').map((c) => c.id), childrenOf('cc').map((c) => c.id)]), [['ca'], ['cd']]);
+      check(`${at}: every write was taken`, (await toasts(page)).filter((t) => ORDER_REFUSALS.test(t)), []);
+      check('no page errors', app.errors, []);
+    });
+  }
+  // A promoted loop root dragged itself: it is shown at the top level, so a
+  // drop beside a top-level row writes no parent - its saved parent (CycB)
+  // is not the one it is shown under.
+  await withApp(browser, server, loopProbeOpts(), 'M1 probe: CycA (a promoted loop root) dropped above Outside', async (app) => {
+    const { page } = app;
+    await applyReparents(page);
+    await dragCategory(page, 'ca', 'root', 0.1);
+    await page.waitForTimeout(300);
+    check('M1 CycA above Outside: no parent is written', await reparents(app), []);
+    check('M1 CycA above Outside: the whole top level in its new order', (await orders(app)).map((o) => o.orderedIds),
+      [['ca', 'root', 'cc', 'self', 'cb', 'cd']]);
+    check('M1 CycA above Outside: the order read back', await topOrder(page), ['CycA', 'Outside', 'CycC', 'Self']);
+    check('M1 CycA above Outside: the loops are shown as before',
+      await page.evaluate(() => [childrenOf('ca').map((c) => c.id), childrenOf('cc').map((c) => c.id)]), [['cb'], ['cd']]);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── a change whose audit row could not be written (B1) ────────────────────
+
+async function scenarioAuditWarnings(browser, server) {
+  const W = (what) => `The ${what}, but its audit row could not be written: disk I/O error`;
+  const keys = [Object.assign(KEY('k1', 'alpha'), { category_ids: ['c1'] }), KEY('k2', 'beta')];
+  await withApp(browser, server, { keys, categories: CATS, replies: {
+    category_list: CAT_REPLY({ k1: ['c1'] }),
+    category_create: { id: 'c9', name: 'New', parent_id: null, scope: 'key', sort_index: 9, color: null, warning: W('category was created') },
+    category_delete: { ok: true, reassigned: [], warning: W('category was deleted') },
+    key_set_categories: { ok: true, warning: W("key's categories were saved") },
+    key_rename: { ok: true, name: 'alpha2', warning: W('key was renamed') },
+    key_delete: { ok: true, warning: W('key was deleted') },
+    key_create_with_categories: { ok: true, id: 'k9', fingerprint: 'SHA256:k9', warning: W('key was created') },
+  } }, 'B1 a change whose audit row failed is said as a warning', async (app) => {
+    const { page } = app;
+    const warned = async (w) => (await page.evaluate(() =>
+      [...document.querySelectorAll('#toast .toast-item.warn .toast-text')].map((n) => n.textContent))).includes(w);
+    await page.evaluate(() => createCategory('New', null, null));
+    await page.waitForTimeout(100);
+    yes('category_create: its warning is shown', await warned(W('category was created')));
+    await page.evaluate(() => { window.__d = deleteCategory('c2'); });
+    await answerConfirm(page, 'ok');
+    await page.waitForTimeout(150);
+    yes('category_delete: its warning is shown', await warned(W('category was deleted')));
+    await page.evaluate(() => selectKey('k1'));
+    await page.waitForTimeout(150);
+    await page.click('#detailCategories .cat-chip .cat-chip-x');
+    await page.waitForTimeout(150);
+    yes('key_set_categories: its warning is shown', await warned(W("key's categories were saved")));
+    await page.click('#detailRenameBtn');
+    yes('(set-up) the rename prompt opens', await waitVisible(page, '#promptModal'));
+    await page.fill('#promptInput', 'alpha2');
+    await page.click('#promptOkBtn');
+    await page.waitForTimeout(150);
+    yes('key_rename: its warning is shown', await warned(W('key was renamed')));
+    await page.evaluate(() => selectKey('k2'));
+    await page.waitForTimeout(100);
+    await page.click('#detailDeleteBtn');
+    await answerConfirm(page, 'ok');
+    await page.waitForTimeout(150);
+    yes('key_delete: its warning is shown', await warned(W('key was deleted')));
+    await page.evaluate(() => openKeyModal());
+    await waitVisible(page, '#modalBackdrop');
+    await page.fill('#genName', 'gamma');
+    await page.click('#modalPrimary');
+    await page.waitForTimeout(200);
+    yes('key_create_with_categories: its warning is shown', await warned(W('key was created')));
+    check('each was done once: a warning is not a reason to retry', await page.evaluate(() =>
+      ['category_create', 'category_delete', 'key_rename', 'key_delete', 'key_create_with_categories'].map((c) => window.__calls.filter((x) => x.cmd === c).length)),
+    [1, 1, 1, 1, 1]);
+    check('no page errors', app.errors, []);
+  });
+  // Several keys deleted at once, each answering the same warning: it is said
+  // once, as the bulk "add to categories" says its warnings.
+  await withApp(browser, server, { keys: [KEY('k1', 'alpha'), KEY('k2', 'beta'), KEY('k3', 'gamma')], replies: {
+    key_delete: { ok: true, warning: W('key was deleted') },
+  } }, 'B1 a bulk delete says a repeated warning once', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => deleteKeyBatch(['k1', 'k2', 'k3'], [], false));
+    await page.waitForTimeout(150);
+    const said = (await page.evaluate(() => [...document.querySelectorAll('#toast .toast-item.warn .toast-text')].map((n) => n.textContent))).join('\n');
+    check('B1 three keys deleted with one audit warning: it is said once', [await app.count('key_delete'), said.split(W('key was deleted')).length - 1], [3, 1]);
     check('no page errors', app.errors, []);
   });
 }
@@ -1743,6 +2087,10 @@ const SCENARIOS = [
   ['fix2 focus: moving the focus while an action runs', scenarioFix2Focus],
   ['JU6b pointer drags in the tree and the order probes (Task 16 A3-23 JU4 review)', scenarioPointerCategories],
   ['JU6b fix round: reordering without a drag, the drag\'s lock gates (M2 L7)', scenarioCategoryOrderNoDrag],
+  ['deploy warnings: the preview\'s warnings and the user\'s own Host lines', scenarioDeployWarnings],
+  ['locked keys view: the empty card and its gated buttons', scenarioLockedKeysView],
+  ['loop order: drops next to promoted loop roots (category_set_order)', scenarioCategoryOrderBesideLoops],
+  ['audit warnings: changes whose audit row could not be written', scenarioAuditWarnings],
 ];
 
 (async () => {

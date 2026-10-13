@@ -45,7 +45,7 @@ let mcpRefreshSeq = 0;   // only the newest list request may replace the registr
 
 const mcpCall = (cmd, args) => (window.call || call)(cmd, args);
 
-function mcpErrText(e) { return (e && (e.message || e.error)) || String(e); }
+// An error becomes text through app.js's errText (it loads first).
 
 /// Tauri's own answer for a command that is not registered (tauri 2.11.5,
 /// src/webview/mod.rs, on_message: `Command {command} not found`). Only THAT means "this
@@ -68,7 +68,7 @@ async function mcpRefresh() {
     if (seq === mcpRefreshSeq) mcpServers = Array.isArray(list) ? list : [];
     return mcpServers;
   } catch (e) {
-    if (mcpIsUnknownCommand(mcpErrText(e))) {
+    if (mcpIsUnknownCommand(errText(e))) {
       mcpAvailable = false; // old backend without MCP: degrade, stop asking
       mcpServers = [];
       return null;
@@ -194,7 +194,7 @@ function mcpValidateToolSchema(t, serverName, toolName) {
       parsed = JSON.parse(raw);
     } catch (e) {
       throw new Error(
-        'MCP tool "' + toolName + '" from server "' + serverName + '" has invalid inputSchema: ' + String(e.message || e)
+        'MCP tool "' + toolName + '" from server "' + serverName + '" has invalid inputSchema: ' + errText(e)
       );
     }
   } else if (typeof raw === 'object') {
@@ -218,6 +218,20 @@ function mcpListHost() { return document.getElementById('mcpServerList'); }
 function mcpFormHost() { return document.getElementById('mcpFormHost'); }
 
 const MCP_STATUS_TEXT = { connected: 'Connected', error: 'Error', unknown: 'Not connected' };
+
+// A server the backend keeps switched off until the user confirms it (A4-07):
+// one restored from a backup, and one whose credential the user did not allow
+// to be sent in SSHSpan's own native question. Connect and call are refused
+// meanwhile. What its row says:
+const MCP_NOT_CONFIRMED_CREDENTIAL = 'Not confirmed - SSHSpan will not send this credential until you allow it.';
+const MCP_NOT_CONFIRMED_ADDRESS = 'Not confirmed - SSHSpan will not connect to this server until you open Edit, check its address and save it.';
+// A save answered "not confirmed" without saying why.
+const MCP_SAVED_NOT_CONFIRMED = 'Saved, but not confirmed - SSHSpan will not send its credential until you allow it.';
+
+/// Does `sv` send a credential - a stored secret or an environment variable?
+function mcpSendsCredential(sv) {
+  return !!sv && (sv.auth_type || 'none') !== 'none' && (!!sv.has_secret || !!sv.auth_env_var);
+}
 
 // The dot is colour; the text next to it says the same in words (A4-24).
 function mcpStatusDot(status) {
@@ -282,8 +296,9 @@ function mcpEnabledCount(sv) {
 }
 
 // One row per server: status, name, url, enabled/total tools, protocol, the
-// last Test error, and the actions (edit, review tools, test, remove). Every
-// string from the server goes through textContent.
+// last Test error, whether it is confirmed, and the actions (allow sending,
+// edit, review tools, test, remove). Every string from the server goes
+// through textContent.
 function mcpServerRow(sv) {
   const row = document.createElement('div');
   row.className = 'mcp-server-row';
@@ -305,12 +320,17 @@ function mcpServerRow(sv) {
   url.textContent = sv.url || '';
   url.title = sv.url || '';
   head.appendChild(url);
-  if (sv.confirmed === false) {
-    // A restored entry is inert until the user re-saves it (SECURITY.md).
+  // Only `confirmed: true` is confirmed - the same rule as a save's answer
+  // (mcpSaveOutcome): a record that says nothing of it fails closed.
+  const unconfirmed = sv.confirmed !== true;
+  const asksToSend = unconfirmed && mcpSendsCredential(sv);
+  if (unconfirmed) {
+    // Seen at a glance; the sentence below the head says it in full, so the
+    // badge is not read out twice.
     const badge = document.createElement('span');
     badge.className = 'mcp-badge';
-    badge.textContent = 'Unconfirmed - review and re-save';
-    badge.title = 'Restored from a backup: open Edit, check the URL and auth, and save to use it.';
+    badge.textContent = 'Not confirmed';
+    badge.setAttribute('aria-hidden', 'true');
     head.appendChild(badge);
   }
   const total = Array.isArray(sv.tools) ? sv.tools.length : 0;
@@ -319,6 +339,15 @@ function mcpServerRow(sv) {
   count.textContent = mcpEnabledCount(sv) + '/' + total + ' tools enabled';
   head.appendChild(count);
   row.appendChild(head);
+
+  let unconfirmedNote = null;
+  if (unconfirmed) {
+    unconfirmedNote = document.createElement('div');
+    unconfirmedNote.className = 'mcp-unconfirmed';
+    unconfirmedNote.id = 'mcpUnconfirmed-' + row.dataset.id.replace(/[^\w-]/g, '_');
+    unconfirmedNote.textContent = asksToSend ? MCP_NOT_CONFIRMED_CREDENTIAL : MCP_NOT_CONFIRMED_ADDRESS;
+    row.appendChild(unconfirmedNote);
+  }
 
   if (sv.protocol_version) {
     const meta = document.createElement('div');
@@ -353,6 +382,13 @@ function mcpServerRow(sv) {
     actions.appendChild(b);
     return b;
   };
+  if (asksToSend) {
+    // Asked again by the backend, in its own dialog (it saves to the vault,
+    // so not while it is locked).
+    const allow = mkBtn('Allow sending...', 'ghost-btn', () => mcpAllowSending(sv));
+    allow.setAttribute('aria-describedby', unconfirmedNote.id);
+    lockGate(allow, 'settings');
+  }
   mkBtn('Edit', 'ghost-btn', () => mcpOpenForm(sv));
   // The stored tools and their approvals, without reconnecting (A4-15).
   mkBtn('Review tools', 'ghost-btn', () => mcpShowToolsFor(sv.id));
@@ -381,9 +417,9 @@ async function mcpRemoveServer(sv) {
       if (mcpToolsShownFor === sv.id) mcpToolsShownFor = null;
       await mcpLoadSettings();
       // The entry is gone either way; what went wrong around it - a failed
-      // session teardown (A4-27), an audit row that could not be written
-      // (RU6b), or both - is said as the backend says it, as text, where it
-      // stays readable.
+      // session teardown (A4-27), an audit row that could not be written,
+      // or both - is said as the backend says it, as text, where it stays
+      // readable.
       if (r && r.warning) {
         mcpSetStatus('MCP server removed. ' + r.warning, 'warn');
         toast('MCP server removed. ' + r.warning, 'warn');
@@ -391,7 +427,7 @@ async function mcpRemoveServer(sv) {
         toast('MCP server removed.', 'ok');
       }
     } catch (e) {
-      toast(mcpErrText(e), 'err');
+      toast(errText(e), 'err');
     }
   });
 }
@@ -439,9 +475,11 @@ function mcpSyncAuthRows() {
 
 /// The MCP rule, mirrored from the backend's classify_url (assistant/mcp.rs):
 /// plain http only to localhost, ::1 or 127.x - NOT the provider base URL's
-/// broader local/private-network rule. 127.x must be a real IPv4 literal
-/// here; the backend's text-prefix test would also pass a DNS name like
-/// "127.example.com", which the form refuses (fail closed).
+/// broader local/private-network rule. Like the backend's url_host it is
+/// decided on the PARSED host (A4-23): an IPv4 address in 127.0.0.0/8 (the
+/// URL parser writes 127.1 as 127.0.0.1), the IPv6 address ::1 or the name
+/// localhost - never a name that only starts like one ("127.example.com",
+/// "localhost.example.com").
 function mcpIsLoopbackHost(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
   return h === 'localhost' || h === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
@@ -576,7 +614,7 @@ function mcpCloseForm() {
 
 /// An env-var server switched to "Stored secret" with no secret typed and no
 /// URL/auth change: plan_auth keeps an absent source, so the variable stays
-/// in effect - the form says so rather than refusing (JU3 review item 7).
+/// in effect - the form says so rather than refusing (A4-07).
 function mcpEnvVarStays() {
   const sv = mcpEditing;
   const kind = mcpAuthKind();
@@ -623,37 +661,99 @@ async function mcpSaveServer() {
     const authProblem = mcpAuthProblem(kind, source, val('mcpHeaderName'), secretValue, val('mcpAuthEnvVar'));
     if (authProblem) { toast(authProblem, 'err'); return; }
     const keptEnv = mcpEnvVarStays() ? mcpEditing.auth_env_var : null;
-    // null keeps what is stored; a value replaces it (mcp_save_server).
-    const payload = {
-      id: mcpEditing ? mcpEditing.id : null,
-      name,
-      url,
-      auth_type: kind,
-      auth_header_name: kind === 'custom_header' ? val('mcpHeaderName') : null,
-      auth_secret: withSecret && source === 'stored' && secretValue ? secretValue : null,
-      auth_env_var: withSecret && source === 'env' ? val('mcpAuthEnvVar') : null,
-    };
     try {
-      const r = await mcpCall('mcp_save_server', payload);
-      // Saved, but something after it failed (RU6b: the audit row): said as
-      // the backend says it, without undoing the save.
-      const warning = r && r.warning ? String(r.warning) : '';
+      // null keeps what is stored; a value replaces it (mcp_save_server).
+      const r = await mcpSendSave({
+        id: mcpEditing ? mcpEditing.id : null,
+        name,
+        url,
+        authType: kind,
+        headerName: kind === 'custom_header' ? val('mcpHeaderName') : null,
+        secret: withSecret && source === 'stored' && secretValue ? secretValue : null,
+        envVar: withSecret && source === 'env' ? val('mcpAuthEnvVar') : null,
+      });
+      const { warning, notConfirmed } = mcpSaveOutcome(r);
       if (secretInput) secretInput.value = '';
       mcpCloseForm();
       await mcpLoadSettings();
-      if (keptEnv) {
-        mcpSetStatus('Saved. No secret was entered, so the environment variable ' + keptEnv + ' stays in effect.'
-          + (warning ? ' ' + warning : ''), warning ? 'warn' : undefined);
-        if (!warning) toast('MCP server saved - the environment variable ' + keptEnv + ' stays in effect.', 'ok');
-      } else if (warning) {
-        mcpSetStatus(warning, 'warn');
+      // Saved, but switched off (its credential was not allowed) or with a
+      // failure after the save (its audit row): said as the backend says it,
+      // without undoing the save.
+      const kept = keptEnv ? 'Saved. No secret was entered, so the environment variable ' + keptEnv + ' stays in effect.' : '';
+      const why = warning || (notConfirmed ? MCP_SAVED_NOT_CONFIRMED : '');
+      if (why) {
+        mcpSetStatus(kept ? kept + ' ' + why : why, 'warn');
+        toast(why, 'warn');
+      } else if (kept) {
+        mcpSetStatus(kept);
+        toast('MCP server saved - the environment variable ' + keptEnv + ' stays in effect.', 'ok');
       } else {
         toast('MCP server saved.', 'ok');
       }
-      if (warning) toast(warning, 'warn');
     } catch (e) {
-      toast(mcpErrText(e), 'err');
+      toast(errText(e), 'err');
     }
+  });
+}
+
+/// The one mcp_save_server request: the form's Save and a row's "Allow
+/// sending..." both send it. The payload always names the three auth fields
+/// (null keeps what is stored, a value replaces it, '' clears it -
+/// scripts/check-mcp-contract.js reads this literal). A save that binds a
+/// credential to a place it was not confirmed for is asked about by the
+/// backend, in a native dialog the page can neither show nor answer, before
+/// it answers { ok, id, warning, confirmed } (A4-07).
+function mcpSendSave(s) {
+  const payload = {
+    id: s.id,
+    name: s.name,
+    url: s.url,
+    auth_type: s.authType,
+    auth_header_name: s.headerName,
+    auth_secret: s.secret,
+    auth_env_var: s.envVar,
+  };
+  return mcpCall('mcp_save_server', payload);
+}
+
+/// What a save's answer says beyond "saved": the backend's `warning`, and
+/// whether the server stays switched off. Only `confirmed: true` is a
+/// confirmation - an answer without it is not one (fail closed), so neither
+/// the form's Save nor "Allow sending..." says the credential may go.
+function mcpSaveOutcome(r) {
+  return {
+    warning: r && r.warning ? String(r.warning) : '',
+    notConfirmed: !r || r.confirmed !== true,
+  };
+}
+
+/// "Allow sending..." on a server that is not confirmed: its stored settings
+/// are saved again unchanged - nothing typed, so its credential stays - and
+/// the backend asks its native question again. The row is busy until that is
+/// answered; then the backend's answer is said as it is.
+async function mcpAllowSending(sv) {
+  const name = sv.name || '';
+  await mcpRowAction(sv.id, async () => {
+    mcpSetStatus('Waiting for your answer: SSHSpan asks in its own dialog whether it may send the credential of "'
+      + name + '".', 'info');
+    let r;
+    try {
+      r = await mcpSendSave({ id: sv.id, name: sv.name, url: sv.url, authType: sv.auth_type, headerName: null, secret: null, envVar: null });
+    } catch (e) {
+      const msg = errText(e);
+      mcpSetStatus(msg, 'err');
+      toast(msg, 'err');
+      return;
+    }
+    await mcpLoadSettings();
+    const { warning, notConfirmed } = mcpSaveOutcome(r);
+    if (notConfirmed || warning) {
+      const why = warning || MCP_SAVED_NOT_CONFIRMED;
+      mcpSetStatus(why, 'warn');
+      toast(why, 'warn');
+      return;
+    }
+    toast('MCP server "' + name + '" is confirmed - SSHSpan may send its credential now.', 'ok');
   });
 }
 
@@ -677,7 +777,7 @@ async function mcpTestConnection(id) {
           + changed.map(String).join(', ') + '.', 'err');
       }
     } catch (e) {
-      const msg = mcpErrText(e);
+      const msg = errText(e);
       // Shown beside the row (the list has the status, not the reason) and
       // the row is redrawn from the backend, which now says "error".
       mcpLastErrors.set(id, msg);
@@ -727,10 +827,10 @@ async function mcpSetToolState(serverId, t, enabled, autoApprove) {
   let warning = '';
   try {
     const r = await mcpCall('mcp_set_tool_state', args);
-    // Done, but its audit row could not be written (RU6b): said as it is.
+    // Done, but its audit row could not be written: said as it is.
     warning = r && r.warning ? String(r.warning) : '';
   } catch (e) {
-    refusal = mcpErrText(e);
+    refusal = errText(e);
   } finally {
     mcpToolBusy.delete(key); // before the redraw, or its toggles stay disabled
   }
@@ -889,7 +989,7 @@ async function mcpLoadSettings() {
   try {
     await mcpRefresh();
   } catch (e) {
-    failed = mcpErrText(e);
+    failed = errText(e);
     toast(failed, 'err');
   }
   if (!mcpAvailable) {

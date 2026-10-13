@@ -1,8 +1,14 @@
 #!/usr/bin/env node
-/* JU3: real-page assistant/MCP regression evals. No provider, SSH host or secrets.
+/* Real-page assistant/MCP regression evals. No provider, SSH host or secrets.
  * Each scenario gets a fresh app from the shared renderer harness. The stub
  * records actual IPC; these checks never reimplement renderer algorithms.
  * SSHSPAN_RENDERER_DIR can point at the captured baseline for RED evidence.
+ *
+ * The stub answers like the backend: an MCP save comes back with `confirmed`
+ * (a credential bound to a new place is asked about in a NATIVE dialog the
+ * page cannot answer - declined, the server stays switched off and `warning`
+ * says why), and a move of the stored API key to another address is asked
+ * about the same way (declined, the save is refused with the backend's text).
  */
 'use strict';
 const {
@@ -32,6 +38,17 @@ const FULL_ARGS = {
   tokens: 'fixture-tokens-value', max_tokens: 'fixture-max-tokens-value', credentials_file: 'fixture-credentials-file-value',
 };
 const FULL_ARG_VALUES = Object.values(FULL_ARGS);
+// The backend's own words (src-tauri/src/assistant/mcp.rs settle_binding,
+// assistant/mod.rs save_config_confirmed, commands CREDENTIAL_QUESTION_OPEN).
+const DECLINED = (host) => 'The server was saved but stays switched off, because sending its credential to '
+  + host + ' was not allowed. Save it again to be asked again.';
+const KEY_MOVE_DECLINED = 'Enter the API key for the new address.';
+const KEY_MOVE_CHANGED = 'The assistant settings changed while you were deciding - save them again.';
+const KEY_MOVE_TOO_QUICK = 'The question about sending the stored API key was answered within a second of opening - too fast to be a decision. Save again to be asked again.';
+const QUESTION_OPEN = 'Another question about sending a credential is still open - answer it, then save again.';
+// What a server row says while its credential is not allowed yet.
+const NOT_CONFIRMED = 'Not confirmed - SSHSpan will not send this credential until you allow it';
+const MCP_SAVED_NOT_CONFIRMED_TEXT = 'Saved, but not confirmed - SSHSpan will not send its credential until you allow it.';
 let passed = 0;
 const ok = (name, got, want) => { const n = failures.length; check(name, got, want); if (failures.length === n) passed++; };
 const expect = (name, cond) => ok(name, !!cond, true);
@@ -49,6 +66,12 @@ async function fixture(browser, server, title, fn, opts = {}) {
         window.__replies.assistant_set_level = (a) => { window.__levels[a.tabId] = a.level; return { ok: true }; };
         window.__replies.assistant_chat = { text: 'Finished.', tool_calls: [] };
         window.__replies.mcp_call_tool = { ok: true, content: 'tool output', is_error: false, warning: null };
+        // Plain saves, shaped like the backend's answers (a scenario that
+        // needs the native question installs emulateCredentialQuestion).
+        if (!('mcp_save_server' in window.__replies)) {
+          window.__replies.mcp_save_server = (a) => ({ ok: true, id: a.id || 'm-new', warning: null, confirmed: true });
+        }
+        if (!('assistant_save_config' in window.__replies)) window.__replies.assistant_save_config = { ok: true, warning: null };
       }, FULL_ARGS);
       // A scenario that hangs (an awaited promise that never settles) fails
       // on its own instead of stalling the whole suite.
@@ -97,6 +120,45 @@ function complete(messages) {
 async function settings(page) {
   await page.evaluate(async () => { await switchView('settings'); showSettingsSection('assistant'); await aiLoadConfig(); await mcpLoadSettings(); });
 }
+/// A stand-in for the backend's mcp_save_server and the native question it
+/// asks (binding_needs_confirmation / settle_binding): a save that binds a
+/// credential to a place it was not confirmed for is asked about, and the
+/// user's answer is window.__answer ('allow' or anything else for "Don't
+/// allow"). The questions asked are counted in window.__asked; the records
+/// live in window.__registry, which mcp_list_servers serves.
+async function emulateCredentialQuestion(page, registry) {
+  await page.evaluate((reg) => {
+    window.__registry = reg;
+    window.__asked = [];
+    window.__answer = 'deny';
+    window.__replies.mcp_list_servers = () => structuredClone(window.__registry);
+    window.__replies.mcp_save_server = (a) => {
+      const at = window.__registry.findIndex((s) => s.id === a.id);
+      const prev = at >= 0 ? window.__registry[at] : null;
+      const rec = Object.assign({
+        id: 'm-new', status: 'unknown', has_secret: false, auth_env_var: null, auth_header_name: null,
+        protocol_version: null, loopback_insecure: false, tool_count: 0, tools: [],
+      }, structuredClone(prev || {}), { name: a.name, url: a.url, auth_type: a.auth_type });
+      if (a.auth_header_name != null) rec.auth_header_name = a.auth_header_name;
+      if (a.auth_secret) { rec.has_secret = true; rec.auth_env_var = null; }
+      if (a.auth_env_var) { rec.auth_env_var = a.auth_env_var; rec.has_secret = false; }
+      const sends = rec.auth_type !== 'none' && (rec.has_secret || !!rec.auth_env_var);
+      const sameAsConfirmed = !!prev && prev.confirmed && prev.url === rec.url
+        && (!a.auth_env_var || a.auth_env_var === prev.auth_env_var);
+      const asks = sends && !sameAsConfirmed;
+      let warning = null;
+      rec.confirmed = !asks;
+      if (asks) {
+        window.__asked.push(rec.url);
+        if (window.__answer === 'allow') rec.confirmed = true;
+        else warning = 'The server was saved but stays switched off, because sending its credential to '
+          + new URL(rec.url).hostname + ' was not allowed. Save it again to be asked again.';
+      }
+      if (at >= 0) window.__registry[at] = rec; else window.__registry.push(rec);
+      return { ok: true, id: rec.id, warning, confirmed: rec.confirmed };
+    };
+  }, registry);
+}
 
 async function approvalChecks(browser, server) {
   for (const v of ['read', 'draft', 'execute']) {
@@ -124,7 +186,7 @@ async function approvalChecks(browser, server) {
       if (card) {
         ok('no MCP request before approval', await app.count('mcp_call_tool'), 0);
         // The card, not its danger button, takes the focus: a key-repeat Enter
-        // from the user's own Send must not approve (fix round 1, item 2).
+        // from the user's own Send must not approve (A4-24).
         ok('the pending card itself has the focus', await page.evaluate(() => {
           const a = document.activeElement; return !!a && a.classList.contains('ai-card') && a.classList.contains('confirm');
         }), true);
@@ -135,7 +197,7 @@ async function approvalChecks(browser, server) {
         ok('Tab reaches Approve from the card', await page.evaluate(() => document.activeElement.textContent), 'Approve');
         // The card is the control between an injected model and an
         // exfiltration: every argument value is shown, whatever its name -
-        // server-chosen names must not hide anything (fix round 1, item 1).
+        // server-chosen names must not hide anything (R6).
         const cardText = await page.locator('.ai-card.confirm').last().innerText();
         expect('card shows every argument value in full (no name-based masking)',
           FULL_ARG_VALUES.every((x) => cardText.includes(x)) && !/redacted/i.test(cardText));
@@ -446,7 +508,7 @@ async function mcpSettingsChecks(browser, server) {
     ]; });
     await settings(page);
     expect('count is enabled/total', /0\s*\/\s*1/.test(await page.locator('.mcp-server-count').innerText()));
-    expect('unconfirmed entry is visibly inert', /unconfirmed.*review.*re-save/i.test(await page.locator('.mcp-server-row').innerText()));
+    expect('unconfirmed entry is visibly inert', (await page.locator('.mcp-server-row').innerText()).includes(NOT_CONFIRMED));
     expect('negotiated protocol visible', /2025-03-26/.test(await page.locator('.mcp-server-row').innerText()));
     expect('status dot has a textual accessible name', !!(await page.locator('.mcp-dot').getAttribute('aria-label')));
     const review = page.locator('.mcp-server-row button').filter({ hasText: /^Review tools$/ });
@@ -462,7 +524,7 @@ async function mcpSettingsChecks(browser, server) {
     const p = (await app.calls('mcp_save_server')).at(-1).args;
     ok('round-trip keeps header + env-var', [p.auth_header_name, p.auth_env_var, p.auth_secret], ['X-Fixed', 'FIXTURE_ENV_NAME', null]);
     // Env var -> "stored secret" with nothing typed: the backend keeps the
-    // binding, and the form says so instead of refusing (fix round 1, item 7).
+    // binding, and the form says so instead of refusing (A4-07).
     await page.locator('.mcp-server-row button').filter({ hasText: /^Edit$/ }).click();
     await page.selectOption('#mcpSecretSource', 'stored');
     expect('the form says the env-var binding stays in effect', /FIXTURE_ENV_NAME[^.]*stays in effect/i.test(await page.locator('#mcpFormHost').innerText()));
@@ -573,7 +635,7 @@ async function mcpSettingsChecks(browser, server) {
 }
 
 async function providerChecks(browser, server) {
-  await fixture(browser, server, 'Provider presets, saved-key removal, reuse confirmation and dirty reload', async (app) => {
+  await fixture(browser, server, 'Provider presets, saved-key removal, the native key-move question and dirty reload', async (app) => {
     const { page } = app; await settings(page);
     await page.selectOption('#aiProvider', 'anthropic'); await page.selectOption('#aiBaseUrlPreset', 'http://localhost:11434/v1');
     ok('Ollama preset sets provider', await page.inputValue('#aiProvider'), 'openai');
@@ -590,20 +652,44 @@ async function providerChecks(browser, server) {
     await page.evaluate(() => { window.__load = aiLoadConfig(); });
     if (await waitVisible(page, '#confirmModal', 500)) await answerConfirm(page, 'ok');
     await page.evaluate(() => window.__load);
+    // A new address and no new key: the backend asks in a NATIVE dialog
+    // whether the stored key may go there - the page can neither show that
+    // question nor answer it. Declined, the save is refused with its text.
     await page.fill('#aiBaseUrl', 'https://new-provider.example.test/v1');
-    await page.evaluate(() => { window.__replies.assistant_save_config = (a) => {
-      if (!a.reuseKeyAtNewOrigin) throw 'The provider or base URL changed but no new API key was entered - enter the key for the new endpoint, or confirm reusing the stored key there.';
-      return { ok: true };
-    }; });
-    await page.click('#aiSaveBtn'); const confirm = await answerConfirm(page, 'cancel'); expect('reuse is opt-in, not silent', confirm); await page.waitForTimeout(40);
-    ok('Cancel sends no confirmed reuse', (await app.calls('assistant_save_config')).filter((x) => x.args.reuseKeyAtNewOrigin).length, 0);
-    await page.click('#aiSaveBtn'); if (await waitVisible(page, '#confirmModal', 500)) await answerConfirm(page, 'ok'); await page.waitForTimeout(60);
-    ok('confirmed retry explicitly attests reuse', (await app.calls('assistant_save_config')).at(-1).args.reuseKeyAtNewOrigin, true);
+    await page.evaluate((m) => { window.__replies.assistant_save_config = () => { throw m; }; }, KEY_MOVE_DECLINED);
+    const saves = await app.count('assistant_save_config');
+    await page.click('#aiSaveBtn'); await page.waitForTimeout(80);
+    ok('the renderer asks no key question of its own', [await app.open('confirmModal'), await page.evaluate(() => window.__nativeDialogCalls)], [false, 0]);
+    ok('one save request, never resent with a flag', await app.count('assistant_save_config'), saves + 1);
+    const sent = (await app.calls('assistant_save_config')).at(-1).args;
+    ok('no renderer flag claims the key may move', Object.prototype.hasOwnProperty.call(sent, 'reuseKeyAtNewOrigin'), false);
+    ok('the refusal is shown as the backend says it', (await page.textContent('#aiStatus')).trim(), KEY_MOVE_DECLINED);
+    for (const refusal of [KEY_MOVE_TOO_QUICK, KEY_MOVE_CHANGED, QUESTION_OPEN]) {
+      await page.evaluate((m) => { window.__replies.assistant_save_config = () => { throw m; }; }, refusal);
+      await page.click('#aiSaveBtn'); await page.waitForTimeout(60);
+      ok('shown as it is: ' + refusal.slice(0, 40), (await page.textContent('#aiStatus')).trim(), refusal);
+    }
+    ok('none of them opened a question in the page', await app.open('confirmModal'), false);
+    // Allowed in the native dialog: the save goes through like any other.
+    await page.evaluate(() => { window.__replies.assistant_save_config = { ok: true, warning: null }; });
+    await page.click('#aiSaveBtn'); await page.waitForTimeout(80);
+    ok('allowed there, it is saved', (await page.textContent('#aiStatus')).trim(), 'Saved.');
+    ok('still without a flag', (await app.calls('assistant_save_config')).some((x) => Object.prototype.hasOwnProperty.call(x.args, 'reuseKeyAtNewOrigin')), false);
+    // The backend stores the address as it parsed it (lowercase host, no
+    // default port, no trailing slash); the form shows what was stored.
+    await page.evaluate(() => {
+      window.__replies.assistant_save_config = () => { window.__storedUrl = 'https://new-provider.example.test/v1'; return { ok: true, warning: null }; };
+      window.__replies.assistant_get_config = () => ({ provider: 'openai', base_url: window.__storedUrl || 'https://api.openai.com/v1', model: 'fixture-model', has_api_key: true });
+    });
+    await page.fill('#aiBaseUrl', 'HTTPS://New-Provider.Example.TEST:443/v1/');
+    await page.click('#aiSaveBtn'); await page.waitForTimeout(100);
+    ok('after a save the form shows the address as stored', await page.inputValue('#aiBaseUrl'), 'https://new-provider.example.test/v1');
     const remove = page.locator('#aiRemoveKeyBtn'); ok('Remove stored key exists', await remove.count(), 1);
     if (await remove.count()) {
-      await page.evaluate(() => { window.__replies.assistant_save_config = { ok: true }; });
+      await page.evaluate(() => { window.__replies.assistant_save_config = { ok: true, warning: null }; });
       await remove.click(); if (await waitVisible(page, '#confirmModal', 500)) await answerConfirm(page, 'ok'); await page.waitForTimeout(50);
-      ok('Remove stored key sends clearApiKey=true', (await app.calls('assistant_save_config')).at(-1).args.clearApiKey, true);
+      const removal = (await app.calls('assistant_save_config')).at(-1).args;
+      ok('Remove stored key sends clearApiKey=true and no reuse flag', [removal.clearApiKey, Object.prototype.hasOwnProperty.call(removal, 'reuseKeyAtNewOrigin')], [true, false]);
     }
     expect('provider strings are complete (no [OI] placeholder)', !/\[OI\]/.test(await page.locator('.settings-section[data-section="assistant"]').innerText()));
     expect('complete model placeholder', !/\/\s*$/.test(await page.locator('#aiModel').getAttribute('placeholder')));
@@ -641,22 +727,24 @@ async function lockedSettingsChecks(browser, server) {
     const { page } = app;
     const read = () => page.evaluate(() => {
       const rowButtons = [...document.querySelectorAll('.mcp-server-row button')].filter((b) => /^(Test connection|Remove)$/.test(b.textContent));
+      const allow = [...document.querySelectorAll('.mcp-server-row button')].filter((b) => /^Allow sending/.test(b.textContent));
       return {
         save: document.getElementById('aiSaveBtn').disabled,
         test: document.getElementById('aiTestBtn').disabled,
         add: document.getElementById('mcpAddBtn').disabled,
         rowActions: rowButtons.length > 0 && rowButtons.every((b) => b.disabled),
+        allow: allow.length > 0 && allow.every((b) => b.disabled),
         toggles: [...document.querySelectorAll('.mcp-tool-row input')].every((i) => i.disabled),
       };
     });
     await page.evaluate(() => { window.__backend.unlocked = false; return refreshVaultStatus(); });
     await page.waitForTimeout(60);
     await settings(page); await page.evaluate(() => mcpShowToolsFor('m1'));
-    ok('locked: write actions are disabled (fail closed)', await read(), { save: true, test: true, add: true, rowActions: true, toggles: true });
+    ok('locked: write actions are disabled (fail closed)', await read(), { save: true, test: true, add: true, rowActions: true, allow: true, toggles: true });
     await page.evaluate(() => { window.__backend.unlocked = true; return refreshVaultStatus(); });
     await page.waitForTimeout(80);
-    ok('unlocked: the same actions work again', await read(), { save: false, test: false, add: false, rowActions: false, toggles: false });
-  });
+    ok('unlocked: the same actions work again', await read(), { save: false, test: false, add: false, rowActions: false, allow: false, toggles: false });
+  }, { replies: { mcp_list_servers: [MCP(), MCP({ id: 'm2', name: 'svc2', auth_type: 'bearer', has_secret: true, confirmed: false })] } });
 }
 
 async function setupChecks(browser, server) {
@@ -739,12 +827,177 @@ async function panelChecks(browser, server) {
   });
 }
 
+async function mcpConfirmChecks(browser, server) {
+  // A server record without `confirmed: true` is not confirmed, on the rows
+  // as in a save's answer: one rule everywhere (fail closed).
+  await fixture(browser, server, 'A server row without `confirmed` reads not confirmed', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      const record = Object.assign({}, window.__replies.mcp_list_servers[0], { auth_type: 'bearer', has_secret: true });
+      delete record.confirmed;
+      window.__replies.mcp_list_servers = [record];
+    });
+    await settings(page);
+    const row = await page.locator('.mcp-server-row').first().innerText();
+    expect('10 a row whose record says nothing of `confirmed` reads not confirmed', row.includes(NOT_CONFIRMED));
+    ok('10 and offers to allow sending', await page.locator('.mcp-server-row button').filter({ hasText: /^Allow sending/ }).count(), 1);
+    ok('no page errors so far', app.errors, []);
+  });
+  await fixture(browser, server, 'An MCP save the native question did not allow: the row says so and asks again', async (app) => {
+    const { page } = app;
+    await emulateCredentialQuestion(page, [MCP({ auth_type: 'bearer', has_secret: true })]);
+    await settings(page);
+    await page.locator('.mcp-server-row button').filter({ hasText: /^Edit$/ }).click();
+    await page.fill('#mcpUrl', 'https://other.example.test/mcp');
+    await page.fill('#mcpAuthSecret', 'fixture-new-secret');
+    await page.click('#mcpSaveBtn'); await page.waitForTimeout(100);
+    ok('the page asks no credential question of its own', [await app.open('confirmModal'), await page.evaluate(() => window.__nativeDialogCalls)], [false, 0]);
+    ok('one save, one native question', [await app.count('mcp_save_server'), await page.evaluate(() => window.__asked.length)], [1, 1]);
+    const declined = DECLINED('other.example.test');
+    ok('why it stays off is shown as the backend says it', (await page.textContent('#mcpStatus')).trim(), declined);
+    const shown = await toasts(page);
+    expect('as a warning, never as "saved"', shown.includes(declined) && !shown.some((x) => /^MCP server saved/.test(x)));
+    const row = page.locator('.mcp-server-row').first();
+    expect('the row says the credential is not sent until it is allowed', (await row.innerText()).includes(NOT_CONFIRMED));
+    expect('without the old backup-only explanation', !/Restored from a backup/i.test(await row.evaluate((r) => r.outerHTML)));
+    const allow = () => page.locator('.mcp-server-row button').filter({ hasText: /^Allow sending/ });
+    ok('the row offers a way to be asked again', await allow().count(), 1);
+    // Asked again: the stored settings unchanged, nothing typed - the backend
+    // keeps the stored credential and asks its question again.
+    await hold(page, 'mcp_save_server');
+    await allow().click();
+    await page.waitForTimeout(60);
+    expect('while the question is open the row is busy', await page.locator('.mcp-server-row').first().evaluate((r) =>
+      r.getAttribute('aria-busy') === 'true' && [...r.querySelectorAll('.mcp-server-actions button')].every((b) => b.disabled)));
+    expect('and the status line says what it waits for', /answer/i.test(await page.textContent('#mcpStatus')));
+    await page.evaluate(() => { const b = [...document.querySelectorAll('.mcp-server-row button')].find((x) => /^Allow sending/.test(x.textContent)); if (b) b.click(); });
+    await letGo(page, 'mcp_save_server'); await page.waitForTimeout(100);
+    const calls = await app.calls('mcp_save_server');
+    ok('a second click meanwhile asks nothing more', calls.length, 2);
+    ok('asking again re-saves the stored settings and keeps the credential', calls.at(-1).args, {
+      id: 'm1', name: 'svc', url: 'https://other.example.test/mcp', auth_type: 'bearer',
+      auth_header_name: null, auth_secret: null, auth_env_var: null,
+    });
+    ok('declined again: said as it is', (await page.textContent('#mcpStatus')).trim(), declined);
+    ok('and the row still offers it', await allow().count(), 1);
+    await page.evaluate(() => { window.__answer = 'allow'; });
+    await allow().click(); await page.waitForTimeout(100);
+    const after = await page.locator('.mcp-server-row').first().innerText();
+    expect('allowed: the row no longer says it is not confirmed', !/not confirmed/i.test(after));
+    ok('and offers nothing to allow', await allow().count(), 0);
+    expect('the confirmation is said', (await toasts(page)).some((x) => /is confirmed/i.test(x)));
+    ok('no page dialog at any point', await page.evaluate(() => window.__nativeDialogCalls), 0);
+  });
+  await fixture(browser, server, 'Not-confirmed MCP servers: with and without a credential, and every answer shape', async (app) => {
+    const { page } = app;
+    await emulateCredentialQuestion(page, [
+      MCP({ confirmed: false }),
+      MCP({ id: 'm2', name: 'env-svc', auth_type: 'bearer', auth_env_var: 'FIXTURE_TOKEN', confirmed: false }),
+    ]);
+    await settings(page);
+    const plain = page.locator('.mcp-server-row').nth(0);
+    const plainText = await plain.innerText();
+    expect('a server without a credential says it is not confirmed', /not confirmed/i.test(plainText));
+    expect('and that Edit and Save switch it on', /Edit/.test(plainText) && /save/i.test(plainText));
+    expect('without credential wording', !plainText.includes(NOT_CONFIRMED));
+    ok('Edit is its way: no ask-again button', await plain.locator('button').filter({ hasText: /^Allow sending/ }).count(), 0);
+    const env = page.locator('.mcp-server-row').nth(1);
+    expect('a server sending an environment variable says the credential is held back', (await env.innerText()).includes(NOT_CONFIRMED));
+    ok('and can be asked again', await env.locator('button').filter({ hasText: /^Allow sending/ }).count(), 1);
+    // An answer that says "not confirmed" without a reason still says so.
+    await page.evaluate(() => { window.__replies.mcp_save_server = (a) => ({ ok: true, id: a.id, warning: null, confirmed: false }); });
+    await env.locator('button').filter({ hasText: /^Allow sending/ }).click(); await page.waitForTimeout(100);
+    expect('a bare "confirmed: false" is a warning, not a success', /not confirmed/i.test(await page.textContent('#mcpStatus'))
+      && !(await toasts(page)).some((x) => /is confirmed/i.test(x)));
+    // An answer without `confirmed: true` is not confirmed (fail closed): it
+    // used to read as a plain save, and "Allow sending..." as confirmed.
+    await page.evaluate(() => { window.__replies.mcp_save_server = (a) => ({ ok: true, id: a.id || 'm-new', warning: null }); });
+    await env.locator('button').filter({ hasText: /^Allow sending/ }).click(); await page.waitForTimeout(100);
+    expect('I2 "Allow sending..." answered without `confirmed` is not said to be confirmed',
+      /not confirmed/i.test(await page.textContent('#mcpStatus')) && !(await toasts(page)).some((x) => /is confirmed/i.test(x)));
+    await page.locator('.mcp-server-row button').filter({ hasText: /^Edit$/ }).first().click();
+    await page.fill('#mcpName', 'renamed-svc'); await page.click('#mcpSaveBtn'); await page.waitForTimeout(100);
+    expect('I2 a save answered without `confirmed` says it is not confirmed, not "MCP server saved."',
+      (await toasts(page)).includes(MCP_SAVED_NOT_CONFIRMED_TEXT) && !(await toasts(page)).includes('MCP server saved.'));
+    ok('no page errors so far', app.errors, []);
+  });
+}
+
+async function focusChecks(browser, server) {
+  await fixture(browser, server, 'A new approval card takes the focus only from the panel or the page', async (app) => {
+    const { page } = app; const id = await panel(app);
+    const focus = () => page.evaluate(() => {
+      const a = document.activeElement;
+      if (!a || a === document.body) return 'body';
+      if (a.classList.contains('ai-card')) return 'card';
+      if (a.closest('#terminalBody')) return 'terminal';
+      return a.id || a.className;
+    });
+    let n = 0;
+    const card = async () => {
+      n += 1;
+      await page.evaluate(({ t, k }) => { window['__card' + k] = aiConfirmCard(t, 'echo ' + k); }, { t: id, k: n });
+      await page.waitForFunction((k) => document.querySelectorAll('.ai-card.confirm').length >= k, n);
+    };
+    // Answered without a click, so the answer moves no focus.
+    const deny = () => page.evaluate(() => {
+      for (const c of document.querySelectorAll('.ai-card.confirm:not(.approved):not(.denied)')) {
+        [...c.querySelectorAll('button')].find((b) => b.textContent === 'Deny').click();
+      }
+    });
+    await page.evaluate((t) => window.tabRecord(t).term.focus(), id);
+    ok('the user is typing in the terminal', await focus(), 'terminal');
+    await card();
+    ok('a new card leaves the keyboard in the terminal', await focus(), 'terminal');
+    expect('the card is still announced (the transcript is a live log)', (await page.getAttribute('#assistantMessages', 'aria-live')) === 'polite');
+    await deny();
+    await page.focus('#assistantToggleBtn');
+    await card();
+    ok('nor does it take the keyboard from a control outside the panel', await focus(), 'assistantToggleBtn');
+    await deny();
+    await page.evaluate(() => { if (document.activeElement) document.activeElement.blur(); });
+    ok('nothing has the focus', await focus(), 'body');
+    await card();
+    ok('from <body> the card takes the focus', await focus(), 'card');
+    await deny();
+    await page.focus('#assistantInput');
+    await card();
+    ok('from inside the panel the card takes the focus', await focus(), 'card');
+    await deny();
+  });
+  await fixture(browser, server, 'Closing the panel returns the keyboard to its toggle', async (app) => {
+    const { page } = app; await panel(app);
+    const where = () => page.evaluate(() => [assistantIsOpen(), document.activeElement === document.body ? 'body' : document.activeElement.id]);
+    await page.click('#assistantCloseBtn');
+    ok('the X closes the panel and the toggle has the focus, not <body>', await where(), [false, 'assistantToggleBtn']);
+    ok('the toggle says the panel is closed', await page.getAttribute('#assistantToggleBtn', 'aria-pressed'), 'false');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => assistantIsOpen());
+    await page.waitForTimeout(150); // the panel's input takes the focus
+    await page.focus('#assistantCloseBtn'); await page.keyboard.press('Enter');
+    ok('the X from the keyboard does the same', await where(), [false, 'assistantToggleBtn']);
+    // WebKit (macOS) does not focus a button it clicks: the X closes the panel
+    // while the focus is on <body>, and must still hand it to the toggle.
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => assistantIsOpen());
+    await page.waitForTimeout(150);
+    await page.evaluate(() => { document.activeElement.blur(); document.getElementById('assistantCloseBtn').click(); });
+    ok('a click that does not focus the X still returns the focus to the toggle', await where(), [false, 'assistantToggleBtn']);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => assistantIsOpen());
+    await page.waitForTimeout(150);
+    await page.focus('#assistantInput');
+    await page.keyboard.press('Control+Shift+A');
+    ok('closed with Ctrl+Shift+A from inside it, the focus goes to the toggle too', await where(), [false, 'assistantToggleBtn']);
+  });
+}
+
 (async () => {
   const chromium = loadChromium();
   if (!chromium) { console.error('Playwright is required for test:assistant; no silent skip.'); process.exit(1); }
   const server = await serve(rendererDir()); const browser = await chromium.launch({ headless: true });
   try {
-    for (const fn of [approvalChecks, typingChecks, historyChecks, lifecycleChecks, mcpSettingsChecks, providerChecks, lockedSettingsChecks, setupChecks, panelChecks]) {
+    for (const fn of [approvalChecks, typingChecks, historyChecks, lifecycleChecks, mcpSettingsChecks, mcpConfirmChecks, providerChecks, lockedSettingsChecks, setupChecks, panelChecks, focusChecks]) {
       // ASSISTANT_ONLY=<group> runs one group while iterating; CI runs all.
       if (process.env.ASSISTANT_ONLY && fn.name !== process.env.ASSISTANT_ONLY) continue;
       console.log('\n' + fn.name); await fn(browser, server);

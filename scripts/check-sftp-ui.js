@@ -2605,7 +2605,8 @@ async function unlockVault(page) {
 /// locked already when the page hears of it).
 const LOCK_PATHS = [
   ['Ctrl+L', (page) => page.keyboard.press('Control+l')],
-  ['the tray Lock', (page) => page.evaluate(() => window.__emit('vault-lock-requested', {}))],
+  // The tray locks the vault first, then tells the page (which only follows).
+  ['the tray Lock', (page) => page.evaluate(() => { window.__backend.unlocked = false; window.__emit('vault-lock-requested', {}); })],
   ['the idle auto-lock', (page) => page.evaluate(() => { autoLockDeadline = Date.now() - 1; onAutoLockTimer(); })],
   ['the backend watchdog', (page) => page.evaluate(() => { window.__backend.unlocked = false; window.__emit('vault-locked-by-watchdog', {}); })],
 ];
@@ -2919,6 +2920,404 @@ async function scenarioDotNames(browser, server) {
   });
 }
 
+// ─── "Stop editing" when changes are not on the server ─────────────────────
+//
+// sftp_close_edit without `force` keeps a local copy holding changes that are
+// not on the server and answers { ok: false, unsynced: true, error } - the
+// backend knows (a save still in its debounce, a failed or held-back upload,
+// a lost watcher event); the page asks in its words, and only a yes sends
+// force: true.
+
+const UNSYNCED = 'app.conf has changes that are not on the server. Stop editing and lose them?';
+const CLOSE_ARGS = { sessionId: 'sess-t1', remote: '/home/u/app.conf' };
+
+async function scenarioStopEditAsks(browser, server) {
+  const spec = { remote: { '/home/u': ['app.conf'] }, local: HOME_ONLY };
+  const openEdit = async (page) => {
+    await page.evaluate(() => {
+      window.__replies.sftp_open_for_edit = { ok: true, localPath: 'C:\\stage\\app.conf.txt', remote: '/home/u/app.conf' };
+    });
+    await rowEvent(page, 'contextmenu', 'app.conf');
+    await clickMenuItem(page, 'Open with system app');
+    await settle(page, 200);
+  };
+  const sync = (page, p) => page.evaluate((x) => window.__emit('sftp-edit-sync', Object.assign({ sessionId: 'sess-t1', editId: 'e1', remote: '/home/u/app.conf' }, x)), p);
+  const stop = async (page) => {
+    await rowEvent(page, 'contextmenu', 'app.conf');
+    await clickMenuItem(page, 'Stop editing');
+    await settle(page, 150);
+  };
+  const closes = async (app) => (await app.calls('sftp_close_edit')).map((c) => c.args);
+  await withFiles(browser, server, spec, 'stop editing: changes that are not on the server', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await page.evaluate((m) => {
+      window.__replies.sftp_close_edit = (a) => (a.force ? { ok: true } : { ok: false, unsynced: true, error: m });
+    }, UNSYNCED);
+    await stop(page);
+    yes('an unsynced answer asks first', await app.open('confirmModal'));
+    check('in the backend\'s words', plain(await page.textContent('#confirmMessage')), UNSYNCED);
+    check('with Cancel focused', await page.evaluate(() => (document.activeElement || {}).id), 'confirmCancelBtn');
+    await page.click('#confirmCancelBtn');
+    await settle(page);
+    check('Cancel keeps the edit: nothing is forced', await closes(app), [CLOSE_ARGS]);
+    await rowEvent(page, 'contextmenu', 'app.conf');
+    yes('and the menu still offers Stop editing', (await menuItems(page) || []).includes('Stop editing'));
+    await clickMenuItem(page, 'Stop editing');
+    await settle(page, 150);
+    yes('(set-up) asked again', await app.open('confirmModal'));
+    await page.click('#confirmOkBtn');
+    await settle(page);
+    check('yes stops it, with force', await closes(app), [CLOSE_ARGS, CLOSE_ARGS, { ...CLOSE_ARGS, force: true }]);
+    yes('and says so', (await toasts(page)).some((t) => /^Stopped syncing app\.conf/.test(plain(t))), JSON.stringify(await toasts(page)));
+    await rowEvent(page, 'contextmenu', 'app.conf');
+    yes('then the edit is over', !(await menuItems(page) || []).includes('Stop editing'));
+    await page.keyboard.press('Escape');
+    check('no page errors', app.errors, []);
+  });
+  await withFiles(browser, server, spec, 'stop editing: a clean close', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await stop(page);
+    check('a clean close asks nothing and forces nothing', [await app.open('confirmModal'), await closes(app)], [false, [CLOSE_ARGS]]);
+    // The backend decides: a failed save no longer makes the page ask on its
+    // own as well (one question, not two).
+    await openEdit(page);
+    await sync(page, { ok: false, error: 'Permission denied' });
+    await settle(page);
+    await stop(page);
+    check('after a failed save the page asks only when the backend says so', [await app.open('confirmModal'), (await closes(app)).length], [false, 2]);
+    check('no page errors', app.errors, []);
+  });
+  await withFiles(browser, server, spec, 'stop editing: one check at a time, and an error', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    // The backend may take up to 10 s (it waits for a running upload).
+    await hold(page, 'sftp_close_edit');
+    await stop(page);
+    await stop(page);
+    check('while the backend checks, a second Stop editing sends nothing more', (await closes(app)).length, 1);
+    await letGo(page, 'sftp_close_edit');
+    await settle(page);
+    await openEdit(page);
+    await page.evaluate(() => { window.__replies.sftp_close_edit = { $reject: 'The SFTP session is closed.' }; });
+    await stop(page);
+    check('an error is said as it is; nothing is asked or forced',
+      [await app.open('confirmModal'), (await toasts(page)).includes('The SFTP session is closed.'), (await closes(app)).filter((a) => a.force).length],
+      [false, true, 0]);
+    check('no page errors', app.errors, []);
+  });
+  // N2: the vault locks while the backend checks (that can take 10 s). Its
+  // answer, arriving after, opens no question - it would sit on the unlock
+  // dialog, with the server's file name in it - and nothing more is sent.
+  await withFiles(browser, server, spec, 'stop editing: a lock while the backend checks', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await hold(page, 'sftp_close_edit');
+    await stop(page);
+    await page.evaluate(() => { window.__backend.unlocked = false; window.__emit('vault-lock-requested', {}); });
+    await settle(page, 150);
+    await page.evaluate((m) => { window.__replies.sftp_close_edit = { ok: false, unsynced: true, error: m }; }, UNSYNCED);
+    await letGo(page, 'sftp_close_edit');
+    await settle(page, 150);
+    check('N2 an answer after the lock asks nothing', await app.open('confirmModal'), false);
+    check('N2 and nothing more is sent', await closes(app), [CLOSE_ARGS]);
+    check('no page errors', app.errors, []);
+  });
+  // The lock closes the session tabs as well; the vault's own state is
+  // checked too, for an answer that finds the page locked with its tab still
+  // there.
+  await withFiles(browser, server, spec, 'stop editing: an answer to a locked page', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await hold(page, 'sftp_close_edit');
+    await stop(page);
+    await page.evaluate((m) => { state.unlocked = false; window.__replies.sftp_close_edit = { ok: false, unsynced: true, error: m }; }, UNSYNCED);
+    await letGo(page, 'sftp_close_edit');
+    await settle(page, 150);
+    check('N2 a page that reads locked asks nothing, though its tab is still there',
+      [await app.open('confirmModal'), await page.evaluate(() => !!sftpTab('t1')), (await closes(app)).length], [false, true, 1]);
+    await page.evaluate(() => { state.unlocked = true; });
+    check('no page errors', app.errors, []);
+  });
+  // Only { ok: true } closes. { unsynced: true } alone still asks (in the
+  // page's own words: it brings none); null, { ok: false } or {} is an error,
+  // and the edit goes on.
+  await withFiles(browser, server, spec, 'stop editing: answers that are not ok', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await page.evaluate(() => { window.__replies.sftp_close_edit = (a) => (a.force ? { ok: true } : { unsynced: true }); });
+    await stop(page);
+    yes('{ unsynced: true } alone asks too', await app.open('confirmModal'));
+    check('without a text of the backend\'s, in the page\'s words', plain(await page.textContent('#confirmMessage')), UNSYNCED);
+    await page.click('#confirmCancelBtn');
+    await settle(page);
+    for (const [label, reply] of [['null', null], ['{ ok: false }', { ok: false }], ['{}', {}]]) {
+      await page.evaluate((r) => { window.__replies.sftp_close_edit = () => r; }, reply);
+      await stop(page);
+      yes(`an answer of ${label} is said as an error`, (await toasts(page)).includes('Something went wrong, and no reason was given.'), JSON.stringify(await toasts(page)));
+      await rowEvent(page, 'contextmenu', 'app.conf');
+      yes(`and after ${label} the edit goes on`, (await menuItems(page) || []).includes('Stop editing'));
+      await page.keyboard.press('Escape');
+      await page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].forEach((t) => t.remove()));
+    }
+    check('none of it was forced', (await closes(app)).filter((a) => a.force).length, 0);
+    check('no page errors', app.errors, []);
+  });
+  // The backend's question is spelled out (a direction override in the file
+  // name it quotes cannot turn the question around), and the second click of
+  // a double-click - the menu item sits under OK, and the answer comes at
+  // once - is no yes (N1).
+  const RLO_QUESTION = 'invoice\u{202E}fdp.exe has changes that are not on the server. Stop editing and lose them?';
+  await withFiles(browser, server, spec, 'stop editing: the question spelled out, a double-click', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await page.evaluate((m) => {
+      window.__replies.sftp_close_edit = (a) => (a.force ? { ok: true } : { ok: false, unsynced: true, error: m });
+    }, RLO_QUESTION);
+    await stop(page);
+    const asked = (await page.textContent('#confirmMessage')) || '';
+    check('the question is the backend\'s, its direction characters spelled out',
+      [asked.includes('\u{202E}'), asked], [false, 'invoice<U+202E>fdp.exe has changes that are not on the server. Stop editing and lose them?']);
+    await page.evaluate(() => document.getElementById('confirmOkBtn')
+      .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 2 })));
+    await settle(page);
+    check('N1 the second click of a double-click on OK forces nothing; the question stays',
+      [(await closes(app)).filter((a) => a.force).length, await app.open('confirmModal')], [0, true]);
+    await page.click('#confirmCancelBtn');
+    check('no page errors', app.errors, []);
+  });
+  // A check that takes longer than a second is said, in the strip under the
+  // panes, until its answer comes.
+  await withFiles(browser, server, spec, 'stop editing: a slow check is said', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    const before = await page.textContent('#termStrip');
+    await hold(page, 'sftp_close_edit');
+    await stop(page);
+    check('within the first second nothing is said yet', await page.textContent('#termStrip'), before);
+    await page.waitForTimeout(1100);
+    check('after a second the wait is said, the name kept to itself',
+      await page.textContent('#termStrip'), 'Checking \u{2068}app.conf\u{2069} for changes that are not on the server\u{2026}');
+    await stop(page);
+    check('a second Stop editing meanwhile still sends nothing', (await closes(app)).length, 1);
+    await letGo(page, 'sftp_close_edit');
+    await settle(page);
+    check('the answer takes it away', await page.textContent('#termStrip'), before);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── the file menus from the keyboard ───────────────────────────────────────
+
+async function scenarioMenusKeyboard(browser, server) {
+  const spec = { remote: { '/home/u': ['docs/', 'notes.txt'] }, local: { '/home/me': ['l1.txt'] } };
+  const menu = (page) => page.evaluate(() => {
+    const m = document.getElementById('keyConnectMenu');
+    const a = document.activeElement;
+    return m ? { role: m.getAttribute('role'), label: m.getAttribute('aria-label'), focus: a && m.contains(a) ? a.textContent.trim() : null } : null;
+  });
+  await withFiles(browser, server, spec, 'A2-50 the SFTP menus take the keyboard', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await page.focus('#sftpTbody-t1 tr.sftp-entry[data-name="notes.txt"]');
+    await page.keyboard.press('Shift+F10');
+    await settle(page, 80);
+    const m1 = await menu(page);
+    check('Shift+F10 on a file opens its menu as a menu, the focus on its first item',
+      m1 && [m1.role, m1.focus], ['menu', 'Download']);
+    await page.keyboard.press('ArrowDown');
+    check('ArrowDown moves along it', (await menu(page) || {}).focus, 'Download as...');
+    await page.keyboard.press('Escape');
+    await settle(page, 60);
+    check('Escape closes it and the focus goes back to the file',
+      [await menu(page), await page.evaluate(() => document.activeElement && document.activeElement.dataset && document.activeElement.dataset.name)], [null, 'notes.txt']);
+    await page.evaluate(() => {
+      const wrap = document.getElementById('sftpTbody-t1').closest('.sftp-tablewrap');
+      const r = wrap.getBoundingClientRect();
+      wrap.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 20, clientY: r.bottom - 10 }));
+    });
+    await settle(page, 80);
+    const m2 = await menu(page);
+    check('the folder menu (empty space) is a menu too, focused', m2 && [m2.role, m2.focus], ['menu', 'Upload...']);
+    await page.keyboard.press('Escape');
+    check('and Escape closes it', await menu(page), null);
+    await openDual(page);
+    await rowEvent(page, 'contextmenu', 'l1.txt', { local: true });
+    await settle(page, 80);
+    const m3 = await menu(page);
+    check('the local pane\'s menu is a menu too, focused', m3 && [m3.role, m3.focus], ['menu', 'Upload']);
+    await page.keyboard.press('Escape');
+    check('and Escape closes it', await menu(page), null);
+    // The Bookmarks button toggles its menu: a second click closes it (the
+    // menu was closed and opened again).
+    const clickBookmarks = () => page.evaluate(() => {
+      const b = [...document.querySelectorAll('#sftpPanel-t1 button')].find((x) => x.title === 'Bookmarks');
+      return openBookmarkMenu({ currentTarget: b }, 't1');
+    });
+    await clickBookmarks();
+    await settle(page, 80);
+    check('the Bookmarks button opens its menu', (await menu(page) || {}).label, 'Bookmarks');
+    await clickBookmarks();
+    await settle(page, 80);
+    check('and a second click on it closes the menu', await menu(page), null);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── the search summary and "Send to" say what happened ────────────────────
+
+async function scenarioSearchCapsSendTo(browser, server) {
+  const spec = { remote: { '/home/u': ['etc/', 'notes.txt'] }, local: HOME_ONLY };
+  await withFiles(browser, server, spec, 'search caps', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await page.click('#sftpPanel-t1 .sftp-toolbar button[title^="Search"]');
+    const run = async (q, done) => {
+      await page.fill('#sftpSearchInput-t1', q);
+      await page.press('#sftpSearchInput-t1', 'Enter');
+      await settle(page);
+      const id = (await app.calls('sftp_search')).pop().args.searchId;
+      await page.evaluate((x) => window.__emit('sftp-search', Object.assign({ sessionId: 'sess-t1', done: true, cancelled: false }, x)), Object.assign({ searchId: id }, done));
+      await settle(page, 60);
+      return page.textContent('#sftpSearchStatus-t1');
+    };
+    check('the result cap is named', await run('a', { matched: 500, scanned: 812, capped: true }),
+      '500 match(es) (stopped at 500 matches) · 812 scanned');
+    check('so is the entry cap', await run('b', { matched: 3, scanned: 200000, capped: true }),
+      '3 match(es) (stopped after scanning 200,000 entries) · 200000 scanned');
+    check('and the time cap', await run('c', { matched: 3, scanned: 4567, capped: true }),
+      '3 match(es) (stopped after 2 minutes) · 4567 scanned');
+    check('an uncapped search says no cap', await run('d', { matched: 3, scanned: 4567, capped: false }), '3 match(es) · 4567 scanned');
+    check('no page errors', app.errors, []);
+  });
+  await withFiles(browser, server, spec, 'send to queues', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openFilesTab(page, { tabId: 't2' });
+    await page.evaluate(() => { window.__replies.sftp_server_copy = { ok: true, added: 1 }; });
+    await page.evaluate(() => sftpSendTo('t1', '/home/u/notes.txt', state.sessions.get('t2')));
+    await settle(page);
+    // The name kept to itself (U+2068 ... U+2069), as in every SFTP sentence.
+    check('"Send to" says the file is queued, not sent', await page.textContent('#termStrip'), 'Queued \u2068notes.txt\u2069 for sending to host-t2.');
+    yes('and so does its toast', (await toasts(page)).includes('Queued \u2068notes.txt\u2069 for sending to host-t2 - see Transfers.'), JSON.stringify(await toasts(page)));
+    // A name that is not what it shows: spelled out there too, so the
+    // override cannot turn the rest of the sentence around.
+    await page.evaluate(() => sftpSendTo('t1', '/home/u/invoice\u202Etxt.exe', state.sessions.get('t2')));
+    await settle(page);
+    check('a name with a direction override is spelled out in the status line', await page.textContent('#termStrip'),
+      'Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to host-t2.');
+    yes('and in its toast', (await toasts(page)).includes('Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to host-t2 - see Transfers.'),
+      JSON.stringify(await toasts(page)));
+    check('no page errors', app.errors, []);
+  });
+  // A path picked in the save dialog that is SSHSpan's own program: the
+  // backend refuses it, and its words are shown as they are.
+  const PROGRAM = 'SSHSpan\'s own program files (where it is installed, its AppImage or app bundle) cannot be replaced by a download - choose another folder.';
+  await withFiles(browser, server, spec, 'download as onto the program files', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await page.evaluate((m) => {
+      window.__replies.system_pick_save_path = { canceled: false, path: 'C:\\Program Files\\SSHSpan\\version.dll' };
+      window.__replies.sftp_download = { $reject: m };
+    }, PROGRAM);
+    await rowEvent(page, 'contextmenu', 'notes.txt');
+    await clickMenuItem(page, 'Download as...');
+    await settle(page, 200);
+    yes('the refusal of a download onto the program files is shown as it is', (await toasts(page)).includes(PROGRAM), JSON.stringify(await toasts(page)));
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── names with no letter or digit (U+2800 BRAILLE PATTERN BLANK) ──────────
+
+async function scenarioBlankNames(browser, server) {
+  const BLANK = '\u2800';
+  const DOTS_BLANK = '..' + BLANK;
+  const DASHES = '--';
+  const INSIDE = 'a' + BLANK + 'b.txt';
+  // MUSICAL SYMBOL NULL NOTEHEAD: a symbol that shows as nothing.
+  const DOTS_NULL = '..\u{1D159}';
+  // Visible content - emoji, symbols, punctuation, other scripts, accents,
+  // digits - is a name like any other; only a name that shows nothing, passes
+  // for dots or for the home folder is flagged.
+  const VISIBLE = ['\u{1F389}', '\u{1F4C1}', '\u{2605}', '\u{20AC}', '_', '-', '#', DASHES, '\u{6587}\u{4EF6}', 'caf\u{E9}', 'e\u{301}', '2024'];
+  const UNUSUAL = [BLANK + BLANK, '\u{3164}', '\u{115F}', '\u{2003}', '\u{A0}', '\u{301}', '\u{200B}', '\u{E0041}', '...', '. .', '\u{A4F8}\u{A4F8}', DOTS_BLANK, '~'];
+  const spec = {
+    remote: {
+      '/home/u': [DOTS_BLANK + '/', BLANK + '/', DASHES + '/', 'docs/', INSIDE, '\u{1F389}', '\u{2605}', '_', '\u{6587}\u{4EF6}', '2024', '~', '...x/', '\u{3164}',
+        DOTS_NULL + '/', '\u{93E}', '\u{20DD}', 'report\u{2024}pdf'],
+      ['/home/u/' + DOTS_BLANK]: [], ['/home/u/' + BLANK]: [], ['/home/u/' + DASHES]: [], '/home/u/docs': [], '/home/u/...x': [], ['/home/u/' + DOTS_NULL]: [],
+    },
+    local: { '/home/me': ['l1.txt'] },
+  };
+  const cell = (page, n) => page.evaluate((name) => {
+    const tr = [...document.querySelectorAll('#sftpTbody-t1 tr.sftp-entry')].find((r) => r.dataset.name === name);
+    return tr ? [tr.querySelector('.sftp-name').textContent, !!tr.querySelector('.sftp-name-flag')] : null;
+  }, n);
+  const rowAt = (page, n) => page.evaluate((name) => {
+    const tr = [...document.querySelectorAll('#sftpTbody-t1 tr.sftp-entry')].find((r) => r.dataset.name === name);
+    const b = tr.getBoundingClientRect();
+    return { x: b.left + b.width / 2, y: b.top + b.height / 2 };
+  }, n);
+  await withFiles(browser, server, spec, 'F4 names that show as dots or as nothing', async (app) => {
+    const { page } = app;
+    await emulateWindowsDragDrop(page);
+    await openFilesTab(page, { tab: { showHidden: true } });
+    check('".." and U+2800 is spelled out and flagged', await cell(page, DOTS_BLANK), ['..<U+2800>', true]);
+    check('U+2800 alone is spelled out and flagged', await cell(page, BLANK), ['<U+2800>', true]);
+    check('U+2800 inside a name is spelled out and flagged', await cell(page, INSIDE), ['a<U+2800>b.txt', true]);
+    check('a plain name is not', await cell(page, 'docs'), ['docs', false]);
+    check('names of emoji, symbols, punctuation, CJK or digits are shown as they are, not flagged',
+      await Promise.all([DASHES, '\u{1F389}', '\u{2605}', '_', '\u{6587}\u{4EF6}', '2024'].map((n) => cell(page, n))),
+      [DASHES, '\u{1F389}', '\u{2605}', '_', '\u{6587}\u{4EF6}', '2024'].map((n) => [n, false]));
+    check('"~" is flagged (it passes for the home folder), and so is a Hangul filler', [await cell(page, '~'), await cell(page, '\u{3164}')],
+      [['~', true], ['<U+3164>', true]]);
+    check('a name with letters after its dots is not dots only', await cell(page, '...x'), ['...x', false]);
+    check('not flagged: emoji-, symbol- and punctuation-only names, CJK, accented, digits',
+      await page.evaluate((n) => n.filter((x) => sftpUnusualName(x)), VISIBLE), []);
+    check('flagged: blank-only, marks-only, format-only, tag-only, dots-only, "~"',
+      await page.evaluate((n) => n.filter((x) => !sftpUnusualName(x)).map((x) => [...x].map((c) => c.codePointAt(0).toString(16)).join(' ')), UNUSUAL), []);
+    check('".." and U+1D159 (a null notehead) is spelled out and flagged', await cell(page, DOTS_NULL), ['..<U+1D159>', true]);
+    check('a dot look-alike inside a name is spelled out too (the list made from the shared one keeps them)',
+      await cell(page, 'report\u{2024}pdf'), ['report<U+2024>pdf', true]);
+    check('a name of a spacing or an enclosing mark alone is spelled out and flagged',
+      [await cell(page, '\u{93E}'), await cell(page, '\u{20DD}')], [['<U+093E>', true], ['<U+20DD>', true]]);
+    check('what each flag says', await page.evaluate((n) => n.map((x) => sftpUnusualNote(x).replace(/[\u2068\u2069]/g, '')), [DOTS_BLANK, BLANK, '\u{301}', '\u{93E}', '~']), [
+      'Unusual name: ..<U+2800> - only dots, or characters that look like dots, so it can read as a way up.',
+      'Unusual name: <U+2800> - only blank, mark or format characters, spelled out here.',
+      'Unusual name: <U+0301> - only blank, mark or format characters, spelled out here.',
+      'Unusual name: <U+093E> - only blank, mark or format characters, spelled out here.',
+      'Unusual name: ~ - it can read as your home folder.',
+    ]);
+    await openDual(page);
+    await mouseDrag(page, localRow('l1.txt'), await rowAt(page, DOTS_BLANK));
+    yes('a local file dropped on "..<U+2800>" asks first', await waitVisible(page, '#confirmModal'));
+    yes('naming the folder spelled out', plain(await page.textContent('#confirmMessage')).includes('"..<U+2800>"'), await page.textContent('#confirmMessage'));
+    await page.click('#confirmCancelBtn');
+    await settle(page, 150);
+    check('Cancel uploads nothing', (await queueAdds(app)).length, 0);
+    const at = await rowAt(page, BLANK);
+    await page.evaluate((p) => { window.__dragDrop({ payload: { type: 'drop', paths: ['/home/me/os.txt'], position: p } }); }, at);
+    yes('a file dropped on U+2800 from the system asks first too', await waitVisible(page, '#confirmModal'));
+    await page.click('#confirmCancelBtn');
+    await settle(page, 150);
+    check('and Cancel uploads nothing from there either', (await queueAdds(app)).length, 0);
+    await page.evaluate((p) => sftpUiNavigateRemote('t1', p), '/home/u/' + DOTS_BLANK);
+    await settle(page, 250);
+    check('inside it, the path above the list spells it out', (await crumbsOf(page)).current, '..<U+2800>');
+    check('no page errors', app.errors, []);
+  });
+}
+
 // ─── runner ─────────────────────────────────────────────────────────────────
 
 const SCENARIOS = [
@@ -2949,6 +3348,10 @@ const SCENARIOS = [
   ['JU6b fix round 2: the questions, the vault lock and closed tabs (H1-lock N2)', scenarioEditConflictLock],
   ['JU6b fix round 2: the transfer panel\'s height in a small window (N3)', scenarioQueueHeight],
   ['JU6b fix round 2: names that pass for dots (F4)', scenarioDotNames],
+  ['stop editing: asked when changes are not on the server', scenarioStopEditAsks],
+  ['menus from the keyboard: the file, folder and local menus (A2-50)', scenarioMenusKeyboard],
+  ['search caps and Send to: saying what happened', scenarioSearchCapsSendTo],
+  ['blank names: no letter or digit, U+2800 (F4)', scenarioBlankNames],
 ];
 
 (async () => {

@@ -30,6 +30,72 @@ async function call(cmd, args) {
 
 function el(id) { return document.getElementById(id); }
 
+/// What an error says, as text - the one place an error is turned into a
+/// message, for every renderer script: the bare string a Rust Err(String)
+/// rejects with, an Error's message, an { error } object's error. Anything
+/// else - null, an object with neither, a null-prototype object, one whose
+/// getters throw - gets a short text of its own: never "[object Object]",
+/// "null" or a throw. The copies this replaces read e.message off a null
+/// rejection (a TypeError of their own) or showed "[object Object]".
+function errText(e) {
+  try {
+    if (typeof e === 'string' && e.trim()) return e;
+    if (typeof e === 'number' || typeof e === 'bigint') return String(e);
+    if (e && typeof e === 'object') {
+      for (const said of [e.message, e.error]) {
+        if (typeof said === 'string' && said.trim()) return said;
+      }
+    }
+  } catch (_) { /* a getter that throws says nothing */ }
+  return 'Something went wrong, and no reason was given.';
+}
+
+/// Characters spelled out ("<U+202E>") wherever text from outside is shown as
+/// text: controls, format and default-ignorable characters (direction marks,
+/// overrides and isolates, zero-width ones), line and paragraph separators,
+/// spaces other than U+0020, BRAILLE PATTERN BLANK and MUSICAL SYMBOL NULL
+/// NOTEHEAD (U+1D159 - a symbol that shows as nothing).
+const SPELLED_CHARS = /[\x00-\x1F\x7F-\x9F\p{Cf}\p{Default_Ignorable_Code_Point}\u{2028}\u{2029}\xA0\u{1680}\u{2000}-\u{200A}\u{202F}\u{205F}\u{3000}\u{2800}\u{1D159}]/gu;
+
+/// One character spelled out: "\n", "\r", "\t" or "<U+XXXX>".
+function spellChar(ch) {
+  if (ch === '\n') return '\\n';
+  if (ch === '\r') return '\\r';
+  if (ch === '\t') return '\\t';
+  return '<U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0') + '>';
+}
+
+/// `text` with every character of SPELLED_CHARS spelled out (spellChar).
+function spellOut(text) {
+  return String(text == null ? '' : text).replace(SPELLED_CHARS, spellChar);
+}
+
+/// `text` cut to at most `max` characters (whole characters, never half of a
+/// pair), the last an ellipsis when it was cut.
+function capText(text, max) {
+  const chars = Array.from(String(text == null ? '' : text));
+  return chars.length > max ? chars.slice(0, max).join('') + '\u{2026}' : chars.join('');
+}
+
+/// Characters that show as nothing on their own: white space, BRAILLE
+/// PATTERN BLANK, MUSICAL SYMBOL NULL NOTEHEAD, the Hangul fillers, marks,
+/// format and other default-ignorable characters (tags among them) and
+/// controls.
+const BLANK_CHARS = /[\s\u{2800}\u{1D159}\u{115F}\u{1160}\u{3164}\u{FFA0}\p{M}\p{Cf}\p{Default_Ignorable_Code_Point}\p{Cc}]/gu;
+
+/// Whether `text` shows nothing at all: empty, or BLANK_CHARS only.
+function showsNothing(text) {
+  return !String(text == null ? '' : text).replace(BLANK_CHARS, '');
+}
+
+/// A <bdi> holding `text`: kept to itself in its line, so text written right
+/// to left cannot turn the words around it.
+function bdiOf(text) {
+  const b = document.createElement('bdi');
+  b.textContent = text;
+  return b;
+}
+
 /// Boolean settings read. The backend's collect_settings returns every
 /// value as a JSON string, so a stored false arrives as "false" - and the
 /// strict comparisons this replaces ("!== false") never matched it, which
@@ -147,14 +213,14 @@ async function withBusy(button, busyLabel, fn) {
   }
 }
 
-/// Disabling a focused button blurs it to body (I1). After the work, when the
-/// button had the focus: focus that has since moved to a control still on
-/// screen (a validation field, wherever the user went) stays there; focus
+/// Disabling a focused button blurs it to body (A5-23). After the work, when
+/// the button had the focus: focus that has since moved to a control still
+/// on screen (a validation field, wherever the user went) stays there; focus
 /// left on body or on a control that went away goes back to the button, or -
 /// for a key action whose button the result hid (a closed dialog, a hidden
-/// pane) - to the key search box, never to body. (Round 1 also tracked every
-/// focus move during the work; that only ever changed the outcome by leaving
-/// focus on body after the user's control vanished - fix2.)
+/// pane) - to the key search box, never to body. (Tracking every focus move
+/// during the work changed the outcome only by leaving the focus on body
+/// once the user's control had vanished, so it is not done.)
 function busyFocusReturn(button) {
   const ownedFocus = document.activeElement === button;
   // Key dialogs close or hide their own action buttons on success.
@@ -172,6 +238,18 @@ function busyFocusReturn(button) {
 function focusTargetAvailable(node) {
   return !!node && node instanceof HTMLElement && node.isConnected && !node.disabled
     && !node.closest('[hidden]') && node.getClientRects().length > 0;
+}
+
+/// A change the backend made but whose audit row it could not write comes
+/// back with `warning` - a sentence that says what was done and what failed
+/// after (key_delete, key_rename, category_create, category_delete,
+/// key_set_categories, key_create_with_categories, bitwarden_save_config).
+/// Shown as a warning, as it is: the change did happen, so nothing is
+/// retried. Returns it ('' when there is none).
+function showAuditWarning(r) {
+  const warning = r && r.warning ? String(r.warning) : '';
+  if (warning) toast(warning, 'warn');
+  return warning;
 }
 
 /// Backend array fields may be absent in older replies. Normalise them once,
@@ -576,7 +654,7 @@ function rebuildCategoryIndex() {
   const cycleRoots = categoryCycleRoots(scoped, state.catsById);
   for (const c of scoped) {
     // A dangling parent is a UI root. A cycle also needs ONE UI root, so its
-    // members have menus and can be moved to break it (M4). Only this index's
+    // members have menus and can be moved to break it (A2-45). Only this index's
     // edge is cut: never change the restored parent links without an action.
     const key = !cycleRoots.has(c.id) && c.parent_id && state.catsById.has(c.parent_id) ? c.parent_id : '';
     if (!state.childrenOf.has(key)) state.childrenOf.set(key, []);
@@ -668,14 +746,14 @@ function catRoot(cat) {
 }
 
 /// Said when a move would put a category under one whose SAVED parent chain
-/// runs in a loop (fix2 N1).
+/// runs in a loop (A2-45).
 const CATEGORY_LOOP_REFUSAL = 'That category is part of a loop - move one of its categories to the top level first.';
 
 /// Whether `parentId` (null: the top level) may receive a category. Not a
 /// category whose saved chain has no root: category_reparent walks the new
 /// parent's chain upwards looking for the moved id, and a loop that does not
-/// contain it never ends - on the main thread, so the whole app froze (N1).
-/// Loop members are shown (M4) so they can be moved OUT; nothing moves IN.
+/// contain it never ends - on the main thread, so the whole app froze
+/// (A2-45). Loop members are shown so they can be moved OUT; nothing moves IN.
 function categoryCanHoldChildren(parentId) {
   if (!parentId) return true;
   const parent = catById(parentId);
@@ -975,7 +1053,7 @@ async function loadCategories() {
     // used to abort refreshVaultStatus() and, at boot, main() itself - no 10 s
     // poll, no idle-activity listeners, no stored settings. The tree keeps
     // what it had.
-    toast('Could not load categories: ' + (e.message || String(e)), 'err');
+    toast('Could not load categories: ' + errText(e), 'err');
     return;
   }
   state.categories = res.categories || [];
@@ -983,7 +1061,7 @@ async function loadCategories() {
   state.keyCategories = res.allKeyCategories || {};
   rebuildCategoryIndex();
   // The backend only counts empty category links. Keys under rootless
-  // cycles or deleted ids are Uncategorized in this UI too (A2-45 / M4).
+  // cycles or deleted ids are Uncategorized in this UI too (A2-45).
   state.orphans = state.categoryScope === 'host' ? !!res.hostOrphans : uncategorizedKeyCount() > 0;
   renderCategoryTree();
   updateBreadcrumb();
@@ -993,6 +1071,7 @@ async function createCategory(name, parentId, color) {
   if (!name) return null;
   const cat = await call('category_create', { name, parentId, color, scope: state.categoryScope });
   await loadCategories();
+  showAuditWarning(cat);
   return cat;
 }
 
@@ -1023,7 +1102,8 @@ async function deleteCategory(id) {
     // hold every sibling as well).
     const moved = res && Array.isArray(res.reassigned) ? res.reassigned.length : 0;
     toast(`Category "${cat.name}" deleted.` + (moved ? ` ${moved} ${moved === 1 ? 'subcategory' : 'subcategories'} moved up.` : ''), 'ok');
-  } catch (e) { toast(e.message || String(e), 'err'); }
+    showAuditWarning(res);
+  } catch (e) { toast(errText(e), 'err'); }
 }
 
 async function renameCategory(id) {
@@ -1032,14 +1112,14 @@ async function renameCategory(id) {
   promptModal(`Rename category`, 'Enter a new name.', cat.name, async (newName) => {
     if (!newName || newName === cat.name) return;
     try { await call('category_rename', { id, name: newName }); await loadCategories(); toast('Renamed.', 'ok'); }
-    catch (e) { toast(e.message || String(e), 'err'); }
+    catch (e) { toast(errText(e), 'err'); }
   });
 }
 
 async function moveCategoryPrompt(id) {
   if (!lockGateOpen('categories')) return;
   // The category itself and what is under it cannot be its new parent, and
-  // neither can a member of a restored loop (fix2 N1). The top level is
+  // neither can a member of a restored loop (A2-45). The top level is
   // always offered: that is how a loop member is moved out to repair it.
   const own = categoryAndDescendants(id);
   // opens the picker in single-select mode for choosing a new parent
@@ -1056,7 +1136,7 @@ async function moveCategoryPrompt(id) {
       // Whatever reached here, a loop is never sent as the destination.
       if (!categoryCanHoldChildren(parentId)) { toast(CATEGORY_LOOP_REFUSAL, 'err'); return; }
       try { await call('category_reparent', { id, newParentId: parentId }); await loadCategories(); toast('Moved.', 'ok'); }
-      catch (e) { toast(e.message || String(e), 'err'); }
+      catch (e) { toast(errText(e), 'err'); }
     },
   });
 }
@@ -1071,7 +1151,7 @@ async function addCategoryPrompt(parentId) {
     try {
       const cat = await createCategory(name, parentId || null, null);
       if (cat) { state.expandedCatIds.add(parentId || ''); /* noop for roots */ if (parentId) state.expandedCatIds.add(parentId); renderCategoryTree(); toast(`Created "${cat.name}".`, 'ok'); }
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    } catch (e) { toast(errText(e), 'err'); }
   });
 }
 
@@ -1084,10 +1164,11 @@ async function addCategoryPrompt(parentId) {
 // opener's aria-expanded is reset, and the menu is kept on screen
 // (positionCtxMenuAt). They used to be ad-hoc builders that ignored the
 // keyboard, opened at the raw pointer position off the window's edge and left
-// aria-expanded="true" behind (A2-50 / A1-26 / A2-21 / A1-04). The cascading
-// host picker below and the sftp.js menus still build their own. All of them
-// use the one #keyConnectMenu, so closeKeyConnectMenu() closes whichever is
-// open, and only one menu is ever open.
+// aria-expanded="true" behind (A2-50 / A1-26 / A2-21 / A1-04). The SFTP file,
+// folder, local-pane and bookmark menus are built by it too; the cascading
+// host picker below builds its own. All of them use the one #keyConnectMenu,
+// so closeKeyConnectMenu() closes whichever is open, and only one menu is
+// ever open.
 
 /// The open menu's bookkeeping: { anchor, opener, onClose, cleanup }, or null.
 let activeMenu = null;
@@ -1229,7 +1310,7 @@ async function catMoveBy(id, step) {
   if (!other) return;
   try {
     await moveCategoryTo(id, other, step < 0 ? 'before' : 'after');
-  } catch (err) { toast(err.message || String(err), 'err'); }
+  } catch (err) { toast(errText(err), 'err'); }
   await catReadBack();
 }
 
@@ -1437,7 +1518,7 @@ async function catDropAt(draggedId, x, y) {
   if (!lockGateOpen('categories')) return;
   try {
     await moveCategoryTo(draggedId, target, zone);
-  } catch (err) { toast(err.message || String(err), 'err'); }
+  } catch (err) { toast(errText(err), 'err'); }
   await catReadBack();
 }
 
@@ -1451,55 +1532,59 @@ function catDropZone(row, clientY) {
   return 'into';
 }
 
-/// Move category `id` before, after or into `target`, numbering the siblings
-/// it joins so the order shown is the order kept (A2-07): "sort_index + 1"
-/// used to tie with the next sibling, and ties are broken by name. The moved
-/// category is sent first: the backend refuses a move into its own subtree,
-/// and then nothing else changes.
+/// Move category `id` before, after or into `target` (A2-07) - the order
+/// shown is the order kept, and no row the user did not move moves.
 ///
-/// At the top level two kinds of rows are shown without being saved there.
-/// A row whose parent no longer exists is a real sibling: it is renumbered
-/// like the others, which also writes it a top-level parent - safe, as there
-/// is no chain for the backend to walk. The one promoted member of each
-/// restored parent loop is never written (that would quietly change its saved
-/// parent), so a drop next to it takes its place from that row's
-/// own sort_index - one below for "before", one above for "after" - and the
-/// real siblings on that side move one further out. Numbering the real rows
-/// 0..n-1 as if those rows were not there left a drop after one of them one
-/// place early, however often it was repeated.
+/// A parent changes only through category_reparent (it walks the new parent's
+/// chain and refuses a loop); the order is written whole, in ONE
+/// category_set_order: every category of the list the tree shows, numbered
+/// 0, 1, 2 ... as it is shown with `id` in its new place. Rows beside a
+/// promoted loop root are numbered like any other - the root's saved parent is
+/// never written - so a drop lands where it was dropped, and the same drop
+/// again changes nothing. (Renumbering only the "real" siblings around a
+/// promoted root's own sort_index put drops one place out and moved rows the
+/// user had not touched.)
 async function moveCategoryTo(id, target, zone) {
-  // Beside a row means under the parent it is SHOWN under (fix2 N1): a
-  // promoted loop member, or one whose parent no longer exists, is top level.
-  // Its saved parent was taken before, so a drop beside CycA sent CycB - a
-  // loop - as the new parent, and the backend's walk never ended.
+  // Beside a row means under the parent it is SHOWN under: a promoted loop
+  // member, or one whose parent no longer exists, is top level. Its saved
+  // parent was taken before, so a drop beside CycA sent CycB - a loop - as the
+  // new parent, and the backend's walk never ended.
   const parentId = zone === 'into' ? target.id : (state.uiParentOf.get(target.id) || null);
   if (!categoryCanHoldChildren(parentId)) throw new Error(CATEGORY_LOOP_REFUSAL);
-  const siblings = childrenOf(parentId).filter((c) => c.id !== id);
-  // A promoted loop member: shown at the top level, no root up its chain.
-  const pinned = (c) => parentId === null && !catRoot(c);
-  const real = siblings.filter((c) => !pinned(c));
-  const place = (cid, sortIndex) => call('category_reparent', { id: cid, newParentId: parentId, sortIndex });
-  if (zone !== 'into' && pinned(target)) {
-    const step = zone === 'before' ? -1 : 1;
-    const at = target.sort_index + step;
-    await place(id, at);
-    for (const c of real) {
-      if (step < 0 ? c.sort_index <= at : c.sort_index >= at) await place(c.id, c.sort_index + step);
-    }
-    return;
+  // Where the target is shown before anything changes: a loop member moved
+  // out beside its own loop's promoted root breaks the loop, which nests the
+  // root under it - the root is then no row to drop beside, and the moved one
+  // takes its place (it landed last).
+  const targetWasAt = childrenOf(parentId).filter((c) => c.id !== id).findIndex((c) => c.id === target.id);
+  if ((state.uiParentOf.get(id) || null) !== parentId) {
+    await call('category_reparent', { id, newParentId: parentId });
+    // The tree as it is now: moving a loop member out breaks its loop, which
+    // changes what the top level shows.
+    await loadCategories();
   }
-  let at = real.length;
+  const siblings = childrenOf(parentId).filter((c) => c.id !== id).map((c) => c.id);
+  let at = siblings.length;
   if (zone !== 'into') {
-    const i = real.findIndex((c) => c.id === target.id);
-    at = i === -1 ? real.length : (zone === 'before' ? i : i + 1);
+    const i = siblings.indexOf(target.id);
+    if (i !== -1) at = zone === 'before' ? i : i + 1;
+    else if (targetWasAt !== -1) at = Math.min(targetWasAt, siblings.length);
   }
-  await place(id, at);
-  const order = [...real.slice(0, at), { id }, ...real.slice(at)];
-  for (let i = 0; i < order.length; i++) {
-    const c = order[i];
-    if (c.id === id || c.sort_index === i) continue;
-    await place(c.id, i);
-  }
+  const shown = [...siblings.slice(0, at), id, ...siblings.slice(at)];
+  await call('category_set_order', { parentId, orderedIds: parentId === null ? shown.concat(categoriesNestedAtTop(shown)) : shown });
+}
+
+/// The categories the backend counts as top level that the tree shows
+/// nested: a member of a parent loop other than its promoted root, and every
+/// category below a loop (their chains never reach the top). category_set_order
+/// takes the top level's whole list, so they are named too - after every row
+/// shown at the top, in the order they are shown in: their own places among
+/// their siblings stay as they are, and no promoted root changes.
+function categoriesNestedAtTop(shown) {
+  const named = new Set(shown);
+  return [...state.catsById.values()]
+    .filter((c) => !named.has(c.id) && state.uiParentOf.get(c.id) && !catRoot(c))
+    .sort(categoryOrder)
+    .map((c) => c.id);
 }
 
 // ─── breadcrumb + toolbar cat-filter button ───────────────────────────────
@@ -1567,7 +1652,7 @@ function openCategoryPicker({ title, initial, single, onSave, scope, exclude, to
   state.pickerSelected = new Set(initial || []);
   state.pickerSingle = !!single;
   state.pickerCallback = onSave;
-  // Move to... (fix2 N1): categories it may not offer, and a top-level row.
+  // Move to...: categories it may not offer (A2-45), and a top-level row.
   state.pickerExclude = typeof exclude === 'function' ? exclude : null;
   state.pickerTopLevel = !!topLevel;
   state.pickerActive = -1;
@@ -1794,7 +1879,12 @@ function confirmModal(title, message, okLabel, opts) {
       modal.removeEventListener('click', onBackdrop);
       resolve(answer);
     };
-    const onOk = () => settle(true);
+    // The second click of a double-click is no answer (detail > 1): a
+    // question can open under the pointer within milliseconds of the click
+    // that asked it (a menu item under OK), and the double-click's second half
+    // then landed on OK and said yes. A single click (detail 1) and the
+    // keyboard (detail 0) answer as always. No timing guard: none is needed.
+    const onOk = (ev) => { if (ev && ev.detail > 1) return; settle(true); };
     const onCancel = () => settle(false);
     const onBackdrop = (ev) => { if (ev.target === modal) settle(false); };
     okBtn.addEventListener('click', onOk);
@@ -1947,7 +2037,8 @@ let vaultSubmitBusy = false;
 
 /// Title, text and buttons for the current mode - and, while its request runs,
 /// the busy state: the primary button says what is happening and takes no
-/// second submit, and a master-password change cannot be cancelled (RU1 C1).
+/// second submit, and a master-password change cannot be cancelled while
+/// the vault is re-sealed.
 function paintVaultDialog() {
   const mode = state.vaultMode;
   const copy = VAULT_DIALOG_COPY[mode] || VAULT_DIALOG_COPY.unlock;
@@ -2033,7 +2124,7 @@ function hideVaultModal() {
 /// while locked and made the "Vault stays locked" toast a lie. The change-
 /// password dialog is a deliberate request, not a gate, and just closes.
 function dismissVaultModal() {
-  // A master-password change that is running keeps its dialog (RU1 C1):
+  // A master-password change that is running keeps its dialog:
   // closing it mid-rotation is how the rest of the app came to write vault
   // data that was being re-sealed. Cancel is disabled meanwhile; this is the
   // Escape path. A lock still closes it (closeDialogsForLock).
@@ -2099,7 +2190,7 @@ async function refreshVaultStatus(silent) {
   if (gate !== prevGate) state.vaultDismissed = false;
 
   if (gate === 'create') {
-    clearCategoryTree();
+    clearKeysUI(); // the Keys view says there is no vault yet (and the tree goes)
     if (!state.vaultDismissed) showVaultModal('create');
   } else if (gate === 'unlock') {
     clearKeysUI();
@@ -2189,7 +2280,20 @@ const LOCK_GATE_HINTS = {
   // ssh_config_list_hosts refuses while locked (R4): the user's ssh config is
   // an inventory of hosts, accounts and key paths.
   sshconfig: 'Unlock the vault to import servers from your SSH config.',
+  keys: 'Unlock the vault to create or import keys.',
+  bitwarden: 'Unlock the vault to save, test or run the Bitwarden sync.',
+  backup: 'Unlock the vault to create or restore a backup.',
+  // Lock now, while there is nothing to lock.
+  lock: 'The vault is already locked.',
 };
+
+/// Lock now with no vault at all: nothing is locked, and nothing can be.
+const LOCK_GATE_NO_VAULT = 'There is no vault to lock yet.';
+
+/// The reason a gated control gives while the vault is locked (or missing).
+function lockGateHint(kind) {
+  return kind === 'lock' && !state.hasVault ? LOCK_GATE_NO_VAULT : (LOCK_GATE_HINTS[kind] || '');
+}
 
 /// Mark `control` as needing an unlocked vault (`kind` picks the reason) and
 /// set it for the current state. Its own tooltip comes back on unlock.
@@ -2206,7 +2310,7 @@ function applyLockGate(control) {
   // reason only, so a control that is busy, or disabled for a reason of its
   // own, stays disabled.
   setDisabledFor(control, 'lock', locked);
-  control.title = locked ? (LOCK_GATE_HINTS[control.dataset.lockGate] || '') : control.dataset.unlockedTitle;
+  control.title = locked ? lockGateHint(control.dataset.lockGate) : control.dataset.unlockedTitle;
 }
 
 /// Re-apply every gate after a vault state change. Run from every status
@@ -2221,7 +2325,7 @@ function applyLockGates() {
 /// begun before the lock: false (with the reason) while locked.
 function lockGateOpen(kind) {
   if (state.unlocked) return true;
-  toast(LOCK_GATE_HINTS[kind], 'info');
+  toast(lockGateHint(kind), 'info');
   return false;
 }
 
@@ -2321,7 +2425,7 @@ async function submitVaultModal() {
       toast('The vault locked while the password was being changed - unlock it with the new master password.', 'info');
     }
   } catch (e) {
-    const msg = e.message || String(e);
+    const msg = errText(e);
     if (msg === VAULT_LOCKED_MIDWAY) {
       toast('The vault was locked while the password was being changed, so nothing was changed - your current master password still unlocks it.', 'err');
       refreshVaultStatus().catch(() => {});
@@ -2351,10 +2455,29 @@ function clearKeysUI() {
   state.deploySelected.clear();
   el('keyList').innerHTML = '';
   hideDetailPane();
+  paintEmptyKeys();
   el('emptyState').hidden = false;
   clearCategoryTree();
   updateSelectionHint();
   updateBreadcrumb();
+}
+
+/// The card the Keys view shows with no keys in it, for the vault as it is:
+/// unlocked, the first-run card ("No keys yet", + New key); locked, "The
+/// vault is locked" with Unlock - it used to invite "Generate or import your
+/// first SSH key pair" over a vault full of keys; with no vault yet, "No
+/// vault yet" with Create vault. Text only.
+function paintEmptyKeys() {
+  const unlocked = !!state.unlocked;
+  const [title, text] = unlocked ? ['No keys yet', 'Generate or import your first SSH key pair.']
+    : state.hasVault ? ['The vault is locked', 'Unlock it to see and use your keys.']
+      : ['No vault yet', 'Create a vault to keep your SSH keys in.'];
+  el('emptyTitle').textContent = title;
+  el('emptyText').textContent = text;
+  el('emptyNewBtn').hidden = !unlocked;
+  const unlock = el('emptyUnlockBtn');
+  unlock.hidden = unlocked;
+  unlock.textContent = state.hasVault ? 'Unlock' : 'Create vault';
 }
 
 /// The sidebar's category tree while the vault is locked or there is none:
@@ -2542,6 +2665,7 @@ function renderKeyList() {
   const rows = filteredKeys();
   const total = state.keys.length;
   pruneHiddenKeys(rows);
+  if (!total) paintEmptyKeys();
   el('emptyState').hidden = total > 0;
   const countChip = el('keyCount');
   if (countChip) {
@@ -2592,7 +2716,7 @@ function pruneHiddenKeys(rows) {
 }
 
 /// The default (unfiltered) list's groups: one per root category, in tree
-/// order, then Uncategorized. Split from renderKeyList (M7).
+/// order, then Uncategorized. Split out of renderKeyList to keep that short.
 function keyGroups(rows) {
   // Grouped: by category (or uncategorized if no cats).
   // First, build the group order: roots in sort_index order; for each, walk sub-tree.
@@ -2859,7 +2983,7 @@ async function loadKeys(opts) {
     state.keysLoadError = null;
   } catch (e) {
     state.keys = [];
-    state.keysLoadError = e.message || String(e);
+    state.keysLoadError = errText(e);
     toast(state.keysLoadError, 'err');
   }
   // Never rejects: a failure is reported in a toast (A2-20).
@@ -2933,8 +3057,8 @@ async function selectKey(id, opts) {
       removable: true,
       onRemove: async (catId) => {
         const next = catIds.filter(x => x !== catId);
-        try { await call('key_set_categories', { keyId: k.id, categoryIds: next }); await loadKeys(); }
-        catch (e) { toast(e.message || String(e), 'err'); }
+        try { showAuditWarning(await call('key_set_categories', { keyId: k.id, categoryIds: next })); await loadKeys(); }
+        catch (e) { toast(errText(e), 'err'); }
       },
       onClickPath: (catId) => { setActiveCategory(catId); },
     });
@@ -2949,8 +3073,13 @@ async function selectKey(id, opts) {
       title: 'Assign categories',
       initial: catIds,
       onSave: async (ids) => {
-        try { await call('key_set_categories', { keyId: k.id, categoryIds: ids }); await loadKeys(); toast('Categories updated.', 'ok'); }
-        catch (e) { toast(e.message || String(e), 'err'); }
+        try {
+          const r = await call('key_set_categories', { keyId: k.id, categoryIds: ids });
+          await loadKeys();
+          toast('Categories updated.', 'ok');
+          showAuditWarning(r);
+        }
+        catch (e) { toast(errText(e), 'err'); }
       },
     }));
     el('detailCategories').appendChild(addChip);
@@ -2965,18 +3094,18 @@ async function selectKey(id, opts) {
   } catch (e) {
     if (seq !== selectKeySeq) return;
     hideDetailPane();
-    toast(e.message || String(e), 'err');
+    toast(errText(e), 'err');
   }
 }
 
-/// One rule for every action that asks "is this key deployed?" (M7). The list
+/// One rule for every action that asks "is this key deployed?". The list
 /// carries `deployed`; key_get also carries the recorded path.
 function keyIsDeployed(k) {
   return !!(k && (k.deployed || k.deploy_path));
 }
 
 /// Hiding the pane also returns it to Overview, which wipes any passphrase
-/// typed for an Export that is no longer visible (M1).
+/// typed for an Export that is no longer visible.
 function hideDetailPane() {
   showDetailTab('overview');
   el('detailPane').hidden = true;
@@ -3018,7 +3147,7 @@ async function deleteSelected() {
     }
   }
   // After the question, while the change runs: one delete per click, and a
-  // keyboard user is not left on body when the pane goes (I1).
+  // keyboard user is not left on body when the pane goes (A5-23).
   await withBusy(el('detailDeleteBtn'), null, async () => {
     try {
       if (removeFiles) {
@@ -3027,20 +3156,21 @@ async function deleteSelected() {
         try {
           await removeDeployedCopy(id);
         } catch (e) {
-          toast('The deployed copy of "' + name + '" could not be removed, so the key was not deleted: ' + (e.message || String(e)), 'err');
+          toast('The deployed copy of "' + name + '" could not be removed, so the key was not deleted: ' + errText(e), 'err');
           await loadKeys();
           return;
         }
       }
-      await call('key_delete', { id });
+      const r = await call('key_delete', { id });
       state.deploySelected.delete(id);
       state.selectedId = null;
       toast(deployed && !removeFiles ? 'Key deleted. Its deployed copy is still on disk.' : 'Key deleted.', 'ok');
+      showAuditWarning(r);
       // Nothing else opens in its place (A5-34).
       await loadKeys({ autoSelect: false });
       updateSelectionHint();
     } catch (e) {
-      toast(e.message || String(e), 'err');
+      toast(errText(e), 'err');
     }
   });
 }
@@ -3074,7 +3204,7 @@ async function undeploySelected() {
     try {
       await removeDeployedCopy(id);
     } catch (e) {
-      toast(e.message || String(e), 'err');
+      toast(errText(e), 'err');
     }
     // The Deployed chip and the detail pane follow the record either way.
     await loadKeys();
@@ -3109,7 +3239,7 @@ async function deleteSelectedKeys() {
     }
   }
   // The selection bar disappears with its selection; busy focus falls back to
-  // search instead of body (I1), and repeated clicks cannot delete twice.
+  // search instead of body (A5-23), and repeated clicks cannot delete twice.
   await withBusy(el('selDeleteBtn'), null, () => deleteKeyBatch(ids, deployedIds, removeFiles));
 }
 
@@ -3131,12 +3261,13 @@ async function deleteKeyBatch(ids, deployedIds, removeFiles) {
         warnings.push(...arrayOrEmpty(r && r.warnings));
       } catch (e) {
         failed += 1;
-        kept.push(e.message || String(e));
+        kept.push(errText(e));
         continue;
       }
     }
     try {
-      await call('key_delete', { id });
+      const r = await call('key_delete', { id });
+      if (r && r.warning) warnings.push(String(r.warning));
       if (wasDeployed && !removeFiles) leftOnDisk += 1;
     } catch (e) { failed += 1; }
   }
@@ -3148,7 +3279,8 @@ async function deleteKeyBatch(ids, deployedIds, removeFiles) {
   await loadKeys({ autoSelect: false });
   updateSelectionHint();
   if (undeployed) toast(`Removed the deployed copies of ${undeployed} key(s).`, 'ok');
-  if (warnings.length) toast(warnings.join('\n'), 'warn');
+  // Each text once: several keys can answer the same warning (one cause).
+  if (warnings.length) toast([...new Set(warnings)].join('\n'), 'warn');
   if (kept.length) toast('Not deleted - the deployed copy could not be removed:\n' + kept.join('\n'), 'err');
   const stillOnDisk = leftOnDisk
     ? ` ${leftOnDisk} deployed ${leftOnDisk === 1 ? 'copy is' : 'copies are'} still on disk.`
@@ -3166,7 +3298,7 @@ async function copyPublic() {
     const ok = await copyText(k.public_key || '');
     toast(ok ? 'Public key copied to clipboard.' : 'Clipboard unavailable.', ok ? 'ok' : 'err');
   } catch (e) {
-    toast(e.message || String(e), 'err');
+    toast(errText(e), 'err');
   }
 }
 
@@ -3320,7 +3452,7 @@ async function exportSelected() {
       await call('system_write_text_file', { path: pick.path, contents: out.data });
       toast('Exported ' + label + ' to ' + pick.path, 'ok');
     } catch (e) {
-      toast(e.message || String(e), 'err');
+      toast(errText(e), 'err');
     } finally {
       passEl.value = '';
     }
@@ -3540,7 +3672,7 @@ function runPaletteItem(i, alt) {
   if (!it) return;
   closePalette();
   const fn = alt && it.runAlt ? it.runAlt : it.run;
-  try { fn(); } catch (e) { toast(e.message || String(e), 'err'); }
+  try { fn(); } catch (e) { toast(errText(e), 'err'); }
 }
 
 function movePaletteActive(delta) {
@@ -3629,7 +3761,7 @@ async function browseForImport() {
     el('importPass').focus();
     toast('Loaded ' + res.name + '. Enter the passphrase if the key is encrypted, then Import.', 'info');
   } catch (e) {
-    toast(e.message || String(e), 'err');
+    toast(errText(e), 'err');
   }
 }
 
@@ -3692,7 +3824,7 @@ function showImportFormatMsg(msg) { showFieldMessage('importFormatMsg', msg); }
 /// The backend's answer to a name another key already has (A2-46 / A5-25).
 const DUPLICATE_KEY_NAME = /^A key named ".*" already exists\./;
 
-/// The Generate tab's request (split from submitKeyModal, M7).
+/// The Generate tab's request (split from submitKeyModal).
 async function createKeyFromForm() {
   const cats = (state._pendingGenerateCategories && state._pendingGenerateCategories()) || [];
   return call('key_create_with_categories', {
@@ -3729,7 +3861,7 @@ async function importKeyFromForm() {
       passphrase: el('importPass').value || undefined,
     });
   } catch (e) {
-    const msg = e.message || String(e);
+    const msg = errText(e);
     // The format guidance belongs beside the key it is about, where it
     // stays readable; every other refusal is a toast like before.
     if (/^Unsupported key format/.test(msg)) {
@@ -3741,8 +3873,8 @@ async function importKeyFromForm() {
   }
   const cats = (state._pendingImportCategories && state._pendingImportCategories()) || [];
   if (res && res.id && cats.length) {
-    try { await call('key_set_categories', { keyId: res.id, categoryIds: cats }); }
-    catch (e) { /* assignment failed but key was created; surface but don't fail the create */ toast('Key imported, but category assignment failed: ' + (e.message || e), 'err'); }
+    try { showAuditWarning(await call('key_set_categories', { keyId: res.id, categoryIds: cats })); }
+    catch (e) { /* assignment failed but key was created; surface but don't fail the create */ toast('Key imported, but category assignment failed: ' + errText(e), 'err'); }
   }
   return res || {};
 }
@@ -3767,8 +3899,9 @@ async function submitKeyModal() {
       const done = generating ? 'Key generated' : 'Key imported';
       const hidden = res && res.id && state.keys.some((k) => k.id === res.id) && !filteredKeys().some((k) => k.id === res.id);
       toast(hidden ? done + ' - it is hidden by the current filter. Clear the filter to see it.' : done + '.', 'ok');
+      showAuditWarning(res);
     } catch (e) {
-      const msg = e.message || String(e);
+      const msg = errText(e);
       toast(msg, 'err');
       // A name another key has: the backend's words, and the caret on the name.
       if (DUPLICATE_KEY_NAME.test(msg)) {
@@ -3814,7 +3947,7 @@ async function openDeploySheet() {
 
 function closeDeploySheet() {
   // A preview still waiting on the typing delay must not ask the backend
-  // about a sheet that is gone; an answer on its way is dropped (M7).
+  // about a sheet that is gone; an answer on its way is dropped.
   cancelScheduledDeployPreview();
   deployPreviewSeq += 1;
   el('deployModal').hidden = true;
@@ -3863,12 +3996,15 @@ function syncDeployRegisterToggle() {
     : 'They appear under Servers, ready to connect. Needs a Host alias and a User.';
 }
 
-/// `dir` and `name` joined with the separator `dir` itself uses: system_paths
-/// reports a Windows path with backslashes, which the hint used to end in
-/// "/sshspan_<name>" (A8-26).
+/// `dir` and `name` joined with the separator `dir` itself uses - the one
+/// platform path join (the deploy hints and the SFTP local pane): a path of
+/// backslashes only is a Windows one (system_paths reports them so, and the
+/// hint used to end in "/sshspan_<name>" - A8-26); one with any forward slash
+/// takes a forward slash, which Windows reads too and which keeps a Unix name
+/// holding a backslash ("/home/we\ird") a name, not a separator.
 function joinPlatformPath(dir, name) {
   const d = String(dir || '');
-  const sep = d.includes('\\') ? '\\' : '/';
+  const sep = d.includes('\\') && !d.includes('/') ? '\\' : '/';
   return d.endsWith(sep) ? d + name : d + sep + name;
 }
 
@@ -3883,7 +4019,7 @@ function cancelScheduledDeployPreview() {
   deployPreviewTimer = null;
 }
 
-/// Keystrokes coalesce into one backend read (M7). An answer still on its way
+/// Keystrokes coalesce into one backend read. An answer still on its way
 /// for older fields is invalidated at once, not when the delay expires. A
 /// local field error (the port) is shown at once and asks the backend nothing.
 /// Deploy and Copy config ask afresh themselves, so neither waits on the delay
@@ -3934,7 +4070,7 @@ async function previewConfig() {
     // A field the backend will not write (alias pattern, quotes in HostName,
     // ...): its own words, under the fields, and nothing to deploy.
     state.deployPreview = null;
-    showDeployFieldError(e.message || String(e));
+    showDeployFieldError(errText(e));
     renderDeployPreview(null, false);
     return null;
   }
@@ -3961,6 +4097,7 @@ function renderDeployPreview(p, noSelection) {
   const plan = el('deployPlan');
   plan.replaceChildren(...keys.map(deployPlanItem));
   plan.hidden = keys.length === 0;
+  renderDeployNotes(p);
   const refused = keys.filter((k) => k.refusal).length;
   el('deploySelectionHint').textContent = refused
     ? `${refused} of ${keys.length} selected key(s) cannot be deployed - see why above.`
@@ -3968,6 +4105,61 @@ function renderDeployPreview(p, noSelection) {
   // Nothing to deploy: fields the backend refuses, or every key refused.
   setDisabledFor(el('deployConfigBtn'), 'invalid', !noSelection && (!p || (keys.length > 0 && refused === keys.length)));
 }
+
+/// What the preview warns about, under the plan: the backend's `warnings`
+/// (sentences that say what to do - a % in the managed config's path, a Host
+/// line of the user's own config); and its `legacyHostLines`, each as
+/// "<file>:<line> - <text>" with what it is - a line ssh cannot read (which
+/// stops every ssh command), one an older SSHSpan wrote, or the user's own
+/// entry. SSHSpan never edits that file. Text only, and as text from outside
+/// (deployNote): a Host line is the user's own text and a warning quotes one,
+/// so a direction override in it is spelled out - each of file, line and text
+/// sits in a <bdi> of its own besides, so none can turn SSHSpan's verdict
+/// after it around - and a line of 50,000 characters is not shown whole.
+function renderDeployNotes(p) {
+  const warnings = arrayOrEmpty(p && p.warnings);
+  const lines = arrayOrEmpty(p && p.legacyHostLines).filter(Boolean);
+  el('deployWarningList').replaceChildren(...warnings.map((w) => {
+    const li = document.createElement('li');
+    li.textContent = deployNote(w, DEPLOY_WARNING_MAX);
+    return li;
+  }));
+  el('deployWarnings').hidden = !warnings.length;
+  el('deployLegacyList').replaceChildren(...lines.map((l) => {
+    const li = document.createElement('li');
+    const at = document.createElement('code');
+    at.append(bdiOf(deployNote(l.file, DEPLOY_LINE_MAX)), ':', bdiOf(deployNote(l.line, DEPLOY_LINE_MAX)), ' - ',
+      bdiOf(deployNote(l.text, DEPLOY_LINE_MAX)));
+    const what = document.createElement('span');
+    what.className = 'deploy-legacy-what' + (l.unreadable ? ' breaks' : '');
+    what.textContent = [l.unreadable ? DEPLOY_LINE_BREAKS : '', l.writtenBySshspan ? DEPLOY_LINE_OLDER : DEPLOY_LINE_OWN].filter(Boolean).join(' ');
+    li.append(at, ' - ', what);
+    return li;
+  }));
+  el('deployLegacy').hidden = !lines.length;
+}
+
+/// The longest a Host line's file or text is shown: the backend cuts a line
+/// there too (and adds "…"), so its own cut is shown as it is.
+const DEPLOY_LINE_MAX = 300;
+/// The longest a warning is shown: the backend's run to some 600 characters
+/// (a sentence, the file and a quoted line of up to 301), and none of them is
+/// cut - only something no backend sentence is, like 50,000 characters.
+const DEPLOY_WARNING_MAX = 800;
+
+/// A note from the preview as shown: invisible and direction characters
+/// spelled out (spellOut), at most `max` characters (capText).
+function deployNote(text, max) {
+  return capText(spellOut(text), max);
+}
+
+/// What a Host line of the user's own config is.
+const DEPLOY_LINE_BREAKS = 'Breaks ssh: ssh cannot read this line, so every ssh command fails until it is fixed.';
+const DEPLOY_LINE_OLDER = 'An older SSHSpan wrote it.';
+const DEPLOY_LINE_OWN = 'Your own entry.';
+
+/// The Deploy question repeats at most this many of the preview's warnings.
+const DEPLOY_WARNINGS_ASKED = 6;
 
 /// One key of the plan: where its files go and its Host alias - or, for a
 /// key the deploy will refuse, the reason in the backend's words.
@@ -4035,7 +4227,7 @@ async function runDeploy() {
   // The plan as the backend sees it now, for the question below: the real
   // files (not "<deploy dir>/" with the wrong separator, A8-26) and the keys
   // it will refuse. A field it will not write stops here, with its reason.
-  // Asked directly, never through the typing delay (M7); the answer used is
+  // Asked directly, never through the typing delay; the answer used is
   // the one for exactly these fields, even if a later keystroke superseded
   // what the sheet shows.
   const plan = await previewConfig();
@@ -4057,7 +4249,7 @@ async function runDeploy() {
     });
   } catch (e) {
     // Nothing was deployed; the reasons, one per key. The sheet stays open.
-    toast(e.message || String(e), 'err');
+    toast(errText(e), 'err');
     return;
   }
   const deployed = arrayOrEmpty(res && res.keys);
@@ -4078,7 +4270,8 @@ async function runDeploy() {
 }
 
 /// The question before a deploy: the files it writes, the file it updates,
-/// and the keys it will skip.
+/// the keys it will skip, and what the preview warns about (repeated here, so
+/// a line that breaks ssh is read before the Deploy, not only in the sheet).
 function deployQuestion(writes, refused, plan, selected) {
   const lines = [];
   if (writes.length) {
@@ -4090,6 +4283,12 @@ function deployQuestion(writes, refused, plan, selected) {
   }
   if (plan.configPath) lines.push('', 'Host blocks go in ' + plan.configPath + '.');
   if (refused.length) lines.push('', 'Not deployed: ' + refused.map((k) => '"' + (k.name || k.id) + '"').join(', ') + ' (see the sheet).');
+  const warnings = arrayOrEmpty(plan.warnings);
+  if (warnings.length) {
+    lines.push('', 'Before you deploy:');
+    for (const w of warnings.slice(0, DEPLOY_WARNINGS_ASKED)) lines.push('- ' + deployNote(w, DEPLOY_WARNING_MAX));
+    if (warnings.length > DEPLOY_WARNINGS_ASKED) lines.push(`- ...and ${warnings.length - DEPLOY_WARNINGS_ASKED} more (see the sheet).`);
+  }
   return lines.join('\n');
 }
 
@@ -4118,7 +4317,7 @@ async function saveDeployedAsServers(deployed, fields) {
       });
       saved += 1;
     } catch (e) {
-      failed.push(name + ': ' + (e.message || String(e)));
+      failed.push(name + ': ' + errText(e));
     }
   }
   if (saved) {
@@ -4174,12 +4373,12 @@ async function importFromSshConfig(anchorEl) {
     // Which file these came from, as the menu's first, inert line.
     items.unshift({ label: 'From ' + file, icon: 'file-text', disabled: true, onSelect: () => {} }, 'sep');
     openMenu(anchorEl, items, { label: 'Hosts in ' + file });
-  } catch (e) { toast(e.message || String(e), 'err'); }
+  } catch (e) { toast(errText(e), 'err'); }
 }
 
 async function copyConfig() {
   // Fields typed within the preview delay are not shown yet: ask now rather
-  // than copy the text of older fields (M7).
+  // than copy the text of older fields.
   if (deployPreviewTimer) await previewConfig();
   const text = el('configPreview').value;
   // The preview is always live: the old message sent the user to a Preview
@@ -4224,7 +4423,7 @@ function setBwStatus(text, cls) {
 /// what a blank password field means (A5-35) - and that it means nothing once
 /// the server or account is changed: the backend uses a stored password for
 /// the saved server and account only, and refuses to save another endpoint
-/// without a new one (RU5).
+/// without a new one.
 let bwSaved = { server_url: '', email: '', hasMasterPassword: false };
 
 const bwUrlKey = (u) => String(u || '').trim().replace(/\/+$/, '').toLowerCase();
@@ -4330,8 +4529,18 @@ async function loadBitwardenConfig() {
   paintBwPasswordHint();
   renderBwErrors([]);
 
-  // Sync status
-  if (config.last_sync) {
+  // Sync status: the last run as it ended (A2-08). One that stopped
+  // part-way, or had failed items, used to read "Last synced ..." like a
+  // clean one.
+  const last = config.last_result && typeof config.last_result === 'object' ? config.last_result : null;
+  const lastErrors = arrayOrEmpty(last && last.errors);
+  if (last && last.ok === false) {
+    setBwStatus('Last sync stopped: ' + (last.aborted || 'it did not finish.'), 'err');
+  } else if (lastErrors.length) {
+    renderBwErrors(lastErrors);
+    setBwStatus((config.last_sync ? 'Last synced: ' + fmtTime(config.last_sync) + ' - ' : '')
+      + plural(lastErrors.length, 'error') + ', see the list below.', 'warn');
+  } else if (config.last_sync) {
     setBwStatus('Last synced: ' + fmtTime(config.last_sync), 'info');
   } else {
     setBwStatus('Not configured yet.');
@@ -4352,14 +4561,15 @@ async function saveBitwardenConfig() {
     if (!payload.serverUrl) { toast('Server URL is required.', 'err'); el('bw_server_url').focus(); return; }
     if (!payload.email) { toast('Email is required.', 'err'); el('bw_email').focus(); return; }
     try {
-      await call('bitwarden_save_config', payload);
+      const r = await call('bitwarden_save_config', payload);
       toast('Bitwarden settings saved.', 'ok');
+      showAuditWarning(r);
       el('bw_master_password').value = ''; // clear after save
       await loadBitwardenConfig();
     } catch (e) {
       // The backend's own words, e.g. a new server or account without a new
-      // password (RU5).
-      toast(e.message || String(e), 'err');
+      // password.
+      toast(errText(e), 'err');
     }
   });
 }
@@ -4387,7 +4597,7 @@ async function bwTest() {
       setBwStatus(text, 'ok');
       toast(text, 'ok');
     } catch (e) {
-      const msg = e.message || String(e);
+      const msg = errText(e);
       setBwStatus(msg, 'err');
       toast(msg, 'err');
     }
@@ -4425,12 +4635,23 @@ function bwCleanText(text) {
   return chars.length > BW_TEXT_MAX ? chars.slice(0, BW_TEXT_MAX - 1).join('').trimEnd() + '…' : s;
 }
 
-/// A Bitwarden value inside a sentence of plain text (the sync's status
-/// line): cleaned (bwCleanText - no isolate, override or mark of its own is
+/// A name from a Bitwarden item as shown: cleaned (bwCleanText). One that
+/// shows nothing after that - U+2800 three times, only spaces, only marks -
+/// reads "(blank name)" with its characters spelled out, so it cannot pose as
+/// nothing at all.
+function bwName(text) {
+  const clean = bwCleanText(text);
+  if (!showsNothing(clean)) return clean;
+  const spelled = capText(Array.from(String(text == null ? '' : text), spellChar).join(''), BW_TEXT_MAX);
+  return spelled ? '(blank name) ' + spelled : '(blank name)';
+}
+
+/// A Bitwarden name inside a sentence of plain text (the sync's status
+/// line): as bwName shows it (no isolate, override or mark of its own is
 /// left), then kept to itself between FIRST STRONG ISOLATE and POP
 /// DIRECTIONAL ISOLATE.
 function bwInText(text) {
-  return '\u2068' + bwCleanText(text) + '\u2069';
+  return '\u2068' + bwName(text) + '\u2069';
 }
 
 /// "host:port", an IPv6 host in brackets ("[::1]:22"); null without a host.
@@ -4442,10 +4663,13 @@ function bwAddress(host, port) {
 }
 
 /// The settings a server pull would change, in words (the sync result names
-/// them host, port, user, password, authMethod, linkedKey; an unknown name is
-/// shown as it comes, cleaned).
+/// them name, host, port, user, password, authMethod, linkedKey, category -
+/// in that order; an unknown name is shown as it comes, cleaned).
 function bwChangeName(name) {
-  const words = { host: 'host', port: 'port', user: 'user name', password: 'saved password', authMethod: 'sign-in method', linkedKey: 'linked key' };
+  const words = {
+    name: 'name', host: 'host', port: 'port', user: 'user name', password: 'saved password',
+    authMethod: 'sign-in method', linkedKey: 'linked key', category: 'host category',
+  };
   return words[name] || bwCleanText(name);
 }
 
@@ -4456,21 +4680,19 @@ function bwChangeName(name) {
 /// From the sync result's optional pendingServers / pendingKeys; null without
 /// them (an older backend: the question gives the counts alone). One entry
 /// per change, each value in a <bdi> of its own, all of it text - never
-/// markup. A list cut at 50 says how many more there are, and that Apply
-/// applies those too.
+/// markup. A cut list says how many more there are; the backend refuses to
+/// apply one (approvalRefused), so it is asked about only by an older backend,
+/// which applied the rest unseen - then the note says so.
 function bwPendingList(s) {
   const servers = arrayOrEmpty(s.pendingServers);
   const keys = arrayOrEmpty(s.pendingKeys);
   if (!servers.length && !keys.length) return null;
   const box = document.createElement('div');
   box.className = 'bw-pending';
-  const value = (text) => {
-    const b = document.createElement('bdi');
-    b.textContent = bwCleanText(text);
-    return b;
-  };
+  const value = (text) => bdiOf(bwCleanText(text));
+  const name = (text) => bdiOf(bwName(text));
   const fromItem = (p) => (p.incomingName && bwCleanText(p.incomingName) !== bwCleanText(p.name)
-    ? [' (from the Bitwarden item ', value(p.incomingName), ')'] : []);
+    ? [' (from the Bitwarden item ', name(p.incomingName), ')'] : []);
   const group = (title, entries, total, describe) => {
     if (!entries.length) return;
     const head = document.createElement('p');
@@ -4491,20 +4713,20 @@ function bwPendingList(s) {
   };
   group('Servers', servers, (s.skippedServerOverwrites || 0) + (s.skippedServerNew || 0), (p) => {
     const incoming = p.host ? value(bwAddress(p.host, p.port)) : 'no address in Bitwarden';
-    if (p.kind !== 'overwrite') return ['new: ', value(p.name), ', ', incoming];
+    if (p.kind !== 'overwrite') return ['new: ', name(p.name), ', ', incoming];
     const changes = arrayOrEmpty(p.changes).map(bwChangeName).filter(Boolean);
-    return [value(p.name), ': ', p.localHost ? value(bwAddress(p.localHost, p.localPort)) : 'no address', ' → ', incoming,
+    return [name(p.name), ': ', p.localHost ? value(bwAddress(p.localHost, p.localPort)) : 'no address', ' → ', incoming,
       ...fromItem(p), ...(changes.length ? [` - changes: ${changes.join(', ')}`] : [])];
   });
   group('Keys', keys, (s.skippedOverwrites || 0) + (s.skippedNew || 0), (p) => {
     const incoming = p.fingerprint ? value(p.fingerprint) : 'fingerprint unknown';
-    if (p.kind !== 'overwrite') return ['new: ', value(p.name), ', ', incoming];
-    return [value(p.name), ': ', p.localFingerprint ? value(p.localFingerprint) : 'fingerprint unknown', ' → ', incoming, ...fromItem(p)];
+    if (p.kind !== 'overwrite') return ['new: ', name(p.name), ', ', incoming];
+    return [name(p.name), ': ', p.localFingerprint ? value(p.localFingerprint) : 'fingerprint unknown', ' → ', incoming, ...fromItem(p)];
   });
   if (s.pendingTruncated) {
     const note = document.createElement('p');
     note.className = 'bw-pending-note';
-    note.textContent = 'Not every change is listed (the list stops at 50 of each kind). Apply also applies the changes not listed here.';
+    note.textContent = 'Not every change is listed. Apply also applies the changes not listed here.';
     box.appendChild(note);
   }
   return box;
@@ -4516,7 +4738,7 @@ function bwPendingList(s) {
 /// `linked` and `conflicts` count keys and servers together (bitwarden/
 /// sync.rs adds to both from either pass), so they are said apart from the
 /// two groups - under "Keys:" they claimed servers' links and conflicts as
-/// keys' (fix round 1).
+/// keys'.
 function bwSyncSummary(s) {
   const counted = (pairs) => pairs.filter(([n]) => n > 0).map(([n, label]) => n + ' ' + label);
   const keys = counted([
@@ -4543,8 +4765,9 @@ function bwSyncSummary(s) {
 }
 
 /// Show a sync's result as it is (A2-08 / A7-24): a run that stopped part-way
-/// (RU5: ok false, aborted) or had failed items is never "Sync complete.".
-function showBwSyncResult(s) {
+/// (ok false, with `aborted`) or had failed items is never "Sync complete.".
+/// opts.keptChanging: every Apply met another list (bwSyncNow gave up).
+function showBwSyncResult(s, opts) {
   const errors = arrayOrEmpty(s.errors);
   const summary = bwSyncSummary(s);
   renderBwErrors(errors);
@@ -4552,6 +4775,18 @@ function showBwSyncResult(s) {
     const reason = s.aborted || 'The sync stopped before it finished.';
     setBwStatus('Sync stopped: ' + reason + (summary ? ' Done before it stopped: ' + summary : ''), 'err');
     toast('Bitwarden sync stopped: ' + reason, 'err');
+    return;
+  }
+  // More changes from Bitwarden than can be shown for approval: the backend
+  // applied none of them and says why (approvalRefused) - as it says it.
+  if (s.approvalRefused) {
+    bwSayNothingApplied(summary, String(s.approvalRefused), errors);
+    return;
+  }
+  // The list changed again at every Apply (approvalStale each time): nothing
+  // from Bitwarden was applied. It read "Sync complete.".
+  if (opts && opts.keptChanging) {
+    bwSayNothingApplied(summary, BW_KEPT_CHANGING, errors);
     return;
   }
   if (errors.length) {
@@ -4562,6 +4797,38 @@ function showBwSyncResult(s) {
   }
   setBwStatus(summary || 'Nothing to sync.', 'ok');
   toast('Sync complete.', 'ok');
+}
+
+/// A run that applied nothing from Bitwarden, and why: in the status line
+/// after what the run did do (and its errors), and in a toast.
+function bwSayNothingApplied(summary, why, errors) {
+  setBwStatus((summary ? summary + ' ' : '') + why
+    + (errors.length ? ' ' + plural(errors.length, 'error') + ' - see the list below.' : ''), 'warn');
+  toast(why, 'warn');
+}
+
+/// How often one Sync asks again when the list keeps changing between the
+/// question and the Apply.
+const BW_APPROVAL_ROUNDS = 3;
+
+/// What it says when the list changed at each of those Applies.
+const BW_KEPT_CHANGING = 'The changes in Bitwarden changed each time you applied them, so nothing from Bitwarden was applied - sync again to review them.';
+
+/// The approval question for the changes a sync left: what would change, by
+/// name, as a list under the question (text only - bwPendingList). The list
+/// leaves with the question, the dialog being shared, and is not added when
+/// another question holds the dialog (confirmModal refuses this one then).
+/// `again`: the list changed since the last question, and nothing was applied.
+async function bwAskApproval(s, pending, again) {
+  const list = bwPendingList(s);
+  if (list && !(confirmPending && !el('confirmModal').hidden)) el('confirmMessage').after(list);
+  try {
+    return await confirmModal(again ? 'Apply the changed list' : 'Apply remote changes',
+      (again ? 'The changes in Bitwarden changed while you were deciding, so nothing was applied. ' : '')
+        + 'Bitwarden has changes that need your approval: ' + pending + '. Apply them now?', 'Apply');
+  } finally {
+    if (list) list.remove();
+  }
 }
 
 async function bwSyncNow() {
@@ -4575,30 +4842,32 @@ async function bwSyncNow() {
       // applied. The "Apply them now?" approval was silently discarded and the
       // UI still reported "Sync complete."
       let s = await call('bitwarden_sync', { allowRemoteOverwrite: false });
-      const pending = s && s.ok !== false ? bwPendingRemoteChanges(s) : '';
-      if (pending) {
-        // What would change, by name, as a list under the question (built
-        // from text only - bwPendingList). It leaves with the question, the
-        // dialog being shared, and is not added when another question holds
-        // the dialog (confirmModal refuses this one then).
-        const list = bwPendingList(s);
-        if (list && !(confirmPending && !el('confirmModal').hidden)) el('confirmMessage').after(list);
-        let apply;
-        try {
-          apply = await confirmModal('Apply remote changes',
-            'Bitwarden has changes that need your approval: ' + pending + '. Apply them now?', 'Apply');
-        } finally {
-          if (list) list.remove();
-        }
+      // Changes from Bitwarden wait for the user's approval, and an approval
+      // is for the list it was asked about: Apply sends back that list's
+      // approvalToken, and the backend applies nothing when its own fetch
+      // finds another list by then (approvalStale) - the new list comes back
+      // with its own token and is asked about again. A list too long to show
+      // cannot be approved (approvalRefused): never asked, said instead.
+      let round = 0;
+      for (; round < BW_APPROVAL_ROUNDS && s && s.ok !== false && !s.approvalRefused; round++) {
+        const pending = bwPendingRemoteChanges(s);
+        if (!pending) break;
+        const apply = await bwAskApproval(s, pending, round > 0);
         // The vault can lock while the dialog is open; a lock answers it "no",
         // and this keeps a late approval from reaching a vault that is sealed.
-        if (apply && state.unlocked) s = await call('bitwarden_sync', { allowRemoteOverwrite: true });
+        if (!apply || !state.unlocked) break;
+        const approval = { allowRemoteOverwrite: true };
+        if (s.approvalToken) approval.approvalToken = String(s.approvalToken);
+        s = await call('bitwarden_sync', approval);
+        if (!s || !s.approvalStale) break;
       }
-      showBwSyncResult(s || {});
+      // Only an Apply answered with another list every time runs every round
+      // (a "no", or any other answer, leaves the loop early).
+      showBwSyncResult(s || {}, { keptChanging: round === BW_APPROVAL_ROUNDS });
       await loadKeys();
       if (state.view === 'connect' || state.servers.length) await loadServers();
     } catch (e) {
-      const msg = e.message || String(e);
+      const msg = errText(e);
       setBwStatus(msg, 'err');
       toast(msg, 'err');
     }
@@ -4655,7 +4924,7 @@ async function loadSettings() {
     // Say so where the rows would be, with a Retry (A5-21). This used to
     // leave a blank page AND replace state.settings with {}, quietly putting
     // every setting back to its default for the rest of the session.
-    const msg = e.message || String(e);
+    const msg = errText(e);
     renderLoadError(grid, 'Could not load settings', msg, loadSettings);
     toast(msg, 'err');
     return;
@@ -4750,7 +5019,7 @@ async function loadSettings() {
       await call('settings_set', { key, value });
     } catch (e) {
       revert();
-      toast(e.message || String(e), 'err');
+      toast(errText(e), 'err');
       return false;
     }
     state.settings[key] = value;
@@ -4953,7 +5222,7 @@ async function loadSettings() {
     } catch (e) {
       // Saved, so the next transfer uses it; only the running ones did not
       // get it. The control stays: it shows the stored limit.
-      toast(e.message || String(e), 'err');
+      toast(errText(e), 'err');
       return;
     }
     toast(bytesPerSec === 0
@@ -5110,7 +5379,7 @@ async function backupCreate() {
       el('backupStatus').textContent = `Backup saved to ${r.path}: ${summary}.`;
       toast(`Backup saved to ${r.path} - ${summary}.`, 'ok');
     } catch (e) {
-      const msg = e.message || String(e);
+      const msg = errText(e);
       toast(msg === VAULT_LOCKED_MIDWAY ? 'The vault was locked before the backup was written, so no file was saved.' : msg, 'err');
     }
   });
@@ -5142,7 +5411,7 @@ async function runRestore(path, backupPassword) {
         ? await call('vault_backup_restore_from_file', {})
         : await call('vault_backup_restore_from_file', { path, backupPassword });
     } catch (e) {
-      const msg = e.message || String(e);
+      const msg = errText(e);
       // A wrong password uses up the retry Rust granted for that file, so the
       // only way on is to pick the file again. A lock during the restore
       // aborts it before anything is written. Every other message - a busy
@@ -5209,7 +5478,7 @@ async function reloadAfterRestore() {
   try {
     stored = await call('settings_get');
   } catch (e) {
-    toast('Restored, but the settings could not be read back: ' + (e.message || String(e)), 'err');
+    toast('Restored, but the settings could not be read back: ' + errText(e), 'err');
     return;
   }
   applyStoredSettings(stored);
@@ -5253,7 +5522,7 @@ async function loadKnownHosts() {
     if (seq !== knownHostsSeq) return;
     // A failure is not "No hosts pinned yet" - that is what it used to show,
     // with no word of the error. Said in the table, with a Retry, and toasted.
-    const msg = e.message || String(e);
+    const msg = errText(e);
     empty.hidden = true;
     if (chip) chip.hidden = true;
     const tr = document.createElement('tr');
@@ -5308,7 +5577,7 @@ async function loadKnownHosts() {
         await call('known_hosts_forget', { host: h.host });
         await loadKnownHosts();
         toast('Host forgotten.', 'ok');
-      } catch (e) { toast(e.message || String(e), 'err'); }
+      } catch (e) { toast(errText(e), 'err'); }
     });
     tdAct.appendChild(forget);
     tr.appendChild(tdHost); tr.appendChild(tdFp); tr.appendChild(tdSeen); tr.appendChild(tdAct);
@@ -5338,7 +5607,7 @@ async function loadAudit(fromStart) {
   } catch (e) {
     // Say so in the table, with a Retry; it used to be an empty table and a
     // toast that faded.
-    const msg = e.message || String(e);
+    const msg = errText(e);
     auditRows = [];
     const tr = document.createElement('tr');
     tr.className = 'audit-error';
@@ -5443,24 +5712,28 @@ function csvField(value) {
 
 /// Export the audit log as CSV through a native save dialog. Pulls the full
 /// retained set (not the 200-row page the table shows), so the export is
-/// complete even when the view is truncated.
+/// complete even when the view is truncated. One export at a time (A2-18):
+/// the button is busy until its save dialog is answered and the file written -
+/// a second click used to read the log again and open a second dialog.
 async function auditExport() {
-  try {
-    const res = await call('audit_list', { limit: 10000 });
-    const rows = res.rows || [];
-    if (!rows.length) { toast('Nothing to export yet.', 'info'); return; }
-    const header = ['time', 'event', 'key_id', 'detail'].join(',');
-    const lines = rows.map(r => [fmtTime(r.ts), r.event, r.keyId, r.detail].map(csvField).join(','));
-    // Leading BOM so Excel opens UTF-8 correctly; the CSV is otherwise plain.
-    const csv = '\ufeff' + header + '\r\n' + lines.join('\r\n') + '\r\n';
-    const pick = await call('system_pick_save_path', {
-      title: 'Export audit log',
-      defaultName: `sshspan-audit-${new Date().toISOString().slice(0, 10)}.csv`,
-    });
-    if (pick.canceled) return;
-    await call('system_write_text_file', { path: pick.path, contents: csv });
-    toast(`Exported ${rows.length} entrie(s).`, 'ok');
-  } catch (e) { toast((e && (e.message || e.error)) || String(e), 'err'); }
+  return withBusy(el('auditExportBtn'), 'Exporting\u2026', async () => {
+    try {
+      const res = await call('audit_list', { limit: 10000 });
+      const rows = res.rows || [];
+      if (!rows.length) { toast('Nothing to export yet.', 'info'); return; }
+      const header = ['time', 'event', 'key_id', 'detail'].join(',');
+      const lines = rows.map(r => [fmtTime(r.ts), r.event, r.keyId, r.detail].map(csvField).join(','));
+      // Leading BOM so Excel opens UTF-8 correctly; the CSV is otherwise plain.
+      const csv = '\ufeff' + header + '\r\n' + lines.join('\r\n') + '\r\n';
+      const pick = await call('system_pick_save_path', {
+        title: 'Export audit log',
+        defaultName: `sshspan-audit-${new Date().toISOString().slice(0, 10)}.csv`,
+      });
+      if (pick.canceled) return;
+      await call('system_write_text_file', { path: pick.path, contents: csv });
+      toast(`Exported ${rows.length} entrie(s).`, 'ok');
+    } catch (e) { toast(errText(e), 'err'); }
+  });
 }
 
 /// Clear the audit log after a confirmation. The backend records the clear
@@ -5482,7 +5755,7 @@ async function auditClear() {
     const out = await call('audit_clear');
     await loadAudit(true);
     toast(`Cleared ${out.removed} entrie(s).`, 'ok');
-  } catch (e) { toast((e && (e.message || e.error)) || String(e), 'err'); }
+  } catch (e) { toast(errText(e), 'err'); }
 }
 
 
@@ -5610,7 +5883,12 @@ function wire() {
   // keys view
   el('newKeyBtn').addEventListener('click', openKeyModal);
   const emptyNew = el('emptyNewBtn');
-  if (emptyNew) emptyNew.addEventListener('click', openKeyModal);
+  if (emptyNew) {
+    emptyNew.addEventListener('click', openKeyModal);
+    lockGate(emptyNew, 'keys');
+  }
+  // The locked card's own way on: the dialog that unlocks - or creates - it.
+  el('emptyUnlockBtn').addEventListener('click', () => requestVaultModal(state.hasVault ? 'unlock' : 'create'));
   el('searchInput').addEventListener('input', renderKeyList);
   el('typeFilter').addEventListener('change', renderKeyList);
   el('catAddRootBtn').addEventListener('click', () => addCategoryPrompt(null));
@@ -5656,14 +5934,18 @@ function wire() {
       initial: [],
       onSave: async (catIds) => {
         if (!catIds.length) return;
+        // Each key's audit warning, once per text (several keys, one cause).
+        const warned = new Set();
         try {
           for (const keyId of ids) {
             const merged = [...new Set([...(state.keyCategories[keyId] || []), ...catIds])];
-            await call('key_set_categories', { keyId, categoryIds: merged });
+            const r = await call('key_set_categories', { keyId, categoryIds: merged });
+            if (r && r.warning) warned.add(String(r.warning));
           }
           await loadKeys();
           toast('Categories updated.', 'ok');
-        } catch (e) { toast(e.message || String(e), 'err'); }
+        } catch (e) { toast(errText(e), 'err'); }
+        for (const w of warned) toast(w, 'warn');
       },
     });
   });
@@ -5734,11 +6016,12 @@ function wire() {
       const next = (name || '').trim();
       if (!next || next === k.name) return;
       try {
-        await call('key_rename', { id: k.id, name: next });
+        const r = await call('key_rename', { id: k.id, name: next });
         await loadKeys();
         selectKey(k.id);
         toast('Key renamed.', 'ok');
-      } catch (e) { toast(e.message || String(e), 'err'); }
+        showAuditWarning(r);
+      } catch (e) { toast(errText(e), 'err'); }
     });
   });
   el('detailCopyPublicBtn').addEventListener('click', copyPublic);
@@ -5812,6 +6095,7 @@ function wire() {
 
   // vault actions, now in Settings rather than the corner of every view
   el('lockBtn').addEventListener('click', lockFromUser);
+  lockGate(el('lockBtn'), 'lock');
   // Changing the password needs an unlocked vault; otherwise the useful dialog
   // is the one that unlocks (or creates) it.
   el('changePasswordBtn').addEventListener('click', () =>
@@ -5830,10 +6114,16 @@ function wire() {
     if (!state.unlocked) { toast('Unlock the vault first.', 'err'); return; }
     bwSyncNow();
   });
+  // All three read or write the vault: disabled while it is locked, saying
+  // why, like the neighbours (A6-08) - they used to answer a click with an
+  // error toast.
+  for (const id of ['bwSaveBtn', 'bwTestBtn', 'bwSyncNowBtn']) lockGate(el(id), 'bitwarden');
 
   // backup & restore (Settings)
   el('backupExportBtn').addEventListener('click', backupCreate);
   el('backupImportBtn').addEventListener('click', backupRestore);
+  lockGate(el('backupExportBtn'), 'backup');
+  lockGate(el('backupImportBtn'), 'backup');
 
   // audit log (Settings)
   el('auditExportBtn').addEventListener('click', auditExport);
@@ -5954,7 +6244,7 @@ function wire() {
     // Only a real press counts: a second Ctrl+L or Ctrl+Q is the yes of its
     // question (confirmLiveWork), and a key held for half a second repeats,
     // so holding it answered its own question - locking or quitting, live
-    // sessions and all, unasked (fix round 2).
+    // sessions and all, unasked.
     if ((k === 'l' || k === 'q') && ev.repeat) { ev.preventDefault(); return; }
     if (k === 'l') { ev.preventDefault(); lockFromUser(); return; }
     // Quit (R11). Like Ctrl+L it works with a dialog open; in a focused
@@ -5977,9 +6267,13 @@ function wire() {
     }
   });
 
-  // Listen for vault-lock-requested from the tray menu. It locks without a
-  // question: the window may be hidden, where no one would see one.
-  listen('vault-lock-requested', () => { lockNow(); });
+  // The tray's Lock: the backend has locked the vault already when this
+  // arrives, so the page only follows - no question (the window may be
+  // hidden, where no one would see one) and no vault_lock of its own, which
+  // locked the locked vault again.
+  listen('vault-lock-requested', async () => {
+    try { await refreshVaultStatus(); } catch (e) { /* the next status poll catches up */ }
+  });
 
   // The first X-close of a run hides the window to the tray (R11 / A5-24).
   // The notice stays until dismissed: the window is hidden when it arrives,
@@ -6072,7 +6366,7 @@ function wire() {
     try {
       const r = await call('system_pick_file_path', { title: 'Select .pem file' });
       if (r && !r.canceled) { el('srvPemPath').value = r.path; el('srvPemPath').title = r.path; }
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    } catch (e) { toast(errText(e), 'err'); }
   });
   // A long path is cut off in the field; its tooltip has all of it (A1-21).
   el('srvPemPath').addEventListener('input', () => { el('srvPemPath').title = el('srvPemPath').value; });
@@ -6081,6 +6375,10 @@ function wire() {
     state._clearSavedPw = !state._clearSavedPw;
     paintSavedPasswordRow();
   });
+  // The fields a saved password is bound to: the row says at once when it is
+  // needed again, and a typed password answers the question.
+  for (const id of ['srvHost', 'srvPort', 'srvUser']) el(id).addEventListener('input', paintSavedPasswordRow);
+  el('srvPassword').addEventListener('input', () => showFieldMessage('srvPwMsg', ''));
   // A port refused on Save is checked again as it is corrected (A5-30).
   el('srvPort').addEventListener('input', () => {
     if (el('srvPort').getAttribute('aria-invalid') !== 'true') return;
@@ -6163,7 +6461,7 @@ function liveWorkText() {
 let liveWorkQuestion = null;
 
 /// A question about ending live work - kind 'lock' or 'quit'. The same chord
-/// again while its question is open is the answer yes (fix round 1): Ctrl+L
+/// again while its question is open is the answer yes: Ctrl+L
 /// twice locks, Ctrl+Q twice quits; that second call resolves null and leaves
 /// the work to the first. Otherwise one question at a time (confirmModal): a
 /// confirmation still open is answered "no" first - the lock or quit is what
@@ -6207,14 +6505,17 @@ async function quitApp() {
   try {
     await call('app_quit');
   } catch (e) {
-    toast(e.message || String(e), 'err');
+    toast(errText(e), 'err');
   }
 }
-window.appQuit = quitApp;
 
 /// Lock now. opts.ask: a lock from the user in this window (lockFromUser).
+/// A vault that is locked already - by the tray, the watchdog, the idle
+/// timer - is left as it is, without a word: Ctrl+L there used to lock it
+/// again and say "Vault locked.".
 async function lockNow(opts) {
-  if (opts && opts.ask && state.unlocked) {
+  if (!state.unlocked) return;
+  if (opts && opts.ask) {
     const work = liveWorkText();
     if (work) {
       const ok = await confirmLiveWork('lock', 'Lock the vault?', 'Locking ' + work + '.\n\nPress Ctrl+L again to lock.', 'Lock');
@@ -6226,12 +6527,14 @@ async function lockNow(opts) {
   // Settle every open dialog BEFORE the round trip. Between the lock request
   // and the status refresh a pending "Confirm" could otherwise still be
   // clicked, and its action would run against a vault that is already locking.
-  if (state.unlocked) closeDialogsForLock();
+  closeDialogsForLock();
   try {
+    // { ok, alreadyLocked }: alreadyLocked - the tray was first - changes
+    // nothing here; the vault is locked either way.
     await call('vault_lock');
     await refreshVaultStatus();
     toast('Vault locked.', 'ok');
-  } catch (e) { toast(e.message || String(e), 'err'); }
+  } catch (e) { toast(errText(e), 'err'); }
 }
 
 /// Everything that has to happen to the UI when the vault locks, however it
@@ -6460,7 +6763,7 @@ window.noteUserActivity = noteUserActivity;
 /// It gives the time really left when it appears (a shorter auto-lock set
 /// meanwhile can leave less than the usual minute - it said "60 s" whatever),
 /// it is pinned so newer toasts cannot push it off the screen, and it comes
-/// back if anything removed it (fix round 1).
+/// back if anything removed it.
 const AUTO_LOCK_WARN_MS = 60 * 1000;
 let autoLockWarning = null;
 
@@ -6581,7 +6884,7 @@ function queueActivityHeartbeat() {
 /// progress to show: R10). A newer release with no installer for this
 /// platform is said to exist (A2-41) - it used to read "latest version".
 ///
-/// One run at a time, whatever starts it (fix round 1): the palette, "Check
+/// One run at a time, whatever starts it: the palette, "Check
 /// now", or a "Check now" Settings drew again while a run was on - the busy
 /// button only guarded itself. The run is check, question and download; a
 /// second request meanwhile is told what is going on and starts nothing.
@@ -6610,7 +6913,7 @@ async function runUpdateCheck(btn) {
   try {
     r = await withBusy(btn, 'Checking…', () => call('update_check'));
   } catch (e) {
-    toast(e.message || String(e), 'err');
+    toast(errText(e), 'err');
     return;
   }
   if (!r) return; // the button was busy with something else
@@ -6635,8 +6938,8 @@ async function runUpdateCheck(btn) {
       // The backend exits the app right after it starts the installer.
     } catch (e) {
       if (notice && notice.dismiss) notice.dismiss();
-      // The backend's own reason, e.g. a declined UAC prompt (RU5).
-      toast(e.message || String(e), 'err');
+      // The backend's own reason, e.g. a declined UAC prompt.
+      toast(errText(e), 'err');
     }
   });
 }
@@ -6691,7 +6994,7 @@ async function loadServers() {
     state.serversLoadError = null;
   } catch (e) {
     state.servers = [];
-    state.serversLoadError = e.message || String(e);
+    state.serversLoadError = errText(e);
     toast(state.serversLoadError, 'err');
   }
   renderServerList();
@@ -6900,7 +7203,7 @@ function serverMenuItems(srv) {
         if (state.connectSelectedId === srv.id) selectServer(null);
         await loadServers();
         toast('Server deleted.', 'ok');
-      } catch (e) { toast(e.message || String(e), 'err'); }
+      } catch (e) { toast(errText(e), 'err'); }
     } },
   ];
 }
@@ -6951,6 +7254,12 @@ function openServerModal({ id, keyId, prefill } = {}) {
   // every edit - a rename too - and the backend erased it.
   state._editingSavedPw = !!(srv && srv.hasSavedPassword);
   state._clearSavedPw = false;
+  // The account a saved password belongs to, as saved.
+  state._editingAccount = srv ? {
+    host: String(srv.host || '').trim(), port: Number(srv.port) || 22,
+    username: String(srv.username || '').trim(), authMethod: srv.authMethod,
+  } : null;
+  showFieldMessage('srvPwMsg', '');
   paintSavedPasswordRow();
   showFieldMessage('srvPortMsg', '');
   el('srvPort').removeAttribute('aria-invalid');
@@ -6975,23 +7284,31 @@ function closeServerModal() {
   state._pendingServerCategory = null;
   state._editingSavedPw = false;
   state._clearSavedPw = false;
+  state._editingAccount = null;
   // A typed server password does not stay behind in a hidden field.
   el('srvPassword').value = '';
+  showFieldMessage('srvPwMsg', '');
 }
 
 /// The password row says what Save will do with a saved password (A5-03): a
 /// server that has one gets "A password is saved - leave blank to keep it"
 /// and a Remove toggle, and a typed password replaces it; the "Save password"
-/// switch is for servers that have none.
+/// switch is for servers that have none. A saved password belongs to its
+/// server and account: once the host, the port, the user name or the sign-in
+/// method differs from the saved ones, the row says the password is needed
+/// again - the moment the field changes - and Save asks for it
+/// (serverNeedsPasswordAgain; the backend refuses such a save as well).
 function paintSavedPasswordRow() {
   const saved = !!state._editingSavedPw;
   const clearing = saved && !!state._clearSavedPw;
+  const again = serverNeedsPasswordAgain();
   // The hint is the field's accessible description (aria-describedby), and a
   // hidden element still describes: it is empty whenever it is hidden, or a
-  // new server's field was announced as having a saved password (fix round 1).
+  // new server's field was announced as having a saved password.
   const hint = el('srvPwSavedHint');
   hint.hidden = !saved;
-  hint.textContent = !saved ? '' : (clearing ? 'The saved password is removed when you save.' : 'A password is saved - leave blank to keep it.');
+  hint.textContent = !saved ? '' : clearing ? 'The saved password is removed when you save.'
+    : again ? SERVER_PASSWORD_AGAIN : 'A password is saved - leave blank to keep it.';
   const remove = el('srvClearPwBtn');
   remove.hidden = !saved;
   remove.setAttribute('aria-pressed', clearing ? 'true' : 'false');
@@ -6999,7 +7316,30 @@ function paintSavedPasswordRow() {
   const pw = el('srvPassword');
   pw.disabled = clearing;
   if (clearing) pw.value = '';
-  pw.placeholder = saved ? 'Type a new password to replace it' : 'Leave blank to type it when you connect';
+  pw.placeholder = !saved ? 'Leave blank to type it when you connect'
+    : again ? 'The password for the changed server or account' : 'Type a new password to replace it';
+  if (!again || clearing) showFieldMessage('srvPwMsg', '');
+}
+
+/// What the password row says once the saved password no longer fits.
+const SERVER_PASSWORD_AGAIN = 'A changed server needs its password again - type it below, or remove the saved password.';
+/// The backend's own refusal of such a save (server_save), used for the
+/// same check here so the two read alike.
+const SERVER_PASSWORD_REFUSAL = 'Enter the password for the new server or account.';
+
+/// An edited server with a saved password, kept (not removed), signing in
+/// with a password, whose host, port, user name or sign-in method differs
+/// from the saved one (password <-> keyboard-interactive included): the saved
+/// password is not sent to the changed one, so it is needed again. A port that
+/// cannot be read counts as changed.
+function serverNeedsPasswordAgain() {
+  const was = state._editingAccount;
+  if (!was || !state._editingSavedPw || state._clearSavedPw) return false;
+  const method = state.connectAuthMethod;
+  if (method === 'publickey') return false; // key login sends no password
+  const port = serverPortFrom(el('srvPort').value).port;
+  return el('srvHost').value.trim() !== was.host || port !== was.port
+    || el('srvUser').value.trim() !== was.username || method !== was.authMethod;
 }
 
 /// The port as typed (A2-39 / A5-30): a whole number from 1 to 65535, blank
@@ -7025,6 +7365,7 @@ function setConnectAuthMethod(method) {
   }
   el('srvKeyRow').hidden = method !== 'publickey';
   el('srvPwRow').hidden = method === 'publickey';
+  paintSavedPasswordRow(); // another sign-in method can need the password again
 }
 
 async function submitServerModal() {
@@ -7052,9 +7393,16 @@ async function submitServerModal() {
   const hadSaved = !!state._editingSavedPw;
   const clearSaved = hadSaved && !!state._clearSavedPw;
   const typed = el('srvPassword').value;
+  // The saved password does not go to a changed server or account: asked
+  // for here, at its field, before anything is sent.
+  if (!typed && serverNeedsPasswordAgain()) {
+    showFieldMessage('srvPwMsg', SERVER_PASSWORD_REFUSAL);
+    el('srvPassword').focus();
+    return;
+  }
   // savedPassword is a password to store - a server with one saved replaces it
   // with what is typed; one with none stores it only with "Save password" on -
-  // and null otherwise, which KEEPS a stored one (RU4). Removing it is
+  // and null otherwise, which KEEPS a stored one (A2-04). Removing it is
   // clearSavedPassword. Key login needs none: the backend drops it.
   const savedPassword = method === 'publickey' || clearSaved ? null
     : (typed && (hadSaved || el('srvSavePw').checked) ? typed : null);
@@ -7078,7 +7426,7 @@ async function submitServerModal() {
       if (r && r.id) selectServer(r.id);
       toast(hadSaved && method === 'publickey' ? 'Server saved - its saved password was removed (key login uses none).'
         : clearSaved ? 'Server saved - its saved password was removed.' : 'Server saved.', 'ok');
-    } catch (e) { toast(e.message || String(e), 'err'); }
+    } catch (e) { toast(errText(e), 'err'); }
   });
 }
 
@@ -7334,8 +7682,7 @@ async function testSelectedServer(srv) {
   if (!srv) return;
   // One test at a time (A2-18), known before any password is asked for: the
   // header button's busy state was the only guard, and a row's test that met
-  // it after its prompt dropped the typed password without a word (fix
-  // round 2).
+  // it after its prompt dropped the typed password without a word.
   if (serverTestRunning) {
     toast('A connection test is already running.', 'info');
     return;
@@ -7370,8 +7717,8 @@ async function runServerTest(srv) {
       const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
       toast(`Connection to ${srv.name || srv.host} succeeded${ms}.`, 'ok');
     } catch (e) {
-      // The backend's own words, as they are (RU4).
-      toast(e.message || String(e), 'err');
+      // The backend's own words, as they are.
+      toast(errText(e), 'err');
     }
   });
 }
@@ -7487,9 +7834,9 @@ async function connectTab(tab, srv, { fresh, beforeConnect } = {}) {
     if (!ours()) return;
     tab.connecting = false;
     tab.ended = true;
-    // The backend's words as they are (RU4): a host-key mismatch, a declined
+    // The backend's words as they are: a host-key mismatch, a declined
     // key, a timeout - "Failed: " in front of them added nothing.
-    const msg = (e && e.message) || String(e);
+    const msg = errText(e);
     setTabStatus(tab.tabId, msg);
     toast(msg, 'err');
   }
@@ -7518,7 +7865,7 @@ function cancelActiveConnect() {
 /// The session terminal.js holds open for a tab - the one a disconnect must
 /// end. tab.sessionId is app.js's copy, set when a connect completes and
 /// cleared when the session ends; whatever ends a session asks terminal.js,
-/// so a copy that ever lags behind (fix round 1: a cancelled restart) cannot
+/// so a copy that ever lags behind (a cancelled restart) cannot
 /// leave a live shell nobody can close.
 function liveSessionId(tabId) {
   const rec = typeof window.tabRecord === 'function' ? window.tabRecord(tabId) : null;
@@ -7585,7 +7932,7 @@ async function reconnectActiveTab() {
     // every file action failed (A3-13). But only once the password is in hand
     // (connectTab runs this right before the connect): ended before the
     // prompt, a restart cancelled there left the session open with the tab
-    // calling it gone, and Disconnect sent no id (fix round 1).
+    // calling it gone, and Disconnect sent no id.
     beforeConnect = () => {
       if (window.tabSessionLive(tab.tabId) && typeof window.onSessionClosed === 'function') window.onSessionClosed(tab.tabId);
     };
@@ -7872,7 +8219,7 @@ async function loadAppInfo() {
   });
   window.addEventListener('unhandledrejection', (ev) => {
     const r = ev.reason;
-    window.__bootErrors.push('unhandled rejection: ' + (r && r.message ? r.message : String(r)));
+    window.__bootErrors.push('unhandled rejection: ' + errText(r));
   });
 
   injectIcons();
@@ -7887,8 +8234,8 @@ async function loadAppInfo() {
   try {
     wire();
   } catch (e) {
-    window.__bootErrors.push('wire() threw: ' + (e.stack || e.message || String(e)));
-    toast('UI init failed: ' + e.message, 'err');
+    window.__bootErrors.push('wire() threw: ' + (e.stack || errText(e)));
+    toast('UI init failed: ' + errText(e), 'err');
     throw e;
   }
   onGenTypeChange();
@@ -7928,7 +8275,7 @@ async function loadAppInfo() {
   try {
     await refreshVaultStatus();
   } catch (e) {
-    const msg = (e && e.message) || String(e);
+    const msg = errText(e);
     window.__bootErrors.push('first vault refresh failed: ' + msg);
     toast(msg, 'err');
   }
@@ -7953,5 +8300,5 @@ async function loadAppInfo() {
     refreshVaultStatus(true).catch(() => {});
   }, 10000);
 })().catch((e) => {
-  toast(e.message || String(e), 'err');
+  toast(errText(e), 'err');
 });

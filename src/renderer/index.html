@@ -104,11 +104,15 @@
               <label class="select-all"><input type="checkbox" id="selectAllKeys" /><span id="selectAllLabel">Select all</span></label>
             </div>
             <div class="key-list" id="keyList"></div>
+            <!-- No keys to show: the first-run card, or - while the vault is
+                 locked or there is none yet - what to do first
+                 (paintEmptyKeys, app.js). -->
             <div class="empty-state" id="emptyState" hidden>
               <div class="empty-ico" data-ico="key-round"></div>
-              <h3>No keys yet</h3>
-              <p>Generate or import your first SSH key pair.</p>
+              <h3 id="emptyTitle">No keys yet</h3>
+              <p id="emptyText">Generate or import your first SSH key pair.</p>
               <button id="emptyNewBtn" class="ghost-btn">+ New key</button>
+              <button id="emptyUnlockBtn" class="primary-btn" hidden>Unlock</button>
             </div>
             <!-- Selection acts here, where the selection is. Deploy used to be a
                  separate top-level view whose own copy read "select keys using
@@ -222,7 +226,7 @@
                      task, not two modes. -->
                 <!-- Every label is a .btn-label: in a narrow header the buttons
                      show their icons only, the label still their name and the
-                     title a tooltip (fix round 1 - they used to be clipped). -->
+                     title a tooltip (they used to be clipped). -->
                 <div class="seg mode-seg" id="termModeSeg" hidden role="tablist" aria-label="Session surface">
                   <button type="button" class="seg-btn active" data-mode="ssh" role="tab" aria-selected="true" aria-controls="sessionSurface" tabindex="0" title="Terminal only (Ctrl+Shift+1)"><span data-ico="terminal"></span><span class="btn-label">Shell</span></button>
                   <button type="button" class="seg-btn" data-mode="sftp" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="File browser only (Ctrl+Shift+2)"><span data-ico="folder-tree"></span><span class="btn-label">Files</span></button>
@@ -791,6 +795,17 @@
           <div class="hint deploy-paths">
             <p>Key files go to <code id="deployDirHint">&hellip;</code>, readable by you only:</p>
             <ul class="deploy-plan" id="deployPlan" hidden></ul>
+            <!-- What the backend's plan warns about, and the Host lines of
+                 the user's own ~/.ssh/config that name these hosts (SSHSpan
+                 never edits that file). Filled with text only. -->
+            <div class="deploy-notes" id="deployWarnings" hidden>
+              <p class="deploy-notes-head">Check before you deploy:</p>
+              <ul id="deployWarningList"></ul>
+            </div>
+            <div class="deploy-notes" id="deployLegacy" hidden>
+              <p class="deploy-notes-head">Host lines in your own ssh config that name these hosts:</p>
+              <ul id="deployLegacyList"></ul>
+            </div>
             <p>Host blocks go in SSHSpan's own config file <code id="sshConfigHint">&hellip;</code>.
               ssh reads it only through an Include line: put this line at the top of
               ~/.ssh/config, before any Host block.</p>
@@ -908,10 +923,13 @@
           </div>
           <div class="span-2 pw-row" id="srvPwRow" hidden>
             <label>Password (optional)
-              <input type="password" id="srvPassword" placeholder="Leave blank to type it when you connect" autocomplete="off" aria-describedby="srvPwSavedHint" />
+              <input type="password" id="srvPassword" placeholder="Leave blank to type it when you connect" autocomplete="off" aria-describedby="srvPwSavedHint srvPwMsg" />
             </label>
-            <!-- A saved password is kept unless replaced or removed (A5-03). -->
+            <!-- A saved password is kept unless replaced or removed (A5-03) -
+                 and only for its own server and account: a changed host, port,
+                 user or sign-in method needs it again. -->
             <p class="hint" id="srvPwSavedHint" hidden></p>
+            <p class="field-error" id="srvPwMsg" role="alert" hidden></p>
             <button type="button" class="ghost-btn" id="srvClearPwBtn" aria-pressed="false" hidden>Remove saved password</button>
             <label class="toggle-chip" id="srvSavePwChip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
           </div>

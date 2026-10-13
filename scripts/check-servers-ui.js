@@ -478,6 +478,60 @@ async function scenarioSavedPassword(browser, server) {
   });
 }
 
+/// A saved password belongs to the server and account it was saved for: an
+/// edit that changes the host, the port, the user name or the sign-in method
+/// needs the password again (or its removal) - said in the form the moment
+/// one changes, and Save asks for it before anything is sent.
+async function scenarioServerRetarget(browser, server) {
+  const NEEDS = 'A changed server needs its password again';
+  const REFUSAL = 'Enter the password for the new server or account.';
+  const servers = [SAVED_PW_SERVER('s2', 'legacy-box')];
+  await withApp(browser, server, { servers }, 'S1 a changed server needs its password again', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    const hint = () => page.evaluate(() => { const h = el('srvPwSavedHint'); return h.hidden ? '' : h.textContent; });
+    const pwMsg = () => page.evaluate(() => { const m = el('srvPwMsg'); return m && !m.hidden ? m.textContent : ''; });
+    await page.evaluate(() => openServerModal({ id: 's2' }));
+    yes('(set-up) unchanged, blank keeps the saved password', /leave blank to keep it/.test(await hint()), await hint());
+    await setValue(page, '#srvName', 'renamed-box');
+    yes('a rename keeps it', /leave blank to keep it/.test(await hint()), await hint());
+    for (const [field, value, back] of [['#srvHost', '10.9.9.9', '10.0.0.2'], ['#srvPort', '2222', '22'], ['#srvUser', 'admin', 'root']]) {
+      await setValue(page, field, value);
+      yes(`changing ${field} says at once that the password is needed again`, (await hint()).startsWith(NEEDS), await hint());
+      await setValue(page, field, back);
+      yes(`and back to the saved ${field} it is kept again`, /leave blank to keep it/.test(await hint()), await hint());
+    }
+    await page.click('#serverModal .seg-btn[data-auth="keyboard-interactive"]');
+    yes('so does another sign-in method (password -> keyboard-interactive)', (await hint()).startsWith(NEEDS), await hint());
+    await page.click('#serverModal .seg-btn[data-auth="password"]');
+    await setValue(page, '#srvHost', '10.9.9.9');
+    check('Save without the password sends nothing', await saveServerForm(app), null);
+    check('and says why at the password field, in the backend\'s words', await pwMsg(), REFUSAL);
+    check('with the focus there', await page.evaluate(() => document.activeElement && document.activeElement.id), 'srvPassword');
+    await setValue(page, '#srvPassword', 'new-host-pw');
+    check('the message goes as the password is typed', await pwMsg(), '');
+    const sent = await saveServerForm(app);
+    check('typed, it is saved for the new host', sent && [sent.host, sent.savedPassword, sent.clearSavedPassword], ['10.9.9.9', 'new-host-pw', false]);
+
+    await page.evaluate(() => openServerModal({ id: 's2' }));
+    await setValue(page, '#srvUser', 'admin');
+    await page.click('#srvClearPwBtn');
+    yes('removing the saved password instead is fine too', !(await hint()).startsWith(NEEDS), await hint());
+    const cleared = await saveServerForm(app);
+    check('and Save sends the removal', cleared && [cleared.username, cleared.savedPassword, cleared.clearSavedPassword], ['admin', null, true]);
+
+    // The backend's refusal, should one come anyway (another save moved the
+    // server meanwhile), is shown as it is.
+    await page.evaluate((m) => { window.__replies.server_save = { $reject: m }; }, REFUSAL);
+    await page.evaluate(() => openServerModal({ id: 's2' }));
+    await setValue(page, '#srvName', 'only-a-rename');
+    await saveServerForm(app);
+    await page.waitForTimeout(100);
+    yes('the backend\'s refusal is shown as it is', (await liveToasts(page)).includes(REFUSAL), JSON.stringify(await liveToasts(page)));
+    check('no page errors', app.errors, []);
+  });
+}
+
 async function scenarioPort(browser, server) {
   await withApp(browser, server, {}, 'A2-39 / A5-30 the port is checked in the form', async (app) => {
     const { page } = app;
@@ -1452,13 +1506,45 @@ async function scenarioManualLock(browser, server) {
     check('no page errors', app.errors, []);
   });
 
+  // The tray locks the vault itself and then tells the page: the page follows
+  // and asks nothing - calling vault_lock again wrote a second audit row.
   await withApp(browser, server, {}, 'A5-09 the tray lock does not wait for an answer', async (app) => {
     const { page } = app;
     await openLiveTab(app);
     await page.waitForTimeout(150);
-    await page.evaluate(() => window.__emit('vault-lock-requested', null));
+    await page.evaluate(() => { window.__backend.unlocked = false; window.__emit('vault-lock-requested', null); });
     await page.waitForTimeout(250);
-    check('A5-09 a lock from the tray (the window may be hidden) locks at once', [await app.open('confirmModal'), await app.count('vault_lock')], [false, 1]);
+    check('A5-09 a lock from the tray (the window may be hidden) is followed at once, unasked',
+      [await app.open('confirmModal'), await page.evaluate(() => state.unlocked), await page.evaluate(() => state.sessions.size)], [false, false, 0]);
+    check('and the page does not lock the locked vault again', await app.count('vault_lock'), 0);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { unlocked: false }, 'Ctrl+L while locked', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(150);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    const before = await liveToasts(page);
+    await page.keyboard.press('Control+l');
+    await page.waitForTimeout(200);
+    check('Ctrl+L while locked does nothing: no vault_lock, no "Vault locked." toast',
+      [await app.count('vault_lock'), (await liveToasts(page)).filter((t) => !before.includes(t))], [0, []]);
+    await page.evaluate(() => lockNow());
+    await page.waitForTimeout(150);
+    check('nor does any other lock of a locked vault (the idle timer\'s lockNow)', await app.count('vault_lock'), 0);
+    check('Lock now is lock-gated while locked', await page.evaluate(() => [el('lockBtn').disabled, el('lockBtn').title]),
+      [true, 'The vault is already locked.']);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { replies: { vault_lock: { ok: true, alreadyLocked: true } } }, 'a lock the tray beat', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(150);
+    await page.evaluate(() => { window.__backend.unlocked = false; });
+    await page.keyboard.press('Control+l');
+    await page.waitForTimeout(250);
+    check('alreadyLocked from vault_lock is no error: the page shows the vault locked',
+      [await page.evaluate(() => state.unlocked), (await liveToasts(page)).some((t) => /error|failed/i.test(t))], [false, false]);
     check('no page errors', app.errors, []);
   });
 }
@@ -1710,6 +1796,231 @@ async function scenarioBwSync(browser, server) {
     await page.waitForTimeout(250);
     check('nothing to do reads as such', (await bwStatus(page)).text, 'Nothing to sync.');
     yes('and is complete', (await liveToasts(page)).includes('Sync complete.'), JSON.stringify(await liveToasts(page)));
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── Bitwarden: the last result, the approval token, the lock gates ─────────
+
+async function scenarioBwLastResult(browser, server) {
+  const cfg = (lastResult) => Object.assign({}, BW_CONFIG, { last_sync: '2026-10-12T08:30:00Z', last_result: lastResult });
+  const STOPPED = { ok: false, aborted: 'Vault was locked; sync aborted.', pushed: 1, errors: [] };
+  await withApp(browser, server, { replies: { bitwarden_get_config: cfg(STOPPED) } }, 'the last run stopped part-way', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const st = await bwStatus(page);
+    check('a last run that stopped says so, with its reason, as an error',
+      [st.text, /\berr\b/.test(st.cls)], ['Last sync stopped: Vault was locked; sync aborted.', true]);
+    check('no page errors', app.errors, []);
+  });
+  const ERRORS = { ok: true, pushed: 2, errors: [{ name: 'alpha', error: 'could not decrypt the item\'s name' }, { server: 'web-1', error: 'push failed' }] };
+  await withApp(browser, server, { replies: { bitwarden_get_config: cfg(ERRORS) } }, 'the last run had errors', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const st = await bwStatus(page);
+    yes('a last run with errors counts them, as a warning', /2 errors/.test(st.text) && /\bwarn\b/.test(st.cls), JSON.stringify(st));
+    yes('and still says when it ran', st.text.startsWith('Last synced: '), st.text);
+    check('its errors are listed', await page.evaluate(() => [...document.querySelectorAll('#bwErrors li')].map((li) => li.textContent)),
+      ['alpha: could not decrypt the item\'s name', 'web-1: push failed']);
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { replies: { bitwarden_get_config: cfg({ ok: true, pushed: 1, errors: [] }) } }, 'the last run was clean', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const st = await bwStatus(page);
+    yes('a clean last run reads "Last synced"', st.text.startsWith('Last synced: ') && !/error/.test(st.text), JSON.stringify(st));
+    check('with no error list', await page.evaluate(() => document.getElementById('bwErrors').hidden), true);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioBwApproval(browser, server) {
+  const LIST = (token, name) => ({
+    ok: true, errors: [], skippedServerOverwrites: 1, approvalToken: token,
+    pendingServers: [{ kind: 'overwrite', name, incomingName: name, host: '10.0.0.9', port: 22, localHost: '10.0.0.1', localPort: 22,
+      changes: ['name', 'host', 'category'] }],
+    pendingKeys: [],
+  });
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'S4 an approval carries the token of the list it approves', async (app) => {
+    const { page } = app;
+    await page.evaluate(({ first, second }) => {
+      let n = 0;
+      window.__replies.bitwarden_sync = (a) => {
+        n += 1;
+        if (!a.allowRemoteOverwrite) return first;
+        // The list changed between the question and the Apply: nothing is
+        // applied, the new list and its token come back (approvalStale).
+        if (a.approvalToken === 'tok-1') return Object.assign({}, second, { approvalStale: true });
+        if (a.approvalToken === 'tok-2') return { ok: true, serversPulled: 1, errors: [] };
+        return { ok: true, errors: [] };
+      };
+    }, { first: LIST('tok-1', 'web-1'), second: LIST('tok-2', 'web-2') });
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    yes('(set-up) the approval is asked', await waitVisible(page, '#confirmModal', 1500));
+    const list1 = await page.evaluate(() => (document.querySelector('#confirmModal .bw-pending') || {}).textContent || '');
+    yes('S6 the changes name a rename and a new category too', /changes: name, host, host category/.test(list1), list1);
+    await answerConfirm(page, 'ok');
+    yes('S4 a list that changed meanwhile is shown again, and asked again', await waitVisible(page, '#confirmModal', 1500));
+    const list2 = await page.evaluate(() => (document.querySelector('#confirmModal .bw-pending') || {}).textContent || '');
+    yes('with the new list', /web-2/.test(list2) && !/web-1/.test(list2), list2);
+    const msg2 = await page.textContent('#confirmMessage');
+    yes('saying the list changed', /changed/i.test(msg2), msg2);
+    await answerConfirm(page, 'ok');
+    await page.waitForTimeout(250);
+    check('S4 each Apply sends back the token of exactly the list it showed',
+      (await app.calls('bitwarden_sync')).map((c) => [c.args.allowRemoteOverwrite, c.args.approvalToken || null]),
+      [[false, null], [true, 'tok-1'], [true, 'tok-2']]);
+    yes('the applied run is reported', /1 pulled/.test((await bwStatus(page)).text), (await bwStatus(page)).text);
+    check('no page errors', app.errors, []);
+  });
+
+  // Every Apply meets another list (approvalStale each time): asked three
+  // times, then said - nothing from Bitwarden was applied - where it used to
+  // read "Sync complete.".
+  const KEPT_CHANGING = 'The changes in Bitwarden changed each time you applied them, so nothing from Bitwarden was applied - sync again to review them.';
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'S4 a list that changes at every Apply', async (app) => {
+    const { page } = app;
+    await page.evaluate((list) => {
+      let n = 0;
+      window.__replies.bitwarden_sync = (a) => {
+        n += 1;
+        const entry = Object.assign({}, list.pendingServers[0], { name: 'web-' + n, incomingName: 'web-' + n });
+        return Object.assign({}, list, { approvalToken: 'tok-' + n, pendingServers: [entry] }, a.allowRemoteOverwrite ? { approvalStale: true } : {});
+      };
+    }, LIST('tok-0', 'web-0'));
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    let asked = 0;
+    while (asked < 5 && await waitVisible(page, '#confirmModal', 1500)) {
+      asked += 1;
+      await answerConfirm(page, 'ok');
+    }
+    await page.waitForTimeout(250);
+    check('asked three times, each Apply with the token of the list it showed, then no more',
+      [asked, (await app.calls('bitwarden_sync')).map((c) => [c.args.allowRemoteOverwrite, c.args.approvalToken || null])],
+      [3, [[false, null], [true, 'tok-1'], [true, 'tok-2'], [true, 'tok-3']]]);
+    const st = await bwStatus(page);
+    yes('then it says nothing from Bitwarden was applied, as a warning', st.text.includes(KEPT_CHANGING) && /\bwarn\b/.test(st.cls), JSON.stringify(st));
+    const said = await liveToasts(page);
+    yes('and its toast says so, not "Sync complete."', said.includes(KEPT_CHANGING) && !said.includes('Sync complete.'), JSON.stringify(said));
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'S4 a changed list declined', async (app) => {
+    const { page } = app;
+    await page.evaluate((list) => {
+      let n = 0;
+      window.__replies.bitwarden_sync = (a) => {
+        n += 1;
+        return Object.assign({}, list, { approvalToken: 'tok-' + n }, a.allowRemoteOverwrite ? { approvalStale: true } : {});
+      };
+    }, LIST('tok-0', 'web-1'));
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    yes('(set-up) the approval is asked', await waitVisible(page, '#confirmModal', 1500));
+    await answerConfirm(page, 'ok');
+    yes('(set-up) the changed list is asked about', await waitVisible(page, '#confirmModal', 1500));
+    await answerConfirm(page, 'cancel');
+    await page.waitForTimeout(250);
+    const st = await bwStatus(page);
+    yes('declining the changed list is a plain decline: not said to have kept changing',
+      !st.text.includes(KEPT_CHANGING) && /Not applied/.test(st.text), JSON.stringify(st));
+    check('no page errors', app.errors, []);
+  });
+
+  // A name that is blank after cleaning (U+2800 shows as nothing) reads
+  // "(blank name)" with its characters spelled out - never as nothing at all.
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'I3 a Bitwarden name that shows nothing', async (app) => {
+    const { page } = app;
+    await page.evaluate((list) => {
+      window.__replies.bitwarden_sync = (a) => (a.allowRemoteOverwrite ? { ok: true, errors: [] } : list);
+    }, LIST('tok-1', '\u{2800}\u{2800}\u{2800}'));
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    yes('(set-up) the approval is asked', await waitVisible(page, '#confirmModal', 1500));
+    const entry = await page.evaluate(() => ([...document.querySelectorAll('#confirmModal .bw-pending li')][0] || {}).textContent || '');
+    yes('I3 a name blank after cleaning reads "(blank name)" with its characters spelled out',
+      entry.startsWith('(blank name) <U+2800><U+2800><U+2800>: '), entry);
+    await answerConfirm(page, 'cancel');
+    // MUSICAL SYMBOL NULL NOTEHEAD shows as nothing too.
+    check('I3 so does a name of U+1D159', await page.evaluate(() => bwName('\u{1D159}\u{1D159}')), '(blank name) <U+1D159><U+1D159>');
+    check('no page errors', app.errors, []);
+  });
+  // The "Renamed:" part of the status line names items as the list does.
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'I3 a blank name in the Renamed line', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      window.__replies.bitwarden_sync = { ok: true, pulled: 1, errors: [], renamed: [{ name: '\u{2800}\u{2800}', storedAs: 'web' }] };
+    });
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    await page.waitForTimeout(250);
+    const st = (await bwStatus(page)).text.replace(/[\u{2068}\u{2069}]/gu, '');
+    yes('I3 a blank name in the Renamed line reads "(blank name)" spelled out', st.includes('Renamed: (blank name) <U+2800><U+2800> stored as web.'), st);
+    check('no page errors', app.errors, []);
+  });
+
+  const REFUSED = 'Too many changes to review at once (612) - nothing from Bitwarden was applied. SSHSpan can show at most 500 server and 500 key changes for approval: bring the new or changed items in Bitwarden below that, then sync again.';
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'S4 a list too long to review cannot be approved', async (app) => {
+    const { page } = app;
+    await page.evaluate((m) => {
+      window.__replies.bitwarden_sync = () => ({ ok: true, errors: [], skippedServerOverwrites: 612, pendingTruncated: true,
+        pendingServers: [{ kind: 'overwrite', name: 'web-1', incomingName: 'web-1', host: 'h', port: 22, localHost: 'h0', localPort: 22, changes: ['host'] }],
+        pendingKeys: [], approvalRefused: m });
+    }, REFUSED);
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    await page.waitForTimeout(300);
+    check('no Apply question is offered', await app.open('confirmModal'), false);
+    const st = await bwStatus(page);
+    yes('the refusal is said as the backend words it', st.text.includes(REFUSED) && /\bwarn\b|\berr\b/.test(st.cls), JSON.stringify(st));
+    check('and nothing is sent to apply', (await app.calls('bitwarden_sync')).map((c) => !!c.args.allowRemoteOverwrite), [false]);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioSettingsLockGates(browser, server) {
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'A6-08 settings buttons that need the vault', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const read = () => page.evaluate(() => ['bwSaveBtn', 'bwTestBtn', 'bwSyncNowBtn', 'backupExportBtn', 'backupImportBtn', 'lockBtn']
+      .map((id) => [id, el(id).disabled, el(id).disabled ? el(id).title : '']));
+    check('unlocked: all of them work', (await read()).map(([id, d]) => [id, d]),
+      [['bwSaveBtn', false], ['bwTestBtn', false], ['bwSyncNowBtn', false], ['backupExportBtn', false], ['backupImportBtn', false], ['lockBtn', false]]);
+    await page.evaluate(() => { window.__backend.unlocked = false; return refreshVaultStatus(); });
+    await page.waitForTimeout(150);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    check('locked: each is disabled and says why', await read(), [
+      ['bwSaveBtn', true, 'Unlock the vault to save, test or run the Bitwarden sync.'],
+      ['bwTestBtn', true, 'Unlock the vault to save, test or run the Bitwarden sync.'],
+      ['bwSyncNowBtn', true, 'Unlock the vault to save, test or run the Bitwarden sync.'],
+      ['backupExportBtn', true, 'Unlock the vault to create or restore a backup.'],
+      ['backupImportBtn', true, 'Unlock the vault to create or restore a backup.'],
+      ['lockBtn', true, 'The vault is already locked.'],
+    ]);
+    await page.evaluate(() => { window.__backend.unlocked = true; return refreshVaultStatus(); });
+    await page.waitForTimeout(150);
+    check('unlocked again: they work again', (await read()).map(([, d]) => d), [false, false, false, false, false, false]);
+    check('no page errors', app.errors, []);
+  });
+  // With no vault at all there is nothing locked - and nothing to lock.
+  await withApp(browser, server, { hasVault: false, unlocked: false }, 'Lock now with no vault yet', async (app) => {
+    const { page } = app;
+    await page.waitForTimeout(150);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    check('with no vault yet, Lock now says there is no vault to lock', await page.evaluate(() => [el('lockBtn').disabled, el('lockBtn').title]),
+      [true, 'There is no vault to lock yet.']);
+    check('no page errors', app.errors, []);
+  });
+
+  const W = 'The sync settings were saved, but their audit row could not be written: disk I/O error';
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG, bitwarden_save_config: { ok: true, warning: W } } }, 'B1 the sync settings saved without their audit row', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    await page.click('#bwSaveBtn');
+    await page.waitForTimeout(200);
+    yes('the warning is shown as it is', (await liveToasts(page)).includes(W), JSON.stringify(await liveToasts(page)));
+    check('once: the save did happen', await app.count('bitwarden_save_config'), 1);
     check('no page errors', app.errors, []);
   });
 }
@@ -2721,6 +3032,10 @@ const SCENARIOS = [
   ['JU6b item 10: Bitwarden approval names (JU5 F6)', scenarioBwPendingNames],
   ['JU6b item 11: the host category survives a reload from Keys', scenarioHostScopeReload],
   ['JU6b fix round 2: Bitwarden names in the status line', scenarioBwStatusNames],
+  ['server retarget: a changed server needs its password again (S1)', scenarioServerRetarget],
+  ['bitwarden last result: the status line after a stopped or failed run', scenarioBwLastResult],
+  ['bitwarden approval: the token, a changed list, a list too long (S4 S6)', scenarioBwApproval],
+  ['settings lock gates: Bitwarden, backup and Lock now (A6-08 B1)', scenarioSettingsLockGates],
 ];
 
 (async () => {

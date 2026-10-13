@@ -1274,6 +1274,38 @@ const STATIC = [
     const ipc = run('check-ipc-args.js');
     const sites = Number((ipc.out.match(/Checked (\d+) call sites/) || [])[1] || 0);
     check('A8-17 the IPC check counts the assistant\'s aiCall sites too, and passes', [ipc.code, sites >= 133], [0, true]);
+    check('the IPC check reads every call site: none is left unchecked', /NOT checked/.test(ipc.out), false);
+    // Comments with internal labels, dead exports and helpers that came back,
+    // stale notes, hand-made error texts (scripts/check-renderer-hygiene.js).
+    const hygiene = run('check-renderer-hygiene.js');
+    check('the renderer hygiene check passes', [hygiene.code, hygiene.code ? hygiene.out.split('\n').filter((l) => /^\s+src\//.test(l)).slice(0, 8) : []], [0, []]);
+  }],
+  ['one error text and one path join', () => {
+    const app = read('app.js');
+    const fn = (name) => {
+      const m = app.match(new RegExp('\\nfunction ' + name + '\\([\\s\\S]*?\\n}\\n'));
+      // eslint-disable-next-line no-new-func
+      return m ? new Function(m[0] + '; return ' + name + ';')() : null;
+    };
+    const errText = fn('errText');
+    check('errText: an Error, a backend string, an { error } object, a { message } object', errText
+      ? [errText(new Error('Vault is locked.')), errText('Session is closing.'), errText({ error: 'No such file' }), errText({ message: 'Timed out.' })]
+      : 'no errText in app.js', ['Vault is locked.', 'Session is closing.', 'No such file', 'Timed out.']);
+    // Anything else: a short text of its own - never "[object Object]", never
+    // "null", never a throw (a null-prototype object, a throwing getter).
+    const odd = [null, undefined, '', '   ', {}, [], { message: { nested: 1 } }, { error: 42 }, Object.create(null), new Error(''),
+      { get message() { throw new Error('getter'); } }, new Proxy({}, { get() { throw new Error('trap'); } })];
+    const said = errText ? odd.map((e) => { try { return errText(e); } catch (x) { return 'THREW ' + x.message; } }) : ['no errText in app.js'];
+    check('I4 errText of anything else is a short text - never "[object Object]", "null" or a throw',
+      said.filter((t) => typeof t !== 'string' || !t.trim() || /object Object|THREW|^null$|^undefined$/.test(t) || t.length > 80), []);
+    const join = fn('joinPlatformPath');
+    check('joinPlatformPath joins with the separator the path itself uses', join ? [
+      join('C:\\Users\\u', 'x.txt'), join('C:\\', 'x.txt'), join('/home/u', 'x.txt'), join('/', 'x.txt'),
+      join('/home/we\\ird', 'x.txt'), join('C:\\Users\\u/Documents', 'x.txt'), join('\\\\host\\share', 'x.txt'),
+    ] : 'no joinPlatformPath in app.js', [
+      'C:\\Users\\u\\x.txt', 'C:\\x.txt', '/home/u/x.txt', '/x.txt',
+      '/home/we\\ird/x.txt', 'C:\\Users\\u/Documents/x.txt', '\\\\host\\share\\x.txt',
+    ]);
   }],
 ];
 
