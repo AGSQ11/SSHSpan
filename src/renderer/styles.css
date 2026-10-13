@@ -708,6 +708,15 @@ label.toggle-chip,
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
 /* A Bitwarden sync's failed items, under its status line. */
+/* The changes a Bitwarden sync waits to apply, listed under its question
+   (app.js bwPendingList): one entry each, every value in a <bdi>. */
+.bw-pending { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--text-dim); }
+.bw-pending .bw-pending-head { margin: 4px 0 0; font-weight: 600; color: var(--text); }
+.bw-pending ul { margin: 0; padding-left: 18px; }
+.bw-pending li { overflow-wrap: anywhere; }
+.bw-pending bdi { color: var(--text); }
+.bw-pending .bw-pending-note { margin: 4px 0 0; color: var(--warn); }
+
 .bw-errors {
   margin: 6px 0 0; padding: 8px 12px 8px 28px;
   max-height: 180px; overflow-y: auto;
@@ -1031,7 +1040,6 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 .cat-node.dragging { opacity: 0.4; }
 /* Keyboard focus (A1-11): inside the scrolling tree, so the ring sits inside. */
 .cat-node:focus-visible, .cat-chevron:focus-visible, .cat-actions-btn:focus-visible { outline-offset: -2px; }
-.cat-node[draggable="true"] { -webkit-user-drag: element; }
 
 .cat-chevron {
   appearance: none; background: transparent; border: 0; padding: 0; font: inherit;
@@ -1682,15 +1690,23 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 .term-tab-add svg { width: 14px; height: 14px; }
 
 .terminal-body { display: flex; flex: 1; min-height: 0; flex-direction: column; }
-.sftp-body { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
+/* The file surface never scrolls sideways (A1-02): everything in it shrinks
+   to its width - the listing scrolls inside its own pane instead. */
+.sftp-body { display: none; flex: 1; min-height: 0; min-width: 0; overflow: auto; flex-direction: column; }
 .sftp-body.visible { display: flex; }
+/* Scrolls up and down itself only when even the list's floor (.sftp-pane)
+   does not fit - a tiny window in Split - instead of the list running over
+   the status bar and the transfer panel below it. */
 .sftp-panel {
-  padding: 10px 12px;
+  padding: 8px 12px 6px;
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  gap: 8px;
+  min-width: 0;
+  overflow: hidden auto;
+  gap: 6px;
+  container: sftp-panel / inline-size;
 }
 /* Toolbar: labelled buttons; wraps instead of clipping. */
 .sftp-toolbar {
@@ -1698,6 +1714,23 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 }
 .sftp-toolbar .ghost-btn { white-space: nowrap; }
 .sftp-toolbar .ghost-btn.active { border-color: var(--accent); color: var(--accent); }
+.sftp-toolbar .sftp-more-btn { display: none; }
+.sftp-toolbar .sftp-more-btn[aria-expanded="true"] { border-color: var(--accent); color: var(--text); }
+/* A5-07 / A1-01: on a panel narrower than this the toolbar keeps to one row,
+   so the file list keeps its room - it took three rows at the default window
+   and left no row of the listing on screen. The secondary buttons (Columns,
+   Dual, Log, Compare, Sync browse) fold into More, which offers them by name,
+   and the rest show their icons: the label stays each button's name, the
+   title its tooltip. */
+@container sftp-panel (max-width: 900px) {
+  .sftp-toolbar .sftp-tb-secondary { display: none; }
+  .sftp-toolbar .sftp-more-btn { display: inline-flex; }
+  .sftp-toolbar .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .sftp-toolbar .ghost-btn { padding: 6px 8px; }
+}
 .sftp-path {
   flex: 1; min-width: 80px;
   background: var(--panel-2);
@@ -1733,26 +1766,51 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 }
 
 /* panes (dual mode) */
-.sftp-paneswrap { position: relative; display: flex; flex: 1; min-height: 0; }
-.sftp-panes { display: flex; flex: 1; min-height: 0; gap: 0; }
+.sftp-paneswrap { position: relative; display: flex; flex: 1; min-height: 150px; min-width: 0; }
+.sftp-panes { display: flex; flex: 1; min-height: 0; min-width: 0; gap: 0; }
+/* A floor (A1-01): the header, the column titles and two whole rows - the
+   list was squeezed to nothing under the toolbar and the transfer panel (and
+   to one row with jobs listed, in the smallest window). Two, not three: in
+   that window a third row would leave the transfer list no room for a job.
+   The quick-find indicator is placed over the pane (position: relative). */
 .sftp-pane {
-  flex: 1; min-width: 0; display: flex; flex-direction: column;
+  flex: 1 1 0; min-width: 0; min-height: 150px; display: flex; flex-direction: column;
   border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  position: relative;
+  container: sftp-pane / inline-size;
 }
 .sftp-pane .sftp-panehead { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; }
+/* A narrow pane (dual, or Split) gives its header to the path: no "Local
+   site" / "Remote site" title, Up and Home as icons (named by their label). */
+@container sftp-pane (max-width: 420px) {
+  .sftp-panehead .sftp-panetitle { display: none; }
+  .sftp-panehead .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .sftp-panehead .ghost-btn { padding: 3px 6px; }
+}
 .sftp-tablewrap { overflow: auto; flex: 1; min-height: 0; }
-.sftp-splitter {
+/* Both splitters (A1-15) are separators: dragged, or moved with the arrow
+   keys once focused. */
+.sftp-splitter, .surface-splitter {
   flex: none; width: 6px; cursor: col-resize;
   background: transparent; position: relative;
+  touch-action: none;
 }
-.sftp-splitter::after {
+.sftp-splitter::after, .surface-splitter::after {
   content: ''; position: absolute; left: 2px; top: 10%; bottom: 10%; width: 2px;
   background: var(--line-strong); border-radius: 2px;
 }
-.sftp-splitter:hover::after { background: var(--accent); }
+.sftp-splitter:hover::after, .surface-splitter:hover::after,
+.sftp-splitter.dragging::after, .surface-splitter.dragging::after,
+.sftp-splitter:focus-visible::after, .surface-splitter:focus-visible::after { background: var(--accent); }
+.sftp-splitter:focus-visible, .surface-splitter:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .sftp-panel:not(.dual) .sftp-local,
 .sftp-panel:not(.dual) .sftp-splitter { display: none; }
-.sftp-panel.dual .sftp-remote { flex: 0 0 var(--remote-pct, 50%); }
+/* ONE share (A1-15): the local pane takes --local-pct, the splitter its 6px,
+   and the remote pane what is left (.sftp-pane: flex 1 1 0). Each side used
+   to have its own 50%, so a drag pushed the remote pane past the edge. */
 .sftp-panel.dual .sftp-local { flex: 0 0 var(--local-pct, 50%); }
 
 /* sortable table */
@@ -1761,6 +1819,7 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
   text-align: left; padding: 6px 8px; font-size: 11px; text-transform: uppercase;
   letter-spacing: 0.04em; color: var(--text-faint); border-bottom: 1px solid var(--line);
   cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel);
+  white-space: nowrap;
 }
 .sftp-table th.sorted { color: var(--accent); }
 
@@ -1773,15 +1832,57 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 .sftp-panel.show-owner-cols .col-extra { display: table-cell; }
 .sftp-table th.sorted::after { content: ' ↑'; }
 .sftp-table th.sorted.desc::after { content: ' ↓'; }
-.sftp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); }
+/* One line per row (A1-16): no cell wraps. */
+.sftp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); white-space: nowrap; }
 .sftp-entry { cursor: default; user-select: none; outline: none; }
 .sftp-entry.sftp-dir { cursor: pointer; }
 .sftp-entry.sftp-file { cursor: pointer; }
-.sftp-tdname { display: flex; align-items: center; gap: 7px; overflow: hidden; text-overflow: ellipsis; }
+/* The Name cell stays a table cell (A1-16: it was the flex box itself, out of
+   the column layout) and takes the room the other columns leave; icon and
+   name sit in the wrapper, and a long name is cut, whole on hover. */
+.sftp-table td.sftp-tdname { width: 100%; max-width: 0; min-width: 120px; }
+.sftp-namewrap { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.sftp-name { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* An unusual name - characters spelled out, or nothing but dots - is flagged;
+   its tooltip says why (sftp.js sftpNameCell). */
+.sftp-name-flag {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  min-width: 14px; height: 14px; border-radius: 7px;
+  font-size: 10px; font-weight: 700; line-height: 1; color: #0a1120; background: var(--warn);
+}
 /* entry icon: folder color cue via CSS (no emoji) */
-.sftp-eicon { display: inline-flex; align-items: center; flex: none; color: var(--text-faint); }
+.sftp-eicon { display: inline-flex; align-items: center; flex: none; color: var(--text-faint); position: relative; }
 .sftp-eicon svg { width: 15px; height: 15px; }
 .sftp-eicon.is-dir { color: var(--accent); }
+/* A1-17: a symbolic link carries a corner badge (the row's tooltip says what
+   it is), and one found broken when opened gets a warning one instead. */
+.sftp-eicon.is-link::after {
+  content: "\2197" / "";
+  position: absolute; right: -5px; bottom: -4px;
+  min-width: 10px; padding: 0 1px; border-radius: 3px;
+  font-size: 9px; font-weight: 700; line-height: 10px; text-align: center;
+  color: var(--accent); background: var(--panel);
+}
+.sftp-eicon.is-link.broken::after { content: "!" / ""; color: #0a1120; background: var(--danger); }
+/* A folder being sized (Calculate size): a turning ring in its Size cell. */
+.sftp-spinner {
+  display: inline-block; width: 12px; height: 12px; vertical-align: -2px;
+  border: 2px solid var(--line-strong); border-top-color: var(--accent); border-radius: 50%;
+  animation: sftpSpin 0.8s linear infinite;
+}
+@keyframes sftpSpin { to { transform: rotate(360deg); } }
+/* Type-to-filter's indicator (A1-17): over the pane, opaque, out of the
+   list's way - it had no style, so it took a row's height from the list. */
+.sftp-quickfind {
+  position: absolute; right: 10px; bottom: 10px; z-index: 3;
+  max-width: calc(100% - 20px);
+  padding: 4px 10px; border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--panel-2); color: var(--text);
+  font-family: var(--mono); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
 /* directory Size cell: muted placeholder reads as intentional */
 td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .sftp-entry.sftp-dir td:first-child { color: var(--accent); font-weight: 600; }
@@ -1795,7 +1896,7 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
   padding: 6px 9px; color: var(--text); font-size: 13px;
 }
-.sftp-searchstatus { font-size: 11px; color: var(--text-dim); }
+.sftp-searchhint, .sftp-searchstatus { font-size: 11px; color: var(--text-dim); }
 .sftp-searchresults { max-height: 160px; overflow: auto; display: flex; flex-direction: column; gap: 2px; }
 .sftp-searchitem {
   padding: 4px 8px; border-radius: 6px; font-size: 12px; cursor: pointer;
@@ -1825,35 +1926,63 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 }
 .sftp-statusbar .sftp-status-left { overflow: hidden; text-overflow: ellipsis; }
 
-/* transfer queue: resizable table-like panel */
+/* transfer queue: resizable table-like panel. A1-01: at most about a third of
+   the file surface until the user resizes it (sftp.js sets --q-h, and lifts
+   --q-cap, when they do) - a fixed 220px left the file list no rows at the
+   default window - and only its header while the queue is empty. */
 .sftp-queuepanel {
-  flex: none; height: 220px; min-height: 120px;
+  flex: none;
+  /* ...and never so tall that the file list loses its floor: the panel
+     gives way first, down to its header and a sliver of its list, in the
+     smallest window (--q-floor is the file list's floor with its toolbar,
+     header and status line). A height the user chose gives way too: the
+     resize handle (sftp.js) reads these two to offer only heights that
+     take effect. */
+  --q-least: 60px;
+  --q-floor: 226px;
+  height: clamp(var(--q-least), calc(100% - var(--q-floor)), min(var(--q-h, 200px), var(--q-cap, 35%)));
+  min-height: 0;
   display: flex; flex-direction: column;
   border-top: 1px solid var(--line); background: var(--panel);
-  padding: 0 12px 8px; gap: 6px;
+  padding: 2px 12px 6px; gap: 4px;
   position: relative;
+  container: sftp-queue / inline-size;
 }
+.sftp-queuepanel.empty { height: auto; }
+.sftp-queuepanel.empty > :not(.sftp-queuehead),
+.sftp-queuepanel.empty .sftp-queuetabs,
+.sftp-queuepanel.empty .sftp-queueactions-head { display: none; }
+/* The resize handle lies over the panel's top edge, taking no room. */
 .sftp-queuehandle {
-  flex: none; height: 7px; margin: 0 -12px;
-  cursor: ns-resize; position: relative;
+  position: absolute; left: 0; right: 0; top: -4px; height: 9px; z-index: 2;
+  cursor: ns-resize; touch-action: none;
 }
 .sftp-queuehandle::after {
   content: ''; position: absolute; left: 50%; top: 3px; transform: translateX(-50%);
   width: 48px; height: 2px; border-radius: 2px; background: var(--line-strong);
 }
-.sftp-queuehandle:hover::after { background: var(--accent); }
-.sftp-queuehead { display: flex; align-items: center; gap: 10px; min-height: 26px; }
-.sftp-queuetitle { font-size: 12px; font-weight: 600; color: var(--text); }
-.sftp-queuesummary { font-size: 11px; color: var(--text-dim); flex: 1; }
-.sftp-queuetabs { display: flex; gap: 4px; }
+.sftp-queuehandle:hover::after, .sftp-queuehandle:focus-visible::after, .sftp-queuehandle.dragging::after { background: var(--accent); }
+.sftp-queuehandle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* A1-02: wraps rather than running off; the summary is one line, cut short. */
+.sftp-queuehead { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-height: 24px; }
+.sftp-queuetitle { flex: none; font-size: 12px; font-weight: 600; color: var(--text); }
+/* Never squeezed below a few words (it was down to one character in a
+   narrow Split): rather than that, the tabs and actions wrap to a line of
+   their own. */
+.sftp-queuesummary {
+  flex: 1 1 8em; min-width: 6em; font-size: 11px; line-height: 16px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sftp-queuetabs { display: flex; gap: 4px; flex: none; }
 .sftp-queuetab {
   background: transparent; border: 1px solid transparent; border-radius: 6px;
   color: var(--text-dim); font-size: 11px; padding: 3px 8px; cursor: pointer;
 }
 .sftp-queuetab.active { color: var(--accent); border-color: var(--accent); }
 /* extensible action area in the head (pause/priority controls append here) */
-.sftp-queueactions-head { display: flex; align-items: center; gap: 6px; }
-.sftp-queueactions-head .ghost-btn { padding: 3px 10px; font-size: 11px; }
+.sftp-queueactions-head { display: flex; align-items: center; gap: 6px; flex: none; }
+.sftp-queueactions-head .ghost-btn { padding: 3px 10px; font-size: 11px; gap: 5px; }
+.sftp-queueactions-head .ghost-btn svg { width: 12px; height: 12px; }
 
 /* restored-transfer banner (Task 5) - hidden unless a paused job's session
    died with the previous run */
@@ -1861,13 +1990,20 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   flex: none; font-size: 11px; color: var(--warn);
   background: rgba(var(--accent-rgb), 0.08);
   border: 1px solid var(--line); border-radius: var(--r-sm);
-  padding: 5px 10px;
+  padding: 4px 10px;
+  /* One line, whole in its tooltip: two lines of it took most of a small
+     transfer panel's height from the jobs (A1-01). */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* column grid shared by the header row and job rows */
+/* column grid shared by the header row and job rows. A1-02: its minimum was
+   742px, so in a narrower panel the list scrolled sideways and each job's
+   Pause/Cancel/Retry sat off screen. It now fits: the full grid where there
+   is room, then without Route/Speed/ETA (the name's tooltip and the summary
+   keep the rate), then two lines per job. */
 .sftp-queuecols, .sftp-queueitem {
   display: grid;
-  grid-template-columns: 26px minmax(120px, 2fr) minmax(110px, 1.4fr) minmax(150px, 1.6fr) 76px 64px minmax(80px, 1fr) 60px;
+  grid-template-columns: 22px minmax(100px, 2fr) minmax(70px, 1.1fr) minmax(130px, 1.6fr) 72px 56px minmax(60px, 1fr) 60px;
   gap: 8px; align-items: center;
 }
 .sftp-queuecols {
@@ -1877,8 +2013,42 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   padding-bottom: 3px;
 }
 .sftp-queuelist { overflow: auto; display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; }
-.sftp-queueitem { font-size: 12px; color: var(--text); min-height: 30px; }
-.q-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sftp-queueitem { font-size: 12px; color: var(--text); min-height: 28px; }
+.q-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+@container sftp-queue (max-width: 720px) {
+  .sftp-queuecols, .sftp-queueitem {
+    grid-template-columns: 22px minmax(80px, 2fr) minmax(120px, 1.5fr) minmax(50px, 1fr) 60px;
+  }
+  .sftp-queuecols .q-route, .sftp-queuecols .q-speed, .sftp-queuecols .q-eta,
+  .sftp-queueitem .q-route, .sftp-queueitem .q-speed, .sftp-queueitem .q-eta { display: none; }
+  .sftp-queueactions-head .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .sftp-queueactions-head .ghost-btn { padding: 5px 7px; }
+}
+/* In a very narrow panel (Split) the tabs and the bulk actions share one line
+   under the title and the summary. */
+@container sftp-queue (max-width: 300px) {
+  .sftp-queuetabs { gap: 2px; }
+  .sftp-queuetab { padding: 3px 5px; }
+  .sftp-queueactions-head { gap: 2px; }
+  .sftp-queueactions-head .ghost-btn { padding: 4px 5px; }
+}
+@container sftp-queue (max-width: 480px) {
+  .sftp-queuecols { display: none; }
+  .sftp-queueitem {
+    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr) 60px;
+    grid-template-areas: "dir name name act" ". prog err err";
+    row-gap: 0; padding: 2px 0;
+  }
+  .sftp-queueitem .q-dir { grid-area: dir; }
+  .sftp-queueitem .q-name { grid-area: name; }
+  .sftp-queueitem .q-act { grid-area: act; }
+  .sftp-queueitem .q-prog { grid-area: prog; }
+  .sftp-queueitem .q-err { grid-area: err; }
+  .sftp-queuelist .sftp-queuegroup { min-height: 22px; }
+}
 
 /* Grouping: a server header, then one row per remote directory, then the
    transfers themselves. Depth is carried as --q-depth and spent on the name
@@ -1913,11 +2083,13 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .q-cell.q-name { color: var(--text); }
 .q-cell.q-route, .q-cell.q-speed, .q-cell.q-eta { color: var(--text-dim); font-size: 11px; }
 .q-cell.q-prog { display: flex; align-items: center; gap: 8px; }
-.q-progtext { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.q-progtext { font-size: 11px; color: var(--text-dim); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .q-cell.q-err { color: var(--danger); font-size: 11px; }
 .q-cell.q-err.retrying { color: var(--warn); } /* auto-retry backoff - expected, not a failure */
 .q-cell.q-err.info { color: var(--text-dim); } /* restored/paused note - informational */
-.q-cell.q-act { display: flex; justify-content: flex-end; }
+/* Always reachable (A1-02): pinned to the list's right edge, should anything
+   ever make the list wider than the panel. */
+.q-cell.q-act { display: flex; justify-content: flex-end; position: sticky; right: 0; background: var(--panel); }
 .sftp-queuebar {
   flex: none; width: 70px; height: 6px; border-radius: 3px;
   background: var(--panel-3); overflow: hidden;
@@ -1990,6 +2162,40 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   padding: 12px;
 }
 .sftp-drop-hint.dragover { display: flex; }
+
+/* In-page drags by the pointer (A3-23 - app.js beginPointerDrag):
+   a ghost follows the pointer, dimmed where nothing takes the drop; the folder
+   row or pane under it is lit. Shared by the category tree. */
+.drag-ghost {
+  position: fixed; left: 0; top: 0; z-index: 1000; pointer-events: none;
+  max-width: 280px; padding: 4px 10px;
+  border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--panel-3); color: var(--text);
+  font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.drag-ghost.no-drop { opacity: 0.6; border-color: var(--line-strong); }
+body.pointer-dragging, body.pointer-dragging * { cursor: grabbing !important; user-select: none; }
+.sftp-pane.drag-over { outline: 2px dashed var(--accent); outline-offset: -4px; background: var(--accent-weak); }
+.sftp-entry.drop-target td { background: var(--accent-weak); box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent); }
+.sftp-entry.drop-target td:first-child { box-shadow: inset 3px 0 0 var(--accent), inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent); }
+.sftp-entry.sftp-dragging { opacity: 0.55; }
+
+/* The edit-conflict prompt (A7-19): how many other files wait for an
+   answer, and a status line only screen readers hear, for a question that
+   changes while the prompt is open. */
+.edit-conflict-queue { color: var(--warn); }
+/* One height whatever the question says, so Cancel, Reload and Overwrite stay
+   where they were when the question changes or the next file's comes up (the
+   body scrolls if a long name needs more room). */
+#editConflictModal .modal { height: min(360px, calc(100vh - 60px)); }
+/* Cancel waits a moment when the prompt has moved on to another file: shown
+   like a disabled button, still focusable (aria-disabled, sftp.js). */
+#editConflictModal .ghost-btn[aria-disabled="true"] { opacity: 0.5; cursor: default; }
+.sftp-live {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 
 /* ─── directory comparison tints (agent-e) ─────────────────────────────
    FileZilla-style: yellow = only on this side, red = differs between
@@ -2470,21 +2676,21 @@ label.opt-row { flex-direction: row; }
 
 .session-surface { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .session-surface.split { flex-direction: row; }
-.session-surface.split .terminal-body { flex: 0 0 var(--split-pct, 54%); min-width: 240px; }
-.session-surface.split .sftp-body { flex: 1; min-width: 280px; }
-.surface-splitter {
-  flex: none; width: 6px; cursor: col-resize; position: relative;
-  background: transparent;
-}
-.surface-splitter::after {
-  content: ''; position: absolute; left: 2px; top: 10%; bottom: 10%; width: 2px;
-  background: var(--line-strong); border-radius: 2px;
-}
-.surface-splitter:hover::after { background: var(--accent); }
+/* A1-03: the two sides share the surface's width and never overflow its
+   column - fixed floors of 240px + 280px pushed the file browser out of a
+   460px column. --split-pct is the terminal's share (the splitter, sftp.js,
+   keeps it within the floors); the file browser takes the rest. In a very
+   narrow surface the floors give way to percentages. */
+.session-surface.split .terminal-body { flex: 0 1 var(--split-pct, 54%); min-width: min(180px, 40%); }
+.session-surface.split .sftp-body { flex: 1 1 0; min-width: min(260px, 55%); }
 
 .mode-seg .seg-btn { display: inline-flex; align-items: center; gap: 6px; }
 .mode-seg .seg-btn svg { width: 13px; height: 13px; }
 .mode-seg .seg-btn.active { color: #0a1120; font-weight: 600; }
+/* A5-12(b): the file browser is opening - the surface asked for pulses until
+   it is ready, and more clicks wait for the same request. */
+.mode-seg[aria-busy="true"] { cursor: progress; }
+.mode-seg .seg-btn.pending { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); animation: pulse 1.1s ease-in-out infinite; }
 
 /* ---- server rows: live state + connect affordance ----------------------- */
 

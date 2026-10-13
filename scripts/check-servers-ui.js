@@ -2511,6 +2511,157 @@ async function scenarioServerNoMatch(browser, server) {
   });
 }
 
+// ─── JU6b item 10: the names behind "Apply remote changes" (JU5 F6, RU6b) ───
+
+/// The question as it reads.
+const plainConfirm = async (page) => (await confirmText(page)).message;
+/// The list of pending changes under the question: one entry per line item,
+/// its text, and the text of each value kept to itself in a <bdi>.
+const pendingList = (page) => page.evaluate(() => {
+  const box = document.querySelector('#confirmModal .bw-pending');
+  if (!box) return null;
+  return {
+    heads: [...box.querySelectorAll('.bw-pending-head')].map((n) => n.textContent),
+    items: [...box.querySelectorAll('li')].map((li) => ({ text: li.textContent, values: [...li.querySelectorAll('bdi')].map((b) => b.textContent) })),
+    note: (box.querySelector('.bw-pending-note') || {}).textContent || '',
+  };
+});
+
+async function scenarioBwPendingNames(browser, server) {
+  // The reviewers' probes (review F2 / L3): a name that closes the isolate
+  // and turns the text around (PDI + RLO), and one that pads itself out to
+  // look like a line of its own under pre-wrap.
+  const PDI_RLO = 'web-2\u2069\u202Eevil';
+  const FAKE_LINE = 'db' + ' '.repeat(150) + 'web-9: 10.0.0.1:22 → 6.6.6.6:22' + ' and so on'.repeat(8);
+  const PENDING = {
+    ok: true, errors: [], skippedServerOverwrites: 3, skippedServerNew: 4, skippedOverwrites: 1, skippedNew: 3,
+    pendingServers: [
+      { kind: 'overwrite', name: 'web-1', incomingName: 'web-1 (Bitwarden)', host: '10.0.0.9', port: 2222, localHost: '10.0.0.1', localPort: 22,
+        changes: ['host', 'port', 'user', 'password'] },
+      { kind: 'new', name: 'db-<img src=x onerror="window.__xss=1">', incomingName: null, host: null, port: null, localHost: null, localPort: null },
+      { kind: 'overwrite', name: PDI_RLO, incomingName: PDI_RLO, host: 'a.example', port: 22, localHost: 'a.example', localPort: 22, changes: null },
+      { kind: 'overwrite', name: 'v6', incomingName: 'v6', host: '2001:db8::5', port: 22, localHost: '::1', localPort: 22, changes: ['host'] },
+      { kind: 'new', name: FAKE_LINE, incomingName: null, host: '10.0.0.7', port: 22, localHost: null, localPort: null },
+    ],
+    pendingKeys: [
+      { kind: 'overwrite', name: 'alpha', incomingName: 'alpha', fingerprint: 'SHA256:NEWfp', localFingerprint: 'SHA256:OLDfp' },
+      { kind: 'new', name: 'gamma', incomingName: null, fingerprint: 'SHA256:gammafp', localFingerprint: null },
+    ],
+    pendingTruncated: true,
+  };
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'JU5 F6 the approval names what it applies', async (app) => {
+    const { page } = app;
+    await page.evaluate((p) => {
+      window.__replies.bitwarden_sync = (a) => (a.allowRemoteOverwrite ? { ok: true, pulled: 2, serversPulled: 2, errors: [] } : p);
+    }, PENDING);
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    yes('(set-up) the approval is asked', await waitVisible(page, '#confirmModal', 1500));
+    const msg = await plainConfirm(page);
+    yes('F6 the counts are still said', /3 servers/.test(msg) && /4 new servers/.test(msg) && /3 new keys/.test(msg), msg);
+    const list = await pendingList(page);
+    yes('F2 the changes are listed under the question, one entry each', !!list && list.items.length === 9, JSON.stringify(list));
+    const item = (re) => (list ? list.items.find((i) => re.test(i.text)) : null);
+    const web1 = item(/^web-1:/);
+    yes('F6 a server overwrite names the server, its address now and the address it would get',
+      !!web1 && /^web-1: 10\.0\.0\.1:22 → 10\.0\.0\.9:2222/.test(web1.text) && web1.text.includes('web-1 (Bitwarden)'), JSON.stringify(web1));
+    yes('F5 and which of its settings the pull would change', !!web1 && /changes: host, port, user name, saved password/.test(web1.text), JSON.stringify(web1));
+    check('F2 each value is kept to itself in a <bdi>', web1 && web1.values, ['web-1', '10.0.0.1:22', '10.0.0.9:2222', 'web-1 (Bitwarden)']);
+    yes('F6 a new server is named, and an item without an address says so',
+      !!item(/^new: db-<img src=x onerror="window\.__xss=1">, no address/), JSON.stringify(list && list.items));
+    const evil = list && list.items.find((i) => i.values.some((v) => v.startsWith('web-2')));
+    check('F2 a name cannot close its isolate or turn the text around: those characters are dropped',
+      evil && evil.values[0], 'web-2evil');
+    const fake = list && list.items.find((i) => i.values.some((v) => v.startsWith('db ')));
+    yes('F2 a run of spaces is one space, and a long value is cut short: no line of its own',
+      !!fake && !/ {2}/.test(fake.text) && fake.values[0].length <= 80 && fake.values[0].endsWith('…'), JSON.stringify(fake));
+    yes('L8 an IPv6 address is bracketed before its port', !!item(/^v6: \[::1\]:22 → \[2001:db8::5\]:22/), JSON.stringify(list && list.items));
+    yes('F6 a key overwrite names the key and the fingerprint it would get', !!item(/^alpha: SHA256:OLDfp → SHA256:NEWfp/), JSON.stringify(list && list.items));
+    yes('F6 a new key is named with its fingerprint', !!item(/^new: gamma, SHA256:gammafp/), JSON.stringify(list && list.items));
+    check('F6 a cut list says how many more there are', list && list.items.filter((i) => /^and \d+ more$/.test(i.text)).map((i) => i.text), ['and 2 more', 'and 2 more']);
+    yes('F5 and that Apply applies the ones not listed too', !!list && /not listed/.test(list.note) && /Apply/.test(list.note), list && list.note);
+    check('F6 every name stays text, never markup',
+      await page.evaluate(() => [document.querySelectorAll('#confirmModal img').length, window.__xss || 0]), [0, 0]);
+    check('F2 no direction or isolate character reaches the dialog',
+      await page.evaluate(() => /[\u202A-\u202E\u2066-\u2069\u061C]/.test(document.getElementById('confirmModal').textContent)), false);
+    await answerConfirm(page, 'ok');
+    await page.waitForTimeout(250);
+    check('OK still applies them', (await app.calls('bitwarden_sync')).map((c) => c.args.allowRemoteOverwrite), [false, true]);
+    await page.evaluate(() => { window.__next = confirmModal('Another question', 'Something else', 'OK'); });
+    await waitVisible(page, '#confirmModal');
+    check('the list leaves with its question (the dialog is shared)', await pendingList(page), null);
+    await answerConfirm(page, 'cancel');
+    check('no page errors', app.errors, []);
+  });
+
+  // A backend without the lists (RU6b not in it yet): today's counts, nothing else.
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'JU5 F6 without the lists', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      window.__replies.bitwarden_sync = (a) => (a.allowRemoteOverwrite ? { ok: true, errors: [] }
+        : { ok: true, errors: [], skippedOverwrites: 2, skippedServerNew: 1 });
+    });
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    yes('(set-up) the approval is asked', await waitVisible(page, '#confirmModal', 1500));
+    check('F6 without pending lists the question is the counts alone', await plainConfirm(page),
+      'Bitwarden has changes that need your approval: 2 keys replaced by a newer Bitwarden copy, 1 new server from Bitwarden. Apply them now?');
+    await answerConfirm(page, 'cancel');
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── JU6b fix round 2: Bitwarden names in the status line ───────────────────
+
+async function scenarioBwStatusNames(browser, server) {
+  // The "Renamed:" part of a sync's summary names Bitwarden items too: an
+  // override in one turned the rest of the status line around.
+  const RESULT = {
+    ok: true, errors: [], pulled: 1,
+    renamed: [{ name: 'web\u202Etxt.exe', storedAs: 'web\u202Etxt.exe (2)' }, { name: 'db\u2069\u202E', storedAs: 'db (2)' }],
+  };
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG, bitwarden_sync: RESULT } }, 'round 2 #5 renamed items in the status line', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    await page.waitForTimeout(250);
+    const text = (await bwStatus(page)).text;
+    check('round 2 #5 a renamed name cannot turn the status line around: its direction characters are dropped',
+      /[\u202A-\u202E\u2066\u2067\u200E\u200F\u061C]/.test(text), false);
+    yes('round 2 #5 and each name is kept to itself, closing its own isolate',
+      text.includes('Renamed: \u2068webtxt.exe\u2069 stored as \u2068webtxt.exe (2)\u2069, \u2068db\u2069 stored as \u2068db (2)\u2069.'),
+      JSON.stringify(text));
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── JU6b item 11: the server list keeps the HOST category everywhere ───────
+
+async function scenarioHostScopeReload(browser, server) {
+  const servers = [SERVER('s1', 'web-1'), SERVER('s2', 'db-1')];
+  await withApp(browser, server, { servers }, 'JU5 review: a server list rebuilt from Keys', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    await page.evaluate(() => selectServer('s2'));
+    check('(set-up) db-1 is selected', await page.textContent('#termTitle'), 'db-1');
+    await page.evaluate(() => switchView('keys'));
+    await page.waitForTimeout(80);
+    await page.evaluate(() => setActiveCategory('c1'));
+    check('(set-up) the key list is filtered by key category c1', await page.evaluate(() => activeCategoryId()), 'c1');
+    // What a Bitwarden sync started from Settings does: the server list is
+    // read again while another view - and another category tree - is shown.
+    await page.evaluate(() => loadServers());
+    await page.waitForTimeout(80);
+    await serversView(page);
+    await page.waitForTimeout(80);
+    check('the server list was filtered by the HOST category: both rows are still listed',
+      await page.evaluate(() => [...document.querySelectorAll('#serverList .server-row')].map((r) => r.dataset.id)), ['s1', 's2']);
+    check('the selection is kept', await page.evaluate(() => state.connectSelectedId), 's2');
+    check('and the header does not read "No connection"', await page.textContent('#termTitle'), 'db-1');
+    check('no page errors', app.errors, []);
+  });
+}
+
 // ─── runner ─────────────────────────────────────────────────────────────────
 
 const SCENARIOS = [
@@ -2567,6 +2718,9 @@ const SCENARIOS = [
   ['fix2 #1: held lock and quit chords', scenarioHeldChords],
   ['fix2 #2: one connection test at a time', scenarioOneTest],
   ['fix2 #3: a server filter with no matches', scenarioServerNoMatch],
+  ['JU6b item 10: Bitwarden approval names (JU5 F6)', scenarioBwPendingNames],
+  ['JU6b item 11: the host category survives a reload from Keys', scenarioHostScopeReload],
+  ['JU6b fix round 2: Bitwarden names in the status line', scenarioBwStatusNames],
 ];
 
 (async () => {

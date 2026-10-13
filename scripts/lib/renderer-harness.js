@@ -415,6 +415,43 @@ async function openLiveTab(app, auth) {
 const afterScheduledTimers = (page, ms = 100) =>
   page.evaluate((d) => new Promise((r) => setTimeout(r, d)), ms);
 
+/// What Tauri's `dragDropEnabled` (on, because OS file drops need it) does to
+/// in-page HTML5 drag and drop on Windows (A3-23): WebView2's drop handler is
+/// replaced, so a drag can start but `dragover` / `drop` never reach the page.
+/// Headless Chromium has no such handler and runs HTML5 drags happily, so a
+/// drag test without this would pass for code that is dead on Windows.
+const emulateWindowsDragDrop = (page) => page.evaluate(() => {
+  if (window.__noHtml5Drops) return;
+  window.__noHtml5Drops = true;
+  for (const type of ['dragenter', 'dragover', 'drop']) {
+    window.addEventListener(type, (e) => { e.stopImmediatePropagation(); }, true);
+  }
+});
+
+/// A real mouse drag (pointer events): press over `from`, move past the drag
+/// threshold, glide to `to` (at `o.at` of its height, default the middle),
+/// optionally look around while still pressed (`o.during(point)`) or press
+/// Escape (`o.escape`), then release. Selectors or { x, y } points. Returns
+/// what `o.during` returned.
+async function mouseDrag(page, from, to, o = {}) {
+  const point = async (target, frac, dx) => {
+    if (typeof target !== 'string') return target;
+    const box = await page.locator(target).first().boundingBox();
+    if (!box) throw new Error(`mouseDrag: ${target} is not on screen`);
+    return { x: box.x + (dx == null ? box.width / 2 : dx), y: box.y + box.height * (frac == null ? 0.5 : frac) };
+  };
+  const a = await point(from, 0.5, o.fromX);
+  const b = await point(to, o.at, o.toX);
+  await page.mouse.move(a.x, a.y);
+  await page.mouse.down();
+  await page.mouse.move(a.x + 6, a.y + 4, { steps: 2 });
+  await page.mouse.move(b.x, b.y, { steps: 8 });
+  const seen = o.during ? await o.during(b) : undefined;
+  if (o.escape) await page.keyboard.press('Escape');
+  await page.mouse.up();
+  return seen;
+}
+
 const bytesOf = (c) => String.fromCharCode(...(c.args.bytes || []));
 const sends = async (app) => (await app.calls('terminal_send')).map(bytesOf);
 
@@ -439,7 +476,7 @@ module.exports = {
   DEFAULT_RENDERER_DIR, rendererDir, serve,
   delay, firstLine, part,
   openPage,
-  stubInit, PASSWORD, T0, KEY, SERVER, CATEGORY,
+  stubInit, PASSWORD, T0, KEY, SERVER, CATEGORY, pauseClockAhead,
   openApp, withApp, settled, waitVisible, focusIs, answerConfirm, openLiveTab, afterScheduledTimers, bytesOf, sends,
-  toasts, hold, letGo,
+  toasts, hold, letGo, emulateWindowsDragDrop, mouseDrag,
 };

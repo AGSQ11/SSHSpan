@@ -218,8 +218,9 @@ async function scenarioMenus(browser, server) {
     await page.waitForTimeout(80);
     const m = await menuState(page);
     check('A2-50 the category menu uses the shared menu', m && m.role, 'menu');
-    check('A2-50 with the same items as before', m && m.labels, ['Rename', 'New subcategory', 'Move to...', 'Delete']);
-    check('A2-27 every item shows its icon', m && m.icons, [true, true, true, true]);
+    // Move up / Move down reorder without a drag (WCAG 2.2 SC 2.5.7).
+    check('A2-50 with its items', m && m.labels, ['Rename', 'New subcategory', 'Move to...', 'Move up', 'Move down', 'Delete']);
+    check('A2-27 every item shows its icon', m && m.icons, [true, true, true, true, true, true]);
     check('A1-26 the first item has the focus', m && m.focused, 0);
     await page.keyboard.press('Escape');
     await page.waitForTimeout(60);
@@ -430,7 +431,7 @@ async function scenarioNarrow(browser, server) {
     await page.click('#catTree .cat-node[data-id="c1"] .cat-actions-btn');
     await page.waitForTimeout(80);
     check('A5-13 rename, move and delete are reachable from it',
-      (await menuState(page) || { labels: [] }).labels, ['Rename', 'New subcategory', 'Move to...', 'Delete']);
+      (await menuState(page) || { labels: [] }).labels, ['Rename', 'New subcategory', 'Move to...', 'Move up', 'Move down', 'Delete']);
     await page.keyboard.press('Escape');
     await page.click('#catTree .cat-node[data-id="c1"]');
     await page.waitForTimeout(150);

@@ -25,7 +25,9 @@
  *      before it closes;
  *   7. removing a deployed copy;
  *   plus the key row's Connect menu, the category drawer while locked and
- *   the tree on lock.
+ *   the tree on lock; and (JU6b) category drags made with the mouse - pointer
+ *   events, since HTML5 drops never reach the page on Windows (A3-23) - with
+ *   the JU4 review's order probes.
  *
  * Run with `npm run test:keys`. Needs playwright (see check-renderer-ui.js);
  * without it only the static checks run. `--only <text>` runs the scenarios
@@ -40,6 +42,7 @@ const path = require('path');
 const {
   failures, check, yes, loadChromium, rendererDir, serve, part,
   KEY, SERVER, CATEGORY, withApp, settled, waitVisible, answerConfirm, toasts, hold, letGo, afterScheduledTimers,
+  emulateWindowsDragDrop, mouseDrag,
 } = require('./lib/renderer-harness');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -553,20 +556,25 @@ async function scenarioKeyList(browser, server) {
 
 // ─── item 4: categories ────────────────────────────────────────────────────
 
-/// An HTML5 drag of one category row onto another, released at `frac` of the
-/// target row's height (0.1 = its top edge, 0.5 = its middle, 0.9 = its bottom).
-const dragCategory = (page, from, to, frac) => page.evaluate(({ f, t, y }) => {
-  const src = document.querySelector(`#catTree .cat-node[data-id="${f}"]`);
-  const dst = document.querySelector(`#catTree .cat-node[data-id="${t}"]`);
-  const dt = new DataTransfer();
-  src.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: dt }));
-  const r = dst.getBoundingClientRect();
-  const at = { bubbles: true, cancelable: true, dataTransfer: dt, clientX: r.left + 20, clientY: r.top + r.height * y };
-  dst.dispatchEvent(new DragEvent('dragenter', at));
-  dst.dispatchEvent(new DragEvent('dragover', at));
-  dst.dispatchEvent(new DragEvent('drop', at));
-  src.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt }));
-}, { f: from, t: to, y: frac });
+/// A mouse drag of one category row onto another, released at `frac` of the
+/// target row's height (0.1 = its top edge, 0.5 = its middle, 0.9 = its
+/// bottom). Pointer events with the page's HTML5 drops switched off, as they
+/// are on Windows while Tauri handles OS file drops (Task 16 / A3-23): the
+/// HTML5 drag this used to dispatch never reaches the page there.
+const dragCategory = async (page, from, to, frac, o = {}) => {
+  await emulateWindowsDragDrop(page);
+  // A mouse can only press a row that is on screen: open the branches above
+  // it, as a user would (the shown parents, so a loop member's chain ends).
+  await page.evaluate((id) => {
+    let opened = false;
+    for (let p = state.uiParentOf.get(id), n = 0; p && n < 64; p = state.uiParentOf.get(p), n++) {
+      if (!state.expandedCatIds.has(p)) { state.expandedCatIds.add(p); opened = true; }
+    }
+    if (opened) renderCategoryTree();
+  }, from);
+  return mouseDrag(page, `#catTree .cat-node[data-id="${from}"] .cat-label`, `#catTree .cat-node[data-id="${to}"]`,
+    Object.assign({ at: frac }, o));
+};
 
 async function scenarioCategories(browser, server) {
   const ROOTS = [CAT('c1', 'Alpha', null, 0), CAT('c2', 'Beta', null, 1), CAT('c3', 'Gamma', null, 2)];
@@ -1457,6 +1465,177 @@ async function scenarioFix2Loops(browser, server) {
   });
 }
 
+// ─── JU6b: pointer drags in the tree (Task 16 / A3-23 / SC 2.5.7) ──────────
+
+/// The top level as the tree shows it, after the stub applied every move.
+const topOrder = (page) => page.evaluate(() => childrenOf(null).map((c) => c.name));
+
+async function scenarioPointerCategories(browser, server) {
+  const ROOTS = [CAT('c1', 'Alpha', null, 0), CAT('c2', 'Beta', null, 1), CAT('c3', 'Gamma', null, 2)];
+  const reply = { categories: ROOTS, allKeyCategories: {}, orphans: false, hostOrphans: false };
+  await withApp(browser, server, { categories: ROOTS, replies: { category_list: reply } }, 'A3-23 a category dragged with the mouse', async (app) => {
+    const { page } = app;
+    const seen = await dragCategory(page, 'c3', 'c1', 0.5, {
+      during: () => page.evaluate(() => {
+        const g = document.querySelector('.drag-ghost');
+        return {
+          ghost: g ? g.textContent : null,
+          into: [...document.querySelectorAll('#catTree .cat-node.drop-into')].map((n) => n.dataset.id),
+          dragging: [...document.querySelectorAll('#catTree .cat-node.dragging')].map((n) => n.dataset.id),
+        };
+      }),
+    });
+    check('A3-23 a ghost names the category being dragged', seen && seen.ghost, 'Gamma');
+    check('A3-23 the row under the pointer shows where it would go (into Alpha)', seen && seen.into, ['c1']);
+    check('A3-23 the dragged row is marked', seen && seen.dragging, ['c3']);
+    await page.waitForTimeout(200);
+    check('A3-23 released on the middle of Alpha it is re-parented under Alpha',
+      await reparents(app), [{ id: 'c3', newParentId: 'c1', sortIndex: 0 }]);
+    check('the ghost and the marks are gone',
+      await page.evaluate(() => document.querySelectorAll('.drag-ghost, .cat-node.dragging, .cat-node.drop-into, .cat-node.drop-before, .cat-node.drop-after').length), 0);
+    check('A3-23 the release is not also a click that filters the list', await page.evaluate(() => activeCategoryId()), 'all');
+
+    const before = (await reparents(app)).length;
+    const mid = await dragCategory(page, 'c1', 'c3', 0.9, {
+      escape: true,
+      during: () => page.evaluate(() => !!document.querySelector('.drag-ghost')),
+    });
+    await page.waitForTimeout(200);
+    yes('(set-up) a drag was under way when Escape was pressed', mid === true);
+    check('A3-23 Escape mid-drag posts nothing', (await reparents(app)).length - before, 0);
+    check('A3-23 and leaves no ghost or highlight behind',
+      await page.evaluate(() => document.querySelectorAll('.drag-ghost, .cat-node.dragging, .cat-node.drop-into, .cat-node.drop-before, .cat-node.drop-after').length), 0);
+    check('the release after Escape does not filter the list either', await page.evaluate(() => activeCategoryId()), 'all');
+
+    // Dragged away and brought back onto its own row: nowhere to go, and the
+    // release there is not a click on the row (the browser sends one when the
+    // press and the release are on the same element).
+    const before2 = (await reparents(app)).length;
+    const back = await dragCategory(page, 'c2', 'c2', 0.5, { during: () => page.evaluate(() => !!document.querySelector('.drag-ghost')) });
+    await page.waitForTimeout(200);
+    yes('(set-up) a drag was under way over its own row', back === true);
+    check('A3-23 a drag released on its own row moves nothing', (await reparents(app)).length - before2, 0);
+    check('A3-23 and does not filter by it either', await page.evaluate(() => activeCategoryId()), 'all');
+
+    await page.click('#catTree .cat-node[data-id="c2"] .cat-label');
+    check('a plain click (no drag) still filters by the category', await page.evaluate(() => activeCategoryId()), 'c2');
+    await page.click('#catTree .cat-node[data-id="c2"] .cat-actions-btn');
+    check('SC 2.5.7 the row menu keeps Move to... (the same without dragging)',
+      await page.evaluate(() => [...document.querySelectorAll('#keyConnectMenu .ctx-item')].map((b) => b.textContent.trim()).includes('Move to...')), true);
+    check('no page errors', app.errors, []);
+  });
+
+  // The JU4 review's order probes: a drop AFTER a promoted loop root, or after
+  // a row whose parent no longer exists, used to land one place early - and
+  // a second try changed nothing.
+  for (const [title, from, to, want] of [
+    ['Outside after CycC', 'root', 'cc', ['CycA', 'CycC', 'Outside', 'Self']],
+    ['Outside after Self', 'root', 'self', ['CycA', 'CycC', 'Self', 'Outside']],
+  ]) {
+    await withApp(browser, server, loopOpts(), `JU4 order probe: ${title}`, async (app) => {
+      const { page } = app;
+      await applyReparents(page);
+      await dragCategory(page, from, to, 0.9);
+      await page.waitForTimeout(250);
+      check(`JU4 probe ${title}: the order read back`, await topOrder(page), want);
+      check(`JU4 probe ${title}: no promoted loop root was rewritten`,
+        (await reparents(app)).filter((a) => ['ca', 'cb', 'cc', 'cd', 'self'].includes(a.id)), []);
+      check('no page errors', app.errors, []);
+    });
+  }
+
+  const DANGLING = [CAT('a', 'Alpha', null, 0), CAT('b', 'Bravo', 'gone', 1), CAT('c', 'Charlie', null, 2), CAT('d', 'Delta', 'missing', 3)];
+  const danglingOpts = () => ({ categories: DANGLING,
+    replies: { category_list: { categories: DANGLING, allKeyCategories: {}, orphans: false, hostOrphans: false } } });
+  for (const [title, from, want] of [
+    ['Alpha after Delta', 'a', ['Bravo', 'Charlie', 'Delta', 'Alpha']],
+    ['Bravo after Delta', 'b', ['Alpha', 'Charlie', 'Delta', 'Bravo']],
+  ]) {
+    await withApp(browser, server, danglingOpts(), `JU4 order probe: ${title}`, async (app) => {
+      const { page } = app;
+      await applyReparents(page);
+      check('(set-up) the rows whose parent is gone are shown at the top level', await topOrder(page), ['Alpha', 'Bravo', 'Charlie', 'Delta']);
+      await dragCategory(page, from, 'd', 0.9);
+      await page.waitForTimeout(250);
+      check(`JU4 probe ${title}: the order read back`, await topOrder(page), want);
+      await dragCategory(page, from, 'd', 0.9);
+      await page.waitForTimeout(250);
+      check(`JU4 probe ${title}: dropping it there again keeps it there`, await topOrder(page), want);
+      check('no page errors', app.errors, []);
+    });
+  }
+}
+
+// ─── JU6b fix round: reordering without dragging, the drag's gates ──────────
+
+/// The category menu's items for `id`, with their disabled state.
+const catMenu = async (page, id) => {
+  await page.click(`#catTree .cat-node[data-id="${id}"] .cat-actions-btn`);
+  return page.evaluate(() => [...document.querySelectorAll('#keyConnectMenu .ctx-item')]
+    .map((b) => [b.textContent.trim(), b.disabled]));
+};
+
+async function scenarioCategoryOrderNoDrag(browser, server) {
+  const ROOTS = [CAT('c1', 'Alpha', null, 0), CAT('c2', 'Beta', null, 1), CAT('c3', 'Gamma', null, 2)];
+  const opts = () => ({ categories: ROOTS, replies: { category_list: { categories: ROOTS, allKeyCategories: {}, orphans: false, hostOrphans: false } } });
+  await withApp(browser, server, opts(), 'M2 Move up and Move down', async (app) => {
+    const { page } = app;
+    await applyReparents(page);
+    const first = await catMenu(page, 'c1');
+    check('M2 the category menu offers Move up and Move down (SC 2.5.7: reordering without a drag)',
+      first.map(([l]) => l), ['Rename', 'New subcategory', 'Move to...', 'Move up', 'Move down', 'Delete']);
+    check('M2 the first category cannot move up', first.filter(([l]) => /^Move (up|down)$/.test(l)), [['Move up', true], ['Move down', false]]);
+    check('M2 both show a drawn arrow (not an empty icon slot)', await page.evaluate(() => [...document.querySelectorAll('#keyConnectMenu .ctx-item')]
+      .filter((b) => /^Move (up|down)$/.test(b.textContent.trim())).map((b) => b.querySelectorAll('svg path').length > 0)), [true, true]);
+    await page.keyboard.press('Escape');
+    const last = await catMenu(page, 'c3');
+    check('M2 the last category cannot move down', last.filter(([l]) => /^Move (up|down)$/.test(l)), [['Move up', false], ['Move down', true]]);
+    await page.keyboard.press('Escape');
+    await catMenu(page, 'c1');
+    await page.click('#keyConnectMenu .ctx-item:has-text("Move down")');
+    await page.waitForTimeout(250);
+    check('M2 Move down puts it one place lower', await topOrder(page), ['Beta', 'Alpha', 'Gamma']);
+    await catMenu(page, 'c3');
+    await page.click('#keyConnectMenu .ctx-item:has-text("Move up")');
+    await page.waitForTimeout(250);
+    check('M2 Move up one place higher', await topOrder(page), ['Beta', 'Gamma', 'Alpha']);
+    await page.focus('#catTree .cat-node[data-id="c2"]');
+    await page.keyboard.press('Alt+ArrowDown');
+    await page.waitForTimeout(250);
+    check('M2 Alt+ArrowDown on a focused category moves it down', await topOrder(page), ['Gamma', 'Beta', 'Alpha']);
+    check('M2 and the focus stays on it', await page.evaluate(() => document.activeElement && document.activeElement.dataset.id), 'c2');
+    await page.keyboard.press('Alt+ArrowUp');
+    await page.waitForTimeout(250);
+    check('M2 Alt+ArrowUp moves it back up', await topOrder(page), ['Beta', 'Gamma', 'Alpha']);
+    const sent = (await reparents(app)).length;
+    await page.keyboard.press('Alt+ArrowUp');
+    await page.waitForTimeout(250);
+    check('M2 at the top Alt+ArrowUp does nothing', [await topOrder(page), (await reparents(app)).length - sent], [['Beta', 'Gamma', 'Alpha'], 0]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, opts(), 'L7 the drag\'s lock gates', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => { document.querySelector('#catTree .cat-node[data-id="c3"]').dataset.draggable = 'false'; });
+    const seen = await dragCategory(page, 'c3', 'c1', 0.5, { during: () => page.evaluate(() => !!document.querySelector('.drag-ghost')) });
+    await page.waitForTimeout(200);
+    check('L7 a row the lock gate marks undraggable does not drag', [seen, (await reparents(app)).length], [false, 0]);
+    const seen2 = await dragCategory(page, 'c2', 'c1', 0.5, {
+      during: async () => {
+        const g = await page.evaluate(() => !!document.querySelector('.drag-ghost'));
+        // The vault locks while the drag is held.
+        await page.evaluate(() => { state.unlocked = false; });
+        return g;
+      },
+    });
+    await page.waitForTimeout(200);
+    yes('(set-up) the second drag was under way', seen2 === true);
+    check('L7 a drop after the vault locked moves nothing', (await reparents(app)).length, 0);
+    yes('L7 and says why', (await toasts(page)).includes('Unlock the vault to change categories.'), JSON.stringify(await toasts(page)));
+    check('no page errors', app.errors, []);
+  });
+}
+
 async function scenarioFix2Focus(browser, server) {
   // fix2 item 3: what withBusy does when the user moves the focus while an
   // action runs. Moved to another control: it stays there. Moved to a
@@ -1562,6 +1741,8 @@ const SCENARIOS = [
   ['fix1 copy: sentence case and RSA duration hint', scenarioFixCopy],
   ['fix2 loops: no loop member as a move destination, repairs still work', scenarioFix2Loops],
   ['fix2 focus: moving the focus while an action runs', scenarioFix2Focus],
+  ['JU6b pointer drags in the tree and the order probes (Task 16 A3-23 JU4 review)', scenarioPointerCategories],
+  ['JU6b fix round: reordering without a drag, the drag\'s lock gates (M2 L7)', scenarioCategoryOrderNoDrag],
 ];
 
 (async () => {

@@ -261,15 +261,10 @@ async function scenarioGuards(browser, server) {
     await page.evaluate(() => loadKnownHosts());
     await openLiveTab(app);
     // A plain tab record with an SFTP panel for the move guard (no shell).
-    // buildSftpPanel() wires the pane's drop listeners on the panel itself
-    // (A3-01), so nothing has to be re-wired once it is attached.
     await page.evaluate(() => {
       state.sessions.set('tm', { tabId: 'tm', sessionId: 'sess-move', serverId: 's1', serverName: 'files', host: '10.0.0.1', port: 22, mode: 'sftp', sftpReady: true, sftpPath: '/srv', ended: false });
       const panel = buildSftpPanel('tm');
       document.getElementById('sftpBody').appendChild(panel);
-      const row = document.createElement('tr');
-      row.className = 'sftp-entry'; row.dataset.isdir = '1'; row.dataset.name = 'dest';
-      document.getElementById('sftpTbody-tm').appendChild(row);
     });
 
     const multi = 'echo a\nrm -rf /tmp/x\n';
@@ -319,19 +314,12 @@ async function scenarioGuards(browser, server) {
       { name: 'move a remote file by drag and drop', n: 1,
         effect: (c) => c.cmd === 'sftp_rename',
         trigger: () => {
-          window.__action = undefined;
-          // A refresh (after a move that did happen) rebuilds the rows; make
-          // sure the directory row to drop on is there.
-          const tbody = document.getElementById('sftpTbody-tm');
-          let row = tbody.querySelector('tr.sftp-entry');
-          if (!row) {
-            row = document.createElement('tr');
-            row.className = 'sftp-entry'; row.dataset.isdir = '1'; row.dataset.name = 'dest';
-            tbody.appendChild(row);
-          }
-          const dt = new DataTransfer();
-          dt.setData('text/sftp-remote', JSON.stringify({ path: '/srv/file.txt', name: 'file.txt' }));
-          row.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+          // What a pointer drag of /srv/file.txt released on the folder row
+          // "dest" resolves to (Task 16: drags are pointer events now - the
+          // gesture itself is driven with the mouse in check-sftp-ui.js).
+          window.__action = sftpDropDragged(
+            { tabId: 'tm', side: 'remote', items: [{ path: '/srv/file.txt', name: 'file.txt', isDir: false }] },
+            { side: 'remote', dir: '/srv/dest' });
         } },
       { name: 'close a live session tab', n: 1,
         effect: (c) => c.cmd === 'terminal_disconnect',
@@ -971,11 +959,11 @@ async function scenarioModals(browser, server) {
   });
 }
 
-/// The SFTP delete, chmod and conflict dialogs have no Escape handler of their
-/// own: the central one closes them, and so does a vault lock, and each settles
-/// whatever it was holding.
+/// The SFTP delete, chmod, conflict and edit-conflict dialogs have no Escape
+/// handler of their own: the central one closes them, and so does a vault
+/// lock, and each settles whatever it was holding.
 async function scenarioSftpDialogs(browser, server) {
-  const modalId = { delete: 'deleteModal', chmod: 'chmodModal', conflict: 'conflictModal' };
+  const modalId = { delete: 'deleteModal', chmod: 'chmodModal', conflict: 'conflictModal', editConflict: 'editConflictModal' };
   const opener = {
     delete: () => { window.__yes = 0; sftpConfirmDelete('Delete 1 item?', () => { window.__yes += 1; }); },
     chmod: () => { openChmodDialog('tm', ['/srv/a.txt'], { name: 'a.txt' }); },
@@ -983,8 +971,14 @@ async function scenarioSftpDialogs(browser, server) {
       window.__batch = resolveBatchConflicts('tm', 'upload',
         [{ local: '/home/u/a.txt', remote: '/srv/a.txt', destEntry: { size: 1, modifiedMs: 1 } }]);
     },
+    // A file open in an editor changed on the server (A7-19, RU6a contract).
+    editConflict: () => {
+      window.__emit('sftp-edit-sync', { sessionId: 'sess-sftp', editId: 'e1', remote: '/srv/app.conf', ok: false, conflict: true,
+        conflictId: 'c1', reason: 'changed', error: 'app.conf changed on the server since you opened it - choose Overwrite or Reload.',
+        remoteSize: 10, remoteModifiedMs: 1700000000000 });
+    },
   };
-  for (const kind of ['delete', 'chmod', 'conflict']) {
+  for (const kind of ['delete', 'chmod', 'conflict', 'editConflict']) {
     for (const how of ['escape', 'lock']) {
       await withApp(browser, server, {}, `${kind} dialog via ${how}`, async (app) => {
         const { page } = app;
@@ -1001,6 +995,7 @@ async function scenarioSftpDialogs(browser, server) {
           check(`conflict: ${how} cancels the whole batch (the awaiting transfer is released)`,
             await settled(page, () => window.__batch, null, 800), null);
         }
+        if (kind === 'editConflict') check(`editConflict: ${how} settles nothing on the server`, await app.count('sftp_edit_resolve'), 0);
         if (how === 'escape') {
           yes(`${kind}: and the page behind it is untouched (the vault is still unlocked)`, await page.evaluate(() => state.unlocked));
         } else {
@@ -1513,7 +1508,9 @@ async function scenarioLockGates(browser, server) {
       add: document.getElementById('catAddRootBtn').disabled,
       addTitle: document.getElementById('catAddRootBtn').title,
       menus: [...document.querySelectorAll('#catTree .cat-actions-btn')].map((b) => [b.disabled, b.title]),
-      drag: [...document.querySelectorAll('#catTree .cat-node:not(.uncategorized)')].map((n) => n.draggable),
+      // Rows drag by pointer events now (Task 16); the gate is their
+      // data-draggable flag, which applyLockGates keeps in step with the vault.
+      drag: [...document.querySelectorAll('#catTree .cat-node:not(.uncategorized)')].map((n) => n.dataset.draggable === 'true'),
     }));
     const otherControls = () => page.evaluate(() => ({
       clear: [document.getElementById('auditClearBtn').disabled, document.getElementById('auditClearBtn').title],

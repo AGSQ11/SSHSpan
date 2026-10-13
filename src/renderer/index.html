@@ -1010,7 +1010,7 @@
           <span class="modal-title-ico" data-ico="settings"></span>
           <h2 id="chmodTitle">Permissions</h2>
         </div>
-        <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
+        <button class="icon-btn" data-close title="Close" aria-label="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
         <table class="chmod-grid">
@@ -1059,7 +1059,9 @@
           <span class="modal-title-ico" data-ico="file-text"></span>
           <h2 id="conflictTitle">Target file already exists</h2>
         </div>
-        <button class="icon-btn" id="conflictCloseBtn" title="Close"></button>
+        <!-- The shared X (A1-28c): it rendered empty and was named only by
+             its tooltip. -->
+        <button class="icon-btn" id="conflictCloseBtn" title="Close" aria-label="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
         <p id="conflictSummary" class="hint"></p>
@@ -1074,6 +1076,37 @@
         <span class="hint" id="conflictHint">Skip removes a file from this batch.</span>
         <button id="conflictCancelBtn" class="ghost-btn">Cancel</button>
         <button id="conflictApplyBtn" class="primary-btn">Continue</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- SFTP edit conflict (A7-19): a file open in an external editor changed,
+       or was deleted, on the server since it was opened. It asks about one
+       file at a time: a newer conflict for the file on screen replaces the
+       question, one for another file waits its turn (the note under the
+       question counts them). Filled with text and <bdi> only (sftp.js
+       sftpShowEditConflict); the polite live region says when the question
+       changes while the prompt is open. -->
+  <div class="modal-backdrop" id="editConflictModal" hidden>
+    <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="editConflictTitle" aria-describedby="editConflictMessage editConflictDetail">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="triangle-alert"></span>
+          <h2 id="editConflictTitle">Changed on the server</h2>
+        </div>
+      </header>
+      <div class="modal-body">
+        <p id="editConflictMessage"></p>
+        <p id="editConflictDetail" class="hint"></p>
+        <p id="editConflictServer" class="hint"></p>
+        <p class="field-error" id="editConflictError" role="alert" hidden></p>
+        <p id="editConflictQueue" class="hint edit-conflict-queue" hidden></p>
+        <p id="editConflictLive" class="sftp-live" role="status" aria-live="polite"></p>
+      </div>
+      <footer class="modal-footer">
+        <button id="editConflictCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="editConflictReloadBtn" class="ghost-btn">Reload</button>
+        <button id="editConflictOverwriteBtn" class="danger-btn">Overwrite</button>
       </footer>
     </div>
   </div>

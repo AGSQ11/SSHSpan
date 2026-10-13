@@ -280,14 +280,24 @@ const modalStack = [];
 // lock. A closer must leave nothing pending - it resolves the dialog's promise
 // or callback with the "no" answer and blanks any secret field. A dialog that
 // has no closer is left to handle its own Escape.
+//
+// A dialog whose answer to a lock is not its answer to Escape registers that
+// too (`onLock`): the lock settles every dialog while the vault still reads as
+// unlocked (lockNow does it before the round trip), so a closer cannot tell
+// the two apart by state.unlocked.
 const modalClosers = new Map();
+const modalLockClosers = new Map();
 
-function registerModalCloser(node, fn) {
-  if (node && typeof fn === 'function') modalClosers.set(node, fn);
+function registerModalCloser(node, fn, onLock) {
+  if (!node || typeof fn !== 'function') return;
+  modalClosers.set(node, fn);
+  if (typeof onLock === 'function') modalLockClosers.set(node, onLock);
+  else modalLockClosers.delete(node);
 }
 
 function unregisterModalCloser(node) {
   modalClosers.delete(node);
+  modalLockClosers.delete(node);
 }
 
 /// Stacking follows open order, not document order. Every .modal-backdrop used
@@ -760,8 +770,10 @@ function catNodeEl(cat, depth) {
   row.dataset.id = cat.id;
   row.dataset.depth = String(depth);
   // A drop is category_reparent, which the backend refuses while the vault
-  // is locked (A6-08); applyLockGates() keeps this in step afterwards.
-  row.draggable = state.unlocked;
+  // is locked (A6-08); applyLockGates() keeps this in step afterwards. Not
+  // the HTML5 `draggable` (A3-23): a native drag would take the pointer
+  // events the drag below runs on.
+  row.dataset.draggable = state.unlocked ? 'true' : 'false';
   if (activeCategoryId() === cat.id) row.classList.add('active');
   // Keyboard-operable (A1-11): a tab stop, Enter/Space filter by it. It is a
   // toggle - selecting the active category clears the filter - so it says
@@ -821,7 +833,7 @@ function catNodeEl(cat, depth) {
   row.appendChild(menuBtn);
 
   row.addEventListener('click', () => { setActiveCategory(cat.id); });
-  attachCatDnD(row, cat, depth);
+  attachCatDnD(row, cat);
 
   wrap.appendChild(row);
 
@@ -1187,59 +1199,246 @@ function openMenu(at, items, opts) {
 // ─── cat row menu ─────────────────────────────────────────────────────────
 
 function openCatMenu(cat, anchor) {
+  // Move up / Move down do what a drag above or below a neighbour does, with
+  // no drag (WCAG 2.2 SC 2.5.7); so does Alt+ArrowUp / Alt+ArrowDown on the
+  // focused row (attachCatDnD).
+  const { list, i } = catShownSiblings(cat.id);
   openMenu(anchor, [
     { label: 'Rename', icon: 'pencil', onSelect: () => renameCategory(cat.id) },
     { label: 'New subcategory', icon: 'folder-plus', onSelect: () => addCategoryPrompt(cat.id) },
     { label: 'Move to...', icon: 'move', onSelect: () => moveCategoryPrompt(cat.id) },
+    { label: 'Move up', icon: 'arrow-up', disabled: i <= 0, onSelect: () => catMoveBy(cat.id, -1) },
+    { label: 'Move down', icon: 'arrow-down', disabled: i < 0 || i >= list.length - 1, onSelect: () => catMoveBy(cat.id, 1) },
     { label: 'Delete', icon: 'x', danger: true, onSelect: () => deleteCategory(cat.id) },
   ], { alignRight: true, label: 'Category actions' });
 }
 
-// ─── HTML5 drag-and-drop for the sidebar tree ─────────────────────────────
+/// The rows shown beside a category (under the parent its row is shown
+/// under) and its place among them.
+function catShownSiblings(id) {
+  const list = childrenOf(state.uiParentOf.get(id) || null);
+  return { list, i: list.findIndex((c) => c.id === id) };
+}
 
-function attachCatDnD(row, cat, depth) {
-  row.addEventListener('dragstart', (e) => {
-    state.draggingCatId = cat.id;
-    row.classList.add('dragging');
-    e.dataTransfer.setData('text/plain', cat.id);
-    e.dataTransfer.effectAllowed = 'move';
-  });
-  row.addEventListener('dragend', () => {
-    state.draggingCatId = null;
-    row.classList.remove('dragging');
-    document.querySelectorAll('.cat-node').forEach(n => n.classList.remove('drop-before', 'drop-after', 'drop-into'));
-  });
-  row.addEventListener('dragover', (e) => {
-    if (!state.draggingCatId || state.draggingCatId === cat.id) return;
+/// Move a category one place up (-1) or down (+1) among the rows shown beside
+/// it: before the one above, or after the one below - the drag's zones.
+async function catMoveBy(id, step) {
+  if (!lockGateOpen('categories')) return;
+  const { list, i } = catShownSiblings(id);
+  const other = i < 0 ? null : list[i + step];
+  if (!other) return;
+  try {
+    await moveCategoryTo(id, other, step < 0 ? 'before' : 'after');
+  } catch (err) { toast(err.message || String(err), 'err'); }
+  await catReadBack();
+}
+
+/// After a category move: read back whatever did change (a refused move
+/// changes nothing; a failed renumbering may have changed some) - this never
+/// rejects - then redraw the list the tree filters (server categories are
+/// moved in Servers).
+async function catReadBack() {
+  await loadCategories();
+  if (state.categoryScope === 'host') renderServerList(); else renderKeyList();
+}
+
+// ─── pointer drag and drop (the sidebar tree; sftp.js uses it too) ────────
+//
+// In-page drags run on pointer events, not HTML5 drag and drop (A3-23). On
+// Windows the webview's drop handling belongs to Tauri while
+// `dragDropEnabled` is on - and OS file drops onto the SFTP list need it on -
+// so HTML5 `dragover` / `drop` never reach the page: a category drag, an SFTP
+// move or a pane-to-pane transfer started (the cursor changed) and did nothing.
+//
+// A press that moves past POINTER_DRAG_THRESHOLD_PX is a drag: a ghost
+// follows the pointer, the target under it is lit, Escape cancels, and only
+// the release acts. Whatever is dragged can also be done without dragging
+// (WCAG 2.2 SC 2.5.7): the category menu's Move to..., Move up and Move down
+// (Alt+ArrowUp / Alt+ArrowDown on a focused row), and Move to... / Download /
+// Upload in the SFTP menus.
+
+const POINTER_DRAG_THRESHOLD_PX = 5;
+/// The press or drag being watched, or null: one at a time.
+let pointerDrag = null;
+
+/// Watch a press (`ev`, a pointerdown) that may become a drag.
+///   o.label        what the ghost says;
+///   o.over(x, y)   lights the target under the pointer, true when there is one
+///                  (the ghost dims over anything else);
+///   o.drop(x, y)   the release of a drag that was not cancelled;
+///   o.cleanup()    takes the lights down - once, however the gesture ends;
+///   o.onStart()    the press became a drag.
+/// Returns false (and watches nothing) while another gesture is under way.
+function beginPointerDrag(ev, o) {
+  if (pointerDrag) return false;
+  const g = { id: ev.pointerId, x: ev.clientX, y: ev.clientY, started: false, cancelled: false, cleaned: false, ghost: null };
+  pointerDrag = g;
+  const tidy = () => {
+    if (g.ghost) { g.ghost.remove(); g.ghost = null; }
+    document.body.classList.remove('pointer-dragging');
+    if (g.started && !g.cleaned) {
+      g.cleaned = true;
+      if (typeof o.cleanup === 'function') o.cleanup();
+    }
+  };
+  const onMove = (e) => {
+    if (e.pointerId !== g.id || g.cancelled) return;
+    if (!g.started) {
+      if (Math.hypot(e.clientX - g.x, e.clientY - g.y) < POINTER_DRAG_THRESHOLD_PX) return;
+      g.started = true;
+      g.ghost = document.createElement('div');
+      g.ghost.className = 'drag-ghost';
+      g.ghost.setAttribute('aria-hidden', 'true');
+      g.ghost.textContent = o.label;
+      document.body.appendChild(g.ghost);
+      document.body.classList.add('pointer-dragging');
+      if (typeof o.onStart === 'function') o.onStart();
+    }
+    g.ghost.style.left = (e.clientX + 14) + 'px';
+    g.ghost.style.top = (e.clientY + 12) + 'px';
+    g.ghost.classList.toggle('no-drop', !o.over(e.clientX, e.clientY));
+  };
+  const onKey = (e) => {
+    if (e.key !== 'Escape' || !g.started || g.cancelled) return;
+    // Only the drag hears this Escape - not a quick-find, not a dialog.
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    row.classList.remove('drop-before', 'drop-after', 'drop-into');
-    row.classList.add('drop-' + catDropZone(row, e.clientY));
+    e.stopImmediatePropagation();
+    g.cancelled = true;
+    tidy();
+  };
+  const end = () => {
+    if (pointerDrag === g) pointerDrag = null;
+    window.removeEventListener('pointermove', onMove, true);
+    window.removeEventListener('pointerup', onUp, true);
+    window.removeEventListener('pointercancel', onCancel, true);
+    window.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('blur', onCancel);
+    tidy();
+  };
+  function onUp(e) {
+    if (e.pointerId !== g.id) return;
+    const drop = g.started && !g.cancelled;
+    end();
+    // The release of a drag - a cancelled one too - is not also a click on
+    // what is under it: a row click selects, a tree click filters, and a
+    // double-click (a press that ended a click, then dragged) downloads or
+    // uploads the row.
+    if (g.started) swallowNextClick();
+    if (drop) o.drop(e.clientX, e.clientY);
+  }
+  // The window lost the pointer (blur) or the system took the gesture
+  // (pointercancel): the drag ends here. Its release, if it still comes, is
+  // not a click either; a new press means it never will.
+  function onCancel(e) {
+    if (e && e.pointerId !== undefined && e.pointerId !== g.id) return;
+    const started = g.started;
+    end();
+    if (started) swallowReleaseOf(g.id);
+  }
+  window.addEventListener('pointermove', onMove, true);
+  window.addEventListener('pointerup', onUp, true);
+  window.addEventListener('pointercancel', onCancel, true);
+  window.addEventListener('keydown', onKey, true);
+  window.addEventListener('blur', onCancel);
+  return true;
+}
+
+/// The click - and the double-click, when the press ended one - a browser
+/// sends after a release: dispatched in the same task as the release, so
+/// listeners taken down on the next tick see them.
+function swallowNextClick() {
+  const swallow = (e) => { e.stopPropagation(); e.preventDefault(); };
+  window.addEventListener('click', swallow, { capture: true, once: true });
+  window.addEventListener('dblclick', swallow, { capture: true, once: true });
+  setTimeout(() => {
+    window.removeEventListener('click', swallow, { capture: true });
+    window.removeEventListener('dblclick', swallow, { capture: true });
+  }, 0);
+}
+
+/// After a drag that was cut short: the release of pointer `id` - whenever
+/// it comes - clicks nothing. A press first means the release happened
+/// outside the window, and the wait ends there, so a later click is left
+/// alone.
+function swallowReleaseOf(id) {
+  const stop = () => {
+    window.removeEventListener('pointerup', up, true);
+    window.removeEventListener('pointerdown', stop, true);
+  };
+  const up = (e) => {
+    if (e.pointerId !== id) return;
+    stop();
+    swallowNextClick();
+  };
+  window.addEventListener('pointerup', up, true);
+  window.addEventListener('pointerdown', stop, true);
+}
+
+/// A category row drags by the pointer (see beginPointerDrag); its chevron
+/// and "..." button stay buttons. Focused, Alt+ArrowUp / Alt+ArrowDown move
+/// it one place without a drag.
+function attachCatDnD(row, cat) {
+  row.addEventListener('keydown', (ev) => {
+    if (ev.target !== row || !ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+    const step = ev.key === 'ArrowUp' ? -1 : ev.key === 'ArrowDown' ? 1 : 0;
+    if (!step || row.dataset.draggable !== 'true') return;
+    ev.preventDefault();
+    catMoveBy(cat.id, step);
   });
-  row.addEventListener('dragleave', () => {
-    row.classList.remove('drop-before', 'drop-after', 'drop-into');
+  row.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
+    if (ev.target.closest('.cat-chevron, .cat-actions-btn')) return;
+    // Locked, the tree is cleared; a row built before the lock carries the
+    // gate (applyLockGates).
+    if (row.dataset.draggable !== 'true') return;
+    beginPointerDrag(ev, {
+      label: cat.name,
+      onStart: () => row.classList.add('dragging'),
+      over: (x, y) => catDragOver(cat.id, x, y),
+      cleanup: () => { row.classList.remove('dragging'); clearCatDropMarks(); },
+      drop: (x, y) => catDropAt(cat.id, x, y),
+    });
   });
-  row.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    const draggedId = state.draggingCatId;
-    state.draggingCatId = null;
-    // Where it landed, from the pointer - the same rule that drew the drop
-    // highlight. This read the highlight classes AFTER clearing them, so every
-    // drop was "after": nesting by drag never worked (A2-07).
-    const zone = catDropZone(row, e.clientY);
-    row.classList.remove('drop-before', 'drop-after', 'drop-into');
-    if (!draggedId || draggedId === cat.id) return;
-    // A drag that started before the vault locked.
-    if (!lockGateOpen('categories')) return;
-    try {
-      await moveCategoryTo(draggedId, cat, zone);
-    } catch (err) { toast(err.message || String(err), 'err'); }
-    // Read back whatever did change (a refused move changes nothing; a failed
-    // renumbering may have changed some), never rejects. Then the list the
-    // tree filters - server categories are dragged in Servers.
-    await loadCategories();
-    if (state.categoryScope === 'host') renderServerList(); else renderKeyList();
-  });
+}
+
+function clearCatDropMarks() {
+  for (const n of document.querySelectorAll('#catTree .cat-node.drop-before, #catTree .cat-node.drop-after, #catTree .cat-node.drop-into')) {
+    n.classList.remove('drop-before', 'drop-after', 'drop-into');
+  }
+}
+
+/// The category row at (x, y) that a drag of `draggedId` can be dropped on.
+function catDropRowAt(draggedId, x, y) {
+  const hit = document.elementFromPoint(x, y);
+  const row = hit && hit.closest ? hit.closest('#catTree .cat-node') : null;
+  if (!row || row.classList.contains('uncategorized') || row.dataset.id === draggedId) return null;
+  return row;
+}
+
+/// Show where the dragged category would go: before, into or after the row
+/// under the pointer (A2-07's zones).
+function catDragOver(draggedId, x, y) {
+  clearCatDropMarks();
+  const row = catDropRowAt(draggedId, x, y);
+  if (!row) return false;
+  row.classList.add('drop-' + catDropZone(row, y));
+  return true;
+}
+
+/// The release: where it landed is read from the pointer, by the same rule
+/// that drew the highlight (reading the highlight after clearing it made
+/// every drop "after" - A2-07).
+async function catDropAt(draggedId, x, y) {
+  const row = catDropRowAt(draggedId, x, y);
+  const target = row && catById(row.dataset.id);
+  if (!target) return;
+  const zone = catDropZone(row, y);
+  // A drag that started before the vault locked.
+  if (!lockGateOpen('categories')) return;
+  try {
+    await moveCategoryTo(draggedId, target, zone);
+  } catch (err) { toast(err.message || String(err), 'err'); }
+  await catReadBack();
 }
 
 /// Which part of a category row the pointer is over: the top quarter means
@@ -1253,10 +1452,21 @@ function catDropZone(row, clientY) {
 }
 
 /// Move category `id` before, after or into `target`, numbering the siblings
-/// it joins 0..n-1 in their new order (A2-07). "sort_index + 1" used to tie
-/// with the next sibling, and ties are broken by name, so a drop could land
-/// anywhere. The moved category is sent first: the backend refuses a move
-/// into its own subtree, and then nothing else changes.
+/// it joins so the order shown is the order kept (A2-07): "sort_index + 1"
+/// used to tie with the next sibling, and ties are broken by name. The moved
+/// category is sent first: the backend refuses a move into its own subtree,
+/// and then nothing else changes.
+///
+/// At the top level two kinds of rows are shown without being saved there.
+/// A row whose parent no longer exists is a real sibling: it is renumbered
+/// like the others, which also writes it a top-level parent - safe, as there
+/// is no chain for the backend to walk. The one promoted member of each
+/// restored parent loop is never written (that would quietly change its saved
+/// parent), so a drop next to it takes its place from that row's
+/// own sort_index - one below for "before", one above for "after" - and the
+/// real siblings on that side move one further out. Numbering the real rows
+/// 0..n-1 as if those rows were not there left a drop after one of them one
+/// place early, however often it was repeated.
 async function moveCategoryTo(id, target, zone) {
   // Beside a row means under the parent it is SHOWN under (fix2 N1): a
   // promoted loop member, or one whose parent no longer exists, is top level.
@@ -1265,21 +1475,30 @@ async function moveCategoryTo(id, target, zone) {
   const parentId = zone === 'into' ? target.id : (state.uiParentOf.get(target.id) || null);
   if (!categoryCanHoldChildren(parentId)) throw new Error(CATEGORY_LOOP_REFUSAL);
   const siblings = childrenOf(parentId).filter((c) => c.id !== id);
-  let at = siblings.length;
-  if (zone !== 'into') {
-    const i = siblings.findIndex((c) => c.id === target.id);
-    at = i === -1 ? siblings.length : (zone === 'before' ? i : i + 1);
+  // A promoted loop member: shown at the top level, no root up its chain.
+  const pinned = (c) => parentId === null && !catRoot(c);
+  const real = siblings.filter((c) => !pinned(c));
+  const place = (cid, sortIndex) => call('category_reparent', { id: cid, newParentId: parentId, sortIndex });
+  if (zone !== 'into' && pinned(target)) {
+    const step = zone === 'before' ? -1 : 1;
+    const at = target.sort_index + step;
+    await place(id, at);
+    for (const c of real) {
+      if (step < 0 ? c.sort_index <= at : c.sort_index >= at) await place(c.id, c.sort_index + step);
+    }
+    return;
   }
-  await call('category_reparent', { id, newParentId: parentId, sortIndex: at });
-  const order = [...siblings.slice(0, at), { id }, ...siblings.slice(at)];
+  let at = real.length;
+  if (zone !== 'into') {
+    const i = real.findIndex((c) => c.id === target.id);
+    at = i === -1 ? real.length : (zone === 'before' ? i : i + 1);
+  }
+  await place(id, at);
+  const order = [...real.slice(0, at), { id }, ...real.slice(at)];
   for (let i = 0; i < order.length; i++) {
     const c = order[i];
     if (c.id === id || c.sort_index === i) continue;
-    // Only genuine siblings are renumbered. A promoted loop member or a
-    // category with a dangling parent is shown at the top level, but writing
-    // it there would quietly change its saved parent (fix2 N1).
-    if ((c.parent_id || null) !== parentId) continue;
-    await call('category_reparent', { id: c.id, newParentId: parentId, sortIndex: i });
+    await place(c.id, i);
   }
 }
 
@@ -1678,8 +1897,6 @@ const state = window.state = {
   pickerExclude: null,        // Move to...: categories that may not be offered
   pickerTopLevel: false,      // Move to...: offer "Top level" first
   uiParentOf: new Map(),      // category id -> the parent its row is SHOWN under (null: top level)
-  // drag
-  draggingCatId: null,
   // prompt
   promptCallback: null,
   promptSecret: false,
@@ -1997,7 +2214,7 @@ function applyLockGate(control) {
 function applyLockGates() {
   for (const n of document.querySelectorAll('[data-lock-gate]')) applyLockGate(n);
   for (const n of document.querySelectorAll('[data-lock-hint]')) n.hidden = state.unlocked;
-  for (const n of document.querySelectorAll('#catTree .cat-node:not(.uncategorized)')) n.draggable = state.unlocked;
+  for (const n of document.querySelectorAll('#catTree .cat-node:not(.uncategorized)')) n.dataset.draggable = state.unlocked ? 'true' : 'false';
 }
 
 /// The same rule for the actions behind those controls, for a menu or a drag
@@ -2035,6 +2252,8 @@ function clearConnectView() {
     // Its assistant conversation, pending approval and access level go too.
     window.assistantClearTab?.(tabId);
   }
+  // So does any question about a file edited over those sessions (sftp.js).
+  window.sftpPruneEditConflicts?.();
   state.activeTabId = null;
   const sbody = document.getElementById('sftpBody');
   if (sbody) {
@@ -4186,6 +4405,111 @@ function bwPendingRemoteChanges(s) {
   return parts.join(', ');
 }
 
+/// Most characters a value from a Bitwarden item takes in the approval list.
+const BW_TEXT_MAX = 80;
+
+/// Text from a Bitwarden item, as the approval list shows it: control, format
+/// and text-direction characters dropped (U+061C, U+200B-200F, U+202A-202E,
+/// U+2060-2069 and U+FEFF among them - a name holding U+2069 and U+202E closed
+/// the isolate it sat in and turned the rest of its line around), every run
+/// of whitespace one space (a name padded with spaces posed as a line of its
+/// own), the ends trimmed, and at most BW_TEXT_MAX characters, the last an
+/// ellipsis when it was cut. Anyone who can edit the vault item writes this
+/// text; the backend cleans it too, and this does not count on that.
+function bwCleanText(text) {
+  const s = String(text == null ? '' : text)
+    .replace(/[\u0000-\u0008\u000E-\u001F\u007F-\u009F\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const chars = Array.from(s);
+  return chars.length > BW_TEXT_MAX ? chars.slice(0, BW_TEXT_MAX - 1).join('').trimEnd() + '…' : s;
+}
+
+/// A Bitwarden value inside a sentence of plain text (the sync's status
+/// line): cleaned (bwCleanText - no isolate, override or mark of its own is
+/// left), then kept to itself between FIRST STRONG ISOLATE and POP
+/// DIRECTIONAL ISOLATE.
+function bwInText(text) {
+  return '\u2068' + bwCleanText(text) + '\u2069';
+}
+
+/// "host:port", an IPv6 host in brackets ("[::1]:22"); null without a host.
+function bwAddress(host, port) {
+  if (!host) return null;
+  const h = String(host);
+  const shown = h.includes(':') && !h.startsWith('[') ? '[' + h + ']' : h;
+  return port != null ? shown + ':' + port : shown;
+}
+
+/// The settings a server pull would change, in words (the sync result names
+/// them host, port, user, password, authMethod, linkedKey; an unknown name is
+/// shown as it comes, cleaned).
+function bwChangeName(name) {
+  const words = { host: 'host', port: 'port', user: 'user name', password: 'saved password', authMethod: 'sign-in method', linkedKey: 'linked key' };
+  return words[name] || bwCleanText(name);
+}
+
+/// The changes a sync left for approval, as a list under the question: the
+/// servers it would overwrite - the address each has here, the one it would
+/// get and which of its settings would change - and the new ones; the keys
+/// it would replace - with the fingerprint each would get - and the new ones.
+/// From the sync result's optional pendingServers / pendingKeys; null without
+/// them (an older backend: the question gives the counts alone). One entry
+/// per change, each value in a <bdi> of its own, all of it text - never
+/// markup. A list cut at 50 says how many more there are, and that Apply
+/// applies those too.
+function bwPendingList(s) {
+  const servers = arrayOrEmpty(s.pendingServers);
+  const keys = arrayOrEmpty(s.pendingKeys);
+  if (!servers.length && !keys.length) return null;
+  const box = document.createElement('div');
+  box.className = 'bw-pending';
+  const value = (text) => {
+    const b = document.createElement('bdi');
+    b.textContent = bwCleanText(text);
+    return b;
+  };
+  const fromItem = (p) => (p.incomingName && bwCleanText(p.incomingName) !== bwCleanText(p.name)
+    ? [' (from the Bitwarden item ', value(p.incomingName), ')'] : []);
+  const group = (title, entries, total, describe) => {
+    if (!entries.length) return;
+    const head = document.createElement('p');
+    head.className = 'bw-pending-head';
+    head.textContent = title;
+    const list = document.createElement('ul');
+    for (const p of entries) {
+      const li = document.createElement('li');
+      li.append(...describe(p || {}));
+      list.appendChild(li);
+    }
+    if (s.pendingTruncated && total > entries.length) {
+      const li = document.createElement('li');
+      li.textContent = `and ${total - entries.length} more`;
+      list.appendChild(li);
+    }
+    box.append(head, list);
+  };
+  group('Servers', servers, (s.skippedServerOverwrites || 0) + (s.skippedServerNew || 0), (p) => {
+    const incoming = p.host ? value(bwAddress(p.host, p.port)) : 'no address in Bitwarden';
+    if (p.kind !== 'overwrite') return ['new: ', value(p.name), ', ', incoming];
+    const changes = arrayOrEmpty(p.changes).map(bwChangeName).filter(Boolean);
+    return [value(p.name), ': ', p.localHost ? value(bwAddress(p.localHost, p.localPort)) : 'no address', ' → ', incoming,
+      ...fromItem(p), ...(changes.length ? [` - changes: ${changes.join(', ')}`] : [])];
+  });
+  group('Keys', keys, (s.skippedOverwrites || 0) + (s.skippedNew || 0), (p) => {
+    const incoming = p.fingerprint ? value(p.fingerprint) : 'fingerprint unknown';
+    if (p.kind !== 'overwrite') return ['new: ', value(p.name), ', ', incoming];
+    return [value(p.name), ': ', p.localFingerprint ? value(p.localFingerprint) : 'fingerprint unknown', ' → ', incoming, ...fromItem(p)];
+  });
+  if (s.pendingTruncated) {
+    const note = document.createElement('p');
+    note.className = 'bw-pending-note';
+    note.textContent = 'Not every change is listed (the list stops at 50 of each kind). Apply also applies the changes not listed here.';
+    box.appendChild(note);
+  }
+  return box;
+}
+
 /// What a sync did, keys and servers apart (A7-24: only the key counters were
 /// read, so a run that only moved servers said "Nothing to sync."), with the
 /// linked items gone from Bitwarden and what was renamed or left unapplied.
@@ -4209,8 +4533,10 @@ function bwSyncSummary(s) {
   if (s.linked > 0) parts.push('Matched to existing Bitwarden items: ' + s.linked + '.');
   if (s.conflicts > 0) parts.push('Conflicts (changed on both sides - the copy here replaced the one in Bitwarden): ' + s.conflicts + '.');
   if (s.remoteDeleted) parts.push(plural(s.remoteDeleted, 'linked item') + ' gone from Bitwarden (kept here).');
+  // Item names, in a line of plain text: cleaned and kept to themselves, so
+  // an override in one cannot turn the rest of the line around.
   const renamed = arrayOrEmpty(s.renamed);
-  if (renamed.length) parts.push('Renamed: ' + renamed.map((r) => `${r.name} stored as ${r.storedAs}`).join(', ') + '.');
+  if (renamed.length) parts.push('Renamed: ' + renamed.map((r) => `${bwInText(r.name)} stored as ${bwInText(r.storedAs)}`).join(', ') + '.');
   const pending = bwPendingRemoteChanges(s);
   if (pending) parts.push('Not applied: ' + pending + '.');
   return parts.join(' ');
@@ -4251,8 +4577,19 @@ async function bwSyncNow() {
       let s = await call('bitwarden_sync', { allowRemoteOverwrite: false });
       const pending = s && s.ok !== false ? bwPendingRemoteChanges(s) : '';
       if (pending) {
-        const apply = await confirmModal('Apply remote changes',
-          'Bitwarden has changes that need your approval: ' + pending + '. Apply them now?', 'Apply');
+        // What would change, by name, as a list under the question (built
+        // from text only - bwPendingList). It leaves with the question, the
+        // dialog being shared, and is not added when another question holds
+        // the dialog (confirmModal refuses this one then).
+        const list = bwPendingList(s);
+        if (list && !(confirmPending && !el('confirmModal').hidden)) el('confirmMessage').after(list);
+        let apply;
+        try {
+          apply = await confirmModal('Apply remote changes',
+            'Bitwarden has changes that need your approval: ' + pending + '. Apply them now?', 'Apply');
+        } finally {
+          if (list) list.remove();
+        }
         // The vault can lock while the dialog is open; a lock answers it "no",
         // and this keeps a late approval from reaching a vault that is sealed.
         if (apply && state.unlocked) s = await call('bitwarden_sync', { allowRemoteOverwrite: true });
@@ -5906,11 +6243,12 @@ function onVaultLocked() {
   cancelAutoLockTimer();
 }
 
-/// Close every open dialog through its own closer (so a pending confirmation,
-/// connect-password prompt or YOLO opt-in is answered "no" rather than left
-/// waiting for a click that could now act on a sealed vault), topmost first,
-/// then wipe the places a secret can sit. The vault dialog itself is closed
-/// without being marked dismissed: the unlock gate that follows must show.
+/// Close every open dialog through its own closer - its lock closer, where it
+/// registered one - so a pending confirmation, connect-password prompt or
+/// YOLO opt-in is answered "no" rather than left waiting for a click that
+/// could now act on a sealed vault; topmost first. Then wipe the places a
+/// secret can sit. The vault dialog itself is closed without being marked
+/// dismissed: the unlock gate that follows must show.
 function closeDialogsForLock() {
   // An open menu goes too: a category's Rename / Delete or a key's Connect,
   // over a tree and a list the lock empties.
@@ -5920,7 +6258,7 @@ function closeDialogsForLock() {
     .filter((n) => !n.hidden && n !== el('vaultModal'))
     .sort((a, b) => rank(b) - rank(a));
   for (const node of open) {
-    const close = modalClosers.get(node);
+    const close = modalLockClosers.get(node) || modalClosers.get(node);
     try {
       if (close) close();
     } catch (e) {
@@ -7302,8 +7640,10 @@ async function closeSessionTab(tabId, { skipConfirm = false } = {}) {
   const panel = document.getElementById('sftpPanel-' + tabId);
   if (panel) panel.remove();
   state.sessions.delete(tabId);
-  // Its assistant conversation, pending approval and access level go too.
+  // Its assistant conversation, pending approval and access level go too,
+  // and any question about a file edited over its session (sftp.js).
   window.assistantClearTab?.(tabId);
+  window.sftpPruneEditConflicts?.();
   if (state.activeTabId === tabId) {
     const nextId = state.sessions.keys().next().value || null;
     if (nextId) activateSessionSurface(nextId);
