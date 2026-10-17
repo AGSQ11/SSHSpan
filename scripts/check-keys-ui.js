@@ -911,7 +911,7 @@ async function scenarioDeploy(browser, server) {
     check('no page errors', app.errors, []);
   });
 
-  // J6 (R10): server_save's `warning` - a key file protected by a passphrase,
+  // J6 (A5-26): server_save's `warning` - a key file protected by a passphrase,
   // which SSHSpan cannot ask for when connecting - for servers the deploy
   // saved: each line names its server (as "Not saved as servers" does) and
   // gives the backend's words, spelled out, in one warning toast after the

@@ -3628,7 +3628,7 @@ mod tests {
 
     #[test]
     fn the_own_item_of_a_server_is_never_another_servers_item() {
-        // Round 4, at the planner: an item another local server is linked to
+        // At the planner: an item another local server is linked to
         // is that server's, whatever its notes say; several unowned items
         // naming a server are not guessed between.
         let web = server_row("web", None, never_synced());

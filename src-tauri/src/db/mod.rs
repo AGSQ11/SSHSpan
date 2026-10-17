@@ -408,10 +408,10 @@ fn count_category_read(db_path: &std::path::Path) {
 /// `block_on` parks on the very parker of that thread's `block_on`, and used
 /// up a wake-up meant for another part of the root future that came in
 /// meanwhile - which then waited for the next event, forever when there was
-/// none (the hung MCP tests of round 6). On a current-thread runtime it does
-/// not: that thread drives the runtime's timers and I/O, which would stop
-/// while it sleeps on a parker of its own - `block_in_place` refuses there
-/// at once, as it always did.
+/// none (tests that raced a call with a change hung this way). On a
+/// current-thread runtime it does not: that thread drives the runtime's
+/// timers and I/O, which would stop while it sleeps on a parker of its own -
+/// `block_in_place` refuses there at once, as it always did.
 fn block<F: std::future::Future<Output = T>, T>(f: F) -> T {
     if tokio::runtime::Handle::try_current().is_err() {
         return cached_runtime().block_on(f);
@@ -4796,8 +4796,8 @@ mod tests {
     /// that very `block_on`. A wake-up meant for another part of the root
     /// future that came in during the call was used up there, and the root
     /// future waited for the next event: here for the 30 s timer, in the MCP
-    /// tests of round 6 forever. The call parks on a parker of its own now,
-    /// and the wake-up is kept.
+    /// tests that raced a call with a change forever. The call parks on a
+    /// parker of its own now, and the wake-up is kept.
     #[test]
     fn rw_fix6_a_database_call_in_a_block_on_root_keeps_the_wake_ups_of_others() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -5233,7 +5233,7 @@ mod ru5_fix2_tests {
 
     #[test]
     fn a_settings_write_waits_for_another_connections_write() {
-        // Round 3: the settings transaction read first and wrote second; with
+        // The settings transaction used to read first and write second; with
         // another connection holding a write, SQLite refused the upgrade at
         // once ("database is locked") instead of waiting, so a finished sync
         // failed to store its result and Save could fail for nothing.
@@ -5339,8 +5339,8 @@ mod ru5_fix2_tests {
 
     #[test]
     fn a_pull_waits_for_another_connections_write() {
-        // Round 4: apply_pulled_key / apply_pulled_server read the row and then
-        // wrote it in a deferred transaction, so another connection's write
+        // apply_pulled_key / apply_pulled_server used to read the row and then
+        // write it in a deferred transaction, so another connection's write
         // made the pull fail at once ("database is locked") instead of waiting.
         let path = temp_db_path();
         let db = Database::open_at(path.clone()).unwrap();

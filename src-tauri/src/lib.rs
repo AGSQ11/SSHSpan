@@ -75,7 +75,9 @@ pub fn run() {
             app.manage(commands::VaultGeneration::new());
             // Master-password change vs. every other write of sealed data
             app.manage(commands::VaultRotationLock::new());
-            // One native credential question (MCP binding, API key move) at a time
+            // One native credential question (MCP credential, assistant API
+            // key move, Bitwarden sync destination) at a time, app-wide, and
+            // per kind the 30-second wait after a "no"
             app.manage(commands::CredentialQuestions::new());
             // Per-tab AI access levels; in-memory, cleared on vault lock
             app.manage(assistant::AssistantLevels::new());

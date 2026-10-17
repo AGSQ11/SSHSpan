@@ -3119,11 +3119,12 @@ mod tests {
 
     /// On a server that leaves the type bits out and answers "list
     /// this folder" on a file with "permission denied", the `.part` could not
-    /// be proven to be a file: every upload failed (it worked before round
-    /// 1), and the unknown `.part` then blocked the next upload - the
-    /// pre-clean left it and the exclusive create failed. A `.part` that is
-    /// not a link and holds exactly the bytes just written is accepted, and a
-    /// stale one of unknown type is removed.
+    /// be proven to be a file: every upload failed (it worked before the
+    /// rename checked for a regular file), and the unknown `.part` then
+    /// blocked the next upload - the pre-clean left it and the exclusive
+    /// create failed. A `.part` that is not a link and holds exactly the
+    /// bytes just written is accepted, and a stale one of unknown type is
+    /// removed.
     #[cfg(unix)]
     #[tokio::test]
     async fn ru6a_fix2_uploads_work_when_the_folder_probe_on_a_file_is_refused() {

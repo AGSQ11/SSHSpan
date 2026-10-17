@@ -6739,7 +6739,7 @@ mod tests {
 
     /// `fut`, or a failure saying `what` did not finish within
     /// [`LOADED_MACHINE_WAIT`]: a stall fails the test instead of hanging the
-    /// whole run (round 6).
+    /// whole run.
     async fn bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
         tokio::time::timeout(LOADED_MACHINE_WAIT, fut)
             .await
@@ -8472,10 +8472,10 @@ mod tests {
     /// server was removed - while its session was set up. The refresh used
     /// to run anyway, on that context: the OLD endpoint got `tools/list` on
     /// the very session the refusal had just ended. Nothing more goes there
-    /// now, and the context forgets the ended session. (Since round 5 the
-    /// change is caught once the initialize is answered, before that session
-    /// is registered - so the list change its answer announced goes with it,
-    /// and the refusal no longer carries it.)
+    /// now, and the context forgets the ended session. (The change is caught
+    /// once the initialize is answered, before that session is registered -
+    /// so the list change its answer announced goes with it, and the refusal
+    /// no longer carries it.)
     #[tokio::test(flavor = "multi_thread")]
     async fn rw_fix2_a_call_refused_for_new_settings_sends_nothing_more_to_the_old_endpoint() {
         for removed in [false, true] {
@@ -8597,9 +8597,9 @@ mod tests {
     /// the call, but the refresh checked only that the URL and credential
     /// were unchanged: it set up a session of its own, sent `initialize` and
     /// `tools/list` to the switched-off server and left that session
-    /// registered. Nothing more goes there now. (Since round 5 the refusal
-    /// comes before the call's session is registered, without the list
-    /// change its initialize announced - see the round-2 test above.)
+    /// registered. Nothing more goes there now. (The refusal comes before
+    /// the call's session is registered, without the list change its
+    /// initialize announced - see the new-settings test above.)
     #[tokio::test(flavor = "multi_thread")]
     async fn rw_fix3_a_call_refused_on_a_switched_off_server_refreshes_nothing() {
         for restored in [false, true] {
@@ -9180,7 +9180,7 @@ mod tests {
         }
     }
 
-    /// The code reviewer's probe: the change lands while the renewal's
+    /// A race: the change lands while the renewal's
     /// initialize is out. It got `notifications/initialized` and the page
     /// again on the new session, which stayed registered. Two checks stop it
     /// now - the set-up's own, after the initialize, and the one before the

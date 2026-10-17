@@ -262,11 +262,11 @@ function showAuditWarning(r) {
 }
 
 /// A backend `warning`, as text from outside: the backend's words, spelled
-/// out ('' when there is none). server_save's (R10: a key file protected by a
-/// passphrase, which SSHSpan cannot ask for when connecting - the server is
+/// out ('' when there is none). server_save's (A5-26: a key file protected by
+/// a passphrase, which SSHSpan cannot ask for when connecting - the server is
 /// saved either way, so the save says so as before and this follows as a
-/// warning); a Bitwarden save's or "Allow syncing..."'s (W1-W8, which name the
-/// host, or an audit warning).
+/// warning); a Bitwarden save's or "Allow syncing..."'s (the backend's warning
+/// texts - why the sync stays off - or an audit warning).
 function warningSpelled(r) {
   return r && typeof r.warning === 'string' && r.warning.trim() ? spellOut(r.warning) : '';
 }
@@ -4314,7 +4314,7 @@ function deployQuestion(writes, refused, plan, selected) {
 
 /// "Also save these as servers": one saved server per deployed key file, with
 /// the sheet's fields. Returns "<server>: <reason>" for each that could not be
-/// saved. A server saved with a warning about its key file (R10) is said in
+/// saved. A server saved with a warning about its key file (A5-26) is said in
 /// one warning toast after the count, each line "<server>: <warning>".
 async function saveDeployedAsServers(deployed, fields) {
   const failed = [];
@@ -4577,7 +4577,7 @@ async function loadBitwardenConfig() {
 }
 
 /// What a save or "Allow syncing..." says when the answer is "not allowed"
-/// without a reason of the backend's (which names one, W1-W8).
+/// without a reason of the backend's (each of its warning texts names one).
 const BW_NOT_ALLOWED = 'Bitwarden sync stays off until you allow it. Use "Allow syncing..." in Settings > Bitwarden.';
 
 /// A server URL's host - with its port when it is not the default - for a
@@ -7566,7 +7566,7 @@ async function submitServerModal() {
       toast(!hidden ? `Server saved${removed}.`
         : removed ? `Server saved${removed}. It is hidden by the current filter. Clear the filter to see it.`
           : 'Server saved - it is hidden by the current filter. Clear the filter to see it.', 'ok');
-      // What its key file needs (R10) follows as a warning of its own, so
+      // What its key file needs (A5-26) follows as a warning of its own, so
       // neither message hides the other - as a save with an audit warning.
       const warning = warningSpelled(r);
       if (warning) toast(warning, 'warn');

@@ -111,6 +111,33 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
+      # Windows only: build the test executables first; the manifest below goes beside them.
+      - name: Build the test executables (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-run
+
+      # Windows only: tests need a Common-Controls 6 manifest to load (same step as ci.yml's windows job).
+      - name: Declare Common-Controls 6 for the test executables (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $manifest = @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <dependency>
+              <dependentAssembly>
+                <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+              </dependentAssembly>
+            </dependency>
+          </assembly>
+          '@
+          $executables = @(Get-ChildItem -Path src-tauri/target/debug/deps -Filter *.exe)
+          if ($executables.Count -eq 0) { throw 'no test executables found in src-tauri/target/debug/deps' }
+          foreach ($exe in $executables) {
+            Set-Content -LiteralPath "$($exe.FullName).manifest" -Value $manifest -Encoding utf8
+          }
+          Write-Host "wrote $($executables.Count) manifests"
+
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 

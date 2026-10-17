@@ -825,7 +825,7 @@ pub fn apply_bitwarden_save(
 
 /// How many Bitwarden master-key derivations run at once, app-wide - Test
 /// connection and sync alike. Each is Argon2id with the account's memory
-/// (64 MiB by default, up to the 1 GiB ceiling, 16 passes at most) or
+/// (often 32 or 64 MiB, up to the 1 GiB ceiling, 16 passes at most) or
 /// PBKDF2: parallel sign-ins must not take every worker and gigabytes of
 /// memory.
 const KDF_PERMITS: usize = 2;
@@ -1938,8 +1938,8 @@ mod tests {
     // ── The master key is derived on the blocking pool, two at a time ──
 
     /// The derivation ran inline on the async worker of the sign-in. Now
-    /// that the memory is read in MiB, as the server means it - 64 MiB by
-    /// default, up to 1 GiB - parallel sign-ins could take every worker. It
+    /// that the memory is read in MiB, as the server means it - often 32 or
+    /// 64 MiB, up to 1 GiB - parallel sign-ins could take every worker. It
     /// runs on the blocking pool now (`on_pool_only` fails here otherwise)
     /// and still derives the master key of the official SDK's vector.
     #[tokio::test(flavor = "multi_thread")]

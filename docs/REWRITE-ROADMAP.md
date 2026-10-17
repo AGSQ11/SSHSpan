@@ -15,7 +15,7 @@ Branch: `rewrite-to-rust-improvements` (work branch: `migrate-to-tauri`). Delta 
 
 | Area | What existed |
 | --- | --- |
-| **Vault** | Master-password gate; private keys sealed with bcrypt-pbkdf2 + AES-256-GCM; in-memory password only |
+| **Vault** | Master-password gate; private keys sealed with scrypt (N=2^16, r=8, p=1) + AES-256-GCM; in-memory password only; database at `~/.sshspan/sshspan.db`. *(Correction 2026-10-09: this row used to say "bcrypt-pbkdf2"; the Node app's `cryptoService.js` derived keys with `scrypt`.)* |
 | **Keys** | Generate Ed25519 / RSA / ECDSA-P256/384/521; import OpenSSH (incl. encrypted), PKCS#8, SPKI, `authorized_keys` lines, PuTTY `.ppk` v3 **and legacy v2**; export to all of those formats; SHA-256/MD5 fingerprints |
 | **Categories** | User-defined tree (any depth), many-to-many key↔category, sidebar tree with drag-and-drop, breadcrumbs, grouped key list, multi-select picker; Bitwarden two-way sync encodes the tree into cipher `notes` as `{v:1, sshspan:{categories:[{id,path}]}}` with deterministic IDs for convergence |
 | **Bitwarden/Vaultwarden** | Direct Bitwarden API client (no `bw serve`): login, HKDF stretch, user-key unwrap, cipher CRUD restricted to a single SSHSpan folder, two-way sync (newest wins, deletions never propagated), SSRF-hardened server URL |
@@ -54,7 +54,7 @@ framework-free (plain DOM + `window.__TAURI__.core.invoke`) so the CSP can remai
 | Module | Responsibility |
 | --- | --- |
 | `src-tauri/src/crypto/keys.rs` | Key generation/import/export via the `ssh-key` crate: Ed25519, RSA (3072–8192), ECDSA P-256/384/521; OpenSSH/PKCS#8/SPKI/`authorized_keys` formats; SHA-256 + MD5 fingerprints; private halves held as raw OpenSSH blobs, converted to a target format only at export |
-| `src-tauri/src/crypto/vault.rs` | `seal()`/`unseal()` — bcrypt-pbkdf2 KDF + AES-256-GCM envelope; same scheme as v1.2.0, so **existing vaults migrate without re-entry** |
+| `src-tauri/src/crypto/vault.rs` | `seal()`/`unseal()` - Argon2id KDF (m=64 MiB, t=3, p=4) → HKDF-SHA-256 → AES-256-GCM envelope. This is **not** the scheme of the Electron app (1.2.0 and earlier, which derived keys with `scrypt`), and the Rust app keeps its vault in a different directory with a different schema, so **Electron-era (1.2.0 and earlier) vaults are not migrated and there is no importer**: export the keys from the Electron app (OpenSSH private or PuTTY `.ppk`, the two formats SSHSpan imports) and import them into a new vault. *(Correction 2026-10-09: this row used to say "bcrypt-pbkdf2 KDF + AES-256-GCM envelope; same scheme as v1.2.0, so existing vaults migrate without re-entry". Neither half was true - see [SECURITY.md](SECURITY.md).)* |
 | `src-tauri/src/crypto/putty.rs` | PuTTY `.ppk` v3 **and legacy v2** import (v3 export only, per the legacy-format policy: read anything, write modern) |
 | `src-tauri/src/db/mod.rs` | sqlx + SQLite. Phased migrations: core (`keys`, `audit`, `config`) → categories (`categories`, `key_categories`) → Connect (`servers`, `known_hosts`). All DB access via a `block()` helper that is runtime-aware (works from sync commands and inside async commands without nesting a tokio runtime) |
 | `src-tauri/src/bitwarden/` | Direct Bitwarden/Vaultwarden client: login (PBKDF2/Argon2id KDF info), **expand-only HKDF** (matches Bitwarden's stretch semantics), EncString parse/encrypt, user-key unwrap (incl. the 80-byte PKCS7 pad-strip fix), two-way cipher sync with folder gating, Vaultwarden `Bitwarden-Client-Version` header, SSRF-safe URL resolution |
@@ -91,6 +91,11 @@ framework-free (plain DOM + `window.__TAURI__.core.invoke`) so the CSP can remai
 | Bitwarden | `bitwarden_get_config`, `bitwarden_save_config`, `bitwarden_test_connection`, `bitwarden_sync` |
 | Ops | `settings_get`, `settings_set`, `audit_list`, `system_open_external`, `system_select_file` |
 
+*(Correction 2026-10-13: this table is the surface at the time of the rewrite. The registered
+commands today are listed in [ARCHITECTURE.md](ARCHITECTURE.md#ipc-surface); `vault_export`,
+`vault_import`, `key_generate`, `key_fingerprint`, `ssh_config_read` and `ssh_config_write` are
+gone.)*
+
 ### 2.4 Renderer
 
 - `app.js` (framework-free controller), `icons.js` (generated Lucide SVG sprite — zero font/CDN
@@ -108,7 +113,9 @@ framework-free (plain DOM + `window.__TAURI__.core.invoke`) so the CSP can remai
   clicked key overrides the saved binding) or create a new server pre-filled with the key.
 - Boot diagnostics: dynamic script loading with per-file `onerror` toasts, global error →
   toast, and a build marker in the sidebar (`KEY MANAGER · <build>`) so the exact shipped
-  frontend is always identifiable.
+  frontend is always identifiable. *(Correction 2026-10-13: the development marker, later the
+  literal `v14-tabs`, was replaced by the real app version, which the sidebar, the window title
+  and Settings now show from the `app_info` command.)*
 
 ---
 
@@ -172,10 +179,12 @@ the grid in sync with maximize.
 ### v1.3.6 — Publickey auth
 
 Vault keys are stored as **raw binary OpenSSH blobs**, not PEM text. The Connect path now
-loads keys through the same `load_private_key_data` → `export_private_key(OpenSsh)` pipeline
+loads keys through the same `unseal_key_data` → `export_private_key(OpenSsh)` pipeline
 used by export/deploy, so every key type (Ed25519, RSA, ECDSA, .ppk-imported) works for SSH
 auth, and the right-click "use this key to connect" flow works against any vault key. Failures
-surface with the key's name.
+surface with the key's name. *(Correction 2026-10-13: this paragraph used to name a helper
+that has since been removed; the connect path unseals the key directly, as export and deploy
+do.)*
 
 ---
 

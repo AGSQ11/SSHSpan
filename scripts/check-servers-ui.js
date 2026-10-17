@@ -2141,7 +2141,7 @@ async function scenarioServerNewInFilter(browser, server) {
   });
 }
 
-// ─── J6 (R10): a server saved with a warning ───────────────────────────────
+// ─── J6 (A5-26): a server saved with a warning ─────────────────────────────
 //
 // server_save's result carries `warning` when the server uses a key file
 // protected by a passphrase, which SSHSpan cannot ask for when connecting
