@@ -1101,7 +1101,14 @@ mod tests {
     fn pbes2_export_wrong_passphrase_fails() {
         let der = vec![0x30, 0x03, 0x02, 0x01, 0x00, 0xAB, 0xCD];
         let pem = encrypt_pkcs8_with_passphrase(&der, "right").expect("encrypt");
-        assert!(decrypt_pbes2_pem(&pem, "wrong").is_err());
+        // The decrypt itself may succeed: AES-CBC with PKCS#7 padding has no
+        // integrity check, and a wrong key decrypts to random bytes whose
+        // padding is valid about 0.4% of the time (1/256 + 1/256^2 + ...).
+        // What must hold is that the key bytes never come back.
+        assert!(
+            decrypt_pbes2_pem(&pem, "wrong").map_or(true, |pt| pt != der),
+            "a wrong passphrase must not recover the key"
+        );
     }
 
     #[test]
