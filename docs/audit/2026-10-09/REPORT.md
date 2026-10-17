@@ -1,6 +1,6 @@
 # SSHSpan flaw remediation: audit and remediation report
 
-This report covers the branch `gsq/app-flaws-audit-subagents-c36b18`, which fixes the findings of the 2026-10-09 audit of SSHSpan. The base is `main` at 1ca864f. The code described here is the branch at 3b0fcfb plus the final fix wave (6c19b1b). The report is published in the documentation commit that adds it, together with the [audit index](README.md), the user and developer documents and the CI changes.
+This report covers the branch `gsq/app-flaws-audit-subagents-c36b18`, which fixes the findings of the 2026-10-09 audit of SSHSpan. The base is `main` at 1ca864f. The code described here is the branch at 3b0fcfb plus the final fix wave (6c19b1b). The report is published in the documentation commit that adds it, together with the [audit index](README.md), the user and developer documents and the CI changes. A follow-up commit answers the first CI run and the review of [pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85) (section 3.2).
 
 ## 1. Summary
 
@@ -12,10 +12,10 @@ This report covers the branch `gsq/app-flaws-audit-subagents-c36b18`, which fixe
 - **Beyond the audit.** Reviews and new tests found more real defects; all were fixed except a few that are documented as accepted risks (sections 6.3 and 7.3). Two predate the branch and matter most:
   - a compromised renderer could point the Bitwarden sync at its own server and upload every private key and saved server password (rated High);
   - Bitwarden accounts that use Argon2id with any memory setting other than 16 MiB could not log in.
-- **Tests.** Rust tests grew from 272 at the base (216 library, 45 integration, 11 MCP integration) to 905 at 3b0fcfb and 950 at the fix-wave commit 6c19b1b (882, 48, 20). The renderer had one suite of 76 checks; seven suites ran 2,810 checks at 3b0fcfb, 2,936 at 6c19b1b and 2,935 with the documentation commit, whose `test:ui` no longer carries a copy of the MCP contract check.
+- **Tests.** Rust tests grew from 272 at the base (216 library, 45 integration, 11 MCP integration) to 905 at 3b0fcfb and 950 at the fix-wave commit 6c19b1b (882, 48, 20). The renderer had one suite of 76 checks; seven suites ran 2,810 checks at 3b0fcfb, 2,936 at 6c19b1b and 2,935 with the documentation commit, whose `test:ui` no longer carries a copy of the MCP contract check. The pull request follow-up brings Rust to 952 (884 library) and the renderer to 2,998 checks (`test:sftp` 763).
 - **Coverage of the final code (6c19b1b).** Renderer lines 92.9% (changed lines 95.7%). Rust production lines 72.0% (changed lines 77.3%), below the 80% target, mainly because code that needs a running Tauri app runs in no test: the commands' 2,378 lines and 1,391 lines of helpers that take an `AppHandle`, `State` or `Window` make up 61% of the uncovered lines; without the commands alone the figure is 80.7%. Section 8.9 has the method and an earlier measurement.
-- **Not done.** Seven findings are Partial and one is Deferred, each with a reason (section 7). Some things were never run on the real platform: the Windows CI job, a real WebView2 drag, a real GTK credential dialog and the exit-time MCP session teardown on Windows (section 9).
-- **Not published.** Nothing is pushed. There is no pull request and no release.
+- **Not done.** Seven findings are Partial and one is Deferred, each with a reason (section 7). Some things were never run on the real platform: a real WebView2 drag, a real GTK credential dialog and the exit-time MCP session teardown on Windows (section 9). The Windows CI job first ran on the pull request and failed five tests, none for a product bug (Unix-style paths in four, a too-strict ACL check in one), which the follow-up commit fixes; it has not passed on a runner yet (section 8.4).
+- **Published for review.** The branch is pushed and [pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85) is open. There is no release.
 
 ### 1.2 What was audited
 
@@ -30,7 +30,7 @@ The documentation accuracy review later found two index rows marked Fixed that w
 
 ### 1.3 What landed
 
-At 3b0fcfb the branch holds 23 commits on top of `main`: 4 audit and plan documentation commits, 18 `fix(...)` commits and 1 `chore(scripts)` commit. Two more follow: the fix wave (6c19b1b) and the documentation commit that adds this report.
+At 3b0fcfb the branch holds 23 commits on top of `main`: 4 audit and plan documentation commits, 18 `fix(...)` commits and 1 `chore(scripts)` commit. Two more follow: the fix wave (6c19b1b) and the documentation commit that adds this report. A third, the pull request follow-up, answers the pull request's first CI run and review (section 3.2).
 
 Against the base, `git diff --shortstat 1ca864f..3b0fcfb` gives 65 files changed, +77,763 / -12,129 lines:
 
@@ -45,7 +45,7 @@ Against the base, `git diff --shortstat 1ca864f..3b0fcfb` gives 65 files changed
 
 The fix-wave commit 6c19b1b changes 13 files under `src-tauri/` (+4,470 / -301) and 8 renderer and test files (+996 / -53). The documentation commit adds the user and developer documents, the audit index, this report and the CI changes. The documentation commit also edits code comments, and nothing else, in `src/renderer/app.js`, six Rust files and two test scripts: references to review rounds and internal labels become audit IDs or plain words, the `lib.rs` note on the credential questions is completed, and two notes no longer state Bitwarden's default memory setting as a fact.
 
-No remote-tracking ref contains 3b0fcfb or 6c19b1b (`git branch -r --contains` prints nothing for either). The remote itself was not queried.
+When this report was first written, no remote-tracking ref contained 3b0fcfb or 6c19b1b (`git branch -r --contains` printed nothing for either). The branch was pushed later, for pull request #85.
 
 ### 1.4 Status counts
 
@@ -88,7 +88,7 @@ Definitions, as in the index:
   - A6-02 (Medium): the local-path boundary is a deny-list plus confinement, not a dialog-bound grant model.
   - A7-03 (High): importers for PKCS#1, PKCS#8, SPKI and authorized_keys are deferred (R9). The misleading promise is gone from the app and, with the documentation commit, from the README, but a PKCS#8 export still cannot be re-imported.
   - A7-55 (Low): the mock-server `run_sync` suite is deferred (R10); targeted tests exist.
-  - A7-56 (Low): the `windows-latest` CI job exists but has never run on a runner, so it is `continue-on-error` until it has passed once.
+  - A7-56 (Low): the `windows-latest` CI job exists but has not passed on a runner yet (its first run, on the pull request, failed five tests that the follow-up commit fixes; section 8.4), so it is `continue-on-error` until it has passed once.
 - **Deferred**: A7-54 (Low), the full queue state-machine suite (R10). Targeted tests exist.
 - **Accepted limitation**: A6-11 (Low). russh 0.63 zeroizes the password `String` it takes, but builds its authentication packets in a buffer it clears without wiping, and frees keyboard-interactive answers unwiped. SSHSpan wipes its own copies.
 
@@ -108,9 +108,9 @@ What the counts rest on:
 2. **A5-01, every native `confirm()` guard was bypassed.** `tauri-plugin-dialog` replaces `window.confirm` with an async shim whose Promise is always truthy. Key and server deletes, backup restore, host-key forget, tab close, MCP removal, multi-line paste and update install therefore ran unconfirmed. Closed in 7e5c5c5: all 13 sites await the in-app `confirmModal` (Cancel focused, Escape means no). A static scan in `test:safety` fails on any native `confirm(` call. Since 3b0fcfb a confirmation also ignores the second click of a double-click, so a double-click cannot answer a question that opens under the pointer.
 3. **A7-01, every private-key write failed on Windows.** `restrict_windows_file` passed a bare SID to `icacls /grant:r`, which Windows rejects. Deploy, private-key export, backup export and audit CSV export all failed. Closed in 57993ba:
    - one `icacls` call with the `*SID` form, from absolute `System32` paths, with `CREATE_NO_WINDOW`;
-   - the file is created empty and restricted before any secret byte is written.
+   - the file is created empty and restricted before any secret byte is written: inherited permissions are removed and the current user gets full control; where the folder passes none down, SYSTEM and Administrators keep the full control Windows gave the new file.
 
-   The ACL test went RED to GREEN natively on Windows 11, and 22 targeted tests including it ran natively on the final RU1 tree. These remain the only tests the branch ran natively on Windows (section 8.4).
+   The ACL test went RED to GREEN natively on Windows 11, and 22 targeted tests including it ran natively on the final RU1 tree. These were the only tests the branch ran natively on Windows until the pull request (section 8.4).
 
 ## 2. Method
 
@@ -272,6 +272,7 @@ Rows are in commit order. "Fix rounds" counts the rounds sent back to the implem
 | 3b0fcfb | JW | Renderer final fix wave: deploy warnings and Host lines, the password again for changed servers, the MCP and Bitwarden flows for RW's contract, "Stop editing" asks, lock gating, SFTP menus, one error text, category order through `category_set_order`, `check-renderer-hygiene.js` | Opus code: approve with warnings (1 Medium). Opus security: Approve (1 Low, 4 Info). Fix 1 (10 items); fix 2 (11 items); both Approve. **2 rounds** | `test:assistant` 312 to 367, `test:safety` 481 to 491, `test:sftp` 598 to 679, `test:polish` 190 to 195, `test:keys` 324 to 422, `test:servers` 511 to 580; 135 mutants killed | A2-04 A2-05 A2-07 A2-08 A2-18 A2-45 A2-50 A4-23 A5-03 A5-09 A6-08 A8-01 A8-17 |
 | 6c19b1b | FW | Last fix wave: the Bitwarden destination bound to a native question that names the account; a 30-second back-off per kind of credential question; the Argon2id memory unit, and its derivation off the async workers; advice for passphrase-protected key files, at connect and at save; on Windows, key files from local drives only; save dialogs in Downloads with bare suggested names, and the write deny-list for paths picked in them and for every export; the cross-scope category parent; no reuse of an edit being closed; the key move after a lock; the Bitwarden destination in Settings; new servers in a filtered list; backend texts spelled out; clean file-dialog titles | Opus re-checks. Round 1: code Approve (2 Lows, 2 nits); security Approve with warnings (the High closed end to end; 3 Lows, 1 informational point, 1 nit). Round 2: code Approve (2 Lows, 2 nits); security Approve with warnings (2 Lows, one shared). Round 3: code Approve (2 nits); security Approve with warnings (2 Lows, one of them a design limit; 1 informational point). Round 4: security Approve (1 nit, older than the branch). Round 5: checked by the controller. **4 fix rounds** | Library 837 to 856, 871, 878 and 880 over rounds 1 to 4, final 882 (950 with the integration and MCP tests); renderer at the fix-wave commit `test:servers` 676, `test:sftp` 700, `test:keys` 431, 2,936 checks in all; 136 Rust and 64 renderer mutations, all caught | A2-07 A2-08 A4-13 A5-26 A5-42 A6-02 A7-19 |
 | the documentation commit that adds this report | Docs | README, CHANGELOG, CONTRIBUTING, `docs/**` (with the audit index and this report), `ci.yml`, `release.yml`, `package.json`, `scripts/check-renderer-ui.js`; comment-only edits in `src/renderer/app.js`, six Rust files and two test scripts | Opus documentation accuracy review of the uncommitted documents against 3b0fcfb: about 140 corrections, all applied | No suite; `test:ui` 76 to 75 (its embedded copy of the MCP contract check is removed; `check-mcp-contract.js` keeps it) | A1-39 A5-05 A6-07 A7-58 A8-04 to A8-10 A8-17 A8-19 A8-21 A8-22 A8-26 A8-27 A8-28; the Windows job of A7-56; the README corrections behind A5-39 and A7-03 |
+| the pull request follow-up commit | PR | The first CI run and review of pull request #85: two dependencies with advisories, the transfer list at 880x560, five Windows-only test failures, the release signing gate, the MCP smoke mock, the nine review comments on the documents | The layout fix: an independent code review, Approve with three small points, all taken. The whole follow-up: a Fable code review (Approve, one Low) and a Fable security review (Approve with warnings, three Lows), all answered (section 3.2). The controller checked each subagent's diff, report and evidence, then verified the whole tree | Library 882 to 884 (952 in all); `test:sftp` 700 to 763 (2,998 checks in all); before the layout fix 8 of its checks failed on Windows and 10 on Linux; every changed Rust test and each part of the layout fix was mutation-checked | A1-02; A7-56 (still Partial) |
 
 Notes on the table:
 - An ID appears in several commits when each landed a part (A2-18, A5-12 and A8-23, for example). The final status is in the index, not in this table.
@@ -444,6 +445,42 @@ The last fix wave. It carried the findings of the second whole-branch reviews (p
 - **How it was written.** On Sonnet, beside the code units, with marked placeholders for work not yet committed; then end passes after JU6b, after RW and JW, after the accuracy review, and for the fix wave, whose later rounds were written in marked passages and checked against each round's code. A last pass after the fix-wave commit fills in its commit, the counts and the coverage figures.
 - **Review.** An Opus documentation accuracy review checked the uncommitted documents against the code at 3b0fcfb and recorded about 140 corrections, all of them applied (section 6.3).
 
+#### The pull request follow-up (2026-10-17)
+
+Three checks failed in the first CI run of [pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85): the dependency advisories, the renderer suites, and the new Windows job, which does not fail the workflow. An automated review bot left nine comments on the documents and workflows, all Low. One more commit answers them. The controller made the lockfile change; subagents wrote the other fixes and the document changes, and the controller checked their diffs, reports and evidence, then verified the whole tree.
+
+- **Dependency advisories.** `cargo audit` failed on seven advisories against two locked dependencies: RUSTSEC-2026-0338, -0340 and -0343 in quinn-proto 0.11.17, and RUSTSEC-2026-0346 to -0349 in rustls 0.23.45. `Cargo.lock` moves to the patched releases, quinn-proto 0.11.18 and rustls 0.23.46. The only other lockfile change is tempfile's `getrandom` entry, which names 0.3.4 instead of 0.4.3; both were already locked and both are in tempfile's range.
+- **The transfer list at 880x560 (A1-02).** The renderer job failed "A1-02 880x560: the first job's buttons are not covered".
+  - Cause: text width, not line height. At 880x560 the transfer panel is clamped to 92 px. With Linux fonts its head no longer fits on one line, so its actions wrap, and the note about paused transfers of a server that is not connected took the rest, leaving the job list 0 px. With Windows fonts the list was 24.7 px, already less than one 28 px job row. In Split the head wraps on every platform, and the list was about 4 px, with the buttons under the note. No check covered either case.
+  - The fix: the note is the head's last item. Where the file surface is under 420 px tall it is thinner and shares the head's last line; elsewhere it keeps a line of its own, and the panel looks as before (pixel-identical at 1600x1000). The job list never drops below one row, whatever the fonts: when text needs more room, the panel grows and the file list above it scrolls. The resize handle offers only heights that take effect with that floor; without that, an arrow key in Split could store a height that changed nothing, and that height later made the panel shorter in a larger window.
+  - Tests: the list keeps a whole row and the note stays on screen on one line, at all three sizes in Files, Dual and Split; the note keeps a line of its own where there is room; a test-only larger-text variant (letter spacing and taller lines) reproduces the CI failure with any machine's fonts; and a scenario for the handle. Before the fix 8 checks failed on Windows and 10 on Linux, the CI check among them, with its failure note reproduced byte for byte. After it, `test:sftp` passes 763 checks on both, and removing any one part of the fix fails at least one check.
+  - The seven suites also passed on Linux (WSL, with the Chromium and fonts CI uses). The last four had never run on Linux for this branch, because CI stopped at `test:sftp`. An independent code review approved the change, with three small points, all taken.
+- **Windows.** The five failures and their fix are in section 8.4: test portability and a too-strict ACL test, no product bug. The comments and documents that said a key file on Windows is restricted to the current user, or has exactly one entry, now say what happens.
+- **Release signing.** Before, a release with an empty `MINISIGN_SECRET_KEY` was published unsigned with a warning, and existing installations would refuse it as an update. In this repository the signing step now fails with an error before any asset is attached; forks keep the warning and an unsigned build.
+- **The MCP smoke mock** (`scripts/mcp-smoke-server.py`) answers `/mcp-listchanged` like `/mcp`: it sends the `list_changed` notification and then the matching response. Its `image_cat` tool returns a real image block. Steps 19 and 26 of `docs/MCP-SMOKE-TEST.md` can be run again. A check script passed 51 of 51 checks against the new mock; against the old one, 23 of 50 failed.
+- **The review comments.** Eight led to edits:
+  - two sentences in PRIVACY: which key paths are opened, and what happens before a Bitwarden destination is allowed;
+  - the gate re-check in MCP-SMOKE-TEST;
+  - the mock and the release signing (above);
+  - a note in both workflows on why doctests need no manifest;
+  - a correction note in REWRITE-ROADMAP on import formats;
+  - the lines the mock prints, in MCP-SMOKE-TEST step 5.
+
+  One needed no change: CONTRIBUTING's Node version. Playwright 1.56.1 declares `engines.node >=18`, CI runs the suites on Node 20, and no document says Node 20 is required. Each thread is answered on the pull request.
+- **Documents.** Besides the above:
+  - the Windows job's first run and the native Windows runs (README, CONTRIBUTING, CHANGELOG, SECURITY, `ci.yml`'s comment, the index);
+  - the Windows ACL wording (CHANGELOG, ARCHITECTURE, README, PRIVACY, REWRITE-ROADMAP, SECURITY, the index);
+  - correction notes on two older CHANGELOG entries: the Electron backend's key files, and SFTP edit staging, whose copies take the per-user temp folder's permissions on Windows;
+  - this report.
+- **Tests.** Rust 952 (884 library, 48 integration, 20 MCP integration). Renderer: the seven suites pass with 2,998 checks (`test:sftp` 763; the other six unchanged). The five static checks pass.
+- **Reviews of the whole follow-up** (Fable, read-only):
+  - Code: Approve. One Low, two documents that still gave the renderer's old counts (fixed), and two nits: the Node wording above (fixed) and the signing gate's repository name (below).
+  - Security: Approve with warnings, three Lows.
+    - The signing gate was keyed on the repository's name, so a rename or a transfer would have brought back the warning-only path; it is now keyed on the repository's ID, which survives both.
+    - The CHANGELOG headline "a release is never published unsigned" claimed more than the workflow guarantees. It now says what is true. Two gaps remain, listed in SECURITY.md and section 9: the installers and their signatures are attached in separate steps, and the workflow does not check a new signature against the public key the app embeds. Either gap ends in a release the updater refuses, not in an unsigned install.
+    - The ACL test accepted SYSTEM and Administrators in every folder. In a folder that passes permissions down, the product leaves only the user's entry, so an explicit extra grant would have passed there. The test now sets up both kinds of folder itself and requires the user's entry alone in the first (section 8.4); natively on Windows, an explicit Administrators grant fails it there.
+  - Informational points, taken: "no other account has access" is what Windows' default settings give, not something the call enforces, and the documents now say so.
+
 ## 4. What changed for users, by area
 
 Each item names the commits that carry it. 6c19b1b is the fix wave.
@@ -507,7 +544,8 @@ Each item names the commits that carry it. 6c19b1b is the fix wave.
   - the file list keeps a floor of whole rows, and secondary toolbar buttons fold into a "More" menu on a narrow panel;
   - the queue grid drops columns or wraps instead of scrolling sideways, and row actions stay reachable;
   - Split never overflows its column; the dual-pane split is one percentage; both splitters work from the keyboard and report their position to assistive technology;
-  - names stay on one line, with the full name on hover; symlink and broken-link badges, the size spinner and the quick-find indicator are styled; the local table shows only the columns its rows fill.
+  - names stay on one line, with the full name on hover; symlink and broken-link badges, the size spinner and the quick-find indicator are styled; the local table shows only the columns its rows fill;
+  - while the note about paused transfers of a server that is not connected is showing, the transfer list keeps room for at least one job at every size, in Files, Dual and Split, whatever the fonts. At 880x560 the note had left it no room with Linux fonts, and in Split on any platform (the pull request follow-up, section 3.2).
 - Drag and drop no longer depends on the HTML5 drag events the Windows webview withholds: in-page drags use pointer events, with a 5 px threshold, a ghost, highlighted targets and Escape to cancel, and a release never also clicks. Every drag has a menu alternative (Move to..., Download, Upload) and keeps its confirmation. Drops onto the local side ask first, because the old folder-drop path could replace a local file silently (d94ed2d).
 - File names with control, direction or invisible characters, and names that only look like "..", show nothing or are "~", are spelled out ("<U+202E>") and flagged; dropping into a flagged folder asks first (d94ed2d, 3b0fcfb, 6c19b1b). Every backend error and warning about an edit is spelled out too (6c19b1b).
 - Repeated Files and Split clicks open one SFTP session, and the control shows that it is opening (d94ed2d).
@@ -589,7 +627,7 @@ Each item names the commits that carry it. 6c19b1b is the fix wave.
 
 | ID | Problem | Closed in | How |
 |---|---|---|---|
-| A7-01 | Every private-key write failed on Windows (`icacls` was given a bare SID) | 57993ba | One `icacls` call with `*SID`, absolute `System32` paths and `CREATE_NO_WINDOW`; the file is restricted before any secret byte is written; the ACL test went RED to GREEN natively on Windows 11 |
+| A7-01 | Every private-key write failed on Windows (`icacls` was given a bare SID) | 57993ba | One `icacls` call with `*SID`, absolute `System32` paths and `CREATE_NO_WINDOW`; the file is restricted before any secret byte is written; the ACL test went RED to GREEN natively on Windows 11; after the Windows job's first run it checks two folders it sets up, by SID: the user's entry alone where the folder passes permissions down, the user, SYSTEM and Administrators where it passes none down |
 | A2-01 | The idle auto-lock never fired | 7e5c5c5, 57993ba | Deadline from the last trusted input, a poll that no longer re-arms, a heartbeat only after activity, and a backend default of 15 minutes |
 | A5-01 | Every native `confirm()` guard was bypassed | 7e5c5c5 | All 13 sites await `confirmModal`; a static scan in `test:safety` fails on any native call |
 
@@ -748,6 +786,8 @@ These came from the per-unit reviews, the new tests, or a unit's own verificatio
 | 38 | Keyed on the host, the back-off still let a page raise one fresh question per made-up host | Fix-wave security re-check, round 3 (Low, a design limit) | 6c19b1b, round 4: after any "no", no question of that kind for 30 seconds, whatever it names | `fw_u2_a_declined_destination_holds_back_every_destination`, `fw_u2_a_declined_credential_holds_back_every_mcp_question`, `fw_u2_a_declined_key_move_holds_back_every_key_move` |
 | 39 | A key named like a path (`/root/.ssh/config`, `../../.ssh/config`, `C:\Users\u\.ssh\config`) opened the private-key export's dialog in `~/.ssh` with `config` filled in, and the `~/.ssh` exception then let one Save and "Replace" overwrite the user's ssh config. The suggested name is older than the branch | Fix-wave security re-check, round 3 (Low, shown with a GTK probe) | 6c19b1b, round 4: every save dialog suggests a bare file name | `fw_u1_a_key_name_suggests_only_a_bare_file_name`, `fw_u1_every_save_dialog_suggests_a_bare_file_name` |
 | 40 | File-dialog titles from the page reached the dialog library uncleaned; a NUL in a title would have made its Linux GTK code panic inside a callback, which aborts the app. Older than the branch; found by reading the library's code | Fix-wave security re-check, round 4 (nit) | 6c19b1b, round 5: titles are cleaned like the texts of message dialogs | - |
+| 41 | A release whose `MINISIGN_SECRET_KEY` was empty was published unsigned, with only a warning; existing installations would refuse it as an update. Older than the branch | The pull request's automated review (Low) | The pull request follow-up: in AGSQ11/SSHSpan the signing step fails before any asset is attached; forks keep the warning | `release.yml` |
+| 42 | Seven advisories against two locked dependencies: quinn-proto 0.11.17 (RUSTSEC-2026-0338, -0340, -0343) and rustls 0.23.45 (RUSTSEC-2026-0346 to -0349) | `cargo audit` in the pull request's first CI run | The pull request follow-up: quinn-proto 0.11.18 and rustls 0.23.46 in `Cargo.lock` | `cargo audit` passes |
 
 ### 5.6 Limits of the security work
 
@@ -832,6 +872,7 @@ Rows 1 and 2 of section 5.5 also came from new round-trip tests. The rest, by ar
 | A move into a restored category loop froze the app (the backend's ancestor walk was unbounded and synchronous) | JU4 re-review (Important) | 652aa5e (renderer refusal); cd11f97 (backend bound) |
 | The terminal's deferred focus (50 ms after a connect, 60 ms after a tab switch) took focus from controls the user had just reached; the old `terminal.js` failed 5 of 20 runs | JU4 first fix round traced an intermittent `test:polish` failure to it; JU5 | d5e9d22 (72 of 72 runs passed without the harness's timer barrier) |
 | The harness failed with "Cannot fast-forward to the past" under load (2 of 16 runs), and some slow boots exceeded the step timeout | JU5 second fix round | d5e9d22 |
+| At 880x560, with the note about paused transfers showing, the transfer list had no room for a job: with Linux fonts the panel's head wrapped and the note left the list 0 px; with Windows fonts the list was 24.7 px, under one 28 px row; in Split about 4 px on every platform, with the buttons under the note. The layout check passed on Windows only because the first button's centre still fell inside the list once it was scrolled to | The pull request's first CI run (the renderer job, on Linux) | The pull request follow-up: the note joins the panel's head, the list keeps one row whatever the fonts, and the resize handle offers only heights that take effect; a test-only larger-text variant reproduces the CI failure on any machine (section 3.2) |
 
 ### 6.3 Documentation
 
@@ -868,7 +909,7 @@ The plan requires a RED run before each fix. These are the recorded exceptions:
 
 R1 to R12 are in section 2.2. These are the controller's own rulings, each with its reason and what it costs if it is wrong:
 
-- **Commits stay local.** Nothing is pushed, and no pull request or release is created without the user. "Fix on a new branch" implies commits on that branch; the cost if wrong is discarding a branch.
+- **Commits stay local.** Nothing is pushed, and no pull request or release is created without the user. (The user later asked for the pull request, #85.) "Fix on a new branch" implies commits on that branch; the cost if wrong is discarding a branch.
 - **Sequential work on one branch, with controller-side commits.** One tree is robust to the controller changing mode. The cost is wall-clock time, with no merge debt. Two lanes, one Rust and one renderer, ran together only where their files were disjoint.
 - **Deploy keeps writing SSHSpan's managed config** (R3) instead of editing `~/.ssh/config`, because `ssh_config_write` was de-registered for ProxyCommand injection. The cost is one manual `Include` step.
 - **Auto-lock activity is human input,** not remote output. The lock still ends live sessions, warns 60 seconds ahead and asks first on a manual lock with live work. The cost: a long unattended job is still cut at the idle timeout.
@@ -898,7 +939,7 @@ R1 to R12 are in section 2.2. These are the controller's own rulings, each with 
 - **Rounds 4 and 5 mutation-checked only their new and changed guards** (32 and 10 mutations); the others stand from round 3's full run.
 - **A nit older than the branch, found by the last re-check, was still fixed before the fix-wave commit,** in a small fifth round that the controller checked itself, because the user asked for every flaw to be fixed.
 - **`server_save`'s rejection texts are not spelled out.** The security re-check accepted this: they carry only what the user typed.
-- **The Windows CI job is `continue-on-error`** until it has passed once on a runner: it has never run, and several tests assume Unix paths. Cost: a Windows regression does not fail CI until the flag is removed.
+- **The Windows CI job is `continue-on-error`** until it has passed once on a runner: it had never run when this was decided, and several tests assumed Unix paths. Its first run, on the pull request, failed five such tests, which the follow-up commit fixes (section 8.4). Cost: a Windows regression does not fail CI until the flag is removed.
 - **Coverage is reported as measured,** with no exclusion hidden in the headline figures, and a follow-up is recommended for the command code. Cost: the 80% rule stays unmet for Rust production code, and this report says so.
 - **After the C: drive filled, cargo uses only two shared target directories** (section 2.6).
 
@@ -910,7 +951,7 @@ R1 to R12 are in section 2.2. These are the controller's own rulings, each with 
 - **A1-29 (Partial), R10:** the wholesale CSS token refactor; dead and duplicate rules were removed (53347df, d5e9d22).
 - **A5-22 (Partial), R10:** updater download progress events. The dialog, the busy state and the notice landed without a progress bar (d5e9d22).
 - **A5-28 (Partial):** an Edit button in the terminal header. The unit brief narrowed the finding to the row "..." button.
-- **A7-56 (Partial):** the Windows CI job exists in the documentation commit but has not run; a Windows test executable needs a Common-Controls 6 manifest beside it, which the job writes; one cross-built with the MinGW target also needs `WebView2Loader.dll`, while the MSVC build the runner uses links the loader statically.
+- **A7-56 (Partial):** the Windows CI job exists in the documentation commit but has not passed on a runner yet (its first run failed five tests, fixed in the follow-up commit; section 8.4); a Windows test executable needs a Common-Controls 6 manifest beside it, which the job writes; one cross-built with the MinGW target also needs `WebView2Loader.dll`, while the MSVC build the runner uses links the loader statically.
 - **A6-02 (Partial):** a grant model for local paths, which needs dialog-picked destinations and upload sources (section 7.3).
 - **Command code that tests can reach:** making the Tauri commands generic over `tauri::Runtime`, so Tauri's `MockRuntime` can test them (section 8.9).
 - **A persistent terminal debug-trace setting.** It needs a key in the Rust `settings_set` allowlist; today it is a developer-tools page flag.
@@ -954,13 +995,13 @@ These are known, deliberate states. `docs/SECURITY.md` ("Accepted risks and limi
 - **`server_save`'s rejection texts** carry names the user typed and are shown as plain text, not spelled out. The security re-check accepted this, since no server supplies them.
 - **A database call from the root future of a current-thread runtime** still panics, as before; the app runs Tauri's multi-thread runtime.
 - **Connect** uses one 20-second budget across the addresses it tries in turn, and has no deadline after authentication.
-- **Key files.** On Windows only this computer's drives are read, mapped drives included, so a key on a raw UNC path needs a mapped drive; a verbatim path written with forward slashes (`\\?\C:/...`) is refused too. The Windows rule is tested on every platform through its pure function and compiled by the `windows-gnu` check, but no test runs on Windows. Elsewhere, `//path` is another spelling of `/path`; such a key path gets no warning at save, and the connect still says what to do.
+- **Key files.** On Windows only this computer's drives are read, mapped drives included, so a key on a raw UNC path needs a mapped drive; a verbatim path written with forward slashes (`\\?\C:/...`) is refused too. The Windows rule is tested on every platform through its pure function, and the library tests have since run natively on Windows too (section 8.4); no key file on a real network share was tried. Elsewhere, `//path` is another spelling of `/path`; such a key path gets no warning at save, and the connect still says what to do.
 - **Webviews, platform and dependencies.** The terminal header uses container queries and wraps on an older WebKitGTK; held-key and chord handling was tested in Chromium with a US layout; key rows, category rows and session tabs are `role=button` elements with interactive children, which an accessibility scan flags. There is no hardware-backed key storage, and suspend does not lock the vault. Several transitive Rust crates are flagged unmaintained-class by advisory tooling, with no known exploitable issue in SSHSpan's use.
 
 ### 7.4 Residual risks and what no suite exercised
 
 - **Not the shipping webviews.** The renderer suites run in headless Chromium only. WebView2 and WebKitGTK rendering, the native dialogs, the tray, real SSH, SFTP, Bitwarden and MCP servers, and screen readers were not exercised.
-- **Windows.** Windows code ran natively only for RU1's secret-file tests; the `windows-gnu` check executes nothing. The `ShellExecuteExW` installer path, the Windows sharing-violation retry, the key-file rule for network paths and Win32-OpenSSH behaviour (emulated in the test kit) have not run on Windows. The new `windows-latest` CI job has never run on a runner, and `release.yml`'s Windows tests, with the new manifest step, run only at a tag and have not run since that step was added.
+- **Windows.** Until the pull request, Windows code ran natively only for RU1's secret-file tests; the `windows-gnu` check executes nothing. Since then the library tests have run natively on the `windows-latest` runner, and the library and integration tests on Windows 11 from a cross-build (section 8.4). Still not exercised for real on Windows: the `ShellExecuteExW` installer path, a real sharing violation, a key file on a network share and Win32-OpenSSH (emulated in the test kit). The new `windows-latest` CI job has not passed on a runner yet, and `release.yml`'s Windows tests, with the new manifest step, run only at a tag and have not run since that step was added.
 - **Drag and drop is emulated.** The suites withhold the HTML5 drag events WebView2 withholds and drive a real mouse; no real WebView2 drag was run.
 - **Native dialogs.** The credential questions are tested through injected answers and the answer mapping; they were never shown in a real dialog, GTK included (the reviewers' offscreen GTK probes covered the save dialogs only).
 - **Runtime-bound code.** The exit-time MCP DELETE wait, the tray hide and `app_quit` need a Tauri runtime. A manual check on Windows is still wanted: quit with a connected MCP server and see the session DELETE arrive.
@@ -992,10 +1033,11 @@ These are known, deliberate states. `docs/SECURITY.md` ("Accepted risks and limi
 | fix wave, round 3 | FW | 878 | 48 | 20 | Controller: fmt clean, clippy exit 0, test exit 0, `windows-gnu` exit 0 |
 | fix wave, round 4 | FW | 880 | 48 | 20 | Controller: fmt clean, clippy exit 0, test exit 0, `windows-gnu` exit 0 |
 | 6c19b1b | FW, after round 5 | 882 | 48 | 20 | Controller, on the worktree with `src-tauri` equal to HEAD plus the round-5 diff: fmt clean, clippy (`-D clippy::correctness`) exit 0, test exit 0, `windows-gnu` exit 0 |
+| the pull request follow-up | PR | 884 | 48 | 20 | Controller, on the worktree with the follow-up's `src-tauri`: `cargo audit` exit 0, fmt clean, clippy (`-D clippy::correctness`) exit 0, test exit 0, `windows-gnu` exit 0; natively on Windows 11, library 740 of 742, integration 47 of 47, MCP 20 of 20 (section 8.4) |
 
 (a) The run in the shared tree included RU3 work in progress. (b) The shared tree included RU5 work in progress; the commit message states the same totals.
 
-Growth: 272 Rust tests at the base, 905 at 3b0fcfb (+633) and 950 at 6c19b1b (+45). These counts are Linux runs; only RU1's 22 targeted tests ran natively on Windows (section 8.4). The `windows-gnu` check passed at every Rust verification, with two warnings in Windows-only test code in `sftp/mod.rs`.
+Growth: 272 Rust tests at the base, 905 at 3b0fcfb (+633) and 950 at 6c19b1b (+45). These counts are Linux runs; until the pull request only RU1's 22 targeted tests had run natively on Windows (section 8.4). The pull request follow-up adds two tests: 952 (884, 48, 20). The `windows-gnu` check passed at every Rust verification, with two warnings in Windows-only test code in `sftp/mod.rs`.
 
 ### 8.2 Renderer suites per unit (checks passed, 0 FAIL in every run)
 
@@ -1014,8 +1056,9 @@ Growth: 272 Rust tests at the base, 905 at 3b0fcfb (+633) and 950 at 6c19b1b (+4
 | fix wave, round 1 | FW | 75 (d) | 491 | 693 | 195 | 367 | 422 | 635 | 2,878 |
 | 6c19b1b | FW, final | 76 | 491 | 700 | 195 | 367 | 431 | 676 | 2,936 |
 | the documentation commit | Docs | 75 (d) | 491 | 700 | 195 | 367 | 431 | 676 | 2,935 |
+| the pull request follow-up | PR | 75 | 491 | 763 | 195 | 367 | 431 | 676 | 2,998 |
 
-Up to d5e9d22 the counts come from the unit reports and, for JU4 and JU5, also from the controller's logs, which agree with them. d94ed2d and 3b0fcfb are the controller's runs on clean copies. The final fix-wave row is the controller's clean-copy run of the fix wave's round-2 renderer: its later rounds changed only two test stubs, and the two suites those feed counted the same afterwards. The committed code was run as well: on a clean copy of 6c19b1b the seven suites count 76, 491, 700, 195, 367, 431 and 676 (2,936), in the coverage run of section 8.9 and again in a final review of the documents, and that review counted 75 for `test:ui` with the documentation commit's script (2,935). The documentation row is the documentation pass's run of a snapshot that carries the fix wave and the documentation commit. Round 1 is the implementer's acceptance run. Only `test:ui` existed at the base.
+Up to d5e9d22 the counts come from the unit reports and, for JU4 and JU5, also from the controller's logs, which agree with them. d94ed2d and 3b0fcfb are the controller's runs on clean copies. The final fix-wave row is the controller's clean-copy run of the fix wave's round-2 renderer: its later rounds changed only two test stubs, and the two suites those feed counted the same afterwards. The committed code was run as well: on a clean copy of 6c19b1b the seven suites count 76, 491, 700, 195, 367, 431 and 676 (2,936), in the coverage run of section 8.9 and again in a final review of the documents, and that review counted 75 for `test:ui` with the documentation commit's script (2,935). The documentation row is the documentation pass's run of a snapshot that carries the fix wave and the documentation commit. Round 1 is the implementer's acceptance run. The pull request row is the controller's run on a clean copy of the documentation commit plus the follow-up, and the seven suites also passed on Linux in WSL, with the Chromium and fonts CI uses. Only `test:ui` existed at the base.
 
 (c) The first `test:safety` run lost one scenario to a 20 s page-load timeout with the CPU at 100%; the re-run passed.
 
@@ -1035,9 +1078,27 @@ The command count fell from 118 to 109 because RW deleted ten unregistered comma
 
 ### 8.4 Windows
 
-- Native execution: RU1's secret-file tests only. The ACL test went RED to GREEN on Windows 11, and 22 targeted tests passed natively on the final RU1 tree.
+- Native execution: until the pull request, RU1's secret-file tests only. The ACL test went RED to GREEN on Windows 11, and 22 targeted tests passed natively on the final RU1 tree.
 - Everything else Windows-specific was type-checked with `cargo check --target x86_64-pc-windows-gnu --all-targets` and not executed.
 - The documentation commit adds a `windows-latest` CI job (`cargo test` and the static renderer checks, with the Common-Controls 6 manifest step), `continue-on-error` until it has passed once. The documentation accuracy review ran that job's five static renderer checks on Windows at 3b0fcfb, and they passed.
+- **The job's first run, on the pull request (2026-10-17).** The static renderer checks passed. `cargo test` ran the library natively: 736 passed and 5 failed, so the integration suites did not run. None of the five was a product bug:
+  - Three numbering tests (`case_only_collisions_are_renamed_on_every_platform`, `colliding_sanitized_names_get_a_numbered_local_name`, `numbering_keeps_the_extension_and_handles_dotfiles_and_taken_numbers`) spelled their paths with `/`. A real download batch on Windows is spelled with `\` throughout, and the renamed path came back as `/d\readme (1)`.
+  - `rw_fix1_a_dialog_picked_download_never_writes_the_program_files` used a `/fixture` base with no drive letter, which is refused as not absolute before the program-folder rule under test is reached.
+  - `write_secret_file_leaves_one_full_control_ace_for_the_current_user` expected exactly one entry. The product's one `icacls <file> /inheritance:r /grant:r` call removes every inherited entry and gives the current user full control. Where the folder passes no permissions down, as the runner's temp folder did, the new file's entries come from the creating process's defaults instead, and SYSTEM and Administrators keep full control beside the user. OpenSSH for Windows accepts both on a private key.
+- **The fix, in the follow-up commit** (test code and comments only):
+  - The numbering tests build their paths the way a batch does, from a platform folder with `Path::join`, and still compare exact strings.
+  - The program-folder test uses `C:\fixture` on Windows.
+  - The ACL test keeps its name, which the index cites, and no longer depends on the machine's temp folder. It sets up two folders and writes a secret file into each. In one that passes permissions down (`icacls <dir> /inheritance:r /grant:r *<SID>:(OI)(CI)F`), the file must end with exactly one entry, the user's full control, explicit, with inheritance blocked. In one that passes none down (`/grant:r *<SID>:F`, the runner's shape), it requires blocked inheritance, nothing inherited, allow entries only, full control for the current user, and no entry for anyone but the user, SYSTEM and Administrators. Entries are judged by SID from `icacls /save`, so localized account names do not matter.
+  - Two cross-platform table tests pin both rules: `secret_acl_rule_in_an_inheriting_folder_admits_only_the_user` and `secret_acl_rule_admits_only_the_user_system_and_administrators`. They refuse Users, Everyone, Authenticated Users and any other account, and the first also refuses SYSTEM or Administrators beside the user.
+  - Every changed test was mutation-checked on Linux and natively on Windows. Among the mutations: an explicit extra Administrators grant (it fails the folder that passes permissions down), no `/inheritance:r`, read-only access for the user, and a Users entry. The comments and documents that said a key file on Windows is restricted to the current user now say what happens.
+  - The tightening of the ACL test came from the follow-up's security review (section 3.2); the native runs below predate it, and the ACL tests passed natively again after it, in both folders and with the temp folder in either state.
+- **Native runs after the fix.** The test executables were cross-built in WSL (`x86_64-pc-windows-gnu`) and run on Windows 11 as a user without elevation, with `WebView2Loader.dll` and the Common-Controls 6 manifest:
+  - library: 740 of 742; the other two read source files through `env!("CARGO_MANIFEST_DIR")`, which the cross-build bakes in as a WSL path, and both passed on the runner;
+  - integration: 47 of 47 (the 48th is `#[cfg(unix)]`);
+  - MCP integration: 20 of 20.
+
+  All five failures were first reproduced natively, the ACL one in a folder that passes no permissions down.
+- **One latent fragility, left as it is.** `dedupe_local_targets` compares lowercased path strings, so one path spelled with mixed separators would count as two. Its only caller passes paths spelled one way, so this cannot happen today.
 
 ### 8.5 RED evidence
 
@@ -1146,11 +1207,11 @@ At d94ed2d, 112 of the 118 commands took an `AppHandle`, `State` or `Window` (2,
 
 | Item | What it needs |
 |---|---|
-| Manual checks never run | On Windows, quit with a connected MCP server and see the session DELETE arrive. On Windows, a key file on a network share: the drive-letter rule is tested through its pure function only. A real WebView2 drag and drop in the SFTP view and the category tree. A real GTK credential dialog (no default button; the idle-callback timing). The Windows CI job's first run on a runner, after which `continue-on-error` should go. `release.yml`'s new Windows manifest step, at the next tag |
+| Manual checks never run | On Windows, quit with a connected MCP server and see the session DELETE arrive. On Windows, a key file on a network share: the drive-letter rule is tested through its pure function only. A real WebView2 drag and drop in the SFTP view and the category tree. A real GTK credential dialog (no default button; the idle-callback timing). The Windows CI job's first green run on a runner (its first run failed five tests, fixed in the follow-up commit; section 8.4), after which `continue-on-error` should go. `release.yml`'s new Windows manifest step, at the next tag |
 | The coverage refactor | Commands generic over `tauri::Runtime`, so `MockRuntime` can test the command code (10.8% of production lines at 6c19b1b), which no test reaches today (section 8.9) |
 | Deferred and Partial findings | A7-03 importers (R9); A7-54 and A7-55 suites, A7-58 importer, A1-29 token refactor and A5-22 progress events (R10); A5-28 terminal-header Edit button; A6-02 grant model; A7-56 Windows job's first green run |
-| Smaller follow-ups | Skip the tools of unconfirmed MCP servers in the renderer; module splits; a read-back check for servers without file types; the rest of section 7.2 |
-| Publication | Nothing is pushed, and there is no pull request and no release. Each needs the user |
+| Smaller follow-ups | Skip the tools of unconfirmed MCP servers in the renderer; module splits; a read-back check for servers without file types; in `release.yml`, attach the installers and their signatures in one step (or publish a draft last), check each new signature against the public key the app embeds, and refuse a missing key before the build rather than after it; the rest of section 7.2 |
+| Publication | The branch is pushed and [pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85) is open for review. Merging it and any release need the user |
 
 ---
 

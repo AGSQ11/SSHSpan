@@ -61,11 +61,14 @@ hidden by the exit code of `tr`.
 `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-gnu --all-targets`
 (with its own shared target directory, for example `$HOME/sshspan-target-win`) type-checks
 `#[cfg(windows)]` code from Linux. It does **not** execute Windows behavior. Windows behavior runs
-natively in CI (the `windows` job runs `cargo test` and the static renderer checks on
-`windows-latest`, but has not run on a runner yet, so it is `continue-on-error` until it has
-passed once; the release workflow also runs `cargo test` on `windows-latest` at every tag, never on
-a pull request) and was run once by hand from a cross-built test executable on Windows 11 for the
-secret-file/ACL path; treat any other Windows-only claim accordingly.
+natively in CI: the `windows` job runs `cargo test` and the static renderer checks on
+`windows-latest`. It has not passed on a runner yet (its first run, on pull request #85, passed
+the static checks and failed five library tests that assumed Unix paths or a single ACL entry; they
+are fixed), so it is `continue-on-error` until it has passed once. The release workflow also runs
+`cargo test` on `windows-latest` at every tag, never on a pull request. The library and
+integration tests have also been run by hand on Windows 11, from test executables cross-built in
+WSL (the next paragraph says what they need beside them); treat any other Windows-only claim
+accordingly.
 
 A Windows test executable stops at load time (`0xC0000139`, `STATUS_ENTRYPOINT_NOT_FOUND` for
 `comctl32` `TaskDialogIndirect`) unless it declares Common-Controls 6. `tauri-build` embeds that
@@ -210,7 +213,8 @@ timeout.
 - `windows`: the static renderer checks (the same list as `renderer`, plus `check-ipc-args.js`),
   then `cargo test` on `windows-latest` (the suites run on Linux only: they drive the same files
   in the same browser). The job is `continue-on-error` - its failure does not fail the workflow -
-  until it has passed once on a runner (audit row A7-56); delete that flag then.
+  until it has passed once on a runner (audit row A7-56); delete that flag then. Its first run
+  passed the static checks and failed five library tests, which are fixed.
 
 ### Scripts
 

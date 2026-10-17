@@ -23,8 +23,9 @@
  *     search ids and edit-in-editor sync reporting;
  * and (unit JU6b):
  *   - the layout at 880x560, 1100x720 and 1600x1000: rows on screen with an
- *     empty queue, a queue whose actions stay reachable, Split inside its
- *     column, the toolbar's More menu, working splitters, single-line rows;
+ *     empty queue, a queue whose actions stay reachable (on any fonts), Split
+ *     inside its column, the toolbar's More menu, working splitters,
+ *     single-line rows;
  *   - pointer-event drag and drop (HTML5 drops never reach the page on
  *     Windows - A3-23), Escape to cancel, and the menu alternatives;
  *   - one sftp_open per tab, the edit-conflict prompt, settings that revert
@@ -1371,6 +1372,19 @@ const layoutOf = (page, tabId) => page.evaluate((t) => {
   }
   const fb = R(firstBtn);
   const topAt = fb ? document.elementFromPoint(fb.left + fb.width / 2, fb.top + fb.height / 2) : null;
+  // A whole job row is its box, and never less than its min-height (28px):
+  // the list squeezes rows down to it when they do not all fit.
+  const jobRow = list ? list.querySelector('.sftp-queueitem') : null;
+  const jobRowH = jobRow ? Math.max(R(jobRow).height, parseFloat(getComputedStyle(jobRow).minHeight) || 0) : null;
+  // The restored-transfer note: on screen and on top, inside the panel, and
+  // on one line - counted from its text's line boxes, whatever the font.
+  const note = document.getElementById('sftpQueueRestoredBanner');
+  const nr = R(note);
+  const qr = R(q);
+  const hr = q ? R(q.querySelector('.sftp-queuehead')) : null;
+  const noteAt = nr && nr.height > 0 ? document.elementFromPoint(nr.left + Math.min(20, nr.width / 2), nr.top + nr.height / 2) : null;
+  const noteText = document.createRange();
+  if (note) noteText.selectNodeContents(note);
   const surface = document.getElementById('sessionSurface');
   const col = document.querySelector('.terminal-col');
   const panes = panel.querySelector('.sftp-panes');
@@ -1396,6 +1410,17 @@ const layoutOf = (page, tabId) => page.evaluate((t) => {
       return r.width > 0 && r.right <= innerWidth && r.left >= lr.left - 1 && r.right <= lr.right + 1;
     }),
     firstActOnTop: !!(firstBtn && topAt && firstBtn.contains(topAt)),
+    listH: lr ? Math.round(lr.height * 10) / 10 : null,
+    jobRowH: jobRowH === null ? null : Math.round(jobRowH * 10) / 10,
+    note: note ? {
+      shown: !note.hidden && !!nr && nr.width > 0 && nr.height > 0,
+      onTop: !!(noteAt && note.contains(noteAt)),
+      inside: !!(nr && qr) && nr.top >= qr.top - 1 && nr.bottom <= qr.bottom + 1 && nr.left >= 0 && nr.right <= innerWidth,
+      lines: new Set([...noteText.getClientRects()].map((x) => Math.round(x.top))).size,
+      whole: note.textContent.length > 0 && note.title === note.textContent,
+      // A line of the head to itself: as wide as the head.
+      ownLine: !!(nr && hr) && Math.abs(nr.width - hr.width) <= 1,
+    } : null,
     // For a failure note: where the button is, the list's box, what is on top.
     firstAct: fb ? [Math.round(fb.top), Math.round(fb.bottom)] : null,
     list: lr ? [Math.round(lr.top), Math.round(lr.bottom)] : null,
@@ -1428,6 +1453,24 @@ const toSplit = (page, tabId) => page.evaluate((t) => {
   activateSessionSurface(t);
 }, tabId || 't1');
 
+/// A1-02 with the restored-transfer note showing (LAYOUT_JOBS has a paused
+/// job whose server is not connected): the job list keeps room for a whole
+/// job, so the first one's Pause/Cancel/Retry can be scrolled to and used,
+/// and the note stays on screen - one line, the whole of it in its tooltip.
+/// CI on Linux: the head wrapped to a second line there, the note took the
+/// rest and the list was 0px high.
+function jobListKeepsARow(at, how, m) {
+  yes(`A1-02 ${at}: ${how}the job list keeps room for one whole job row`, m.jobRowH !== null && m.listH + 0.5 >= m.jobRowH, JSON.stringify(m));
+  yes(`A1-02 ${at}: ${how}the reconnect note stays on screen, on one line, whole in its tooltip`,
+    !!m.note && m.note.shown && m.note.onTop && m.note.inside && m.note.lines === 1 && m.note.whole, JSON.stringify(m.note));
+}
+
+/// Wider and taller text than the fonts of any platform give: the letter
+/// spacing wraps the transfer panel's head the way Linux fonts (DejaVu Sans)
+/// do, and every line is taller - so the layout is checked past what CI
+/// found, on whatever fonts the machine has.
+const LARGER_TEXT = '#sftpQueuePanel * { letter-spacing: 1px !important; line-height: calc(1em + 8px) !important; }';
+
 async function scenarioLayout(browser, server) {
   for (const [w, h, minRows] of [[880, 560, 3], [1100, 720, 5], [1600, 1000, 5]]) {
     const at = `${w}x${h}`;
@@ -1448,6 +1491,10 @@ async function scenarioLayout(browser, server) {
       yes(`A1-01 ${at}: and takes at most about 35% of the surface`, m.queueH <= m.bodyH * 0.35 + 2, JSON.stringify(m));
       yes(`A1-02 ${at}: every job's Pause/Cancel/Retry sits inside the window and the list`, m.actsInside, JSON.stringify(m));
       yes(`A1-02 ${at}: the first job's buttons are not covered`, m.firstActOnTop, JSON.stringify(m));
+      jobListKeepsARow(at, '', m);
+      // Only a short file surface makes the note share a line (styles.css):
+      // with room, it reads as it did, whole on a line of its own.
+      if (w !== 880) yes(`A1-02 ${at}: with room for it the reconnect note keeps a line of its own`, m.note && m.note.ownLine, JSON.stringify(m.note));
       yes(`A1-02 ${at}: the job list does not scroll sideways`, m.queueOverflowX <= 0, JSON.stringify(m));
       check(`A1-02 ${at}: the summary stays on one line`, m.summaryLines, 1);
       yes(`A1-02 ${at}: still no sideways scroll of the SFTP body`, m.bodyOverflowX <= 0, JSON.stringify(m));
@@ -1462,6 +1509,8 @@ async function scenarioLayout(browser, server) {
       m = await layoutOf(page);
       yes(`A1-15 ${at}: the two panes and the splitter fill the pane area exactly`, Math.abs(m.panesSum - m.panesW) <= 1, JSON.stringify(m));
       yes(`A1-02 ${at}: no sideways scroll with both panes`, m.bodyOverflowX <= 0, JSON.stringify(m));
+      yes(`A1-02 ${at}: with both panes the first job's buttons are not covered`, m.firstActOnTop, JSON.stringify(m));
+      jobListKeepsARow(at, 'with both panes ', m);
 
       await toSplit(page);
       await settle(page, 250);
@@ -1471,6 +1520,38 @@ async function scenarioLayout(browser, server) {
       // Review L4: in Split the summary was squeezed to about one character.
       yes(`L4 ${at}: in Split the transfer summary keeps a readable width (6em or more)`, m.summaryW !== null && m.summaryW >= 66, JSON.stringify(m));
       check(`L4 ${at}: and stays on one line`, m.summaryLines, 1);
+      // Split's head takes two lines on any fonts: at 880x560 the note left
+      // the list a few pixels there, with the first job's buttons under it.
+      yes(`A1-02 ${at}: in Split the first job's buttons are not covered`, m.firstActOnTop, JSON.stringify(m));
+      jobListKeepsARow(at, 'in Split ', m);
+      check('no page errors', app.errors, []);
+    });
+  }
+
+  // The CI failure, on any machine's fonts. Past it, the panel may take room
+  // from the file list (which scrolls) - the job list keeps its row.
+  for (const [w, h] of [[880, 560], [1100, 720], [1600, 1000]]) {
+    const at = `${w}x${h}`;
+    await withFiles(browser, server, LAYOUT_SPEC, `A1-02 larger text at ${at}`, async (app) => {
+      const { page } = app;
+      await page.setViewportSize({ width: w, height: h });
+      await page.addStyleTag({ content: LARGER_TEXT });
+      await openFilesTab(page);
+      await emitJobs(page, LAYOUT_JOBS);
+      await settle(page, 250);
+      let m = await layoutOf(page);
+      yes(`A1-02 ${at}: with larger text every job's Pause/Cancel/Retry sits inside the window and the list`, m.actsInside, JSON.stringify(m));
+      yes(`A1-02 ${at}: with larger text the first job's buttons are not covered`, m.firstActOnTop, JSON.stringify(m));
+      jobListKeepsARow(at, 'with larger text ', m);
+      yes(`A1-02 ${at}: with larger text nothing scrolls sideways`, m.bodyOverflowX <= 0 && m.queueOverflowX <= 0, JSON.stringify(m));
+      check(`A1-02 ${at}: with larger text the summary stays on one line`, m.summaryLines, 1);
+
+      await toSplit(page);
+      await settle(page, 250);
+      m = await layoutOf(page);
+      yes(`A1-02 ${at}: with larger text in Split the first job's buttons are not covered`, m.firstActOnTop, JSON.stringify(m));
+      jobListKeepsARow(at, 'with larger text in Split ', m);
+      yes(`A1-02 ${at}: with larger text in Split nothing scrolls sideways`, m.bodyOverflowX <= 0 && m.queueOverflowX <= 0, JSON.stringify(m));
       check('no page errors', app.errors, []);
     });
   }
@@ -2826,6 +2907,33 @@ async function scenarioQueueHeight(browser, server) {
     await settle(page, 60);
     const top = await queueOf(page);
     check('N3 up to the maximum the handle gives, and no further', [top.h, top.now], [top.max, top.max]);
+    check('no page errors', app.errors, []);
+  });
+
+  // A1-02 keeps the panel at its head and one job even above those bounds
+  // (Split in the smallest window). The handle must say so and keep no
+  // height there: one it kept would change nothing on screen, then make the
+  // panel shorter than the default in a larger window.
+  await withFiles(browser, server, LAYOUT_SPEC, 'N3 the transfer panel held at its head and one job', async (app) => {
+    const { page } = app;
+    await page.setViewportSize({ width: 1600, height: 1000 });
+    await openFilesTab(page);
+    await toSplit(page);
+    await emitJobs(page, LAYOUT_JOBS);
+    await settle(page, 250);
+    const roomy = await queueOf(page);
+    await page.setViewportSize({ width: 880, height: 560 });
+    await settle(page, 250);
+    await page.focus(handle);
+    const held = await queueOf(page);
+    check('N3 in Split at 880x560 the handle says the panel can neither grow nor shrink there',
+      [held.now, held.min, held.max], [held.h, held.h, held.h]);
+    for (const key of ['ArrowUp', 'ArrowDown', 'ArrowDown']) await page.keyboard.press(key);
+    await settle(page, 80);
+    check('N3 and the arrows change nothing there', (await queueOf(page)).h, held.h);
+    await page.setViewportSize({ width: 1600, height: 1000 });
+    await settle(page, 250);
+    check('N3 and keep no height: in a larger window the panel is as tall as before', (await queueOf(page)).h, roomy.h);
     check('no page errors', app.errors, []);
   });
 }

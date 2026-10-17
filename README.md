@@ -233,11 +233,13 @@ which lists every accepted risk; the status of every audit finding is in the
   timeout.
 - **What the tests do not exercise.** The renderer suites run in headless Chromium against stubbed
   IPC. Native dialogs, the tray, WebView2 and WebKitGTK rendering, screen readers, and real SSH,
-  SFTP, Bitwarden and MCP servers were not exercised, and Windows-only code ran natively only for
-  the secret-file tests (see [CONTRIBUTING.md](CONTRIBUTING.md)). Drag and drop is emulated: the
-  suites remove the HTML5 drag events the Windows webview withholds and drive a real mouse, and
-  no real WebView2 drag was run. The `windows-latest` CI job has never run on a runner (it is
-  `continue-on-error` until it has passed once), and the exit-time wait for MCP session
+  SFTP, Bitwarden and MCP servers were not exercised. The Rust library and integration tests have
+  also run natively on Windows 11, from test executables cross-built in WSL (see
+  [CONTRIBUTING.md](CONTRIBUTING.md)). The `windows-latest` CI job has not passed on a runner yet:
+  its first run, on the pull request, failed five tests that assumed Unix paths or a single ACL
+  entry, and they are fixed (the job is `continue-on-error` until it has passed once). Drag and
+  drop is emulated: the suites remove the HTML5 drag events the Windows webview withholds and
+  drive a real mouse, and no real WebView2 drag was run. The exit-time wait for MCP session
   teardowns (quit with a connected MCP server) needs a manual check on Windows.
 
 ## Screenshots
@@ -582,9 +584,11 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
   a toast say why. An item's fingerprint and public key are derived from its private key; an item
   that claims otherwise is refused by name.
 - **Deploy to SSH** - select keys in the Keys view and a selection bar offers Deploy. The backend
-  writes each private key to `~/.ssh/sshspan_<sanitized-name>` (owner-only permissions from the
-  moment of creation) and its public key beside it as `.pub`, and the `Host` stanzas to **SSHSpan's
-  managed SSH config** - it never edits your `~/.ssh/config`. To use the aliases, add the generated
+  writes each private key to `~/.ssh/sshspan_<sanitized-name>` (restricted from the moment of
+  creation: mode 0600 on Unix; on Windows every inherited permission is removed and the current
+  user gets full control, see [SECURITY.md](docs/SECURITY.md#secret-file-writes)) and its public
+  key beside it as `.pub`, and the `Host` stanzas to **SSHSpan's managed SSH config** - it never
+  edits your `~/.ssh/config`. To use the aliases, add the generated
   `Include "<managed config path>"` line (quoted; `%` doubled; forward slashes on Windows) at the
   **top** of your own `~/.ssh/config` and check an affected path with `ssh -G <alias>`: OpenSSH
   treats `*`, `?` and `[` in an `Include` path as a glob pattern, SSHSpan does not escape them, and

@@ -238,12 +238,13 @@ jobs:
   # the same Chromium, so a second run would double the minutes without adding
   # coverage.
   #
-  # Not yet proven on a runner: until this job has run green once, a failure may
-  # be a test that assumes Unix paths (several use literal /tmp and /etc
-  # strings) or a mistake in the manifest step, not a regression. So the job is
-  # continue-on-error: its failure does not fail the workflow run. The flag
-  # stays until the job has passed once on a runner; then delete it, so that a
-  # Windows regression fails CI like any other (audit row A7-56).
+  # Not yet green on a runner: its first run failed five library tests that
+  # assumed Unix paths or a single ACL entry (fixed since; the manifest step
+  # worked). Until this job has run green once, a failure may be another such
+  # test (several use literal /tmp and /etc strings) rather than a regression.
+  # So the job is continue-on-error: its failure does not fail the workflow
+  # run. The flag stays until the job has passed once on a runner; then delete
+  # it, so that a Windows regression fails CI like any other (audit row A7-56).
   windows:
     name: Windows (cargo test, static checks)
     runs-on: windows-latest
@@ -305,6 +306,8 @@ jobs:
       # MSVC build links the WebView2 loader statically, so no DLL is needed
       # here (the MinGW cross-build used in WSL does need WebView2Loader.dll).
       # The release workflow's Windows test step writes the same manifest.
+      # No runnable doctests exist today (cargo test prints "running 0 tests"
+      # for Doc-tests); rustdoc would build one elsewhere, without this manifest.
       - name: Declare Common-Controls 6 for the test executables
         shell: pwsh
         run: |

@@ -150,12 +150,23 @@ and apply protection before the first secret byte:
   `/inheritance:r /grant:r *SID:F` and `CREATE_NO_WINDOW`; then write through the original
   handle. If ACL setup or the write fails, remove the file.
 
+On Windows `/inheritance:r` removes inherited entries only and `/grant:r` replaces only the user's
+own entry, so the entries Windows gave the new file at creation stay. Where the folder passes
+permissions down, as `~/.ssh` under the user profile normally does, the file got inherited entries
+only, and the current user is then the only account with access. Where it passes none down (seen
+for an elevated administrator on the CI runner and for a UAC user on Windows 11), the file got the
+creating process's default entries, so SYSTEM and Administrators keep the full control Windows gave
+it, beside the user; OpenSSH for Windows accepts both on a private key, and both accounts can reach
+any file anyway. The call grants no other account anything; with Windows' default settings, Users,
+Everyone and Authenticated Users get no access either way.
+
 A FAT/exFAT destination that cannot carry the expected ACL can therefore reject an export rather
 than leave a readable private key. That is fail-closed behavior, not a promise that every volume
 is supported. This path was verified natively on Windows 11 from a test executable cross-built in
-WSL; the rest of the Windows-specific code is type-checked, and is meant to run in CI on
-`windows-latest` (that job has not run on a runner yet and does not fail the workflow until it
-has passed once).
+WSL, and the library and integration tests have since run natively there too. The `windows-latest`
+CI job has not passed on a runner yet: its first run failed five tests that assumed Unix paths or
+a single ACL entry, and they are fixed; the job does not fail the workflow until it has passed
+once.
 
 ### Backups
 
@@ -718,7 +729,15 @@ AppImage and replaces it in place. The renderer must ask the user before calling
 The minisign signature authenticates the installer bytes as signed by the key holder and detects
 asset substitution/tampering and hostile mirrors. It does **not** defend against compromise of the
 repository, release workflow, or `MINISIGN_SECRET_KEY`, because that environment can sign a
-malicious build. The signing key was provisioned on 2026-09-12, so the updater is fail-closed.
+malicious build. The signing key was provisioned on 2026-09-12, so the updater is fail-closed. In
+this repository the release workflow also stops with an error when `MINISIGN_SECRET_KEY` is
+missing, before it attaches any installer, instead of publishing an unsigned release (a fork,
+which has no such secret, builds unsigned with a warning). Two gaps remain: the installers are
+attached, and the release published, in one step and the `.minisig` files in a later one, so a
+failed upload in between leaves a public release without signatures; and no step checks a new
+signature against the public key the app embeds (`MINISIGN_PUBLIC_KEY` in `updater.rs`), so a
+secret key that does not match it signs without an error. Installed copies refuse such a release,
+because the updater fails closed, so either gap means an update outage, not an unverified install.
 
 The embedded public key (key id `D67C45BA942239D8`) pairs with the `MINISIGN_SECRET_KEY` Actions
 secret and the maintainer's offline backup. To rotate it, replace both in the same release;
@@ -846,11 +865,14 @@ Each is a known, deliberate state, with the reason it was left.
   once (a lock with many sessions), the rest are not sent and those sessions expire on their
   servers.
 - **Windows CI and drag and drop are not proven on the real thing.** The `windows-latest` CI job
-  has never run on a runner (it is `continue-on-error` until it has passed once, A7-56, Partial);
-  the release workflow's own Windows `cargo test`, with the same manifest step, runs only when a tag
-  is pushed and has not run since that step was added. Drag and drop is emulated in the renderer
-  suites - they remove the HTML5 drag events the Windows webview withholds and drive a real mouse -
-  and no real WebView2 drag was run (A3-23).
+  has not passed on a runner yet: its first run, on the pull request, passed the static checks and
+  failed five library tests that assumed Unix paths or a single ACL entry. They are fixed, and the
+  library and integration tests have since run natively on Windows 11, from test executables
+  cross-built in WSL. The job stays `continue-on-error` until it has passed once on a runner (A7-56,
+  Partial). The release workflow's own Windows `cargo test`, with the same manifest step, runs only
+  when a tag is pushed and has not run since that step was added. Drag and drop is emulated in the
+  renderer suites - they remove the HTML5 drag events the Windows webview withholds and drive a real
+  mouse - and no real WebView2 drag was run (A3-23).
 - **Platform limits.** There is no hardware-backed key storage; keys are as strong as the master
   password and the OS random-number generator. A weak master password can be attacked offline
   against the stored Argon2id verifier. Tauri v2 exposes no OS suspend or lock event, so suspend
@@ -893,7 +915,7 @@ transmitted by SSHSpan.
 - CI runs formatting, clippy correctness, Rust tests, the renderer syntax, globals, vendor-hash,
   MCP-contract and comment-hygiene checks, the seven renderer suites, IPC argument checks,
   `cargo audit` (with a documented ignore for RUSTSEC-2023-0071), and the Rust tests and static
-  checks on `windows-latest` (a job that has not run on a runner yet; its failure does not fail
+  checks on `windows-latest` (a job that has not passed on a runner yet; its failure does not fail
   the workflow until it has passed once).
 - RUSTSEC-2023-0071 affects RSA PKCS#1 v1.5 decryption. SSHSpan uses RSA for signatures/auth, not
   attacker-controlled RSA decryption; there is no patched upstream version, so the risk is

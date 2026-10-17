@@ -26,11 +26,12 @@ No other outbound destination is hard-wired in the source, apart from the base-U
 settings offer (OpenAI, OpenRouter, Groq, Ollama and LM Studio on `localhost`, Anthropic), which
 only fill the field: nothing is contacted until the user saves and tests the settings or sends a
 message. The renderer's CSP and architecture route provider, MCP, Bitwarden, and updater requests
-through Rust rather than page `fetch`. On Windows a server's key file is read only from this
-computer's drives (`C:\...`; a drive letter that Windows has mapped to a share counts as a drive,
-and reading it uses that mapping): SSHSpan never opens a path written as a share or a device
-(`\\server\share\...`) for it, so a key file path cannot by itself make SSHSpan contact a file
-server.
+through Rust rather than page `fetch`. On Windows a server's key file is read only through a drive
+letter (`C:\...`, `C:/...` or the verbatim `\\?\C:\...`). A path written as a share or a device
+(`\\server\...`, `\\?\UNC\...`, `\??\...`, `\\.\...`), a path with any other prefix and a relative
+path (`key`, `\key`, `D:key`) are never opened, so a key file path cannot make SSHSpan open a
+connection to a file server by naming one. A drive letter is read like a local drive: if you
+mapped it to a share, that read goes through your mapping to the file server.
 
 ## AI assistant data flow
 
@@ -132,9 +133,10 @@ Sync with Bitwarden?"), whether SSHSpan may upload the SSH private keys and save
 there; the question names the account, the server and the address (Esc means no; the default
 button is "Don't allow" on Windows and macOS, and the GTK dialog on Linux sets none; an "Allow"
 within a second of the dialog opening, or after the vault locked, is not taken; and only one such
-question is open at a time). Until it is allowed, no sync is attempted and nothing is sent, not
-even a login; Test connection uploads nothing and still works. A restore cannot bring or confirm a
-destination, because a backup carries no Bitwarden settings, and settings saved before this
+question is open at a time). Before you allow the destination, nothing is uploaded and no sync
+runs. Test connection, which you start yourself, still signs in to the server you typed and lists
+what its vault holds, to check the settings, and uploads nothing. A restore cannot bring or confirm
+a destination, because a backup carries no Bitwarden settings, and settings saved before this
 question existed keep syncing: a one-time migration at the first start counts their destination as
 allowed. SSHSpan records the answer as `sync.destination_allowed`
 or `sync.destination_declined`, holding only the host (an "Allow" that came within a second is
@@ -180,8 +182,9 @@ separate settings file. The project manifests support Windows and Linux only.
 ### Backups and exports
 
 Private-key exports and vault backups are chosen/written by native Rust dialogs and are written
-owner-only; public-key exports use the native save dialog too, so a cancelled dialog exports
-nothing. Every save dialog opens in the Downloads folder (the home folder when there is none).
+with restricted permissions (see [SECURITY.md](SECURITY.md#secret-file-writes)); public-key exports
+use the native save dialog too, so a cancelled dialog exports nothing. Every save dialog opens in
+the Downloads folder (the home folder when there is none).
 Private-key exports and backups are refused in system folders, in the places whose contents run at
 login or when a program starts, in the folder settings (`user-dirs.dirs`, `user-dirs.locale`) and
 in SSHSpan's own folders (`~/.ssh` stays allowed for them; see

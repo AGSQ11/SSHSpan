@@ -330,11 +330,17 @@ says which are only Partial and what is still open.
   own CI step and in `test:polish` and fails on comments that cite the internal work labels it
   knows (`JU3`, `RU6b`, "fix round 1", `I1`, `M7`, "item 7"; other label shapes pass), on
   removed code that comes back and on error text built by hand in the shapes it knows; there is a
-  `windows-latest` job for `cargo test` and the static checks (it has not run on a runner yet, so
-  its failure does not fail the workflow until it has passed once); every job has a timeout. The
-  unreferenced `scripts/refactor_tabs.py` and `scripts/cdp-*.js` drivers were removed.
+  `windows-latest` job for `cargo test` and the static checks (it has not passed on a runner yet:
+  its first run failed five tests that assumed Unix paths or a single ACL entry, and they are
+  fixed; its failure does not fail the workflow until it has passed once); every job has a
+  timeout. The unreferenced `scripts/refactor_tabs.py` and `scripts/cdp-*.js` drivers were removed.
   (`7e5c5c5`, `11abb3e`, `c227218`, `53347df`, `d589b51`, `652aa5e`, `d5e9d22`, `11e7e30`,
-  `3b0fcfb`, `6c19b1b`; A7-56, A8-17, A8-21)
+  `3b0fcfb`, `6c19b1b`, #85; A7-56, A8-17, A8-21)
+- **The MCP smoke mock answers like a real server.** `scripts/mcp-smoke-server.py` (developer
+  tooling) answers `/mcp-listchanged` like `/mcp` and, for a tool call there, sends a
+  `notifications/tools/list_changed` event before the JSON-RPC response; `image_cat` returns a real
+  image content block; and the streamed branch of `/mcp` ends with a JSON-RPC response too. Steps
+  19 and 26 of `docs/MCP-SMOKE-TEST.md` use them. (#85)
 - **Clearer errors.** SFTP list, mkdir, remove, rename, stat, touch and statvfs errors name the
   status once (`<step> failed: <Status> (code <n>): <server message>` instead of "mkdir failed:
   Failure: Failure"). Connect, Test and the assistant refuse at once, with "The vault is being
@@ -407,9 +413,15 @@ Vault, dialogs and settings
   spreadsheet formulas. (`57993ba`, `c227218`; A7-52, A8-11, A2-32)
 - **Secret files on Windows.** Deploy, private-key export, backup export and the audit CSV export
   all failed on Windows because `icacls` was given a bare SID. The file is now created empty with
-  no sharing, restricted to the current user in one `icacls` call from the absolute System32
-  path (no console window), and only then written; a failed restriction removes it. Verified
-  natively on Windows 11. (`57993ba`; A7-01, A7-43, A6-13)
+  no sharing, and one `icacls` call from the absolute System32 path (no console window) removes
+  every inherited permission and gives the current user full control before any byte is written;
+  a failed restriction removes the file. Where the folder passes permissions down (`~/.ssh` under
+  the user profile normally does), the current user is then the only account with access. Where it
+  passes none down (seen on the CI runner, an elevated administrator), SYSTEM and Administrators
+  keep the full control Windows gave the new file, which OpenSSH accepts on a private key. The call
+  grants no other account anything; with Windows' default settings, Users, Everyone and
+  Authenticated Users get no access either way. Verified natively on Windows 11.
+  (`57993ba`; A7-01, A7-43, A6-13)
 - **No more freezes on slow work.** Key import, vault create and unlock, server save, local SFTP
   mkdir and rename, eight more commands and the Bitwarden settings save run off the main thread; the
   unlock throttle holds for parallel guesses and for the password-change check; a lock during an
@@ -554,6 +566,12 @@ SFTP
   own tab's listing, the Preserve-timestamps toggle appears, and searches carry an id so a new
   search cancels the previous walk. (`11abb3e`, `dc09f93`; A3-22, A5-46, A1-04, A3-37, A1-25,
   A3-01, A7-21)
+- **The transfer list in a small window.** While the note about paused transfers of a server that
+  is not connected is showing, the transfer list keeps room for at least one job in the smallest
+  window, in Files, Dual and Split, whatever the fonts: where room is short the note shares the
+  panel's header line, and the panel grows into the file list (which scrolls) rather than leave no
+  job row. Before, no job's Pause, Cancel or Retry could be reached there on Linux, or in Split on
+  any platform. (#85; A1-02)
 
 Assistant and MCP
 
@@ -832,23 +850,48 @@ Bitwarden, updates and lifecycle
   own text-direction isolate, so it cannot reorder the words around it. A file dropped onto a
   remote folder with a flagged name (from the OS or from the local pane) asks before it uploads,
   and a move names the folder and the folder it is in. (`d94ed2d`, `3b0fcfb`, `6c19b1b`)
+- **Dependency advisories.** `quinn-proto` 0.11.17 -> 0.11.18 (RUSTSEC-2026-0338, -0340 and
+  -0343, which can panic it) and `rustls` 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348 and
+  -0349: TLS secrets in `Debug` output, application data sent to the outer server after an ECH
+  rejection, a 1 GiB allocation before authentication, and a downgrade to classical key exchange).
+  Both are patched releases in `Cargo.lock`. (#85)
+- **A release is no longer published without signatures when the signing key is missing.** In
+  this repository the release workflow now stops with an error when the `MINISIGN_SECRET_KEY`
+  secret is missing, before any installer is attached. It used to skip signing with a warning and
+  publish installers that the updater, which refuses an unsigned release, cannot install. A fork,
+  which has no such secret, still builds unsigned with the warning. Two gaps remain (see
+  [SECURITY.md](docs/SECURITY.md#updater)): a signature upload that fails after the installers are
+  attached leaves a published release without signatures, and nothing checks a new signature
+  against the public key the app embeds. Installed copies refuse such a release either way. (#85)
 
 ### Verification
 
 - Before this work: 216 Rust library tests, 45 integration tests, 11 MCP integration tests and 76
   renderer UI assertions.
-- Rust at `6c19b1b`: 882 library, 48 integration and 20 MCP integration tests (950 in all).
-  Renderer, with this documentation update: `test:ui` 75, `test:safety`
-  491, `test:sftp` 700, `test:polish` 195, `test:assistant` 367, `test:keys` 431, `test:servers`
-  676 (2,935 checks in all; each number is the count of `ok` lines the suite prints). `test:ui` was
-  76 before its embedded MCP check moved to `check-mcp-contract.js`. The five static renderer
-  checks pass; `check-ipc-args.js` reads 147 call sites against 110 commands.
+- Rust: 884 library, 48 integration and 20 MCP integration tests (952 in all; 950 at `6c19b1b`,
+  before the two ACL table tests added with the Windows test fixes).
+  Renderer: `test:ui` 75, `test:safety` 491, `test:sftp` 763, `test:polish` 195, `test:assistant`
+  367, `test:keys` 431, `test:servers` 676 (2,998 checks in all, 2,935 at the documentation commit
+  `e80b01e`; each number is the count of `ok` lines the suite prints). `test:ui` was 76 before its
+  embedded MCP check moved to `check-mcp-contract.js`. The five static renderer checks pass;
+  `check-ipc-args.js` reads 147 call sites against 110 commands.
 - Rust checks ran in WSL2: formatting, Clippy (correctness) and `cargo test` on Linux, plus
   `cargo check --target x86_64-pc-windows-gnu --all-targets`, which type-checks Windows-only code
-  and executes nothing. Windows behavior ran natively only for the secret-file and ACL tests, from a
-  test executable cross-built in WSL and run on Windows 11. A `windows-latest` CI job
-  (`cargo test` and the static renderer checks) is added with these changes; it has not run on a
-  runner yet, so it is `continue-on-error` until it has passed once.
+  and executes nothing. The library and both integration suites also ran natively on Windows 11,
+  from test executables cross-built in WSL: 740 of 742 library tests (the other two read source
+  files through a path the cross-build bakes in, and passed on the runner), 47 of 47 integration
+  tests (the 48th is Unix-only) and 20 of 20 MCP integration tests. A `windows-latest` CI job
+  (`cargo test` and the static renderer checks) is added with these changes. Its first run, on the
+  pull request, passed the static checks and failed five library tests, none of them a product
+  bug: three numbering tests spelled their paths with `/`, a download test used a base with no
+  drive letter, and the ACL test expected one entry where SYSTEM and Administrators keep theirs.
+  All five are fixed in test code. The ACL test now sets up two folders and writes a secret file
+  into each. In one that passes permissions down it requires the user's entry alone; in one that
+  passes none down it admits only the user, SYSTEM and Administrators. Two table tests pin both
+  rules on every platform, and natively the test passes with `%TEMP%` as is and with `TEMP`
+  pointed at a folder that passes nothing down (the native counts above were taken before the
+  second table test was added). The job has not passed yet, so it is `continue-on-error` until it
+  has passed once.
 - The renderer suites run in headless Chromium against a stubbed Tauri bridge. They do not exercise
   WebView2 or WebKitGTK rendering, native dialogs, the tray, screen readers or real SSH, SFTP,
   Bitwarden or MCP servers.
@@ -1660,6 +1703,10 @@ or syncs with Bitwarden.
 - **SFTP edit staging hardened.** Temporary copies of edited remote files are
   created with owner-only permissions and unpredictable names, and are cleaned
   up when the session closes, when the vault locks, or after 24 hours.
+  (Correction 2026-10-17: "owner-only" is the staging folder's mode 0700 on
+  Unix. On Windows the copies get no permissions of their own: they take those
+  of the per-user temp folder, which by default gives access to the user,
+  SYSTEM and Administrators.)
 
 ### Changed
 
@@ -2018,6 +2065,11 @@ SSHSpan gains an **embedded SSH client**. Full migration story:
 - SSH config deployment: marker-bounded managed Host blocks in ~/.ssh/config; deployed key
   files are written to ~/.sshspan/keys/<id> with 0600 permissions on POSIX and
   current-user-only ACLs (icacls /inheritance:r) on Windows.
+  (Correction 2026-10-17: this backend ran `icacls <file> /inheritance:r /grant:r <user>:(F)`,
+  which removes inherited permissions only and gives that user full control, so "current-user-only"
+  was too strong: where the folder passes no permissions down, SYSTEM and Administrators keep the
+  full control Windows gave the new file. The Rust app that replaced this backend does the same
+  with the user's SID; see [`docs/SECURITY.md`](docs/SECURITY.md#secret-file-writes).)
 - Dark-themed vanilla-JS renderer (no framework) with Keys, Deploy, Settings, and Audit
   views, vault gate (create/unlock/change password), keyboard shortcuts (Ctrl+1..4, Ctrl+N,
   Ctrl+L, Ctrl+,), and a 10-second auto-lock status poll.

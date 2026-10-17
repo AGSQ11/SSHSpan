@@ -7227,6 +7227,26 @@ mod tests {
         items.iter().map(|i| i.local_path.as_str()).collect()
     }
 
+    /// `name` in a download folder, spelled the way a batch spells its jobs'
+    /// paths: the canonical destination joined with the names by `Path::join`,
+    /// so with `\` on Windows - the way the renamed paths are joined too. A
+    /// `/d/a` input would put `/` before `a` and `\` before `a (1)` there,
+    /// two spellings of one file that a batch never produces.
+    fn in_d(name: &str) -> String {
+        let d = if cfg!(windows) { r"C:\d" } else { "/d" };
+        std::path::Path::new(d).join(name).display().to_string()
+    }
+
+    /// The paths of `names` in the folder of [`in_d`].
+    fn all_in_d<const N: usize>(names: [&str; N]) -> Vec<String> {
+        names.into_iter().map(in_d).collect()
+    }
+
+    /// Download jobs for `names` in the folder of [`in_d`].
+    fn dls_in_d<const N: usize>(names: [&str; N]) -> Vec<QueuedItem> {
+        names.into_iter().map(|name| dl(&in_d(name))).collect()
+    }
+
     /// `back:up` and `back_up` both sanitize to `back_up`: two jobs, one `.part`.
     #[test]
     fn colliding_sanitized_names_get_a_numbered_local_name() {
@@ -7235,11 +7255,11 @@ mod tests {
         // is rejected outright.)
         assert_eq!(sanitize_remote_name("back:up"), Some("back_up".to_string()));
         assert_eq!(sanitize_remote_name("back_up"), Some("back_up".to_string()));
-        let mut items = vec![dl("/d/back_up"), dl("/d/back_up"), dl("/d/c")];
+        let mut items = dls_in_d(["back_up", "back_up", "c"]);
         let notes = dedupe_local_targets(&mut items);
-        assert_eq!(locals(&items), vec!["/d/back_up", "/d/back_up (1)", "/d/c"]);
+        assert_eq!(locals(&items), all_in_d(["back_up", "back_up (1)", "c"]));
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("/d/back_up (1)"), "{notes:?}");
+        assert!(notes[0].contains(&in_d("back_up (1)")), "{notes:?}");
     }
 
     /// README / readme are ONE file on a case-insensitive disk, and "the
@@ -7251,33 +7271,33 @@ mod tests {
     /// alternative is silently losing one of them.
     #[test]
     fn case_only_collisions_are_renamed_on_every_platform() {
-        let mut items = vec![dl("/d/README"), dl("/d/readme"), dl("/d/ReadMe")];
+        let mut items = dls_in_d(["README", "readme", "ReadMe"]);
         let notes = dedupe_local_targets(&mut items);
         assert_eq!(
             locals(&items),
-            vec!["/d/README", "/d/readme (1)", "/d/ReadMe (2)"]
+            all_in_d(["README", "readme (1)", "ReadMe (2)"])
         );
         assert_eq!(notes.len(), 2);
         // The numbered name is itself compared case-insensitively.
-        let mut clash = vec![dl("/d/a"), dl("/d/A (1)"), dl("/d/A")];
+        let mut clash = dls_in_d(["a", "A (1)", "A"]);
         dedupe_local_targets(&mut clash);
-        assert_eq!(locals(&clash), vec!["/d/a", "/d/A (1)", "/d/A (2)"]);
+        assert_eq!(locals(&clash), all_in_d(["a", "A (1)", "A (2)"]));
     }
 
     #[test]
     fn numbering_keeps_the_extension_and_handles_dotfiles_and_taken_numbers() {
-        let mut items = vec![dl("/d/x.tar.gz"), dl("/d/x.tar.gz")];
+        let mut items = dls_in_d(["x.tar.gz", "x.tar.gz"]);
         dedupe_local_targets(&mut items);
-        assert_eq!(locals(&items), vec!["/d/x.tar.gz", "/d/x.tar (1).gz"]);
+        assert_eq!(locals(&items), all_in_d(["x.tar.gz", "x.tar (1).gz"]));
 
-        let mut dot = vec![dl("/d/.bashrc"), dl("/d/.bashrc")];
+        let mut dot = dls_in_d([".bashrc", ".bashrc"]);
         dedupe_local_targets(&mut dot);
-        assert_eq!(locals(&dot), vec!["/d/.bashrc", "/d/.bashrc (1)"]);
+        assert_eq!(locals(&dot), all_in_d([".bashrc", ".bashrc (1)"]));
 
         // `a (1)` is already taken by another job of the batch.
-        let mut taken = vec![dl("/d/a"), dl("/d/a (1)"), dl("/d/a")];
+        let mut taken = dls_in_d(["a", "a (1)", "a"]);
         dedupe_local_targets(&mut taken);
-        assert_eq!(locals(&taken), vec!["/d/a", "/d/a (1)", "/d/a (2)"]);
+        assert_eq!(locals(&taken), all_in_d(["a", "a (1)", "a (2)"]));
     }
 
     /// Only downloads write a local file; uploads and server copies are left
@@ -12810,7 +12830,14 @@ mod tests {
     /// picked.
     #[test]
     fn rw_fix1_a_dialog_picked_download_never_writes_the_program_files() {
-        let base = std::path::PathBuf::from("/fixture");
+        // A download target must be absolute, or it is refused for that before
+        // the rule under test is reached - and `/fixture` has no drive letter,
+        // so on Windows it is not.
+        let base = PathBuf::from(if cfg!(windows) {
+            r"C:\fixture"
+        } else {
+            "/fixture"
+        });
         let s = sensitive_fixture(&base);
         for p in [
             base.join("opt/SSHSpan/version.dll"),

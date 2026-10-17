@@ -4256,17 +4256,23 @@ function sftpApplyQueueHeight(panel) {
 /// styles.css lays it out: never under --q-least, never so tall that the
 /// file list loses its floor (--q-floor), and one the user chose up to
 /// SFTP_QUEUE_MAX_SHARE of the surface. { lo, hi } - equal in a window too
-/// small to grow it. The handle offers only these: it used to offer 70% of
-/// the surface, the floor then ignored the height it kept, and that "taller"
-/// height made the panel SHORTER than the default in a larger window later.
+/// small to grow it. Both are raised to its head plus one job, which
+/// styles.css never goes below (A1-02): its height less what the job list
+/// has beyond one row (--q-row). The handle offers only these: it used to
+/// offer 70% of the surface, the floor then ignored the height it kept, and
+/// that "taller" height made the panel SHORTER than the default in a larger
+/// window later.
 function sftpQueueBounds(panel) {
   const body = panel.parentElement;
   const bodyH = body ? body.getBoundingClientRect().height : window.innerHeight;
   const css = getComputedStyle(panel);
   const least = parseFloat(css.getPropertyValue('--q-least')) || 60;
   const floor = parseFloat(css.getPropertyValue('--q-floor')) || 226;
-  const hi = Math.round(Math.max(least, Math.min(bodyH - floor, bodyH * SFTP_QUEUE_MAX_SHARE)));
-  return { lo: Math.min(SFTP_QUEUE_MIN_PX, hi), hi };
+  const row = parseFloat(css.getPropertyValue('--q-row')) || 28;
+  const list = panel.querySelector('.sftp-queuelist');
+  const snug = list ? Math.round(panel.getBoundingClientRect().height - Math.max(0, list.getBoundingClientRect().height - row)) : 0;
+  const hi = Math.max(snug, Math.round(Math.max(least, Math.min(bodyH - floor, bodyH * SFTP_QUEUE_MAX_SHARE))));
+  return { lo: Math.max(snug, Math.min(SFTP_QUEUE_MIN_PX, hi)), hi };
 }
 
 function buildQueuePanel() {
@@ -4377,11 +4383,14 @@ function buildQueuePanel() {
 
   // Restored-transfer banner (Task 5): hidden until renderQueuePanel finds a
   // paused job whose server is not connected (see sftpQueueJobResumable).
-  // Plain textContent below - only ever a count.
+  // Plain textContent below - only ever a count. The head's last item rather
+  // than a row of the panel: in a short panel it shares the head's last line,
+  // where a row of its own left the job list no room for a job (A1-02).
   const restoredBanner = document.createElement('div');
   restoredBanner.className = 'sftp-queuebanner';
   restoredBanner.id = 'sftpQueueRestoredBanner';
   restoredBanner.hidden = true;
+  head.appendChild(restoredBanner);
 
   // Column header row + scrolling rows (table-like grid).
   const colhead = document.createElement('div');
@@ -4402,7 +4411,6 @@ function buildQueuePanel() {
 
   panel.appendChild(handle);
   panel.appendChild(head);
-  panel.appendChild(restoredBanner);
   panel.appendChild(colhead);
   panel.appendChild(list);
   return panel;

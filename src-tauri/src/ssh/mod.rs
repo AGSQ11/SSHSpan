@@ -6,8 +6,10 @@ use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Write secret bytes to `path` under owner-only permissions from the first
-/// byte: 0600 on Unix, a current-user-only ACL on Windows.
+/// Write secret bytes to `path` under restricted permissions from the first
+/// byte: mode 0600 on Unix; on Windows no inherited permission and full control
+/// for the current user, with SYSTEM and Administrators beside it where the
+/// folder passes no permissions down (see `restrict_windows_file`).
 ///
 /// SECURITY: `OpenOptions::mode()` applies at CREATION ONLY. Opening an
 /// existing file with `.create(true).truncate(true).mode(0o600)` keeps that
@@ -1060,7 +1062,16 @@ fn parse_whoami_sid(csv: &str) -> Option<String> {
     well_formed.then(|| sid.to_string())
 }
 
-/// Leave `path` with exactly one ACE: full control for the current user.
+/// Take every inherited permission off `path` and give the current user full
+/// control. The only other entries left are those Windows gave the new file
+/// at creation, and `/inheritance:r` (inherited entries only) and `/grant:r`
+/// (the user's own entry only) do not touch them. Where the folder passes
+/// permissions down (as `~/.ssh` under the profile normally does), the file
+/// got inherited entries only, so the user is then the only account with
+/// access. Where it passes none down, the file got the creating process's
+/// default entries instead, and SYSTEM and Administrators keep that full
+/// control (seen for an elevated administrator and for a UAC user). OpenSSH
+/// for Windows accepts both on a private key.
 ///
 /// ONE icacls call does both halves - `/inheritance:r /grant:r *<SID>:F`.
 /// The old code ran `/inheritance:r` on its own first and then granted the
@@ -2082,8 +2093,27 @@ mod secret_write_tests {
     /// done.") - it only takes a SID with a `*` prefix - and it ran after
     /// inheritance had already been stripped in a separate call. Deploy,
     /// private-key export, backup export and the audit CSV export all died
-    /// there. The write must succeed and leave exactly one ACE: full control
-    /// for the current user, nothing inherited.
+    /// there. The write must succeed and leave the file with inheritance
+    /// blocked, nothing inherited, allow entries only and full control for
+    /// the current user ([`secret_acl_problem`]). What else may stay depends
+    /// on the folder, so the test writes into two folders it sets up itself
+    /// instead of trusting the ACL of `%TEMP%`:
+    ///
+    /// - A folder that passes permissions down (one inheritable entry, the
+    ///   user's): the new file holds inherited entries only and
+    ///   `/inheritance:r` removes them all, so exactly one entry must be left,
+    ///   the user's full control. A grant to anyone else - SYSTEM and
+    ///   Administrators included - fails here.
+    /// - A folder that passes none down (as CI's temp folder did): Windows
+    ///   gives the new file the creating process's default DACL as explicit
+    ///   entries, which `/inheritance:r` (inherited entries only) and
+    ///   `/grant:r` (the user's own entry only) leave alone - SYSTEM and
+    ///   Administrators with full control, for an elevated administrator and
+    ///   for a UAC user alike. OpenSSH for Windows accepts those beside the
+    ///   owner on a private key, so they may stay; no one else may.
+    ///
+    /// The entries are judged by SID, from the SDDL `icacls /save` writes: the
+    /// account names `icacls` prints are localized (`NT-AUTORITÄT\SYSTEM`).
     #[cfg(windows)]
     #[test]
     fn write_secret_file_leaves_one_full_control_ace_for_the_current_user() {
@@ -2093,49 +2123,290 @@ mod secret_write_tests {
             std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
         )
         .join("System32");
-        let dir =
-            std::env::temp_dir().join(format!("sshspan-acl-{}", uuid::Uuid::new_v4().simple()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("key.pem");
-
-        let written = write_secret_file(&path, b"-----BEGIN OPENSSH PRIVATE KEY-----");
-        let listing = std::process::Command::new(system32.join("icacls.exe"))
-            .arg(&path)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        // `"domain\user","S-1-5-21-..."`: the SID is read here rather than by
+        // the code under test.
         let me = std::process::Command::new(system32.join("whoami.exe"))
+            .args(["/user", "/fo", "csv", "/nh"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        let _ = fs::remove_dir_all(&dir);
-
-        written.expect("a secret write must succeed on Windows");
-        let listing = listing.expect("icacls must run");
-        let me = me.expect("whoami must run");
-        // `icacls <file>` prints "<file> <ACE>", one more indented ACE per
-        // line, then a blank line and a summary.
-        let aces: Vec<String> = listing
-            .lines()
-            .take_while(|l| !l.trim().is_empty())
-            .enumerate()
-            .map(|(i, l)| {
-                let l = if i == 0 {
-                    l.strip_prefix(&path.display().to_string())
-                        .unwrap_or_else(|| panic!("unexpected icacls output: {listing}"))
-                } else {
-                    l
-                };
-                l.trim().to_string()
-            })
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .expect("whoami must run");
+        let sids: Vec<&str> = me
+            .split(',')
+            .map(|field| field.trim().trim_matches('"'))
+            .filter(|field| field.starts_with("S-1-"))
             .collect();
-        assert_eq!(
-            aces.len(),
-            1,
-            "exactly one ACE expected, icacls said: {listing}"
+        let [my_sid] = sids[..] else {
+            panic!("one SID expected from whoami, got {me:?}");
+        };
+        // Removed on drop, so also when the assertion below fails.
+        let scratch = ScratchDir(
+            std::env::temp_dir().join(format!("sshspan-acl-{}", uuid::Uuid::new_v4().simple())),
         );
-        assert!(
-            aces[0].eq_ignore_ascii_case(&format!("{me}:(F)")),
-            "the only ACE must be full control for {me}, not inherited; got {:?}",
-            aces[0]
-        );
+        let failures: Vec<String> = [
+            (
+                "inheriting",
+                format!("*{my_sid}:(OI)(CI)F"),
+                Expected::ExactlyTheUser,
+            ),
+            (
+                "non-inheriting",
+                format!("*{my_sid}:F"),
+                Expected::UserSystemAndAdministrators,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(folder, grant, expected)| {
+            secret_write_in(&system32, &scratch.0.join(folder), &grant, my_sid, expected)
+                .err()
+                .map(|why| format!("{folder} folder: {why}"))
+        })
+        .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A scratch folder, removed with everything in it on drop.
+    #[cfg(windows)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Make `dir` and give it a protected DACL holding only `grant` for the
+    /// user (`icacls <dir> /inheritance:r /grant:r <grant>`), write a secret
+    /// file in it and check the file's DACL against `expected`. The error
+    /// says what is wrong, with the DACL and the names `icacls` prints.
+    #[cfg(windows)]
+    fn secret_write_in(
+        system32: &Path,
+        dir: &Path,
+        grant: &str,
+        user_sid: &str,
+        expected: Expected,
+    ) -> Result<(), String> {
+        let run = |command: &mut std::process::Command| -> Result<String, String> {
+            let out = command
+                .output()
+                .map_err(|e| format!("icacls could not run: {e}"))?;
+            let said = String::from_utf8_lossy(&out.stdout).to_string();
+            if out.status.success() {
+                return Ok(said);
+            }
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(format!("icacls failed: {said} {err}"))
+        };
+        let icacls = || std::process::Command::new(system32.join("icacls.exe"));
+        fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        run(icacls()
+            .arg(dir)
+            .args(["/inheritance:r", "/grant:r", grant]))?;
+        let path = dir.join("key.pem");
+        write_secret_file(&path, b"-----BEGIN OPENSSH PRIVATE KEY-----")
+            .map_err(|e| format!("the secret write failed: {e}"))?;
+        // The account names, for whoever reads a failure; the SDDL, for the
+        // checks. The dump goes beside the folder, not into it.
+        let listing = run(icacls().arg(&path))?;
+        let dump = dir.with_extension("acl");
+        run(icacls().arg(&path).arg("/save").arg(&dump))?;
+        let sddl = fs::read(&dump)
+            .ok()
+            .and_then(|bytes| saved_sddl(&bytes))
+            .ok_or_else(|| format!("no DACL in the icacls /save dump; icacls said: {listing}"))?;
+        match secret_acl_problem(&sddl, user_sid, expected) {
+            Some(problem) => Err(format!(
+                "{problem}; the DACL is {sddl}; icacls said: {listing}"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The DACL line of an `icacls <file> /save <dump>` dump: UTF-16LE text,
+    /// the file's name on the first line and its DACL in SDDL on the second.
+    #[cfg(windows)]
+    fn saved_sddl(dump: &[u8]) -> Option<String> {
+        let units: Vec<u16> = dump
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let text = String::from_utf16(&units).ok()?;
+        let sddl = text.trim_start_matches('\u{feff}').lines().nth(1)?.trim();
+        (!sddl.is_empty()).then(|| sddl.to_string())
+    }
+
+    /// One entry of a DACL in SDDL:
+    /// `(type;flags;rights;object type;inherited object type;account)`.
+    #[derive(Debug)]
+    struct SddlAce<'a> {
+        kind: &'a str,
+        flags: &'a str,
+        rights: &'a str,
+        account: &'a str,
+    }
+
+    /// The flags and the entries of a DACL in SDDL (`D:PAI(A;;FA;;;SY)...`),
+    /// or None for anything else.
+    fn parse_sddl_dacl(sddl: &str) -> Option<(&str, Vec<SddlAce<'_>>)> {
+        let dacl = sddl.trim().strip_prefix("D:")?;
+        let (dacl_flags, mut rest) = dacl.split_at(dacl.find('(').unwrap_or(dacl.len()));
+        let mut aces = Vec::new();
+        while let Some(body) = rest.strip_prefix('(') {
+            let end = body.find(')')?;
+            let fields: Vec<&str> = body[..end].split(';').collect();
+            let [kind, flags, rights, _, _, account] = fields[..] else {
+                return None;
+            };
+            aces.push(SddlAce {
+                kind,
+                flags,
+                rights,
+                account,
+            });
+            rest = &body[end + 1..];
+        }
+        rest.is_empty().then_some((dacl_flags, aces))
+    }
+
+    /// What a secret file's DACL may hold besides the user's full control, by
+    /// the folder the file was written in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expected {
+        /// Nothing: the folder passes permissions down, so the new file held
+        /// inherited entries only, and all of them are gone.
+        ExactlyTheUser,
+        /// SYSTEM and Administrators at most: the folder passes none down, so
+        /// the file keeps the entries Windows gave it at creation.
+        UserSystemAndAdministrators,
+    }
+
+    /// Why the DACL `sddl` is not that of a secret file written by the user
+    /// `user_sid`, if it is not. Required: inheritance blocked (`P`), no
+    /// inherited entry (`ID`), allow entries only, full control (`FA`) for
+    /// the user, and, by `expected`, either exactly that one entry or no
+    /// entry for anyone but the user, SYSTEM (`SY`) and the Administrators
+    /// group (`BA`).
+    fn secret_acl_problem(sddl: &str, user_sid: &str, expected: Expected) -> Option<String> {
+        let Some((dacl_flags, aces)) = parse_sddl_dacl(sddl) else {
+            return Some(format!("not a DACL in SDDL: {sddl:?}"));
+        };
+        if !dacl_flags.contains('P') {
+            return Some("the file still inherits from its folder".to_string());
+        }
+        // SDDL writes the built-in Administrator account (RID 500) as `LA`.
+        let is_user = |account: &str| {
+            account.eq_ignore_ascii_case(user_sid)
+                || (account == "LA" && user_sid.ends_with("-500"))
+        };
+        let is_system_or_administrators =
+            |account: &str| matches!(account, "SY" | "S-1-5-18" | "BA" | "S-1-5-32-544");
+        if let Some(ace) = aces
+            .iter()
+            .find(|ace| ace.flags.as_bytes().chunks(2).any(|flag| flag == b"ID"))
+        {
+            return Some(format!("an inherited entry is left: {ace:?}"));
+        }
+        if let Some(ace) = aces.iter().find(|ace| ace.kind != "A") {
+            return Some(format!("an entry that is not an allow entry: {ace:?}"));
+        }
+        let others_allowed = expected == Expected::UserSystemAndAdministrators;
+        if let Some(ace) = aces.iter().find(|ace| {
+            !is_user(ace.account) && !(others_allowed && is_system_or_administrators(ace.account))
+        }) {
+            let who = if others_allowed {
+                "the user, SYSTEM and Administrators"
+            } else {
+                "the user"
+            };
+            return Some(format!("an entry for someone other than {who}: {ace:?}"));
+        }
+        if !others_allowed && aces.len() != 1 {
+            return Some(format!(
+                "{} entries for the user where exactly one is expected",
+                aces.len()
+            ));
+        }
+        let full_control = aces
+            .iter()
+            .any(|ace| is_user(ace.account) && ace.rights == "FA");
+        (!full_control).then(|| "no full-control entry for the current user".to_string())
+    }
+
+    /// The rule the Windows ACL test applies in a folder that passes no
+    /// permissions down, checked on every platform: what CI's runner leaves
+    /// (SYSTEM and Administrators beside the user), the user alone, the
+    /// built-in Administrator written `LA`; and what it refuses: Users,
+    /// Everyone, Authenticated Users or another account with access, an
+    /// inherited or a deny entry, inheritance left on, a user without full
+    /// control, and what is not a DACL.
+    #[test]
+    fn secret_acl_rule_admits_only_the_user_system_and_administrators() {
+        let problem = |sddl: &str, sid: &str| {
+            secret_acl_problem(sddl, sid, Expected::UserSystemAndAdministrators)
+        };
+        let me = "S-1-5-21-1-2-3-1001";
+        let ci = format!("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{me})");
+        for fine in [
+            ci.clone(),
+            format!("D:PAI(A;;FA;;;{me})"),
+            format!("D:P(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)(A;;FA;;;{me})"),
+        ] {
+            assert_eq!(problem(&fine, me), None, "{fine}");
+        }
+        let admin = "S-1-5-21-1-2-3-500";
+        let as_la = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LA)";
+        assert_eq!(problem(as_la, admin), None);
+        for extra in [
+            "(A;;0x1200a9;;;BU)",            // Users
+            "(A;;FR;;;WD)",                  // Everyone
+            "(A;;FR;;;AU)",                  // Authenticated Users
+            "(A;;FR;;;S-1-5-21-1-2-3-1002)", // another account
+            "(A;;FA;;;LA)",                  // the built-in Administrator, not `me`
+            "(A;ID;FA;;;SY)",                // inherited
+            "(D;;FA;;;SY)",                  // deny
+        ] {
+            let bad = format!("{ci}{extra}");
+            assert!(problem(&bad, me).is_some(), "{bad} must be refused");
+        }
+        for bad in [
+            format!("D:AI(A;;FA;;;{me})"),
+            format!("D:PAI(A;;FR;;;{me})(A;;FA;;;SY)"),
+            "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+            format!("D:PAI(A;;FA;;;{me}"),
+            String::new(),
+        ] {
+            assert!(problem(&bad, me).is_some(), "{bad:?} must be refused");
+        }
+    }
+
+    /// The rule in a folder that passes permissions down, checked on every
+    /// platform: exactly one entry, the user's full control (the built-in
+    /// Administrator written `LA` too). Refused: Administrators or SYSTEM
+    /// granted beside it (what a second grant in `restrict_windows_file`
+    /// would leave), CI's shape, a second entry for the user, an inherited or
+    /// a deny entry, inheritance left on, and the user with read access only.
+    #[test]
+    fn secret_acl_rule_in_an_inheriting_folder_admits_only_the_user() {
+        let problem =
+            |sddl: &str, sid: &str| secret_acl_problem(sddl, sid, Expected::ExactlyTheUser);
+        let me = "S-1-5-21-1-2-3-1001";
+        for fine in [format!("D:PAI(A;;FA;;;{me})"), format!("D:P(A;;FA;;;{me})")] {
+            assert_eq!(problem(&fine, me), None, "{fine}");
+        }
+        let admin = "S-1-5-21-1-2-3-500";
+        assert_eq!(problem("D:PAI(A;;FA;;;LA)", admin), None);
+        for bad in [
+            format!("D:PAI(A;;FA;;;{me})(A;;FA;;;BA)"), // Administrators granted too
+            format!("D:PAI(A;;FA;;;{me})(A;;FA;;;S-1-5-18)"), // SYSTEM granted too
+            format!("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{me})"), // CI's shape
+            format!("D:PAI(A;;FA;;;{me})(A;;FR;;;{me})"), // a second entry
+            format!("D:PAI(A;ID;FA;;;{me})"),           // inherited
+            format!("D:PAI(D;;FA;;;{me})"),             // deny
+            format!("D:AI(A;;FA;;;{me})"),              // inheritance left on
+            format!("D:PAI(A;;FR;;;{me})"),             // read access only
+        ] {
+            assert!(problem(&bad, me).is_some(), "{bad} must be refused");
+        }
     }
 }

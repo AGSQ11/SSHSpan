@@ -31,7 +31,7 @@ names and numbers can be re-derived with the commands in the sections that quote
 │ commands/       IPC boundary and native dialogs                          │
 │ crypto/         vault, SSH key formats, PPK, PKCS#8, Bitwarden crypto    │
 │ db/             sqlx + SQLite schema/migrations                          │
-│ ssh/            key deployment and owner-only secret-file writes         │
+│ ssh/            key deployment and restricted secret-file writes         │
 │ ssh_client/     russh sessions, host-key trust, terminal channels        │
 │ sftp/           SFTP registry, queue, staging and transfer workers       │
 │ bitwarden/      HTTPS client, SSRF guard and sync                        │
@@ -481,8 +481,9 @@ seal or rewrite secrets take a shared guard and fail fast while rotation is acti
 ### Export, import, and backup
 
 Private-key export and backup export open native save dialogs in Rust and call the shared
-owner-only secret-file writer once the path has passed the write deny-list (`check_own_export`;
-`~/.ssh` allowed for these two; the backup is checked before it is built). Their dialogs suggest a
+secret-file writer (restricted permissions, see [Validation boundaries](#validation-boundaries))
+once the path has passed the write deny-list (`check_own_export`; `~/.ssh` allowed for these two;
+the backup is checked before it is built). Their dialogs suggest a
 bare file name: the key's name cut after its last `/`, `\` or `:`, with the format's extension
 (`private_export_file_name`), and `sshspan-backup-<stamp>.json`. Public-key exports use the native
 save dialog too, and every save dialog opens in the Downloads folder or home (see
@@ -517,8 +518,9 @@ drives is refused before it is opened (see `server_save` above).
 `key_deploy_preview` builds a plan with the same serializer deploy uses: the Host alias, HostName,
 User and Port from the sheet, quoted and escaped so OpenSSH accepts every line, the files per key,
 and refusals (another key's deploy file, a foreign file, an alias that belongs to another key,
-pattern aliases). `key_deploy` writes the private key `~/.ssh/sshspan_<name>` with owner-only
-permissions from creation, the `.pub` file beside it (a plain write) and the `Host` stanzas into
+pattern aliases). `key_deploy` writes the private key `~/.ssh/sshspan_<name>` with restricted
+permissions from creation (see [Validation boundaries](#validation-boundaries)), the `.pub` file
+beside it (a plain write) and the `Host` stanzas into
 SSHSpan's managed config under the config directory, serialising writes to it; it returns the
 `Include` line the user adds, quoted and with `%` doubled, at the top of their own `~/.ssh/config`.
 SSHSpan never edits that file. `key_remove_deployed` removes the files and the stanza and deletes
@@ -807,8 +809,11 @@ refuses credentials in the base URL.
 - CSP: `script-src 'self'`, no inline/eval script, no remote renderer fetches.
 - Dynamic renderer text uses `textContent` or project escaping; xterm consumes remote terminal
   control sequences by design, and links in terminal output ask first.
-- Secret-file writes are 0600 from creation on Unix; Windows creates an empty unshared file,
-  applies a current-user-only ACL, then writes.
+- Secret-file writes are 0600 from creation on Unix. Windows creates an empty unshared file, has
+  one `icacls` call remove every inherited permission and give the current user full control, then
+  writes; where the folder passes no permissions down, SYSTEM and Administrators keep the full
+  control Windows gave the new file. The call grants no other account anything; with Windows'
+  default settings, no other account has access.
 - Bitwarden is HTTPS-only with DNS/address filtering (a configured system proxy resolves the host
   itself and bypasses the connect-time filter; see [SECURITY.md](SECURITY.md)), and a sync uploads
   only to the server and account the user allowed in a native question. MCP intentionally allows

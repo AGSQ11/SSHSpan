@@ -3788,9 +3788,11 @@ fn export_backup_guarded(
 
 /// [`vault_backup_export_to_file`] after the dialog, without the `AppHandle`:
 /// build the backup and write it to `path` with `write_secret_file` (0600
-/// from the first byte on Unix, owner-only ACL on Windows, fail closed), then
-/// audit it. `still_current` is the vault-generation re-check, run after the
-/// build and before the write.
+/// from the first byte on Unix; on Windows, before the first byte, no inherited
+/// permission and full control for the current user, with SYSTEM and
+/// Administrators beside it where the folder passes no permissions down; fail
+/// closed), then audit it. `still_current` is the vault-generation re-check,
+/// run after the build and before the write.
 fn export_backup_to_path(
     db: &db::Database,
     pw: &str,
@@ -4937,10 +4939,12 @@ fn private_export_passphrase<'a>(
 /// Export a PRIVATE key straight to a user-chosen file. The PEM text is
 /// serialized in the backend and written to the path the user picks in the
 /// native save dialog - the key material never crosses the IPC boundary into
-/// the renderer. The file is owner-only from the first byte: 0600 on Unix; on
-/// Windows it is restricted to the current user while still empty, and the
-/// export fails - leaving no file - if that is impossible (a volume that
-/// cannot store ACLs, say), as for every secret file SSHSpan writes.
+/// the renderer. The file is restricted from the first byte: 0600 on Unix; on
+/// Windows, while it is still empty, it loses every inherited permission and
+/// the current user gets full control (where the folder passes no permissions
+/// down, SYSTEM and Administrators keep the full control Windows gave the new
+/// file). The export fails - leaving no file - if that is impossible (a volume
+/// that cannot store ACLs, say), as for every secret file SSHSpan writes.
 #[tauri::command]
 /// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
 /// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when

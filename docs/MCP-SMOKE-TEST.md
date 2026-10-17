@@ -67,8 +67,9 @@ backend and a real webview.
 5. Click **Test connection** for the new server.
 
    Expected: a success toast ("MCP: 5 tools returned.") and a status dot; the row shows "MCP
-   protocol 2025-11-25"; the mock prints nothing for these requests (its request log is silenced),
-   but in a capture the `initialize` answer carries
+   protocol 2025-11-25"; the mock prints nothing for these requests (its request log is silenced:
+   after its banner it prints only a line for a `DELETE`, for the one-shot 404 and for a list
+   change it announces), but in a capture the `initialize` answer carries
    `Mcp-Session-Id: 00000000-0000-0000-0000-000000000001` and `notifications/initialized` sends it
    back. A failure shows its error inline in the server's row.
 
@@ -163,17 +164,28 @@ backend and a real webview.
 
 15. Re-approve `echo` and run it.
 
-    Expected: turning Enable on names the newly shown definition hash and the tool works. The
-    stale-row refusal (an enable that carries a hash older than the stored one) cannot be produced
-    by editing the mock alone: the backend compares the hash the page sends with the hash stored
-    by the last fetch of the list, which changes only when SSHSpan fetches the list again, so it is
-    covered by the stale-hash tests below. The backend also re-checks the gate right before every
-    call, so a definition that changed between the approval and the call is refused ("Tool 'echo'
-    changed on the server since it was approved - re-approve it in the MCP settings.").
+    Expected: turning Enable on names the newly shown definition hash and the tool works.
 
-    Automated: `enabling_with_a_stale_definition_hash_is_refused` (the stale enable) and
-    `a_tool_revoked_while_the_session_is_set_up_is_never_called` (the gate re-check right before
-    the call).
+    Two checks sit behind this that a manual pass cannot reliably provoke:
+
+    - The stale-row refusal (an enable that carries a hash older than the stored one): the backend
+      compares the hash the page sends with the hash stored by the last fetch of the list, which
+      changes only when SSHSpan fetches the list again.
+    - The gate re-check: right before every `tools/call` the backend runs the gate again on the
+      record as stored at that moment. It refuses a tool whose approval was revoked since the
+      first check ("Tool 'echo' is not enabled - enable it in the MCP server settings.") and a
+      tool whose stored definition no longer matches the approved one after a refresh ("Tool
+      'echo' changed on the server since it was approved - re-approve it in the MCP settings.").
+      It reads only what SSHSpan has stored, so a definition changed only on the server is seen
+      once SSHSpan fetches the list again: on Test connection (step 14), or after a
+      `notifications/tools/list_changed` that comes with a call or with the answer to a session's
+      `initialize`, which includes a renewed session (step 26).
+
+    Automated: `enabling_with_a_stale_definition_hash_is_refused` (the stale enable),
+    `a_tool_revoked_while_the_session_is_set_up_is_never_called` (the re-check refuses a tool
+    revoked while the session is set up) and
+    `a_tool_changed_while_an_expired_session_is_renewed_is_not_called_again` (it refuses a tool
+    whose stored definition changed while a lost session is renewed).
 
 ## Error / edge paths
 
@@ -208,15 +220,17 @@ backend and a real webview.
 
 19. Enable `image_cat` the same way, then call it.
 
-    Current mock behavior: the script returns a JSON object containing `resource.type: "image"`, but
-    wraps the whole object as a **text** content block. The base64 therefore arrives as text; the
-    client's `[image omitted]` placeholder path is not exercised by this mock.
+    Expected: the mock answers with a real image content block,
+    `{"type":"image","mimeType":"image/png","data":"<base64 of a 1x1 PNG>"}`, as the only block of
+    the result. SSHSpan shows and forwards no image: the backend turns the block into the text
+    `[image omitted]`. The assistant transcript gets a tool-event row headed
+    `MCP <server> - image_cat` with the outcome "done" (not "failed"); after the arguments its
+    body reads `Result: [image omitted]`, and no picture and no base64 appears anywhere. The model
+    receives the same text, wrapped as untrusted output, and the audit log has an `mcp.tool_call`
+    row with `result=ok`.
 
-    To exercise a real image content block, change the mock to emit
-    `{"type":"image","mimeType":"image/png","data":"..."}`; that is a mock/script update, not a
-    client-side expectation for the current script.
-
-    Automated: `tool_result_shaping_covers_all_content_kinds`.
+    Automated: `tool_result_shaping_covers_all_content_kinds` (an image block becomes
+    `[image omitted]`).
 
 ## Authentication
 
@@ -313,17 +327,39 @@ backend and a real webview.
     - The client always sends `Accept: application/json, text/event-stream` and handles either reply;
       it never requests a streamed `tools/call` body, so the mock's `_meta.stream` branch is
       unreachable from the app.
-    - The mock's `/mcp-listchanged` endpoint replies with a `text/event-stream` body whose result
-      event carries no `jsonrpc` and no `id`, so the app never gets an answer it can match and the
-      endpoint is not a useful manual step. A list change announced ahead of a result (also one
-      announced with the `initialize` answer) refreshes the tool list, and a tool whose definition
-      changed is disabled by that refresh; the automated tests below cover it.
+    - The mock's `/mcp-listchanged` endpoint is `/mcp` with one difference: it answers a
+      `tools/call` as a `text/event-stream` with two events, first a
+      `notifications/tools/list_changed` notification and then the JSON-RPC response to the call
+      (same `id`, the usual `content` and `isError`); initialize, `notifications/initialized` and
+      tools/list are answered as on `/mcp`. Each such call makes the mock print a `[list-changed]`
+      line. To see what the app does with it, add a server with the URL
+      `http://127.0.0.1:8777/mcp-listchanged`, test it, review `echo` and turn Enable on, then stop
+      the mock, edit the `description` of `echo` in `scripts/mcp-smoke-server.py`, start the mock
+      again and ask the assistant to run `echo`.
+
+      Expected: the call is answered and its tool-event row shows the usual
+      `Result: {"echoed": "...", "ok": true}` as "done"; the call is not refused, because it was
+      checked against the definition you approved. The stream announced a change, so SSHSpan then
+      fetches the tool list again (in a capture, three `tools/list` requests to
+      `/mcp-listchanged` follow the call). That refresh finds the new description: `echo` is
+      disabled and its Auto-approve cleared, and the audit log records
+      `mcp.tool_definition_changed`. Once the page reloads its list (opening the MCP settings or
+      the assistant panel does), the row is marked changed as in step 14 and the assistant no
+      longer offers `echo`; until then the page may still offer it, and the backend refuses the
+      call ("Tool 'echo' is not enabled - enable it in the MCP server settings."). Without the
+      edit the refresh finds the same definitions: `echo` stays enabled and no
+      `mcp.tool_definition_changed` row is written.
+
+      A change announced with the answer to an `initialize` (also on a session renewed after a
+      404) counts the same way; the mock never does that, so only the automated tests cover it.
     - The backend decodes SSE incrementally and returns when the answer with the wanted id arrives; an
       open stream no longer forces the call to wait for timeout.
 
     Automated: `sse_and_json_responses_are_both_handled`,
-    `an_sse_answer_is_returned_while_the_stream_stays_open`, `list_changed_flag_drives_refetch`,
-    `list_changed_refresh_persists_to_database`.
+    `an_sse_answer_is_returned_while_the_stream_stays_open`, `list_changed_flag_drives_refetch`
+    (the notification in a call's stream, and the re-pin that disables a changed tool),
+    `list_changed_refresh_persists_to_database` and
+    `a_list_change_announced_with_the_initialize_answer_brings_the_refresh`.
 
 ## Additional backend behavior covered by tests
 

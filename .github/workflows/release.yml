@@ -117,6 +117,8 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-run
 
       # Windows only: tests need a Common-Controls 6 manifest to load (same step as ci.yml's windows job).
+      # No runnable doctests exist today (cargo test prints "running 0 tests" for Doc-tests); rustdoc
+      # would build one elsewhere, without this manifest.
       - name: Declare Common-Controls 6 for the test executables (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -243,11 +245,16 @@ jobs:
       #   3. Paste the base64 body of minisign.pub (the second line, starting
       #      with "RW") into the MINISIGN_PUBLIC_KEY const in
       #      src-tauri/src/commands/updater.rs, replacing the placeholder.
-      # Until the secret exists this step is skipped with a warning and the
-      # release proceeds unsigned. The key has been provisioned since
-      # 2026-09-12, so the in-app updater is fail-closed: it refuses an
-      # unsigned release instead of falling back to the GitHub digest check
-      # (that fallback exists only while the const is still the placeholder).
+      # In AGSQ11/SSHSpan, recognised by its repository ID in the check below,
+      # a missing secret stops this step, and with it the release, with an
+      # error. The key has been provisioned since 2026-09-12, so the in-app
+      # updater is fail-closed: it refuses an unsigned release instead of
+      # falling back to the GitHub digest check (that fallback exists only
+      # while the const is still the placeholder), and an unsigned release
+      # would be one that no installed copy can update to. Restore the secret
+      # as described under MAINTAINER SETUP above and run the release again.
+      # In a fork, which has no such secret, this step is skipped with a
+      # warning and the build stays unsigned.
       - name: Sign installers with minisign
         id: minisign_sign
         shell: bash
@@ -261,6 +268,12 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            # 1353945013 is AGSQ11/SSHSpan's repository ID, which survives a
+            # rename or a transfer; a fork has its own ID.
+            if [ "${GITHUB_REPOSITORY_ID:-}" = "1353945013" ]; then
+              echo "::error::MINISIGN_SECRET_KEY is empty, so this release would be unsigned, and the in-app updater refuses unsigned releases. Restore the Actions secret MINISIGN_SECRET_KEY (see MAINTAINER SETUP in the comment above this step), then run the release again."
+              exit 1
+            fi
             echo "::warning::MINISIGN_SECRET_KEY is not configured; skipping release signing. See the workflow comment above this step for the provisioning steps."
             echo "signed=false" >> "$GITHUB_OUTPUT"
             exit 0

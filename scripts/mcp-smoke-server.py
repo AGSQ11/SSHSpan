@@ -6,6 +6,11 @@ initialize -> notifications/initialized -> tools/list (paginated) -> tools/call,
 with special endpoints for a one-shot session 404, a list-changed SSE event,
 redirect hard-error, and DELETE teardown.
 
+/mcp-listchanged is /mcp with one difference: a tools/call there is answered as an
+event stream that first announces notifications/tools/list_changed and then sends
+the JSON-RPC response to the call (same id), the way a server whose tool list has
+just changed does. Every other method is answered exactly as on /mcp.
+
 Run with:
     python scripts/mcp-smoke-server.py [PORT]
 """
@@ -22,6 +27,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ─── test configuration ────────────────────────────────────────────────────
 
 TEST_SESSION_ID = "00000000-0000-0000-0000-000000000001"
+
+# A valid 1x1 PNG (one opaque red pixel), base64 as an MCP image content block carries it.
+TINY_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg=="
 
 ALL_TOOLS = [
     {
@@ -67,7 +75,7 @@ ALL_TOOLS = [
     {
         "name": "image_cat",
         "title": "Image Cat",
-        "description": "Return a tiny fake PNG as a binary resource.",
+        "description": "Return a 1x1 PNG as an image content block.",
         "inputSchema": {"type": "object", "properties": {}},
         "annotations": {"readOnlyHint": True},
     },
@@ -100,6 +108,12 @@ def jsonrpc_response(req_id, result=None, error=None):
     return json.dumps(body, separators=(",", ":")).encode("utf-8")
 
 
+def jsonrpc_notification(method, params=None):
+    """A JSON-RPC notification: a method and its params, no id, and no answer."""
+    body = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Quieter logs; the startup banner already names the endpoint.
@@ -110,6 +124,19 @@ class Handler(BaseHTTPRequestHandler):
         for h, v in (extra_headers or {}).items():
             self.send_header(h, v)
         self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_event_stream(self, messages):
+        """Answer 200 with a text/event-stream body: one `message` event per
+        JSON-RPC message in `messages` (each already encoded as JSON bytes)."""
+        body = b"".join(
+            b"id: evt-" + str(number).encode("ascii") + b"\nevent: message\ndata: " + message + b"\n\n"
+            for number, message in enumerate(messages, 1)
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -146,15 +173,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        # Special endpoint: inject notifications/tools/list_changed into SSE stream.
-        if path == "/mcp-listchanged":
-            self._handle_listchanged_stream(raw)
-            return
-
-        # Normal /mcp traffic only.
-        if path != "/mcp":
+        # /mcp-listchanged is /mcp, except that a tools/call is answered as an
+        # event stream that announces notifications/tools/list_changed first.
+        if path not in ("/mcp", "/mcp-listchanged"):
             self.send_error(404)
             return
+        announce_list_changed = path == "/mcp-listchanged"
 
         session_id = self.headers.get("Mcp-Session-Id", TEST_SESSION_ID)
 
@@ -183,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "tools/list":
             self._handle_tools_list(req_id, params, session_id)
         elif method == "tools/call":
-            self._handle_tools_call(req_id, params, session_id)
+            self._handle_tools_call(req_id, params, session_id, announce_list_changed)
         else:
             self._send_json(
                 200,
@@ -249,23 +273,44 @@ class Handler(BaseHTTPRequestHandler):
         }
         self._send_json(200, jsonrpc_response(req_id, result=result))
 
-    def _handle_tools_call(self, req_id, params, session_id: str):
+    def _handle_tools_call(self, req_id, params, session_id: str, announce_list_changed: bool = False):
         name = (params or {}).get("name")
         arguments = (params or {}).get("arguments", {})
         meta = (params or {}).get("_meta", {})
         stream = meta.get("stream", False) if isinstance(meta, dict) else False
+        result = self._tool_result(name, arguments)
+
+        # /mcp-listchanged: announce a changed tool list, then answer the call.
+        if announce_list_changed:
+            print(f"[list-changed] announced before the answer to tools/call (session={session_id})", flush=True)
+            self._send_event_stream(
+                [
+                    jsonrpc_notification("notifications/tools/list_changed"),
+                    jsonrpc_response(req_id, result=result),
+                ]
+            )
+            return
 
         # Return application/json unless caller asks for text/event-stream.
         if stream:
-            self._stream_tools_call(req_id, name, arguments)
+            self._stream_tools_call(req_id, result)
             return
 
+        self._send_json(200, jsonrpc_response(req_id, result=result))
+
+    def _tool_result(self, name: str, arguments: dict) -> dict:
+        """The result of a tools/call, as MCP carries it: {"content": [...], "isError": bool}."""
+        if name == "image_cat":
+            # A real image content block, not JSON inside a text block.
+            return {
+                "content": [{"type": "image", "mimeType": "image/png", "data": TINY_PNG_BASE64}],
+                "isError": False,
+            }
         result = self._run_tool(name, arguments)
-        body = {
+        return {
             "content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}],
             "isError": result.get("isError", False),
         }
-        self._send_json(200, jsonrpc_response(req_id, result=body))
 
     def _run_tool(self, name: str, arguments: dict):
         if name == "echo":
@@ -278,60 +323,19 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": True, "path": arguments.get("path"), "content": "hello from mock"}
         if name == "make_error":
             return {"ok": False, "isError": True, "error": arguments.get("reason", "boom")}
-        if name == "image_cat":
-            # Return as an image resource object.
-            return {
-                "ok": True,
-                "resource": {
-                    "type": "image",
-                    "mimeType": "image/png",
-                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGfCMuP4w==",
-                },
-            }
         return {"ok": False, "error": f"unknown tool: {name}"}
 
-    def _stream_tools_call(self, req_id, name: str, arguments: dict):
-        # text/event-stream with a tiny JSON result at the end.
-        result = self._run_tool(name, arguments)
-        event_id = "evt-1"
-        lines = [
-            f"id: {event_id}\n",
-            "event: message\n",
-            f"data: {json.dumps({'progress': 'started'}, separators=(',', ':'))}\n\n",
-            f"id: {event_id}\n",
-            "event: message\n",
-            f"data: {json.dumps({'progress': 'finished', 'result': result}, separators=(',', ':'))}\n\n",
-        ]
-        payload = "".join(lines).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _handle_listchanged_stream(self, raw: bytes):
-        # Same as a tools/call but first injects a notification event.
-        try:
-            req = json.loads(raw.decode("utf-8")) if raw else {}
-        except json.JSONDecodeError:
-            req = {}
-        req_id = req.get("id")
-        result = self._run_tool(req.get("params", {}).get("name"), req.get("params", {}).get("arguments", {}))
-        event_id = "evt-listchanged"
-        lines = [
-            f"id: {event_id}\n",
-            "event: notification\n",
-            "data: {\"method\":\"notifications/tools/list_changed\",\"params\":{}}\n\n",
-            f"id: {event_id}\n",
-            "event: message\n",
-            f"data: {json.dumps({'ok': True, 'result': result}, separators=(',', ':'))}\n\n",
-        ]
-        payload = "".join(lines).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(payload)
+    def _stream_tools_call(self, req_id, result: dict):
+        # text/event-stream: a logging notification, then the JSON-RPC response.
+        self._send_event_stream(
+            [
+                jsonrpc_notification(
+                    "notifications/message",
+                    {"level": "info", "logger": "mcp-smoke", "data": "started"},
+                ),
+                jsonrpc_response(req_id, result=result),
+            ]
+        )
 
 
 def main():
@@ -342,7 +346,8 @@ def main():
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
     sys.stdout.write(f"[mcp-smoke-server] listening on {url}\n")
-    sys.stdout.write("[mcp-smoke-server] Test here: /mcp (POST), /mcp-listchanged (SSE), /mcp-redirect (302)\n")
+    sys.stdout.write("[mcp-smoke-server] Test here: /mcp (POST), /mcp-listchanged (POST; a tools/call is answered as SSE\n")
+    sys.stdout.write("                 that announces a tool-list change first), /mcp-redirect (302)\n")
     sys.stdout.write("                 Expect: initialize, tools/list pagination, tools/call JSON/SSE,\n")
     sys.stdout.write("                 one-shot 404 session, redirect hard-error, DELETE teardown.\n")
     sys.stdout.flush()

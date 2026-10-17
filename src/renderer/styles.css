@@ -1693,8 +1693,10 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 
 .terminal-body { display: flex; flex: 1; min-height: 0; flex-direction: column; }
 /* The file surface never scrolls sideways (A1-02): everything in it shrinks
-   to its width - the listing scrolls inside its own pane instead. */
-.sftp-body { display: none; flex: 1; min-height: 0; min-width: 0; overflow: auto; flex-direction: column; }
+   to its width - the listing scrolls inside its own pane instead. Its size
+   comes from the window alone, so it can be a size container: the transfer
+   panel's restored-transfer banner reads its height. */
+.sftp-body { display: none; flex: 1; min-height: 0; min-width: 0; overflow: auto; flex-direction: column; container: sftp-body / size; }
 .sftp-body.visible { display: flex; }
 /* Scrolls up and down itself only when even the list's floor (.sftp-pane)
    does not fit - a tiny window in Split - instead of the list running over
@@ -1935,15 +1937,21 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .sftp-queuepanel {
   flex: none;
   /* ...and never so tall that the file list loses its floor: the panel
-     gives way first, down to its header and a sliver of its list, in the
+     gives way first, down to its header and one job of its list, in the
      smallest window (--q-floor is the file list's floor with its toolbar,
      header and status line). A height the user chose gives way too: the
-     resize handle (sftp.js) reads these two to offer only heights that
-     take effect. */
+     resize handle (sftp.js) reads these to offer only heights that take
+     effect. */
   --q-least: 60px;
   --q-floor: 226px;
+  --q-row: 28px; /* one job row (.sftp-queueitem) */
   height: clamp(var(--q-least), calc(100% - var(--q-floor)), min(var(--q-h, 200px), var(--q-cap, 35%)));
-  min-height: 0;
+  /* Never under its head and one job, though (A1-02) - the job list counts
+     one row in min-content (below). With Linux fonts the head wrapped and
+     left the list 0px, so no job's Pause/Cancel/Retry could be reached;
+     text that needs more room than the clamp leaves now takes it from the
+     file list, which scrolls. */
+  min-height: min-content;
   display: flex; flex-direction: column;
   border-top: 1px solid var(--line); background: var(--panel);
   padding: 2px 12px 6px; gap: 4px;
@@ -1987,15 +1995,24 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .sftp-queueactions-head .ghost-btn svg { width: 12px; height: 12px; }
 
 /* restored-transfer banner (Task 5) - hidden unless a paused job's session
-   died with the previous run */
+   died with the previous run. The head's last item (sftp.js): a line of its
+   own where there is room for one. */
 .sftp-queuebanner {
-  flex: none; font-size: 11px; color: var(--warn);
+  flex: 1 1 100%; font-size: 11px; color: var(--warn);
   background: rgba(var(--accent-rgb), 0.08);
   border: 1px solid var(--line); border-radius: var(--r-sm);
   padding: 4px 10px;
   /* One line, whole in its tooltip: two lines of it took most of a small
      transfer panel's height from the jobs (A1-01). */
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* A1-02: in a short file surface (under 420px the panel is too low for a
+   wrapped head, this line and a job) a line of its own left the job list
+   less than one job - none where Linux fonts wrap the head - with the first
+   job's buttons under the banner. There it is thinner and takes what the
+   head's last line leaves (beside the actions when the head wraps). */
+@container sftp-body (max-height: 420px) {
+  .sftp-queuebanner { flex: 1 1 8em; min-width: 6em; padding: 1px 8px; }
 }
 
 /* column grid shared by the header row and job rows. A1-02: its minimum was
@@ -2014,8 +2031,11 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   border-bottom: 1px solid var(--line);
   padding-bottom: 3px;
 }
-.sftp-queuelist { overflow: auto; display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; }
-.sftp-queueitem { font-size: 12px; color: var(--text); min-height: 28px; }
+/* Room for one job whatever else the panel holds (A1-02). A basis of 0px,
+   not flex: 1's 0%: the panel's min-content then counts that one row of the
+   list, not all of it. */
+.sftp-queuelist { overflow: auto; display: flex; flex-direction: column; gap: 2px; flex: 1 1 0px; min-height: var(--q-row); }
+.sftp-queueitem { font-size: 12px; color: var(--text); min-height: var(--q-row); }
 .q-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 @container sftp-queue (max-width: 720px) {
   .sftp-queuecols, .sftp-queueitem {
