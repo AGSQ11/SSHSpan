@@ -235,12 +235,13 @@ which lists every accepted risk; the status of every audit finding is in the
   IPC. Native dialogs, the tray, WebView2 and WebKitGTK rendering, screen readers, and real SSH,
   SFTP, Bitwarden and MCP servers were not exercised. The Rust library and integration tests have
   also run natively on Windows 11, from test executables cross-built in WSL (see
-  [CONTRIBUTING.md](CONTRIBUTING.md)). The `windows-latest` CI job has not passed on a runner yet:
-  its first run, on the pull request, failed five tests that assumed Unix paths or a single ACL
-  entry, and they are fixed (the job is `continue-on-error` until it has passed once). Drag and
-  drop is emulated: the suites remove the HTML5 drag events the Windows webview withholds and
-  drive a real mouse, and no real WebView2 drag was run. The exit-time wait for MCP session
-  teardowns (quit with a connected MCP server) needs a manual check on Windows.
+  [CONTRIBUTING.md](CONTRIBUTING.md)). The `windows-latest` CI job passed on a runner for the
+  first time on 2026-10-17 (743 library, 47 integration and 20 MCP integration tests, natively);
+  its first run had failed five tests that assumed Unix paths or a single ACL entry, since fixed.
+  It is still `continue-on-error`; that flag can now be removed. Drag and drop is emulated: the
+  suites remove the HTML5 drag events the Windows webview withholds and drive a real mouse, and no
+  real WebView2 drag was run. The exit-time wait for MCP session teardowns (quit with a connected
+  MCP server) needs a manual check on Windows.
 
 ## Screenshots
 

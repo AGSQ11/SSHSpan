@@ -20,6 +20,9 @@
  *     dialogs whose buttons stay on screen, tabs/radios/listbox ARIA, the
  *     command palette's matching and ranking, the audit log filters and
  *     paging, show/hide on every password field;
+ *   - toasts over an open dialog: a click on the dialog under a toast reaches
+ *     it, and a toast under the pointer or over the focused control turns
+ *     see-through (WCAG 2.4.11), while its × still dismisses it;
  *   - static: the dead CSS and JS the audit listed stay deleted, and the CI
  *     checks cover assistant.js and mcp.js.
  *
@@ -35,7 +38,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const {
-  failures, check, yes, loadChromium, rendererDir, serve, part,
+  failures, check, yes, loadChromium, rendererDir, serve, part, firstLine, delay,
   KEY, SERVER, CATEGORY, withApp, waitVisible, openLiveTab,
 } = require('./lib/renderer-harness');
 
@@ -530,6 +533,392 @@ async function scenarioDialogs(browser, server) {
     check('A5-15 Enter in a single-line field of the import tab imports', await app.count('key_import'), 1);
     check('no page errors', app.errors, []);
   });
+}
+
+// ─── toasts over a dialog: clicks reach it, a toast in the way turns see-through
+
+/// Long enough to wrap - two or three lines at the toasts' 560px cap, more in
+/// a narrow window - so the stack reaches the New key dialog's footer at
+/// 1400x900 and at 880x560, with Windows and with Linux fonts. Sticky, so a
+/// slow run cannot see one time out halfway through.
+const LONG_TOASTS = [
+  ['err', 'Could not save the server list: the vault database is locked by another process (SQLITE_BUSY after 5 retries). '
+    + 'Close any other SSHSpan window, or wait for a backup to finish, then try again.'],
+  ['warn', 'The key was renamed, but its audit row could not be written: disk I/O error while writing the audit log to the vault database.'],
+  ['err', 'Could not reach 10.0.0.1:22 - the connection timed out after 30 seconds. Check the host, the port and any firewall in between.'],
+  ['warn', 'The category was deleted, but its audit row could not be written: disk I/O error while writing the audit log to the vault database.'],
+];
+
+/// Toast text set wider, the way Linux's DejaVu Sans sets it (where CI found a
+/// warning toast over Create): a test-only style sheet, like the "A1-02 larger
+/// text" one in check-sftp-ui.js.
+const WIDER_TOAST_TEXT = '.toast-text { letter-spacing: 1px !important; }';
+
+const CREATE = '#modalPrimary';
+const CANCEL = '#modalBackdrop .modal-footer [data-close]';
+
+/// Poll until `fn` holds in the page; false if it never does - the check after
+/// it then says what was there instead.
+const until = (page, fn, arg, ms) =>
+  page.waitForFunction(fn, arg, { timeout: ms || 1500, polling: 25 }).then(() => true, () => false);
+
+/// The same, polled from here: until `fn()` resolves truthy, for up to `ms`.
+async function eventually(fn, ms = 1500) {
+  const end = Date.now() + ms;
+  for (;;) {
+    if (await fn()) return true;
+    if (Date.now() > end) return false;
+    await delay(25);
+  }
+}
+
+/// Two animation frames: the page works out which toasts are see-through in one.
+const nextFrames = (page) => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+
+/// The centre of `sel`, in page coordinates.
+const centreOf = (page, sel) => page.evaluate((s) => {
+  const r = document.querySelector(s).getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}, sel);
+
+/// What the page hit-tests at `pt`: whether it is `sel` (or inside it), and
+/// what it is, for the failure note.
+const hitAt = (page, sel, pt) => page.evaluate(({ s, x, y }) => {
+  const want = document.querySelector(s);
+  const hit = document.elementFromPoint(x, y);
+  const name = !hit ? 'nothing' : hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '')
+    + (String(hit.className || '').trim() ? '.' + String(hit.className).trim().split(/\s+/).join('.') : '');
+  return { ok: !!hit && (hit === want || want.contains(hit)), name: `${name} at ${Math.round(x)},${Math.round(y)}` };
+}, { s: sel, x: pt.x, y: pt.y });
+
+/// A point of control `sel` that a toast covers and no toast's × does - where
+/// a click on the control landed on the toast instead - in page coordinates
+/// and relative to the control (page.click's `position`); null if no toast
+/// covers it. The centre if it qualifies, else the nearest point that does.
+/// Kept clear of rounded corners and of toast edges, so the hit test there
+/// cannot go either way.
+const coveredPoint = (page, sel) => page.evaluate((s) => {
+  const b = document.querySelector(s);
+  const r = b.getBoundingClientRect();
+  const inset = Math.max(4, parseFloat(getComputedStyle(b).borderTopLeftRadius) || 0);
+  const toasts = [...document.querySelectorAll('#toast .toast-item')].map((n) => n.getBoundingClientRect());
+  const dismiss = [...document.querySelectorAll('#toast .toast-dismiss')].map((n) => n.getBoundingClientRect());
+  const onToast = (x, y) => toasts.some((q) => x > q.left + 10 && x < q.right - 10 && y > q.top + 2 && y < q.bottom - 2);
+  const onDismiss = (x, y) => dismiss.some((q) => x >= q.left - 2 && x <= q.right + 2 && y >= q.top - 2 && y <= q.bottom + 2);
+  const cx = r.left + r.width / 2;
+  const cy = r.top + r.height / 2;
+  const points = [[cx, cy]];
+  for (let y = r.top + 3; y <= r.bottom - 3; y += 2) {
+    for (let x = r.left + inset; x <= r.right - inset; x += 2) points.push([x, y]);
+  }
+  const d = ([x, y]) => (x - cx) ** 2 + (y - cy) ** 2;
+  const best = points.sort((p, q) => d(p) - d(q)).find(([x, y]) => onToast(x, y) && !onDismiss(x, y));
+  return best ? { x: best[0], y: best[1], rel: { x: best[0] - r.left, y: best[1] - r.top } } : null;
+}, sel);
+
+/// The toasts, oldest first: whether each overlaps `sel`, whether it is
+/// see-through (class peek, computed opacity), and its pointer-events.
+const toastsOver = (page, sel) => page.evaluate((s) => {
+  const t = document.querySelector(s).getBoundingClientRect();
+  return [...document.querySelectorAll('#toast .toast-item')].map((n) => {
+    const a = n.getBoundingClientRect();
+    const cs = getComputedStyle(n);
+    return {
+      text: n.querySelector('.toast-text').textContent.slice(0, 32),
+      covers: a.left < t.right && t.left < a.right && a.top < t.bottom && t.top < a.bottom,
+      peek: n.classList.contains('peek'),
+      opacity: Math.round(Number(cs.opacity) * 100) / 100,
+      pointerEvents: cs.pointerEvents,
+    };
+  });
+}, sel);
+
+/// Every toast over `sel` is see-through, and has faded out (in the page).
+function toastsOverAreSeeThrough(s) {
+  const t = document.querySelector(s).getBoundingClientRect();
+  const over = [...document.querySelectorAll('#toast .toast-item')].filter((n) => {
+    const a = n.getBoundingClientRect();
+    return a.left < t.right && t.left < a.right && a.top < t.bottom && t.top < a.bottom;
+  });
+  return over.length > 0 && over.every((n) => n.classList.contains('peek') && Number(getComputedStyle(n).opacity) <= 0.2);
+}
+
+/// The toasts over `sel` are see-through and the others solid (in the page).
+/// A toast on its way out is left aside.
+function peeksFollow(s) {
+  const t = document.querySelector(s).getBoundingClientRect();
+  return [...document.querySelectorAll('#toast .toast-item:not(.leaving)')].every((n) => {
+    const a = n.getBoundingClientRect();
+    const over = a.left < t.right && t.left < a.right && a.top < t.bottom && t.top < a.bottom;
+    return over ? n.classList.contains('peek') && Number(getComputedStyle(n).opacity) <= 0.2 : !n.classList.contains('peek');
+  });
+}
+
+/// The texts of the toasts over `sel`, joined (in the page).
+function textsOver(s) {
+  const t = document.querySelector(s).getBoundingClientRect();
+  return [...document.querySelectorAll('#toast .toast-item')].filter((n) => {
+    const a = n.getBoundingClientRect();
+    return a.left < t.right && t.left < a.right && a.top < t.bottom && t.top < a.bottom;
+  }).map((n) => n.querySelector('.toast-text').textContent.slice(0, 32)).join(' | ');
+}
+
+/// Four long toasts, then the New key dialog, at w x h - with wider toast text
+/// if asked. Returns once the dialog and the toasts have stopped moving in.
+async function toastsOverKeyDialog(page, w, h, wider) {
+  await page.setViewportSize({ width: w, height: h });
+  if (wider) await page.addStyleTag({ content: WIDER_TOAST_TEXT });
+  await page.evaluate((list) => { for (const [kind, msg] of list) toast(msg, kind, { sticky: true }); }, LONG_TOASTS);
+  await page.evaluate(() => openKeyModal());
+  await until(page, () => [...document.querySelectorAll('#toast .toast-item, #modalBackdrop .modal')]
+    .every((n) => n.getAnimations().every((a) => a.playState === 'finished')), null, 2000);
+}
+
+/// The dialog's buttons take the pointer where toasts cover them: at their
+/// centre, and at the covered point nearest it. Which button the stack
+/// reaches depends on the window and the fonts - at 880x560 the toasts are at
+/// most 440px wide and end left of Create's centre, and with Windows fonts
+/// only the lowest toast's × lies on Create there - so a button no toast
+/// covers passes its second check, and at least one must be covered.
+async function dialogButtonsTakeThePointer(page, label) {
+  const covered = [];
+  for (const [sel, name] of [[CREATE, 'Create'], [CANCEL, 'Cancel']]) {
+    const centre = await hitAt(page, sel, await centreOf(page, sel));
+    yes(`${label}: the pointer reaches ${name} at its centre`, centre.ok, centre.name);
+    const pt = await coveredPoint(page, sel);
+    const under = pt ? await hitAt(page, sel, pt) : { ok: true };
+    yes(`${label}: the pointer reaches ${name} where a toast covers it`, under.ok, under.name);
+    if (pt) covered.push(name);
+  }
+  yes(`${label}: (set-up) toasts cover part of the dialog's buttons`, covered.length > 0, 'no toast covers Create or Cancel');
+}
+
+/// With Create focused, every toast over it turns see-through and no other
+/// toast does. The pointer is put on the dialog's title first, clear of every
+/// toast, so the focus alone decides.
+async function focusShowsThrough(page, label) {
+  const title = await centreOf(page, '#modalTitle');
+  await page.mouse.move(title.x, title.y);
+  await page.focus(CREATE);
+  await until(page, toastsOverAreSeeThrough, CREATE);
+  await nextFrames(page);
+  const t = await toastsOver(page, CREATE);
+  yes(`${label}: (set-up) toasts lie both over Create and elsewhere`, t.some((x) => x.covers) && t.some((x) => !x.covers), JSON.stringify(t));
+  yes(`${label}: with Create focused, every toast over it is see-through`,
+    t.filter((x) => x.covers).every((x) => x.peek && x.opacity <= 0.2), JSON.stringify(t.filter((x) => x.covers)));
+  check(`${label}: and no other toast is`, t.filter((x) => !x.covers && x.peek).map((x) => x.text), []);
+  return t;
+}
+
+/// A Playwright click that says why it failed instead of throwing: true, or
+/// the error's first line and what intercepted the pointer.
+const clickOrWhy = (page, sel, opts) => page.click(sel, Object.assign({ timeout: 1500 }, opts)).then(() => true, (e) => {
+  const why = String((e && e.message) || '').replace(/\u001b\[[\d;]*m/g, '').split('\n').map((l) => l.trim())
+    .find((l) => /intercepts pointer events/.test(l));
+  return firstLine(e) + (why ? ' [' + why + ']' : '');
+});
+
+/// A point on a toast (not on its ×) that lies over the dialog's backdrop,
+/// outside the dialog itself - null if no toast reaches past the dialog - and
+/// the boxes measured, for the note when there is none. At 880x560 only the
+/// lowest toast's bottom 8px lie below the dialog, so the scan starts at a
+/// toast's last row of pixels.
+const backdropToastPoint = (page) => page.evaluate(() => {
+  const box = (q) => [q.left, q.top, q.right, q.bottom].map(Math.round);
+  const m = document.querySelector('#modalBackdrop .modal').getBoundingClientRect();
+  const outside = (x, y) => x < m.left || x > m.right || y < m.top || y > m.bottom;
+  const toasts = [];
+  for (const n of document.querySelectorAll('#toast .toast-item')) {
+    const r = n.getBoundingClientRect();
+    const d = n.querySelector('.toast-dismiss').getBoundingClientRect();
+    toasts.push(box(r));
+    for (let y = r.bottom - 1; y > r.top + 3; y -= 3) {
+      for (let x = r.left + 12; x < d.left - 4; x += 6) {
+        if (outside(x, y)) return { point: { x, y }, dialog: box(m), toasts };
+      }
+    }
+  }
+  return { point: null, dialog: box(m), toasts };
+});
+
+/// A click on Create reaches it - on the part a toast covers, if one does (the
+/// centre, where a toast covers that) - and the key is made. The pointer comes
+/// to rest there first, as a hand does: the toast under it turns see-through,
+/// so the check after the dialog closes also shows that closing it clears that.
+async function createUnderAToast(app, label) {
+  const { page } = app;
+  const pt = await coveredPoint(page, CREATE);
+  if (pt) {
+    await page.mouse.move(pt.x, pt.y);
+    await until(page, (p) => [...document.querySelectorAll('#toast .toast-item.peek')].some((n) => {
+      const r = n.getBoundingClientRect();
+      return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+    }), pt);
+  }
+  const clicked = await clickOrWhy(page, CREATE, { position: pt ? pt.rel : undefined });
+  check(`${label}: a click on Create reaches it, where a toast covers it if one does`, clicked, true);
+  await until(page, () => window.__calls.some((c) => c.cmd === 'key_create_with_categories'));
+  check(`${label}: and the key is created`, await app.count('key_create_with_categories'), 1);
+}
+
+/// The stack moves under the focused Create - a new toast pushes the oldest
+/// out, the lowest is dismissed and the rest move down, the window grows - and
+/// each time the see-through toasts follow. Each move must change which
+/// toasts lie over Create, or it would show nothing.
+async function peeksFollowTheStack(page, w, h, label) {
+  await toastsOverKeyDialog(page, w, h, false);
+  const title = await centreOf(page, '#modalTitle');
+  await page.mouse.move(title.x, title.y);
+  await page.focus(CREATE);
+  await until(page, toastsOverAreSeeThrough, CREATE);
+  const moves = [
+    ['the oldest toast\'s message again moves it to the top', () => page.evaluate(([kind, msg]) => {
+      toast(msg, kind, { sticky: true });
+    }, LONG_TOASTS[0])],
+    ['a new toast pushes the oldest out', () => page.evaluate(() => {
+      toast('Could not read the known hosts file: permission denied. Its entries were left as they were, and nothing was written.', 'err', { sticky: true });
+    })],
+    ['the lowest toast is dismissed and the rest move down', () => page.evaluate(() => document.querySelector('#toast .toast-item').dismiss())],
+    ['the window grows', () => page.setViewportSize({ width: w + 160, height: h + 200 })],
+  ];
+  for (const [what, move] of moves) {
+    // Nothing still sliding in or fading from the step before: what follows
+    // the move is then the move's own doing.
+    await until(page, () => [...document.querySelectorAll('#toast .toast-item')]
+      .every((n) => n.getAnimations().every((a) => a.playState === 'finished')), null, 2000);
+    const before = await page.evaluate(textsOver, CREATE);
+    await move();
+    const moved = await eventually(async () => (await page.evaluate(textsOver, CREATE)) !== before);
+    yes(`${label}: (set-up) ${what}, and the toasts over Create change`, moved, before);
+    yes(`${label}: ${what}: the see-through toasts follow the focused Create`,
+      await until(page, peeksFollow, CREATE), JSON.stringify(await toastsOver(page, CREATE)));
+  }
+}
+
+async function scenarioToastsOverDialogs(browser, server) {
+  for (const [w, h] of [[1400, 900], [880, 560]]) {
+    const label = `toasts over a dialog at ${w}x${h}`;
+    await withApp(browser, server, {}, label, async (app) => {
+      const { page } = app;
+      await toastsOverKeyDialog(page, w, h, false);
+      await dialogButtonsTakeThePointer(page, label);
+      const t = await focusShowsThrough(page, label);
+
+      // The pointer on the × of a toast over the focused Create: that toast is
+      // solid while it is there - the × shows where a click goes - and
+      // see-through again once the pointer leaves.
+      const over = `#toast .toast-item:nth-child(${t.findIndex((x) => x.covers) + 1})`;
+      const overPeeks = () => page.evaluate((s) => document.querySelector(s).classList.contains('peek'), over);
+      const overX = await centreOf(page, `${over} .toast-dismiss`);
+      await page.mouse.move(overX.x, overX.y);
+      await nextFrames(page);
+      check(`${label}: the pointer on the × of a toast over the focused Create keeps that toast solid`, await overPeeks(), false);
+      const away = await centreOf(page, '#modalTitle');
+      await page.mouse.move(away.x, away.y);
+      await until(page, (s) => document.querySelector(s).classList.contains('peek'), over);
+      check(`${label}: and off it, the focus makes it see-through again`, await overPeeks(), true);
+
+      // The focus leaves for the page itself - a click on the dialog's title,
+      // which takes no focus, with the pointer already resting there - and no
+      // focusin comes: the toast over Create is solid again all the same.
+      await page.mouse.down();
+      await page.mouse.up();
+      yes(`${label}: (set-up) a click on the dialog's title leaves the focus with the page`,
+        await until(page, () => document.activeElement === document.body));
+      await until(page, (s) => !document.querySelector(s).classList.contains('peek'), over);
+      check(`${label}: with the focus gone from Create to the page, the toast over it is solid again`, await overPeeks(), false);
+      await page.focus(CREATE);
+      await until(page, (s) => document.querySelector(s).classList.contains('peek'), over);
+
+      // A second dialog over this one, closed again: the toasts still let
+      // clicks through to the dialog left open.
+      await page.evaluate(() => openCategoryPicker({ title: 'Categories', initial: [], onSave: () => {} }));
+      await waitVisible(page, '#pickerModal');
+      await page.evaluate(() => closeCategoryPicker());
+      await until(page, () => document.getElementById('pickerModal').hidden);
+      const still = (await coveredPoint(page, CREATE)) ? CREATE : CANCEL;
+      const stillHit = await hitAt(page, still, (await coveredPoint(page, still)) || (await centreOf(page, still)));
+      yes(`${label}: with a second dialog opened over it and closed, the toasts still let clicks through`,
+        stillHit.ok && (await app.open('modalBackdrop')), stillHit.name);
+
+      // The pointer over a toast that is not over the focused Create: see-through
+      // while it is there, solid again after - and solid with the pointer on
+      // its ×, which is what a click there reaches.
+      const k = t.findIndex((x) => !x.covers);
+      const item = `#toast .toast-item:nth-child(${k + 1})`;
+      const peeks = () => page.evaluate((s) => document.querySelector(s).classList.contains('peek'), item);
+      const text = await centreOf(page, `${item} .toast-text`);
+      await page.mouse.move(text.x, text.y);
+      await until(page, (s) => document.querySelector(s).classList.contains('peek'), item);
+      check(`${label}: the pointer on a toast's text makes it see-through`, await peeks(), true);
+      const title = await centreOf(page, '#modalTitle');
+      await page.mouse.move(title.x, title.y);
+      await until(page, (s) => !document.querySelector(s).classList.contains('peek'), item);
+      check(`${label}: and moving away makes it solid again`, await peeks(), false);
+      const onDismiss = await centreOf(page, `${item} .toast-dismiss`);
+      await page.mouse.move(onDismiss.x, onDismiss.y);
+      await nextFrames(page);
+      check(`${label}: with the pointer on its × the toast stays solid`, await peeks(), false);
+      const hit = await hitAt(page, `${item} .toast-dismiss`, onDismiss);
+      yes(`${label}: and a click there reaches the ×`, hit.ok, hit.name);
+
+      // The × still dismisses its toast, and leaves the dialog open.
+      const gone = await page.evaluate((s) => document.querySelector(s + ' .toast-text').textContent, item);
+      const dismissed = await clickOrWhy(page, `${item} .toast-dismiss`);
+      await until(page, (n) => document.querySelectorAll('#toast .toast-item').length === n, t.length - 1);
+      const left = await page.evaluate(() => [...document.querySelectorAll('#toast .toast-text')].map((n) => n.textContent));
+      check(`${label}: the × dismisses its toast while the dialog is open`,
+        [dismissed, left.length, left.includes(gone), await app.open('modalBackdrop')], [true, t.length - 1, false, true]);
+
+      // A click on a toast where it lies over the backdrop, outside the
+      // dialog, does not close the dialog - which would drop what was typed.
+      await page.fill('#genName', 'kept-name');
+      const backdrop = await backdropToastPoint(page);
+      yes(`${label}: (set-up) a toast reaches past the dialog, over its backdrop`, !!backdrop.point,
+        `dialog ${JSON.stringify(backdrop.dialog)}, toasts ${JSON.stringify(backdrop.toasts)}`);
+      if (backdrop.point) await page.mouse.click(backdrop.point.x, backdrop.point.y);
+      await nextFrames(page);
+      check(`${label}: a click on a toast over the backdrop leaves the dialog open, and what was typed`,
+        [await app.open('modalBackdrop'), await page.inputValue('#genName')], [true, 'kept-name']);
+
+      await createUnderAToast(app, label);
+
+      // Closed, the dialog takes nothing from the toasts: they take the pointer
+      // as before, and none is see-through.
+      if (!(await until(page, () => document.getElementById('modalBackdrop').hidden))) await page.evaluate(() => closeKeyModal());
+      await nextFrames(page);
+      const after = await page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].map((n) => {
+        const r = n.querySelector('.toast-text').getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return [getComputedStyle(n).pointerEvents, n.classList.contains('peek'), !!hit && n.contains(hit)];
+      }));
+      check(`${label}: with the dialog closed every toast takes the pointer again, and none is see-through`,
+        after, after.map(() => ['auto', false, true]));
+      check('no page errors', app.errors, []);
+    });
+  }
+  // The same with the toast text set wider, as Linux's fonts set it.
+  for (const [w, h] of [[1400, 900], [880, 560]]) {
+    const label = `toasts over a dialog, wider text, at ${w}x${h}`;
+    await withApp(browser, server, {}, label, async (app) => {
+      const { page } = app;
+      await toastsOverKeyDialog(page, w, h, true);
+      await dialogButtonsTakeThePointer(page, label);
+      await focusShowsThrough(page, label);
+      await createUnderAToast(app, label);
+      check('no page errors', app.errors, []);
+    });
+  }
+  // With reduced motion no toast slides in, so no animationend comes to work
+  // the see-through toasts out again: there the direct calls alone must do it.
+  for (const [w, h, reduced] of [[1400, 900, false], [880, 560, true]]) {
+    const label = `toasts over a dialog, the stack moving${reduced ? ' with reduced motion' : ''}, from ${w}x${h}`;
+    await withApp(browser, server, {}, label, async (app) => {
+      if (reduced) await app.page.emulateMedia({ reducedMotion: 'reduce' });
+      await peeksFollowTheStack(app.page, w, h, label);
+      check('no page errors', app.errors, []);
+    });
+  }
 }
 
 // ─── item 7: layout and field details (A1-08 A1-18 A1-35 A1-37 A1-32 A1-33 A1-34)
@@ -1175,6 +1564,7 @@ const SCENARIOS = [
   ['item 4: contrast - faint text, selected segment, YOLO badge', scenarioContrast],
   ['item 5: narrow window - category drawer, vault chip, New key', scenarioNarrow],
   ['item 6: dialogs - buttons stay on screen, Enter submits the key dialog', scenarioDialogs],
+  ['toasts over a dialog - its buttons take clicks, a toast over the focus or under the pointer turns see-through', scenarioToastsOverDialogs],
   ['item 7: details - settings width, selection bar, full text, dark widgets, field hints', scenarioDetails],
   ['item 8: aria - tabs, radios, palette listbox, labels, reduced motion, hit areas', scenarioAria],
   ['item 9: palette - every word matches, ranked, more destinations, live sessions', scenarioPalette],

@@ -330,9 +330,10 @@ says which are only Partial and what is still open.
   own CI step and in `test:polish` and fails on comments that cite the internal work labels it
   knows (`JU3`, `RU6b`, "fix round 1", `I1`, `M7`, "item 7"; other label shapes pass), on
   removed code that comes back and on error text built by hand in the shapes it knows; there is a
-  `windows-latest` job for `cargo test` and the static checks (it has not passed on a runner yet:
-  its first run failed five tests that assumed Unix paths or a single ACL entry, and they are
-  fixed; its failure does not fail the workflow until it has passed once); every job has a
+  `windows-latest` job for `cargo test` and the static checks (it passed on a runner for the first
+  time on 2026-10-17, at `38e586e`; its first run had failed five tests that assumed Unix paths or
+  a single ACL entry, which are fixed; the job is still `continue-on-error`, so its failure does not
+  fail the workflow, and that flag can now be removed); every job has a
   timeout. The unreferenced `scripts/refactor_tabs.py` and `scripts/cdp-*.js` drivers were removed.
   (`7e5c5c5`, `11abb3e`, `c227218`, `53347df`, `d589b51`, `652aa5e`, `d5e9d22`, `11e7e30`,
   `3b0fcfb`, `6c19b1b`, #85; A7-56, A8-17, A8-21)
@@ -403,6 +404,13 @@ Vault, dialogs and settings
   A1-26)
 - **Boot and errors.** Boot no longer aborts when one call fails, identical toasts collapse, and an
   asynchronous callback that fails shows its error instead of only logging it. (`c227218`; A2-20)
+- **Notifications over a dialog.** A notification no longer blocks the dialog beneath it: clicks
+  pass through to the dialog (except on the notification's × button), and a notification turns
+  see-through while the pointer is over it or while it covers the control that has the keyboard
+  focus, so buttons such as Create and Save can always be seen and clicked. A click on the part
+  of a notification that lies over the dimmed backdrop does nothing, so it cannot close the
+  dialog. Before, a few long notifications could cover a tall dialog's Create button for up to 9
+  seconds. (#85)
 - **Restoring a backup.** Restore keeps each key's Bitwarden revision metadata (numbers were read
   as strings), writes its audit rows after the commit instead of through a second connection while
   its own transaction was open, validates the restored settings, aborts if the vault locks
@@ -870,8 +878,8 @@ Bitwarden, updates and lifecycle
   renderer UI assertions.
 - Rust: 884 library, 48 integration and 20 MCP integration tests (952 in all; 950 at `6c19b1b`,
   before the two ACL table tests added with the Windows test fixes).
-  Renderer: `test:ui` 75, `test:safety` 491, `test:sftp` 763, `test:polish` 195, `test:assistant`
-  367, `test:keys` 431, `test:servers` 676 (2,998 checks in all, 2,935 at the documentation commit
+  Renderer: `test:ui` 75, `test:safety` 491, `test:sftp` 763, `test:polish` 283, `test:assistant`
+  367, `test:keys` 431, `test:servers` 676 (3,086 checks in all, 2,935 at the documentation commit
   `e80b01e`; each number is the count of `ok` lines the suite prints). `test:ui` was 76 before its
   embedded MCP check moved to `check-mcp-contract.js`. The five static renderer checks pass;
   `check-ipc-args.js` reads 147 call sites against 110 commands.
@@ -890,8 +898,10 @@ Bitwarden, updates and lifecycle
   passes none down it admits only the user, SYSTEM and Administrators. Two table tests pin both
   rules on every platform, and natively the test passes with `%TEMP%` as is and with `TEMP`
   pointed at a folder that passes nothing down (the native counts above were taken before the
-  second table test was added). The job has not passed yet, so it is `continue-on-error` until it
-  has passed once.
+  second table test was added). The job passed on a runner for the first time on 2026-10-17, at
+  `38e586e`: the static checks passed, and `cargo test` ran 743 library, 47 integration and 20 MCP
+  integration tests natively, none failing. It is still `continue-on-error`; that flag can now be
+  removed.
 - The renderer suites run in headless Chromium against a stubbed Tauri bridge. They do not exercise
   WebView2 or WebKitGTK rendering, native dialogs, the tray, screen readers or real SSH, SFTP,
   Bitwarden or MCP servers.

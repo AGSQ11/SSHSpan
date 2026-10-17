@@ -238,13 +238,14 @@ jobs:
   # the same Chromium, so a second run would double the minutes without adding
   # coverage.
   #
-  # Not yet green on a runner: its first run failed five library tests that
-  # assumed Unix paths or a single ACL entry (fixed since; the manifest step
-  # worked). Until this job has run green once, a failure may be another such
-  # test (several use literal /tmp and /etc strings) rather than a regression.
-  # So the job is continue-on-error: its failure does not fail the workflow
-  # run. The flag stays until the job has passed once on a runner; then delete
-  # it, so that a Windows regression fails CI like any other (audit row A7-56).
+  # The job passed on a runner for the first time on 2026-10-17, at 38e586e.
+  # Its first run had failed five library tests that assumed Unix paths or a
+  # single ACL entry (fixed since; the manifest step worked). Until the job had
+  # run green once, a failure could have been another such test (several use
+  # literal /tmp and /etc strings) rather than a regression, so the job is
+  # continue-on-error: its failure does not fail the workflow run. Now that it
+  # has passed once, the flag can be deleted, so that a Windows regression
+  # fails CI like any other (audit row A7-56).
   windows:
     name: Windows (cargo test, static checks)
     runs-on: windows-latest

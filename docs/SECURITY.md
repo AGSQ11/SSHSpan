@@ -164,9 +164,10 @@ A FAT/exFAT destination that cannot carry the expected ACL can therefore reject 
 than leave a readable private key. That is fail-closed behavior, not a promise that every volume
 is supported. This path was verified natively on Windows 11 from a test executable cross-built in
 WSL, and the library and integration tests have since run natively there too. The `windows-latest`
-CI job has not passed on a runner yet: its first run failed five tests that assumed Unix paths or
-a single ACL entry, and they are fixed; the job does not fail the workflow until it has passed
-once.
+CI job, whose tests cover this path, passed on a runner for the first time on 2026-10-17, at
+`38e586e`; its first run had failed five tests that assumed Unix paths or a single ACL entry, since
+fixed. It is still `continue-on-error`, so its failure does not fail the workflow; that flag can
+now be removed.
 
 ### Backups
 
@@ -864,12 +865,12 @@ Each is a known, deliberate state, with the reason it was left.
   the session DELETEs, which only end sessions. When more than 16 session teardowns are pending at
   once (a lock with many sessions), the rest are not sent and those sessions expire on their
   servers.
-- **Windows CI and drag and drop are not proven on the real thing.** The `windows-latest` CI job
-  has not passed on a runner yet: its first run, on the pull request, passed the static checks and
-  failed five library tests that assumed Unix paths or a single ACL entry. They are fixed, and the
-  library and integration tests have since run natively on Windows 11, from test executables
-  cross-built in WSL. The job stays `continue-on-error` until it has passed once on a runner (A7-56,
-  Partial). The release workflow's own Windows `cargo test`, with the same manifest step, runs only
+- **A Windows regression does not fail CI yet, and drag and drop is not proven on the real thing.**
+  The `windows-latest` CI job passed on a runner for the first time on 2026-10-17, at `38e586e`
+  (743 library, 47 integration and 20 MCP integration tests, natively); its first run had failed
+  five library tests that assumed Unix paths or a single ACL entry, since fixed. It is still
+  `continue-on-error` (A7-56, Partial); that flag can now be removed.
+  The release workflow's own Windows `cargo test`, with the same manifest step, runs only
   when a tag is pushed and has not run since that step was added. Drag and drop is emulated in the
   renderer suites - they remove the HTML5 drag events the Windows webview withholds and drive a real
   mouse - and no real WebView2 drag was run (A3-23).
@@ -915,8 +916,9 @@ transmitted by SSHSpan.
 - CI runs formatting, clippy correctness, Rust tests, the renderer syntax, globals, vendor-hash,
   MCP-contract and comment-hygiene checks, the seven renderer suites, IPC argument checks,
   `cargo audit` (with a documented ignore for RUSTSEC-2023-0071), and the Rust tests and static
-  checks on `windows-latest` (a job that has not passed on a runner yet; its failure does not fail
-  the workflow until it has passed once).
+  checks on `windows-latest` (a job that passed on a runner for the first time on 2026-10-17, at
+  `38e586e`; it is still `continue-on-error`, so its failure does not fail the workflow, and that
+  flag can now be removed).
 - RUSTSEC-2023-0071 affects RSA PKCS#1 v1.5 decryption. SSHSpan uses RSA for signatures/auth, not
   attacker-controlled RSA decryption; there is no patched upstream version, so the risk is
   documented and monitored rather than described as eliminated.

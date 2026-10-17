@@ -124,6 +124,9 @@ function settingOn(v) {
 // textContent and never innerHTML, so markup in any of them can never render.
 const TOAST_TTL_MS = { err: 9000, warn: 6000, ok: 3800, info: 3800 };
 const TOAST_MAX = 4;
+/// Where the pointer is while a dialog is open, the pending frame, and
+/// whether anything is being followed (see toastsOverDialogs below).
+const toastPeek = { x: null, y: null, frame: 0, watching: false };
 
 /// Show a toast; returns it, with dismiss(). opts.sticky keeps it until it is
 /// dismissed (a notice that arrives while the window is hidden); opts.ttlMs
@@ -165,7 +168,8 @@ function toast(msg, kind, opts) {
     item._done = true;
     clearTimeout(item._timer);
     item.classList.add('leaving');
-    setTimeout(() => item.remove(), 180);
+    // The toasts above it move down when it goes.
+    setTimeout(() => { item.remove(); toastPeekSoon(); }, 180);
   };
   dismiss.addEventListener('click', remove);
   // Errors linger longer than confirmations - they are the ones worth reading.
@@ -185,6 +189,7 @@ function toast(msg, kind, opts) {
     clearTimeout(item._timer);
     if (ttl) item._timer = setTimeout(remove, ttl);
     host.appendChild(item);
+    toastPeekSoon();
   };
   item.dismiss = remove;
 
@@ -197,7 +202,122 @@ function toast(msg, kind, opts) {
     if (!oldest) break;
     oldest.remove();
   }
+  // Over an open dialog, which toasts are see-through: now, and again once
+  // this one has slid into place (its entry animation starts it 8px lower).
+  item.addEventListener('animationend', toastPeekSoon);
+  toastPeekSoon();
   return item;
+}
+
+// A toast over an open dialog (the reason is in styles.css, "Over an open
+// dialog": a dialog's footer reaches the bottom of the window, under the
+// toasts). While a dialog is open #toast carries .over-dialog, so a toast lets
+// clicks through to the dialog everywhere but on its ×, and a toast under the
+// pointer or over the control with the keyboard focus turns see-through
+// (.peek): the focused control is never hidden (WCAG 2.4.11). With the pointer
+// on its × a toast stays solid - a click there dismisses it, and the pointer
+// should show that. Nothing in the dialog moves.
+
+/// The modal stack changed: mark the toasts while a dialog is open, and
+/// follow the pointer, the focus, scrolling and the window size only then.
+/// Nothing is followed while no dialog is open, so where the pointer is stays
+/// unknown until it first moves: a dialog opened from the keyboard or by a
+/// timer while the pointer rests on a toast leaves that toast solid - though
+/// it already lets clicks through - until the pointer moves.
+function toastsOverDialogs() {
+  const host = el('toast');
+  if (!host) return;
+  const open = modalStack.length > 0;
+  host.classList.toggle('over-dialog', open);
+  if (open !== toastPeek.watching) {
+    toastPeek.watching = open;
+    const method = open ? 'addEventListener' : 'removeEventListener';
+    document[method]('pointermove', toastPointerMoved, { passive: true });
+    document[method]('pointerout', toastPointerLeft, { passive: true });
+    document[method]('focusin', toastPeekSoon);
+    // The focus can also leave for the page itself - a click on a dialog's
+    // title - and no focusin comes then.
+    document[method]('focusout', toastPeekSoon);
+    // Scrolling moves a focused control under a toast, or out from under it.
+    document[method]('scroll', toastPeekSoon, { capture: true, passive: true });
+    window[method]('resize', toastPeekSoon);
+    document[method]('mousedown', toastShieldsBackdrop, true);
+    document[method]('click', toastShieldsBackdrop, true);
+  }
+  if (open) {
+    toastPeekSoon();
+    return;
+  }
+  toastPeek.x = null;
+  toastPeek.y = null;
+  for (const n of host.children) n.classList.remove('peek');
+}
+
+function toastPointerMoved(ev) {
+  toastPeek.x = ev.clientX;
+  toastPeek.y = ev.clientY;
+  toastPeekSoon();
+}
+
+/// The pointer left the window (or the finger lifted): it is over no toast.
+function toastPointerLeft(ev) {
+  if (ev.relatedTarget) return;
+  toastPeek.x = null;
+  toastPeek.y = null;
+  toastPeekSoon();
+}
+
+/// A press or click on a toast where it lies over a dialog's backdrop, outside
+/// the dialog itself, goes nowhere - as it did before toasts let clicks
+/// through. A dialog takes a click on its backdrop for a click outside it and
+/// closes, dropping what was typed (a pasted key, a password): not what a
+/// click on a notification should do. The window-level activity listeners
+/// run before this, so the press still counts as the user being there.
+function toastShieldsBackdrop(ev) {
+  const target = ev.target;
+  if (!target || !target.classList || !target.classList.contains('modal-backdrop')) return;
+  const host = el('toast');
+  if (!host) return;
+  const onToast = [...host.children].some((n) => {
+    const r = n.getBoundingClientRect();
+    return ev.clientX >= r.left && ev.clientX < r.right && ev.clientY >= r.top && ev.clientY < r.bottom;
+  });
+  if (!onToast) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+}
+
+/// Work out which toasts are see-through on the next frame: once per frame
+/// however many pointer moves arrive, and after the browser has scrolled a
+/// newly focused control into view.
+function toastPeekSoon() {
+  if (!toastPeek.watching || toastPeek.frame) return;
+  toastPeek.frame = requestAnimationFrame(() => {
+    toastPeek.frame = 0;
+    toastPeekNow();
+  });
+}
+
+function toastPeekNow() {
+  const host = el('toast');
+  if (!host || !modalStack.length) return;
+  const { x, y } = toastPeek;
+  const pointerIn = (r) => x !== null && x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+  // The control with the keyboard focus - not a toast's own × after a click,
+  // and not one with no box on screen.
+  const active = document.activeElement;
+  const box = active && active !== document.body && !host.contains(active) ? active.getBoundingClientRect() : null;
+  const focus = box && (box.width > 0 || box.height > 0) ? box : null;
+  // Every box is read before any class changes, so the page works its style
+  // out once for all the toasts instead of once for each.
+  const peeks = [...host.children].map((item) => {
+    const r = item.getBoundingClientRect();
+    const dismiss = item.querySelector('.toast-dismiss');
+    const onDismiss = !!dismiss && pointerIn(dismiss.getBoundingClientRect());
+    const overFocus = !!focus && r.left < focus.right && focus.left < r.right && r.top < focus.bottom && focus.top < r.bottom;
+    return [item, !onDismiss && (pointerIn(r) || overFocus)];
+  });
+  for (const [item, on] of peeks) item.classList.toggle('peek', on);
 }
 
 /// Run `fn` while `button` shows that it is working: disabled, aria-busy,
@@ -465,6 +585,7 @@ function modalDidOpen(node) {
   const opener = document.activeElement;
   modalStack.push({ node, opener: opener && opener !== document.body ? opener : null });
   layerModals();
+  toastsOverDialogs();
   // Only take focus if the dialog's own open path has not already placed it
   // somewhere deliberate (the picker focuses its search box, the delete
   // prompt focuses Cancel) \u2014 a rAF lets those run first.
@@ -481,6 +602,7 @@ function modalDidClose(node) {
   const [entry] = modalStack.splice(i, 1);
   node.style.zIndex = '';
   layerModals();
+  toastsOverDialogs();
   // A password shown in this dialog is masked again for next time (A5-35).
   remaskSecrets(node);
   // Restore focus to the control that opened the dialog, so keyboard users

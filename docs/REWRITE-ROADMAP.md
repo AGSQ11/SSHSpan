@@ -223,7 +223,7 @@ do.)*
 
 | Capability | v1.2.0 (Node) | v1.3.6 (Rust) |
 | --- | --- | --- |
-| Key lifecycle (gen/import/export) | ✔ | ✔ (same formats, Rust `ssh-key`) |
+| Key lifecycle (gen/import/export) | ✔ | ✔ (same formats, Rust `ssh-key`) *(Correction 2026-10-17: not the same import formats. The Rust app imports only OpenSSH private keys and PuTTY `.ppk`; PKCS#8, SPKI and `authorized_keys` are export formats there and are refused on import, as the `crypto/keys.rs` row above says.)* |
 | PuTTY .ppk v3 export / v2+v3 import | ✔ | ✔ |
 | Categories tree + DnD + Bitwarden notes sync | ✔ | ✔ (re-implemented) |
 | Bitwarden/Vaultwarden two-way sync | ✔ | ✔ (+ Vaultwarden client-version gate) |

@@ -790,7 +790,9 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
    opened over the server form was hidden behind it while still taking the
    keyboard focus. app.js (layerModals) now gives each open backdrop an inline
    z-index of 50 + its position in the open-order stack, which stays below the
-   toast layer at 99 so errors remain readable over any dialog. */
+   toast layer at 99 so errors remain readable over any dialog. While a dialog
+   is open the toasts let clicks through to it, and turn see-through where
+   they are in its way (Toast, below). */
 
 /* A column: the header and footer stay put and only the body scrolls, so
    Create / Save / Import are on screen at the minimum window size instead of
@@ -902,6 +904,7 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
   display: flex; align-items: center; gap: 9px;
   max-width: 100%;
   animation: toastIn 0.18s ease;
+  transition: opacity 0.12s ease;
 }
 @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 .toast-item.leaving { opacity: 0; transition: opacity 0.18s ease; }
@@ -933,6 +936,23 @@ tr.load-error-row .ghost-btn { margin-left: 10px; }
 .toast-item.warn::before { background: var(--warn); }
 .toast-item.ok   { border-color: rgba(var(--ok-rgb), 0.4); }
 .toast-item.ok::before   { background: var(--ok); }
+
+/* Over an open dialog. A tall dialog's footer reaches the bottom of the
+   window, under the toasts: its Create or Save could not be clicked while a
+   toast showed, and a control focused from the keyboard could be hidden
+   outright (WCAG 2.4.11). The dialog is not moved out of the way - it would
+   shift under the pointer - and the toasts stay where they are, above it.
+   While a dialog is open, app.js (toastsOverDialogs) marks #toast
+   .over-dialog: a toast then takes no pointer input except on its ×, so a
+   click anywhere else on it reaches the dialog beneath (where it lies over
+   the backdrop instead, app.js keeps the click from closing the dialog). A
+   toast under the pointer, or over the control that has the keyboard focus,
+   turns see-through (.peek) - but not while the pointer is on its ×, since a
+   click there dismisses the toast. With no dialog open, toasts are as
+   before. */
+#toast.over-dialog .toast-item { pointer-events: none; }
+#toast.over-dialog .toast-dismiss { pointer-events: auto; }
+.toast-item.peek:not(.leaving) { opacity: 0.12; }
 
 /* ==========================================================================
    Scrollbars
