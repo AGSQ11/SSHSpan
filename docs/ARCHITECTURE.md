@@ -1,7 +1,8 @@
 # SSHSpan architecture
 
 **Last updated:** 2026-10-17  
-**Status:** describes the remediation branch; checked against committed source at `6c19b1b`  
+**Status:** describes the remediation branch; checked against committed source at `6c19b1b`;
+nothing it describes has changed since (later changes are listed in the CHANGELOG)  
 **Platforms:** Windows and Linux  
 **Entry points:** `src-tauri/src/main.rs`, `src-tauri/src/lib.rs`, `src/renderer/index.html`,
 `src/renderer/app.js`
@@ -186,11 +187,13 @@ What the newer commands do:
   destination. A "no", or an "Allow" within a second, clears `confirmed_destination` again if it
   holds this very destination (an earlier "Allow" for it, or an "Allow syncing..." asked again), so
   the later answer stands; during a master-password change such an answer is logged, not written.
-  Both answers are audited without the account (`sync.destination_allowed`,
-  `sync.destination_declined`, detail `host=<host>`, then a space and `answered=too-quickly` for an
-  "Allow" within a second); an "Allow" that comes after a lock, for settings that changed meanwhile,
-  while the vault is being re-encrypted or when the answer cannot be stored (reasons 4 to 7 below)
-  writes no row. When the destination ends not allowed, `confirmed` is
+  Both answers are audited without the account: an "Allow" as `sync.destination_allowed` and a "no"
+  as `sync.destination_declined`, both with the detail `host=<host>`. An "Allow" within a second
+  counts as a refusal: it is audited as `sync.destination_declined` with the detail
+  `host=<host> answered=too-quickly` and does not start the 30-second wait described below. An
+  "Allow" that comes after a lock, for settings that changed meanwhile, while the vault is being
+  re-encrypted or when the answer cannot be stored (reasons 4 to 7 below) writes no row. When the
+  destination ends not allowed, `confirmed` is
   false and `warning` says why, after any warning the save already had and joined by one space;
   each reason starts "Bitwarden sync stays off, because ":
   1. "uploading your keys and passwords to {host} was not allowed. Use "Allow syncing..." in
@@ -254,7 +257,7 @@ What the newer commands do:
   address (a new server, another URL or variable, a restored or refused record) stays unconfirmed
   until the user answers a native question that Rust asks, and the call returns only after that.
   The dialog ("SSHSpan - Send a credential?") has the buttons "Don't allow", "Allow" and "Cancel";
-  "Don't allow" is the default button on Windows and macOS only, because the GTK dialog on Linux
+  "Don't allow" is the default button on Windows only, because the GTK dialog on Linux
   sets no default; only "Allow" allows, Esc or closing the dialog is "not allowed", an "Allow"
   within a second of the dialog opening is not taken (the clock starts when the dialog is created
   on the main thread), only one question is open app-wide and a second is never queued

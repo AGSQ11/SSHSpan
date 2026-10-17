@@ -1049,7 +1049,7 @@ fn backup_restore_round_trip_keeps_key_sync_metadata_bookmarks_and_audit() {
 /// each rename is audited. The audit row used to be written through a second
 /// pooled connection while the restore's own write transaction held the
 /// SQLite write lock - so every rename after the first write waited out the
-/// 5 s busy timeout and then lost its audit row.
+/// busy timeout (5 s then, 30 s now) and then lost its audit row.
 #[test]
 fn restore_with_invalid_key_names_audits_each_rename_without_stalling() {
     let db = fresh_db("restore_rename");
@@ -1068,16 +1068,22 @@ fn restore_with_invalid_key_names_audits_each_rename_without_stalling() {
         "keys": keys,
     });
 
+    // A stalled rename waits out the whole busy timeout (30 s) and loses its
+    // audit row (counted below). The restore runs on a thread and is waited
+    // for at most 4.5 s, so a stall fails here instead of sitting through
+    // the timeout; the rest is room for a loaded machine.
     let started = std::time::Instant::now();
-    let counts = db.restore_backup(&payload).expect("restore");
-    let elapsed = started.elapsed();
+    let (sent, restored) = std::sync::mpsc::channel();
+    let restoring = db.clone();
+    std::thread::spawn(move || {
+        let _ = sent.send(restoring.restore_backup(&payload));
+    });
+    let counts = restored
+        .recv_timeout(std::time::Duration::from_millis(4500))
+        .unwrap_or_else(|_| panic!("restore stalled for {:?}", started.elapsed()))
+        .expect("restore");
 
     let mut problems = Vec::new();
-    // A stalled rename waits out the whole 5 s busy timeout (and loses its
-    // audit row, counted below); the rest is room for a loaded machine.
-    if elapsed >= std::time::Duration::from_millis(4500) {
-        problems.push(format!("restore stalled for {elapsed:?}"));
-    }
     if counts["keys"] != 2 {
         problems.push(format!("restored keys: {}", counts["keys"]));
     }

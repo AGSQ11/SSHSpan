@@ -66,7 +66,7 @@ forwarded to another origin; plain `http://` is accepted only for `localhost` an
 names and for loopback, private, link-local and IPv6 local addresses. A stored API key is never
 silently reused for a different provider or address: saving the settings with a changed provider or
 address and no new key asks a native question first (Esc means no; the default button is "Don't
-allow" on Windows and macOS, and the GTK dialog on Linux sets none; an "Allow" within a second of
+allow" on Windows, and the GTK dialog on Linux sets none; an "Allow" within a second of
 the dialog opening, or after the vault locked, is not taken; and only one such question is open at
 a time; after a "Don't allow" or "Cancel", no further key move is asked about for 30 seconds,
 whatever address it names), and a declined key move saves nothing and is audited as
@@ -90,7 +90,7 @@ way.
 
 A secret or environment variable is bound to an MCP address only after a native question that names
 the host (and the variable) has been allowed (Esc means no; the default button is "Don't allow" on
-Windows and macOS, and the GTK dialog on Linux sets none; an "Allow" within a second of the dialog
+Windows, and the GTK dialog on Linux sets none; an "Allow" within a second of the dialog
 opening is not taken; and only one such question is open at a time; after a "Don't allow" or
 "Cancel", no further MCP credential question is asked for 30 seconds, whatever server it names):
 until then the server stays off and nothing is sent to it. SSHSpan records the answer as
@@ -131,18 +131,22 @@ The sync uploads only to a server and account the user allowed. Saving a server 
 email other than the allowed one stores the settings and then asks, in a native dialog ("SSHSpan -
 Sync with Bitwarden?"), whether SSHSpan may upload the SSH private keys and saved server passwords
 there; the question names the account, the server and the address (Esc means no; the default
-button is "Don't allow" on Windows and macOS, and the GTK dialog on Linux sets none; an "Allow"
+button is "Don't allow" on Windows, and the GTK dialog on Linux sets none; an "Allow"
 within a second of the dialog opening, or after the vault locked, is not taken; and only one such
 question is open at a time). Before you allow the destination, nothing is uploaded and no sync
 runs. Test connection, which you start yourself, still signs in to the server you typed and lists
 what its vault holds, to check the settings, and uploads nothing. A restore cannot bring or confirm
 a destination, because a backup carries no Bitwarden settings, and settings saved before this
 question existed keep syncing: a one-time migration at the first start counts their destination as
-allowed. SSHSpan records the answer as `sync.destination_allowed`
-or `sync.destination_declined`, holding only the host (an "Allow" that came within a second is
-noted as `answered=too-quickly`), never the account, a password or a sealed value. The account
-must be one email address, and after "Don't allow" or "Cancel" no further question about uploading
-is asked for 30 seconds, whatever server or account it names.
+allowed. SSHSpan audits each answer with the host, never the account, a password or a sealed
+value. An "Allow" that is taken writes `sync.destination_allowed` with `host=<host>`. "Don't
+allow", "Cancel", Esc or closing the dialog writes `sync.destination_declined` with
+`host=<host>`. An "Allow" within a second counts as a refusal (the sync stays off) and writes
+`sync.destination_declined` with `host=<host> answered=too-quickly`. No row is written for an
+"Allow" that is not taken for another reason: after a lock, for settings that changed meanwhile,
+during a master-password change, or when it cannot be stored. The account must be one email
+address, and after "Don't allow" or "Cancel" no further question about uploading is asked for 30
+seconds, whatever server or account it names; an "Allow" within a second starts no such wait.
 
 A sync can pull changes too. Items that would overwrite a local server or key, or add a new one,
 are listed by name and applied only after the user confirms; the names come from the remote items

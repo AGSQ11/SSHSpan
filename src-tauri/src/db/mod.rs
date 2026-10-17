@@ -5,7 +5,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
+    Row, SqlitePool,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::AppHandle;
@@ -452,6 +455,29 @@ fn block_on_own_parker<F: std::future::Future>(f: F) -> F::Output {
     }
 }
 
+/// How long a statement waits for another connection's lock before it fails
+/// with "database is locked" (SQLITE_BUSY).
+///
+/// The database keeps SQLite's rollback journal: while a commit holds the file
+/// EXCLUSIVE, through its fsyncs, a reader waits, and writers wait for each
+/// other the same way. sqlx's default budget of 5 s ran out behind
+/// back-to-back commits on a loaded machine, and a plain settings read failed
+/// with "database is locked" (reproduced on Windows, where it gave up after
+/// 7.5 s: SQLite counts the sleeps it asks for, and Windows stretches them).
+/// With a longer budget the read waits instead.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A pool on the database file at `db_path`, created if missing, whose
+/// connections wait up to [`BUSY_TIMEOUT`] for another connection's lock. The
+/// app and the tests open the database this way; `pool` carries the pool's
+/// own settings (the defaults, or one connection for a test).
+fn open_pool(db_path: &std::path::Path, pool: SqlitePoolOptions) -> Result<SqlitePool> {
+    let options = format!("sqlite:{}?mode=rwc", db_path.display())
+        .parse::<SqliteConnectOptions>()?
+        .busy_timeout(BUSY_TIMEOUT);
+    Ok(block(pool.connect_with(options))?)
+}
+
 impl Database {
     pub fn new(app: &AppHandle) -> Result<Self> {
         let db_path = get_db_path(app)?;
@@ -476,8 +502,7 @@ impl Database {
                 }
             }
         }
-        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = block(async { SqlitePool::connect(&db_url).await })?;
+        let pool = open_pool(&db_path, SqlitePoolOptions::new())?;
         // Owner-only permissions on the vault file (Unix). The DB holds the
         // Argon2id verifier and sealed key material; default umasks can leave
         // it world-readable depending on the system.
@@ -515,8 +540,7 @@ impl Database {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = block(async { SqlitePool::connect(&db_url).await })?;
+        let pool = open_pool(&db_path, SqlitePoolOptions::new())?;
         let db = Self { pool, db_path };
         db.migrate()?;
         Ok(db)
@@ -3023,8 +3047,8 @@ impl Database {
     /// commit (A7-25). They used to go through `add_audit` from inside the
     /// transaction, i.e. through a second pooled connection while this one
     /// held SQLite's write lock: each rename after the first write waited out
-    /// the 5 s busy timeout, failed with "database is locked", and the row was
-    /// dropped.
+    /// the busy timeout (5 s then), failed with "database is locked", and the
+    /// row was dropped.
     ///
     /// `BEGIN IMMEDIATE`: the restore reads (category and known-host checks)
     /// between its writes - a payload whose first entry is such a check read
@@ -5092,16 +5116,10 @@ mod ru5_fix2_tests {
     }
 
     /// A database whose pool has ONE connection, so a TEMP trigger created on
-    /// it applies to every statement the database runs.
+    /// it applies to every statement the database runs. Opened as the app
+    /// opens its database ([`open_pool`]).
     fn single_connection_db(path: &std::path::Path) -> Database {
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        let pool = block(async {
-            sqlx::sqlite::SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect(&url)
-                .await
-        })
-        .unwrap();
+        let pool = open_pool(path, SqlitePoolOptions::new().max_connections(1)).unwrap();
         let db = Database {
             pool,
             db_path: path.to_path_buf(),
@@ -5202,23 +5220,36 @@ mod ru5_fix2_tests {
         }
 
         // Concurrent: whole settings switched back and forth while another
-        // connection keeps reading.
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop = done.clone();
+        // connection keeps reading. The writer waits for a read before the
+        // first switch and after every switch, so reads and writes interleave
+        // however the threads are scheduled: the 40 writes take well under a
+        // second, and on a loaded machine they could all be done before the
+        // reader's first read.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let (stop, counted) = (done.clone(), reads.clone());
         let (seen_a, seen_b) = (endpoint(&a), endpoint(&b));
         let watcher = std::thread::spawn(move || {
-            let mut reads = 0usize;
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            while !stop.load(SeqCst) {
                 let seen = endpoint(&reader.load_bitwarden_config().unwrap());
                 assert!(
                     seen == seen_a || seen == seen_b,
                     "a reader saw a mixed tuple: {seen:?}"
                 );
-                reads += 1;
+                counted.fetch_add(1, SeqCst);
             }
-            reads
         });
+        // Stops waiting if the reader has stopped (its panic is reported by
+        // the join below).
+        let wait_for_a_read_after = |count: usize| {
+            while reads.load(SeqCst) <= count && !watcher.is_finished() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        wait_for_a_read_after(0);
         for round in 0..40 {
+            let before = reads.load(SeqCst);
             let next = if round % 2 == 0 { b.clone() } else { a.clone() };
             writer
                 .update_bitwarden_config(move |current| {
@@ -5226,9 +5257,65 @@ mod ru5_fix2_tests {
                     Ok(())
                 })
                 .unwrap();
+            wait_for_a_read_after(before);
         }
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(watcher.join().unwrap() > 0);
+        done.store(true, SeqCst);
+        watcher.join().unwrap();
+        assert!(reads.load(SeqCst) > 40, "a read after every switch");
+    }
+
+    /// A read behind another connection's commit that lasts longer than
+    /// sqlx's default 5 s budget waits for the commit, then succeeds. In the
+    /// rollback journal a commit holds the database EXCLUSIVE through its
+    /// fsyncs and a reader waits meanwhile; with the 5 s budget a plain
+    /// settings read behind back-to-back commits on a loaded machine failed
+    /// with "database is locked" (CI's Windows run, behind the 40 settings
+    /// writes above) - see [`BUSY_TIMEOUT`]. The other connection is a plain
+    /// one with sqlx's defaults, as any other program's would be; it holds
+    /// the lock a commit holds (`BEGIN EXCLUSIVE` and an update) past the old
+    /// budget.
+    #[test]
+    fn a_settings_read_waits_out_a_commit_longer_than_the_old_budget() {
+        // Past the old budget in wall-clock time: SQLite counts the sleeps it
+        // asks for, and Windows stretches them - there the 5 s ran out after
+        // about 7.5 s.
+        let hold = std::time::Duration::from_secs(if cfg!(windows) { 10 } else { 6 });
+        let path = temp_db_path();
+        let db = Database::open_at(path.clone()).unwrap();
+        db.save_bitwarden_config(&settings("https://a.example", "a@example.com", "sealed-a"))
+            .unwrap();
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let (held, wait_for_hold) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            block(async {
+                let other = SqlitePool::connect(&url).await.unwrap();
+                let mut conn = other.acquire().await.unwrap();
+                sqlx::query("BEGIN EXCLUSIVE")
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE bitwarden_config SET value = 'sealed-b' WHERE key = 'master_password'",
+                )
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(hold);
+                sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+                drop(conn);
+                other.close().await;
+            })
+        });
+        wait_for_hold.recv().unwrap();
+        let read = db.load_bitwarden_config();
+        holder.join().unwrap();
+        let read = read.expect("the read must wait for the commit, not fail");
+        assert_eq!(
+            read.master_password.as_deref(),
+            Some("sealed-b"),
+            "the reader sees the committed settings"
+        );
     }
 
     #[test]

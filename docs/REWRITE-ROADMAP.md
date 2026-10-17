@@ -179,12 +179,12 @@ the grid in sync with maximize.
 ### v1.3.6 — Publickey auth
 
 Vault keys are stored as **raw binary OpenSSH blobs**, not PEM text. The Connect path now
-loads keys through the same `unseal_key_data` → `export_private_key(OpenSsh)` pipeline
+loads keys through the same `load_private_key_data` → `export_private_key(OpenSsh)` pipeline
 used by export/deploy, so every key type (Ed25519, RSA, ECDSA, .ppk-imported) works for SSH
 auth, and the right-click "use this key to connect" flow works against any vault key. Failures
-surface with the key's name. *(Correction 2026-10-13: this paragraph used to name a helper
-that has since been removed; the connect path unseals the key directly, as export and deploy
-do.)*
+surface with the key's name. *(Correction 2026-10-13: `load_private_key_data` has since been
+removed. The connect path now unseals the key with `unseal_key_data`, as export and deploy do,
+and then calls `export_private_key(OpenSsh)`.)*
 
 ---
 

@@ -240,12 +240,14 @@ jobs:
   #
   # The job passed on a runner for the first time on 2026-10-17, at 38e586e.
   # Its first run had failed five library tests that assumed Unix paths or a
-  # single ACL entry (fixed since; the manifest step worked). Until the job had
-  # run green once, a failure could have been another such test (several use
-  # literal /tmp and /etc strings) rather than a regression, so the job is
-  # continue-on-error: its failure does not fail the workflow run. Now that it
-  # has passed once, the flag can be deleted, so that a Windows regression
-  # fails CI like any other (audit row A7-56).
+  # single ACL entry (fixed since; the manifest step worked); its next run, at
+  # fd4765d, failed one test because a database read gave up behind a run of
+  # writes on the loaded runner (fixed since). Until the job passes
+  # consistently, a failure may be a test that does not port to Windows
+  # (several use literal /tmp and /etc strings) rather than a regression, so
+  # the job is continue-on-error: its failure does not fail the workflow run.
+  # Delete the flag once the job passes consistently, so that a Windows
+  # regression fails CI like any other (audit row A7-56).
   windows:
     name: Windows (cargo test, static checks)
     runs-on: windows-latest

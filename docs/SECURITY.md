@@ -1,7 +1,8 @@
 # SSHSpan security model
 
-**Last updated:** 2026-10-17  
-**Status:** describes the remediation branch; checked against committed source at `6c19b1b`  
+**Last updated:** 2026-10-18  
+**Status:** describes the remediation branch; checked against committed source at `6c19b1b`, the
+release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -166,8 +167,9 @@ is supported. This path was verified natively on Windows 11 from a test executab
 WSL, and the library and integration tests have since run natively there too. The `windows-latest`
 CI job, whose tests cover this path, passed on a runner for the first time on 2026-10-17, at
 `38e586e`; its first run had failed five tests that assumed Unix paths or a single ACL entry, since
-fixed. It is still `continue-on-error`, so its failure does not fail the workflow; that flag can
-now be removed.
+fixed. Its next run, at `fd4765d`, failed one test, because a database read gave up behind a run of
+writes on the loaded runner (since fixed). The job stays `continue-on-error`, so its failure does
+not fail the workflow, until it passes consistently.
 
 ### Backups
 
@@ -469,7 +471,7 @@ to an address it was not bound to before (a new server, another URL or variable,
 restored from a backup or refused before), for a stored assistant API key moved to another
 provider or address, and for the Bitwarden sync pointed at a server or account other than the
 allowed one (see [Bitwarden / Vaultwarden](#bitwarden--vaultwarden)). Its buttons are "Don't allow",
-"Allow" and "Cancel"; "Don't allow" is the default button on Windows and macOS, where a stray Enter
+"Allow" and "Cancel"; "Don't allow" is the default button on Windows, where a stray Enter
 answers it, and the GTK dialog on Linux sets no default button, so only a deliberate click on
 "Allow" can come early; Esc or closing it means no; an "Allow" within a second of the dialog
 opening, after the vault locked (even if it was unlocked again), or for settings that changed
@@ -545,7 +547,7 @@ answer:
   for the server and account it was saved for.
 - The question follows the rules of the other credential questions (see
   [Renderer-attested approvals](#renderer-attested-approvals)): "Don't allow" is the default button
-  on Windows and macOS (the GTK dialog sets none), Esc or closing means no, an "Allow" counts only
+  on Windows (the GTK dialog on Linux sets none), Esc or closing means no, an "Allow" counts only
   after a second, and counts for nothing after the vault locked (even if it was unlocked again),
   for settings that changed meanwhile, or while a master-password change re-encrypts the vault;
   only one such question is open at a time and a second is never queued (the save says so and the
@@ -840,9 +842,9 @@ Each is a known, deliberate state, with the reason it was left.
   its parts only; a manual check on Windows (quit with a connected MCP server, then see the session
   DELETE arrive) is still wanted.
 - **Native credential questions on Linux.** The one-second minimum before an "Allow" counts is
-  measured from the moment the dialog is requested on the main thread. On Windows and macOS the
+  measured from the moment the dialog is requested on the main thread. On Windows the
   dialog is created at once; on Linux the GTK dialog is created from an idle callback, so a flooded
-  main loop can use up part of that second before the dialog is visible. On Windows and macOS a
+  main loop can use up part of that second before the dialog is visible. On Windows a
   stray Enter answers "Don't allow" (the default button); the GTK dialog sets no default button, so
   only a deliberate click on "Allow" can come early.
 - **A mistaken "no" costs 30 seconds.** A "no" given by mistake (or Esc, or closing the dialog)
@@ -868,12 +870,13 @@ Each is a known, deliberate state, with the reason it was left.
 - **A Windows regression does not fail CI yet, and drag and drop is not proven on the real thing.**
   The `windows-latest` CI job passed on a runner for the first time on 2026-10-17, at `38e586e`
   (743 library, 47 integration and 20 MCP integration tests, natively); its first run had failed
-  five library tests that assumed Unix paths or a single ACL entry, since fixed. It is still
-  `continue-on-error` (A7-56, Partial); that flag can now be removed.
-  The release workflow's own Windows `cargo test`, with the same manifest step, runs only
-  when a tag is pushed and has not run since that step was added. Drag and drop is emulated in the
-  renderer suites - they remove the HTML5 drag events the Windows webview withholds and drive a real
-  mouse - and no real WebView2 drag was run (A3-23).
+  five library tests that assumed Unix paths or a single ACL entry, since fixed. Its next run, at
+  `fd4765d`, failed one test, because a database read gave up behind a run of writes on the loaded
+  runner (since fixed). The job stays `continue-on-error` (A7-56, Partial) until it passes
+  consistently. The release workflow's own Windows `cargo test`, with the same manifest step, runs
+  only when a tag is pushed and has not run since that step was added. Drag and drop is emulated in
+  the renderer suites - they remove the HTML5 drag events the Windows webview withholds and drive a
+  real mouse - and no real WebView2 drag was run (A3-23).
 - **Platform limits.** There is no hardware-backed key storage; keys are as strong as the master
   password and the OS random-number generator. A weak master password can be attacked offline
   against the stored Argon2id verifier. Tauri v2 exposes no OS suspend or lock event, so suspend
@@ -917,8 +920,9 @@ transmitted by SSHSpan.
   MCP-contract and comment-hygiene checks, the seven renderer suites, IPC argument checks,
   `cargo audit` (with a documented ignore for RUSTSEC-2023-0071), and the Rust tests and static
   checks on `windows-latest` (a job that passed on a runner for the first time on 2026-10-17, at
-  `38e586e`; it is still `continue-on-error`, so its failure does not fail the workflow, and that
-  flag can now be removed).
+  `38e586e`; its next run, at `fd4765d`, failed one test, because a database read gave up behind a
+  run of writes on the loaded runner, since fixed; it stays `continue-on-error`, so its failure does
+  not fail the workflow, until it passes consistently).
 - RUSTSEC-2023-0071 affects RSA PKCS#1 v1.5 decryption. SSHSpan uses RSA for signatures/auth, not
   attacker-controlled RSA decryption; there is no patched upstream version, so the risk is
   documented and monitored rather than described as eliminated.

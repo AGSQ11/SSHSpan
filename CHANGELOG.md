@@ -98,7 +98,7 @@ says which are only Partial and what is still open.
   or address, and pointing the Bitwarden sync at a server or account you have not allowed (next
   entry) ask a native question that names the host (and the variable; the Bitwarden question names
   the account, the server and its address). Its buttons are "Don't allow", "Allow" and "Cancel";
-  "Don't allow" is the default button on Windows and macOS, where a stray Enter answers it, while
+  "Don't allow" is the default button on Windows, where a stray Enter answers it, while
   the GTK dialog on Linux sets no default button, so only a deliberate click on "Allow" can come
   early. Esc or closing the dialog means no; an "Allow"
   within a second of the dialog opening, after the vault locked (even if it was unlocked again), or
@@ -155,8 +155,9 @@ says which are only Partial and what is still open.
   either (only the last destination allowed is kept, so returning to an earlier one after allowing
   another asks again), and a restored backup carries no Bitwarden settings, so it can neither
   bring nor confirm a destination. The audit rows `sync.destination_allowed` and
-  `sync.destination_declined` hold the host only, followed by `answered=too-quickly` when an
-  "Allow" came within a second. (`6c19b1b`)
+  `sync.destination_declined` hold the host only. An "Allow" within a second counts as a refusal and
+  is logged as `sync.destination_declined` with `answered=too-quickly`, without starting the
+  30-second wait that follows a "no". (`6c19b1b`)
 - **Category order.** `category_set_order` renumbers one whole list of categories (it must name
   every category under that parent, restored loop roots included) in a single transaction without
   changing any parent; a partial list is refused. A drag, Move up or Move down in the category
@@ -332,9 +333,11 @@ says which are only Partial and what is still open.
   removed code that comes back and on error text built by hand in the shapes it knows; there is a
   `windows-latest` job for `cargo test` and the static checks (it passed on a runner for the first
   time on 2026-10-17, at `38e586e`; its first run had failed five tests that assumed Unix paths or
-  a single ACL entry, which are fixed; the job is still `continue-on-error`, so its failure does not
-  fail the workflow, and that flag can now be removed); every job has a
-  timeout. The unreferenced `scripts/refactor_tabs.py` and `scripts/cdp-*.js` drivers were removed.
+  a single ACL entry, which are fixed; its next run, at `fd4765d`, failed one test, because a
+  database read gave up behind a run of writes on the loaded runner, since fixed; the job stays
+  `continue-on-error`, so its failure does not fail the workflow, until it passes consistently);
+  every job has a timeout. The unreferenced `scripts/refactor_tabs.py` and `scripts/cdp-*.js`
+  drivers were removed.
   (`7e5c5c5`, `11abb3e`, `c227218`, `53347df`, `d589b51`, `652aa5e`, `d5e9d22`, `11e7e30`,
   `3b0fcfb`, `6c19b1b`, #85; A7-56, A8-17, A8-21)
 - **The MCP smoke mock answers like a real server.** `scripts/mcp-smoke-server.py` (developer
@@ -411,6 +414,10 @@ Vault, dialogs and settings
   of a notification that lies over the dimmed backdrop does nothing, so it cannot close the
   dialog. Before, a few long notifications could cover a tall dialog's Create button for up to 9
   seconds. (#85)
+- **Reads no longer fail behind a busy write.** A read or a write that finds another write in
+  progress now waits up to 30 seconds for it to finish, instead of 5. Before, on a loaded machine
+  (seen on Windows) a settings read could fail with "database is locked" behind a run of writes,
+  for example during a sync. (#85)
 - **Restoring a backup.** Restore keeps each key's Bitwarden revision metadata (numbers were read
   as strings), writes its audit rows after the commit instead of through a second connection while
   its own transaction was open, validates the restored settings, aborts if the vault locks
@@ -747,7 +754,7 @@ Bitwarden, updates and lifecycle
   syncing..." asks again; and a restored backup, which carries no Bitwarden settings, can neither
   bring a destination nor confirm one. The question follows the rules of the other credential
   questions (see "Native questions for credentials" under Added): one at a time, "Don't allow" as
-  the default button on Windows and macOS, no "Allow" that counts within a second, after a lock,
+  the default button on Windows, no "Allow" that counts within a second, after a lock,
   for settings that changed meanwhile, or while the vault is being re-encrypted, and no "no"
   undone by an earlier "Allow". An "Allow" that comes after a lock, for settings that changed
   meanwhile, while the vault is being re-encrypted or when the answer cannot be stored writes no
@@ -900,8 +907,10 @@ Bitwarden, updates and lifecycle
   pointed at a folder that passes nothing down (the native counts above were taken before the
   second table test was added). The job passed on a runner for the first time on 2026-10-17, at
   `38e586e`: the static checks passed, and `cargo test` ran 743 library, 47 integration and 20 MCP
-  integration tests natively, none failing. It is still `continue-on-error`; that flag can now be
-  removed.
+  integration tests natively, none failing. Its next run, at `fd4765d`, failed one library test
+  (742 passed): a database read gave up behind a run of writes on the loaded runner, since fixed
+  (see "Reads no longer fail behind a busy write" under Fixed). The job stays `continue-on-error`
+  until it passes consistently.
 - The renderer suites run in headless Chromium against a stubbed Tauri bridge. They do not exercise
   WebView2 or WebKitGTK rendering, native dialogs, the tray, screen readers or real SSH, SFTP,
   Bitwarden or MCP servers.

@@ -64,12 +64,13 @@ hidden by the exit code of `tr`.
 natively in CI: the `windows` job runs `cargo test` and the static renderer checks on
 `windows-latest`. It passed on a runner for the first time on 2026-10-17, at `38e586e` (743
 library, 47 integration and 20 MCP integration tests); its first run, on pull request #85, had
-failed five library tests that assumed Unix paths or a single ACL entry, since fixed. It is still
-`continue-on-error`; that flag can now be removed. The release workflow also runs
-`cargo test` on `windows-latest` at every tag, never on a pull request. The library and
-integration tests have also been run by hand on Windows 11, from test executables cross-built in
-WSL (the next paragraph says what they need beside them); treat any other Windows-only claim
-accordingly.
+failed five library tests that assumed Unix paths or a single ACL entry, since fixed. Its next
+run, at `fd4765d`, failed one test, because a database read gave up behind a run of writes on the
+loaded runner (since fixed), so the job stays `continue-on-error` until it passes consistently.
+The release workflow also runs `cargo test` on `windows-latest` at every tag, never on a pull
+request. The library and integration tests have also been run by hand on Windows 11, from test
+executables cross-built in WSL (the next paragraph says what they need beside them); treat any
+other Windows-only claim accordingly.
 
 A Windows test executable stops at load time (`0xC0000139`, `STATUS_ENTRYPOINT_NOT_FOUND` for
 `comctl32` `TaskDialogIndirect`) unless it declares Common-Controls 6. `tauri-build` embeds that
@@ -214,9 +215,10 @@ timeout.
 - `windows`: the static renderer checks (the same list as `renderer`, plus `check-ipc-args.js`),
   then `cargo test` on `windows-latest` (the suites run on Linux only: they drive the same files
   in the same browser). The job is `continue-on-error` - its failure does not fail the workflow -
-  until it has passed once on a runner (audit row A7-56); delete that flag then. It has now passed
-  once, on 2026-10-17 at `38e586e` (its first run had failed five library tests, since fixed);
-  the flag is still set and can now be deleted.
+  until it passes consistently on a runner (audit row A7-56); delete that flag then. It passed on
+  2026-10-17 at `38e586e` (its first run had failed five library tests, since fixed); its next run,
+  at `fd4765d`, failed one test, because a database read gave up behind a run of writes on the
+  loaded runner (since fixed).
 
 ### Scripts
 
@@ -286,7 +288,7 @@ passes without the fix is not evidence.
   "Allow" in under a second or after a lock is not taken, one question is open at a time, a "no"
   holds back every further question of its kind (`QuestionKind`) for 30 seconds, whatever host,
   address or account it names (`CredentialQuestions`), and "Don't allow" is the default button on
-  Windows and macOS only - the GTK dialog sets none). A
+  Windows only - the GTK dialog on Linux sets none). A
   "yes" flag from the renderer is never trusted, and the renderer asks no question of its own for
   it. The Bitwarden sync reads its settings only through `settings_for_sync`; a new place that
   uploads with them goes through it too.

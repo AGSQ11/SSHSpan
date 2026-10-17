@@ -1,7 +1,8 @@
 # MCP smoke-test checklist
 
 **Last updated:** 2026-10-17  
-**Status:** describes the remediation branch; checked against committed source at `6c19b1b`
+**Status:** describes the remediation branch; checked against committed source at `38e586e`, which
+changed the smoke mock (steps 5, 19 and 26); nothing MCP-related has changed since
 
 A manual QA pass for the MCP feature. Run the real app against the mock server in
 `scripts/mcp-smoke-server.py`. Each step names the Rust unit/integration test that already proves
@@ -172,20 +173,25 @@ backend and a real webview.
       compares the hash the page sends with the hash stored by the last fetch of the list, which
       changes only when SSHSpan fetches the list again.
     - The gate re-check: right before every `tools/call` the backend runs the gate again on the
-      record as stored at that moment. It refuses a tool whose approval was revoked since the
-      first check ("Tool 'echo' is not enabled - enable it in the MCP server settings.") and a
-      tool whose stored definition no longer matches the approved one after a refresh ("Tool
-      'echo' changed on the server since it was approved - re-approve it in the MCP settings.").
-      It reads only what SSHSpan has stored, so a definition changed only on the server is seen
-      once SSHSpan fetches the list again: on Test connection (step 14), or after a
-      `notifications/tools/list_changed` that comes with a call or with the answer to a session's
-      `initialize`, which includes a renewed session (step 26).
+      record as stored at that moment. A tool whose approval was revoked since the first check,
+      and one that a refresh found changed meanwhile (the refresh disables it and clears its
+      Auto-approve, as in step 14), are refused with "Tool 'echo' is not enabled - enable it in
+      the MCP server settings.", the message step 26 shows. The gate's other refusal, "Tool 'echo'
+      changed on the server since it was approved - re-approve it in the MCP settings.", is for a
+      tool that is still enabled although its stored definition no longer matches the approved
+      one. SSHSpan never stores such a record itself (an enable pins the current definition, and a
+      refresh disables a changed tool), so only Rust tests that set one up directly get that
+      message. The re-check reads only what SSHSpan has stored, so a definition changed only on
+      the server is seen once SSHSpan fetches the list again: on Test connection (step 14), or
+      after a `notifications/tools/list_changed` that comes with a call or with the answer to a
+      session's `initialize`, which includes a renewed session (step 26).
 
     Automated: `enabling_with_a_stale_definition_hash_is_refused` (the stale enable),
     `a_tool_revoked_while_the_session_is_set_up_is_never_called` (the re-check refuses a tool
-    revoked while the session is set up) and
-    `a_tool_changed_while_an_expired_session_is_renewed_is_not_called_again` (it refuses a tool
-    whose stored definition changed while a lost session is renewed).
+    revoked while the session is set up, with "not enabled") and
+    `a_tool_changed_while_an_expired_session_is_renewed_is_not_called_again` (the test writes a
+    changed definition for the still-enabled tool while a lost session is renewed, and the
+    re-check refuses it with "changed on the server").
 
 ## Error / edge paths
 
@@ -248,7 +254,7 @@ backend and a real webview.
     Saving a server that binds a secret or an environment variable to an address it was not bound
     to before also shows a native question ("SSHSpan - Send a credential?") that names the host and
     the variable. Its buttons are "Don't allow", "Allow" and "Cancel" ("Don't allow" is the default
-    button on Windows and macOS; the GTK dialog on Linux sets none); only "Allow" allows, and Esc or
+    button on Windows; the GTK dialog on Linux sets none); only "Allow" allows, and Esc or
     closing the dialog counts as no. Allow: the server is confirmed and the test above works. Don't
     allow: the server is saved but stays off ("The server was saved but stays switched off, because
     sending its credential to `<host>` was not allowed. Save it again to be asked again."), its row

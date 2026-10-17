@@ -56,7 +56,7 @@ minisign signature before they run and a missing or invalid signature refuses th
   in-page drag and drop uses pointer events, so it does not depend on the HTML5 drag events the
   Windows webview withholds; every drag also has a menu command.
   Credentials are bound to their destination by native questions that the page cannot answer
-  (on Windows and macOS the default button is "Don't allow"; the GTK dialog on Linux sets none),
+  (on Windows the default button is "Don't allow"; the GTK dialog on Linux sets none),
   and the Bitwarden sync now asks which server and account it may upload your keys and saved
   passwords to. A saved SSH password follows its account only, an approval for Bitwarden changes
   applies exactly the list you were shown, "Stop editing" no longer deletes changes the server does
@@ -226,7 +226,7 @@ which lists every accepted risk; the status of every audit finding is in the
 - **Native credential questions.** An "Allow" counts only after the dialog has been open for one
   second, measured from the moment the dialog is requested on the main thread. On Linux (GTK)
   the dialog is created from an idle callback, so a flooded main loop can use up part of that
-  second before the dialog is visible. On Windows and macOS a stray Enter answers "Don't allow"
+  second before the dialog is visible. On Windows a stray Enter answers "Don't allow"
   (the default button); the GTK dialog sets no default button, so only a deliberate click on
   "Allow" can come early.
 - **Locking.** Locking ends live sessions, so a long unattended job is still cut at the idle
@@ -236,12 +236,14 @@ which lists every accepted risk; the status of every audit finding is in the
   SFTP, Bitwarden and MCP servers were not exercised. The Rust library and integration tests have
   also run natively on Windows 11, from test executables cross-built in WSL (see
   [CONTRIBUTING.md](CONTRIBUTING.md)). The `windows-latest` CI job passed on a runner for the
-  first time on 2026-10-17 (743 library, 47 integration and 20 MCP integration tests, natively);
-  its first run had failed five tests that assumed Unix paths or a single ACL entry, since fixed.
-  It is still `continue-on-error`; that flag can now be removed. Drag and drop is emulated: the
-  suites remove the HTML5 drag events the Windows webview withholds and drive a real mouse, and no
-  real WebView2 drag was run. The exit-time wait for MCP session teardowns (quit with a connected
-  MCP server) needs a manual check on Windows.
+  first time on 2026-10-17, at `38e586e` (743 library, 47 integration and 20 MCP integration tests,
+  natively); its first run had failed five tests that assumed Unix paths or a single ACL entry,
+  since fixed. Its next run, at `fd4765d`, failed one test, because a database read gave up behind
+  a run of writes on the loaded runner (since fixed), so the job stays `continue-on-error` until it
+  passes consistently. Drag and drop is emulated: the suites remove the HTML5 drag events the
+  Windows webview withholds and drive a real mouse, and no real WebView2 drag was run. The
+  exit-time wait for MCP session teardowns (quit with a connected MCP server) needs a manual check
+  on Windows.
 
 ## Screenshots
 
@@ -420,7 +422,7 @@ characters)" opens the complete text). Closing a tab or locking denies a pending
 level to Read. Remote terminal text and MCP results are wrapped as untrusted data, which raises the
 cost of prompt injection but is not a proof against it. Moving a stored API key to another provider
 or address asks a native question first (Esc means no; the default button is "Don't allow" on
-Windows and macOS, and the GTK dialog on Linux sets none; an "Allow" within a second of the dialog
+Windows, and the GTK dialog on Linux sets none; an "Allow" within a second of the dialog
 opening, or after the vault locked, is not taken; only one such question is open at a time; after
 a "Don't allow" or "Cancel", no further key move is asked about for 30 seconds, whatever address
 it names, while an MCP credential or a Bitwarden upload is not held back by it); a "no" saves
@@ -438,7 +440,7 @@ argument hash. Plain `http://` is accepted only for loopback (`127.0.0.0/8`, `::
 backup stays off until you confirm its URL and credential.
 Binding a secret or an environment variable to an address it was not bound to before asks a
 native question that names the host and the variable (Esc means no; the default button is "Don't
-allow" on Windows and macOS, and the GTK dialog sets none; an "Allow" within a second is not
+allow" on Windows, and the GTK dialog on Linux sets none; an "Allow" within a second is not
 taken; one question at a time; after a "Don't allow" or "Cancel", no further MCP credential
 question is asked for 30 seconds, whatever server it names); until it is allowed the server
 stays off, and its row says "Not confirmed" and offers "Allow sending..." to be asked again. The
@@ -556,7 +558,7 @@ Runs over the same live SSH connection as the terminal - no second login, no ext
   server URL or account email other than the allowed one (the first save included) stores the
   settings and asks a native question ("SSHSpan - Sync with Bitwarden?", naming the account first,
   then the server and its address, and saying when the account is not the one allowed before; on
-  Windows and macOS the default button is "Don't allow", the GTK dialog sets none; an "Allow"
+  Windows the default button is "Don't allow", the GTK dialog on Linux sets none; an "Allow"
   within a second of the dialog opening is not taken). Until it is allowed, a sync is refused
   before any network call, Settings > Bitwarden says "Not confirmed" and offers "Allow syncing..."
   to be asked again, and Test connection still works because it uploads nothing. Settings saved
