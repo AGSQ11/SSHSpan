@@ -146,9 +146,12 @@ backend and a real webview.
     Expected: the call runs without a card, but only for a tool that was enabled and approved; a
     disabled tool or a changed definition is still refused.
 
-    Steps 10-13: the access-level gate lives in `mcp_call_tool`, which needs a Tauri `AppHandle`;
-    the bare integration suite cannot invoke it. The human click is renderer-attested: Rust checks
-    the level and the definition, and cannot tell a real click from a claimed one.
+    Steps 10-13: the gate's rules for each level are in the pure `call_gate`, which
+    `the_call_gate_needs_approval_below_execute_and_names_who_approved` covers (step 9). The
+    `mcp_call_tool` command around it, which reads the stored level and runs the gate, needs a
+    Tauri `AppHandle`, and no automated test invokes it; these steps check that wiring. The human
+    click is renderer-attested: Rust checks the level and the definition, and cannot tell a real
+    click from a claimed one.
 
 ## Rug-pull guard
 
