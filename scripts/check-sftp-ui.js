@@ -3114,6 +3114,159 @@ async function scenarioStopEditAsks(browser, server) {
     check('the answer takes it away', await page.textContent('#termStrip'), before);
     check('no page errors', app.errors, []);
   });
+  // J2: the file's edit asked for while its Stop editing still checks is
+  // refused, and nothing is sent: the backend would hand out the very edit it
+  // is closing, and the stop would then delete the copy just reopened. The
+  // backend refuses that too; its refusal, should one come, is shown as it is.
+  const CLOSING = 'app.conf is being closed - try again when it has stopped.';
+  await withFiles(browser, server, spec, 'stop editing: an edit while it is closing', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await hold(page, 'sftp_close_edit');
+    await stop(page);
+    const opens = await app.count('sftp_open_for_edit');
+    await rowEvent(page, 'contextmenu', 'app.conf');
+    await clickMenuItem(page, 'Open with system app');
+    await settle(page, 150);
+    yes('J2 an edit while it is closing is refused, in words', (await toasts(page)).map(plain).includes(CLOSING), JSON.stringify(await toasts(page)));
+    check('J2 and nothing is sent', await app.count('sftp_open_for_edit'), opens);
+    await letGo(page, 'sftp_close_edit');
+    await settle(page);
+    await page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].forEach((t) => t.remove()));
+    await page.evaluate((m) => { window.__replies.sftp_open_for_edit = { $reject: m }; }, CLOSING);
+    await rowEvent(page, 'contextmenu', 'app.conf');
+    await clickMenuItem(page, 'Open with system app');
+    await settle(page, 150);
+    yes('J2 the backend\'s own refusal is shown as it is', (await toasts(page)).includes(CLOSING), JSON.stringify(await toasts(page)));
+    check('no page errors', app.errors, []);
+  });
+  // J3: two slow checks at once. Whichever answers last puts back the text
+  // the strip had before the first one - not "Checking <the other>...".
+  const TWO = { remote: { '/home/u': ['a.conf', 'b.conf'] }, local: HOME_ONLY };
+  const CHECKING = (n) => `Checking \u{2068}${n}\u{2069} for changes that are not on the server\u{2026}`;
+  const editOf = async (page, n) => {
+    await page.evaluate((x) => {
+      window.__replies.sftp_open_for_edit = { ok: true, localPath: 'C:\\stage\\' + x + '.txt', remote: '/home/u/' + x };
+    }, n);
+    await rowEvent(page, 'contextmenu', n);
+    await clickMenuItem(page, 'Open with system app');
+    await settle(page, 150);
+  };
+  const stopOf = async (page, n) => {
+    await rowEvent(page, 'contextmenu', n);
+    await clickMenuItem(page, 'Stop editing');
+    await settle(page, 100);
+  };
+  await withFiles(browser, server, TWO, 'stop editing: two slow checks at once', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    const strip = () => page.textContent('#termStrip');
+    const answer = (n) => page.evaluate((x) => window.__closing['/home/u/' + x](), n);
+    await page.evaluate(() => {
+      window.__closing = {};
+      window.__replies.sftp_close_edit = (a) => new Promise((res) => { window.__closing[a.remote] = () => res({ ok: true }); });
+    });
+    const before = await strip();
+    for (const [first, last] of [['a.conf', 'b.conf'], ['b.conf', 'a.conf']]) {
+      await editOf(page, 'a.conf');
+      await editOf(page, 'b.conf');
+      await stopOf(page, 'a.conf');
+      await page.waitForTimeout(1100);
+      await stopOf(page, 'b.conf');
+      await page.waitForTimeout(1100);
+      check(`(set-up) both checks running, the later said (${first} answers first)`, await strip(), CHECKING('b.conf'));
+      await answer(first);
+      await settle(page, 100);
+      check(`J3 ${first} answered first: the strip says the check still running`, await strip(), CHECKING(last));
+      await answer(last);
+      await settle(page, 100);
+      check(`J3 ${last} answered too: the text from before the first check is back`, await strip(), before);
+    }
+    check('no page errors', app.errors, []);
+  });
+  // J3: a lock within the first second - no "Checking..." over the locked page.
+  await withFiles(browser, server, spec, 'stop editing: a lock in the first second', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openEdit(page);
+    await hold(page, 'sftp_close_edit');
+    await stop(page);
+    await page.evaluate(() => { window.__backend.unlocked = false; window.__emit('vault-lock-requested', {}); });
+    await page.waitForTimeout(1200);
+    check('J3 a lock within the first second cancels the "Checking..." line',
+      /Checking/.test((await page.evaluate(() => (document.getElementById('termStrip') || {}).textContent || ''))), false);
+    await letGo(page, 'sftp_close_edit');
+    await settle(page);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── J7: SFTP edit texts from the backend, spelled out ──────────────────────
+//
+// A backend sentence about an edited file quotes its name (the server chose
+// it): every error of opening, stopping, saving back and settling a conflict
+// is shown with its direction and invisible characters spelled out, as the
+// Stop-editing question is. The R5 refusal is the backend's text; the others
+// are made up around a U+202E.
+
+async function scenarioEditSpelled(browser, server) {
+  const spec = { remote: { '/home/u': ['app.conf'] }, local: HOME_ONLY };
+  const RLO = '\u{202E}';
+  const spelled = (t) => t.split(RLO).join('<U+202E>');
+  const sync = (page, p) => page.evaluate((x) => window.__emit('sftp-edit-sync', Object.assign({ sessionId: 'sess-t1', editId: 'e1', remote: '/home/u/app.conf' }, x)), p);
+  const clear = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].forEach((t) => t.remove()));
+  const turned = async (page) => (await toasts(page)).filter((t) => t.includes(RLO));
+  const menu = async (page, item) => {
+    await rowEvent(page, 'contextmenu', 'app.conf');
+    await clickMenuItem(page, item);
+    await settle(page, 150);
+  };
+  const editing = (page) => page.evaluate(() => {
+    window.__replies.sftp_open_for_edit = { ok: true, localPath: 'C:\\stage\\app.conf.txt', remote: '/home/u/app.conf' };
+  });
+  await withFiles(browser, server, spec, 'J7 edit texts from the backend, spelled out', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    // Opening: the backend's own refusal while the file is being closed (R5).
+    const CLOSING = `evil${RLO}fnoc.ppa is being closed - try again when it has stopped.`;
+    await page.evaluate((m) => { window.__replies.sftp_open_for_edit = { $reject: m }; }, CLOSING);
+    await menu(page, 'Open with system app');
+    check('J7 the backend\'s refusal to open (R5) is spelled out', [(await toasts(page)).includes(spelled(CLOSING)), await turned(page)], [true, []]);
+    // Stopping: an answer that is not ok, then a rejection.
+    await clear(page);
+    await editing(page);
+    await menu(page, 'Open with system app');
+    const NOT_CLOSED = `Could not close evil${RLO}fnoc.ppa.`;
+    await page.evaluate((m) => { window.__replies.sftp_close_edit = { ok: false, error: m }; }, NOT_CLOSED);
+    await clear(page);
+    await menu(page, 'Stop editing');
+    check('J7 a Stop editing answered not ok: its error spelled out', [(await toasts(page)).includes(spelled(NOT_CLOSED)), await turned(page)], [true, []]);
+    const GONE = `The session of evil${RLO}fnoc.ppa is closed.`;
+    await page.evaluate((m) => { window.__replies.sftp_close_edit = { $reject: m }; }, GONE);
+    await clear(page);
+    await menu(page, 'Stop editing');
+    check('J7 a Stop editing rejected: its error spelled out', [(await toasts(page)).includes(spelled(GONE)), await turned(page)], [true, []]);
+    // Saving back: a failed save, in the toast and the activity log.
+    const DENIED = `Permission denied: evil${RLO}fnoc.ppa`;
+    await clear(page);
+    await sync(page, { ok: false, error: DENIED });
+    await settle(page, 100);
+    check('J7 a failed save-back: the backend\'s reason spelled out',
+      [(await toasts(page)).some((t) => t.includes(`to the server: ${spelled(DENIED)}. The edit is only on this computer.`)), await turned(page)], [true, []]);
+    const log = await page.evaluate(() => sftpTab('t1').log.join('\n'));
+    check('J7 and in the activity log', [log.includes(spelled(DENIED)), log.includes(RLO)], [true, false]);
+    // Settling a conflict: the backend's refusal in the prompt.
+    const UNCHECKED = `Could not check evil${RLO}fnoc.ppa on the server; nothing was uploaded.`;
+    await page.evaluate((m) => { window.__replies.sftp_edit_resolve = { $reject: m }; }, UNCHECKED);
+    await sync(page, CONFLICT('c1', 'changed'));
+    await waitVisible(page, '#editConflictModal');
+    await page.click('#editConflictOverwriteBtn');
+    await settle(page, 200);
+    check('J7 a refused conflict answer: spelled out in the prompt', (await page.textContent('#editConflictError') || '').trim(), spelled(UNCHECKED));
+    await page.click('#editConflictCancelBtn');
+    check('no page errors', app.errors, []);
+  });
 }
 
 // ─── the file menus from the keyboard ───────────────────────────────────────
@@ -3219,9 +3372,10 @@ async function scenarioSearchCapsSendTo(browser, server) {
       JSON.stringify(await toasts(page)));
     check('no page errors', app.errors, []);
   });
-  // A path picked in the save dialog that is SSHSpan's own program: the
-  // backend refuses it, and its words are shown as they are.
-  const PROGRAM = 'SSHSpan\'s own program files (where it is installed, its AppImage or app bundle) cannot be replaced by a download - choose another folder.';
+  // A path picked in the save dialog inside SSHSpan's own program or data
+  // folders: the backend refuses it (the same text as for a typed path), and
+  // its words are shown as they are.
+  const PROGRAM = 'SSHSpan\'s own program and data folders (where it is installed, its caches and the webview\'s profile) are off-limits for SFTP downloads and local changes.';
   await withFiles(browser, server, spec, 'download as onto the program files', async (app) => {
     const { page } = app;
     await openFilesTab(page);
@@ -3246,6 +3400,8 @@ async function scenarioBlankNames(browser, server) {
   const INSIDE = 'a' + BLANK + 'b.txt';
   // MUSICAL SYMBOL NULL NOTEHEAD: a symbol that shows as nothing.
   const DOTS_NULL = '..\u{1D159}';
+  // ".." with a combining mark on its last dot still reads as "..".
+  const DOTS_MARK = '..\u{301}';
   // Visible content - emoji, symbols, punctuation, other scripts, accents,
   // digits - is a name like any other; only a name that shows nothing, passes
   // for dots or for the home folder is flagged.
@@ -3254,8 +3410,8 @@ async function scenarioBlankNames(browser, server) {
   const spec = {
     remote: {
       '/home/u': [DOTS_BLANK + '/', BLANK + '/', DASHES + '/', 'docs/', INSIDE, '\u{1F389}', '\u{2605}', '_', '\u{6587}\u{4EF6}', '2024', '~', '...x/', '\u{3164}',
-        DOTS_NULL + '/', '\u{93E}', '\u{20DD}', 'report\u{2024}pdf'],
-      ['/home/u/' + DOTS_BLANK]: [], ['/home/u/' + BLANK]: [], ['/home/u/' + DASHES]: [], '/home/u/docs': [], '/home/u/...x': [], ['/home/u/' + DOTS_NULL]: [],
+        DOTS_NULL + '/', '\u{93E}', '\u{20DD}', 'report\u{2024}pdf', DOTS_MARK + '/'],
+      ['/home/u/' + DOTS_BLANK]: [], ['/home/u/' + BLANK]: [], ['/home/u/' + DASHES]: [], '/home/u/docs': [], '/home/u/...x': [], ['/home/u/' + DOTS_NULL]: [], ['/home/u/' + DOTS_MARK]: [],
     },
     local: { '/home/me': ['l1.txt'] },
   };
@@ -3287,6 +3443,7 @@ async function scenarioBlankNames(browser, server) {
     check('flagged: blank-only, marks-only, format-only, tag-only, dots-only, "~"',
       await page.evaluate((n) => n.filter((x) => !sftpUnusualName(x)).map((x) => [...x].map((c) => c.codePointAt(0).toString(16)).join(' ')), UNUSUAL), []);
     check('".." and U+1D159 (a null notehead) is spelled out and flagged', await cell(page, DOTS_NULL), ['..<U+1D159>', true]);
+    check('J3 ".." with a combining mark: the mark is spelled out, and it is flagged', await cell(page, DOTS_MARK), ['..<U+0301>', true]);
     check('a dot look-alike inside a name is spelled out too (the list made from the shared one keeps them)',
       await cell(page, 'report\u{2024}pdf'), ['report<U+2024>pdf', true]);
     check('a name of a spacing or an enclosing mark alone is spelled out and flagged',
@@ -3349,6 +3506,7 @@ const SCENARIOS = [
   ['JU6b fix round 2: the transfer panel\'s height in a small window (N3)', scenarioQueueHeight],
   ['JU6b fix round 2: names that pass for dots (F4)', scenarioDotNames],
   ['stop editing: asked when changes are not on the server', scenarioStopEditAsks],
+  ['edit texts spelled out (J7)', scenarioEditSpelled],
   ['menus from the keyboard: the file, folder and local menus (A2-50)', scenarioMenusKeyboard],
   ['search caps and Send to: saying what happened', scenarioSearchCapsSendTo],
   ['blank names: no letter or digit, U+2800 (F4)', scenarioBlankNames],

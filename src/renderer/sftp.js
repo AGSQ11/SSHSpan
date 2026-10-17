@@ -919,7 +919,9 @@ function sftpDotsOnly(name) {
 function sftpSpellName(name) {
   if (name && showsNothing(name)) return Array.from(name, spellChar).join('');
   let out = name.replace(SFTP_ODD_CHARS, spellChar);
-  if (sftpDotsOnly(name)) out = out.replace(SFTP_DOT_LOOKALIKES, spellChar);
+  // In a name of nothing but dots, the look-alikes and the marks: ".." with a
+  // combining mark on its last dot still reads as "..".
+  if (sftpDotsOnly(name)) out = out.replace(SFTP_DOT_LOOKALIKES, spellChar).replace(/\p{M}/gu, spellChar);
   return out.replace(/^ +| +$| {2,}/g, (run) => '<U+0020>'.repeat(run.length));
 }
 
@@ -3662,6 +3664,14 @@ async function sftpDownloadTo(tabId, fullPath, name) {
 async function sftpOpenForEdit(tabId, fullPath, name) {
   const tab = sftpTab(tabId);
   if (!tab) return;
+  // Its Stop editing still checks (that can take 10 s): the backend would
+  // hand out the very edit it is closing, and the stop would then delete the
+  // copy just reopened. Refused here, nothing sent; the backend refuses it
+  // too, and its words are shown as they are.
+  if (sftpStopping.has(sftpEditKey(tab.sessionId, fullPath))) {
+    toast(`${sftpInText(name)} is being closed - try again when it has stopped.`, 'err');
+    return;
+  }
   try {
     const r = await sftpCall('sftp_open_for_edit', { sessionId: tab.sessionId, remote: fullPath });
     // The save watch exists from here on (even if no editor opens), so the
@@ -3678,7 +3688,7 @@ async function sftpOpenForEdit(tabId, fullPath, name) {
     }
     sftpLog(tabId, `editing ${sftpSpell(name)} (auto-sync on save)`);
     toast(`Editing ${sftpInText(name)} - saves upload automatically.`, 'info');
-  } catch (e) { toast(errText(e), 'err'); }
+  } catch (e) { toast(errSpelled(e), 'err'); }
 }
 
 /// The edits whose "Stop editing" is running, by sftpEditKey: the backend
@@ -3691,21 +3701,36 @@ const sftpEditKey = (sessionId, remote) => sessionId + '\n' + remote;
 /// running (sftpSlowStatus).
 const SFTP_SLOW_MS = 1000;
 
+/// The slow-status lines shown now, oldest first, and what the strip said
+/// before the first of them (sftpSlowStatus).
+const sftpSlowShown = [];
+let sftpSlowBefore = '';
+
 /// `text` in the strip under the panes, once what it describes has taken
-/// longer than SFTP_SLOW_MS; done() takes it away again (the strip's text
-/// before it put back) - at once when it was never shown.
+/// longer than SFTP_SLOW_MS - not after a lock meanwhile, over the locked
+/// page. done() takes it away again: when the strip still says it, another
+/// check still running is said instead, or else what the strip said before
+/// the first of them comes back (two overlapping checks put back "Checking
+/// <the other>..." for good).
 function sftpSlowStatus(text) {
-  let before = null;
+  const shown = { text };
   const timer = setTimeout(() => {
+    if (!state.unlocked) return;
     const strip = document.getElementById('termStrip');
-    before = strip ? strip.textContent : '';
+    if (!sftpSlowShown.length) sftpSlowBefore = strip ? strip.textContent : '';
+    sftpSlowShown.push(shown);
     terminalSetStatus(text);
   }, SFTP_SLOW_MS);
   return {
     done() {
       clearTimeout(timer);
+      const at = sftpSlowShown.indexOf(shown);
+      if (at === -1) return;
+      sftpSlowShown.splice(at, 1);
       const strip = document.getElementById('termStrip');
-      if (before !== null && strip && strip.textContent === text) terminalSetStatus(before);
+      if (!strip || strip.textContent !== text) return;
+      const still = sftpSlowShown[sftpSlowShown.length - 1];
+      terminalSetStatus(still ? still.text : sftpSlowBefore);
     },
   };
 }
@@ -3749,13 +3774,13 @@ async function sftpStopEdit(tabId, fullPath) {
       if (!sure || !current()) return;
       r = await call('sftp_close_edit', { sessionId, remote: fullPath, force: true });
     }
-    if (!(r && r.ok === true)) { toast(errText(r), 'err'); return; }
+    if (!(r && r.ok === true)) { toast(errSpelled(r), 'err'); return; }
     if (tab._edits) tab._edits.delete(fullPath);
     sftpDropEditConflicts((c) => c.sessionId === sessionId && c.remote === fullPath);
     sftpLog(tabId, `stopped syncing ${sftpSpell(fullPath)}`);
     toast(`Stopped syncing ${sftpInText(name)}.`, 'info');
   } catch (e) {
-    toast(errText(e), 'err');
+    toast(errSpelled(e), 'err');
   } finally {
     sftpStopping.delete(key);
   }
@@ -3810,7 +3835,7 @@ function sftpOnEditSync(ev) {
     }
     toast(`Saved "${sftpInText(name)}" to ${(tab && tab.serverName) || 'the server'}.`, 'ok');
   } else {
-    const why = p.error || 'unknown error';
+    const why = spellOut(p.error || 'unknown error');
     if (tab) sftpLog(tab.tabId, `save of ${sftpSpell(remote)} FAILED: ${why}`);
     toast(`Could not save "${sftpInText(name)}" to the server: ${sftpSentence(why)} The edit is only on this computer.`, 'err');
   }
@@ -4063,7 +4088,7 @@ async function sftpAnswerEditConflict(action) {
     if (sftpEditConflict !== c) return;
     c.busy = false;
     sftpPaintEditButtons();
-    err.textContent = errText(e);
+    err.textContent = errSpelled(e);
     err.hidden = false;
   }
 }

@@ -53,7 +53,7 @@ use zeroize::Zeroizing;
 
 use crate::commands::{
     audit_or_log, audit_or_warn, capture_vault_generation, require_generation_current,
-    vault_password, CmdError, ConfirmCredential, CredentialAnswer, CredentialPrompt,
+    vault_password, CmdError, ConfirmCredential, CredentialAnswer, CredentialPrompt, VaultAtSave,
     VaultPasswordStore, VaultRotationLock,
 };
 
@@ -3130,22 +3130,6 @@ pub async fn mcp_save_server(
     Ok(saved.view)
 }
 
-/// The vault as a save found it: unlocked, at `generation`. The answer to a
-/// credential question counts only while the vault is still that.
-struct VaultAtSave<'a> {
-    vault: &'a VaultPasswordStore,
-    generations: &'a crate::commands::VaultGeneration,
-    generation: u64,
-}
-
-impl VaultAtSave<'_> {
-    /// The vault is unlocked, and was not locked since the save.
-    fn unchanged(&self) -> bool {
-        self.generations
-            .is_current(self.generation, self.vault.is_set())
-    }
-}
-
 /// What [`save_server`] did: the command's answer, the teardown of the live
 /// session the save made stale, and the credential binding the user still
 /// has to allow.
@@ -3278,6 +3262,16 @@ const LOCKED_WHILE_ASKED: &str = "The server was saved but stays switched off, b
 /// What a confirmation says when it could not be written.
 const BINDING_NOT_STORED: &str = "The server was saved but stays switched off, because confirming it could not be stored. Save it again to be asked again.";
 
+/// What a save says while the last question about sending a credential, to
+/// `host`, was answered "Don't allow" or "Cancel" less than
+/// [`crate::commands::CREDENTIAL_DECLINE_BACKOFF`] ago, whatever server or
+/// address is saved now: nothing is asked.
+fn binding_declined_lately(host: &str) -> String {
+    format!(
+        "The server was saved but stays switched off, because sending a credential to {host} was declined a moment ago. Wait 30 seconds, then save it again."
+    )
+}
+
 /// Ask about `pending` - in production the native dialog, on the blocking
 /// pool - and, when allowed, confirm the record ([`confirm_binding`]). A
 /// "no", or an "Allow" sooner than a second after the question opened,
@@ -3305,7 +3299,20 @@ fn settle_binding(
             warning: Some(BINDING_QUESTION_OPEN.into()),
         };
     };
+    // After "Don't allow" or "Cancel", no credential question is asked for
+    // 30 seconds ([`crate::commands::CREDENTIAL_DECLINE_BACKOFF`]), whatever
+    // server or address it names; the answer names the host declined.
+    let kind = crate::commands::QuestionKind::McpCredential;
+    if let Some(declined) = questions.declined_lately(kind) {
+        return BindingOutcome {
+            confirmed: false,
+            warning: Some(binding_declined_lately(&declined)),
+        };
+    }
     let answer = ask(&pending.prompt);
+    if answer == CredentialAnswer::NotAllowed {
+        questions.record_decline(kind, &pending.host);
+    }
     if answer != CredentialAnswer::Allowed {
         decline_binding(db, rotation, &pending);
         let detail = match answer {
@@ -8019,6 +8026,181 @@ mod tests {
         );
     }
 
+    /// A credential answered "Don't allow" or "Cancel" for an address is not
+    /// asked about again for 30 seconds - a renderer could ask again and
+    /// again until a tired user gave in. The save is stored switched off and
+    /// says why; after 30 seconds the question is asked again.
+    #[test]
+    fn fw_s1_a_declined_credential_is_not_asked_again_for_30_seconds() {
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let rotation = VaultRotationLock::new();
+        let clock = crate::commands::TestClock::new();
+        let questions = clock.questions();
+        let generations = crate::commands::VaultGeneration::new();
+        let asked = std::cell::Cell::new(0);
+        let counter = &asked;
+        let answer = |reply: CredentialAnswer| {
+            move |_: &CredentialPrompt| {
+                counter.set(counter.get() + 1);
+                reply
+            }
+        };
+        let declined = answer(CredentialAnswer::NotAllowed);
+        let first = save_and_settle_with(
+            &db,
+            &state,
+            &vault,
+            &rotation,
+            &questions,
+            &generations,
+            env_var_save(),
+            &declined,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 1);
+        assert_eq!(first.view["confirmed"], false);
+        let id = saved_id(first.view);
+        let again = || {
+            let mut save = env_var_save();
+            save.id = Some(id.clone());
+            save
+        };
+        let allow = answer(CredentialAnswer::Allowed);
+        let second = save_and_settle_with(
+            &db,
+            &state,
+            &vault,
+            &rotation,
+            &questions,
+            &generations,
+            again(),
+            &allow,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 1, "not asked again within 30 seconds");
+        assert_eq!(second.view["confirmed"], false);
+        assert_eq!(
+            second.view["warning"].as_str(),
+            Some(
+                "The server was saved but stays switched off, because sending a credential to \
+                 mcp.example.com was declined a moment ago. Wait 30 seconds, then save it again."
+            )
+        );
+        assert!(!db.get_mcp_server(&id).unwrap().unwrap().confirmed);
+        clock.advance(crate::commands::CREDENTIAL_DECLINE_BACKOFF);
+        let third = save_and_settle_with(
+            &db,
+            &state,
+            &vault,
+            &rotation,
+            &questions,
+            &generations,
+            again(),
+            &allow,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 2, "asked again after 30 seconds");
+        assert_eq!(third.view["confirmed"], true);
+        assert!(db.get_mcp_server(&id).unwrap().unwrap().confirmed);
+    }
+
+    /// Keyed by the host, the 30 seconds after a "no" let a renderer ask at
+    /// once about the next made-up host (a1.x, a2.x, ...) - an MCP address
+    /// needs no DNS - so the back-off never engaged. After a "no", no
+    /// credential question is asked for 30 seconds, whatever the server or
+    /// the address, and the answer names the host declined. A "no" to another
+    /// kind of question holds nothing back here.
+    #[test]
+    fn fw_u2_a_declined_credential_holds_back_every_mcp_question() {
+        use crate::commands::QuestionKind;
+        let db = temp_db();
+        let vault = unlocked_vault();
+        let state = McpState::new();
+        let rotation = VaultRotationLock::new();
+        let clock = crate::commands::TestClock::new();
+        let questions = clock.questions();
+        let generations = crate::commands::VaultGeneration::new();
+        let asked = std::cell::Cell::new(0);
+        let counter = &asked;
+        let answer = |reply: CredentialAnswer| {
+            move |_: &CredentialPrompt| {
+                counter.set(counter.get() + 1);
+                reply
+            }
+        };
+        questions.record_decline(QuestionKind::AssistantKeyMove, "llm.example.com");
+        questions.record_decline(QuestionKind::BitwardenDestination, "vault.example.com");
+        let declined = answer(CredentialAnswer::NotAllowed);
+        let first = save_and_settle_with(
+            &db,
+            &state,
+            &vault,
+            &rotation,
+            &questions,
+            &generations,
+            env_var_save(),
+            &declined,
+        )
+        .unwrap();
+        assert_eq!(
+            asked.get(),
+            1,
+            "asked, though the other kinds were declined"
+        );
+        let id = saved_id(first.view);
+        // The same server at another address, or a new server (a name of its
+        // own) at a made-up one.
+        let at = |id: Option<&str>, name: &str, url: &str| {
+            let mut save = env_var_save();
+            save.id = id.map(String::from);
+            save.name = name.into();
+            save.url = url.into();
+            save
+        };
+        let held_back = "The server was saved but stays switched off, because sending a \
+             credential to mcp.example.com was declined a moment ago. Wait 30 seconds, then \
+             save it again.";
+        let allow = answer(CredentialAnswer::Allowed);
+        for (server, name, url) in [
+            (Some(id.as_str()), "aws", "https://mcp.example.com/mcp2"),
+            (Some(id.as_str()), "aws", "https://other.example.net/mcp"),
+            (None, "a1", "https://a1.attacker.example/mcp"),
+            (None, "a2", "https://a2.attacker.example/mcp"),
+        ] {
+            let saved = save_and_settle_with(
+                &db,
+                &state,
+                &vault,
+                &rotation,
+                &questions,
+                &generations,
+                at(server, name, url),
+                &allow,
+            )
+            .unwrap();
+            assert_eq!(asked.get(), 1, "{url}: held back");
+            assert_eq!(saved.view["confirmed"], false, "{url}");
+            assert_eq!(saved.view["warning"].as_str(), Some(held_back), "{url}");
+        }
+        // 30 seconds after the "no": asked again, whatever the address.
+        clock.advance(crate::commands::CREDENTIAL_DECLINE_BACKOFF);
+        let later = save_and_settle_with(
+            &db,
+            &state,
+            &vault,
+            &rotation,
+            &questions,
+            &generations,
+            at(None, "a3", "https://a3.attacker.example/mcp"),
+            &allow,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 2, "asked again after 30 seconds");
+        assert_eq!(later.view["confirmed"], true);
+    }
+
     /// An "Allow" within a second of the question opening counts as "Don't
     /// allow", and the warning says why.
     #[test]
@@ -9111,10 +9293,15 @@ mod tests {
     /// The other side of [`set_up_for_call`]: a set-up that fails for any
     /// other reason - the server answers the initialize with HTTP 500, or
     /// nothing listens at its address - stays a failure. A first set-up
-    /// returns the error (it is not a refusal, so no "denied" row is
-    /// written); a renewal after a 404 is a call that went out and failed,
-    /// audited as failed. (Turning every failed set-up into a refusal passed
-    /// every test before this one.)
+    /// returns the error; a renewal after a 404 is a call that went out and
+    /// failed, audited as failed. (Turning every failed set-up into a refusal
+    /// passed every test before this one.)
+    ///
+    /// What pins "no 'denied' row" here is the result type each case is
+    /// matched against: of the results of `run_tool_call`, the command
+    /// (`mcp_call_tool`) writes that row for `Refused` only, and nothing at
+    /// this level writes one - an assertion on the audit rows could not fail
+    /// here.
     #[tokio::test(flavor = "multi_thread")]
     async fn rw_fix6_a_set_up_that_fails_for_another_reason_stays_a_failure() {
         let unchecked = || -> CmdResult<()> { Ok(()) };
@@ -9132,11 +9319,11 @@ mod tests {
         let regate = || regate_call(&db, &record, "t", "execute", true);
         let scope = test_scope(&state, &db, &pw, &unchecked);
         match bounded("the call", run_tool_call(&scope, &mut ctx, &body, &regate)).await {
+            // An error, not a refusal.
             Err(e) => assert!(e.0.contains("HTTP 500"), "{}", e.0),
             other => panic!("a failed first set-up is an error: {other:?}"),
         }
         assert!(state.get_session("s1").is_none());
-        assert!(tool_call_rows(&db).is_empty(), "no refusal was audited");
         // A renewal after a 404, answered HTTP 500: the call went out.
         let db = temp_db();
         let server = scripted_mcp_with(Script {
@@ -9171,7 +9358,6 @@ mod tests {
             rows.iter().any(|d| d.contains("result=failed")),
             "audited as failed: {rows:?}"
         );
-        assert!(!rows.iter().any(|d| d.contains("denied")), "{rows:?}");
         // Nothing listens at the address.
         let db = temp_db();
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

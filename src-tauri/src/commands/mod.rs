@@ -144,6 +144,26 @@ pub fn require_generation_current(app: &AppHandle, captured: u64) -> CmdResult<(
     Ok(())
 }
 
+/// The vault as a save - or a question - found it: unlocked, at
+/// `generation`. The answer to a native question counts only while the
+/// vault is still that: an "Allow" given after a lock (the question can stay
+/// open for as long as the user likes) counts for nothing. Shared by the MCP
+/// credential questions, the Bitwarden destination question and the
+/// assistant's key-move question.
+pub(crate) struct VaultAtSave<'a> {
+    pub(crate) vault: &'a VaultPasswordStore,
+    pub(crate) generations: &'a VaultGeneration,
+    pub(crate) generation: u64,
+}
+
+impl VaultAtSave<'_> {
+    /// The vault is unlocked, and was not locked since the save.
+    pub(crate) fn unchanged(&self) -> bool {
+        self.generations
+            .is_current(self.generation, self.vault.is_set())
+    }
+}
+
 /// In-memory vault password (set on unlock, cleared on lock).
 /// Wrapped in `Zeroizing` so the password is wiped from memory when the
 /// store replaces or drops it, not just left as freed heap bytes.
@@ -929,8 +949,9 @@ pub(crate) static POOL_CRYPTO_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// In tests: fail when an Argon2id derivation is about to run anywhere but on
-/// the blocking pool. A no-op otherwise.
-fn on_pool_only(what: &str) {
+/// the blocking pool. A no-op otherwise. (The Bitwarden master-key
+/// derivation checks itself with it too.)
+pub(crate) fn on_pool_only(what: &str) {
     #[cfg(test)]
     {
         POOL_CRYPTO_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1025,11 +1046,13 @@ pub(crate) const CREDENTIAL_MIN_ANSWER_DELAY: std::time::Duration =
     std::time::Duration::from_secs(1);
 
 /// A credential question's buttons, in the order the dialog shows them:
-/// "Don't allow" first - the default button that Enter (Windows, macOS) and
-/// a stray keypress hit - then "Allow", then "Cancel", which Esc and closing
-/// the dialog also answer. (With OK/Cancel the first button, "Allow", was the
-/// default: a renderer that opened the question while the user typed got an
-/// "Allow" from the next Enter.)
+/// "Don't allow" first - on Windows and macOS the default button, which a
+/// stray Enter answers; on Linux GTK sets no default button, so only a
+/// deliberate click on "Allow" can come early, and the one-second rule
+/// ([`CREDENTIAL_MIN_ANSWER_DELAY`]) still applies - then "Allow", then
+/// "Cancel", which Esc and closing the dialog also answer. (With OK/Cancel
+/// the first button, "Allow", was the default: a renderer that opened the
+/// question while the user typed got an "Allow" from the next Enter.)
 pub(crate) fn credential_buttons() -> tauri_plugin_dialog::MessageDialogButtons {
     tauri_plugin_dialog::MessageDialogButtons::YesNoCancelCustom(
         CREDENTIAL_DONT_ALLOW.to_string(),
@@ -1085,10 +1108,12 @@ pub(crate) fn ask_native_confirmation(
         move |task| main_thread.run_on_main_thread(task).is_ok(),
         // Called on the main thread. On Windows and macOS the plugin then
         // creates the dialog at once (tauri runs a main-thread task
-        // immediately when it is already there). On Linux, rfd creates the
-        // GTK dialog from an idle callback, so a flooded main loop can still
-        // delay it after the clock has started - an accepted residual;
-        // "Don't allow" stays the Enter default.
+        // immediately when it is already there), and "Don't allow" is the
+        // default button, which a stray Enter answers. On Linux, rfd creates
+        // the GTK dialog from an idle callback, so a flooded main loop can
+        // still delay it after the clock has started - an accepted residual -
+        // and GTK sets no default button there: only a deliberate click on
+        // "Allow" can come early, and the one-second rule still applies to it.
         move |answered| dialog.show_with_result(answered),
     )
 }
@@ -1148,8 +1173,39 @@ fn timed_question_by(
 /// first question is open, and the question's turn lasts until its answer is
 /// written, so a later "Don't allow" can never be undone by an earlier
 /// "Allow".
-#[derive(Default)]
-pub struct CredentialQuestions(std::sync::Mutex<()>);
+///
+/// And after "Don't allow" or "Cancel", no question of the same kind
+/// ([`QuestionKind`]) is asked for [`CREDENTIAL_DECLINE_BACKOFF`], whatever
+/// host it names ([`Self::declined_lately`]): a renderer that asks again and
+/// again - about one host, or about a made-up one each time - until a tired
+/// user gives in, gets a refusal in the meantime instead of a dialog.
+pub struct CredentialQuestions {
+    turn: std::sync::Mutex<()>,
+    /// The latest question of each kind answered "no": the host it named,
+    /// and when.
+    declined:
+        std::sync::Mutex<std::collections::HashMap<QuestionKind, (String, std::time::Instant)>>,
+    /// The clock: `Instant::now`; a test moves its own.
+    now: Box<dyn Fn() -> std::time::Instant + Send + Sync>,
+}
+
+/// The kinds of credential question. A "Don't allow" or "Cancel" holds back
+/// the questions of its own kind only
+/// ([`CredentialQuestions::declined_lately`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum QuestionKind {
+    /// Sending an MCP server's credential to its address.
+    McpCredential,
+    /// Sending the assistant's stored API key to a new address.
+    AssistantKeyMove,
+    /// Uploading keys and passwords to a Bitwarden server and account.
+    BitwardenDestination,
+}
+
+/// How long a credential question answered "Don't allow" or "Cancel" is not
+/// asked again ([`CredentialQuestions::declined_lately`]).
+pub(crate) const CREDENTIAL_DECLINE_BACKOFF: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// The turn of one credential question ([`CredentialQuestions::begin`]): no
 /// other question is asked while it is held.
@@ -1157,16 +1213,31 @@ pub(crate) struct QuestionTurn<'a> {
     _held: std::sync::MutexGuard<'a, ()>,
 }
 
+impl Default for CredentialQuestions {
+    fn default() -> Self {
+        Self::with_clock(std::time::Instant::now)
+    }
+}
+
 impl CredentialQuestions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// With the clock `now` (a test moves its own).
+    pub(crate) fn with_clock(now: impl Fn() -> std::time::Instant + Send + Sync + 'static) -> Self {
+        Self {
+            turn: std::sync::Mutex::new(()),
+            declined: std::sync::Mutex::new(std::collections::HashMap::new()),
+            now: Box::new(now),
+        }
     }
 
     /// The turn to ask a question, or `None` while another one is open.
     /// Never waits: a second question is refused, not stacked behind the
     /// first.
     pub(crate) fn begin(&self) -> Option<QuestionTurn<'_>> {
-        match self.0.try_lock() {
+        match self.turn.try_lock() {
             Ok(held) => Some(QuestionTurn { _held: held }),
             // A turn that ended in a panic still ended.
             Err(std::sync::TryLockError::Poisoned(held)) => Some(QuestionTurn {
@@ -1174,6 +1245,58 @@ impl CredentialQuestions {
             }),
             Err(std::sync::TryLockError::WouldBlock) => None,
         }
+    }
+
+    /// The host the latest question of `kind` named, when it was answered
+    /// "Don't allow" or "Cancel" less than [`CREDENTIAL_DECLINE_BACKOFF`] ago
+    /// ([`Self::record_decline`]): then no question of that kind is asked
+    /// yet, whatever host it names - one made up per question would
+    /// otherwise get a fresh dialog each time. `None`: it may be asked.
+    pub(crate) fn declined_lately(&self, kind: QuestionKind) -> Option<String> {
+        let now = (self.now)();
+        self.declined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&kind)
+            .filter(|(_, at)| now.saturating_duration_since(*at) < CREDENTIAL_DECLINE_BACKOFF)
+            .map(|(host, _)| host.clone())
+    }
+
+    /// A question of `kind`, naming `host`, was answered "Don't allow" or
+    /// "Cancel" (Esc, the dialog closed) now. An "Allow" sooner than a
+    /// second does not count: it was no decision, and asking again at once
+    /// is fair. One entry per kind: the latest "no" is the one that counts.
+    pub(crate) fn record_decline(&self, kind: QuestionKind, host: &str) {
+        let at = (self.now)();
+        self.declined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(kind, (host.to_string(), at));
+    }
+}
+
+/// A clock a test moves by hand, and the questions that read it.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestClock(std::sync::Arc<std::sync::Mutex<std::time::Instant>>);
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            std::time::Instant::now(),
+        )))
+    }
+
+    pub(crate) fn advance(&self, by: std::time::Duration) {
+        let mut now = self.0.lock().unwrap();
+        *now += by;
+    }
+
+    /// Credential questions on this clock.
+    pub(crate) fn questions(&self) -> CredentialQuestions {
+        let clock = self.clone();
+        CredentialQuestions::with_clock(move || *clock.0.lock().unwrap())
     }
 }
 
@@ -3617,12 +3740,13 @@ const MAX_BACKUP_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub async fn vault_backup_export_to_file(app: AppHandle) -> CmdResult<serde_json::Value> {
     use tauri_plugin_dialog::DialogExt;
     let generation = capture_vault_generation(&app)?;
-    let picked = app
-        .dialog()
-        .file()
-        .set_title("Save vault backup")
-        .set_file_name(backup_file_name())
-        .blocking_save_file();
+    let picked = in_save_folder(
+        app.dialog()
+            .file()
+            .set_title("Save vault backup")
+            .set_file_name(save_dialog_file_name(Some(&backup_file_name()))),
+    )
+    .blocking_save_file();
     let Some(path) = picked else {
         return Ok(serde_json::json!({ "canceled": true }));
     };
@@ -3673,10 +3797,27 @@ fn export_backup_to_path(
     path: &str,
     still_current: &dyn Fn() -> CmdResult<()>,
 ) -> CmdResult<serde_json::Value> {
-    // The dialog choice is the user's approval; the absolute/app-data/system
-    // checks stay as a backstop (the app-data guard also keeps the vault DB
-    // from being overwritten).
-    validate_export_path(path)?;
+    export_backup_to_path_with(
+        db,
+        pw,
+        path,
+        &sftp::SensitiveLocations::current(),
+        still_current,
+    )
+}
+
+/// [`export_backup_to_path`] with the protected locations `sensitive`.
+fn export_backup_to_path_with(
+    db: &db::Database,
+    pw: &str,
+    path: &str,
+    sensitive: &sftp::SensitiveLocations,
+    still_current: &dyn Fn() -> CmdResult<()>,
+) -> CmdResult<serde_json::Value> {
+    // The dialog choice is the user's approval; the checks of every file
+    // SSHSpan makes stay as a backstop (the app-data guard also keeps the
+    // vault DB from being overwritten), checked before the backup is built.
+    check_own_export(path, sensitive)?;
     let backup = build_backup_document(db, pw)?;
     let text = serde_json::to_string_pretty(&backup.document).map_err(|e| e.to_string())?;
     still_current()?;
@@ -3985,7 +4126,8 @@ pub fn apply_restore(
 
 /// Native save-file dialog; returns the chosen path (or canceled). The chosen
 /// path is registered in the `DialogPathStore` so that `system_write_text_file`
-/// only ever writes where the user explicitly picked in a native dialog.
+/// only ever writes where the user explicitly picked in a native dialog. It
+/// opens in the Downloads folder, or in home ([`save_dialog_folder`]).
 #[tauri::command]
 /// NOTE: async on purpose. Tauri runs a synchronous command on the MAIN
 /// thread, and tauri-plugin-dialog's `blocking_*` helpers deadlock when
@@ -3999,12 +4141,13 @@ pub async fn system_pick_save_path(
     default_name: Option<String>,
 ) -> CmdResult<serde_json::Value> {
     use tauri_plugin_dialog::DialogExt;
-    let result = app
-        .dialog()
-        .file()
-        .set_title(title.unwrap_or_else(|| "Save file".into()))
-        .set_file_name(save_dialog_file_name(default_name.as_deref()))
-        .blocking_save_file();
+    let result = in_save_folder(
+        app.dialog()
+            .file()
+            .set_title(file_dialog_title(title.as_deref(), "Save file"))
+            .set_file_name(save_dialog_file_name(default_name.as_deref())),
+    )
+    .blocking_save_file();
     match result {
         Some(path) => {
             let path_str = path.to_string();
@@ -4012,6 +4155,53 @@ pub async fn system_pick_save_path(
             Ok(serde_json::json!({ "canceled": false, "path": path_str }))
         }
         None => Ok(serde_json::json!({ "canceled": true })),
+    }
+}
+
+/// `dialog` opening in [`save_dialog_folder`] (when there is one). Every
+/// save dialog of SSHSpan is built through this.
+fn in_save_folder<R: tauri::Runtime>(
+    dialog: tauri_plugin_dialog::FileDialogBuilder<R>,
+) -> tauri_plugin_dialog::FileDialogBuilder<R> {
+    match save_dialog_folder() {
+        Some(folder) => dialog.set_directory(folder),
+        None => dialog,
+    }
+}
+
+/// The folder a save dialog opens in: the Downloads folder, or the home
+/// folder when there is none. GTK opens a dialog that has no folder set in
+/// the working directory - usually home - so a suggested `.bashrc` (a
+/// hostile server's file name, or a compromised renderer's) was one Save and
+/// one "Replace?" away from the user's `~/.bashrc`.
+fn save_dialog_folder() -> Option<std::path::PathBuf> {
+    save_dialog_folder_from(dirs::download_dir(), dirs::home_dir())
+}
+
+/// [`save_dialog_folder`] for the Downloads folder `downloads` and the home
+/// folder `home`: the first that is an existing folder (a folder set in the
+/// dialog that does not exist leaves GTK in the working directory).
+fn save_dialog_folder_from(
+    downloads: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    downloads.into_iter().chain(home).find(|dir| dir.is_dir())
+}
+
+/// The longest title a file dialog shows ([`file_dialog_title`]).
+const MAX_DIALOG_TITLE_CHARS: usize = 120;
+
+/// The title a file dialog shows for `title` (the renderer's): cleaned of
+/// control, format and direction characters and capped ([`dialog_text`],
+/// [`MAX_DIALOG_TITLE_CHARS`]), else `fallback`. rfd's GTK dialog builds its
+/// title with `CString::new(title).unwrap()` inside a GLib callback that
+/// cannot unwind, so a NUL in a title aborted the app.
+pub(crate) fn file_dialog_title(title: Option<&str>, fallback: &str) -> String {
+    let title = dialog_text(title.unwrap_or_default(), MAX_DIALOG_TITLE_CHARS);
+    if title.is_empty() {
+        fallback.to_string()
+    } else {
+        title
     }
 }
 
@@ -4125,7 +4315,12 @@ impl DialogPathStore {
 /// Write UTF-8 text to an absolute path. The path must have been returned by
 /// `system_pick_save_path` in this session AND must pass the
 /// absolute/app-data/system checks - both gates, so the write target is
-/// always a human-approved dialog choice.
+/// always a human-approved dialog choice. Even then the renderer suggested
+/// the file's name and supplies its text, so the path gets the whole write
+/// deny-list, as a dialog-picked download does ([`write_text_export`]):
+/// never `~/.ssh`, SSHSpan's own folders and program, a startup folder, a
+/// shell startup file, settings that run commands, a folder on the PATH or
+/// the folder settings.
 ///
 /// The write goes through `write_secret_file` (0600 at create time, replace
 /// rather than truncate, fail-closed Windows ACL). Its callers are the
@@ -4149,15 +4344,28 @@ pub async fn system_write_text_file(
     if !app.state::<DialogPathStore>().consume(&path) {
         return Err("Write target must be a path chosen in a save dialog this session.".into());
     }
-    run_blocking(move || {
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        crate::ssh::write_secret_file(std::path::Path::new(&path), contents.as_bytes())
-            .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({ "ok": true }))
-    })
-    .await
+    run_blocking(move || write_text_export(&path, &contents, &sftp::SensitiveLocations::current()))
+        .await
+}
+
+/// [`system_write_text_file`] once the dialog grant for `path` is used up,
+/// without the `AppHandle` (on the blocking pool): refused where a path
+/// picked in the save dialog may never be written
+/// ([`sftp::export_target_refusal`] against `sensitive`), written otherwise.
+fn write_text_export(
+    path: &str,
+    contents: &str,
+    sensitive: &sftp::SensitiveLocations,
+) -> CmdResult<serde_json::Value> {
+    let target = std::path::Path::new(path);
+    if let Some(why) = sftp::export_target_refusal(target, sensitive) {
+        return Err(why.into());
+    }
+    if let Some(parent) = target.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    crate::ssh::write_secret_file(target, contents.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true }))
 }
 
 /// Component-wise, path-aware prefix test used by every local-target guard.
@@ -4688,6 +4896,19 @@ fn private_export_extension(format: &str) -> &'static str {
     }
 }
 
+/// The name the save dialog suggests for exporting the key `key_name` in
+/// `format`: the key's name with the format's extension, its last part only
+/// ([`save_dialog_file_name`]). A key may be named `/root/.ssh/config` or
+/// `C:\Users\me\.ssh\config`, and a whole path suggested as the name opened
+/// the dialog in that folder with `config` filled in - one Save and one
+/// "Replace?" from overwriting the ssh config, which this export may write.
+fn private_export_file_name(key_name: &str, format: &str) -> String {
+    save_dialog_file_name(Some(&format!(
+        "{key_name}{}",
+        private_export_extension(format)
+    )))
+}
+
 /// The passphrase a private-key export uses, after the format rules: only
 /// the private formats come through here, and "pkcs8-encrypted" - the format
 /// whose whole point is the passphrase - refuses to run without one (A2-03 /
@@ -4779,13 +5000,13 @@ pub async fn key_export_to_file(
     };
 
     use tauri_plugin_dialog::DialogExt;
-    let default_name = format!("{}{}", key.name, private_export_extension(&format));
-    let picked = app
-        .dialog()
-        .file()
-        .set_title("Export private key")
-        .set_file_name(&default_name)
-        .blocking_save_file();
+    let picked = in_save_folder(
+        app.dialog()
+            .file()
+            .set_title("Export private key")
+            .set_file_name(private_export_file_name(&key.name, &format)),
+    )
+    .blocking_save_file();
     let Some(path) = picked else {
         return Ok(serde_json::json!({ "canceled": true }));
     };
@@ -4793,17 +5014,14 @@ pub async fn key_export_to_file(
     // do not write private material decrypted under the now-locked vault.
     require_generation_current(&app, generation)?;
     let path_str = path.to_string();
-    // The dialog choice is the user's approval; keep the absolute/app-data/
-    // system checks as a backstop (a dialog path is always absolute, but the
-    // app-data guard also protects the vault DB from being overwritten).
-    validate_export_path(&path_str)?;
-
-    // One helper for every secret we write to disk (export + deploy), so the
-    // "mode() only applies at creation" trap cannot be reintroduced in one
-    // place and not the other. It replaces any existing file and create_new's
-    // it at 0600, and on Windows fails closed if the ACL cannot be tightened.
-    crate::ssh::write_secret_file(std::path::Path::new(&path_str), data.as_bytes())
-        .map_err(|e| CmdError(e.to_string()))?;
+    // The dialog choice is the user's approval - of a name SSHSpan suggested
+    // from the key's own, which may be `.bashrc` - so the export gets the
+    // checks of every file SSHSpan makes (`check_own_export`).
+    write_key_export(
+        &path_str,
+        data.as_bytes(),
+        &sftp::SensitiveLocations::current(),
+    )?;
 
     let _ = app.state::<AppState>().db.add_audit(
         "keys.exported",
@@ -4812,6 +5030,34 @@ pub async fn key_export_to_file(
     );
 
     Ok(serde_json::json!({ "ok": true, "canceled": false, "path": path_str }))
+}
+
+/// [`key_export_to_file`] after the dialog: the checks of a file SSHSpan
+/// makes ([`check_own_export`]), then the write. One helper for every secret
+/// written to disk (export and deploy), so the "mode() only applies at
+/// creation" trap cannot come back in one place: it replaces any existing
+/// file and creates it at 0600, and on Windows fails closed if the ACL cannot
+/// be tightened.
+fn write_key_export(
+    path: &str,
+    data: &[u8],
+    sensitive: &sftp::SensitiveLocations,
+) -> CmdResult<()> {
+    check_own_export(path, sensitive)?;
+    crate::ssh::write_secret_file(std::path::Path::new(path), data)
+        .map_err(|e| CmdError(e.to_string()))
+}
+
+/// The checks on a file SSHSpan itself writes to a path picked in the save
+/// dialog - a private-key export, a vault backup: absolute, not in SSHSpan's
+/// data or a system folder ([`validate_export_path`]), and nowhere on the
+/// write deny-list but `~/.ssh` ([`sftp::own_export_refusal`]).
+fn check_own_export(path: &str, sensitive: &sftp::SensitiveLocations) -> CmdResult<()> {
+    validate_export_path(path)?;
+    match sftp::own_export_refusal(std::path::Path::new(path), sensitive) {
+        Some(why) => Err(why.into()),
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]
@@ -5446,9 +5692,11 @@ pub async fn category_set_order(
 /// `parent_id` names the list the renderer shows, and every category in it
 /// must be in that list: a category of `parent_id` (and of one scope).
 /// The top level (`None`) is where the tree shows a category whose saved
-/// parent no longer exists or whose chain of parents never reaches the top
-/// (a member of a parent loop, or a category below one): those count as
-/// top-level here too. Refused - nothing written - for a category that does
+/// parent no longer exists or is in the other scope (the tree looks a parent
+/// up only within the category's own scope), or whose chain of parents never
+/// reaches the top (a member of a parent loop, or a category below one):
+/// those count as top-level here too, and not as children of a parent in
+/// the other scope. Refused - nothing written - for a category that does
 /// not exist, one named twice, a list mixing parents or scopes, or one that
 /// leaves out a category of its list (the renderer sends the whole list as
 /// shown; one left out kept a position another now had). Lock- and
@@ -5476,15 +5724,21 @@ fn category_set_order_in(
                 .ok_or_else(|| CmdError("That category no longer exists.".into()))?;
             listed.push(*category);
         }
-        let shown_at_top = |c: &db::Category| match c.parent_id.as_deref() {
-            None => true,
-            Some(parent) => {
-                !by_id.contains_key(parent)
-                    || matches!(db::category_chain(all, &c.id), db::CategoryChain::NoRoot(_))
-            }
+        // The parent the tree shows a category under: the tree looks it up
+        // only among the categories of the category's own scope, so a parent
+        // in the other scope counts as missing (restored data can hold one).
+        let shown_parent = |c: &db::Category| {
+            c.parent_id
+                .as_deref()
+                .and_then(|parent| by_id.get(parent))
+                .filter(|parent| parent.scope == c.scope)
+        };
+        let shown_at_top = |c: &db::Category| {
+            shown_parent(c).is_none()
+                || matches!(db::category_chain(all, &c.id), db::CategoryChain::NoRoot(_))
         };
         let in_list = |c: &db::Category| match parent_id.as_deref() {
-            Some(parent) => c.parent_id.as_deref() == Some(parent),
+            Some(parent) => shown_parent(c).is_some_and(|p| p.id == parent),
             None => shown_at_top(c),
         };
         let one_scope = listed.windows(2).all(|pair| pair[0].scope == pair[1].scope);
@@ -5977,6 +6231,13 @@ pub fn bitwarden_get_config(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// and sealing the Bitwarden password runs Argon2id; as a synchronous command
 /// both ran on the main thread and froze the window. They run on the
 /// blocking pool now.
+///
+/// A save that points the sync at a server or account other than the one
+/// the user allowed is stored, and then asked about in a native dialog on
+/// the blocking pool ([`confirm_after_save`]): until "Allow", a sync refuses
+/// to run - it would upload every private key and saved server password to
+/// whatever destination a renderer named. The answer says whether the
+/// destination is `confirmed` and, when it is not, why (`warning`).
 #[tauri::command]
 pub async fn bitwarden_save_config(
     app: AppHandle,
@@ -5992,15 +6253,17 @@ pub async fn bitwarden_save_config(
     if vault_password(&app)?.is_empty() {
         return Err("Vault is locked.".into());
     }
+    // The vault as the save finds it: an "Allow" given after a lock counts
+    // for nothing.
+    let generation = capture_vault_generation(&app)?;
     // Seals the Bitwarden password with the master password: not while that
     // is being changed.
-    let _rotation = rotation_shared(&app)?;
+    let rotation = rotation_shared(&app)?;
     let pw = vault_password(&app)?;
 
-    let email = email.trim().to_string();
-    if !email.contains('@') {
-        return Err("Enter the account email of your vault.".into());
-    }
+    // One email address: the account is named in the question and in the
+    // sync's refusal (the transaction that writes checks it again).
+    let email = crate::bitwarden::bitwarden_account(&email).map_err(CmdError)?;
 
     let db = app.state::<AppState>().db.clone();
     let folder_name = folder_name.unwrap_or_else(|| "SSHSpan_Keys".to_string());
@@ -6029,7 +6292,110 @@ pub async fn bitwarden_save_config(
             servers_folder_name,
         })
     });
-    save_bitwarden_config_in(&db, async move { prepare.await.map_err(|e| e.0) }).await
+    let view = save_bitwarden_config_in(&db, async move { prepare.await.map_err(|e| e.0) }).await?;
+    // The question can stay open for as long as the user likes: not with the
+    // rotation lock held.
+    drop(rotation);
+    let worker = app.clone();
+    run_blocking(move || {
+        let at_save = VaultAtSave {
+            vault: worker.state::<VaultPasswordStore>().inner(),
+            generations: worker.state::<VaultGeneration>().inner(),
+            generation,
+        };
+        Ok(confirm_after_save(
+            &worker.state::<AppState>().db,
+            worker.state::<VaultRotationLock>().inner(),
+            worker.state::<CredentialQuestions>().inner(),
+            &at_save,
+            view,
+            &|prompt| ask_native_confirmation(&worker, prompt),
+        ))
+    })
+    .await
+}
+
+/// After a sync-settings save (`view` is its `{ok, warning}`): whether the
+/// stored destination is the allowed one and, when it is not, the question
+/// about it ([`crate::bitwarden::settle_destination`]), asked by `ask` - the
+/// native dialog in the app, on the blocking pool. The answer gains
+/// `confirmed`, and the reason it is not after any warning the save had.
+fn confirm_after_save(
+    db: &db::Database,
+    rotation: &VaultRotationLock,
+    questions: &CredentialQuestions,
+    at_save: &VaultAtSave<'_>,
+    mut view: serde_json::Value,
+    ask: ConfirmCredential<'_>,
+) -> serde_json::Value {
+    use crate::bitwarden::DestinationOutcome;
+    let outcome = match db.load_bitwarden_config() {
+        Ok(config) if config.confirmed() => DestinationOutcome {
+            confirmed: true,
+            warning: None,
+        },
+        Ok(config) => match crate::bitwarden::pending_destination(&config) {
+            Some(pending) => {
+                crate::bitwarden::settle_destination(db, rotation, questions, at_save, pending, ask)
+            }
+            None => DestinationOutcome {
+                confirmed: false,
+                warning: Some(crate::bitwarden::DESTINATION_NOT_STORED.into()),
+            },
+        },
+        Err(e) => {
+            log::warn!("[sshspan-sync] the saved sync settings could not be read back: {e}");
+            DestinationOutcome {
+                confirmed: false,
+                warning: Some(crate::bitwarden::DESTINATION_NOT_STORED.into()),
+            }
+        }
+    };
+    apply_destination_outcome(&mut view, outcome);
+    view
+}
+
+/// `view` with the outcome of a destination question: `confirmed`, and its
+/// warning after any the view already had.
+fn apply_destination_outcome(
+    view: &mut serde_json::Value,
+    outcome: crate::bitwarden::DestinationOutcome,
+) {
+    view["confirmed"] = serde_json::json!(outcome.confirmed);
+    if let Some(note) = outcome.warning {
+        let joined = match view["warning"].as_str() {
+            Some(earlier) => format!("{earlier} {note}"),
+            None => note,
+        };
+        view["warning"] = serde_json::json!(joined);
+    }
+}
+
+/// What "Allow syncing..." answers when no destination is stored.
+const NO_SYNC_SETTINGS: &str = "Save the Bitwarden sync settings first.";
+
+/// [`bitwarden_allow_sync`] without the `AppHandle`: the question again for
+/// the stored destination, asked by `ask`.
+fn allow_sync_in(
+    db: &db::Database,
+    rotation: &VaultRotationLock,
+    questions: &CredentialQuestions,
+    at_save: &VaultAtSave<'_>,
+    ask: ConfirmCredential<'_>,
+) -> CmdResult<serde_json::Value> {
+    if !at_save.unchanged() {
+        return Err("Vault is locked.".into());
+    }
+    let config = db.load_bitwarden_config().map_err(|e| e.to_string())?;
+    let pending = crate::bitwarden::pending_destination(&config)
+        .ok_or_else(|| CmdError(NO_SYNC_SETTINGS.into()))?;
+    let outcome =
+        crate::bitwarden::settle_destination(db, rotation, questions, at_save, pending, ask);
+    Ok(serde_json::json!({
+        "ok": true,
+        "confirmed": outcome.confirmed,
+        "warning": outcome.warning,
+    }))
 }
 
 /// The write and the audit row of [`bitwarden_save_config`], without the
@@ -6146,6 +6512,19 @@ pub async fn bitwarden_test_connection(
     }))
 }
 
+/// The sync settings for a run of [`bitwarden_sync`] - refused while the
+/// stored server and account are not the destination the user allowed
+/// ([`crate::bitwarden::sync_refusal`]), before anything is unsealed or sent,
+/// not even a login: a sync uploads every private key and saved server
+/// password.
+fn settings_for_sync(db: &db::Database) -> CmdResult<db::BitwardenConfig> {
+    let config = db.load_bitwarden_config().map_err(|e| e.to_string())?;
+    if let Some(refusal) = crate::bitwarden::sync_refusal(&config) {
+        return Err(CmdError(refusal));
+    }
+    Ok(config)
+}
+
 /// Run a two-way sync with the saved settings. Every run is audited (A8-04):
 /// `sync.run` with the counts and one `sync.error` per failed item (capped),
 /// or one `sync.error` when the sync fails before comparing anything (login,
@@ -6160,6 +6539,9 @@ pub async fn bitwarden_test_connection(
 /// issued for, and otherwise nothing is applied and the new list comes back
 /// with `approvalStale: true`. `allowRemoteOverwrite` alone applies
 /// nothing.
+///
+/// Refused, before anything is sent, while the stored server and account
+/// are not the destination the user allowed ([`settings_for_sync`]).
 #[tauri::command]
 pub async fn bitwarden_sync(
     app: AppHandle,
@@ -6171,11 +6553,7 @@ pub async fn bitwarden_sync(
     // round trips, and rewrites key/server rows - a master-password change
     // must neither start in the middle nor be running when it starts.
     let _rotation = rotation_shared(&app)?;
-    let config = app
-        .state::<AppState>()
-        .db
-        .load_bitwarden_config()
-        .map_err(|e| e.to_string())?;
+    let config = settings_for_sync(&app.state::<AppState>().db)?;
     let server_url = config
         .server_url
         .ok_or_else(|| "No server URL configured.".to_string())?;
@@ -6273,6 +6651,33 @@ pub async fn bitwarden_sync(
     }
 
     Ok(result)
+}
+
+/// Ask again whether the stored Bitwarden destination may receive uploads
+/// (the "Allow syncing..." button): the same native question as a save
+/// asks, on the blocking pool. `{ok, confirmed, warning}`. Refused while the
+/// vault is locked, and while no server URL or account email is stored.
+#[tauri::command]
+pub async fn bitwarden_allow_sync(app: AppHandle) -> CmdResult<serde_json::Value> {
+    // The vault as the question finds it: an "Allow" given after a lock
+    // counts for nothing.
+    let generation = capture_vault_generation(&app)?;
+    let worker = app.clone();
+    run_blocking(move || {
+        let at_save = VaultAtSave {
+            vault: worker.state::<VaultPasswordStore>().inner(),
+            generations: worker.state::<VaultGeneration>().inner(),
+            generation,
+        };
+        allow_sync_in(
+            &worker.state::<AppState>().db,
+            worker.state::<VaultRotationLock>().inner(),
+            worker.state::<CredentialQuestions>().inner(),
+            &at_save,
+            &|prompt| ask_native_confirmation(&worker, prompt),
+        )
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -6824,7 +7229,7 @@ pub async fn system_select_file(
     let result = app
         .dialog()
         .file()
-        .set_title(title.unwrap_or_else(|| "Select file".into()))
+        .set_title(file_dialog_title(title.as_deref(), "Select file"))
         .blocking_pick_file();
     match result {
         Some(path) => {
@@ -6860,7 +7265,7 @@ pub async fn system_pick_file_path(
     let picked = app
         .dialog()
         .file()
-        .set_title(title.unwrap_or_else(|| "Select file".into()))
+        .set_title(file_dialog_title(title.as_deref(), "Select file"))
         .blocking_pick_file();
     Ok(match picked {
         Some(path) => {
@@ -6892,7 +7297,7 @@ pub async fn system_pick_files(
     let dialog = app
         .dialog()
         .file()
-        .set_title(title.unwrap_or_else(|| "Select files".into()));
+        .set_title(file_dialog_title(title.as_deref(), "Select files"));
     let picked = if multiple {
         dialog.blocking_pick_files()
     } else {
@@ -7920,9 +8325,10 @@ mod rw_tests {
     // ── Credential questions: the default button, early answers, one at a
     //    time, and the text they show ─────────────────────────────────────
 
-    /// "Don't allow" is the first button - the default that Enter (Windows,
-    /// macOS) and a stray keypress hit - and "Allow" never is. A compromised
-    /// renderer can open the question while the user is typing.
+    /// "Don't allow" is the first button - on Windows and macOS the default,
+    /// which a stray Enter answers (on Linux GTK sets no default button) -
+    /// and "Allow" never is. A compromised renderer can open the question
+    /// while the user is typing.
     #[test]
     fn rw_fix1_the_credential_question_defaults_to_dont_allow() {
         use tauri_plugin_dialog::MessageDialogButtons;
@@ -8218,5 +8624,991 @@ mod rw_tests {
         .unwrap();
         assert_eq!(sort_and_parent(&db, "z"), (0, Some("p".to_string())));
         assert_eq!(sort_and_parent(&db, "y"), (2, Some("p".to_string())));
+    }
+
+    /// Restored data can hold a host category whose parent is a key
+    /// category. The tree looks a parent up only among the categories of
+    /// the row's own scope, so it shows that one at the top level - and every
+    /// top-level reorder of the host tree was refused ("Those categories do
+    /// not share a parent"), which reloading could not help. A parent in the
+    /// other scope now counts as missing here too.
+    #[test]
+    fn fw_r4_a_parent_in_the_other_scope_counts_as_missing() {
+        let db = test_db();
+        let vault = unlocked();
+        let rotation = VaultRotationLock::new();
+        for c in [
+            category("k1", None, "key"),
+            category("h1", None, "host"),
+            category("h2", Some("k1"), "host"),
+            category("h3", Some("h2"), "host"),
+        ] {
+            db.insert_category(&c).unwrap();
+        }
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        category_set_order_in(&db, &vault, &rotation, None, ids(&["h2", "h1"])).unwrap();
+        assert_eq!(sort_and_parent(&db, "h2"), (0, Some("k1".to_string())));
+        assert_eq!(sort_and_parent(&db, "h1"), (1, None));
+        // Below it, its own children are a list of their own.
+        category_set_order_in(&db, &vault, &rotation, Some("h2".into()), ids(&["h3"])).unwrap();
+        assert!(
+            category_set_order_in(&db, &vault, &rotation, None, ids(&["h2", "h1", "h3"]))
+                .unwrap_err()
+                .0
+                .contains("parent")
+        );
+        // Not under the key category: the host tree does not show it there.
+        assert!(
+            category_set_order_in(&db, &vault, &rotation, Some("k1".into()), ids(&["h2"]))
+                .unwrap_err()
+                .0
+                .contains("parent")
+        );
+        // The key tree's top level is still its own.
+        category_set_order_in(&db, &vault, &rotation, None, ids(&["k1"])).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fw_tests {
+    use super::*;
+    use crate::bitwarden::BitwardenSave;
+    use std::cell::Cell;
+
+    const MASTER: &str = "fw-master";
+
+    /// What a save or a question needs from the app: the vault (unlocked),
+    /// its generation, the rotation lock and the one-question-at-a-time turn
+    /// with its back-off, on a clock the test moves.
+    struct App {
+        store: VaultPasswordStore,
+        generations: VaultGeneration,
+        rotation: VaultRotationLock,
+        clock: TestClock,
+        questions: CredentialQuestions,
+    }
+
+    impl App {
+        fn new() -> Self {
+            let store = VaultPasswordStore::new();
+            store.set(MASTER.into());
+            let clock = TestClock::new();
+            Self {
+                store,
+                generations: VaultGeneration::new(),
+                rotation: VaultRotationLock::new(),
+                questions: clock.questions(),
+                clock,
+            }
+        }
+
+        /// The vault as a save that starts now finds it.
+        fn at_save(&self) -> VaultAtSave<'_> {
+            VaultAtSave {
+                vault: &self.store,
+                generations: &self.generations,
+                generation: self.generations.current(),
+            }
+        }
+    }
+
+    fn fw_db() -> db::Database {
+        db::Database::open_at(
+            std::env::temp_dir().join(format!("sshspan-fw-{}.db", uuid::Uuid::new_v4())),
+        )
+        .unwrap()
+    }
+
+    /// The sync settings `url` / `email`, with a newly sealed `password`
+    /// (none: keep the stored one).
+    fn bw_save(url: &str, email: &str, password: Option<&str>) -> BitwardenSave {
+        BitwardenSave {
+            server_url: url.into(),
+            email: email.into(),
+            sealed_password: password
+                .map(|p| crate::crypto::vault::seal(MASTER, p.as_bytes()).unwrap()),
+            folder_name: "SSHSpan_Keys".into(),
+            servers_folder_name: "SSHSpan_Servers".into(),
+        }
+    }
+
+    /// A save as `bitwarden_save_config` makes it, with `answer` to its
+    /// question (if it asks one; `asked` counts them).
+    fn save_answered(
+        db: &db::Database,
+        app: &App,
+        save: BitwardenSave,
+        answer: CredentialAnswer,
+        asked: &Cell<usize>,
+    ) -> serde_json::Value {
+        let at_save = app.at_save();
+        let view = tauri::async_runtime::block_on(save_bitwarden_config_in(db, async {
+            Ok::<_, String>(save)
+        }))
+        .unwrap();
+        confirm_after_save(
+            db,
+            &app.rotation,
+            &app.questions,
+            &at_save,
+            view,
+            &|_: &CredentialPrompt| {
+                asked.set(asked.get() + 1);
+                answer
+            },
+        )
+    }
+
+    fn not_allowed(host: &str) -> String {
+        format!(
+            "Bitwarden sync stays off, because uploading your keys and passwords to {host} was not allowed. Use \"Allow syncing...\" in Settings > Bitwarden to be asked again."
+        )
+    }
+
+    fn audit_details(db: &db::Database, action: &str) -> Vec<String> {
+        db.list_audit(100)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.action == action)
+            .map(|r| r.details)
+            .collect()
+    }
+
+    /// A save that points the sync at a destination other than the allowed
+    /// one - the first save, a changed URL, a changed email - is stored and
+    /// asked about, and stays unconfirmed until "Allow". The same destination
+    /// again (folders, a new password for it) asks nothing.
+    #[test]
+    fn fw_r1_a_first_save_a_changed_url_and_a_changed_email_come_back_unconfirmed() {
+        let db = fw_db();
+        let app = App::new();
+        let asked = Cell::new(0);
+        let url = "https://vault.example.com";
+        // The first save.
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", Some("pw-1")),
+            CredentialAnswer::NotAllowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 1, "the first save asks");
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(not_allowed("vault.example.com").as_str())
+        );
+        assert!(!db.load_bitwarden_config().unwrap().confirmed());
+        // Allowed after the second - asked once the "no" is 30 seconds old.
+        app.clock.advance(CREDENTIAL_DECLINE_BACKOFF);
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", None),
+            CredentialAnswer::Allowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 2, "still unconfirmed: asked again");
+        assert_eq!(out["confirmed"], true, "{out}");
+        assert!(out["warning"].is_null(), "{out}");
+        assert!(db.load_bitwarden_config().unwrap().confirmed());
+        // The allowed destination again (the account in other case and
+        // spaces): nothing is asked.
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, " ME@Example.com", Some("pw-2")),
+            CredentialAnswer::NotAllowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 2, "the allowed destination is not asked about");
+        assert_eq!(out["confirmed"], true, "{out}");
+        // A changed URL.
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(
+                "https://other.example.net:8443",
+                "me@example.com",
+                Some("pw-3"),
+            ),
+            CredentialAnswer::NotAllowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 3);
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(not_allowed("other.example.net:8443").as_str())
+        );
+        // A changed email on the server that was allowed - asked once the
+        // "no" to the changed URL is 30 seconds old.
+        app.clock.advance(CREDENTIAL_DECLINE_BACKOFF);
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "someone@example.com", Some("pw-4")),
+            CredentialAnswer::NotAllowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 4);
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(
+            crate::bitwarden::config_view(&db.load_bitwarden_config().unwrap())["confirmed"],
+            false
+        );
+    }
+
+    /// "Allow" counts only a second after the question opened, while the
+    /// vault stays unlocked in the generation of the save, while no
+    /// master-password change runs, and for the destination it was asked
+    /// about. One question at a time; a later "no" stands.
+    #[test]
+    fn fw_r1_allow_counts_only_after_a_second_unlocked_and_for_the_destination_asked() {
+        let db = fw_db();
+        let app = App::new();
+        let asked = Cell::new(0);
+        let url = "https://vault.example.com";
+        // Under a second.
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", Some("pw-1")),
+            CredentialAnswer::TooQuick,
+            &asked,
+        );
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(
+                "Bitwarden sync stays off, because the question about uploading to vault.example.com was answered within a second of opening - too fast to be a decision. Use \"Allow syncing...\" in Settings > Bitwarden to be asked again."
+            )
+        );
+        // After a lock (and an unlock) while the question was open.
+        let locked_meanwhile = |_: &CredentialPrompt| {
+            app.generations.bump();
+            CredentialAnswer::Allowed
+        };
+        let at_save = app.at_save();
+        let out = allow_sync_in(
+            &db,
+            &app.rotation,
+            &app.questions,
+            &at_save,
+            &locked_meanwhile,
+        )
+        .unwrap();
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(crate::bitwarden::DESTINATION_LOCKED_WHILE_ASKED)
+        );
+        // For a destination that changed while the question was open.
+        let moved_meanwhile = |_: &CredentialPrompt| {
+            db.update_bitwarden_config(|config| {
+                config.server_url = Some("https://elsewhere.example.org".into());
+                Ok(())
+            })
+            .unwrap();
+            CredentialAnswer::Allowed
+        };
+        let at_save = app.at_save();
+        let out = allow_sync_in(
+            &db,
+            &app.rotation,
+            &app.questions,
+            &at_save,
+            &moved_meanwhile,
+        )
+        .unwrap();
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(crate::bitwarden::DESTINATION_MOVED_WHILE_ASKED)
+        );
+        assert!(!db.load_bitwarden_config().unwrap().confirmed());
+        // While a master-password change runs.
+        {
+            let _change = app.rotation.hold_like_a_password_change();
+            let at_save = app.at_save();
+            let out = allow_sync_in(
+                &db,
+                &app.rotation,
+                &app.questions,
+                &at_save,
+                &|_: &CredentialPrompt| CredentialAnswer::Allowed,
+            )
+            .unwrap();
+            assert_eq!(
+                out["warning"].as_str(),
+                Some(crate::bitwarden::DESTINATION_REENCRYPTING)
+            );
+        }
+        // While another question is open: not asked at all.
+        {
+            let _other = app.questions.begin().unwrap();
+            let at_save = app.at_save();
+            let out = allow_sync_in(
+                &db,
+                &app.rotation,
+                &app.questions,
+                &at_save,
+                &|_: &CredentialPrompt| panic!("asked while another question was open"),
+            )
+            .unwrap();
+            assert_eq!(out["confirmed"], false, "{out}");
+            assert_eq!(
+                out["warning"].as_str(),
+                Some(crate::bitwarden::DESTINATION_QUESTION_OPEN)
+            );
+        }
+        // Allowed, then a later "no" to the same destination: it stands.
+        let at_save = app.at_save();
+        let out = allow_sync_in(
+            &db,
+            &app.rotation,
+            &app.questions,
+            &at_save,
+            &|_: &CredentialPrompt| CredentialAnswer::Allowed,
+        )
+        .unwrap();
+        assert_eq!(out["confirmed"], true, "{out}");
+        assert!(db.load_bitwarden_config().unwrap().confirmed());
+        let at_save = app.at_save();
+        let out = allow_sync_in(
+            &db,
+            &app.rotation,
+            &app.questions,
+            &at_save,
+            &|_: &CredentialPrompt| CredentialAnswer::NotAllowed,
+        )
+        .unwrap();
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert!(
+            !db.load_bitwarden_config().unwrap().confirmed(),
+            "the later no switched it off"
+        );
+    }
+
+    /// A compromised renderer could re-point the sync at its own server and
+    /// account (a new password comes with them), then sync - which uploaded
+    /// every key and server password, encrypted for that account, with no
+    /// question asked. Both steps are taken here, answered "Don't allow" and
+    /// too quickly: the sync refuses, before any network call, until the user
+    /// allows the destination.
+    #[test]
+    fn fw_r1_a_re_pointed_sync_refuses_before_any_network_call() {
+        let db = fw_db();
+        let app = App::new();
+        let asked = Cell::new(0);
+        save_answered(
+            &db,
+            &app,
+            bw_save("https://vault.example.com", "me@example.com", Some("pw-1")),
+            CredentialAnswer::Allowed,
+            &asked,
+        );
+        let allowed = settings_for_sync(&db).expect("the allowed destination syncs");
+        assert_eq!(
+            allowed.server_url.as_deref(),
+            Some("https://vault.example.com")
+        );
+        // Re-pointed; the question is not answered "Allow". (The clock moves
+        // past the 30 seconds after a "no", so the second is asked too.)
+        for answer in [CredentialAnswer::NotAllowed, CredentialAnswer::TooQuick] {
+            app.clock.advance(CREDENTIAL_DECLINE_BACKOFF);
+            save_answered(
+                &db,
+                &app,
+                bw_save(
+                    "https://attacker.example",
+                    "evil@attacker.example",
+                    Some("theirs"),
+                ),
+                answer,
+                &asked,
+            );
+            assert_eq!(
+                settings_for_sync(&db).unwrap_err().0,
+                "Bitwarden sync is off until you allow it to upload your keys and passwords to the account evil@attacker.example on attacker.example. Use \"Allow syncing...\" in Settings > Bitwarden.",
+                "{answer:?}"
+            );
+        }
+        // The command reads its settings that way before it unseals or sends
+        // anything.
+        let sync = {
+            let source = include_str!("mod.rs");
+            let start = source.find("pub async fn bitwarden_sync(").unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let at = |needle: &str| sync.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(
+            !sync.contains("load_bitwarden_config("),
+            "the settings are read only through settings_for_sync"
+        );
+        assert!(
+            at("settings_for_sync(") < at("unseal_off_thread(")
+                && at("settings_for_sync(") < at("run_sync("),
+            "the refusal comes first"
+        );
+    }
+
+    /// "Allow syncing...": the same question again for the stored destination.
+    #[test]
+    fn fw_r1_allow_syncing_asks_about_the_stored_destination() {
+        let db = fw_db();
+        let app = App::new();
+        let at_save = app.at_save();
+        let never = |_: &CredentialPrompt| -> CredentialAnswer { panic!("nothing to ask about") };
+        assert_eq!(
+            allow_sync_in(&db, &app.rotation, &app.questions, &at_save, &never)
+                .unwrap_err()
+                .0,
+            "Save the Bitwarden sync settings first."
+        );
+        tauri::async_runtime::block_on(save_bitwarden_config_in(&db, async {
+            Ok::<_, String>(bw_save(
+                "https://vault.example.com",
+                "me@example.com",
+                Some("pw-1"),
+            ))
+        }))
+        .unwrap();
+        let prompts = std::cell::RefCell::new(Vec::new());
+        let at_save = app.at_save();
+        let out = allow_sync_in(
+            &db,
+            &app.rotation,
+            &app.questions,
+            &at_save,
+            &|prompt: &CredentialPrompt| {
+                prompts
+                    .borrow_mut()
+                    .push((prompt.title.clone(), prompt.message.clone()));
+                CredentialAnswer::Allowed
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({ "ok": true, "confirmed": true, "warning": null })
+        );
+        let prompts = prompts.into_inner();
+        assert_eq!(
+            prompts,
+            vec![(
+                "SSHSpan - Sync with Bitwarden?".to_string(),
+                "SSHSpan will upload your SSH private keys and saved server passwords to this Bitwarden account when it syncs:\n\nAccount: me@example.com\nServer: vault.example.com\nAddress: https://vault.example.com\n\nAllow?".to_string()
+            )]
+        );
+        assert_eq!(
+            crate::bitwarden::config_view(&db.load_bitwarden_config().unwrap())["confirmed"],
+            true
+        );
+        // Locked: refused.
+        app.store.clear();
+        let at_save = app.at_save();
+        assert_eq!(
+            allow_sync_in(&db, &app.rotation, &app.questions, &at_save, &never)
+                .unwrap_err()
+                .0,
+            "Vault is locked."
+        );
+    }
+
+    /// Both answers are audited with the host - no account, password or
+    /// sealed value. A save whose own audit row failed says so first.
+    #[test]
+    fn fw_r1_the_answers_are_audited_without_a_value() {
+        let db = fw_db();
+        let app = App::new();
+        let asked = Cell::new(0);
+        let url = "https://vault.example.com";
+        save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", Some("the-bitwarden-password")),
+            CredentialAnswer::TooQuick,
+            &asked,
+        );
+        save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", None),
+            CredentialAnswer::Allowed,
+            &asked,
+        );
+        assert_eq!(
+            audit_details(&db, "sync.destination_declined"),
+            vec!["host=vault.example.com answered=too-quickly".to_string()]
+        );
+        assert_eq!(
+            audit_details(&db, "sync.destination_allowed"),
+            vec!["host=vault.example.com".to_string()]
+        );
+        let sealed = db.load_bitwarden_config().unwrap().master_password.unwrap();
+        for row in db.list_audit(100).unwrap() {
+            for secret in ["me@example.com", "the-bitwarden-password", sealed.as_str()] {
+                assert!(
+                    !row.details.contains(secret),
+                    "{}: {}",
+                    row.action,
+                    row.details
+                );
+            }
+        }
+        // A save whose audit row could not be written: that first, then why
+        // the sync stays off.
+        crate::assistant::test_support::refuse_audit_rows(&db);
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save("https://other.example.net", "me@example.com", Some("pw-2")),
+            CredentialAnswer::NotAllowed,
+            &asked,
+        );
+        let warning = out["warning"].as_str().unwrap_or_default();
+        assert!(
+            warning.starts_with(
+                "The sync settings were saved, but their audit row could not be written"
+            ) && warning.ends_with(&format!(" {}", not_allowed("other.example.net"))),
+            "{out}"
+        );
+        assert_eq!(out["confirmed"], false);
+    }
+
+    /// The transaction that writes the sync settings refuses an account that
+    /// is not one email address - the command checks it first, but the
+    /// write is what stores it - and stores nothing.
+    #[test]
+    fn fw_s1_a_save_of_more_than_one_email_address_stores_nothing() {
+        let db = fw_db();
+        let injected = "me@example.com) only to check the connection - nothing is uploaded \
+             until you press Sync now (ok";
+        let err = tauri::async_runtime::block_on(save_bitwarden_config_in(&db, async {
+            Ok::<_, String>(bw_save("https://vault.example.com", injected, Some("pw-1")))
+        }))
+        .unwrap_err();
+        assert_eq!(err.0, crate::bitwarden::ACCOUNT_NOT_ONE_EMAIL);
+        let stored = db.load_bitwarden_config().unwrap();
+        assert_eq!(
+            (stored.server_url, stored.email),
+            (None, None),
+            "nothing stored"
+        );
+    }
+
+    /// A renderer could ask again and again until a tired user gave in. A
+    /// destination answered "Don't allow" or "Cancel" is not asked about
+    /// again for 30 seconds, and neither is any other: a save stores the
+    /// settings unconfirmed and says why, "Allow syncing..." too - nothing is
+    /// asked. After 30 seconds the question is asked again. An "Allow" sooner
+    /// than a second was no decision, so it starts no wait.
+    #[test]
+    fn fw_s1_a_declined_destination_is_not_asked_again_for_30_seconds() {
+        let db = fw_db();
+        let app = App::new();
+        let asked = Cell::new(0);
+        let url = "https://vault.example.com";
+        let declined_lately = "Bitwarden sync stays off, because uploading to vault.example.com \
+             was declined a moment ago. Wait 30 seconds, then use \"Allow syncing...\" in \
+             Settings > Bitwarden.";
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", Some("pw-1")),
+            CredentialAnswer::NotAllowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(not_allowed("vault.example.com").as_str())
+        );
+        // Saved again at once, with "Allow" ready: not asked.
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", Some("pw-2")),
+            CredentialAnswer::Allowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 1, "not asked again");
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(out["warning"].as_str(), Some(declined_lately));
+        assert!(!db.load_bitwarden_config().unwrap().confirmed());
+        // "Allow syncing..." 29 seconds later: not asked either.
+        app.clock.advance(std::time::Duration::from_secs(29));
+        let ask = |_: &CredentialPrompt| {
+            asked.set(asked.get() + 1);
+            CredentialAnswer::Allowed
+        };
+        let at_save = app.at_save();
+        let out = allow_sync_in(&db, &app.rotation, &app.questions, &at_save, &ask).unwrap();
+        assert_eq!(asked.get(), 1, "not asked within 30 seconds");
+        assert_eq!(
+            out,
+            serde_json::json!({ "ok": true, "confirmed": false, "warning": declined_lately })
+        );
+        // Another destination, 29 seconds after the "no": not asked either.
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "other@example.com", Some("pw-3")),
+            CredentialAnswer::TooQuick,
+            &asked,
+        );
+        assert_eq!(asked.get(), 1, "another destination within 30 seconds");
+        assert_eq!(out["confirmed"], false, "{out}");
+        assert_eq!(out["warning"].as_str(), Some(declined_lately));
+        // 30 seconds after the "no": asked again.
+        app.clock.advance(std::time::Duration::from_secs(1));
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "other@example.com", Some("pw-4")),
+            CredentialAnswer::TooQuick,
+            &asked,
+        );
+        assert_eq!(asked.get(), 2, "asked again after 30 seconds");
+        assert_eq!(out["confirmed"], false, "{out}");
+        // An "Allow" too soon starts no wait: asked again at once.
+        let at_save = app.at_save();
+        let out = allow_sync_in(&db, &app.rotation, &app.questions, &at_save, &ask).unwrap();
+        assert_eq!(asked.get(), 3, "a quick Allow was no decision");
+        assert_eq!(out["confirmed"], true, "{out}");
+        // Back to the destination declined first: asked, and allowed.
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save(url, "me@example.com", Some("pw-5")),
+            CredentialAnswer::Allowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 4, "the first destination, asked again");
+        assert_eq!(out["confirmed"], true, "{out}");
+    }
+
+    /// After "Don't allow" or "Cancel", no question of the same kind is asked
+    /// for 30 seconds, whatever host it names. Keyed by the host, a
+    /// compromised renderer raised one fresh question per made-up host (a1.x,
+    /// a2.x, ...) - an MCP address needs no DNS - and the back-off never
+    /// engaged. The three kinds are held back apart, each for 30 seconds from
+    /// its own "no", and the back-off keeps the host declined, for the answer
+    /// to name.
+    #[test]
+    fn fw_u2_a_no_holds_back_its_kind_whatever_the_host() {
+        use std::time::Duration;
+        let clock = TestClock::new();
+        let questions = clock.questions();
+        let lately = |kind: QuestionKind| questions.declined_lately(kind);
+        let (mcp, assistant, bitwarden) = (
+            QuestionKind::McpCredential,
+            QuestionKind::AssistantKeyMove,
+            QuestionKind::BitwardenDestination,
+        );
+        for kind in [mcp, assistant, bitwarden] {
+            assert_eq!(lately(kind), None, "{kind:?}: nothing declined yet");
+        }
+        questions.record_decline(mcp, "a1.attacker.example");
+        assert_eq!(lately(mcp).as_deref(), Some("a1.attacker.example"));
+        assert_eq!(lately(assistant), None, "another kind");
+        assert_eq!(lately(bitwarden), None, "another kind");
+        clock.advance(Duration::from_secs(10));
+        questions.record_decline(bitwarden, "vault.example.com");
+        // 29 seconds after the MCP "no", 19 after the Bitwarden one.
+        clock.advance(Duration::from_secs(19));
+        assert_eq!(lately(mcp).as_deref(), Some("a1.attacker.example"));
+        assert_eq!(lately(bitwarden).as_deref(), Some("vault.example.com"));
+        assert_eq!(lately(assistant), None);
+        // 30 seconds after the MCP "no": asked again; Bitwarden waits on.
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(lately(mcp), None, "30 seconds on");
+        assert_eq!(lately(bitwarden).as_deref(), Some("vault.example.com"));
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(lately(bitwarden), None, "30 seconds on");
+        // A new "no" of a kind is the one it keeps.
+        questions.record_decline(mcp, "a2.attacker.example");
+        assert_eq!(lately(mcp).as_deref(), Some("a2.attacker.example"));
+        assert_eq!((lately(assistant), lately(bitwarden)), (None, None));
+    }
+
+    /// Keyed by the server and the account, the 30 seconds after a "no" let a
+    /// renderer ask at once about another account, or another server - one
+    /// made up per question. After a "no", no destination is asked about for
+    /// 30 seconds - another path, account or server - and the answer names
+    /// the one declined. A "no" to another kind of question holds nothing
+    /// back here.
+    #[test]
+    fn fw_u2_a_declined_destination_holds_back_every_destination() {
+        let db = fw_db();
+        let app = App::new();
+        let asked = Cell::new(0);
+        app.questions
+            .record_decline(QuestionKind::McpCredential, "mcp.example.com");
+        app.questions
+            .record_decline(QuestionKind::AssistantKeyMove, "llm.example.com");
+        save_answered(
+            &db,
+            &app,
+            bw_save("https://vault.example.com", "me@example.com", Some("pw-1")),
+            CredentialAnswer::NotAllowed,
+            &asked,
+        );
+        assert_eq!(
+            asked.get(),
+            1,
+            "asked, though the other kinds were declined"
+        );
+        let held_back = "Bitwarden sync stays off, because uploading to vault.example.com \
+             was declined a moment ago. Wait 30 seconds, then use \"Allow syncing...\" in \
+             Settings > Bitwarden.";
+        for (url, email) in [
+            ("https://vault.example.com/x", "me@example.com"),
+            ("https://vault.example.com:443/v2", " ME@Example.com"),
+            ("https://vault.example.com/x", "other@example.com"),
+            ("https://vault.example.org", "me@example.com"),
+            ("https://a1.attacker.example", "evil@attacker.example"),
+            ("https://a2.attacker.example", "evil@attacker.example"),
+        ] {
+            let out = save_answered(
+                &db,
+                &app,
+                bw_save(url, email, Some("pw-2")),
+                CredentialAnswer::Allowed,
+                &asked,
+            );
+            assert_eq!(asked.get(), 1, "{url} {email:?}: held back");
+            assert_eq!(out["confirmed"], false, "{out}");
+            assert_eq!(out["warning"].as_str(), Some(held_back), "{url} {email:?}");
+        }
+        // 30 seconds after the "no": asked again, whatever the destination.
+        app.clock.advance(CREDENTIAL_DECLINE_BACKOFF);
+        let out = save_answered(
+            &db,
+            &app,
+            bw_save("https://vault.example.org", "me@example.com", Some("pw-3")),
+            CredentialAnswer::Allowed,
+            &asked,
+        );
+        assert_eq!(asked.get(), 2, "asked again after 30 seconds");
+        assert_eq!(out["confirmed"], true, "{out}");
+    }
+
+    /// A key's name is its owner's to choose, and `validate_key_name` lets a
+    /// path through: `/root/.ssh/config`, `../../.ssh/config`,
+    /// `C:\Users\u\.ssh\config`. Suggested as it was, a whole path opened the
+    /// export dialog in that folder with `config` filled in - and this export
+    /// may write into `~/.ssh` - so one Save and one "Replace?" overwrote the
+    /// ssh config. The suggestion is the name's last part only, in every
+    /// format; an ordinary name stays as it is.
+    #[test]
+    fn fw_u1_a_key_name_suggests_only_a_bare_file_name() {
+        let formats = [
+            ("openssh-private", ""),
+            ("pkcs8", ".pem"),
+            ("pkcs8-encrypted", ".pem"),
+            ("ppk", ".ppk"),
+        ];
+        for name in [
+            "/root/.ssh/config",
+            "../../.ssh/config",
+            r"C:\Users\u\.ssh\config",
+            r"..\..\.ssh\config",
+            r"\\server\share\.ssh\config",
+            "~/.ssh/config",
+            "C:config",
+        ] {
+            for (format, extension) in formats {
+                assert_eq!(
+                    private_export_file_name(name, format),
+                    format!("config{extension}"),
+                    "{name:?} as {format}"
+                );
+            }
+        }
+        // Nothing after the last separator, or a name that is a folder step:
+        // the dialog's own name.
+        for name in ["/root/.ssh/", "..", "."] {
+            assert_eq!(
+                private_export_file_name(name, "openssh-private"),
+                "file.txt",
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            private_export_file_name("id_ed25519", "openssh-private"),
+            "id_ed25519"
+        );
+        assert_eq!(
+            private_export_file_name("work laptop", "ppk"),
+            "work laptop.ppk"
+        );
+    }
+
+    /// Every save dialog suggests a bare file name: each suggested name goes
+    /// through `save_dialog_file_name` - the private-key export's through
+    /// `private_export_file_name` - the backup's too, though SSHSpan makes
+    /// that name itself.
+    #[test]
+    fn fw_u1_every_save_dialog_suggests_a_bare_file_name() {
+        let backup = backup_file_name();
+        assert_eq!(save_dialog_file_name(Some(&backup)), backup);
+        let source = include_str!("mod.rs");
+        let needle = concat!(".set_", "file_name(");
+        let suggested: Vec<&str> = source.lines().filter(|l| l.contains(needle)).collect();
+        assert_eq!(suggested.len(), 3, "the save dialogs: {suggested:?}");
+        for line in suggested {
+            assert!(
+                line.contains("save_dialog_file_name(")
+                    || line.contains("private_export_file_name("),
+                "a save dialog suggests a name as it came: {}",
+                line.trim()
+            );
+        }
+        let helper = {
+            let start = source.find("fn private_export_file_name(").unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        assert!(helper.contains("save_dialog_file_name("), "{helper}");
+    }
+
+    /// A file dialog's title came from the renderer as it was. rfd's GTK
+    /// dialog builds its title with `CString::new(title).unwrap()` inside a
+    /// GLib callback that cannot unwind, so a NUL in it aborted the app. The
+    /// title is cleaned like every dialog text - no control, format or
+    /// direction character, a run of whitespace one space - and capped; with
+    /// nothing left, the dialog's own title.
+    #[test]
+    fn fw_v1_a_file_dialog_title_is_cleaned_and_capped() {
+        for (given, shown) in [
+            (Some("Export\u{0} public key"), "Export public key"),
+            (Some("Save\u{0}"), "Save"),
+            (
+                Some("\u{1b}[31mSelect\u{7} .pem file"),
+                "[31mSelect .pem file",
+            ),
+            (Some("Import\r\nSSH\tkey"), "Import SSH key"),
+            (Some("\u{202e}yek HSS tropmI"), "yek HSS tropmI"),
+            (Some("Export audit log"), "Export audit log"),
+            (Some(""), "Select file"),
+            (Some("\u{0}\u{0} \u{200b}"), "Select file"),
+            (None, "Select file"),
+        ] {
+            assert_eq!(file_dialog_title(given, "Select file"), shown, "{given:?}");
+        }
+        let long = file_dialog_title(Some(&"x".repeat(1000)), "Select file");
+        assert_eq!(long.chars().count(), MAX_DIALOG_TITLE_CHARS, "capped");
+        assert!(long.ends_with('\u{2026}'), "{long}");
+        let wild: String = (0..=0x7f_u8)
+            .map(char::from)
+            .chain(['\u{85}', '\u{2028}', '\u{202e}', '\u{2066}', '\u{feff}'])
+            .collect();
+        let cleaned = file_dialog_title(Some(&wild), "Select file");
+        assert!(
+            !cleaned
+                .chars()
+                .any(|c| c.is_control() || crate::assistant::is_disguising(c)),
+            "{cleaned:?}"
+        );
+    }
+
+    /// Every dialog's title is cleaned or SSHSpan's own: a file dialog's
+    /// from `file_dialog_title` or a fixed text, a message dialog's from
+    /// `dialog_message_safe` or a fixed text. A title from the renderer
+    /// passed on as it came could carry a NUL. Every source file is read.
+    #[test]
+    fn fw_v1_every_dialog_title_is_cleaned_or_fixed() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path.display().to_string(), text));
+                }
+            }
+        }
+        let mut all = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut all,
+        );
+        assert!(all.len() > 20, "the crate's sources: {}", all.len());
+        let file_title = concat!(".set_", "title(");
+        let message_title = concat!(".tit", "le(");
+        let (mut file_titles, mut message_titles) = (0, 0);
+        for (path, source) in &all {
+            for line in source.lines().map(str::trim) {
+                if let Some(at) = line.find(file_title) {
+                    let given = &line[at + file_title.len()..];
+                    assert!(
+                        given.starts_with('"') || given.starts_with("file_dialog_title("),
+                        "{path}: a file dialog's title as it came: {line}"
+                    );
+                    file_titles += 1;
+                } else if let Some(at) = line.find(message_title) {
+                    let given = &line[at + message_title.len()..];
+                    assert!(
+                        given.starts_with('"') || given.starts_with("dialog_message_safe("),
+                        "{path}: a message dialog's title as it came: {line}"
+                    );
+                    message_titles += 1;
+                }
+            }
+        }
+        assert_eq!(
+            (file_titles, message_titles),
+            (7, 3),
+            "the dialogs that take a title"
+        );
+    }
+
+    /// A save dialog opens in the Downloads folder, or in home when there is
+    /// none - never in the working directory, where GTK opens a dialog that
+    /// has no folder set - and every save dialog is built that way.
+    #[test]
+    fn fw_r3_a_save_dialog_opens_in_downloads_or_else_home() {
+        let root = std::env::temp_dir().join(format!("sshspan-fw-r3-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let downloads = home.join("Downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        assert_eq!(
+            save_dialog_folder_from(Some(downloads.clone()), Some(home.clone())),
+            Some(downloads.clone())
+        );
+        // A Downloads folder that is not there: home.
+        std::fs::remove_dir(&downloads).unwrap();
+        assert_eq!(
+            save_dialog_folder_from(Some(downloads.clone()), Some(home.clone())),
+            Some(home.clone())
+        );
+        assert_eq!(
+            save_dialog_folder_from(None, Some(home.clone())),
+            Some(home.clone())
+        );
+        // Neither: the dialog's own default.
+        assert_eq!(save_dialog_folder_from(Some(downloads), None), None);
+        assert_eq!(save_dialog_folder_from(None, None), None);
+        std::fs::remove_dir_all(&root).unwrap();
+        // Every save dialog is built through `in_save_folder`.
+        let needle = concat!(".blocking_", "save_file()");
+        let lines: Vec<&str> = include_str!("mod.rs").lines().collect();
+        let dialogs: Vec<usize> = (0..lines.len())
+            .filter(|&n| lines[n].contains(needle))
+            .collect();
+        assert_eq!(dialogs.len(), 3, "the save dialogs: {dialogs:?}");
+        for n in dialogs {
+            assert!(
+                lines[n.saturating_sub(8)..n]
+                    .iter()
+                    .any(|line| line.contains("in_save_folder(")),
+                "the save dialog at line {} opens in the working directory",
+                n + 1
+            );
+        }
     }
 }

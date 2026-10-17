@@ -447,25 +447,24 @@ function wrapperBodies(code) {
   return bodies;
 }
 
-/// The index of the `{` or `[` that holds `at` in `code` (masked), or -1 when
-/// a `(` holds it first, or nothing does.
+/// The index of the `(`, `[` or `{` that holds `at` in `code` (masked), or -1.
 function enclosingOpen(code, at) {
   let depth = 0;
   for (let i = at - 1; i >= 0; i--) {
     const c = code[i];
     if (')]}'.includes(c)) depth++;
     else if ('([{'.includes(c)) {
-      if (depth === 0) return c === '(' ? -1 : i;
+      if (depth === 0) return i;
       depth--;
     }
   }
   return -1;
 }
 
-/// The index of the `}` or `]` that closes the bracket at `open`, or -1.
+/// The index of the bracket that closes the one at `open`, or -1.
 function matchingClose(code, open) {
   const o = code[open];
-  const c = o === '{' ? '}' : ']';
+  const c = { '(': ')', '[': ']', '{': '}' }[o];
   let depth = 0;
   for (let i = open; i < code.length; i++) {
     if (code[i] === o) depth++;
@@ -474,19 +473,35 @@ function matchingClose(code, open) {
   return -1;
 }
 
+/// Whether the `(` at `open` starts a parameter list - a function's, an
+/// arrow's, a method's - or a catch clause's, where a pattern renames too.
+function isParameterList(code, open) {
+  const before = code.slice(Math.max(0, open - 60), open);
+  if (/\bcatch\s*$/.test(before)) return true;
+  if (/\bfunction\b[^(){};=]*$/.test(before)) return true;
+  const close = matchingClose(code, open);
+  const after = close >= 0 ? code.slice(close + 1, close + 20) : '';
+  if (/^\s*=>/.test(after)) return true;
+  // A method: `name(...) {` - not `if (...) {` and the other keywords.
+  return /^\s*\{/.test(after)
+    && /(?<![\w$.])(?!(?:if|for|while|switch|catch|with|return|typeof|await|else|function)\b)[A-Za-z_$][\w$]*\s*$/.test(before);
+}
+
 /// Whether the key at `at` sits in a destructuring pattern - `const {
-/// invoke: inv } = ...`, `({ invoke: inv } = ...)`, nested in other object or
-/// array patterns too - rather than in an object literal.
+/// invoke: inv } = ...`, `({ invoke: inv } = ...)`, a parameter's or a catch
+/// clause's (`function f({ invoke: inv })`, `({ call: c }) => ...`), nested in
+/// other object or array patterns too - rather than in an object literal.
 function inDestructuring(code, at) {
   let open = enclosingOpen(code, at);
   for (let level = 0; open >= 0 && level < 8; level++) {
+    if (code[open] === '(') return isParameterList(code, open);
     const before = code.slice(Math.max(0, open - 40), open);
     if (/\b(?:const|let|var)\s*$/.test(before)) return true;
     const close = matchingClose(code, open);
     if (close >= 0 && /^\s*=(?![=>])/.test(code.slice(close + 1, close + 20))) return true;
-    // Only a pattern inside a pattern goes on outwards: `{ a: { invoke: x } }`,
-    // `[{ invoke: x }]`.
-    if (!/[:,[{]\s*$/.test(before)) return false;
+    // Only a pattern inside a pattern, or one in a parameter list, goes on
+    // outwards: `{ a: { invoke: x } }`, `[{ invoke: x }]`, `(a, { call: c })`.
+    if (!/[:,[{(]\s*$/.test(before)) return false;
     open = enclosingOpen(code, open);
   }
   return false;
@@ -1088,10 +1103,20 @@ function selfCheck() {
     'const [{ invoke: inv3 }] = list;',
     'const nested = { a: { call: 1 }, b: [{ invoke: 2 }] }; run({ mcpCall: 3 });',
     'for (const { invoke: inv4 } of list) {}',
+    // A parameter pattern renames a wrapper as well: a function's, an arrow's,
+    // a method's (a later parameter too) and a catch clause's. An object
+    // literal handed to a call, or tested in an if, does not.
+    'function useApi({ invoke: inv5 }) { return inv5; }',
+    'const run = ({ call: c1 }) => c1;',
+    'try { go(); } catch ({ invoke: inv6 }) {}',
+    'class Api { m({ mcpCall: m1 }) { return m1; } }',
+    'go({ call: 1 }); if (ok({ invoke: 2 })) { done(); }',
+    'function two(a, { sftpCall: s1 }) { return s1; }',
+    'list.forEach(function ({ invoke: inv7 }) { return inv7; });',
   ].join('\n'), 'probe.js');
   const shapesGot = shapes.map((s) => (s.cmd == null ? '?' : s.cmd) + '@' + s.line);
   const shapesWant = ['spaced_cmd@1', 'optional_cmd@3', 'optional_invoke_cmd@4', '?@5', '?@6', '?@7', '?@8', '?@9', '?@10', '?@11', '?@12',
-    '?@21', '?@23', '?@24', '?@26'];
+    '?@21', '?@23', '?@24', '?@26', '?@27', '?@28', '?@29', '?@30', '?@32', '?@33'];
   if (JSON.stringify(shapesGot) !== JSON.stringify(shapesWant)) {
     failed.push(`calls with a space or ?. and other uses of a wrapper's name parsed as ${JSON.stringify(shapesGot)}, want ${JSON.stringify(shapesWant)}`);
   }
@@ -1102,9 +1127,9 @@ function selfCheck() {
   if (shapeProblems.length) failed.push(`the readable calls among them pass, got ${JSON.stringify(shapeProblems)}`);
   const shapeSummary = summaryLines(shapes, shapeCmds, shapeRegistered);
   if (shapeSummary[0] !== 'Checked 3 call sites against 3 commands (3 registered).'
-    || !/^12 more call sites were NOT checked/.test(shapeSummary[1] || '')
+    || !/^18 more call sites were NOT checked/.test(shapeSummary[1] || '')
     || /every argument name was checked/i.test(shapeSummary.join('\n'))) {
-    failed.push(`with the wrapper passed on, the summary must count 3 checked and name 12 not checked, got ${JSON.stringify(shapeSummary)}`);
+    failed.push(`with the wrapper passed on, the summary must count 3 checked and name 18 not checked, got ${JSON.stringify(shapeSummary)}`);
   }
   return failed;
 }

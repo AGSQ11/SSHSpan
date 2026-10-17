@@ -94,6 +94,12 @@ fn resolve_for_server(
         } else if let Some(p) = server.pem_path.clone() {
             // Read PEM from disk - leaves the file untouched, treats it as a public key on the SSH server side.
             // This is a stored setting set by the user via the UI; validate it exists and is a regular file.
+            // On Windows only from this computer's drives, asked before the
+            // path is touched: a share would be opened (an NTLM sign-in)
+            // just to look.
+            if let Some(why) = crate::ssh_client::key_path_refusal(&p) {
+                return Err(why.to_string());
+            }
             let path = std::path::Path::new(&p);
             if !path.is_file() {
                 return Err(format!("PEM path does not exist or is not a file: {p}"));

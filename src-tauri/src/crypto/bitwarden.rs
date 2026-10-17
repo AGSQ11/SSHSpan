@@ -22,9 +22,11 @@ use crate::crypto::utils::constant_time_eq;
 
 #[derive(Debug, Clone)]
 pub struct KdfParams {
-    pub kdf_type: u32,    // 0 = PBKDF2, 1 = Argon2id
-    pub iterations: u32,  // PBKDF2 iterations or Argon2 iterations
-    pub memory: u32,      // Argon2 memory in KiB (ignored for PBKDF2)
+    pub kdf_type: u32,   // 0 = PBKDF2, 1 = Argon2id
+    pub iterations: u32, // PBKDF2 iterations or Argon2 iterations
+    /// Argon2 memory in KiB, what `argon2::Params` takes (ignored for
+    /// PBKDF2). A prelogin answer gives it in MiB ([`argon2_memory_kib`]).
+    pub memory: u32,
     pub parallelism: u32, // Argon2 parallelism (ignored for PBKDF2)
 }
 
@@ -41,16 +43,24 @@ impl Default for KdfParams {
 
 // ─── Master key derivation ──────────────────────────────────────────────
 
-/// Derive the 32-byte master key from the master password and account email.
-///
-/// kdf_type 0: PBKDF2-HMAC-SHA256 with email (lowercased) as salt.
-/// kdf_type 1: Argon2id with email (lowercased) as salt.
+/// KiB in a MiB: Bitwarden states Argon2 memory in MiB (`kdfMemory`),
+/// `argon2::Params` takes KiB.
+const KIB_PER_MIB: u32 = 1024;
+
+/// The Argon2 memory of a prelogin answer's `kdfMemory` (MiB), in KiB - as
+/// the official SDK converts it (`memory * 1024`), saturating: a hostile
+/// number ends at the ceiling of [`clamp_kdf_params`], not wrapped round.
+pub(crate) fn argon2_memory_kib(mib: u32) -> u32 {
+    mib.saturating_mul(KIB_PER_MIB)
+}
+
 // Minimum KDF parameters enforced server-side values. Bitwarden's current
 // defaults and floors: PBKDF2 accounts must use at least 600,000 iterations;
 // Argon2id accounts must use at least 16 MiB of memory, 2 iterations, and
 // parallelism of 1. These match the official Bitwarden server-side minimums.
 pub(crate) const PBKDF2_MIN_ITERATIONS: u32 = 600_000;
-pub(crate) const ARGON2_MIN_MEMORY_KIB: u32 = 16 * 1024;
+/// The Argon2 memory floor - 16 MiB - in KiB.
+pub(crate) const ARGON2_MIN_MEMORY_KIB: u32 = 16 * KIB_PER_MIB;
 pub(crate) const ARGON2_MIN_ITERATIONS: u32 = 2;
 pub(crate) const ARGON2_MIN_PARALLELISM: u32 = 1;
 
@@ -58,12 +68,13 @@ pub(crate) const ARGON2_MIN_PARALLELISM: u32 = 1;
 // a hostile vault server can send kdfIterations: 2_000_000_000 or
 // kdfMemory: 16 GiB and turn a sync into an unbounded local CPU/RAM burn -
 // the cost is paid during derivation, which no HTTP timeout covers. The
-// ceilings sit far above anything a real Bitwarden/Vaultwarden account can
+// ceilings sit at or above anything a real Bitwarden/Vaultwarden account can
 // configure (PBKDF2 max 2M iterations, Argon2 max 1024 MiB per the official
 // clients) while still bounding the worst case.
 pub(crate) const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
 pub(crate) const ARGON2_MAX_ITERATIONS: u32 = 16;
-pub(crate) const ARGON2_MAX_MEMORY_KIB: u32 = 1024 * 1024; // 1 GiB
+/// The Argon2 memory ceiling - 1024 MiB, 1 GiB - in KiB.
+pub(crate) const ARGON2_MAX_MEMORY_KIB: u32 = 1024 * KIB_PER_MIB;
 pub(crate) const ARGON2_MAX_PARALLELISM: u32 = 16;
 
 /// Clamp server-supplied KDF parameters to safe bounds, selected by KDF
@@ -71,6 +82,8 @@ pub(crate) const ARGON2_MAX_PARALLELISM: u32 = 16;
 /// (PBKDF2 iterations are hundreds of thousands; Argon2 passes are single
 /// digits), so a shared clamp would be wrong in both directions. Unknown KDF
 /// types are refused outright rather than derived with guessed parameters.
+/// `memory` is in KiB: a prelogin's `kdfMemory` (MiB) goes through
+/// [`argon2_memory_kib`] first.
 pub(crate) fn clamp_kdf_params(
     kdf_type: u32,
     iterations: u32,
@@ -97,6 +110,11 @@ pub(crate) fn clamp_kdf_params(
     Ok(params)
 }
 
+/// Derive the 32-byte master key from the master password and account email.
+///
+/// kdf_type 0: PBKDF2-HMAC-SHA256 with email (lowercased) as salt.
+/// kdf_type 1: Argon2id with the SHA-256 of the email (lowercased) as salt,
+/// `kdf.memory` in KiB.
 pub fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> anyhow::Result<[u8; 32]> {
     // Defense in depth: clamp again at the crypto boundary, so a caller that
     // bypassed the prelogin clamp (a future import path, a test) still

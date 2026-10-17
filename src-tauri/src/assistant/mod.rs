@@ -330,6 +330,7 @@ pub async fn assistant_save_config(
         save_config_from_ipc(
             &app.state::<crate::AppState>().db,
             app.state::<crate::commands::VaultPasswordStore>().inner(),
+            app.state::<crate::commands::VaultGeneration>().inner(),
             app.state::<crate::commands::VaultRotationLock>().inner(),
             app.state::<crate::commands::CredentialQuestions>().inner(),
             IpcConfig {
@@ -365,6 +366,7 @@ struct IpcConfig {
 fn save_config_from_ipc(
     db: &crate::db::Database,
     vault: &crate::commands::VaultPasswordStore,
+    generations: &crate::commands::VaultGeneration,
     rotation: &crate::commands::VaultRotationLock,
     questions: &crate::commands::CredentialQuestions,
     ipc: IpcConfig,
@@ -387,7 +389,7 @@ fn save_config_from_ipc(
         api_key,
         clear_api_key: clear_api_key.unwrap_or(false),
     };
-    save_config_confirmed(db, vault, rotation, questions, args, ask)
+    save_config_confirmed(db, vault, generations, rotation, questions, args, ask)
 }
 
 /// The arguments of [`assistant_save_config`].
@@ -412,6 +414,22 @@ const KEY_MOVE_CHANGED: &str =
 /// opening ([`crate::commands::CREDENTIAL_MIN_ANSWER_DELAY`]).
 const KEY_MOVE_TOO_QUICK: &str = "The question about sending the stored API key was answered within a second of opening - too fast to be a decision. Save again to be asked again.";
 
+/// What a save refuses when the vault was locked while the user was
+/// deciding - even if it was unlocked again before "Allow".
+const KEY_MOVE_LOCKED: &str =
+    "The vault was locked while you were deciding - unlock it and save the settings again.";
+
+/// What a save refuses while the last move of the stored key asked about, to
+/// `host`, was answered "Don't allow" or "Cancel" less than
+/// [`crate::commands::CREDENTIAL_DECLINE_BACKOFF`] ago, whatever the new
+/// address is now: nothing is asked.
+fn key_move_declined_lately(host: &str) -> String {
+    format!(
+        "Sending the stored API key to {} was declined a moment ago. Wait 30 seconds, then save again, or enter the API key for the new address.",
+        crate::commands::dialog_text(host, MAX_DIALOG_NAME_CHARS)
+    )
+}
+
 /// [`assistant_save_config`] without the `AppHandle`, `ask` answering the
 /// native question (blocking: the blocking pool only). A save that would send
 /// the stored key to another provider address with no new key typed is asked
@@ -424,18 +442,28 @@ const KEY_MOVE_TOO_QUICK: &str = "The question about sending the stored API key 
 /// ([`crate::commands::CREDENTIAL_QUESTION_OPEN`]), and the turn lasts until
 /// the save is written. The rotation guard is taken for the look at the
 /// stored settings and again for the save - not while the user decides.
+/// An "Allow" counts only while the vault is still unlocked in the
+/// generation the question was asked in (`generations`): given after a lock -
+/// even one followed by an unlock - nothing is saved ([`KEY_MOVE_LOCKED`]).
 fn save_config_confirmed(
     db: &crate::db::Database,
     vault: &crate::commands::VaultPasswordStore,
+    generations: &crate::commands::VaultGeneration,
     rotation: &crate::commands::VaultRotationLock,
     questions: &crate::commands::CredentialQuestions,
     args: ConfigArgs,
     ask: crate::commands::ConfirmCredential<'_>,
 ) -> CmdResult<serde_json::Value> {
     use crate::commands::CredentialAnswer;
+    // The vault as the save finds it, captured before anything is asked.
+    let at_ask = crate::commands::VaultAtSave {
+        vault,
+        generations,
+        generation: generations.current(),
+    };
     let key_move = {
         let _rotation = rotation.try_shared()?;
-        if !vault.is_set() {
+        if !at_ask.unchanged() {
             return Err("Vault is locked.".into());
         }
         let stored = db.load_assistant_config().map_err(|e| e.to_string())?;
@@ -450,7 +478,17 @@ fn save_config_confirmed(
     let Some(_turn) = questions.begin() else {
         return Err(crate::commands::CREDENTIAL_QUESTION_OPEN.into());
     };
+    // After "Don't allow" or "Cancel", no move of the stored key is asked
+    // about for 30 seconds ([`crate::commands::CREDENTIAL_DECLINE_BACKOFF`]),
+    // whatever the new address; the answer names the host declined.
+    let kind = crate::commands::QuestionKind::AssistantKeyMove;
+    if let Some(declined) = questions.declined_lately(kind) {
+        return Err(key_move_declined_lately(&declined).into());
+    }
     let answer = ask(&key_move.prompt());
+    if answer == CredentialAnswer::NotAllowed {
+        questions.record_decline(kind, &key_move.to_host);
+    }
     if answer != CredentialAnswer::Allowed {
         let quick = answer == CredentialAnswer::TooQuick;
         crate::commands::audit_or_log(
@@ -471,7 +509,7 @@ fn save_config_confirmed(
         .into());
     }
     let _rotation = rotation.try_shared()?;
-    save_config(db, vault, args, Some(&key_move))
+    save_config(db, vault, args, Some((&key_move, &at_ask)))
 }
 
 /// The provider, base URL and model a save writes, checked.
@@ -534,8 +572,9 @@ fn pending_key_move(
 
 /// [`assistant_save_config`] without the `AppHandle`. The caller holds the
 /// rotation guard. The stored settings are read, checked
-/// ([`check_key_reuse`]: a move of the stored key only as `allowed`) and
-/// written in one transaction
+/// ([`check_key_reuse`]: a move of the stored key only as `allowed`, and
+/// only while the vault is still as it was when the move was asked about)
+/// and written in one transaction
 /// ([`crate::db::Database::update_assistant_config`]); a new key is sealed
 /// before it, so Argon2id never runs while the write lock is held. A failed
 /// audit row after the commit is a `warning`, not an error.
@@ -543,7 +582,7 @@ fn save_config(
     db: &crate::db::Database,
     vault: &crate::commands::VaultPasswordStore,
     args: ConfigArgs,
-    allowed: Option<&KeyMove>,
+    allowed: Option<(&KeyMove, &crate::commands::VaultAtSave<'_>)>,
 ) -> CmdResult<serde_json::Value> {
     let pw = vault.get().unwrap_or_default();
     if pw.is_empty() {
@@ -566,15 +605,22 @@ fn save_config(
         .transpose()
         .map_err(|e| e.to_string())?;
 
+    let allowed_move = allowed.map(|(key_move, _)| key_move);
     let key_moved = db
         .update_assistant_config(|config| {
+            // The answer counts only while the vault is still as it was
+            // when the move was asked about - checked inside the transaction
+            // that writes it.
+            if allowed.is_some_and(|(_, at_ask)| !at_ask.unchanged()) {
+                return Err(CmdError(KEY_MOVE_LOCKED.into()).into());
+            }
             let key_moved = check_key_reuse(
                 config,
                 &provider,
                 base_url.as_deref(),
                 sealed_key.is_some(),
                 clear_api_key,
-                allowed,
+                allowed_move,
             )
             .map_err(CmdError)?;
             config.provider = Some(provider);
@@ -589,7 +635,7 @@ fn save_config(
             Ok(key_moved)
         })
         .map_err(CmdError::from)?;
-    let detail = match allowed.filter(|_| key_moved) {
+    let detail = match allowed_move.filter(|_| key_moved) {
         Some(key_move) => format!(
             "saved (stored API key moved to {}, allowed in SSHSpan's confirmation dialog)",
             key_move.to_host
@@ -2432,17 +2478,22 @@ mod tests {
 
     #[test]
     fn rw_s2_the_stored_api_key_moves_only_when_the_native_question_allows_it() {
-        use crate::commands::{CredentialAnswer, CredentialPrompt, CredentialQuestions};
+        use crate::commands::{CredentialAnswer, CredentialPrompt};
         let db = config_db();
         let vault = unlocked();
+        let generations = crate::commands::VaultGeneration::new();
         let rotation = crate::commands::VaultRotationLock::new();
-        let questions = CredentialQuestions::new();
+        // A "no" is not asked about again for 30 seconds: the clock is moved
+        // past that before the same move is asked about again.
+        let clock = crate::commands::TestClock::new();
+        let questions = clock.questions();
         let never = |p: &CredentialPrompt| -> CredentialAnswer {
             panic!("nothing moves, nothing to ask: {}", p.message)
         };
         save_config_confirmed(
             &db,
             &vault,
+            &generations,
             &rotation,
             &questions,
             config_args(None, Some("sk-old")),
@@ -2461,6 +2512,7 @@ mod tests {
         let err = save_config_from_ipc(
             &db,
             &vault,
+            &generations,
             &rotation,
             &questions,
             ipc_with_reuse_flag(moved()),
@@ -2478,9 +2530,20 @@ mod tests {
         let stored = db.load_assistant_config().unwrap();
         assert_eq!(stored.base_url, None, "nothing changed");
         assert_eq!(stored.api_key, sealed);
-        // Allowed: the key goes along, untouched.
+        // Allowed, once the "no" is 30 seconds old: the key goes along,
+        // untouched.
+        clock.advance(crate::commands::CREDENTIAL_DECLINE_BACKOFF);
         let allow = |_: &CredentialPrompt| CredentialAnswer::Allowed;
-        save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &allow).unwrap();
+        save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &allow,
+        )
+        .unwrap();
         let stored = db.load_assistant_config().unwrap();
         assert_eq!(
             stored.base_url.as_deref(),
@@ -2492,6 +2555,7 @@ mod tests {
         save_config_confirmed(
             &db,
             &vault,
+            &generations,
             &rotation,
             &questions,
             config_args(Some("https://llm.example.com/v2"), None),
@@ -2501,6 +2565,7 @@ mod tests {
         save_config_confirmed(
             &db,
             &vault,
+            &generations,
             &rotation,
             &questions,
             config_args(Some("https://other.example.com/v1"), Some("sk-other")),
@@ -2509,7 +2574,16 @@ mod tests {
         .unwrap();
         let mut remove = config_args(Some("https://third.example.com/v1"), None);
         remove.clear_api_key = true;
-        save_config_confirmed(&db, &vault, &rotation, &questions, remove, &never).unwrap();
+        save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            remove,
+            &never,
+        )
+        .unwrap();
         assert_eq!(db.load_assistant_config().unwrap().api_key, None);
     }
 
@@ -2522,12 +2596,14 @@ mod tests {
         use crate::commands::{CredentialAnswer, CredentialPrompt, CredentialQuestions};
         let db = config_db();
         let vault = unlocked();
+        let generations = crate::commands::VaultGeneration::new();
         let rotation = crate::commands::VaultRotationLock::new();
         let questions = CredentialQuestions::new();
         let none = |_: &CredentialPrompt| -> CredentialAnswer { CredentialAnswer::NotAllowed };
         save_config_confirmed(
             &db,
             &vault,
+            &generations,
             &rotation,
             &questions,
             config_args(None, Some("sk-old")),
@@ -2536,8 +2612,16 @@ mod tests {
         .unwrap();
         let moved = || config_args(Some("https://llm.example.com/v1"), None);
         let quick = |_: &CredentialPrompt| CredentialAnswer::TooQuick;
-        let err = save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &quick)
-            .expect_err("a quick Allow moves nothing");
+        let err = save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &quick,
+        )
+        .expect_err("a quick Allow moves nothing");
         assert_eq!(err.0, KEY_MOVE_TOO_QUICK);
         assert_eq!(db.load_assistant_config().unwrap().base_url, None);
         // Another question is open: refused, and not asked.
@@ -2547,15 +2631,281 @@ mod tests {
             asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             CredentialAnswer::Allowed
         };
-        let err = save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &allow)
-            .expect_err("one question at a time");
+        let err = save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &allow,
+        )
+        .expect_err("one question at a time");
         assert_eq!(err.0, crate::commands::CREDENTIAL_QUESTION_OPEN);
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(db.load_assistant_config().unwrap().base_url, None);
         // Once it is answered, the move is asked about - and allowed.
         drop(open);
-        save_config_confirmed(&db, &vault, &rotation, &questions, moved(), &allow).unwrap();
+        save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &allow,
+        )
+        .unwrap();
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A move of the stored key answered "Don't allow" or "Cancel" is not
+    /// asked about again for 30 seconds - a renderer could ask again and
+    /// again until a tired user gave in. The save is refused and says why;
+    /// after 30 seconds the question is asked again.
+    #[test]
+    fn fw_s1_a_declined_key_move_is_not_asked_again_for_30_seconds() {
+        use crate::commands::{CredentialAnswer, CredentialPrompt};
+        let db = config_db();
+        let vault = unlocked();
+        let generations = crate::commands::VaultGeneration::new();
+        let rotation = crate::commands::VaultRotationLock::new();
+        let clock = crate::commands::TestClock::new();
+        let questions = clock.questions();
+        let asked = std::cell::Cell::new(0);
+        let counter = &asked;
+        let answer = |reply: CredentialAnswer| {
+            move |_: &CredentialPrompt| {
+                counter.set(counter.get() + 1);
+                reply
+            }
+        };
+        let never = answer(CredentialAnswer::NotAllowed);
+        save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            config_args(None, Some("sk-old")),
+            &never,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 0, "a new key moves nothing");
+        let moved = || config_args(Some("https://llm.example.com/v1"), None);
+        let err = save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &never,
+        )
+        .unwrap_err();
+        assert_eq!((asked.get(), err.0.as_str()), (1, KEY_MOVE_DECLINED));
+        let allow = answer(CredentialAnswer::Allowed);
+        let err = save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &allow,
+        )
+        .unwrap_err();
+        assert_eq!(asked.get(), 1, "not asked again within 30 seconds");
+        assert_eq!(
+            err.0,
+            "Sending the stored API key to llm.example.com was declined a moment ago. Wait 30 \
+             seconds, then save again, or enter the API key for the new address."
+        );
+        assert_eq!(db.load_assistant_config().unwrap().base_url, None);
+        clock.advance(crate::commands::CREDENTIAL_DECLINE_BACKOFF);
+        save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &allow,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 2, "asked again after 30 seconds");
+        assert_eq!(
+            db.load_assistant_config().unwrap().base_url.as_deref(),
+            Some("https://llm.example.com/v1")
+        );
+    }
+
+    /// Keyed by the host, the 30 seconds after a "no" let a renderer ask at
+    /// once about moving the stored key to the next made-up host. After a
+    /// "no", no move of the stored key is asked about for 30 seconds,
+    /// whatever the new address, and the answer names the host declined. A
+    /// "no" to another kind of question holds nothing back here.
+    #[test]
+    fn fw_u2_a_declined_key_move_holds_back_every_key_move() {
+        use crate::commands::{CredentialAnswer, CredentialPrompt, QuestionKind};
+        let db = config_db();
+        let vault = unlocked();
+        let generations = crate::commands::VaultGeneration::new();
+        let rotation = crate::commands::VaultRotationLock::new();
+        let clock = crate::commands::TestClock::new();
+        let questions = clock.questions();
+        let asked = std::cell::Cell::new(0);
+        let counter = &asked;
+        let answer = |reply: CredentialAnswer| {
+            move |_: &CredentialPrompt| {
+                counter.set(counter.get() + 1);
+                reply
+            }
+        };
+        let declined = answer(CredentialAnswer::NotAllowed);
+        let save = |args: ConfigArgs, ask: &dyn Fn(&CredentialPrompt) -> CredentialAnswer| {
+            save_config_confirmed(&db, &vault, &generations, &rotation, &questions, args, ask)
+        };
+        save(config_args(None, Some("sk-old")), &declined).unwrap();
+        assert_eq!(asked.get(), 0, "a new key moves nothing");
+        questions.record_decline(QuestionKind::McpCredential, "mcp.example.com");
+        questions.record_decline(QuestionKind::BitwardenDestination, "vault.example.com");
+        let err = save(
+            config_args(Some("https://llm.example.com/v1"), None),
+            &declined,
+        )
+        .unwrap_err();
+        assert_eq!(
+            (asked.get(), err.0.as_str()),
+            (1, KEY_MOVE_DECLINED),
+            "asked, though the other kinds were declined"
+        );
+        let allow = answer(CredentialAnswer::Allowed);
+        for base in [
+            "https://llm.example.com/v2",
+            "https://LLM.example.com:443/x/",
+            "https://llm.example.org/v1",
+            "https://a1.attacker.example/v1",
+            "https://a2.attacker.example/v1",
+        ] {
+            let err = save(config_args(Some(base), None), &allow).unwrap_err();
+            assert_eq!(asked.get(), 1, "{base}: held back");
+            assert_eq!(
+                err.0,
+                "Sending the stored API key to llm.example.com was declined a moment ago. \
+                 Wait 30 seconds, then save again, or enter the API key for the new address.",
+                "{base}"
+            );
+        }
+        assert_eq!(db.load_assistant_config().unwrap().base_url, None);
+        // 30 seconds after the "no": asked again, whatever the address.
+        clock.advance(crate::commands::CREDENTIAL_DECLINE_BACKOFF);
+        save(
+            config_args(Some("https://a3.attacker.example/v1"), None),
+            &allow,
+        )
+        .unwrap();
+        assert_eq!(asked.get(), 2, "asked again after 30 seconds");
+        assert_eq!(
+            db.load_assistant_config().unwrap().base_url.as_deref(),
+            Some("https://a3.attacker.example/v1")
+        );
+    }
+
+    /// An "Allow" counts only while the vault is still unlocked in the
+    /// generation the question was asked in. Locked and unlocked again while
+    /// the question was open: the key is not moved, the new address is not
+    /// stored and no "saved" row is written. Asked again, it moves.
+    #[test]
+    fn fw_r2_an_allow_after_a_lock_never_moves_the_api_key() {
+        use crate::commands::{CredentialAnswer, CredentialPrompt, CredentialQuestions};
+        let db = config_db();
+        let vault = unlocked();
+        let generations = crate::commands::VaultGeneration::new();
+        let rotation = crate::commands::VaultRotationLock::new();
+        let questions = CredentialQuestions::new();
+        let never = |p: &CredentialPrompt| -> CredentialAnswer {
+            panic!("nothing moves, nothing to ask: {}", p.message)
+        };
+        save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            config_args(None, Some("sk-old")),
+            &never,
+        )
+        .unwrap();
+        let sealed = db.load_assistant_config().unwrap().api_key;
+        let saved_rows = || {
+            db.list_audit(100)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.action == "assistant.config")
+                .count()
+        };
+        let rows_before = saved_rows();
+        let moved = || config_args(Some("https://llm.example.com/v1"), None);
+        // Locked, then unlocked again, while the question was open.
+        let relocked = |_: &CredentialPrompt| {
+            generations.bump();
+            vault.clear();
+            vault.set("vault-master".into());
+            CredentialAnswer::Allowed
+        };
+        let err = save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &relocked,
+        )
+        .expect_err("an Allow after a lock moves nothing");
+        assert_eq!(err.0, KEY_MOVE_LOCKED);
+        let stored = db.load_assistant_config().unwrap();
+        assert_eq!(stored.base_url, None, "the new address is not stored");
+        assert_eq!(stored.api_key, sealed, "the key stays where it was");
+        assert_eq!(saved_rows(), rows_before, "nothing was saved");
+        // Still locked when "Allow" arrives.
+        let locked = |_: &CredentialPrompt| {
+            generations.bump();
+            vault.clear();
+            CredentialAnswer::Allowed
+        };
+        let err = save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &locked,
+        )
+        .expect_err("a locked vault moves nothing");
+        assert_eq!(err.0, "Vault is locked.");
+        assert_eq!(db.load_assistant_config().unwrap().base_url, None);
+        // Unlocked, and asked again: the key moves.
+        vault.set("vault-master".into());
+        let allow = |_: &CredentialPrompt| CredentialAnswer::Allowed;
+        save_config_confirmed(
+            &db,
+            &vault,
+            &generations,
+            &rotation,
+            &questions,
+            moved(),
+            &allow,
+        )
+        .unwrap();
+        let stored = db.load_assistant_config().unwrap();
+        assert_eq!(
+            stored.base_url.as_deref(),
+            Some("https://llm.example.com/v1")
+        );
+        assert_eq!(stored.api_key, sealed);
     }
 
     /// The url crate drops tabs and line breaks while it parses, so the raw

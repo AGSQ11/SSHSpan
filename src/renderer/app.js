@@ -70,6 +70,15 @@ function spellOut(text) {
   return String(text == null ? '' : text).replace(SPELLED_CHARS, spellChar);
 }
 
+/// A backend error as text from outside (errText, then spellOut): a sentence
+/// that can quote a name the server or the page chose - a file name, an
+/// account email, a host - with its direction and invisible characters
+/// spelled out. A whole sentence cannot sit in a <bdi> around just the name;
+/// spelled out, it holds no control to turn the rest around.
+function errSpelled(e) {
+  return spellOut(errText(e));
+}
+
 /// `text` cut to at most `max` characters (whole characters, never half of a
 /// pair), the last an ellipsis when it was cut.
 function capText(text, max) {
@@ -250,6 +259,16 @@ function showAuditWarning(r) {
   const warning = r && r.warning ? String(r.warning) : '';
   if (warning) toast(warning, 'warn');
   return warning;
+}
+
+/// A backend `warning`, as text from outside: the backend's words, spelled
+/// out ('' when there is none). server_save's (R10: a key file protected by a
+/// passphrase, which SSHSpan cannot ask for when connecting - the server is
+/// saved either way, so the save says so as before and this follows as a
+/// warning); a Bitwarden save's or "Allow syncing..."'s (W1-W8, which name the
+/// host, or an audit warning).
+function warningSpelled(r) {
+  return r && typeof r.warning === 'string' && r.warning.trim() ? spellOut(r.warning) : '';
 }
 
 /// Backend array fields may be absent in older replies. Normalise them once,
@@ -2282,6 +2301,7 @@ const LOCK_GATE_HINTS = {
   sshconfig: 'Unlock the vault to import servers from your SSH config.',
   keys: 'Unlock the vault to create or import keys.',
   bitwarden: 'Unlock the vault to save, test or run the Bitwarden sync.',
+  bitwardenAllow: 'Unlock the vault to allow the Bitwarden sync.',
   backup: 'Unlock the vault to create or restore a backup.',
   // Lock now, while there is nothing to lock.
   lock: 'The vault is already locked.',
@@ -4294,15 +4314,17 @@ function deployQuestion(writes, refused, plan, selected) {
 
 /// "Also save these as servers": one saved server per deployed key file, with
 /// the sheet's fields. Returns "<server>: <reason>" for each that could not be
-/// saved.
+/// saved. A server saved with a warning about its key file (R10) is said in
+/// one warning toast after the count, each line "<server>: <warning>".
 async function saveDeployedAsServers(deployed, fields) {
   const failed = [];
+  const warned = [];
   let saved = 0;
   for (const k of deployed) {
     // The Host alias the deploy wrote for this key - the one ssh knows it by.
     const name = k.alias || (deployed.length > 1 ? `${fields.hostAlias} - ${k.name}` : fields.hostAlias);
     try {
-      await call('server_save', {
+      const r = await call('server_save', {
         id: null,
         name,
         host: fields.hostname || fields.hostAlias,
@@ -4316,6 +4338,8 @@ async function saveDeployedAsServers(deployed, fields) {
         color: null,
       });
       saved += 1;
+      const warning = warningSpelled(r);
+      if (warning) warned.push(name + ': ' + warning);
     } catch (e) {
       failed.push(name + ': ' + errText(e));
     }
@@ -4324,6 +4348,7 @@ async function saveDeployedAsServers(deployed, fields) {
     await loadServers();
     toast(`${saved} server(s) saved under Servers.`, 'ok');
   }
+  if (warned.length) toast(warned.join('\n'), 'warn');
   return failed;
 }
 
@@ -4455,7 +4480,9 @@ function paintBwPasswordHint() {
 
 /// A sync's failed items under the status line (A2-08): what each is about -
 /// a key's name, a server, a folder, a Bitwarden item id, whichever the
-/// backend names - and its reason, as text.
+/// backend names - and its reason, as text from outside: each spelled out
+/// (spellOut) and in a <bdi> of its own, so an item's title - in the name or
+/// quoted in the reason - cannot turn the advice after it around.
 const BW_ERRORS_SHOWN = 50;
 
 function renderBwErrors(errors) {
@@ -4465,7 +4492,8 @@ function renderBwErrors(errors) {
   const rows = all.slice(0, BW_ERRORS_SHOWN).map((e) => {
     const li = document.createElement('li');
     const about = e ? (e.name || e.server || e.folder || e.cipher_id) : '';
-    li.textContent = (about ? about + ': ' : '') + ((e && e.error) || 'failed');
+    if (about) li.append(bdiOf(spellOut(about)), ': ');
+    li.append(bdiOf(spellOut((e && e.error) || 'failed')));
     return li;
   });
   if (all.length > BW_ERRORS_SHOWN) {
@@ -4527,6 +4555,7 @@ async function loadBitwardenConfig() {
   wireRevealToggles(grid); // the master password's eye button (A5-35)
   for (const id of ['bw_server_url', 'bw_email']) el(id).addEventListener('input', paintBwPasswordHint);
   paintBwPasswordHint();
+  paintBwDestination(config);
   renderBwErrors([]);
 
   // Sync status: the last run as it ended (A2-08). One that stopped
@@ -4535,7 +4564,7 @@ async function loadBitwardenConfig() {
   const last = config.last_result && typeof config.last_result === 'object' ? config.last_result : null;
   const lastErrors = arrayOrEmpty(last && last.errors);
   if (last && last.ok === false) {
-    setBwStatus('Last sync stopped: ' + (last.aborted || 'it did not finish.'), 'err');
+    setBwStatus('Last sync stopped: ' + (last.aborted ? spellOut(last.aborted) : 'it did not finish.'), 'err');
   } else if (lastErrors.length) {
     renderBwErrors(lastErrors);
     setBwStatus((config.last_sync ? 'Last synced: ' + fmtTime(config.last_sync) + ' - ' : '')
@@ -4545,6 +4574,83 @@ async function loadBitwardenConfig() {
   } else {
     setBwStatus('Not configured yet.');
   }
+}
+
+/// What a save or "Allow syncing..." says when the answer is "not allowed"
+/// without a reason of the backend's (which names one, W1-W8).
+const BW_NOT_ALLOWED = 'Bitwarden sync stays off until you allow it. Use "Allow syncing..." in Settings > Bitwarden.';
+
+/// A server URL's host - with its port when it is not the default - for a
+/// sentence of ours: spelled out and cut (the caller isolates it). Text that
+/// is no URL is shown as it is, spelled out.
+function bwHostOf(url) {
+  let host = String(url == null ? '' : url);
+  try { host = new URL(host).host || host; } catch (_) { /* not a URL */ }
+  return capText(spellOut(host), BW_TEXT_MAX);
+}
+
+/// The destination the sync uploads keys and passwords to, while it is not
+/// allowed: a stored server and account (`bitwarden_get_config` says
+/// `confirmed` - only `true` counts) that the backend's native question has
+/// not been answered "Allow" for. The note says so - the host spelled out and
+/// in a <bdi> of its own - and "Allow syncing..." asks again. Sync stays
+/// enabled: the backend refuses it and says why. Nothing saved: no note.
+function paintBwDestination(config) {
+  const note = el('bwUnconfirmed');
+  const allow = el('bwAllowBtn');
+  if (!note || !allow) return;
+  const stored = !!(config && config.server_url && config.email);
+  const unconfirmed = stored && config.confirmed !== true;
+  note.replaceChildren(...(unconfirmed
+    ? ['Not confirmed - SSHSpan will not sync with ', bdiOf(bwHostOf(config.server_url)), ' until you allow it.'] : []));
+  note.hidden = !unconfirmed;
+  allow.hidden = !unconfirmed;
+}
+
+/// "Allow syncing...": the backend asks its native question again for the
+/// stored destination (bitwarden_allow_sync). Busy until it is answered (one
+/// question at a time); then the settings are read again, and a "no" is said
+/// in the backend's words. Allowed, the button goes with the note: when it had
+/// the focus, the focus goes on to the next step (bwFocusAfterAllow) - it fell
+/// to the page.
+async function bwAllowSync() {
+  const button = el('bwAllowBtn');
+  // Asked before withBusy disables it (which blurs it).
+  const hadFocus = document.activeElement === button;
+  return withBusy(button, 'Asking\u{2026}', async () => {
+    const host = bwHostOf(bwSaved.server_url);
+    setBwStatus(`Waiting for your answer: SSHSpan asks in its own dialog whether it may upload your keys and passwords to \u{2068}${host}\u{2069}.`, 'info');
+    let r;
+    try {
+      r = await call('bitwarden_allow_sync');
+    } catch (e) {
+      const msg = errSpelled(e);
+      setBwStatus(msg, 'err');
+      toast(msg, 'err');
+      return;
+    }
+    await loadBitwardenConfig();
+    if (r && r.confirmed === true) {
+      if (hadFocus) bwFocusAfterAllow(button);
+      toast(`Bitwarden sync is allowed - SSHSpan may upload your keys and passwords to \u{2068}${host}\u{2069}.`, 'ok');
+      return;
+    }
+    const why = warningSpelled(r) || BW_NOT_ALLOWED;
+    setBwStatus(why, 'warn');
+    toast(why, 'warn');
+  });
+}
+
+/// Where the focus goes when "Allow syncing..." had it and has gone (the
+/// destination is allowed): on to Sync now - the next step - or, when that
+/// cannot take it (hidden, disabled), to Save or Test connection. Not when the
+/// user has moved on to a control that is still there; a field the reload
+/// built anew is no such place.
+function bwFocusAfterAllow(button) {
+  const current = document.activeElement;
+  if (current && current !== document.body && current !== button && focusTargetAvailable(current)) return;
+  const next = ['bwSyncNowBtn', 'bwSaveBtn', 'bwTestBtn'].map(el).find(focusTargetAvailable);
+  if (next) next.focus({ preventScroll: true });
 }
 
 async function saveBitwardenConfig() {
@@ -4561,15 +4667,24 @@ async function saveBitwardenConfig() {
     if (!payload.serverUrl) { toast('Server URL is required.', 'err'); el('bw_server_url').focus(); return; }
     if (!payload.email) { toast('Email is required.', 'err'); el('bw_email').focus(); return; }
     try {
+      // A new server or account is asked about in a native dialog before
+      // this answers (it can stay open as long as the user likes).
       const r = await call('bitwarden_save_config', payload);
-      toast('Bitwarden settings saved.', 'ok');
-      showAuditWarning(r);
       el('bw_master_password').value = ''; // clear after save
+      if (r && r.confirmed === true) {
+        toast('Bitwarden settings saved.', 'ok');
+        const audit = warningSpelled(r);
+        if (audit) toast(audit, 'warn');
+      } else {
+        // Stored, but the sync may not upload there: "saved" alone would read
+        // as done. The backend's reason (after its audit warning, if any).
+        toast(warningSpelled(r) || BW_NOT_ALLOWED, 'warn');
+      }
       await loadBitwardenConfig();
     } catch (e) {
       // The backend's own words, e.g. a new server or account without a new
-      // password.
-      toast(errText(e), 'err');
+      // password - spelled out.
+      toast(errSpelled(e), 'err');
     }
   });
 }
@@ -4593,11 +4708,11 @@ async function bwTest() {
         masterPassword: masterPassword || undefined,
       });
       const items = r && Number.isFinite(r.sshItemCount) ? ', ' + plural(r.sshItemCount, 'SSH key item') : '';
-      const text = `Connection OK - ${(r && r.account) || email} on ${(r && r.server) || serverUrl}${items}.`;
+      const text = `Connection OK - ${spellOut((r && r.account) || email)} on ${spellOut((r && r.server) || serverUrl)}${items}.`;
       setBwStatus(text, 'ok');
       toast(text, 'ok');
     } catch (e) {
-      const msg = errText(e);
+      const msg = errSpelled(e);
       setBwStatus(msg, 'err');
       toast(msg, 'err');
     }
@@ -4772,7 +4887,7 @@ function showBwSyncResult(s, opts) {
   const summary = bwSyncSummary(s);
   renderBwErrors(errors);
   if (s.ok === false) {
-    const reason = s.aborted || 'The sync stopped before it finished.';
+    const reason = s.aborted ? spellOut(s.aborted) : 'The sync stopped before it finished.';
     setBwStatus('Sync stopped: ' + reason + (summary ? ' Done before it stopped: ' + summary : ''), 'err');
     toast('Bitwarden sync stopped: ' + reason, 'err');
     return;
@@ -4780,7 +4895,7 @@ function showBwSyncResult(s, opts) {
   // More changes from Bitwarden than can be shown for approval: the backend
   // applied none of them and says why (approvalRefused) - as it says it.
   if (s.approvalRefused) {
-    bwSayNothingApplied(summary, String(s.approvalRefused), errors);
+    bwSayNothingApplied(summary, spellOut(s.approvalRefused), errors);
     return;
   }
   // The list changed again at every Apply (approvalStale each time): nothing
@@ -4867,7 +4982,7 @@ async function bwSyncNow() {
       await loadKeys();
       if (state.view === 'connect' || state.servers.length) await loadServers();
     } catch (e) {
-      const msg = errText(e);
+      const msg = errSpelled(e);
       setBwStatus(msg, 'err');
       toast(msg, 'err');
     }
@@ -6118,6 +6233,9 @@ function wire() {
   // why, like the neighbours (A6-08) - they used to answer a click with an
   // error toast.
   for (const id of ['bwSaveBtn', 'bwTestBtn', 'bwSyncNowBtn']) lockGate(el(id), 'bitwarden');
+  // Asks the backend's native question again for a destination not allowed.
+  el('bwAllowBtn').addEventListener('click', bwAllowSync);
+  lockGate(el('bwAllowBtn'), 'bitwardenAllow');
 
   // backup & restore (Settings)
   el('backupExportBtn').addEventListener('click', backupCreate);
@@ -7046,18 +7164,24 @@ function serverNoMatchRow(query) {
   return row;
 }
 
-function renderServerList() {
-  const list = el('serverList');
-  const empty = el('serverEmpty');
+/// The server list the UI renders: the active host category narrows the pool
+/// first, then the search box (as filteredKeys for keys).
+function filteredServers() {
   const filter = (el('serverSearch').value || '').toLowerCase().trim();
   const activeCat = activeHostCategoryId();
   let categoryPool = state.servers;
   if (activeCat === 'uncategorized') categoryPool = state.servers.filter(s => !s.categoryId);
   else if (activeCat !== 'all') categoryPool = hostsInCategoryRecursive(activeCat);
-  const filtered = !filter ? categoryPool : categoryPool.filter(s => {
+  return !filter ? categoryPool : categoryPool.filter(s => {
     return [s.name, s.host, s.username, s.keyName].filter(Boolean)
       .some(v => v.toLowerCase().includes(filter));
   });
+}
+
+function renderServerList() {
+  const list = el('serverList');
+  const empty = el('serverEmpty');
+  const filtered = filteredServers();
   list.innerHTML = '';
   if (state.serversLoadError) {
     // Not "No saved servers yet": the servers could not be read (A5-21).
@@ -7263,11 +7387,21 @@ function openServerModal({ id, keyId, prefill } = {}) {
   paintSavedPasswordRow();
   showFieldMessage('srvPortMsg', '');
   el('srvPort').removeAttribute('aria-invalid');
-  // Category (single-select; schema is one category_id per server)
-  state._pendingServerCategory = srv ? (srv.categoryId || null) : null;
+  // Category (single-select; schema is one category_id per server). A new
+  // server starts in the host category the list is filtered by (A5-42).
+  state._pendingServerCategory = srv ? (srv.categoryId || null) : newServerCategoryId();
   renderServerCategoryChips();
   state._editingServerId = id || null;
   setTimeout(() => el('srvName').focus(), 0);
+}
+
+/// The category a new server starts in: the one the server list is filtered
+/// by, if it is a real host category ("all" and "Uncategorized" are not) - as
+/// newKeyCategoryIds for a new key. A server saved without it was created in
+/// none and could not be found in the filtered list (A5-42).
+function newServerCategoryId() {
+  const id = activeHostCategoryId();
+  return state.categories.some((c) => c.id === id && c.scope === 'host') ? id : null;
 }
 
 function renderServerCategoryChips() {
@@ -7424,8 +7558,18 @@ async function submitServerModal() {
       closeServerModal();
       await loadServers();
       if (r && r.id) selectServer(r.id);
-      toast(hadSaved && method === 'publickey' ? 'Server saved - its saved password was removed (key login uses none).'
-        : clearSaved ? 'Server saved - its saved password was removed.' : 'Server saved.', 'ok');
+      // A server the list's filter hides was reported as plainly "saved", and
+      // looked lost (A5-42) - said as for a new key.
+      const hidden = !!(r && r.id) && state.servers.some((s) => s.id === r.id) && !filteredServers().some((s) => s.id === r.id);
+      const removed = hadSaved && method === 'publickey' ? ' - its saved password was removed (key login uses none)'
+        : clearSaved ? ' - its saved password was removed' : '';
+      toast(!hidden ? `Server saved${removed}.`
+        : removed ? `Server saved${removed}. It is hidden by the current filter. Clear the filter to see it.`
+          : 'Server saved - it is hidden by the current filter. Clear the filter to see it.', 'ok');
+      // What its key file needs (R10) follows as a warning of its own, so
+      // neither message hides the other - as a save with an audit warning.
+      const warning = warningSpelled(r);
+      if (warning) toast(warning, 'warn');
     } catch (e) { toast(errText(e), 'err'); }
   });
 }

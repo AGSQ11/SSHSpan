@@ -757,6 +757,95 @@ fn keep_socket_handle(
     tokio::net::TcpStream::from_std(tcp)
 }
 
+/// What a connect - and the save of a server that uses such a key file -
+/// says about a key file protected by a passphrase (A5-26). It used to fail
+/// with "Could not decode the selected private key: The key is encrypted",
+/// and nothing about what to do.
+pub(crate) const PASSPHRASE_PROTECTED_KEY: &str = "This key file is protected by a passphrase, which SSHSpan cannot ask for when connecting. Import it under Keys (New key > Import asks for the passphrase) and choose that key for this server, or remove the passphrase from the file.";
+
+/// Whether the private key text `pem` is protected by a passphrase, given
+/// what decoding it without one answered (`error`): russh says so for an
+/// OpenSSH key and an AES-encrypted legacy PEM key (`KeyIsEncrypted`); an
+/// encrypted PKCS#8 key, a legacy PEM key encrypted otherwise (DES-EDE3, as
+/// `openssl -des3` writes it - russh reports a decoding error for it) and an
+/// encrypted PuTTY key say so in their text.
+fn protected_by_passphrase(pem: &str, error: &russh::keys::Error) -> bool {
+    matches!(error, russh::keys::Error::KeyIsEncrypted)
+        || pem.lines().any(|line| {
+            let line = line.trim();
+            line == "-----BEGIN ENCRYPTED PRIVATE KEY-----"
+                || line.eq_ignore_ascii_case("Proc-Type: 4,ENCRYPTED")
+        })
+        || (pem.trim_start().starts_with("PuTTY-User-Key-File-")
+            && pem.lines().any(|line| {
+                line.strip_prefix("Encryption:")
+                    .is_some_and(|cipher| cipher.trim() != "none")
+            }))
+}
+
+/// What a server save warns, and a connect or Test connection refuses with,
+/// for a key file that is not on one of this computer's drives (Windows).
+pub(crate) const KEY_FILE_NOT_LOCAL: &str = "SSHSpan reads key files only from this computer's drives (like C:\\...). Copy the key to a local folder, or import it under Keys.";
+
+/// Whether `path` names a key file on one of this computer's drives as
+/// Windows reads it: a drive letter, a colon and a separator (`C:\...`,
+/// `C:/...`), or the same in its verbatim form (`\\?\C:\...`). Every other
+/// spelling is refused: a share (`\\server\share`, `//server/share`,
+/// `\\?\UNC\...`), the object namespace (`\??\...`, which also reaches a
+/// share), a device (`\\.\...`), any other prefix (`\\?\Volume{...}`), and a
+/// relative form, which Windows resolves against a current folder - of this
+/// drive or of another (`key`, `\key`, `D:key`). Opening a share at save or
+/// connect time hands it an NTLM sign-in and can stall. A mapped drive letter
+/// (`Z:\`) is allowed: the user set it up. Pure, and the same on every
+/// platform, so it is tested everywhere.
+pub(crate) fn windows_key_path_is_local(path: &str) -> bool {
+    // A drive letter, a colon and one of `separators`.
+    let on_a_drive = |text: &str, separators: &[u8]| {
+        let bytes = text.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && separators.contains(&bytes[2])
+    };
+    match path.strip_prefix(r"\\?\") {
+        // The verbatim form takes the path as it is: only a backslash
+        // separates.
+        Some(verbatim) => on_a_drive(verbatim, b"\\"),
+        None => on_a_drive(path, b"\\/"),
+    }
+}
+
+/// Why the key file at `path` is not read - on Windows, [`KEY_FILE_NOT_LOCAL`]
+/// when it is not on one of this computer's drives
+/// ([`windows_key_path_is_local`]); elsewhere never. Asked before the path
+/// is touched in any way.
+pub(crate) fn key_path_refusal(path: &str) -> Option<&'static str> {
+    key_path_refusal_on(path, cfg!(windows))
+}
+
+/// [`key_path_refusal`] for a platform that is Windows (`windows`) or not.
+fn key_path_refusal_on(path: &str, windows: bool) -> Option<&'static str> {
+    (windows && !windows_key_path_is_local(path)).then_some(KEY_FILE_NOT_LOCAL)
+}
+
+/// Whether the key file text `pem` is protected by a passphrase (see
+/// [`protected_by_passphrase`]): the warning a server save gives.
+pub(crate) fn key_needs_passphrase(pem: &str) -> bool {
+    decode_secret_key(pem, None).is_err_and(|e| protected_by_passphrase(pem, &e))
+}
+
+/// The private key a connect signs with: `pem` decoded without a passphrase,
+/// or what to do when it has one ([`PASSPHRASE_PROTECTED_KEY`]).
+fn decode_key_for_connect(pem: &str) -> anyhow::Result<PrivateKey> {
+    decode_secret_key(pem, None).map_err(|e| {
+        if protected_by_passphrase(pem, &e) {
+            anyhow::anyhow!(PASSPHRASE_PROTECTED_KEY)
+        } else {
+            anyhow::anyhow!("Could not decode the selected private key: {e}")
+        }
+    })
+}
+
 /// Authenticate to a live russh session handle. `auth_method` is one of
 /// "publickey" | "password" | "keyboard-interactive".
 pub async fn authenticate(
@@ -770,8 +859,7 @@ pub async fn authenticate(
                 .key_pem
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("No private key selected for this session"))?;
-            let key_pair = decode_secret_key(pem, None)
-                .map_err(|e| anyhow::anyhow!("Could not decode the selected private key: {e}"))?;
+            let key_pair = decode_key_for_connect(pem)?;
             // RSA keys: pin the signature hash to SHA-256 (rsa-sha2-256)
             // instead of letting the algorithm negotiation fall back to the
             // legacy ssh-rsa (SHA-1) signature format. Non-RSA keys have a
@@ -1457,6 +1545,8 @@ mod ru4_tests {
     struct Behaviour {
         stall_auth: bool,
         second_kbd_round: bool,
+        /// Accept any public key that signs (publickey auth).
+        accept_keys: bool,
     }
 
     struct FixtureHandler {
@@ -1505,6 +1595,18 @@ mod ru4_tests {
                 return Ok(password_prompt());
             }
             Ok(if answers == [FIXTURE_PASSWORD.as_bytes().to_vec()] {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            })
+        }
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _public_key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(if self.behaviour.accept_keys {
                 Auth::Accept
             } else {
                 Auth::reject()
@@ -1975,5 +2077,187 @@ mod ru4_tests {
         assert_eq!(registry.len(), 0);
         assert!(session_send(&registry, "s1", vec![1]).is_err());
         assert!(session_resize(&registry, "s1", 80, 24).is_err());
+    }
+
+    // ── A5-26: a key file protected by a passphrase ─────────────────────────
+
+    /// The key files of the A5-26 tests: one key, written without a
+    /// passphrase and with one in each format a key file can come in.
+    struct KeyFiles {
+        plain: String,
+        openssh: String,
+        pkcs8: String,
+        putty: String,
+    }
+
+    fn key_files() -> KeyFiles {
+        let key = generate_key_pair(KeyType::Ed25519, None, "fw-r10".into()).unwrap();
+        let with = |format| export_private_key(&key, format, Some("fw-r10-passphrase")).unwrap();
+        KeyFiles {
+            plain: export_private_key(&key, KeyFormat::OpenSsh, None).unwrap(),
+            openssh: with(KeyFormat::OpenSsh),
+            pkcs8: with(KeyFormat::Pkcs8),
+            putty: with(KeyFormat::Putty),
+        }
+    }
+
+    /// Which key files are protected by a passphrase: the OpenSSH, PKCS#8
+    /// and PuTTY forms written with one, and a legacy PEM key whose header
+    /// says it is encrypted (`openssl -des3` writes DES-EDE3, which russh
+    /// reports as a decoding error, not as an encrypted key); not the same
+    /// key without one, and not a file that is no key at all.
+    #[test]
+    fn fw_r10_a_key_file_protected_by_a_passphrase_is_recognised() {
+        let files = key_files();
+        assert!(files
+            .pkcs8
+            .contains("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
+        let legacy_des3 = "-----BEGIN RSA PRIVATE KEY-----\n\
+                           Proc-Type: 4,ENCRYPTED\n\
+                           DEK-Info: DES-EDE3-CBC,0123456789ABCDEF\n\
+                           \n\
+                           c29tZSBlbmNyeXB0ZWQgYnl0ZXMgdGhhdCBhcmUgbm8ga2V5\n\
+                           -----END RSA PRIVATE KEY-----\n";
+        for (what, pem) in [
+            ("OpenSSH", files.openssh.as_str()),
+            ("PKCS#8", files.pkcs8.as_str()),
+            ("PuTTY", files.putty.as_str()),
+            ("legacy PEM, DES-EDE3", legacy_des3),
+        ] {
+            assert!(key_needs_passphrase(pem), "{what}");
+        }
+        assert!(!key_needs_passphrase(&files.plain));
+        assert!(!key_needs_passphrase("not a key"));
+    }
+
+    /// Connecting with a key file protected by a passphrase failed with
+    /// "Could not decode the selected private key: The key is encrypted" and
+    /// nothing about what to do (A5-26). It says what to do now; the same key
+    /// without a passphrase connects as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fw_r10_a_connect_with_a_protected_key_file_says_what_to_do() {
+        let server = start_server(Behaviour {
+            accept_keys: true,
+            ..Behaviour::default()
+        })
+        .await;
+        let t = test_db();
+        pin(&t.db, server.port, &server.blob_b64);
+        let files = key_files();
+        let with_key = |pem: &str| ConnectParams {
+            key_pem: Some(Zeroizing::new(pem.to_string())),
+            password: None,
+            ..params(server.port, "publickey")
+        };
+        for (what, pem) in [("OpenSSH", &files.openssh), ("PKCS#8", &files.pkcs8)] {
+            let (no_prompt, _) = prompt(true, Duration::ZERO);
+            let err = open(&t.db, with_key(pem), no_prompt)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{what}: connected without the passphrase"));
+            assert_eq!(err, PASSPHRASE_PROTECTED_KEY, "{what}");
+        }
+        let (no_prompt, _) = prompt(true, Duration::ZERO);
+        let session = open(&t.db, with_key(&files.plain), no_prompt).await;
+        assert!(session.is_ok(), "{:?}", session.err());
+    }
+
+    // ── Key files only from this computer's drives (Windows) ───────────────
+
+    /// Only a drive-letter path, or its verbatim form, names a key file on
+    /// this computer. A share, the object and device namespaces, any other
+    /// prefix and every relative form do not: "\??\UNC\server\share" reached
+    /// the share at save time just like "\\server\share", because only the
+    /// first two characters were looked at.
+    #[test]
+    fn fw_t2_only_a_drive_letter_path_is_a_local_key_file() {
+        for local in [
+            r"C:\Users\me\.ssh\id_ed25519",
+            r"c:\keys\id",
+            "C:/Users/me/.ssh/id_ed25519",
+            r"Z:\mapped\key.pem",
+            r"C:\..\keys\id",
+            r"\\?\C:\keys\id",
+            r"\\?\d:\keys\id",
+        ] {
+            assert!(windows_key_path_is_local(local), "{local}");
+        }
+        for elsewhere in [
+            r"\\server\share\key",
+            "//server/share/key",
+            r"\/server/share/key",
+            r"/\server\share\key",
+            r"\??\UNC\server\share\key",
+            r"\??\C:\keys\id",
+            r"\\.\C:\keys\id",
+            r"\\.\pipe\key",
+            "//./C:/keys/id",
+            "//?/C:/keys/id",
+            r"\\?\UNC\server\share\key",
+            r"\\?\Volume{0b2c8f6e-0000-0000-0000-100000000000}\key",
+            r"\\?\GLOBALROOT\Device\Mup\server\share\key",
+            r"\\?\C:/keys/id",
+            r"\\?\C:",
+            r"C:keys\id",
+            "D:key",
+            "C:",
+            r"\keys\id",
+            "/home/me/.ssh/id",
+            r"keys\id",
+            r"..\id",
+            r"CC:\keys\id",
+            r"1:\keys\id",
+            "",
+        ] {
+            assert!(!windows_key_path_is_local(elsewhere), "{elsewhere}");
+        }
+    }
+
+    /// On Windows a key file elsewhere is refused with what to do, before
+    /// anything touches the path: at the save (a warning) and at a connect
+    /// or Test connection (an error). Elsewhere nothing is refused this way.
+    #[test]
+    fn fw_t2_a_key_file_elsewhere_is_refused_before_it_is_touched() {
+        for path in [r"\??\UNC\server\share\key", r"\\server\share\key", "D:key"] {
+            assert_eq!(
+                key_path_refusal_on(path, true),
+                Some(KEY_FILE_NOT_LOCAL),
+                "{path}"
+            );
+            assert_eq!(key_path_refusal_on(path, false), None, "{path}");
+        }
+        assert_eq!(key_path_refusal_on(r"C:\keys\id", true), None);
+        assert_eq!(
+            key_path_refusal(r"\\server\share\key"),
+            cfg!(windows).then_some(KEY_FILE_NOT_LOCAL)
+        );
+        // Asked first: before the save looks at the file (or skips a share
+        // path), and before the connect checks, audits or reads it.
+        let body = |source: &'static str, signature: &str| -> &'static str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let at = |text: &str, needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} not found"))
+        };
+        let save = body(
+            include_str!("../commands/server.rs"),
+            "fn key_file_warning(path: &str)",
+        );
+        let asked = at(save, "key_path_refusal(path)");
+        assert!(asked < at(save, "separator(start.next())"));
+        assert!(asked < at(save, "std::fs::metadata(path)"));
+        let connect = body(
+            include_str!("../commands/terminal.rs"),
+            "fn resolve_for_server(",
+        );
+        let asked = at(connect, "key_path_refusal(&p)");
+        assert!(asked < at(connect, "path.is_file()"));
+        assert!(asked < at(connect, "connect.pem_path_used"));
+        assert!(asked < at(connect, "read_to_string(&p)"));
     }
 }

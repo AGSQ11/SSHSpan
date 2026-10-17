@@ -382,10 +382,14 @@
                 </div>
               </div>
               <div class="settings-grid" id="bwGrid"></div>
+              <!-- A stored server and account the sync may not upload to yet
+                   (paintBwDestination, app.js). Filled with text only. -->
+              <p class="bw-unconfirmed" id="bwUnconfirmed" hidden></p>
               <div class="bw-actions">
                 <button id="bwSaveBtn" class="primary-btn"><span data-ico="cloud-cog"></span>Save</button>
                 <button id="bwTestBtn" class="ghost-btn"><span data-ico="server-cog"></span>Test connection</button>
                 <button id="bwSyncNowBtn" class="primary-btn"><span data-ico="refresh-cw"></span>Sync now</button>
+                <button id="bwAllowBtn" class="ghost-btn" aria-describedby="bwUnconfirmed" hidden>Allow syncing...</button>
               </div>
               <div class="status-strip" id="bwStatus" role="status" aria-live="polite">Not configured yet.</div>
               <!-- A sync's failed items, one per line (A2-08). -->

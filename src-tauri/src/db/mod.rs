@@ -186,6 +186,10 @@ pub struct BitwardenConfig {
     pub device_id: Option<String>,
     pub last_sync: Option<DateTime<Utc>>,
     pub last_result: Option<String>, // JSON sync summary
+    /// The destination ([`BitwardenConfig::destination`]) the user allowed
+    /// to receive uploads in a native question; `""` while none is. Uploads
+    /// go only to that destination ([`BitwardenConfig::confirmed`]).
+    pub confirmed_destination: Option<String>,
 }
 
 impl Default for BitwardenConfig {
@@ -199,7 +203,27 @@ impl Default for BitwardenConfig {
             device_id: None,
             last_sync: None,
             last_result: None,
+            confirmed_destination: None,
         }
+    }
+}
+
+impl BitwardenConfig {
+    /// Where a sync uploads to: the server URL and the account email (trimmed
+    /// and case-folded, as accounts are compared), as one value; `None` while
+    /// either is missing.
+    pub fn destination(&self) -> Option<String> {
+        let url = self.server_url.as_deref()?;
+        let email = self.email.as_deref()?;
+        serde_json::to_string(&[url, email.trim().to_lowercase().as_str()]).ok()
+    }
+
+    /// Whether uploads may go to the stored destination: it is the one the
+    /// user allowed. A save that points the sync at any other server or
+    /// account leaves it unconfirmed until the question allows that one.
+    pub fn confirmed(&self) -> bool {
+        self.destination()
+            .is_some_and(|destination| self.confirmed_destination.as_deref() == Some(&destination))
     }
 }
 
@@ -378,18 +402,24 @@ fn count_category_read(db_path: &std::path::Path) {
 /// the current worker instead of nesting a runtime. When called from a plain
 /// thread (startup, sync commands, tests) it uses a cached runtime to avoid
 /// re-creating one per call. When called from the root future of a
-/// `block_on` - a runtime is entered but no task runs, as in the body of a
-/// `#[tokio::test(flavor = "multi_thread")]` - it waits on a parker of its
-/// own ([`block_on_own_parker`]): tokio's nested `block_on` parks on the
-/// very parker of that thread's `block_on`, and used up a wake-up meant for
-/// another part of the root future that came in meanwhile - which then
-/// waited for the next event, forever when there was none (the hung MCP
-/// tests of round 6).
+/// multi-thread runtime's `block_on` - a runtime is entered but no task
+/// runs, as in the body of a `#[tokio::test(flavor = "multi_thread")]` - it
+/// waits on a parker of its own ([`block_on_own_parker`]): tokio's nested
+/// `block_on` parks on the very parker of that thread's `block_on`, and used
+/// up a wake-up meant for another part of the root future that came in
+/// meanwhile - which then waited for the next event, forever when there was
+/// none (the hung MCP tests of round 6). On a current-thread runtime it does
+/// not: that thread drives the runtime's timers and I/O, which would stop
+/// while it sleeps on a parker of its own - `block_in_place` refuses there
+/// at once, as it always did.
 fn block<F: std::future::Future<Output = T>, T>(f: F) -> T {
     if tokio::runtime::Handle::try_current().is_err() {
         return cached_runtime().block_on(f);
     }
-    if tokio::task::try_id().is_none() {
+    if tokio::task::try_id().is_none()
+        && tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+    {
         return block_on_own_parker(f);
     }
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
@@ -776,6 +806,7 @@ impl Database {
             // pinned key. Older rows hold the bare padded form (or, from a
             // backup, whatever text the file carried).
             self.migrate_known_host_fingerprints().await?;
+            self.migrate_bitwarden_destination().await?;
 
             // Transfer queue: survives a restart/crash so a 5,000-file batch
             // isn't silently lost mid-way and its `.part` files left orphaned.
@@ -2650,6 +2681,45 @@ impl Database {
         }
     }
 
+    /// Once per database (the `config` row [`BITWARDEN_DESTINATION_MIGRATED`]
+    /// records it): sync settings stored before destinations had to be
+    /// allowed keep syncing - their destination counts as allowed - so an
+    /// upgrade asks nothing. After this ran, nothing counts as allowed unless
+    /// a question allowed it: a destination saved later without an allowed
+    /// one stays off even if its `confirmed_destination` row is missing. A
+    /// backup restore writes only `setting.*` and bookmark rows to `config`,
+    /// so it can never undo the record of this run.
+    async fn migrate_bitwarden_destination(&self) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let done: Option<String> = sqlx::query_scalar("SELECT value FROM config WHERE key = ?")
+            .bind(BITWARDEN_DESTINATION_MIGRATED)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if done.is_none() {
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT key, value FROM bitwarden_config")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let mut config = bitwarden_config_from_rows(rows);
+            if config.confirmed_destination.is_none() {
+                if let Some(destination) = config.destination() {
+                    config.confirmed_destination = Some(destination);
+                    write_bitwarden_config(&mut tx, &config).await?;
+                }
+            }
+            sqlx::query(
+                "INSERT INTO config (key, value, updated_at) VALUES (?, 'done', ?) \
+                 ON CONFLICT(key) DO NOTHING",
+            )
+            .bind(BITWARDEN_DESTINATION_MIGRATED)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Rewrite every stored host-key fingerprint to the current form (see the
     /// call in `migrate()`). Idempotent: a second run finds nothing to change.
     /// The rows are read inside the (`BEGIN IMMEDIATE`) transaction that
@@ -3310,6 +3380,11 @@ impl Database {
 /// Config-key prefix of the per-server SFTP bookmark lists (one row per
 /// server id), as `sftp_bookmarks_list` / `sftp_bookmarks_save` spell it.
 pub const SFTP_BOOKMARKS_PREFIX: &str = "sftp.bookmarks.";
+
+/// The `config` row that records that sync settings stored before
+/// destinations had to be allowed were migrated as allowed
+/// ([`Database::migrate_bitwarden_destination`]).
+pub const BITWARDEN_DESTINATION_MIGRATED: &str = "migration.bitwarden_destination";
 
 /// How many parents a walk up a category's chain follows at most: far
 /// beyond any tree a person builds, and a bound even on a corrupt one.
@@ -4766,6 +4841,138 @@ mod tests {
             "the wake-up was lost: seen only after {took:?} (the 30 s timer)"
         );
     }
+
+    /// Sync settings stored before destinations had to be allowed keep
+    /// syncing: the one-time startup migration counts their destination as
+    /// allowed. After it ran, nothing counts as allowed unless a question
+    /// allowed it - a destination whose row went missing neither - and a
+    /// backup restore, which never carries the sync settings, changes none
+    /// of it.
+    #[test]
+    fn fw_r1_settings_from_before_keep_syncing_and_nothing_else_is_allowed_by_itself() {
+        let db = test_db();
+        // A database from before: settings without the row, and no record of
+        // the migration.
+        block(async {
+            for (key, value) in [
+                ("server_url", "https://vault.example.com"),
+                ("email", "me@example.com"),
+                ("master_password", "sealed"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO bitwarden_config (key, value, updated_at) \
+                     VALUES (?, ?, '2026-01-01T00:00:00Z')",
+                )
+                .bind(key)
+                .bind(value)
+                .execute(&db.pool)
+                .await?;
+            }
+            sqlx::query("DELETE FROM config WHERE key = ?")
+                .bind(BITWARDEN_DESTINATION_MIGRATED)
+                .execute(&db.pool)
+                .await?;
+            anyhow::Ok(())
+        })
+        .unwrap();
+        assert!(!db.load_bitwarden_config().unwrap().confirmed());
+        db.migrate().unwrap();
+        assert!(
+            db.load_bitwarden_config().unwrap().confirmed(),
+            "settings from before keep syncing"
+        );
+        // Re-pointed later, its row gone: the migration does not run again.
+        block(async {
+            sqlx::query(
+                "UPDATE bitwarden_config SET value = 'https://elsewhere.example.org' \
+                 WHERE key = 'server_url'",
+            )
+            .execute(&db.pool)
+            .await?;
+            sqlx::query("DELETE FROM bitwarden_config WHERE key = 'confirmed_destination'")
+                .execute(&db.pool)
+                .await?;
+            anyhow::Ok(())
+        })
+        .unwrap();
+        db.migrate().unwrap();
+        assert!(!db.load_bitwarden_config().unwrap().confirmed());
+        // A restore, even of a payload that names sync settings.
+        let payload = serde_json::json!({
+            "settings": {
+                "confirmed_destination": "x",
+                "bitwarden.server_url": "https://attacker.example",
+            },
+            "bitwardenConfig": {
+                "server_url": "https://attacker.example",
+                "confirmed_destination": "[\"https://attacker.example\",\"evil@attacker.example\"]",
+            },
+        });
+        db.restore_backup(&payload).unwrap();
+        let after = db.load_bitwarden_config().unwrap();
+        assert_eq!(
+            after.server_url.as_deref(),
+            Some("https://elsewhere.example.org")
+        );
+        assert!(!after.confirmed());
+        db.migrate().unwrap();
+        assert!(!db.load_bitwarden_config().unwrap().confirmed());
+        assert_eq!(
+            db.get_config(BITWARDEN_DESTINATION_MIGRATED)
+                .unwrap()
+                .as_deref(),
+            Some("done")
+        );
+    }
+
+    /// A save always stores the `confirmed_destination` row, so even a
+    /// database whose migration record went missing never takes a
+    /// destination saved by this version for one from before.
+    #[test]
+    fn fw_r1_a_saved_destination_is_never_taken_for_one_from_before() {
+        let db = test_db();
+        db.update_bitwarden_config(|config| {
+            crate::bitwarden::apply_bitwarden_save(
+                config,
+                crate::bitwarden::BitwardenSave {
+                    server_url: "https://attacker.example".into(),
+                    email: "evil@attacker.example".into(),
+                    sealed_password: Some("sealed".into()),
+                    folder_name: "SSHSpan_Keys".into(),
+                    servers_folder_name: "SSHSpan_Servers".into(),
+                },
+            )
+        })
+        .unwrap();
+        block(async {
+            sqlx::query("DELETE FROM config WHERE key = ?")
+                .bind(BITWARDEN_DESTINATION_MIGRATED)
+                .execute(&db.pool)
+                .await?;
+            anyhow::Ok(())
+        })
+        .unwrap();
+        db.migrate().unwrap();
+        let config = db.load_bitwarden_config().unwrap();
+        assert_eq!(config.confirmed_destination.as_deref(), Some(""));
+        assert!(!config.confirmed());
+    }
+
+    /// On a current-thread runtime a database call is not waited for on a
+    /// parker of its own ([`block_on_own_parker`]): the runtime's only
+    /// thread would sleep there, driving neither its timers nor its I/O. It
+    /// keeps the old behaviour - `block_in_place` refuses at once, with
+    /// tokio's message - not a silent hang. (The multi-thread side is
+    /// `rw_fix6_a_database_call_in_a_block_on_root_keeps_the_wake_ups_of_others`.)
+    #[test]
+    #[should_panic(expected = "can call blocking only when running on the multi-threaded runtime")]
+    fn fw_r7_a_current_thread_runtime_keeps_the_old_behaviour() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async { block(async { 1 }) });
+    }
 }
 
 fn short_hash(s: &str) -> u32 {
@@ -4794,6 +5001,7 @@ fn bitwarden_config_from_rows(rows: Vec<(String, String)>) -> BitwardenConfig {
                     .map(|d| d.with_timezone(&Utc))
             }
             "last_result" => config.last_result = Some(value),
+            "confirmed_destination" => config.confirmed_destination = Some(value),
             _ => {}
         }
     }
@@ -4820,7 +5028,7 @@ async fn write_bitwarden_config(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     config: &BitwardenConfig,
 ) -> Result<()> {
-    let fields: [(&str, Option<String>); 8] = [
+    let fields: [(&str, Option<String>); 9] = [
         ("server_url", config.server_url.clone()),
         ("email", config.email.clone()),
         ("master_password", config.master_password.clone()),
@@ -4829,6 +5037,10 @@ async fn write_bitwarden_config(
         ("device_id", config.device_id.clone()),
         ("last_sync", config.last_sync.map(|d| d.to_rfc3339())),
         ("last_result", config.last_result.clone()),
+        (
+            "confirmed_destination",
+            config.confirmed_destination.clone(),
+        ),
     ];
     let now = Utc::now().to_rfc3339();
     for (key, value) in fields {

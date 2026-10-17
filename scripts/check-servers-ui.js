@@ -71,6 +71,8 @@ const UPDATE = {
 const BW_CONFIG = {
   server_url: 'https://vault.example.com', email: 'me@example.com', folder_name: 'SSHSpan_Keys',
   servers_folder_name: 'SSHSpan_Servers', last_sync: null, last_result: null, hasMasterPassword: true,
+  // The destination is allowed (fw-rust-report.txt, RENDERER CONTRACT 2).
+  confirmed: true,
 };
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -1690,7 +1692,7 @@ async function scenarioBwForm(browser, server) {
 
 async function scenarioBwTest(browser, server) {
   const OK = { ok: true, server: 'https://vault.example.com', account: 'me@example.com', kdf: { type: 0, iterations: 600000 }, sshItemCount: 3, folders: [] };
-  const replies = { bitwarden_get_config: BW_CONFIG, bitwarden_test_connection: OK, bitwarden_save_config: { ok: true } };
+  const replies = { bitwarden_get_config: BW_CONFIG, bitwarden_test_connection: OK, bitwarden_save_config: { ok: true, confirmed: true, warning: null } };
   await withApp(browser, server, { replies }, 'A2-52 / A2-18 Test and Save', async (app) => {
     const { page } = app;
     await bwOpen(page);
@@ -1822,6 +1824,31 @@ async function scenarioBwLastResult(browser, server) {
     yes('and still says when it ran', st.text.startsWith('Last synced: '), st.text);
     check('its errors are listed', await page.evaluate(() => [...document.querySelectorAll('#bwErrors li')].map((li) => li.textContent)),
       ['alpha: could not decrypt the item\'s name', 'web-1: push failed']);
+    check('no page errors', app.errors, []);
+  });
+  // J1: a failed item's name and reason are text from outside - spelled out,
+  // each in a <bdi> of its own - so an item title cannot turn the advice
+  // after it around.
+  const RLO = '\u{202E}';
+  const TURNING = { ok: true, pushed: 1, errors: [
+    { name: `evil${RLO}txt.exe`, error: `the item evil${RLO}gpj claims a fingerprint that does not match its key - not imported.` },
+    { error: `${RLO}not imported` },
+  ] };
+  await withApp(browser, server, { replies: { bitwarden_get_config: cfg(TURNING) } }, 'J1 a failed item named to turn the advice around', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const items = await page.evaluate(() => [...document.querySelectorAll('#bwErrors li')].map((li) => ({
+      text: li.textContent, parts: [...li.querySelectorAll('bdi')].map((b) => b.textContent),
+    })));
+    check('J1 no direction character reaches the error list', items.some((i) => i.text.includes(RLO)), false);
+    check('J1 the name and the reason each sit in a <bdi> of their own, spelled out', items.map((i) => i.parts), [
+      ['evil<U+202E>txt.exe', 'the item evil<U+202E>gpj claims a fingerprint that does not match its key - not imported.'],
+      ['<U+202E>not imported'],
+    ]);
+    check('J1 read as one line each, as before', items.map((i) => i.text), [
+      'evil<U+202E>txt.exe: the item evil<U+202E>gpj claims a fingerprint that does not match its key - not imported.',
+      '<U+202E>not imported',
+    ]);
     check('no page errors', app.errors, []);
   });
   await withApp(browser, server, { replies: { bitwarden_get_config: cfg({ ok: true, pushed: 1, errors: [] }) } }, 'the last run was clean', async (app) => {
@@ -2014,13 +2041,525 @@ async function scenarioSettingsLockGates(browser, server) {
   });
 
   const W = 'The sync settings were saved, but their audit row could not be written: disk I/O error';
-  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG, bitwarden_save_config: { ok: true, warning: W } } }, 'B1 the sync settings saved without their audit row', async (app) => {
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG, bitwarden_save_config: { ok: true, confirmed: true, warning: W } } }, 'B1 the sync settings saved without their audit row', async (app) => {
     const { page } = app;
     await bwOpen(page);
     await page.click('#bwSaveBtn');
     await page.waitForTimeout(200);
     yes('the warning is shown as it is', (await liveToasts(page)).includes(W), JSON.stringify(await liveToasts(page)));
     check('once: the save did happen', await app.count('bitwarden_save_config'), 1);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── J5 (A5-42): a new server while a host category filters the list ───────
+//
+// The New server dialog starts in the active host category (as New key does
+// in the key category), and a saved server the filter still hides is said
+// to be hidden, in the key version's words - it read as plainly "saved" and
+// was nowhere in the list.
+
+async function scenarioServerNewInFilter(browser, server) {
+  const categories = [CATEGORY_KEY,
+    { id: 'h1', name: 'EU', parent_id: null, scope: 'host', sort_index: 0, color: null },
+    { id: 'h2', name: 'US', parent_id: null, scope: 'host', sort_index: 1, color: null }];
+  const servers = [Object.assign(SERVER('s1', 'web-1'), { categoryId: 'h1' }), SERVER('s2', 'db-1')];
+  const HIDDEN = 'Server saved - it is hidden by the current filter. Clear the filter to see it.';
+  // server_save as the backend does it: the saved server is in the next server_list.
+  const stubSaves = (page) => page.evaluate((list) => {
+    window.__servers = list;
+    window.__replies.server_list = () => ({ servers: window.__servers });
+    window.__replies.server_save = (a) => {
+      const id = a.id || 's-new-' + window.__servers.length;
+      window.__servers = window.__servers.filter((s) => s.id !== id).concat([{
+        id, name: a.name, host: a.host, port: a.port, username: a.username, authMethod: a.authMethod,
+        hasSavedPassword: false, categoryId: a.categoryId || null, keyId: a.keyId, pemPath: a.pemPath,
+      }]);
+      // As the contract has it (fw-rust-report.txt 7): no warning here.
+      return { ok: true, id, warning: null };
+    };
+  }, servers);
+  const newServer = async (page, name) => {
+    await page.evaluate(() => { openServerModal({}); setConnectAuthMethod('password'); });
+    await setValue(page, '#srvName', name);
+    await setValue(page, '#srvHost', name + '.example');
+    await setValue(page, '#srvUser', 'ops');
+  };
+  const chips = (page) => page.evaluate(() => [state._pendingServerCategory, [...document.querySelectorAll('#srvCategory .cat-chip')].map((c) => c.textContent.trim())]);
+  const names = (page) => page.evaluate(() => [...document.querySelectorAll('#serverList .server-row .server-name')].map((n) => n.textContent));
+  const lastToast = async (page) => (await liveToasts(page)).slice(-1)[0];
+  await withApp(browser, server, { servers, categories }, 'J5 a new server while the list is filtered by a host category', async (app) => {
+    const { page } = app;
+    await stubSaves(page);
+    await serversView(page);
+    await page.evaluate(() => setActiveCategory('h1'));
+    await page.waitForTimeout(80);
+    await newServer(page, 'eu-2');
+    const [pending, shown] = await chips(page);
+    check('J5 the New server dialog starts in the active host category', [pending, shown.some((t) => /EU/.test(t))], ['h1', true]);
+    check('J5 and saves the server there', ((await saveServerForm(app)) || {}).categoryId, 'h1');
+    await page.waitForTimeout(150);
+    check('J5 so it appears in the filtered list', (await names(page)).includes('eu-2'), true);
+    check('J5 and the toast is a plain "saved"', await lastToast(page), 'Server saved.');
+    // The user chooses another category, or none: the server the filter hides
+    // is said to be hidden.
+    await newServer(page, 'us-1');
+    await page.evaluate(() => { state._pendingServerCategory = 'h2'; renderServerCategoryChips(); });
+    check('(set-up) saved in US', ((await saveServerForm(app)) || {}).categoryId, 'h2');
+    await page.waitForTimeout(150);
+    check('J5 a server saved into another category is said to be hidden', [(await names(page)).includes('us-1'), await lastToast(page)], [false, HIDDEN]);
+    await newServer(page, 'none-1');
+    await page.evaluate(() => { state._pendingServerCategory = null; renderServerCategoryChips(); });
+    check('(set-up) saved in no category', ((await saveServerForm(app)) || {}).categoryId, null);
+    await page.waitForTimeout(150);
+    check('J5 and so is one saved in none', [(await names(page)).includes('none-1'), await lastToast(page)], [false, HIDDEN]);
+    // An edited server keeps its own category - none stays none, though the
+    // list is filtered by EU.
+    await page.evaluate(() => openServerModal({ id: 's2' }));
+    check('J5 editing a server keeps its own category (none), not the active one', (await chips(page))[0], null);
+    await page.evaluate(() => closeServerModal());
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { servers, categories }, 'J5 a new server with no filter', async (app) => {
+    const { page } = app;
+    await stubSaves(page);
+    await serversView(page);
+    await newServer(page, 'plain-1');
+    check('J5 with no filter the dialog starts in no category', (await chips(page))[0], null);
+    check('J5 and saves the server in none', ((await saveServerForm(app)) || {}).categoryId, null);
+    await page.waitForTimeout(150);
+    check('J5 it is in the list, and the toast is a plain "saved"', [(await names(page)).includes('plain-1'), await lastToast(page)], [true, 'Server saved.']);
+    // "Uncategorized" is no category to start in, and a server in none is shown there.
+    await page.evaluate(() => setActiveCategory('uncategorized'));
+    await page.waitForTimeout(80);
+    await newServer(page, 'plain-2');
+    check('J5 the Uncategorized filter preselects nothing', (await chips(page))[0], null);
+    await saveServerForm(app);
+    await page.waitForTimeout(150);
+    check('J5 and the server saved in none is in that list', [(await names(page)).includes('plain-2'), await lastToast(page)], [true, 'Server saved.']);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── J6 (R10): a server saved with a warning ───────────────────────────────
+//
+// server_save's result carries `warning` when the server uses a key file
+// protected by a passphrase, which SSHSpan cannot ask for when connecting
+// (fw-rust-report.txt, RENDERER CONTRACT 7). The server is saved either way:
+// the save says so as before (the J5 "hidden by the current filter" text
+// included), and the warning follows as a warning toast of its own, in the
+// backend's words, spelled out - from the server dialog, and so from the ssh
+// config import, which saves through it.
+
+const PASSPHRASE_KEY = 'This key file is protected by a passphrase, which SSHSpan cannot ask for when connecting. Import it under Keys (New key > Import asks for the passphrase) and choose that key for this server, or remove the passphrase from the file.';
+
+async function scenarioServerSaveWarning(browser, server) {
+  const categories = [CATEGORY_KEY,
+    { id: 'h1', name: 'EU', parent_id: null, scope: 'host', sort_index: 0, color: null },
+    { id: 'h2', name: 'US', parent_id: null, scope: 'host', sort_index: 1, color: null }];
+  const servers = [Object.assign(SERVER('s1', 'web-1'), { categoryId: 'h1' })];
+  // server_save as the backend does it - the saved server is in the next
+  // server_list - answering with the warning given (null: none).
+  const stubSaves = (page, warning) => page.evaluate(({ list, w }) => {
+    window.__servers = window.__servers || list;
+    window.__replies.server_list = () => ({ servers: window.__servers });
+    window.__replies.server_save = (a) => {
+      const id = a.id || 's-new-' + window.__servers.length;
+      window.__servers = window.__servers.filter((s) => s.id !== id).concat([{
+        id, name: a.name, host: a.host, port: a.port, username: a.username, authMethod: a.authMethod,
+        hasSavedPassword: false, categoryId: a.categoryId || null, keyId: a.keyId, pemPath: a.pemPath,
+      }]);
+      return { ok: true, id, warning: w };
+    };
+  }, { list: servers, w: warning });
+  // A new server signing in with a key file (a new server signs in with a key).
+  const newServer = async (page, name) => {
+    await page.evaluate(() => openServerModal({}));
+    await setValue(page, '#srvName', name);
+    await setValue(page, '#srvHost', name + '.example');
+    await setValue(page, '#srvUser', 'ops');
+    await setValue(page, '#srvPemPath', '/home/u/keys/' + name + '.pem');
+  };
+  const clearToasts = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].forEach((t) => t.remove()));
+  // The toasts on screen, oldest first, each as [kind, text] - with its count
+  // badge (" ×2") when the same message came twice, so each is said once.
+  const said = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item:not(.leaving)')]
+    .map((n) => {
+      const badge = n.querySelector('.toast-count');
+      return [['ok', 'warn', 'err', 'info'].find((k) => n.classList.contains(k)) || '?',
+        n.querySelector('.toast-text').textContent + (badge ? ' ' + badge.textContent : '')];
+    }));
+  const save = async (app) => {
+    await clearToasts(app.page);
+    const sent = await saveServerForm(app);
+    await app.page.waitForTimeout(150);
+    return sent;
+  };
+  await withApp(browser, server, { servers, categories }, 'J6 a server saved from the dialog, with a warning', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    await stubSaves(page, PASSPHRASE_KEY);
+    await newServer(page, 'enc-1');
+    check('(set-up) the server is saved with its key file', ((await save(app)) || {}).pemPath, '/home/u/keys/enc-1.pem');
+    check('J6 saved as before, then the warning as a warning toast, in the backend\'s words',
+      await said(page), [['ok', 'Server saved.'], ['warn', PASSPHRASE_KEY]]);
+    // The backend's words are text from outside: spelled out.
+    await stubSaves(page, 'This key file \u{202E}mep.esrever is protected by a passphrase.');
+    await newServer(page, 'enc-2');
+    await save(app);
+    check('J6 the warning is spelled out (no direction character reaches the toast)',
+      await said(page), [['ok', 'Server saved.'], ['warn', 'This key file <U+202E>mep.esrever is protected by a passphrase.']]);
+    // No warning: as before.
+    await stubSaves(page, null);
+    await newServer(page, 'plain-1');
+    await save(app);
+    check('J6 a save whose warning is null says "Server saved." alone, as before', await said(page), [['ok', 'Server saved.']]);
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { servers, categories }, 'J6 hidden by the filter, and a warning', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    await stubSaves(page, PASSPHRASE_KEY);
+    await page.evaluate(() => setActiveCategory('h1'));
+    await page.waitForTimeout(80);
+    await newServer(page, 'us-enc');
+    await page.evaluate(() => { state._pendingServerCategory = 'h2'; renderServerCategoryChips(); });
+    check('(set-up) saved into US, while the list shows EU', ((await save(app)) || {}).categoryId, 'h2');
+    check('J6 both are said: hidden by the filter, and the warning',
+      await said(page), [['ok', 'Server saved - it is hidden by the current filter. Clear the filter to see it.'], ['warn', PASSPHRASE_KEY]]);
+    check('no page errors', app.errors, []);
+  });
+  // The ssh config import prefills the dialog, and its Save is the dialog's.
+  const HOSTS = {
+    hosts: [{ host: 'bastion', hostname: 'b.example', user: 'ops', port: 22, identity_file: '/home/u/.ssh/id_enc', identities_only: false, forward_agent: false, proxy_jump: null, extra: {} }],
+    path: '/home/u/.ssh/config',
+  };
+  await withApp(browser, server, { servers, categories, replies: { ssh_config_list_hosts: HOSTS } }, 'J6 a server imported from ~/.ssh/config, with a warning', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    await stubSaves(page, PASSPHRASE_KEY);
+    await page.click('#serverImportBtn');
+    await page.waitForSelector('#keyConnectMenu .ctx-item');
+    yes('(set-up) the host opens the server form', (await clickMenuItem(page, /^bastion/)) && await waitVisible(page, '#serverModal'));
+    check('(set-up) saved with the key file of its Host block', ((await save(app)) || {}).pemPath, '/home/u/.ssh/id_enc');
+    check('J6 the imported server\'s save says the warning too', await said(page), [['ok', 'Server saved.'], ['warn', PASSPHRASE_KEY]]);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── J7: Bitwarden texts from the backend, spelled out ──────────────────────
+//
+// A backend sentence can quote a name the server or the page chose - an
+// account email, a host, an item: shown with its direction and invisible
+// characters spelled out ("<U+202E>"), so none can turn the rest around. A
+// whole sentence cannot sit in a <bdi> around just the name; spelled out, it
+// holds no control (as the Stop-editing question). The sync refusal and W8
+// below are the backend's coming texts, each with a U+202E in what it quotes;
+// the save refusal, the Test and "Allow syncing..." errors are made up around
+// one.
+
+async function scenarioBwSpelled(browser, server) {
+  const RLO = '\u{202E}';
+  const spelled = (t) => t.split(RLO).join('<U+202E>');
+  const SYNC_OFF = `Bitwarden sync is off until you allow it to upload your keys and passwords to the account me${RLO}@example.com on vault.example.com. Use "Allow syncing..." in Settings > Bitwarden.`;
+  const W8 = `Bitwarden sync stays off, because uploading to vault${RLO}.example.com was declined a moment ago. Wait 30 seconds, then use "Allow syncing..." in Settings > Bitwarden.`;
+  const AUDIT = `The sync settings were saved, but their audit row could not be written: disk ${RLO}full`;
+  const SAVE_REFUSAL = `Enter the Bitwarden account as one email address, like name@example.com - not me${RLO}@example.com.`;
+  const clear = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].forEach((t) => t.remove()));
+  const warned = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item.warn .toast-text')].map((t) => t.textContent));
+  const shown = async (page) => [(await bwStatus(page)).text, ...(await liveToasts(page))];
+  const turned = async (page) => (await shown(page)).filter((t) => t.includes(RLO));
+  const UNCONFIRMED = Object.assign({}, BW_CONFIG, { confirmed: false });
+
+  await withApp(browser, server, { replies: { bitwarden_get_config: Object.assign({}, BW_CONFIG, {
+    last_sync: '2026-10-12T08:30:00Z', last_result: { ok: false, aborted: `Stopped at the item evil${RLO}txt.exe.`, errors: [] },
+  }) } }, 'J7 the last run stopped, its reason turning', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    check('J7 the last run\'s reason is spelled out', (await bwStatus(page)).text, 'Last sync stopped: Stopped at the item evil<U+202E>txt.exe.');
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'J7 the save\'s texts', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const saveWith = async (reply) => {
+      await clear(page);
+      await page.evaluate((r) => { window.__replies.bitwarden_save_config = r; }, reply);
+      await page.click('#bwSaveBtn');
+      await page.waitForTimeout(250);
+    };
+    await saveWith({ $reject: SAVE_REFUSAL });
+    check('J7 a save refused: the refusal spelled out', [(await liveToasts(page)).includes(spelled(SAVE_REFUSAL)), await turned(page)], [true, []]);
+    await saveWith({ ok: true, confirmed: false, warning: W8 });
+    check('J7 a save not allowed (W8): its warning spelled out', [await warned(page), await turned(page)], [[spelled(W8)], []]);
+    await saveWith({ ok: true, confirmed: true, warning: AUDIT });
+    check('J7 a save with an audit warning: saved, and the warning spelled out',
+      [(await liveToasts(page)).includes('Bitwarden settings saved.'), await warned(page), await turned(page)], [true, [spelled(AUDIT)], []]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'J7 Test connection\'s texts', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const REACH = `Could not reach vault${RLO}.example.com.`;
+    await page.evaluate((m) => { window.__replies.bitwarden_test_connection = { $reject: m }; }, REACH);
+    await page.click('#bwTestBtn');
+    await page.waitForTimeout(250);
+    check('J7 a failed Test: the error spelled out, in the status line and the toast',
+      [(await bwStatus(page)).text, (await liveToasts(page)).includes(spelled(REACH)), await turned(page)], [spelled(REACH), true, []]);
+    await clear(page);
+    await page.evaluate((r) => { window.__replies.bitwarden_test_connection = { ok: true, server: 'https://vault' + r + '.example.com', account: 'me' + r + '@example.com', kdf: { type: 0, iterations: 600000 }, sshItemCount: 3, folders: [] }; }, RLO);
+    await page.click('#bwTestBtn');
+    await page.waitForTimeout(250);
+    const st = (await bwStatus(page)).text;
+    check('J7 a good Test: the account and server it names are spelled out',
+      [st.includes('me<U+202E>@example.com on https://vault<U+202E>.example.com'), await turned(page)], [true, []]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED } }, 'J7 Allow syncing...\'s texts', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const ASK = `Could not ask about vault${RLO}.example.com.`;
+    await page.evaluate((m) => { window.__replies.bitwarden_allow_sync = { $reject: m }; }, ASK);
+    await page.click('#bwAllowBtn');
+    await page.waitForTimeout(250);
+    check('J7 a refused Allow syncing...: the error spelled out', [(await bwStatus(page)).text, await turned(page)], [spelled(ASK), []]);
+    await clear(page);
+    await page.evaluate((w) => { window.__replies.bitwarden_allow_sync = { ok: true, confirmed: false, warning: w }; }, W8);
+    await page.click('#bwAllowBtn');
+    await page.waitForTimeout(250);
+    check('J7 Allow syncing... not allowed (W8): the warning spelled out',
+      [(await bwStatus(page)).text, await warned(page), await turned(page)], [spelled(W8), [spelled(W8)], []]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED, bitwarden_sync: { $reject: SYNC_OFF } } }, 'J7 a sync refused', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    await page.waitForTimeout(250);
+    check('J7 the sync refusal (with the account email) spelled out',
+      [(await bwStatus(page)).text, (await liveToasts(page)).includes(spelled(SYNC_OFF)), await turned(page)], [spelled(SYNC_OFF), true, []]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG } }, 'J7 a sync stopped, a list too long', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    const ABORTED = `The vault${RLO} was locked; sync aborted.`;
+    await page.evaluate((m) => { window.__replies.bitwarden_sync = { ok: false, aborted: m, errors: [] }; }, ABORTED);
+    await page.click('#bwSyncNowBtn');
+    await page.waitForTimeout(250);
+    check('J7 a stopped sync: its reason spelled out, in the status line and the toast',
+      [(await bwStatus(page)).text, (await liveToasts(page)).includes('Bitwarden sync stopped: ' + spelled(ABORTED)), await turned(page)],
+      ['Sync stopped: ' + spelled(ABORTED), true, []]);
+    await clear(page);
+    const REFUSED = `Too many changes to review at once (612) - nothing from Bitwarden was applied, item ${RLO}evil included.`;
+    await page.evaluate((m) => {
+      window.__replies.bitwarden_sync = () => ({ ok: true, errors: [], skippedServerOverwrites: 612, pendingTruncated: true,
+        pendingServers: [{ kind: 'overwrite', name: 'web-1', incomingName: 'web-1', host: 'h', port: 22, localHost: 'h0', localPort: 22, changes: ['host'] }],
+        pendingKeys: [], approvalRefused: m });
+    }, REFUSED);
+    await page.click('#bwSyncNowBtn');
+    await page.waitForTimeout(300);
+    check('J7 a list too long: the refusal spelled out',
+      [(await bwStatus(page)).text.includes(spelled(REFUSED)), (await warned(page)).includes(spelled(REFUSED)), await turned(page)], [true, true, []]);
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── J4: the Bitwarden destination, allowed or not ─────────────────────────
+//
+// The backend asks a native question before keys and passwords may go to a
+// server and account (bitwarden_save_config, bitwarden_allow_sync); until it
+// is answered "Allow", bitwarden_get_config says confirmed: false and every
+// sync is refused (fw-rust-report.txt, RENDERER CONTRACT). Stubs follow that
+// contract: { ok: true, confirmed, warning } and the W1 text.
+
+const BW_W1 = 'Bitwarden sync stays off, because uploading your keys and passwords to vault.example.com was not allowed. Use "Allow syncing..." in Settings > Bitwarden to be asked again.';
+const BW_SYNC_OFF = 'Bitwarden sync is off until you allow it to upload your keys and passwords to the account me@example.com on vault.example.com. Use "Allow syncing..." in Settings > Bitwarden.';
+const BW_NOTE = (host) => `Not confirmed - SSHSpan will not sync with ${host} until you allow it.`;
+
+async function scenarioBwDestination(browser, server) {
+  const UNCONFIRMED = Object.assign({}, BW_CONFIG, { confirmed: false });
+  const state = (page) => page.evaluate(() => {
+    const n = document.getElementById('bwUnconfirmed');
+    const b = document.getElementById('bwAllowBtn');
+    return {
+      note: n && !n.hidden ? n.textContent : null,
+      isolated: n && !n.hidden ? [...n.querySelectorAll('bdi')].map((x) => x.textContent) : null,
+      allow: b && !b.hidden ? [b.textContent.trim(), b.disabled] : null,
+      syncEnabled: !document.getElementById('bwSyncNowBtn').disabled,
+    };
+  });
+  const warned = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item.warn .toast-text')].map((t) => t.textContent));
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED } }, 'J4 a destination not allowed yet, then allowed', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    check('J4 the settings say so, the host isolated; Allow syncing... offered; Sync stays enabled', await state(page), {
+      note: BW_NOTE('vault.example.com'), isolated: ['vault.example.com'], allow: ['Allow syncing...', false], syncEnabled: true,
+    });
+    check('J4 Allow syncing... is described by the note', await page.evaluate(() => el('bwAllowBtn').getAttribute('aria-describedby')), 'bwUnconfirmed');
+    await page.evaluate(() => {
+      window.__replies.bitwarden_allow_sync = () => {
+        window.__replies.bitwarden_get_config = Object.assign({}, window.__replies.bitwarden_get_config, { confirmed: true });
+        return { ok: true, confirmed: true, warning: null };
+      };
+    });
+    await page.click('#bwAllowBtn');
+    await page.waitForTimeout(250);
+    check('J4 Allow syncing... asks the backend once, with no arguments', (await app.calls('bitwarden_allow_sync')).map((c) => c.args), [{}]);
+    check('J4 allowed: the note and the button go', await state(page), { note: null, isolated: null, allow: null, syncEnabled: true });
+    yes('J4 and it says so', (await liveToasts(page)).some((t) => /^Bitwarden sync is allowed - SSHSpan may upload your keys and passwords to /.test(t)),
+      JSON.stringify(await liveToasts(page)));
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED, bitwarden_allow_sync: { ok: true, confirmed: false, warning: BW_W1 } } },
+    'J4 Allow syncing... answered no again', async (app) => {
+      const { page } = app;
+      await bwOpen(page);
+      await page.click('#bwAllowBtn');
+      await page.waitForTimeout(250);
+      const st = await bwStatus(page);
+      check('J4 still not allowed: the backend\'s reason, as a warning', [st.text, /\bwarn\b/.test(st.cls)], [BW_W1, true]);
+      yes('J4 and as a warning toast', (await warned(page)).includes(BW_W1), JSON.stringify(await warned(page)));
+      check('J4 the note stays', (await state(page)).note, BW_NOTE('vault.example.com'));
+      check('no page errors', app.errors, []);
+    });
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED } }, 'J4 Allow syncing... while its question is open', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    await hold(page, 'bitwarden_allow_sync');
+    await page.click('#bwAllowBtn');
+    await page.waitForTimeout(120);
+    check('J4 busy while the native question is open', await page.evaluate(() => [el('bwAllowBtn').disabled, el('bwAllowBtn').getAttribute('aria-busy')]), [true, 'true']);
+    check('J4 and the status says what it waits for, the host isolated', (await bwStatus(page)).text,
+      'Waiting for your answer: SSHSpan asks in its own dialog whether it may upload your keys and passwords to \u{2068}vault.example.com\u{2069}.');
+    await page.evaluate(() => el('bwAllowBtn').click());
+    check('J4 a second click asks nothing more', await app.count('bitwarden_allow_sync'), 1);
+    await page.evaluate(() => { window.__replies.bitwarden_allow_sync = { $reject: 'Save the Bitwarden sync settings first.' }; });
+    await letGo(page, 'bitwarden_allow_sync');
+    await page.waitForTimeout(200);
+    const st = await bwStatus(page);
+    check('J4 a refusal is said as it is, as an error', [st.text, /\berr\b/.test(st.cls)], ['Save the Bitwarden sync settings first.', true]);
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED } }, 'J4 Allow syncing... and the lock', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    await page.evaluate(() => { window.__backend.unlocked = false; return refreshVaultStatus(); });
+    await page.waitForTimeout(150);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    check('J4 lock-gated like its neighbours', await page.evaluate(() => [el('bwAllowBtn').disabled, el('bwAllowBtn').title]),
+      [true, 'Unlock the vault to allow the Bitwarden sync.']);
+    check('no page errors', app.errors, []);
+  });
+  // Only a stored destination that is not allowed is said: none saved, or an
+  // allowed one, shows nothing; a URL that is no URL is shown as it is,
+  // spelled out.
+  for (const [title, config, want] of [
+    ['nothing saved', Object.assign({}, BW_CONFIG, { server_url: '', email: '', confirmed: false }), null],
+    ['no account email saved', Object.assign({}, BW_CONFIG, { email: '', confirmed: false }), null],
+    ['allowed', BW_CONFIG, null],
+    ['an answer that says nothing of confirmed (fails closed)', (() => { const c = Object.assign({}, BW_CONFIG); delete c.confirmed; return c; })(), ['vault.example.com']],
+    ['a host with a port', Object.assign({}, UNCONFIRMED, { server_url: 'https://vault.example.com:8443/' }), ['vault.example.com:8443']],
+    ['no URL at all', Object.assign({}, UNCONFIRMED, { server_url: 'vault\u{202E}moc' }), ['vault<U+202E>moc']],
+  ]) {
+    await withApp(browser, server, { replies: { bitwarden_get_config: config } }, `J4 the note: ${title}`, async (app) => {
+      const { page } = app;
+      await bwOpen(page);
+      const s = await state(page);
+      check(`J4 ${title}: ${want ? 'the note names the host, spelled out' : 'no note, no Allow syncing...'}`, [s.isolated, !!s.allow], [want, !!want]);
+      check('no page errors', app.errors, []);
+    });
+  }
+  // A save the native question did not allow: its warning, as a warning
+  // toast - the settings are stored, but "saved" alone would read as done.
+  const AUDIT = 'The sync settings were saved, but their audit row could not be written: disk I/O error';
+  for (const [title, warning] of [['a save not allowed', BW_W1], ['and its audit row failed too', `${AUDIT} ${BW_W1}`]]) {
+    await withApp(browser, server, { replies: { bitwarden_get_config: BW_CONFIG, bitwarden_save_config: { ok: true, confirmed: false, warning } } },
+      `J4 ${title}`, async (app) => {
+        const { page } = app;
+        await bwOpen(page);
+        await page.click('#bwSaveBtn');
+        await page.waitForTimeout(250);
+        check(`J4 ${title}: its warning as a warning toast, and no "saved"`,
+          [(await warned(page)).includes(warning), (await liveToasts(page)).includes('Bitwarden settings saved.')], [true, false]);
+        check('no page errors', app.errors, []);
+      });
+  }
+  // J8: the focus of a keyboard user. Allowed, "Allow syncing..." goes with
+  // the note - the focus goes on to Sync now, the next step (or Save, when Sync
+  // now cannot take it), not to the page; answered "no", it stays on the
+  // button. A user who moved on keeps their place; one whose click did not
+  // focus the button is not moved.
+  const focused = (page) => page.evaluate(() => (document.activeElement && document.activeElement.id) || 'body');
+  const allowing = (page, confirmed) => page.evaluate((c) => {
+    window.__replies.bitwarden_allow_sync = () => {
+      window.__replies.bitwarden_get_config = Object.assign({}, window.__replies.bitwarden_get_config, { confirmed: c });
+      return { ok: true, confirmed: c, warning: c ? null : 'Bitwarden sync stays off, because uploading your keys and passwords to vault.example.com was not allowed. Use "Allow syncing..." in Settings > Bitwarden to be asked again.' };
+    };
+  }, confirmed);
+  for (const [title, confirmed, prepare, want] of [
+    ['J8 Enter on Allow syncing..., allowed: the focus goes on to Sync now', true, null, 'bwSyncNowBtn'],
+    ['J8 Enter on Allow syncing..., answered no: the focus stays on it', false, null, 'bwAllowBtn'],
+    ['J8 allowed while Sync now cannot take the focus: Save takes it', true, () => { el('bwSyncNowBtn').hidden = true; }, 'bwSaveBtn'],
+  ]) {
+    await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED } }, title, async (app) => {
+      const { page } = app;
+      await bwOpen(page);
+      await allowing(page, confirmed);
+      if (prepare) await page.evaluate(prepare);
+      await page.focus('#bwAllowBtn');
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(300);
+      check(title, await focused(page), want);
+      check('no page errors', app.errors, []);
+    });
+  }
+  // While the question is open the user moves on: to a control the reload
+  // keeps - their place stays; into the form - the reload builds its fields
+  // anew (A2-29), so that place is gone, and the focus goes on to Sync now
+  // rather than to the page.
+  for (const [title, movedTo, want] of [
+    ['J8 a user who moved on while the question was open keeps their place', '#bwTestBtn', 'bwTestBtn'],
+    ['J8 a user who moved into the form, which the reload rebuilds, lands on Sync now', '#bw_email', 'bwSyncNowBtn'],
+  ]) {
+    await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED } }, title, async (app) => {
+      const { page } = app;
+      await bwOpen(page);
+      await allowing(page, true);
+      await hold(page, 'bitwarden_allow_sync');
+      await page.focus('#bwAllowBtn');
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(100);
+      await page.focus(movedTo);
+      await letGo(page, 'bitwarden_allow_sync');
+      await page.waitForTimeout(300);
+      check(title, await focused(page), want);
+      check('no page errors', app.errors, []);
+    });
+  }
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED } }, 'J8 allowed by a click that did not focus it', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    await allowing(page, true);
+    // As WebKit's click: the button never had the focus, the page did.
+    await page.evaluate(() => { document.activeElement && document.activeElement.blur && document.activeElement.blur(); el('bwAllowBtn').click(); });
+    await page.waitForTimeout(300);
+    check('J8 a click that did not focus the button moves no focus', await focused(page), 'body');
+    check('no page errors', app.errors, []);
+  });
+  // Sync stays enabled; the backend's refusal is said as it is.
+  await withApp(browser, server, { replies: { bitwarden_get_config: UNCONFIRMED, bitwarden_sync: { $reject: BW_SYNC_OFF } } }, 'J4 a sync before it is allowed', async (app) => {
+    const { page } = app;
+    await bwOpen(page);
+    await page.click('#bwSyncNowBtn');
+    await page.waitForTimeout(250);
+    const st = await bwStatus(page);
+    check('J4 the backend\'s refusal of a sync, as it is', [st.text, (await liveToasts(page)).includes(BW_SYNC_OFF)], [BW_SYNC_OFF, true]);
     check('no page errors', app.errors, []);
   });
 }
@@ -3036,6 +3575,10 @@ const SCENARIOS = [
   ['bitwarden last result: the status line after a stopped or failed run', scenarioBwLastResult],
   ['bitwarden approval: the token, a changed list, a list too long (S4 S6)', scenarioBwApproval],
   ['settings lock gates: Bitwarden, backup and Lock now (A6-08 B1)', scenarioSettingsLockGates],
+  ['bitwarden destination: not allowed yet, Allow syncing... (J4)', scenarioBwDestination],
+  ['new server in a filtered list (A5-42 J5)', scenarioServerNewInFilter],
+  ['server save warning (R10 J6)', scenarioServerSaveWarning],
+  ['bitwarden texts spelled out (J7)', scenarioBwSpelled],
 ];
 
 (async () => {

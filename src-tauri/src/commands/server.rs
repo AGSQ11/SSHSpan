@@ -67,6 +67,11 @@ pub fn server_list(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// Async, with the work on the blocking pool: a saved password is sealed
 /// with Argon2id, which as a synchronous command ran on the main thread and
 /// froze the window on every save.
+///
+/// `{ ok, id, warning }`: `warning` (else null) says what to do when the
+/// server's key file is protected by a passphrase, which a connect cannot
+/// ask for, or - on Windows - is not on one of this computer's drives. The
+/// server is saved all the same.
 #[tauri::command]
 pub async fn server_save(
     app: AppHandle,
@@ -153,11 +158,53 @@ fn server_save_in(
     rotation: &super::VaultRotationLock,
     request: SaveServerRequest,
 ) -> CmdResult<serde_json::Value> {
-    // Seals the saved password and rewrites the whole row: take the guard
-    // BEFORE reading the master password or any sealed row, and hold it
-    // through the write, so a master-password change cannot commit in
-    // between.
-    let _rotation = rotation.try_shared()?;
+    server_save_with(db, vault, rotation, request, key_file_warning)
+}
+
+/// [`server_save_in`] with `key_warning`, the look at the server's key file
+/// ([`key_file_warning`]; a probe in tests). The save holds the rotation
+/// guard; the look at the key file does not - on Windows a UNC path opens a
+/// network connection, which can stall, and a master-password change waits
+/// for the guard.
+fn server_save_with(
+    db: &db::Database,
+    vault: &super::VaultPasswordStore,
+    rotation: &super::VaultRotationLock,
+    request: SaveServerRequest,
+    key_warning: impl Fn(&str) -> Option<&'static str>,
+) -> CmdResult<serde_json::Value> {
+    let server = {
+        // Seals the saved password and rewrites the whole row: take the
+        // guard BEFORE reading the master password or any sealed row, and
+        // hold it through the write, so a master-password change cannot
+        // commit in between.
+        let _rotation = rotation.try_shared()?;
+        store_server(db, vault, request)?
+    };
+    let warning = key_file_warning_for(&server, &key_warning);
+    Ok(serde_json::json!({ "ok": true, "id": server.id, "warning": warning }))
+}
+
+/// A key file a connect cannot use as it is: said at the save, not at the
+/// first connect. (A vault key, when one is chosen, is used instead of it.)
+fn key_file_warning_for(
+    server: &ServerRecord,
+    key_warning: &impl Fn(&str) -> Option<&'static str>,
+) -> Option<&'static str> {
+    server
+        .pem_path
+        .as_deref()
+        .filter(|_| server.auth_method == "publickey" && server.key_id.is_none())
+        .and_then(key_warning)
+}
+
+/// The save of [`server_save_with`] - checked, sealed, written and audited.
+/// The caller holds the rotation guard.
+fn store_server(
+    db: &db::Database,
+    vault: &super::VaultPasswordStore,
+    request: SaveServerRequest,
+) -> CmdResult<ServerRecord> {
     let vault_pw = vault.get().unwrap_or_default();
     let SaveServerRequest {
         id,
@@ -312,8 +359,47 @@ fn server_save_in(
         None,
         &format!("{} @ {}:{}", server.name, server.host, server.port),
     );
+    Ok(server)
+}
 
-    Ok(serde_json::json!({ "ok": true, "id": server.id }))
+/// How much of a key file a save reads to tell whether it is protected by a
+/// passphrase: far more than any private key takes.
+const KEY_FILE_CHECK_BYTES: u64 = 64 * 1024;
+
+/// The save's warning for the key file at `path`: what to do when it is
+/// protected by a passphrase, which a connect cannot ask for
+/// ([`crate::ssh_client::PASSPHRASE_PROTECTED_KEY`]). Nothing when it is
+/// not, or cannot be read (the connect says why). Only a regular file is
+/// read, and only its first [`KEY_FILE_CHECK_BYTES`]. On Windows a path that
+/// is not on one of this computer's drives gets
+/// [`crate::ssh_client::KEY_FILE_NOT_LOCAL`] instead, without being touched
+/// ([`crate::ssh_client::key_path_refusal`]). Elsewhere a UNC or device
+/// path (`\\...`, `//...`) is not looked at either. Opening a share hands it
+/// an NTLM sign-in and can stall - only to find out whether to warn.
+fn key_file_warning(path: &str) -> Option<&'static str> {
+    use std::io::Read;
+    // On Windows a key file elsewhere than on this computer's drives gets
+    // what to do, and is not touched.
+    if let Some(why) = crate::ssh_client::key_path_refusal(path) {
+        return Some(why);
+    }
+    let mut start = path.chars();
+    let separator = |c: Option<char>| matches!(c, Some('\\' | '/'));
+    if separator(start.next()) && separator(start.next()) {
+        return None;
+    }
+    // Looked at before it is opened: opening a named pipe for reading waits
+    // for a writer.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take(KEY_FILE_CHECK_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    crate::ssh_client::key_needs_passphrase(&text)
+        .then_some(crate::ssh_client::PASSPHRASE_PROTECTED_KEY)
 }
 
 #[tauri::command]
@@ -857,5 +943,164 @@ mod saved_password_binding_tests {
         assert_eq!(after.host, "new-db.example", "the other save's move stands");
         assert_eq!(after.saved_password.as_deref(), Some(sealed_new.as_str()));
         assert_eq!(after.name, "prod-db");
+    }
+
+    /// A server whose key file is protected by a passphrase is saved, and the
+    /// save says at once what its first connect would refuse it for (A5-26).
+    /// A key file without one, a vault key chosen instead of the file, and a
+    /// file that is not there say nothing.
+    #[test]
+    fn fw_r10_saving_a_server_with_a_protected_key_file_says_what_to_do() {
+        use crate::crypto::keys::{export_private_key, generate_key_pair, KeyFormat, KeyType};
+        let f = Fixture::new();
+        let dir = std::env::temp_dir().join(format!("sshspan-fw-r10-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = generate_key_pair(KeyType::Ed25519, None, "fw-r10".into()).unwrap();
+        let write = |name: &str, passphrase: Option<&str>| {
+            let path = dir.join(name);
+            let pem = export_private_key(&key, KeyFormat::OpenSsh, passphrase).unwrap();
+            std::fs::write(&path, pem).unwrap();
+            path.display().to_string()
+        };
+        let protected = write("protected.pem", Some("fw-r10-passphrase"));
+        let plain = write("plain.pem", None);
+        let missing = dir.join("missing.pem").display().to_string();
+        let with_file = |path: &str, key_id: Option<&str>| SaveServerRequest {
+            id: None,
+            name: "with a key file".into(),
+            host: "keyfile.example".into(),
+            port: Some(22),
+            username: "ops".into(),
+            auth_method: Some("publickey".into()),
+            key_id: key_id.map(str::to_string),
+            pem_path: Some(path.to_string()),
+            saved_password: None,
+            clear_saved_password: None,
+            category_id: None,
+            color: None,
+        };
+        let out = f.save(with_file(&protected, None)).unwrap();
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(crate::ssh_client::PASSPHRASE_PROTECTED_KEY),
+            "{out}"
+        );
+        let saved = f.record(out["id"].as_str().unwrap());
+        assert_eq!(
+            saved.pem_path.as_deref(),
+            Some(protected.as_str()),
+            "saved all the same"
+        );
+        for (path, key_id) in [
+            (plain.as_str(), None),
+            (protected.as_str(), Some("a-vault-key")),
+            (missing.as_str(), None),
+        ] {
+            let out = f.save(with_file(path, key_id)).unwrap();
+            assert!(out["warning"].is_null(), "{path} {key_id:?}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A "key file" that is a named pipe: opening one for reading waits for a
+    /// writer, so a save that opened it would hold a blocking-pool thread for
+    /// good. It is looked at first, and not opened.
+    #[cfg(unix)]
+    #[test]
+    fn fw_r10_a_named_pipe_as_key_file_does_not_stall_the_save() {
+        let dir = std::env::temp_dir().join(format!("sshspan-fw-r10-fifo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("key.pem");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|status| status.success()) {
+            eprintln!("mkfifo not available: the named-pipe check is skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let path = fifo.display().to_string();
+        let (done, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(key_file_warning(&path));
+        });
+        let warning = answer
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the check of a named pipe came back");
+        assert_eq!(warning, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The look at a server's key file ran while the save held the rotation
+    /// guard - on Windows a UNC path there opens a network connection, which
+    /// can stall, and a master-password change waits for the guard. The look
+    /// comes after the guard is dropped: probed by asking, at that moment,
+    /// whether a password change could take the lock.
+    #[test]
+    fn fw_s4_the_key_file_is_looked_at_after_the_rotation_guard() {
+        let f = Fixture::new();
+        let looked = std::cell::RefCell::new(Vec::new());
+        let probe = |path: &str| {
+            let free = f.rotation.0.try_write().is_ok();
+            looked.borrow_mut().push((path.to_string(), free));
+            Some(crate::ssh_client::PASSPHRASE_PROTECTED_KEY)
+        };
+        let request = SaveServerRequest {
+            id: None,
+            name: "with a key file".into(),
+            host: "keyfile.example".into(),
+            port: Some(22),
+            username: "ops".into(),
+            auth_method: Some("publickey".into()),
+            key_id: None,
+            pem_path: Some("/keys/id_ed25519".into()),
+            saved_password: None,
+            clear_saved_password: None,
+            category_id: None,
+            color: None,
+        };
+        let out = server_save_with(&f.db, &f.vault, &f.rotation, request, probe).unwrap();
+        assert_eq!(
+            out["warning"].as_str(),
+            Some(crate::ssh_client::PASSPHRASE_PROTECTED_KEY)
+        );
+        assert_eq!(
+            looked.into_inner(),
+            vec![("/keys/id_ed25519".to_string(), true)],
+            "looked at once, with the rotation guard dropped"
+        );
+    }
+
+    /// A UNC or device path (`\\server\share\...`, `//...`) is not looked at:
+    /// on Windows that is a network connection, with an NTLM sign-in, made
+    /// only to decide on a warning. On Unix `//` names the root, so a
+    /// protected key file reached that way shows the path is skipped
+    /// unopened, not merely unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn fw_s4_a_unc_or_device_key_path_is_not_looked_at() {
+        use crate::crypto::keys::{export_private_key, generate_key_pair, KeyFormat, KeyType};
+        let dir = std::env::temp_dir().join(format!("sshspan-fw-s4-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = generate_key_pair(KeyType::Ed25519, None, "fw-s4".into()).unwrap();
+        let protected = dir.join("protected.pem");
+        std::fs::write(
+            &protected,
+            export_private_key(&key, KeyFormat::OpenSsh, Some("fw-s4-passphrase")).unwrap(),
+        )
+        .unwrap();
+        let plain = protected.display().to_string();
+        assert_eq!(
+            key_file_warning(&plain),
+            Some(crate::ssh_client::PASSPHRASE_PROTECTED_KEY)
+        );
+        for skipped in [
+            format!("/{plain}"),
+            format!("\\{plain}"),
+            r"\\server\share\keys\id_ed25519".to_string(),
+            r"\\?\C:\keys\id_ed25519".to_string(),
+            r"/\server\share\id_ed25519".to_string(),
+        ] {
+            assert_eq!(key_file_warning(&skipped), None, "{skipped}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

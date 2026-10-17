@@ -410,6 +410,7 @@ fn db_bitwarden_config_save_load() {
         device_id: Some("device-1".to_string()),
         last_sync: None,
         last_result: None,
+        confirmed_destination: None,
     };
 
     store_bitwarden_config(&db, &config);

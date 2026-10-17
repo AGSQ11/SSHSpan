@@ -911,6 +911,48 @@ async function scenarioDeploy(browser, server) {
     check('no page errors', app.errors, []);
   });
 
+  // J6 (R10): server_save's `warning` - a key file protected by a passphrase,
+  // which SSHSpan cannot ask for when connecting - for servers the deploy
+  // saved: each line names its server (as "Not saved as servers" does) and
+  // gives the backend's words, spelled out, in one warning toast after the
+  // count of servers saved. Without a warning nothing more is said.
+  const PASSPHRASE_KEY = 'This key file is protected by a passphrase, which SSHSpan cannot ask for when connecting. Import it under Keys (New key > Import asks for the passphrase) and choose that key for this server, or remove the passphrase from the file.';
+  const ODD_WARNING = 'This key file \u{202E}mep.esrever is protected by a passphrase.';
+  const warnToasts = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item.warn .toast-text')].map((x) => x.textContent));
+  for (const [title, warningOf, want] of [
+    ['J6 servers saved by a deploy, with warnings', { alpha: ODD_WARNING, beta: PASSPHRASE_KEY },
+      [`web: This key file <U+202E>mep.esrever is protected by a passphrase.\nweb-beta: ${PASSPHRASE_KEY}`]],
+    ['J6 servers saved by a deploy, one with a warning', { beta: PASSPHRASE_KEY }, [`web-beta: ${PASSPHRASE_KEY}`]],
+    ['J6 servers saved by a deploy, without a warning', {}, []],
+  ]) {
+    await withApp(browser, server, {}, title, async (app) => {
+      const { page } = app;
+      await stubDeploy(page);
+      await page.evaluate((w) => {
+        // Both keys deployed (stubDeploy refuses beta), so two servers are
+        // saved; no warnings of the deploy's own.
+        const preview = window.__replies.key_deploy_preview;
+        window.__replies.key_deploy_preview = (a) => { const p = preview(a); p.keys.forEach((k) => { k.refusal = null; }); return p; };
+        const deploy = window.__replies.key_deploy;
+        window.__replies.key_deploy = (a) => Object.assign(deploy(a), { errors: [], warnings: [], keys: [
+          { id: 'k1', name: 'alpha', alias: a.hostAlias, file: '/home/u/.ssh/sshspan_alpha', pubFile: '/home/u/.ssh/sshspan_alpha.pub' },
+          { id: 'k2', name: 'beta', alias: a.hostAlias + '-beta', file: '/home/u/.ssh/sshspan_beta', pubFile: '/home/u/.ssh/sshspan_beta.pub' },
+        ] });
+        window.__replies.server_save = (s) => ({ ok: true, id: 'srv-' + s.name, warning: w[/beta$/.test(s.pemPath) ? 'beta' : 'alpha'] || null });
+      }, warningOf);
+      await openSheet(page, ['k1', 'k2']);
+      await fillHostFields(page, { alias: 'web', hostname: '10.0.0.5', user: 'deploy', port: '22' });
+      await page.evaluate(() => { const t = document.getElementById('deployRegisterToggle'); if (!t.checked) t.click(); window.__d = deployConfig(); });
+      await answerConfirm(page, 'ok');
+      await settled(page, () => window.__d, null, 1500);
+      await page.waitForTimeout(80);
+      check(`${title}: both servers are saved, and said so`,
+        [await app.count('server_save'), (await toasts(page)).includes('2 server(s) saved under Servers.')], [2, true]);
+      check(`${title}: the warnings, named, in one warning toast`, await warnToasts(page), want);
+      check('no page errors', app.errors, []);
+    });
+  }
+
   await withApp(browser, server, {}, 'A7-32 passphrase and servers', async (app) => {
     const { page } = app;
     await stubDeploy(page);

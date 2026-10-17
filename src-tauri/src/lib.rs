@@ -243,6 +243,7 @@ pub fn run() {
             bitwarden_save_config,
             bitwarden_test_connection,
             bitwarden_sync,
+            bitwarden_allow_sync,
             // AI assistant commands
             assistant::assistant_get_config,
             assistant::assistant_save_config,

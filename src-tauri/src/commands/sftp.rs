@@ -42,10 +42,14 @@ enum LocalAccess {
     /// Only the base rules (app data, system directories): for revealing a
     /// location in the file manager.
     Basic,
-    /// A write to a path a human picked in the native save dialog: the base
-    /// rules, and never SSHSpan's own program files - the renderer fills in
-    /// the dialog's suggested name, so a single click on Save must not plant
-    /// a DLL in the install folder.
+    /// A write to a path a human picked in the native save dialog: the same
+    /// rules as [`Self::Write`]. A pick used to skip most of the deny-list,
+    /// since a human chose the place - but the renderer or the server
+    /// suggests the name, and one Save (plus "Replace?", or nothing for a
+    /// file that is not there yet) put a DLL in the install folder, a
+    /// `.bashrc` or a `.gitconfig` in home. A dotfile can be saved elsewhere
+    /// and moved. Kept as a kind of its own so a caller says where the path
+    /// came from.
     DialogWrite,
 }
 
@@ -120,6 +124,23 @@ const HOME_PROGRAM_FILES: [&str; 12] = [
 
 /// The same for git, Neovim and Emacs in the XDG config folder.
 const CONFIG_PROGRAM_DIRS: [&str; 3] = ["git", "nvim", "emacs"];
+
+/// The XDG user-dirs settings in the XDG config folder. They name the
+/// Downloads folder - where SSHSpan's save dialogs open, read again for each
+/// dialog - and the other user folders: a download over them pointed the
+/// next save dialog at a folder of settings, with the name of a settings file
+/// already filled in.
+const CONFIG_FOLDER_SETTINGS: [&str; 2] = ["user-dirs.dirs", "user-dirs.locale"];
+
+/// The folder settings in the XDG config folders `config`
+/// ([`CONFIG_FOLDER_SETTINGS`]). Pure so the layout can be unit-tested
+/// anywhere.
+fn folder_settings_locations(config: &[PathBuf]) -> Vec<PathBuf> {
+    config
+        .iter()
+        .flat_map(|c| CONFIG_FOLDER_SETTINGS.iter().map(move |name| c.join(name)))
+        .collect()
+}
 
 /// The user's own command folders, which are (or are typically) on the PATH:
 /// a program planted there runs in place of the one the user meant.
@@ -404,6 +425,8 @@ struct Locations {
     /// git's settings, the editors' startup files, Office's startup folders,
     /// Windows Terminal's settings, ...
     program_files: Vec<PathBuf>,
+    /// The XDG user-dirs settings ([`folder_settings_locations`]).
+    folder_settings: Vec<PathBuf>,
     /// SSHSpan's program: the install folder (or the executable), the `.app`
     /// bundle, the running AppImage ([`app_program_locations`]).
     app_program: Vec<PathBuf>,
@@ -429,7 +452,8 @@ impl Locations {
         let path: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|p| std::env::split_paths(&p).collect())
             .unwrap_or_default();
-        let (mut startup_dirs, mut shell_startup, mut program_files) = match &home {
+        let (mut startup_dirs, mut shell_startup, mut program_files, folder_settings) = match &home
+        {
             Some(home) => {
                 let config = distinct([Some(home.join(".config")), env_dir("XDG_CONFIG_HOME")]);
                 let data = distinct([
@@ -437,9 +461,14 @@ impl Locations {
                     env_dir("XDG_DATA_HOME"),
                 ]);
                 let (startup, shell) = home_startup_locations(home, &config, &data);
-                (startup, shell, home_program_locations(home, &config, &path))
+                (
+                    startup,
+                    shell,
+                    home_program_locations(home, &config, &path),
+                    folder_settings_locations(&config),
+                )
             }
-            None => (Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
         if cfg!(windows) {
             startup_dirs.extend(windows_startup_dirs(
@@ -502,6 +531,7 @@ impl Locations {
             startup_dirs,
             shell_startup,
             program_files,
+            folder_settings,
             app_program: program.files,
             app_program_dll_dirs: program.dll_dirs,
             app_data: app_data_locations(&own, &bases, home.as_deref()),
@@ -521,6 +551,7 @@ impl Locations {
             startup_dirs: all(self.startup_dirs),
             shell_startup: all(self.shell_startup),
             program_files: all(self.program_files),
+            folder_settings: all(self.folder_settings),
             app_program: all(self.app_program),
             app_program_dll_dirs: all(self.app_program_dll_dirs),
             app_data: all(self.app_data),
@@ -592,8 +623,11 @@ const SENSITIVE_REUSE: std::time::Duration = std::time::Duration::from_secs(5);
 /// transfer or a local-pane mutation at, resolved (see [`Protected`]). The
 /// renderer supplies these paths as plain strings; this is a deny-list, not a
 /// dialog-bound grant, and says so in its limits: anything outside it is
-/// still reachable (see the A6-02 notes on `sftp_download`).
-struct SensitiveLocations {
+/// still reachable (see the A6-02 notes on `sftp_download`). A path picked in
+/// the native save dialog is judged against the same list
+/// ([`Self::write_hit`]): a dialog-picked download, and a text export
+/// (`super::system_write_text_file`).
+pub(crate) struct SensitiveLocations {
     /// SSHSpan's data directory (the vault): refused for every access (the
     /// base rules), and listed so that deleting or moving a folder that
     /// CONTAINS it is refused too.
@@ -603,6 +637,7 @@ struct SensitiveLocations {
     startup_dirs: Vec<Protected>,
     shell_startup: Vec<Protected>,
     program_files: Vec<Protected>,
+    folder_settings: Vec<Protected>,
     /// SSHSpan's program: refused for writes and deletes - a dialog-approved
     /// write included; reading stays allowed.
     app_program: Vec<Protected>,
@@ -617,7 +652,7 @@ struct SensitiveLocations {
 
 impl SensitiveLocations {
     /// This machine's locations, resolved - reused for [`SENSITIVE_REUSE`].
-    fn current() -> Arc<Self> {
+    pub(crate) fn current() -> Arc<Self> {
         type Cached = Option<(std::time::Instant, Arc<SensitiveLocations>)>;
         static LAST: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
         let mut last = LAST
@@ -650,14 +685,24 @@ impl SensitiveLocations {
     /// spelling (see [`Self::path_refusal`]).
     fn refusal(&self, path: &std::path::Path, access: LocalAccess) -> Option<&'static str> {
         match access {
-            LocalAccess::Basic => return None,
-            // A human picked the path - but the renderer suggested it: never
-            // SSHSpan's own program.
-            LocalAccess::DialogWrite => {
-                return self.holds_program(path).then_some(APP_PROGRAM_REFUSAL)
+            LocalAccess::Basic => None,
+            // A path picked in the save dialog gets the rule of a typed one:
+            // a human picked it, but the renderer or the server suggested
+            // its name, and Save (plus "Replace?" - or nothing, for a file
+            // that is not there yet) is not a decision to plant what runs.
+            LocalAccess::Write | LocalAccess::DialogWrite => {
+                self.write_hit(path).map(WriteHit::download_refusal)
             }
-            LocalAccess::Write | LocalAccess::Read => {}
+            LocalAccess::Read => self.read_refusal(path),
         }
+    }
+
+    /// Why `path` may not be uploaded, if so: SSHSpan's data and
+    /// configuration folders, and everything in `~/.ssh` but public keys -
+    /// they are not secret, and putting one on a server is an everyday SSH
+    /// task. Reading a startup or settings file (dotfile syncing) is
+    /// ordinary. A comparison only (see [`Self::refusal`]).
+    fn read_refusal(&self, path: &std::path::Path) -> Option<&'static str> {
         let covered =
             |location: &Option<Protected>| location.as_ref().is_some_and(|l| l.covers(path));
         if covered(&self.app_data_dir) {
@@ -666,48 +711,56 @@ impl SensitiveLocations {
         if covered(&self.managed_config_dir) {
             return Some(MANAGED_CONFIG_REFUSAL);
         }
-        if covered(&self.ssh_dir) {
-            // Public keys are not secret, and putting one on a server is an
-            // everyday SSH task - so reading them is fine. Nothing is ever
-            // WRITTEN into ~/.ssh by a renderer-chosen path.
-            let public_key = path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("pub"));
-            if access == LocalAccess::Write {
-                return Some(
-                    "The ~/.ssh folder is off-limits for SFTP downloads and local changes.",
-                );
-            }
-            if !public_key {
-                return Some(
-                    "Private keys and other files in ~/.ssh cannot be uploaded (public .pub keys can).",
-                );
-            }
+        let public_key = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pub"));
+        (covered(&self.ssh_dir) && !public_key).then_some(SSH_DIR_READ_REFUSAL)
+    }
+
+    /// Where a write may never go - the write deny-list, by kind: SSHSpan's
+    /// vault, configuration, program and data; `~/.ssh` (nothing is ever
+    /// written there by a renderer-chosen path); places whose contents run
+    /// at login, when a shell starts or when a program is next used; and the
+    /// folder settings that steer where the save dialogs open. One rule for
+    /// every write a renderer can aim: a typed path, a path picked in the
+    /// save dialog - a download or a text export - and every local path a
+    /// remote name leads to. A comparison only (see [`Self::refusal`]).
+    fn write_hit(&self, path: &std::path::Path) -> Option<WriteHit> {
+        self.write_hit_with(path, false)
+    }
+
+    /// [`Self::write_hit`], with `~/.ssh` allowed when `ssh_dir_allowed`:
+    /// for the files SSHSpan itself makes, a private-key export or a vault
+    /// backup ([`own_export_refusal`]).
+    fn write_hit_with(&self, path: &std::path::Path, ssh_dir_allowed: bool) -> Option<WriteHit> {
+        let covered =
+            |location: &Option<Protected>| location.as_ref().is_some_and(|l| l.covers(path));
+        let any = |locations: &[Protected]| locations.iter().any(|l| l.covers(path));
+        if covered(&self.app_data_dir) {
+            return Some(WriteHit::Vault);
         }
-        // Planting a startup entry or editing a shell startup file is code
-        // execution at the next login - but reading one (dotfile syncing) is
-        // ordinary, so these only apply to writes.
-        if access == LocalAccess::Write {
-            if self.startup_dirs.iter().any(|d| d.covers(path)) {
-                return Some(
-                    "Startup folders (what is in them runs at login) are off-limits for SFTP downloads and local changes.",
-                );
-            }
-            if self.shell_startup.iter().any(|f| f.covers(path)) {
-                return Some(
-                    "Shell startup files and folders (.bashrc, .profile, fish and PowerShell profiles, ...) are off-limits for SFTP downloads and local changes.",
-                );
-            }
-            if self.program_files.iter().any(|f| f.covers(path)) {
-                return Some(
-                    "Your folders on the PATH and settings that run commands (git, vim, emacs, Office, Windows Terminal, ...) are off-limits for SFTP downloads and local changes.",
-                );
-            }
-            // A DLL beside the executable, a replaced AppImage or a file in
-            // the webview's profile loads or runs at SSHSpan's next start.
-            if self.holds_program(path) || self.app_data.iter().any(|f| f.covers(path)) {
-                return Some(APP_FILES_REFUSAL);
-            }
+        if covered(&self.managed_config_dir) {
+            return Some(WriteHit::ManagedConfig);
+        }
+        if !ssh_dir_allowed && covered(&self.ssh_dir) {
+            return Some(WriteHit::SshDir);
+        }
+        if any(&self.startup_dirs) {
+            return Some(WriteHit::StartupFolder);
+        }
+        if any(&self.shell_startup) {
+            return Some(WriteHit::ShellStartup);
+        }
+        if any(&self.program_files) {
+            return Some(WriteHit::ProgramSettings);
+        }
+        if any(&self.folder_settings) {
+            return Some(WriteHit::FolderSettings);
+        }
+        // A DLL beside the executable, a replaced AppImage or a file in the
+        // webview's profile loads or runs at SSHSpan's next start.
+        if self.holds_program(path) || any(&self.app_data) {
+            return Some(WriteHit::AppFiles);
         }
         None
     }
@@ -797,6 +850,9 @@ impl SensitiveLocations {
         if self.program_files.iter().any(holds) {
             return Some("a folder on your PATH or a settings file that runs commands");
         }
+        if self.folder_settings.iter().any(holds) {
+            return Some("your folder settings (user-dirs.dirs)");
+        }
         if self.app_program.iter().any(holds) || self.app_data.iter().any(holds) {
             return Some("SSHSpan's own program or data files");
         }
@@ -807,9 +863,157 @@ impl SensitiveLocations {
 /// What a write into SSHSpan's own program or data folders is refused with.
 const APP_FILES_REFUSAL: &str = "SSHSpan's own program and data folders (where it is installed, its caches and the webview's profile) are off-limits for SFTP downloads and local changes.";
 
-/// What a download to SSHSpan's own program files, picked in the save
+/// What a write into `~/.ssh` is refused with.
+const SSH_DIR_WRITE_REFUSAL: &str =
+    "The ~/.ssh folder is off-limits for SFTP downloads and local changes.";
+
+/// What an upload of anything in `~/.ssh` but a public key is refused with.
+const SSH_DIR_READ_REFUSAL: &str =
+    "Private keys and other files in ~/.ssh cannot be uploaded (public .pub keys can).";
+
+/// What a write to a folder on the PATH, or to settings that run commands,
+/// is refused with.
+const PROGRAM_SETTINGS_REFUSAL: &str = "Your folders on the PATH and settings that run commands (git, vim, emacs, Office, Windows Terminal, ...) are off-limits for SFTP downloads and local changes.";
+
+/// What a write to the XDG user-dirs settings is refused with.
+const FOLDER_SETTINGS_REFUSAL: &str = "Your folder settings (user-dirs.dirs, user-dirs.locale) are off-limits for SFTP downloads and local changes.";
+
+/// What a text export into SSHSpan's data folder (the vault) is refused
+/// with. (`validate_export_path` refuses it first, in words of its own.)
+const EXPORT_VAULT_REFUSAL: &str =
+    "The application data directory is off-limits for exports - choose another folder.";
+
+/// What a text export into SSHSpan's configuration folder is refused with.
+const EXPORT_MANAGED_CONFIG_REFUSAL: &str =
+    "SSHSpan's own configuration folder is off-limits for exports - choose another folder.";
+
+/// What a text export into `~/.ssh` is refused with.
+const EXPORT_SSH_DIR_REFUSAL: &str =
+    "The ~/.ssh folder is off-limits for exports - choose another folder.";
+
+/// What a text export to a folder on the PATH, or to settings that run
+/// commands, is refused with.
+const EXPORT_PROGRAM_SETTINGS_REFUSAL: &str = "Your folders on the PATH and settings that run commands (git, vim, emacs, Office, Windows Terminal, ...) are off-limits for exports - choose another file.";
+
+/// What a text export to the XDG user-dirs settings is refused with.
+const EXPORT_FOLDER_SETTINGS_REFUSAL: &str = "Your folder settings (user-dirs.dirs, user-dirs.locale) are off-limits for exports - choose another file.";
+
+/// What a text export into SSHSpan's own program or data folders is refused
+/// with.
+const EXPORT_APP_FILES_REFUSAL: &str = "SSHSpan's own program and data folders (where it is installed, its caches and the webview's profile) are off-limits for exports - choose another folder.";
+
+/// The kind of place a write may never go ([`SensitiveLocations::write_hit`]),
+/// and what a write there is refused with - in the words of a download (or a
+/// local change) or of an export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteHit {
+    /// SSHSpan's data folder (the vault).
+    Vault,
+    /// SSHSpan's configuration folder.
+    ManagedConfig,
+    /// `~/.ssh`.
+    SshDir,
+    /// A folder whose contents run at login.
+    StartupFolder,
+    /// A shell startup file or folder.
+    ShellStartup,
+    /// A folder on the PATH, or settings that run commands.
+    ProgramSettings,
+    /// The XDG user-dirs settings.
+    FolderSettings,
+    /// SSHSpan's own program or data folders.
+    AppFiles,
+}
+
+impl WriteHit {
+    /// What a download - or a local change - is refused with.
+    fn download_refusal(self) -> &'static str {
+        match self {
+            Self::Vault => VAULT_REFUSAL,
+            Self::ManagedConfig => MANAGED_CONFIG_REFUSAL,
+            Self::SshDir => SSH_DIR_WRITE_REFUSAL,
+            Self::StartupFolder => STARTUP_DIRS_REFUSAL,
+            Self::ShellStartup => SHELL_STARTUP_REFUSAL,
+            Self::ProgramSettings => PROGRAM_SETTINGS_REFUSAL,
+            Self::FolderSettings => FOLDER_SETTINGS_REFUSAL,
+            Self::AppFiles => APP_FILES_REFUSAL,
+        }
+    }
+
+    /// What a text export is refused with.
+    fn export_refusal(self) -> &'static str {
+        match self {
+            Self::Vault => EXPORT_VAULT_REFUSAL,
+            Self::ManagedConfig => EXPORT_MANAGED_CONFIG_REFUSAL,
+            Self::SshDir => EXPORT_SSH_DIR_REFUSAL,
+            Self::StartupFolder => EXPORT_STARTUP_DIRS_REFUSAL,
+            Self::ShellStartup => EXPORT_SHELL_STARTUP_REFUSAL,
+            Self::ProgramSettings => EXPORT_PROGRAM_SETTINGS_REFUSAL,
+            Self::FolderSettings => EXPORT_FOLDER_SETTINGS_REFUSAL,
+            Self::AppFiles => EXPORT_APP_FILES_REFUSAL,
+        }
+    }
+}
+
+/// What a write into a startup folder is refused with - a path picked in
+/// the save dialog included.
+const STARTUP_DIRS_REFUSAL: &str = "Startup folders (what is in them runs at login) are off-limits for SFTP downloads and local changes.";
+
+/// What a write to a shell startup file or folder is refused with - a path
+/// picked in the save dialog included.
+const SHELL_STARTUP_REFUSAL: &str = "Shell startup files and folders (.bashrc, .profile, fish and PowerShell profiles, ...) are off-limits for SFTP downloads and local changes.";
+
+/// What a text export to a startup folder, picked in the save dialog, is
+/// refused with.
+const EXPORT_STARTUP_DIRS_REFUSAL: &str =
+    "Startup folders (what is in them runs at login) are off-limits for exports - choose another folder.";
+
+/// What a text export to a shell startup file or folder, picked in the save
 /// dialog, is refused with.
-const APP_PROGRAM_REFUSAL: &str = "SSHSpan's own program files (where it is installed, its AppImage or app bundle) cannot be replaced by a download - choose another folder.";
+const EXPORT_SHELL_STARTUP_REFUSAL: &str = "Shell startup files and folders (.bashrc, .profile, fish and PowerShell profiles, ...) are off-limits for exports - choose another file.";
+
+/// Why a text export may not be written to `path`, a path a human picked in
+/// the native save dialog (`super::system_write_text_file`: the public-key
+/// and the audit-log export). The renderer suggested the name and supplies
+/// the text, so the rule is the write deny-list of every other write
+/// ([`SensitiveLocations::write_hit`] - a dialog-picked download's too), in
+/// the words of an export. The path is judged in its literal and its
+/// resolved spelling.
+pub(crate) fn export_target_refusal(
+    path: &std::path::Path,
+    sensitive: &SensitiveLocations,
+) -> Option<&'static str> {
+    export_refusal(path, sensitive, false)
+}
+
+/// Why a file SSHSpan itself makes - a private-key export, a vault backup -
+/// may not be written to `path`, picked in the native save dialog: the same
+/// write deny-list in the words of an export ([`export_target_refusal`]),
+/// except `~/.ssh`. Exporting a private key to `~/.ssh/id_...` is ordinary,
+/// and these files are SSHSpan's own, not text a renderer supplies. The
+/// dialog suggests the key's name, which may be `.bashrc`.
+pub(crate) fn own_export_refusal(
+    path: &std::path::Path,
+    sensitive: &SensitiveLocations,
+) -> Option<&'static str> {
+    export_refusal(path, sensitive, true)
+}
+
+/// The write deny-list on an export to `path`, judged in its literal and its
+/// resolved spelling, in the words of an export; `~/.ssh` allowed when
+/// `ssh_dir_allowed`.
+fn export_refusal(
+    path: &std::path::Path,
+    sensitive: &SensitiveLocations,
+    ssh_dir_allowed: bool,
+) -> Option<&'static str> {
+    let resolved = resolved_local_path(path);
+    let spellings = [resolved.as_path(), path];
+    let hit = spellings
+        .iter()
+        .find_map(|p| sensitive.write_hit_with(p, ssh_dir_allowed));
+    hit.map(WriteHit::export_refusal)
+}
 
 /// `dunce::canonicalize` - the one way the local-path rules resolve a path, so
 /// the tests can count how often that happens (each is several syscalls, and
@@ -1017,10 +1221,10 @@ fn local_write_refusal_with(
     local_path_refusal(path, LocalAccess::Write, sensitive)
 }
 
-/// The rule [`sftp_download`] applies to its target: a path the user picked
-/// in the native save dialog (`granted`) has to clear the base rules and may
-/// never be SSHSpan's own program ([`LocalAccess::DialogWrite`]); any other
-/// path is a renderer-supplied string and gets the full write deny-list.
+/// The rule [`sftp_download`] applies to its target: the base rules and the
+/// full write deny-list, for a path the user picked in the native save
+/// dialog (`granted`, [`LocalAccess::DialogWrite`]) and a renderer-supplied
+/// one alike.
 fn check_download_target(
     local: &str,
     granted: bool,
@@ -1506,11 +1710,13 @@ async fn remote_rename(
 /// A6-02 (PARTIAL). The renderer picks `local` in the native save dialog
 /// (`system_pick_save_path`), which registers the path in the
 /// `DialogPathStore`; a path with that grant is consumed here - one grant, one
-/// write - and trusted beyond the deny-list, because a human approved exactly
-/// this location. Without a grant the path is only a renderer-supplied string
-/// and gets the full [`LocalAccess::Write`] deny-list (`~/.ssh`, SSHSpan's
-/// config directory, Startup folders, shell rc files) on top of the app-data
-/// and system-directory rules.
+/// write, so it cannot authorise a later text export too. A picked path gets
+/// the same rules as a renderer-supplied string ([`check_download_target`]):
+/// the app-data and system-directory rules and the full write deny-list
+/// (`~/.ssh`, SSHSpan's own folders and program, startup folders, shell rc
+/// files, settings that run commands, folders on the PATH, the folder
+/// settings). A human picked it, but a hostile server or renderer suggested
+/// its name; it used to be trusted beyond most of the list.
 ///
 /// The remaining boundary, honestly: a deny-list can never be complete. The
 /// queue's `dest_dir`, queue uploads' sources and the local-pane
@@ -2266,6 +2472,10 @@ pub(crate) struct EditSync {
     mode: Option<u32>,
     emit: Arc<dyn Fn(serde_json::Value) + Send + Sync>,
     stopped: std::sync::atomic::AtomicBool,
+    /// "Stop editing" checks deciding about this edit now ([`ClosingMark`]):
+    /// while one runs, the edit is not handed to another open - the stop
+    /// could end it and delete the copy that open's editor was just given.
+    closing: std::sync::atomic::AtomicUsize,
     debounce: EditDebounce,
     /// Sync-backs and resolutions of one file never overlap: two writers on
     /// the same temporary path would interleave.
@@ -2295,6 +2505,11 @@ impl EditSync {
 
     fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Whether a "Stop editing" is deciding about this edit now.
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst) > 0
     }
 
     /// Whether the staged copy holds anything the server does not have, as
@@ -2813,7 +3028,9 @@ impl EditSync {
 ///
 /// Opening a file that is already open for editing in this session returns
 /// that edit (same `editId` and local copy, `reused: true`) instead of
-/// starting a second one.
+/// starting a second one - except while a "Stop editing" of it is deciding,
+/// which is refused: `"<name> is being closed - try again when it has
+/// stopped."` (see [`reuse_open_edit`]).
 #[tauri::command]
 pub async fn sftp_open_for_edit(
     app: AppHandle,
@@ -2856,7 +3073,7 @@ async fn open_for_edit_in(
         .live_for_key(&key)
         .filter(|open| edit_is_usable(open))
     {
-        return Ok(reused_edit(&open, &remote));
+        return reuse_open_edit(&open, &remote);
     }
     // Best-effort prune of staged copies left behind by crashed/killed
     // sessions (only files directly inside sshspan-edit, older than a day).
@@ -2893,6 +3110,7 @@ async fn open_for_edit_in(
         mode,
         emit,
         stopped: std::sync::atomic::AtomicBool::new(false),
+        closing: std::sync::atomic::AtomicUsize::new(0),
         debounce: EditDebounce::new(EDIT_DEBOUNCE),
         upload_lock: tokio::sync::Mutex::new(()),
         baseline: std::sync::Mutex::new(baseline),
@@ -2919,7 +3137,7 @@ async fn open_for_edit_in(
         sync: sync.clone(),
     };
     if let Err(open) = edit_registry.insert_unless_live(key, watch, edit_is_usable) {
-        return Ok(reused_edit(&open, &remote));
+        return reuse_open_edit(&open, &remote);
     }
     tauri::async_runtime::spawn(periodic_rescan(Arc::downgrade(&sync), EDIT_RESCAN_EVERY));
 
@@ -2943,6 +3161,21 @@ fn reused_edit(open: &EditSync, remote: &str) -> serde_json::Value {
         "editId": open.edit_id,
         "reused": true,
     })
+}
+
+/// [`reused_edit`] - unless a "Stop editing" is deciding about that edit now
+/// (it waits up to 10 s for a running upload, then hashes the copy): it could
+/// end the edit and delete the copy right after this open handed it to an
+/// editor, and that editor's saves would go nowhere. Refused then, with what
+/// to do.
+fn reuse_open_edit(open: &EditSync, remote: &str) -> CmdResult<serde_json::Value> {
+    if open.is_closing() {
+        return Err(CmdError(format!(
+            "{} is being closed - try again when it has stopped.",
+            open.display_name()
+        )));
+    }
+    Ok(reused_edit(open, remote))
 }
 
 /// The file watcher of an edit: a save of the staged copy (or a rescan the
@@ -3119,8 +3352,12 @@ pub async fn sftp_close_edit(
 
 /// [`sftp_close_edit`] without the `AppHandle`: `key` is
 /// `{sessionId}:{remote}`, `upload_wait` how long a running upload is waited
-/// for. Accepted race: a save that lands in the instant between the check
-/// and the close is not seen (the same as the check-then-upload of a save).
+/// for. While it waits and decides, the edit is marked as being closed
+/// ([`ClosingMark`]) and not handed to another open; an answer that keeps
+/// the edit (`unsynced`) clears the mark. Accepted races: a save that lands
+/// in the instant between the check and the close is not seen (the same as
+/// the check-then-upload of a save), and neither is an open that took the
+/// edit in the instant before the mark was set.
 async fn close_edit_in(
     registry: &EditRegistry,
     key: &str,
@@ -3136,6 +3373,9 @@ async fn close_edit_in(
         return Ok(closed);
     };
     let name = sync.display_name().to_string();
+    // Not handed to another open while this decides; the mark goes when
+    // this ends - the edit closed, or kept with a question.
+    let _closing = ClosingMark::set(&sync);
     // The edit's turn: an upload (or a Reload) running now finishes first,
     // and none starts while this decides.
     let Ok(_turn) = tokio::time::timeout(upload_wait, sync.upload_lock.lock()).await else {
@@ -3164,6 +3404,25 @@ async fn close_edit_in(
 /// user whether to lose them (`force`).
 fn edit_kept(question: String) -> serde_json::Value {
     serde_json::json!({ "ok": false, "unsynced": true, "error": question })
+}
+
+/// Marks an edit as being closed for as long as it lives: a "Stop editing"
+/// waiting for the edit's turn and hashing its copy ([`close_edit_in`]). An
+/// answer that keeps the edit open (`unsynced`) drops it, so the edit is
+/// handed out again; so does a close whose caller went away.
+struct ClosingMark<'a>(&'a EditSync);
+
+impl<'a> ClosingMark<'a> {
+    fn set(sync: &'a EditSync) -> Self {
+        sync.closing.fetch_add(1, Ordering::SeqCst);
+        Self(sync)
+    }
+}
+
+impl Drop for ClosingMark<'_> {
+    fn drop(&mut self) {
+        self.0.closing.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Close the SFTP subsystem for a session (also stops edit watches).
@@ -5626,8 +5885,8 @@ fn local_list_blocking(path: String) -> CmdResult<serde_json::Value> {
 
 /// Guard a local filesystem MUTATION (delete/rename/mkdir) on the local pane.
 ///
-/// This is the destructive counterpart to `validate_sftp_local_path`, which
-/// only ever gated transfer SOURCES and DESTINATIONS. A renderer that can ask
+/// This is the destructive counterpart to [`validate_sftp_local_path_with`],
+/// which only ever gated transfer SOURCES and DESTINATIONS. A renderer that can ask
 /// the backend to delete an arbitrary local path has a capability the vault
 /// lock does not take away, so the same boundaries apply: nothing inside the
 /// app data directory (the vault database lives there), nothing inside a
@@ -7977,6 +8236,7 @@ mod tests {
             mode,
             emit: Arc::new(move |payload| sink.lock().unwrap().push(payload)),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            closing: std::sync::atomic::AtomicUsize::new(0),
             debounce: EditDebounce::new(window),
             upload_lock: tokio::sync::Mutex::new(()),
             baseline: std::sync::Mutex::new(baseline),
@@ -8870,6 +9130,7 @@ mod tests {
             mode: None,
             emit: Arc::new(|_| {}),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            closing: std::sync::atomic::AtomicUsize::new(0),
             debounce: EditDebounce::new(std::time::Duration::from_millis(80)),
             upload_lock: tokio::sync::Mutex::new(()),
             baseline: std::sync::Mutex::new(RemoteStamp::default()),
@@ -9203,6 +9464,67 @@ mod tests {
         let answer = stop_editing(&registry).await;
         assert_eq!(answer["unsynced"], true, "{answer}");
         assert!(still_open(&registry, &sync, &staged));
+    }
+
+    /// While "Stop editing" waited for the edit's turn (up to 10 s) and
+    /// hashed its copy, a reopen of the file was handed that same edit - and
+    /// the stop then ended it and deleted the copy the editor had just
+    /// reopened, so its later saves were lost. A reopen is refused while the
+    /// stop decides; once the stop keeps the edit (`unsynced`), it is handed
+    /// out again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fw_r5_an_edit_being_closed_is_not_handed_out_again() {
+        let local = LocalDir::new();
+        let (registry, sync, _fx, staged) =
+            registered_edit(&local, std::time::Duration::from_millis(80)).await;
+        let (reopen_sftp, _reopen_fx) = crate::sftp::testkit::serve().await;
+        let reopen_sftp = Arc::new(reopen_sftp);
+        let emit: Arc<dyn Fn(serde_json::Value) + Send + Sync> = Arc::new(|_| {});
+        let reopen = || {
+            open_for_edit_in(
+                &registry,
+                reopen_sftp.clone(),
+                "sess".into(),
+                "/link.conf".into(),
+                local.0.clone(),
+                emit.clone(),
+            )
+        };
+        // An upload holds the edit's turn: the stop waits for it.
+        let turn = sync.upload_lock.lock().await;
+        let probe = async {
+            let waited = std::time::Instant::now();
+            while !sync.is_closing() {
+                assert!(
+                    waited.elapsed() < std::time::Duration::from_secs(30),
+                    "the stop never started deciding"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let refused = reopen().await;
+            // A save the stop will find when it gets the turn.
+            std::fs::write(&staged, b"saved while the stop waited").unwrap();
+            drop(turn);
+            refused
+        };
+        let (answer, refused) = tokio::join!(stop_editing(&registry), probe);
+        assert_eq!(
+            refused
+                .expect_err("an edit being closed is not handed out")
+                .0,
+            "link.conf is being closed - try again when it has stopped."
+        );
+        assert_kept(&answer, NOT_ON_THE_SERVER);
+        assert!(still_open(&registry, &sync, &staged));
+        assert!(!sync.is_closing(), "the mark went with the answer");
+        let again = reopen().await.expect("kept open: handed out again");
+        assert_eq!(again["reused"], true, "{again}");
+        assert_eq!(again["editId"], "edit-1", "{again}");
+        assert_eq!(
+            again["localPath"].as_str(),
+            Some(staged.display().to_string().as_str())
+        );
     }
 
     // ─── local pane commands off the main thread (A7-48) ─────────────────────
@@ -9619,6 +9941,28 @@ mod tests {
         assert!(validate_sftp_local_path(&other, LocalAccess::Write).is_ok());
     }
 
+    /// This machine's folder settings are on the write deny-list: the save
+    /// dialogs open in the Downloads folder they name.
+    #[test]
+    fn fw_s2_this_machines_folder_settings_are_refused_for_writes() {
+        let Some(home) = dirs::home_dir() else { return };
+        for name in ["user-dirs.dirs", "user-dirs.locale"] {
+            let p = join_parts(&home, ".config")
+                .join(name)
+                .display()
+                .to_string();
+            assert_eq!(
+                validate_sftp_local_path(&p, LocalAccess::Write).map_err(|e| e.0),
+                Err(FOLDER_SETTINGS_REFUSAL.to_string()),
+                "{p}"
+            );
+            assert!(
+                validate_sftp_local_path(&p, LocalAccess::Read).is_ok(),
+                "{p} may be uploaded"
+            );
+        }
+    }
+
     /// Pure layout check of the Windows Startup folders (the code path itself
     /// only runs on Windows).
     #[test]
@@ -9644,6 +9988,7 @@ mod tests {
             startup_dirs: windows_startup_dirs(Some(&base.join("AppData")), None),
             shell_startup: vec![base.join("home/.bashrc")],
             program_files: vec![base.join("home/.gitconfig")],
+            folder_settings: folder_settings_locations(&[join_parts(base, "home/.config")]),
             app_program: vec![
                 base.join("opt/SSHSpan"),
                 base.join("home/Apps/SSHSpan.AppImage"),
@@ -10873,25 +11218,109 @@ mod tests {
 
     // ─── Download targets, remote names and download folders ────
 
-    /// `sftp_download`'s grant branch: a path the user picked in the save
-    /// dialog may sit in a sensitive place (they chose it); the same path as a
-    /// bare renderer string may not. App data and system directories stay
-    /// refused either way.
+    /// `sftp_download` on a path picked in the save dialog. This test was
+    /// `ru6a_a_dialog_granted_download_path_skips_only_the_deny_list`: a
+    /// pick skipped the write deny-list, since a human chose the place. But
+    /// the renderer (or the server) suggests the name, and a pick replaced
+    /// `~/.ssh/config`, `.gitconfig` or `~/.local/bin/ssh` where a typed path
+    /// was refused. So the rule changed: a pick gets the same deny-list as a
+    /// typed path - a dotfile can be saved elsewhere and moved. Relative
+    /// paths and system directories stay refused either way.
     #[cfg(unix)]
     #[test]
-    fn ru6a_a_dialog_granted_download_path_skips_only_the_deny_list() {
+    fn fw_s2_a_dialog_picked_download_gets_the_whole_deny_list() {
         let base = std::path::PathBuf::from("/fixture");
         let s = sensitive_fixture(&base);
         let ssh_config = base.join("home/.ssh/config").display().to_string();
-        assert!(check_download_target(&ssh_config, true, &s).is_ok());
-        assert!(check_download_target(&ssh_config, false, &s).is_err());
         let ordinary = base.join("home/docs/a.txt").display().to_string();
-        assert!(check_download_target(&ordinary, false, &s).is_ok());
         for granted in [true, false] {
+            assert_eq!(
+                check_download_target(&ssh_config, granted, &s).map_err(|e| e.0),
+                Err(SSH_DIR_WRITE_REFUSAL.to_string()),
+                "picked in the dialog: {granted}"
+            );
+            assert!(check_download_target(&ordinary, granted, &s).is_ok());
             assert!(check_download_target("relative/a.txt", granted, &s).is_err());
-            #[cfg(unix)]
             assert!(check_download_target("/etc/passwd", granted, &s).is_err());
         }
+    }
+
+    /// Settings that run commands and a folder on the PATH were refused when
+    /// typed but replaced when picked - with no "Replace?" when the file did
+    /// not exist yet, which a save dialog that falls back to home (no XDG
+    /// Downloads folder) puts one Save away. And the XDG folder settings were
+    /// on no list at all: a typed download over `~/.config/user-dirs.dirs`
+    /// set XDG_DOWNLOAD_DIR to `~/.config/git`, and the next save dialog
+    /// opened there with "config" filled in. Each is refused now, picked or
+    /// typed, as a download and as a local change; an ordinary file in
+    /// Downloads is still accepted.
+    #[cfg(unix)]
+    #[test]
+    fn fw_s2_picked_or_typed_never_program_settings_or_folder_settings() {
+        let base = std::path::PathBuf::from("/fixture");
+        let home = base.join("home");
+        let config = [home.join(".config")];
+        let s = Locations {
+            program_files: home_program_locations(&home, &config, &[]),
+            folder_settings: folder_settings_locations(&config),
+            ..fixture_locations(&base)
+        }
+        .resolve();
+        for (p, why) in [
+            (home.join(".gitconfig"), PROGRAM_SETTINGS_REFUSAL),
+            (
+                join_parts(&home, ".config/git/config"),
+                PROGRAM_SETTINGS_REFUSAL,
+            ),
+            (home.join(".vimrc"), PROGRAM_SETTINGS_REFUSAL),
+            (home.join(".exrc"), PROGRAM_SETTINGS_REFUSAL),
+            (home.join(".emacs"), PROGRAM_SETTINGS_REFUSAL),
+            (home.join(".pam_environment"), PROGRAM_SETTINGS_REFUSAL),
+            (
+                join_parts(&home, ".local/bin/ssh"),
+                PROGRAM_SETTINGS_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/user-dirs.dirs"),
+                FOLDER_SETTINGS_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/user-dirs.locale"),
+                FOLDER_SETTINGS_REFUSAL,
+            ),
+        ] {
+            let p = p.display().to_string();
+            for granted in [true, false] {
+                assert_eq!(
+                    check_download_target(&p, granted, &s).map_err(|e| e.0),
+                    Err(why.to_string()),
+                    "{p} (picked in the dialog: {granted})"
+                );
+            }
+            assert_eq!(
+                validate_sftp_local_path_with(&p, LocalAccess::Write, &s).map_err(|e| e.0),
+                Err(why.to_string()),
+                "{p} as a local change"
+            );
+        }
+        for p in [
+            join_parts(&home, "Downloads/report.pdf"),
+            join_parts(&home, "Downloads/user-dirs.dirs"),
+        ] {
+            let p = p.display().to_string();
+            for granted in [true, false] {
+                assert!(check_download_target(&p, granted, &s).is_ok(), "{p}");
+            }
+        }
+        assert_eq!(
+            folder_settings_locations(&[base.join("a"), base.join("b")]),
+            [
+                base.join("a/user-dirs.dirs"),
+                base.join("a/user-dirs.locale"),
+                base.join("b/user-dirs.dirs"),
+                base.join("b/user-dirs.locale"),
+            ]
+        );
     }
 
     /// Remote names with a NUL are refused, not flattened into a
@@ -12375,7 +12804,10 @@ mod tests {
     /// A path picked in the native save dialog skipped the deny-list - and
     /// the renderer fills in the dialog's suggested name, so one click on
     /// Save could plant a DLL in the install folder. SSHSpan's program is
-    /// refused even then; everything else a human picks stays allowed.
+    /// refused even then. A pick now gets the whole write deny-list
+    /// (`fw_s2_a_dialog_picked_download_gets_the_whole_deny_list`), so a file
+    /// in SSHSpan's data folders is refused too; it used to be accepted when
+    /// picked.
     #[test]
     fn rw_fix1_a_dialog_picked_download_never_writes_the_program_files() {
         let base = std::path::PathBuf::from("/fixture");
@@ -12384,17 +12816,76 @@ mod tests {
             base.join("opt/SSHSpan/version.dll"),
             base.join("home/Apps/SSHSpan.AppImage"),
             base.join("home/Downloads/version.dll"),
-        ] {
-            let err = check_download_target(&p.display().to_string(), true, &s)
-                .expect_err("SSHSpan's program is never a download target");
-            assert!(err.0.contains("SSHSpan's own program"), "{}", err.0);
-        }
-        for p in [
-            base.join("home/Downloads/report.pdf"),
-            base.join("home/.bashrc"),
             base.join("local")
                 .join(BUNDLE_IDENTIFIER)
                 .join("picked-by-hand.txt"),
+        ] {
+            let err = check_download_target(&p.display().to_string(), true, &s)
+                .expect_err("SSHSpan's program and data are never a download target");
+            assert_eq!(err.0, APP_FILES_REFUSAL, "{}", p.display());
+        }
+        assert!(
+            check_download_target(
+                &base.join("home/Downloads/report.pdf").display().to_string(),
+                true,
+                &s
+            )
+            .is_ok(),
+            "an ordinary file picked by a human"
+        );
+    }
+
+    /// GTK opened a save dialog with no folder set in the working directory,
+    /// usually home, so a suggested `.bashrc` (a hostile server's file name,
+    /// or a compromised renderer's) was one Save and one "Replace?" away
+    /// from the user's `~/.bashrc`. A dialog-picked download is refused for
+    /// the startup and shell startup locations the typed-path check refuses,
+    /// by the same rules; an ordinary file in home or Downloads (a `.bashrc`
+    /// in Downloads among them) is still accepted.
+    #[cfg(unix)]
+    #[test]
+    fn fw_r3_a_dialog_picked_download_never_replaces_a_startup_file() {
+        let base = std::path::PathBuf::from("/fixture");
+        let home = base.join("home");
+        let (startup_dirs, shell_startup) = home_startup_locations(
+            &home,
+            &[home.join(".config")],
+            &[join_parts(&home, ".local/share")],
+        );
+        let s = Locations {
+            startup_dirs,
+            shell_startup,
+            ..fixture_locations(&base)
+        }
+        .resolve();
+        for (p, why) in [
+            (home.join(".bashrc"), SHELL_STARTUP_REFUSAL),
+            (home.join(".profile"), SHELL_STARTUP_REFUSAL),
+            (
+                join_parts(&home, ".config/fish/config.fish"),
+                SHELL_STARTUP_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/autostart/x.desktop"),
+                STARTUP_DIRS_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/systemd/user/x.service"),
+                STARTUP_DIRS_REFUSAL,
+            ),
+        ] {
+            let p = p.display().to_string();
+            for granted in [true, false] {
+                let err = check_download_target(&p, granted, &s)
+                    .expect_err("a startup file is never a download target");
+                assert_eq!(err.0, why, "{p} (picked in the dialog: {granted})");
+            }
+        }
+        for p in [
+            home.join("notes.txt"),
+            home.join(".bashrc.bak"),
+            join_parts(&home, "Downloads/report.pdf"),
+            join_parts(&home, "Downloads/.bashrc"),
         ] {
             assert!(
                 check_download_target(&p.display().to_string(), true, &s).is_ok(),
@@ -12402,6 +12893,188 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    /// The public-key and audit-log exports write text the renderer supplies
+    /// to a path picked in the save dialog - whose name the renderer
+    /// suggested - and accepted `~/.bashrc` there. A text export follows the
+    /// rule of a dialog-picked download, the whole write deny-list: never a
+    /// shell startup file, a startup folder (reached through a linked folder
+    /// too), `~/.ssh`, settings that run commands, the folder settings or
+    /// SSHSpan's own program files - in the words of an export, and nothing
+    /// is written. An ordinary file in home or Downloads is written as
+    /// before.
+    #[cfg(unix)]
+    #[test]
+    fn fw_r12_a_dialog_picked_text_export_gets_the_write_deny_list() {
+        let local = LocalDir::new();
+        let base = local.0.clone();
+        let home = base.join("home");
+        std::fs::create_dir_all(join_parts(&home, ".config/autostart")).unwrap();
+        std::fs::create_dir_all(home.join("Downloads")).unwrap();
+        // A folder that leads into ~/.config by a link.
+        std::os::unix::fs::symlink(home.join(".config"), home.join("settings")).unwrap();
+        let config = [home.join(".config")];
+        let (startup_dirs, shell_startup) =
+            home_startup_locations(&home, &config, &[join_parts(&home, ".local/share")]);
+        let s = Locations {
+            startup_dirs,
+            shell_startup,
+            program_files: home_program_locations(&home, &config, &[]),
+            ..fixture_locations(&base)
+        }
+        .resolve();
+        let export = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA exported-by-sshspan";
+        for (p, why) in [
+            (home.join(".bashrc"), EXPORT_SHELL_STARTUP_REFUSAL),
+            (home.join(".profile"), EXPORT_SHELL_STARTUP_REFUSAL),
+            (
+                join_parts(&home, ".config/autostart/key.desktop"),
+                EXPORT_STARTUP_DIRS_REFUSAL,
+            ),
+            (
+                join_parts(&home, "settings/autostart/key.desktop"),
+                EXPORT_STARTUP_DIRS_REFUSAL,
+            ),
+            (
+                join_parts(&base, "opt/SSHSpan/key.pub"),
+                EXPORT_APP_FILES_REFUSAL,
+            ),
+            (join_parts(&home, ".ssh/config"), EXPORT_SSH_DIR_REFUSAL),
+            (home.join(".gitconfig"), EXPORT_PROGRAM_SETTINGS_REFUSAL),
+            (home.join(".vimrc"), EXPORT_PROGRAM_SETTINGS_REFUSAL),
+            (home.join(".exrc"), EXPORT_PROGRAM_SETTINGS_REFUSAL),
+            (home.join(".emacs"), EXPORT_PROGRAM_SETTINGS_REFUSAL),
+            (
+                home.join(".pam_environment"),
+                EXPORT_PROGRAM_SETTINGS_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/git/config"),
+                EXPORT_PROGRAM_SETTINGS_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/user-dirs.dirs"),
+                EXPORT_FOLDER_SETTINGS_REFUSAL,
+            ),
+        ] {
+            let target = p.display().to_string();
+            let err = crate::commands::write_text_export(&target, export, &s)
+                .expect_err("never a place on the write deny-list");
+            assert_eq!(err.0, why, "{target}");
+            assert!(!p.exists(), "{target} was written");
+        }
+        for p in [
+            home.join("id_ed25519.pub"),
+            join_parts(&home, "Downloads/audit-log.csv"),
+            join_parts(&home, "Downloads/.bashrc"),
+        ] {
+            let target = p.display().to_string();
+            let out = crate::commands::write_text_export(&target, export, &s)
+                .unwrap_or_else(|e| panic!("{target}: {}", e.0));
+            assert_eq!(out, serde_json::json!({ "ok": true }));
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), export, "{target}");
+        }
+        // The command writes only through that function.
+        let source = include_str!("mod.rs");
+        let start = source.find("pub async fn system_write_text_file(").unwrap();
+        let rest = &source[start..];
+        let command = &rest[..rest.find("\n}\n").unwrap()];
+        assert!(command.contains("write_text_export("), "{command}");
+        assert!(!command.contains("write_secret_file("), "{command}");
+    }
+
+    /// A private-key export suggests the key's own name - and `.bashrc` is a
+    /// valid key name - and a vault backup goes wherever the dialog says;
+    /// both were checked only against SSHSpan's data and the system folders.
+    /// They get the write deny-list now, in the words of an export - all of it
+    /// but ~/.ssh: exporting a private key to ~/.ssh/id_... is ordinary.
+    /// Nothing is written where they are refused.
+    #[cfg(unix)]
+    #[test]
+    fn fw_t3_key_and_backup_exports_get_the_deny_list_but_not_for_ssh() {
+        let local = LocalDir::new();
+        let base = local.0.clone();
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("Downloads")).unwrap();
+        let config = [home.join(".config")];
+        let (startup_dirs, shell_startup) =
+            home_startup_locations(&home, &config, &[join_parts(&home, ".local/share")]);
+        let s = Locations {
+            startup_dirs,
+            shell_startup,
+            program_files: home_program_locations(&home, &config, &[]),
+            folder_settings: folder_settings_locations(&config),
+            ..fixture_locations(&base)
+        }
+        .resolve();
+        let key =
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nfw-t3\n-----END OPENSSH PRIVATE KEY-----\n";
+        for (p, why) in [
+            (home.join(".bashrc"), EXPORT_SHELL_STARTUP_REFUSAL),
+            (home.join(".gitconfig"), EXPORT_PROGRAM_SETTINGS_REFUSAL),
+            (
+                join_parts(&home, ".local/bin/id_test"),
+                EXPORT_PROGRAM_SETTINGS_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/autostart/id_test"),
+                EXPORT_STARTUP_DIRS_REFUSAL,
+            ),
+            (
+                join_parts(&home, ".config/user-dirs.dirs"),
+                EXPORT_FOLDER_SETTINGS_REFUSAL,
+            ),
+            (
+                join_parts(&base, "opt/SSHSpan/id_test"),
+                EXPORT_APP_FILES_REFUSAL,
+            ),
+        ] {
+            let target = p.display().to_string();
+            let err = crate::commands::write_key_export(&target, key, &s)
+                .expect_err("never a place on the deny-list but ~/.ssh");
+            assert_eq!(err.0, why, "{target}");
+            assert!(!p.exists(), "{target} was written");
+        }
+        for p in [
+            home.join(".ssh/id_test"),
+            join_parts(&home, "Downloads/id_test"),
+        ] {
+            let target = p.display().to_string();
+            crate::commands::write_key_export(&target, key, &s)
+                .unwrap_or_else(|e| panic!("{target}: {}", e.0));
+            assert_eq!(std::fs::read(&p).unwrap(), key, "{target}");
+        }
+        // The vault backup: the same rule.
+        let db = crate::db::Database::open_at(base.join("fw-t3.db")).unwrap();
+        let backup_to = |p: &std::path::Path| {
+            crate::commands::export_backup_to_path_with(
+                &db,
+                "fw-t3-master",
+                &p.display().to_string(),
+                &s,
+                &|| Ok(()),
+            )
+        };
+        let profile = home.join(".profile");
+        let err = backup_to(&profile).expect_err("never a shell startup file");
+        assert_eq!(err.0, EXPORT_SHELL_STARTUP_REFUSAL);
+        assert!(!profile.exists(), "nothing written");
+        let backup = join_parts(&home, "Downloads/vault-backup.json");
+        backup_to(&backup).unwrap_or_else(|e| panic!("{}", e.0));
+        assert!(backup.exists());
+        // The commands write only through those.
+        let source = include_str!("mod.rs");
+        let body = |signature: &str| {
+            let start = source.find(signature).unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let key_export = body("pub async fn key_export_to_file(");
+        assert!(key_export.contains("write_key_export("), "{key_export}");
+        assert!(!key_export.contains("write_secret_file("), "{key_export}");
+        assert!(body("fn export_backup_to_path(").contains("export_backup_to_path_with("));
     }
 
     // ── SFTP errors say what failed, once ───────────────────────────────

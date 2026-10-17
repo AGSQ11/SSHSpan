@@ -323,18 +323,17 @@ fn own_item_candidates<'a>(
 /// by name; the rest are counted.
 const MAX_LISTED_ITEMS: usize = 5;
 
-/// Longest item title [`ambiguous_server_error`] quotes, in characters.
-const MAX_LISTED_TITLE_CHARS: usize = 60;
-
-/// The error for a server that several unowned items name: which
-/// items they are - title and id, at most [`MAX_LISTED_ITEMS`], titles
-/// shortened and stripped of control characters - and what to do without
-/// losing data. "Delete the extra copies" (the old advice) discarded a clone
-/// that was a legitimate second server, and deleting the server's own copy
-/// made SSHSpan link to the clone and overwrite it with this server's data
-/// on the next sync. So: delete only true duplicates; for an item that is a
-/// different server, remove the `serverId` entry from its notes (it is then
-/// offered as a new server) or move it out of the servers folder.
+/// The error for a server that several unowned items name: which items they
+/// are - title and id, at most [`MAX_LISTED_ITEMS`], each quoted as a pending
+/// entry quotes it ([`pending_text`]: shortened, and without control, format
+/// or direction characters that could reverse the advice around them) - and
+/// what to do without losing data. "Delete the extra copies" (the old
+/// advice) discarded a clone that was a legitimate second server, and
+/// deleting the server's own copy made SSHSpan link to the clone and
+/// overwrite it with this server's data on the next sync. So: delete only
+/// true duplicates; for an item that is a different server, remove the
+/// `serverId` entry from its notes (it is then offered as a new server) or
+/// move it out of the servers folder.
 fn ambiguous_server_error(
     client: &BitwardenClient,
     sv: &ServerRecord,
@@ -344,18 +343,9 @@ fn ambiguous_server_error(
         .iter()
         .take(MAX_LISTED_ITEMS)
         .map(|item| {
-            let title: String = item_display_name(client, item)
-                .chars()
-                .filter(|c| !c.is_control())
-                .collect();
-            let shown = if title.chars().count() > MAX_LISTED_TITLE_CHARS {
-                let cut: String = title.chars().take(MAX_LISTED_TITLE_CHARS).collect();
-                format!("{cut}...")
-            } else {
-                title
-            };
-            let id: String = item.id.chars().filter(|c| !c.is_control()).collect();
-            format!("\"{shown}\" (id {id})")
+            let title = pending_text(&item_display_name(client, item));
+            let id = pending_text(&item.id);
+            format!("\"{title}\" (id {id})")
         })
         .collect();
     if candidates.len() > MAX_LISTED_ITEMS {
@@ -1196,9 +1186,9 @@ impl SyncRun<'_> {
                         report.renamed.extend(rename);
                     }
                     Ok(PulledKey::Duplicate) => {}
-                    Err(e) => report.error("cipher_id", &cipher, e),
+                    Err(e) => report.error("cipher_id", &pending_text(&cipher), e),
                 },
-                None => report.error("cipher_id", &cipher, MISSING),
+                None => report.error("cipher_id", &pending_text(&cipher), MISSING),
             },
             RemotePull::Server { row, cipher } => match live.get(cipher.as_str()) {
                 Some(item) => {
@@ -1214,9 +1204,9 @@ impl SyncRun<'_> {
             RemotePull::NewServer { cipher } => match live.get(cipher.as_str()) {
                 Some(item) => match pull_new_server(client, item, db, vault_password).await {
                     Ok(()) => report.servers_pulled += 1,
-                    Err(e) => report.error("cipher_id", &cipher, e),
+                    Err(e) => report.error("cipher_id", &pending_text(&cipher), e),
                 },
-                None => report.error("cipher_id", &cipher, MISSING),
+                None => report.error("cipher_id", &pending_text(&cipher), MISSING),
             },
         }
     }
@@ -1398,7 +1388,7 @@ impl SyncRun<'_> {
                 continue;
             }
             if let Some(why) = unusable.get(&cipher.id) {
-                report.error("cipher_id", &cipher.id, why);
+                report.error("cipher_id", &pending_text(&cipher.id), why);
                 continue;
             }
             // The same key is already in the vault without a link to this
@@ -1618,10 +1608,10 @@ impl SyncRun<'_> {
                 match classify_named_item(cipher, reference) {
                     NamedItem::Own => continue,
                     NamedItem::OlderCopy => {
-                        let item_name = item_display_name(client, cipher);
+                        let item_name = pending_text(&item_display_name(client, cipher));
                         report.error(
                             "cipher_id",
-                            &cipher.id,
+                            &pending_text(&cipher.id),
                             format!(
                                 "{item_name} is an older copy of server '{}' - not imported.",
                                 named.name
@@ -1630,10 +1620,10 @@ impl SyncRun<'_> {
                         continue;
                     }
                     NamedItem::Undetermined => {
-                        let item_name = item_display_name(client, cipher);
+                        let item_name = pending_text(&item_display_name(client, cipher));
                         report.error(
                             "cipher_id",
-                            &cipher.id,
+                            &pending_text(&cipher.id),
                             format!(
                                 "{item_name} names server '{}', but its creation date cannot be \
                                  compared with the server's item - not imported.",
@@ -4343,6 +4333,84 @@ mod tests {
         assert!(text.contains("and 3 more"), "{text}");
         assert!(!text.contains(&long_title), "titles are shortened: {text}");
         assert!(text.chars().count() < 1500, "{}", text.chars().count());
+    }
+
+    /// An item's title and id are written by whoever can edit the item.
+    /// Quoted raw in an error - several items naming one server, an older
+    /// copy, a copy without a creation date, an item holding no usable key -
+    /// a direction character could reverse the advice around them. They are
+    /// quoted as a pending entry quotes them ([`pending_text`]).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fw_r6_error_texts_quote_item_titles_and_ids_cleaned() {
+        let disguising = ['\u{202e}', '\u{2066}', '\u{2067}', '\u{2069}', '\u{200f}'];
+        let error_of = |report: &SyncReport, needle: &str| -> serde_json::Value {
+            let entry = report
+                .errors
+                .iter()
+                .find(|e| e["error"].as_str().is_some_and(|t| t.contains(needle)))
+                .unwrap_or_else(|| panic!("no error with {needle:?}: {report:?}"))
+                .clone();
+            for value in entry.as_object().unwrap().values() {
+                let text = value.as_str().unwrap_or_default();
+                assert!(!text.chars().any(|c| disguising.contains(&c)), "{text:?}");
+            }
+            entry
+        };
+        let mut client = offline_client();
+
+        // Several items name one server.
+        let db = test_db();
+        let web = named_server("web", None, never_synced());
+        db.insert_server(&web).unwrap();
+        let mut own = login_naming_at(&client, "item-\u{2066}1", &web.id, Some(T0));
+        own.name = Some(enc(&client, "web\u{202e}gnigats"));
+        let other = login_naming_at(&client, "item-2", &web.id, Some(T0 + 1_000));
+        let report = run_server_pass(&db, &mut client, &[&own, &other], true).await;
+        let entry = error_of(&report, "Bitwarden items name server");
+        let text = entry["error"].as_str().unwrap();
+        assert!(text.contains("\"webgnigats\" (id item-1)"), "{text}");
+
+        // An older copy, and a copy without a creation date.
+        let db = test_db();
+        let sv = server_row(
+            &uuid::Uuid::new_v4().to_string(),
+            Some("s-new"),
+            synced_at(T0, T0),
+        );
+        db.insert_server(&sv).unwrap();
+        let recreated = login_naming_at(&client, "s-new", &sv.id, Some(T0 + 5_000));
+        let mut restored = login_naming_at(&client, "s-\u{2067}orig", &sv.id, Some(T0));
+        restored.name = Some(enc(&client, "orig\u{202e}inal"));
+        let mut undated = login_naming_at(&client, "s-\u{2069}undated", &sv.id, None);
+        undated.name = Some(enc(&client, "un\u{200f}dated"));
+        let report =
+            run_server_pass(&db, &mut client, &[&recreated, &restored, &undated], true).await;
+        let older = error_of(&report, "is an older copy of server");
+        assert_eq!(older["cipher_id"], "s-orig", "{older}");
+        assert!(
+            older["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("original is an older copy"),
+            "{older}"
+        );
+        let no_date = error_of(&report, "creation date");
+        assert_eq!(no_date["cipher_id"], "s-undated", "{no_date}");
+        assert!(
+            no_date["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("undated names server"),
+            "{no_date}"
+        );
+
+        // An item holding no SSH key.
+        let db = test_db();
+        let mut keyless = cipher("k-\u{202e}1", 5, Some("keys"), Some(T0));
+        keyless.name = Some(enc(&client, "no\u{2066}key"));
+        let report = run_key_pass(&db, &mut client, &[&keyless], true).await;
+        let entry = error_of(&report, "holds no SSH key");
+        assert_eq!(entry["cipher_id"], "k-1", "{entry}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
