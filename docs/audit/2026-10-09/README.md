@@ -19,7 +19,7 @@
 This directory preserves the raw eight-area flaw audit of SSHSpan v1.9.1. The A1-A8 files are the baseline record
 and keep their original text and line anchors, so they intentionally still describe the pre-fix code. Use this file
 to see what has happened since. [REPORT.md](REPORT.md) explains the method, evidence, partial and deferred decisions,
-and remaining work. The fixes recorded here were released in v1.10.0 on 2026-10-18 (pull request #85, merged as
+and remaining work. The fixes recorded here are in v1.10.0 (pull request #85, merged on 2026-10-18 as
 `77f9389`).
 
 ## Source files

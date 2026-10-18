@@ -1,6 +1,6 @@
 # SSHSpan flaw remediation: audit and remediation report
 
-This report covers the branch `gsq/app-flaws-audit-subagents-c36b18`, which fixes the findings of the 2026-10-09 audit of SSHSpan. The base is `main` at 1ca864f. The code described here is the branch at 3b0fcfb plus the final fix wave (6c19b1b). The report is published in the documentation commit that adds it, together with the [audit index](README.md), the user and developer documents and the CI changes. Follow-up commits answer the CI runs and the reviews of [pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85) (section 3.2). The pull request was merged into `main` as 77f9389 on 2026-10-18, and the work was released as v1.10.0.
+This report covers the branch `gsq/app-flaws-audit-subagents-c36b18`, which fixes the findings of the 2026-10-09 audit of SSHSpan. The base is `main` at 1ca864f. The code described here is the branch at 3b0fcfb plus the final fix wave (6c19b1b). The report is published in the documentation commit that adds it, together with the [audit index](README.md), the user and developer documents and the CI changes. Follow-up commits answer the CI runs and the reviews of [pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85) (section 3.2). The pull request was merged into `main` as 77f9389 on 2026-10-18, and the work is in v1.10.0, whose release commit follows the merge.
 
 ## 1. Summary
 
@@ -15,7 +15,7 @@ This report covers the branch `gsq/app-flaws-audit-subagents-c36b18`, which fixe
 - **Tests.** Rust tests grew from 272 at the base (216 library, 45 integration, 11 MCP integration) to 905 at 3b0fcfb and 950 at the fix-wave commit 6c19b1b (882, 48, 20). The renderer had one suite of 76 checks; seven suites ran 2,810 checks at 3b0fcfb, 2,936 at 6c19b1b and 2,935 with the documentation commit, whose `test:ui` no longer carries a copy of the MCP contract check. The pull request follow-ups bring Rust to 953 (885 library) and the renderer to 3,086 checks (`test:sftp` 763, `test:polish` 283).
 - **Coverage of the final code (6c19b1b).** Renderer lines 92.9% (changed lines 95.7%). Rust production lines 72.0% (changed lines 77.3%), below the 80% target, mainly because code that needs a running Tauri app runs in no test: the commands' 2,378 lines and 1,391 lines of helpers that take an `AppHandle`, `State` or `Window` make up 61% of the uncovered lines; without the commands alone the figure is 80.7%. Section 8.9 has the method and an earlier measurement.
 - **Not done.** Seven findings are Partial and one is Deferred, each with a reason (section 7). Some things were never run on the real platform: a real WebView2 drag, a real GTK credential dialog and the exit-time MCP session teardown on Windows (section 9). The Windows CI job first ran on the pull request and failed five tests, none for a product bug (Unix-style paths in four, a too-strict ACL check in one), which the follow-up commit fixes; with that commit it passed on a runner for the first time. Its next run failed one test, behind a product issue that the third follow-up fixes, so it stays `continue-on-error` until it passes consistently (section 8.4).
-- **Released.** [Pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85) was merged into `main` as 77f9389 on 2026-10-18, once every check had passed, the Windows job included, and the work was released as v1.10.0 (section 3.2).
+- **In v1.10.0.** [Pull request #85](https://github.com/AGSQ11/SSHSpan/pull/85) was merged into `main` as 77f9389 on 2026-10-18, once every check had passed, the Windows job included, and the release commit that follows sets the version to 1.10.0 (section 3.2).
 
 ### 1.2 What was audited
 
@@ -531,7 +531,7 @@ Two more commits answer the review bot's last comments, on the documents and on 
 - **The release.** The user asked for a tag and a release, with every document brought up to date. The version is 1.10.0, a minor version as for the earlier feature releases; the database changes are additive. The release commit:
   - sets the version in `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.lock`, and in `package-lock.json`, which still said 1.7.0;
   - turns the CHANGELOG's `[Unreleased]` section into `[1.10.0] - 2026-10-18`, with a short list of highlights at its top, since the release workflow puts that section on the release page;
-  - brings the README, CONTRIBUTING, the status lines of ARCHITECTURE, SECURITY, PRIVACY and MCP-SMOKE-TEST, the audit index and this report up to date.
+  - brings the README, the status lines of ARCHITECTURE, SECURITY, PRIVACY and MCP-SMOKE-TEST, the audit index and this report up to date; CONTRIBUTING needed no change.
 
   The tag `v1.10.0` starts the release workflow, which tests, builds and signs the installers and publishes the release. That run is also the first one of its Windows manifest step.
 
