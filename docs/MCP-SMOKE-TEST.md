@@ -135,11 +135,13 @@ backend and a real webview.
     backend's message and nothing is typed; accepted text appears at the prompt and Enter is never
     pressed.
 
-12. Set to **execute**. Ask it to run `echo hello`.
+12. Set to **execute**. Ask it to run `echo hello` while Auto-approve is still on for `echo`
+    (step 9), then turn Auto-approve off for `echo` and ask again.
 
-    Expected: an approval card shows server, tool, and arguments (invisible and text-direction
-    characters spelled out); Approve sends `approved: true`; Deny does not call the backend. With
-    Auto-approve on `echo` (step 9) the call runs without a card.
+    Expected: the first call runs without a card. The second shows an approval card with server,
+    tool, and arguments (invisible and text-direction characters spelled out); Approve sends
+    `approved: true`; Deny does not call the backend. Turn Auto-approve back on for `echo`: step
+    14 checks that a changed definition clears it.
 
 13. Set to **yolo** and ask for `echo hello`.
 

@@ -519,6 +519,12 @@ On fd4765d the renderer job passed with the notification fix, as did the advisor
 
 On b637fdc every job passed except the Windows job, still `continue-on-error`, which failed one library test; the database tests passed. The review bot found no issues. The failing test, `pbes2_export_wrong_passphrase_fails`, expected a wrong passphrase to fail the PKCS7 padding check of an AES-256-CBC export. That check has no integrity, and random bytes pass it about 0.4% of the time; with a random salt and IV, the test failed at random on any platform. Only the test's own decrypt helper was involved, since the product never decrypts this format. The test now requires that a wrong passphrase never recovers the original key bytes. The user asked for the pull request to be merged once every check passes, the Windows job included.
 
+Two more commits answer the review bot's last comments, on the documents and on one script:
+- MCP-SMOKE-TEST: the access-level rules are unit-tested in `call_gate`, while the command around them is checked only by steps 10-13; step 12 now turns Auto-approve off before it expects a card.
+- PRIVACY's status line names the commit its later passages were checked against.
+- The renderer test harness, and the sample server in AUDIT-CONTEXT that it follows, checked that a requested file lay under the renderer folder with a bare prefix test, so a sibling folder whose name begins with `renderer` was served too (shown with a probe). The test now includes the separator. All seven suites pass with it.
+- Two audit statements, in A4 and A6, are corrected in section 6.4, since the A1-A8 files keep their original text.
+
 ## 4. What changed for users, by area
 
 Each item names the commits that carry it. 6c19b1b is the fix wave.
@@ -931,10 +937,15 @@ In passing it found four code issues:
 - a system proxy bypasses the Bitwarden connect-time address check (documented as an accepted risk);
 - the hygiene check misses "(Task N)" comments, and `test:ui` ignores `SSHSPAN_RENDERER_DIR` (documented).
 
-### 6.4 Audit statements the units corrected
+### 6.4 Audit statements corrected later
 
+The A1-A8 files keep their original text, so their corrections are recorded here. The units corrected these:
 - A7-57: the audit's `a:b` and `a_b` example is not a collision (`a:b` reads as a drive-letter pattern); the real collision is `back:up` and `back_up` (dc09f93, 463345c).
 - A8-21: `cdp-e2e-2.js` and `cdp-featurepass.js` were not broken the way the audit says. They were deleted anyway, because they act on whatever app instance they attach to, with hard-coded throwaway secrets (11e7e30).
+
+The pull request's automated review found these:
+- A4's summary says the findings it did not reproduce in Chromium were proven by code reading. A4-18 was not: that SSHSpan always sent `max_tokens` was read in the code, but that current OpenAI models refuse it is documented provider behaviour, marked "suspected" and not verified live, as the summary's next line says. The provider halves of A4-03 and A4-11 rest on documented rules too. Their fixes follow the same documentation, and no live provider was tried (section 7.4).
+- A6-02 says the host-key trust prompt was the only native dialog in the app. At the base there were native file dialogs too: the save dialogs of `system_pick_save_path` and `key_export_to_file`, which A6-02's Location and A6's list of guarantees name, and the open dialog of `system_select_file`. The host-key prompt was the only native question, and the chain A6-02 describes shows no dialog at all.
 
 ### 6.5 Where tests were not seen failing first
 
@@ -1042,7 +1053,7 @@ These are known, deliberate states. `docs/SECURITY.md` ("Accepted risks and limi
 
 ### 7.4 Residual risks and what no suite exercised
 
-- **Not the shipping webviews.** The renderer suites run in headless Chromium only. WebView2 and WebKitGTK rendering, the native dialogs, the tray, real SSH, SFTP, Bitwarden and MCP servers, and screen readers were not exercised.
+- **Not the shipping webviews.** The renderer suites run in headless Chromium only. WebView2 and WebKitGTK rendering, the native dialogs, the tray, real SSH, SFTP, Bitwarden and MCP servers, AI providers, and screen readers were not exercised.
 - **Windows.** Until the pull request, Windows code ran natively only for RU1's secret-file tests; the `windows-gnu` check executes nothing. Since then the library tests have run natively on the `windows-latest` runner, and the library and integration tests on Windows 11 from a cross-build (section 8.4). Still not exercised for real on Windows: the `ShellExecuteExW` installer path, a real sharing violation, a key file on a network share and Win32-OpenSSH (emulated in the test kit). The new `windows-latest` CI job passed on a runner for the first time with the follow-up commit and is still `continue-on-error`, and `release.yml`'s Windows tests, with the new manifest step, run only at a tag and have not run since that step was added.
 - **Drag and drop is emulated.** The suites withhold the HTML5 drag events WebView2 withholds and drive a real mouse; no real WebView2 drag was run.
 - **Native dialogs.** The credential questions are tested through injected answers and the answer mapping; they were never shown in a real dialog, GTK included (the reviewers' offscreen GTK probes covered the save dialogs only).

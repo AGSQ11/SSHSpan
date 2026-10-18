@@ -1,7 +1,8 @@
 # SSHSpan privacy model
 
-**Last updated:** 2026-10-17  
-**Status:** describes the remediation branch; checked against committed source at `6c19b1b`  
+**Last updated:** 2026-10-18  
+**Status:** describes the remediation branch; checked against committed source at `6c19b1b`, and
+the passages edited since then at `b637fdc`; the code it describes is the same at both  
 **Platforms:** Windows and Linux
 
 SSHSpan collects no telemetry, analytics, advertising identifiers, or crash reports, and it has no
