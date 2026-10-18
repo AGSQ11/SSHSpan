@@ -33,6 +33,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.platform }}
     steps:
+      # The Windows runner's Git converts line endings to CRLF on checkout.
+      # Several Rust tests read source files and match LF line endings, and
+      # five of them failed in the first v1.10.0 run for that reason. Keep LF,
+      # as ci.yml's windows job does (the repository has no .gitattributes).
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
       # Third-party actions are pinned to full commit SHAs (version in a
       # comment): a mutable tag that ever moves would otherwise run attacker
       # code in a workflow that holds contents:write and the release signing
