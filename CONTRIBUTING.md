@@ -12,6 +12,11 @@ Install:
 - Rust (CI pins `1.98.0`) with `rustfmt` and `clippy`;
 - the Tauri v2 system prerequisites for your platform.
 
+On Windows, keep LF line endings: run `git config --global core.autocrlf false` before you clone
+(or clone with `-c core.autocrlf=false`). Several Rust tests read source files and match LF line
+endings, `check-vendor.js` compares the vendored files byte for byte, and the repository has no
+`.gitattributes`. CI and the release workflow set the same option.
+
 From the repository root:
 
 ```sh

@@ -377,7 +377,9 @@ want to return to 1.9.1.
   a single ACL entry, which are fixed; its next run, at `fd4765d`, failed one test, because a
   database read gave up behind a run of writes on the loaded runner, since fixed; the job stays
   `continue-on-error`, so its failure does not fail the workflow, until it passes consistently);
-  every job has a timeout. The unreferenced `scripts/refactor_tabs.py` and `scripts/cdp-*.js`
+  every job has a timeout. The release workflow's Windows tests get the Common-Controls 6 manifest
+  the test executables need and, like the CI job, check out with LF line endings, which the tests
+  that read source files need. The unreferenced `scripts/refactor_tabs.py` and `scripts/cdp-*.js`
   drivers were removed.
   (`7e5c5c5`, `11abb3e`, `c227218`, `53347df`, `d589b51`, `652aa5e`, `d5e9d22`, `11e7e30`,
   `3b0fcfb`, `6c19b1b`, #85; A7-56, A8-17, A8-21)
