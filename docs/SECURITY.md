@@ -1,7 +1,7 @@
 # SSHSpan security model
 
 **Last updated:** 2026-10-18  
-**Status:** describes the remediation branch; checked against committed source at `6c19b1b`, the
+**Status:** describes v1.10.0; checked against committed source at `6c19b1b`, the
 release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since  
 **Platforms:** Windows and Linux
 

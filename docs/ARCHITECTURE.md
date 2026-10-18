@@ -1,7 +1,7 @@
 # SSHSpan architecture
 
-**Last updated:** 2026-10-17  
-**Status:** describes the remediation branch; checked against committed source at `6c19b1b`;
+**Last updated:** 2026-10-18  
+**Status:** describes v1.10.0; checked against committed source at `6c19b1b`;
 nothing it describes has changed since (later changes are listed in the CHANGELOG)  
 **Platforms:** Windows and Linux  
 **Entry points:** `src-tauri/src/main.rs`, `src-tauri/src/lib.rs`, `src/renderer/index.html`,
