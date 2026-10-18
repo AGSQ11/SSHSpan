@@ -7,11 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Changes since v1.9.1: a flaw-remediation pass driven by an eight-area internal audit on
-2026-10-09 ([report](docs/audit/2026-10-09/REPORT.md),
-[finding index](docs/audit/2026-10-09/README.md)). Nothing here is released or version-bumped.
-Each entry ends with the commit that landed it and the audit findings it addresses; the index
-says which are only Partial and what is still open.
+## [1.10.0] - 2026-10-18
+
+Changes since v1.9.1: a flaw-remediation release driven by an eight-area internal audit on
+2026-10-09. Of the audit's 307 findings (3 Critical, 55 High, 147 Medium, 102 Low), 298 are fixed,
+7 are partly fixed, 1 is deferred and 1 is an accepted limitation. The
+[audit report](https://github.com/AGSQ11/SSHSpan/blob/main/docs/audit/2026-10-09/REPORT.md)
+explains the method, the verification and what is still open, and the
+[finding index](https://github.com/AGSQ11/SSHSpan/blob/main/docs/audit/2026-10-09/README.md)
+gives the status of every finding. Each entry under Added, Changed, Fixed and Security ends with
+the commit that landed it and the audit findings it addresses; the index says which are only
+Partial and what is still open.
+
+**Highlights**
+
+- **Confirmations work.** Every native `confirm()` guard was a no-op, so key and server deletes,
+  backup restore, host-key forget, tab close, MCP removal, multi-line paste and update install ran
+  unconfirmed. All 13 now wait for the in-app confirmation. (Critical, A5-01)
+- **The idle auto-lock fires.** It never did, because the status poll re-armed its timer. The
+  vault now locks the configured minutes after the last real input, 15 by default.
+  (Critical, A2-01)
+- **Private keys can be written on Windows.** Deploy, private-key export, backup export and the
+  audit CSV export all failed on Windows. The file now gets its restricted permissions before the
+  first byte is written. (Critical, A7-01)
+- **The Bitwarden sync asks where it may upload.** A page that could save the sync settings could
+  have sent every private key and saved server password to a server of its own. A sync now runs
+  only against a server and account you allowed in a native question, and is refused before any
+  network call until then; settings saved before this release keep syncing. (High, found by the
+  final security review)
+- **Credentials are bound to their destination in Rust.** Sending an MCP secret or environment
+  variable to a new address, or moving the stored API key to another provider or address, needs a
+  native question that the page cannot answer; a saved SSH password is used only for its own
+  server and account; and a Bitwarden approval applies only the list it was shown.
+- **SFTP local paths are confined.** A local path built from a remote name stays in the folder you
+  chose, and a deny-list keeps writes away from SSHSpan's own folders, `~/.ssh`, startup folders,
+  shell startup files, `PATH` folders and settings that run commands, for typed and dialog-picked
+  paths alike (private-key exports and backups may still go to `~/.ssh`). It is a deny-list, not a
+  grant model. (A6-02, Partial)
+- **Keyboard and screen-reader access.** A visible focus ring, Enter and Space on key and category
+  rows and session tabs, one menu system with arrow keys, Escape and focus return, real tab and
+  radio semantics, and reduced motion. It has not been tested with a screen reader.
+
+**Upgrading.** The database is migrated forward at the first start: a table for category sync
+marks, server columns for an older transfer queue, stored host-key fingerprints rewritten to the
+current format, and an existing Bitwarden sync destination counted as allowed, so the upgrade asks
+nothing. There is no migration back, so make a backup first (Settings, Backup & restore) if you may
+want to return to 1.9.1.
 
 ### Added
 
@@ -491,6 +532,10 @@ Servers and terminal
   frame and only when the size changed; the bell flashes the tab; header controls go icon-only
   when the window is narrow instead of being clipped. (`d5e9d22`, `53347df`; A8-03, A3-26, A2-53,
   A8-18, A3-34, A1-38)
+- **Leaving a maximized terminal.** Opening Settings or another view from a maximized terminal
+  left the page clipped, with the sidebar and top bar gone and no way to scroll; leaving Connect
+  now ends the maximized view. The MCP tool list scrolls on its own, and a long name a server sends
+  no longer widens the settings panel. (#83, `7a21dd2`)
 - **Status and focus.** Returning to Servers no longer overwrites the status strip with "Ready.
   (build ...)" or leaves focus on the page; the terminal's deferred focus no longer takes focus
   from a menu or a control you just reached; every successful connect no longer prints developer
@@ -875,16 +920,17 @@ Bitwarden, updates and lifecycle
   secret is missing, before any installer is attached. It used to skip signing with a warning and
   publish installers that the updater, which refuses an unsigned release, cannot install. A fork,
   which has no such secret, still builds unsigned with the warning. Two gaps remain (see
-  [SECURITY.md](docs/SECURITY.md#updater)): a signature upload that fails after the installers are
-  attached leaves a published release without signatures, and nothing checks a new signature
-  against the public key the app embeds. Installed copies refuse such a release either way. (#85)
+  [SECURITY.md](https://github.com/AGSQ11/SSHSpan/blob/main/docs/SECURITY.md#updater)): a
+  signature upload that fails after the installers are attached leaves a published release
+  without signatures, and nothing checks a new signature against the public key the app embeds.
+  Installed copies refuse such a release either way. (#85)
 
 ### Verification
 
 - Before this work: 216 Rust library tests, 45 integration tests, 11 MCP integration tests and 76
   renderer UI assertions.
-- Rust: 884 library, 48 integration and 20 MCP integration tests (952 in all; 950 at `6c19b1b`,
-  before the two ACL table tests added with the Windows test fixes).
+- Rust: 885 library, 48 integration and 20 MCP integration tests (953 in all; 950 at `6c19b1b`,
+  before the two ACL table tests added with the Windows test fixes and the database wait test).
   Renderer: `test:ui` 75, `test:safety` 491, `test:sftp` 763, `test:polish` 283, `test:assistant`
   367, `test:keys` 431, `test:servers` 676 (3,086 checks in all, 2,935 at the documentation commit
   `e80b01e`; each number is the count of `ok` lines the suite prints). `test:ui` was 76 before its
@@ -909,16 +955,18 @@ Bitwarden, updates and lifecycle
   `38e586e`: the static checks passed, and `cargo test` ran 743 library, 47 integration and 20 MCP
   integration tests natively, none failing. Its next run, at `fd4765d`, failed one library test
   (742 passed): a database read gave up behind a run of writes on the loaded runner, since fixed
-  (see "Reads no longer fail behind a busy write" under Fixed). The job stays `continue-on-error`
-  until it passes consistently.
+  (see "Reads no longer fail behind a busy write" under Fixed). A run at `b637fdc` failed one test
+  that could fail at random on any platform (a wrong passphrase passing an AES-CBC padding check),
+  since fixed in the test. The job then passed at `30d6af0`, at `52de6d4` and on `main` after the
+  merge. It stays `continue-on-error` until it passes consistently.
 - The renderer suites run in headless Chromium against a stubbed Tauri bridge. They do not exercise
-  WebView2 or WebKitGTK rendering, native dialogs, the tray, screen readers or real SSH, SFTP,
-  Bitwarden or MCP servers.
+  WebView2 or WebKitGTK rendering, native dialogs, the tray, screen readers, real SSH, SFTP,
+  Bitwarden or MCP servers, or AI providers.
 - Test coverage at `6c19b1b`: renderer 92.9% of lines (95.7% of the lines added since 1.9.1); Rust
   production code 72.0% (77.3% of added lines), below the 80% target, mainly because code that
   needs a running Tauri app runs in no test (the commands and the helpers that take an
   `AppHandle`, `State` or `Window`: 61% of the uncovered lines). Details:
-  [REPORT.md, section 8.9](docs/audit/2026-10-09/REPORT.md#89-coverage).
+  [REPORT.md, section 8.9](https://github.com/AGSQ11/SSHSpan/blob/main/docs/audit/2026-10-09/REPORT.md#89-coverage).
 
 ## [1.9.1] - 2026-09-23
 

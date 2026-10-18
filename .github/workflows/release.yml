@@ -235,7 +235,7 @@ jobs:
       # compromise rotate the key (see MAINTAINER SETUP below and the
       # MINISIGN_PUBLIC_KEY notes in updater.rs) and re-cut the release.
       #
-      # MAINTAINER SETUP (one-time, see CHANGELOG "Unreleased" for details):
+      # MAINTAINER SETUP (one-time, done 2026-09-12; see CHANGELOG [1.7.2]):
       #   1. Install minisign (https://jedisct1.github.io/minisign/) and run
       #      `minisign -G -W` locally (the -W keeps the secret key unencrypted,
       #      which this workflow requires; keep the file itself secret).

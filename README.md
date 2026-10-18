@@ -4,13 +4,6 @@
 
 # SSHSpan
 
-> **Unreleased changes.** This branch is the flaw-remediation pass over v1.9.1 that followed an
-> eight-area internal audit on 2026-10-09. It has not been released or version-bumped: the
-> manifests still say 1.9.1. What changed is in the [changelog](CHANGELOG.md#unreleased); the
-> status of every finding is in the [finding index](docs/audit/2026-10-09/README.md) and the
-> [audit report](docs/audit/2026-10-09/REPORT.md); [Known limitations](#known-limitations) lists
-> what the pass does not fix.
-
 Cross-platform SSH key manager, SSH client, and SFTP file transfer tool for the desktop -
 built on **Rust + Tauri v2** (Windows and Linux).
 
@@ -39,10 +32,10 @@ minisign signature before they run and a missing or invalid signature refuses th
 
 ## What's new
 
-- **Unreleased** - A flaw-remediation pass over v1.9.1 driven by an eight-area internal audit
+- **v1.10.0** - A flaw-remediation pass over v1.9.1 driven by an eight-area internal audit
   ([report](docs/audit/2026-10-09/REPORT.md), [finding index](docs/audit/2026-10-09/README.md),
-  [every change](CHANGELOG.md#unreleased)). Confirmations and the idle auto-lock now work (the
-  native `confirm()` guards were no-ops and the idle lock never fired); secret files can be
+  [every change](CHANGELOG.md#1100---2026-10-18)). Confirmations and the idle auto-lock now work
+  (the native `confirm()` guards were no-ops and the idle lock never fired); secret files can be
   written on Windows; backups are written and read by Rust behind native dialogs; the AI
   assistant can no longer press Enter and MCP approvals are bound to the definition you
   reviewed; deploy shows and writes the same OpenSSH-safe text and removes what it wrote;
@@ -68,7 +61,6 @@ minisign signature before they run and a missing or invalid signature refuses th
   protected places like a typed one, and that now holds for the private-key export and "Create
   backup..." too (`~/.ssh` stays allowed for them). On Windows a key file is read only from this
   computer's drives.
-  Nothing here is released or version-bumped.
 - **v1.9.1** - Remote MCP servers for the AI assistant, plus fixes to the
   assistant panel and MCP integration. The assistant can attach remote MCP
   servers over Streamable HTTP (MCP 2025-11-25) and use their tools next to
@@ -98,7 +90,7 @@ minisign signature before they run and a missing or invalid signature refuses th
   key" and the update-check opt-out actually take effect now, and the keyboard
   compatibility settings (rxvt Home/End, application cursor keys, keypad) were
   said to take effect (the audit later found they changed only the local display, not the
-  session; fixed in the unreleased changes above). The AI assistant lands in this release: a
+  session; fixed in v1.10.0 above). The AI assistant lands in this release: a
   chat panel docked beside the terminal (Ctrl+Shift+A) for OpenAI- and Anthropic-compatible
   providers, with a per-tab access level (Read / Draft / Execute / YOLO) chosen
   on a color-coded control - YOLO behind a red opt-in dialog - a vault-sealed
@@ -151,7 +143,7 @@ minisign signature before they run and a missing or invalid signature refuses th
 
 ## Known limitations
 
-What this branch does not do or does not guarantee, with the reason. The security-relevant ones
+What v1.10.0 does not do or does not guarantee, with the reason. The security-relevant ones
 are explained further in [docs/SECURITY.md](docs/SECURITY.md#accepted-risks-and-limitations),
 which lists every accepted risk; the status of every audit finding is in the
 [finding index](docs/audit/2026-10-09/README.md).
@@ -649,7 +641,7 @@ Back up and protect the data directory, not a `~/.sshspan` folder.
 
 ### From a release (recommended)
 Grab the latest installer from [Releases](https://github.com/AGSQ11/SSHSpan/releases). The source
-manifests currently say **1.9.1**; asset names follow these patterns (substitute the release
+manifests currently say **1.10.0**; asset names follow these patterns (substitute the release
 you are downloading):
 
 | Platform | Files |

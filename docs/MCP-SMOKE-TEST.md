@@ -1,7 +1,7 @@
 # MCP smoke-test checklist
 
-**Last updated:** 2026-10-17  
-**Status:** describes the remediation branch; checked against committed source at `38e586e`, which
+**Last updated:** 2026-10-18  
+**Status:** describes v1.10.0; checked against committed source at `38e586e`, which
 changed the smoke mock (steps 5, 19 and 26); nothing MCP-related has changed since
 
 A manual QA pass for the MCP feature. Run the real app against the mock server in
