@@ -111,6 +111,35 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
+      # Windows only: build the test executables first; the manifest below goes beside them.
+      - name: Build the test executables (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-run
+
+      # Windows only: tests need a Common-Controls 6 manifest to load (same step as ci.yml's windows job).
+      # No runnable doctests exist today (cargo test prints "running 0 tests" for Doc-tests); rustdoc
+      # would build one elsewhere, without this manifest.
+      - name: Declare Common-Controls 6 for the test executables (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $manifest = @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <dependency>
+              <dependentAssembly>
+                <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+              </dependentAssembly>
+            </dependency>
+          </assembly>
+          '@
+          $executables = @(Get-ChildItem -Path src-tauri/target/debug/deps -Filter *.exe)
+          if ($executables.Count -eq 0) { throw 'no test executables found in src-tauri/target/debug/deps' }
+          foreach ($exe in $executables) {
+            Set-Content -LiteralPath "$($exe.FullName).manifest" -Value $manifest -Encoding utf8
+          }
+          Write-Host "wrote $($executables.Count) manifests"
+
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
@@ -187,10 +216,24 @@ jobs:
       # ── Release signing (minisign) ──────────────────────────────────────────
       # Every installer gets a detached minisign signature (`.minisig`) which
       # the in-app updater verifies against the public key embedded in
-      # src-tauri/src/commands/updater.rs (MINISIGN_PUBLIC_KEY). This binds the
-      # installer to the source tree, so replacing BOTH the binary and its
-      # GitHub-computed SHA-256 digest (repo/token compromise) is no longer
-      # enough to push a malicious update.
+      # src-tauri/src/commands/updater.rs (MINISIGN_PUBLIC_KEY). The signed
+      # trusted comment is "SSHSpan release <tag>" (the -t option below), and
+      # the updater refuses a signature whose comment names a different release
+      # than the one it is installing.
+      #
+      # What this protects against: an installer or `.minisig` swapped into an
+      # already-published release, a hostile mirror or proxy, and a genuine
+      # older signed build re-published under a newer tag. In short, it detects
+      # TAMPERED PUBLISHED ASSETS. The GitHub-computed SHA-256 digest cannot,
+      # because it comes from the same release that serves the file.
+      #
+      # What it does NOT protect against: this job signs whatever a pushed `v*`
+      # tag builds, so anyone who can push a tag or change this workflow (a
+      # repository or token compromise), or who can read the MINISIGN_SECRET_KEY
+      # Actions secret, can produce validly signed malicious installers. The
+      # key is not a defence against a compromised repository. After such a
+      # compromise rotate the key (see MAINTAINER SETUP below and the
+      # MINISIGN_PUBLIC_KEY notes in updater.rs) and re-cut the release.
       #
       # MAINTAINER SETUP (one-time, see CHANGELOG "Unreleased" for details):
       #   1. Install minisign (https://jedisct1.github.io/minisign/) and run
@@ -202,9 +245,16 @@ jobs:
       #   3. Paste the base64 body of minisign.pub (the second line, starting
       #      with "RW") into the MINISIGN_PUBLIC_KEY const in
       #      src-tauri/src/commands/updater.rs, replacing the placeholder.
-      # Until the secret exists this step is skipped with a warning and the
-      # release proceeds unsigned (the updater likewise falls back to the
-      # GitHub digest check while that const is still the placeholder).
+      # In AGSQ11/SSHSpan, recognised by its repository ID in the check below,
+      # a missing secret stops this step, and with it the release, with an
+      # error. The key has been provisioned since 2026-09-12, so the in-app
+      # updater is fail-closed: it refuses an unsigned release instead of
+      # falling back to the GitHub digest check (that fallback exists only
+      # while the const is still the placeholder), and an unsigned release
+      # would be one that no installed copy can update to. Restore the secret
+      # as described under MAINTAINER SETUP above and run the release again.
+      # In a fork, which has no such secret, this step is skipped with a
+      # warning and the build stays unsigned.
       - name: Sign installers with minisign
         id: minisign_sign
         shell: bash
@@ -218,6 +268,12 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            # 1353945013 is AGSQ11/SSHSpan's repository ID, which survives a
+            # rename or a transfer; a fork has its own ID.
+            if [ "${GITHUB_REPOSITORY_ID:-}" = "1353945013" ]; then
+              echo "::error::MINISIGN_SECRET_KEY is empty, so this release would be unsigned, and the in-app updater refuses unsigned releases. Restore the Actions secret MINISIGN_SECRET_KEY (see MAINTAINER SETUP in the comment above this step), then run the release again."
+              exit 1
+            fi
             echo "::warning::MINISIGN_SECRET_KEY is not configured; skipping release signing. See the workflow comment above this step for the provisioning steps."
             echo "signed=false" >> "$GITHUB_OUTPUT"
             exit 0

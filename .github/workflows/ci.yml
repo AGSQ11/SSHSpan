@@ -1,10 +1,10 @@
 name: CI
 
-# Until now nothing ran until a `v*` tag: `cargo test`, `cargo fmt --check`
-# and clippy first executed at RELEASE time, so a change could merge with a
-# failing test suite and the breakage surfaced only when cutting a version.
-# This runs the same checks the release job enforces, on every pull request
-# and every push to main.
+# Until now nothing ran until a `v*` tag: `cargo test` and `cargo fmt --check`
+# first executed at RELEASE time (and clippy ran nowhere), so a change could
+# merge with a failing test suite and the breakage surfaced only when cutting
+# a version. This runs the checks the release job enforces, plus clippy, on
+# every pull request and every push to main.
 on:
   pull_request:
   push:
@@ -19,10 +19,14 @@ concurrency:
 permissions:
   contents: read
 
+# Every job has a timeout. Without one a hung step (a test that never returns,
+# a page that never finishes booting) holds a runner for GitHub's default of six
+# hours; each limit below is well above the job's normal run time.
 jobs:
   rust:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       # Third-party actions pinned to full commit SHAs, same rule as the
       # release workflow: a mutable tag that moves would run attacker code.
@@ -74,6 +78,7 @@ jobs:
   renderer:
     name: Renderer (syntax, behaviour)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -109,6 +114,27 @@ jobs:
       - name: Vendored library provenance
         run: node scripts/check-vendor.js
 
+      # What a name check cannot see in the renderer's MCP calls: the three
+      # credential fields mcp_save_server must always send (the backend reads
+      # an absent one as "keep the stored value", so a payload that stopped
+      # carrying auth_secret would say "saved" while the old token stayed in
+      # use), the mcp_call_tool call site, the schema validation and the
+      # untrusted-result wrapping on the model-facing path, and the
+      # inputSchema field the backend forwards. Argument NAMES are checked by
+      # the IPC job below. Static, needs no browser. This replaced a copy that
+      # lived inside check-renderer-ui.js, which CI ran only in the Playwright
+      # step (A8-17).
+      - name: MCP renderer contract
+        run: node scripts/check-mcp-contract.js
+
+      # Comments in the renderer cite an audit ID or a plain reason. The check
+      # fails on the internal labels it knows (work-package, review-round and
+      # agent names such as JU3, RU6b, "fix round 1" or "Agent E"; other label
+      # shapes pass), and exports nothing calls stay deleted (the header of the
+      # script lists every rule). Static, needs no browser.
+      - name: Renderer comment hygiene
+        run: node scripts/check-renderer-hygiene.js
+
       # Static checks only find shapes we have already been burned by. They
       # cannot tell an empty key list from a broken one: reading .parent_id
       # off a category *id* is valid JavaScript that silently dropped every
@@ -123,10 +149,39 @@ jobs:
           npm install --no-save --no-audit --no-fund playwright@1.56.1
           npx playwright install --with-deps chromium
           npm run test:ui
+          # Safety and lifecycle behaviour (confirmations, idle auto-lock,
+          # vault dialogs, paste review), on a fake clock in the same browser.
+          npm run test:safety
+          # The SFTP file browser: navigation, selection, the transfer queue,
+          # conflicts, chmod, shortcuts, drops, edit conflicts, "Stop editing"
+          # and the backend's edit texts, the layout at three window sizes and
+          # pointer drag and drop, against a fake file system.
+          npm run test:sftp
+          # Accessibility, keyboard, menus, palette, audit log and settings
+          # polish, plus static checks for the dead CSS/JS the audit removed.
+          npm run test:polish
+          # The AI assistant panel and MCP settings: approval attestation,
+          # backend-gated typing, per-tab lifecycle, bounded history and the
+          # MCP/provider settings round-trip, against stubbed IPC only.
+          npm run test:assistant
+          # Keys, categories and the deploy sheet: creation and export, the
+          # import formats, the key list, category drag and drop, the
+          # backend-planned deploy preview (with the key-file warnings of the
+          # servers it saves) and removing a deployed copy.
+          npm run test:keys
+          # Servers, terminal sessions and the app lifecycle: saved passwords,
+          # new servers in a filtered list and the key-file warning after a
+          # save, the connect lifecycle and status line, key compatibility,
+          # paste, chords and focus in a real xterm, Quit, the lock questions,
+          # the updater dialog, Bitwarden sync results, its destination
+          # question ("Allow syncing...") and the backend's texts spelled out,
+          # and the Upload picker.
+          npm run test:servers
 
   cargo-audit:
     name: Dependency advisories
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -154,6 +209,7 @@ jobs:
   ipc-arg-names:
     name: IPC argument names
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -171,3 +227,109 @@ jobs:
       # and it fails quietly.
       - name: Cross-check renderer invoke() args against Rust signatures
         run: node scripts/check-ipc-args.js
+
+  # A7-56: the Windows-only code (the icacls secret-file path, the Windows
+  # branches of the local-path policy, drive and UNC handling) ran on Windows
+  # only in the release workflow's `cargo test` on windows-latest, at tag time
+  # and never on a pull request, so a Windows regression surfaced when a
+  # release was cut. This job runs the Rust tests and the static renderer
+  # checks on Windows for every pull request. Format and lint stay on Linux.
+  # The browser suites stay on Linux too: they drive the same renderer files in
+  # the same Chromium, so a second run would double the minutes without adding
+  # coverage.
+  #
+  # The job passed on a runner for the first time on 2026-10-17, at 38e586e.
+  # Its first run had failed five library tests that assumed Unix paths or a
+  # single ACL entry (fixed since; the manifest step worked); its next run, at
+  # fd4765d, failed one test because a database read gave up behind a run of
+  # writes on the loaded runner (fixed since). Until the job passes
+  # consistently, a failure may be a test that does not port to Windows
+  # (several use literal /tmp and /etc strings) rather than a regression, so
+  # the job is continue-on-error: its failure does not fail the workflow run.
+  # Delete the flag once the job passes consistently, so that a Windows
+  # regression fails CI like any other (audit row A7-56).
+  windows:
+    name: Windows (cargo test, static checks)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      # The runner's Git converts line endings to CRLF on checkout. The vendored
+      # libraries are hashed byte for byte (check-vendor.js) and the repository
+      # has no .gitattributes, so keep LF.
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      # The same static checks as the Linux renderer and IPC jobs, first
+      # because they take seconds. They read the repository's own files, so
+      # this is also the check that they work with Windows paths.
+      - name: Static renderer checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in src/renderer/*.js; do
+            echo "checking $f"
+            node --check "$f"
+          done
+          node scripts/check-renderer-globals.js
+          node scripts/check-vendor.js
+          node scripts/check-ipc-args.js
+          node scripts/check-mcp-contract.js
+          node scripts/check-renderer-hygiene.js
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          # Same pin as the other jobs.
+          toolchain: 1.98.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: Build the test executables
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-run
+
+      # A Windows test executable that links Tauri's dialog code stops at load
+      # time with 0xC0000139 (STATUS_ENTRYPOINT_NOT_FOUND, comctl32
+      # TaskDialogIndirect) unless it declares Common-Controls 6. tauri-build
+      # embeds that manifest in the app binary only (the resource is linked
+      # with rustc-link-arg-bins), so beside each executable cargo just built
+      # this writes the external manifest file Windows reads when an
+      # executable has none. An executable that does embed one ignores it. The
+      # MSVC build links the WebView2 loader statically, so no DLL is needed
+      # here (the MinGW cross-build used in WSL does need WebView2Loader.dll).
+      # The release workflow's Windows test step writes the same manifest.
+      # No runnable doctests exist today (cargo test prints "running 0 tests"
+      # for Doc-tests); rustdoc would build one elsewhere, without this manifest.
+      - name: Declare Common-Controls 6 for the test executables
+        shell: pwsh
+        run: |
+          $manifest = @'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+            <dependency>
+              <dependentAssembly>
+                <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+              </dependentAssembly>
+            </dependency>
+          </assembly>
+          '@
+          $executables = @(Get-ChildItem -Path src-tauri/target/debug/deps -Filter *.exe)
+          if ($executables.Count -eq 0) { throw 'no test executables found in src-tauri/target/debug/deps' }
+          foreach ($exe in $executables) {
+            Set-Content -LiteralPath "$($exe.FullName).manifest" -Value $manifest -Encoding utf8
+          }
+          Write-Host "wrote $($executables.Count) manifests"
+
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml

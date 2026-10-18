@@ -1,13 +1,15 @@
 //! SSH key deployment and agent integration
 //! Replaces sshConfigService.js deployment logic and parts of sshspan.js
 
-use crate::config::{SshConfigService, SshHostConfig};
+use crate::config::{SshConfig, SshConfigService, SshHostConfig};
 use anyhow::Result;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Write secret bytes to `path` so the content is NEVER on disk under
-/// permissions broader than 0600.
+/// Write secret bytes to `path` under restricted permissions from the first
+/// byte: mode 0600 on Unix; on Windows no inherited permission and full control
+/// for the current user, with SYSTEM and Administrators beside it where the
+/// folder passes no permissions down (see `restrict_windows_file`).
 ///
 /// SECURITY: `OpenOptions::mode()` applies at CREATION ONLY. Opening an
 /// existing file with `.create(true).truncate(true).mode(0o600)` keeps that
@@ -15,15 +17,29 @@ use std::path::PathBuf;
 /// closes the door after the horse has gone. Reproduced: a pre-existing 0644
 /// file stays 0644 for the whole write and only becomes 0600 afterwards.
 ///
-/// The fix is to remove any existing file first and `create_new`, so the very
-/// first byte lands in a file this process created at 0600. `create_new` also
-/// means we never write through a symlink an attacker planted at the target.
-///
-/// On Windows the current-user-only ACL is applied after creation (there is no
-/// create-time equivalent) and a failure is fatal: the partially written file
-/// is removed and the error propagated, rather than leaving readable key
-/// material behind.
+/// Remove any existing file first and `create_new`: on Unix it is created
+/// with mode 0600; on Windows it is created EMPTY, its ACL restricted, and
+/// only THEN written through the same open handle. A restriction failure
+/// removes the empty file and propagates the error, never leaving readable
+/// secret bytes behind. `create_new` also means we never write through a
+/// symlink an attacker planted at the target.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    write_secret_file_restricted(path, contents, |p| {
+        #[cfg(windows)]
+        restrict_windows_file(&p.to_path_buf())?;
+        #[cfg(not(windows))]
+        let _ = p;
+        Ok(())
+    })
+}
+
+/// The shared write path, with the permission-restriction step separated so a
+/// test can assert it runs on an EMPTY file before any bytes are written.
+fn write_secret_file_restricted(
+    path: &std::path::Path,
+    contents: &[u8],
+    restrict: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> Result<()> {
     use std::io::Write as _;
 
     // Replace rather than truncate: truncating an existing file inherits its
@@ -41,9 +57,31 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> 
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    // Windows: share nothing while the file is ours. Until icacls has
+    // restricted the ACL the file is under the inherited one, and no other
+    // process may open it for reading, writing or deleting in that window
+    // (or while the bytes go in). icacls itself only needs READ_CONTROL and
+    // WRITE_DAC, which sharing does not govern.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
     let mut file = opts
         .open(path)
         .map_err(|e| anyhow::anyhow!("Could not create {}: {e}", path.display()))?;
+
+    // Restrict while the file is still EMPTY. The bytes go in afterwards
+    // through the handle opened above, so the path is never reopened (and
+    // cannot be swapped) in between.
+    if let Err(e) = restrict(path) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(anyhow::anyhow!(
+            "Could not restrict permissions on {}: {e}",
+            path.display()
+        ));
+    }
 
     let written = file
         .write_all(contents)
@@ -55,225 +93,930 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<()> 
         return Err(e);
     }
 
-    #[cfg(windows)]
-    {
-        if let Err(e) = restrict_windows_file(&path.to_path_buf()) {
-            let _ = fs::remove_file(path);
-            return Err(anyhow::anyhow!(
-                "Could not restrict permissions on {}: {e}",
-                path.display()
-            ));
+    Ok(())
+}
+
+/// Where a deploy writes: the directory the key files go to (`~/.ssh`) and
+/// SSHSpan's managed ssh_config file. They are parameters rather than lookups
+/// so tests deploy into a temp dir instead of the real `~/.ssh` (A7-56); the
+/// commands pass [`DeployTarget::user_default`].
+#[derive(Debug, Clone)]
+pub struct DeployTarget {
+    pub ssh_dir: PathBuf,
+    pub config_path: PathBuf,
+}
+
+impl DeployTarget {
+    pub fn new(ssh_dir: impl Into<PathBuf>, config_path: impl Into<PathBuf>) -> Self {
+        Self {
+            ssh_dir: ssh_dir.into(),
+            config_path: config_path.into(),
         }
     }
 
-    Ok(())
+    /// `~/.ssh` and the managed config file the app really uses.
+    pub fn user_default() -> Result<Self> {
+        Ok(Self::new(
+            crate::config::get_ssh_dir()?,
+            crate::config::ssh_config_path()?,
+        ))
+    }
+
+    /// The line a user adds to `~/.ssh/config` so OpenSSH reads the managed
+    /// file (A5-05) - SSHSpan never edits `~/.ssh/config` itself. Quoted, so a
+    /// path with spaces survives ssh_config's word splitting, with `\` and `"`
+    /// escaped the way ssh_config unescapes them and `%` doubled (Include
+    /// expands `%` tokens); on Windows the separators are written as `/`,
+    /// which Win32-OpenSSH accepts and which keeps the path clear of that
+    /// escape handling.
+    pub fn include_line(&self) -> String {
+        let path = self.config_path.display().to_string();
+        #[cfg(windows)]
+        let path = path.replace('\\', "/");
+        format!(
+            "Include \"{}\"",
+            literal_percent(&path)
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        )
+    }
+}
+
+/// `value` with every `%` doubled: IdentityFile, HostName and Include expand
+/// `%` tokens, and an unknown one (`%/` in a path) makes ssh give up on the
+/// host. The paths and host names a deploy writes are meant literally.
+fn literal_percent(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
+/// Whether an IdentityFile value from the managed config names `path` -
+/// written by this version (`%` doubled) or an earlier one (not).
+fn identity_names(identity_file: &str, path: &Path) -> bool {
+    same_path(Path::new(identity_file), path)
+        || same_path(Path::new(&identity_file.replace("%%", "%")), path)
+}
+
+/// The Host fields the deploy sheet collects, written into every stanza a
+/// deploy writes (ruling R3). They used to be dropped: the stanza had no
+/// HostName, User or Port whatever the sheet showed (A7-04 / A2-05).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeployHostFields {
+    /// The `Host` alias - see [`SshService::plan_deploy`] for how it is used.
+    pub host_alias: Option<String>,
+    pub hostname: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub strict_host_key: Option<bool>,
+}
+
+/// Longest HostName / User a deploy writes (a DNS name is at most 253).
+const MAX_HOST_FIELD_CHARS: usize = 255;
+
+impl DeployHostFields {
+    /// Trim each field (blank means absent) and check the ones written
+    /// verbatim. HostName and User must be one word: a space adds arguments
+    /// ssh_config rejects, a quote opens a quoted string ("invalid quotes" -
+    /// fatal for every ssh command once the managed file is Included) and a
+    /// leading `#` turns the rest of the line into a comment; a leading `=`
+    /// is taken as the keyword's separator, and User may not hold `%` or `${`
+    /// (OpenSSH 10 expands both there). The port cannot
+    /// be 0. The alias may not contain `*`, `?` or `!` - they would make it a
+    /// pattern matching other hosts (`Host *` with `StrictHostKeyChecking no`
+    /// would apply to every host); anything else unusual in it is replaced
+    /// (see [`SshService::plan_deploy`]).
+    pub fn parse(
+        host_alias: Option<String>,
+        hostname: Option<String>,
+        user: Option<String>,
+        port: Option<u16>,
+        strict_host_key: Option<bool>,
+    ) -> std::result::Result<Self, String> {
+        fn present(value: Option<String>) -> Option<String> {
+            value
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        }
+        fn one_word(label: &str, value: &str) -> std::result::Result<(), String> {
+            if value.starts_with('#')
+                || value
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\'')
+            {
+                return Err(format!(
+                    "{label} must be a single word without spaces, quotes or control characters, and must not start with #."
+                ));
+            }
+            // ssh_config takes one `=` after the keyword as the separator, so
+            // `HostName =evil` connects to `evil` (and `User ==x` logs in as
+            // `=x`): the value written would not be the value ssh uses.
+            if value.starts_with('=') {
+                return Err(format!(
+                    "{label} must not start with = - ssh_config reads it as part of the keyword."
+                ));
+            }
+            if value.chars().count() > MAX_HOST_FIELD_CHARS {
+                return Err(format!(
+                    "{label} is too long (at most {MAX_HOST_FIELD_CHARS} characters)."
+                ));
+            }
+            Ok(())
+        }
+        /// OpenSSH 10 expands `%` tokens and `${VARIABLE}` in User (`User
+        /// a%hb` logs in as `a<host>b`, an unterminated `${` makes ssh refuse
+        /// the file), and User has no escape for either.
+        fn literal_user(value: &str) -> std::result::Result<(), String> {
+            if value.contains('%') {
+                return Err(
+                    "User cannot contain % - OpenSSH 10 replaces %-tokens in User with other values."
+                        .into(),
+                );
+            }
+            if value.contains("${") {
+                return Err(
+                    "User cannot contain ${ - OpenSSH 10 replaces ${NAME} in User with an environment variable."
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        let host_alias = present(host_alias);
+        if host_alias
+            .as_deref()
+            .is_some_and(|a| a.contains(['*', '?', '!']))
+        {
+            return Err(
+                "Host alias cannot contain *, ? or ! - in ssh_config they make it a pattern that matches other hosts."
+                    .into(),
+            );
+        }
+        let hostname = present(hostname);
+        let user = present(user);
+        if let Some(h) = &hostname {
+            one_word("HostName", h)?;
+        }
+        if let Some(u) = &user {
+            one_word("User", u)?;
+            literal_user(u)?;
+        }
+        if port == Some(0) {
+            return Err("Port must be between 1 and 65535.".into());
+        }
+        Ok(Self {
+            host_alias,
+            hostname,
+            user,
+            port,
+            strict_host_key,
+        })
+    }
+}
+
+/// A vault key in a deploy request.
+#[derive(Debug, Clone)]
+pub struct DeployKey {
+    pub id: String,
+    pub name: String,
+    /// Where the vault records this key as deployed, if anywhere.
+    pub deploy_path: Option<String>,
+}
+
+/// A key's recorded deployment, for the collision check.
+#[derive(Debug, Clone)]
+pub struct RecordedDeployment {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// One key as a deploy would write it - what the preview shows.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedKey {
+    pub id: String,
+    pub name: String,
+    /// The `Host` alias of its stanza.
+    pub alias: String,
+    /// The private key file, `<ssh dir>/sshspan_<sanitized name>`.
+    pub file: String,
+    pub pub_file: String,
+    /// The file - or its `.pub` - exists and is not this key's recorded
+    /// deployment.
+    pub overwrites_file: bool,
+    /// The file is another key's recorded deployment, or an earlier key of
+    /// the same deploy is written there.
+    pub owned_by_other_key: bool,
+    /// The managed config already has a stanza with this alias, and it points
+    /// at another key's recorded deployment.
+    pub alias_owned_by_other_key: bool,
+    /// Why the deploy will refuse this key, if it will - the exact message
+    /// [`SshService::apply_deploy`] reports for it.
+    pub refusal: Option<String>,
+}
+
+/// The result of [`SshService::plan_deploy`]: every key's file, alias and
+/// verdict, and the managed config the stanzas merge into.
+#[derive(Debug, Clone)]
+pub struct DeployPlan {
+    pub target: DeployTarget,
+    pub fields: DeployHostFields,
+    pub keys: Vec<PlannedKey>,
+    /// The managed config as it was read when planning.
+    base: SshConfig,
+    /// `Host` lines in the user's own ssh config naming hosts this deploy
+    /// writes (see [`LegacyHostLine`]).
+    legacy: Vec<LegacyHostLine>,
+}
+
+impl DeployPlan {
+    /// The stanzas the deploy writes for the keys it does not refuse, exactly
+    /// as it writes them - same merge, same serializer. This is the preview
+    /// text; on a fresh managed config it is the whole file.
+    pub fn config_text(&self) -> String {
+        let deployable: Vec<&PlannedKey> =
+            self.keys.iter().filter(|k| k.refusal.is_none()).collect();
+        let config = self.with_stanzas(&deployable);
+        let hosts = deployable
+            .iter()
+            .filter_map(|k| config.hosts.iter().find(|h| h.host == k.alias))
+            .cloned()
+            .collect();
+        SshConfig { hosts }.to_config_string()
+    }
+
+    /// See [`DeployTarget::include_line`].
+    pub fn include_line(&self) -> String {
+        self.target.include_line()
+    }
+
+    /// `Host` lines in the user's own `~/.ssh/config` that name a host this
+    /// deploy writes - typically left there by an older SSHSpan.
+    pub fn legacy_host_lines(&self) -> Vec<LegacyHostLine> {
+        self.legacy.clone()
+    }
+
+    /// What the preview should warn about, as sentences that say what to do.
+    pub fn preview_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.target.config_path.to_string_lossy().contains('%') {
+            warnings.push(
+                "The managed config path contains a % sign. The Include line writes it as %% \
+                 (what OpenSSH expects), but Win32-OpenSSH 9.5p1 reads %% literally and will \
+                 not find the file - with that version, write the Include line with a single %."
+                    .to_string(),
+            );
+        }
+        for l in &self.legacy {
+            warnings.push(legacy_line_warning(l));
+        }
+        warnings
+    }
+
+    /// `current` (the managed config as it is NOW) with a stanza merged in
+    /// for each of `keys`, and a warning for each key whose alias another
+    /// deploy took after this plan was made: that stanza is not re-pointed.
+    fn merge_into(&self, mut current: SshConfig, keys: &[&PlannedKey]) -> (SshConfig, Vec<String>) {
+        let identity_of = |config: &SshConfig, alias: &str| -> Option<String> {
+            config
+                .hosts
+                .iter()
+                .find(|h| h.host == alias)
+                .and_then(|h| h.identity_file.clone())
+        };
+        let mut warnings = Vec::new();
+        for key in keys {
+            let planned = identity_of(&self.base, &key.alias);
+            let now = identity_of(&current, &key.alias);
+            match now {
+                Some(other)
+                    if Some(&other) != planned.as_ref()
+                        && !identity_names(&other, Path::new(&key.file)) =>
+                {
+                    warnings.push(format!(
+                        "{} was written, but the Host alias \"{}\" was given to {} by another \
+                         deploy meanwhile, so no entry was added for it. Deploy \"{}\" again \
+                         with another alias.",
+                        key.file, key.alias, other, key.name
+                    ));
+                }
+                _ => merge_stanza(&mut current, &key.alias, &key.file, &self.fields),
+            }
+        }
+        (current, warnings)
+    }
+
+    /// The base config with a stanza merged in for each of `keys`.
+    fn with_stanzas(&self, keys: &[&PlannedKey]) -> SshConfig {
+        let mut config = self.base.clone();
+        for key in keys {
+            merge_stanza(&mut config, &key.alias, &key.file, &self.fields);
+        }
+        config
+    }
+}
+
+/// A `Host` line in the user's own ssh config that names a host a deploy
+/// writes: either left there by an older SSHSpan, which used the raw key name
+/// as the alias (`Host bob's-key`), or the user's own entry for the same
+/// host. SSHSpan never edits that file; the preview reports these lines so
+/// the user can decide.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyHostLine {
+    /// The file the line is in.
+    pub file: String,
+    /// 1-based line number.
+    pub line: usize,
+    /// The line as written: trimmed, control characters removed, and cut
+    /// after 300 characters with "…" (`quoted_config_line`).
+    pub text: String,
+    /// The vault key whose host it names.
+    pub key: String,
+    /// ssh cannot read the line at all (an unbalanced quote), which stops
+    /// every ssh command while it is there.
+    pub unreadable: bool,
+    /// Its block uses an `sshspan_*` key file: an older SSHSpan wrote it.
+    /// Otherwise it is the user's own entry - never something to remove.
+    pub written_by_sshspan: bool,
+}
+
+/// What the preview says about one [`LegacyHostLine`]. Only a block that an
+/// older SSHSpan wrote (its key file is an `sshspan_*` one) is attributed to
+/// it, with the advice to remove it; the user's own entry for the same host
+/// is described as an overlap - the advice to remove it used to delete a
+/// hand-written `Host github` block.
+fn legacy_line_warning(l: &LegacyHostLine) -> String {
+    let at = format!("{}, line {}: \"{}\"", l.file, l.line, l.text);
+    match (l.written_by_sshspan, l.unreadable) {
+        (true, true) => format!(
+            "{at} names the host of key \"{}\" and cannot be read by ssh (an unbalanced quote), \
+             so every ssh command fails while it is there. An older SSHSpan wrote it; SSHSpan \
+             never edits this file - remove or fix the line yourself.",
+            l.key
+        ),
+        (true, false) => format!(
+            "{at} names the host of key \"{}\" - an older SSHSpan wrote it (its key file is an \
+             sshspan_ one). SSHSpan never edits this file; remove that line and the settings \
+             under it yourself so ssh uses only the new entry.",
+            l.key
+        ),
+        (false, true) => format!(
+            "{at} is your own entry for the host of key \"{}\", and ssh cannot read it (an \
+             unbalanced quote), so every ssh command fails while it is there. SSHSpan never \
+             edits this file - fix the quoting of that line yourself.",
+            l.key
+        ),
+        (false, false) => format!(
+            "{at} is your own entry for the host of key \"{}\". ssh combines it with the new \
+             entry and, for each setting, uses the first value it reads - check that the two \
+             agree. SSHSpan never edits this file.",
+            l.key
+        ),
+    }
+}
+
+/// Whether `identity_file` names a key file a deploy writes (`sshspan_*`).
+fn is_sshspan_key_file(identity_file: &str) -> bool {
+    identity_file
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.starts_with("sshspan_"))
+}
+
+/// Key material for one planned key.
+pub struct DeployFiles {
+    /// The OpenSSH private key text (passphrase-protected or not).
+    pub private_key: zeroize::Zeroizing<String>,
+    /// The `authorized_keys` line, written as `<file>.pub`.
+    pub public_key: String,
+}
+
+/// A key the deploy wrote.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployedKey {
+    pub id: String,
+    pub name: String,
+    pub alias: String,
+    pub file: String,
+    pub pub_file: String,
+}
+
+/// A key the deploy did not write, and why.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeployError {
+    pub id: String,
+    pub name: String,
+    pub error: String,
+}
+
+/// What [`SshService::apply_deploy`] did.
+#[derive(Debug, Default)]
+pub struct DeployOutcome {
+    pub deployed: Vec<DeployedKey>,
+    pub errors: Vec<DeployError>,
+    /// Problems that did not stop a key from being written (the managed
+    /// config could not be updated).
+    pub warnings: Vec<String>,
+}
+
+/// What [`SshService::remove_key`] removed.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovedDeployment {
+    /// Files deleted.
+    pub removed: Vec<String>,
+    /// Aliases of the managed-config stanzas removed with them.
+    pub removed_hosts: Vec<String>,
+    /// What could not be cleaned up. Never the key file itself: when that
+    /// stays, removal fails instead.
+    pub warnings: Vec<String>,
 }
 
 pub struct SshService;
 
 impl SshService {
-    /// Deploy a private key to ~/.ssh/ and update SSH config
-    pub fn deploy_key(
-        key_name: &str,
-        private_key_pem: &str,
-        public_key: &str,
-        host_alias: Option<&str>,
-        hostname: Option<&str>,
-        user: Option<&str>,
-        port: Option<u16>,
-        strict_host_key: Option<bool>,
-    ) -> Result<DeployResult> {
-        let ssh_dir = get_ssh_dir()?;
-        fs::create_dir_all(&ssh_dir)?;
-
-        // Determine key filename
-        let key_filename = format!("sshspan_{}", sanitize_filename(key_name));
-        let private_path = ssh_dir.join(&key_filename);
-        let public_path = ssh_dir.join(format!("{}.pub", key_filename));
-
-        // Private key: written through the shared helper so the very first
-        // byte lands in a file created at 0600. The previous code opened with
-        // .create(true).truncate(true).mode(0o600), which on a RE-DEPLOY over
-        // an existing key kept that file's old mode for the whole write and
-        // only chmod'd afterwards - the comment claimed "0600 from the FIRST
-        // byte on disk", and it was not. On Windows the helper fails closed if
-        // the current-user-only ACL cannot be applied.
-        write_secret_file(&private_path, private_key_pem.as_bytes()).map_err(|e| {
-            let _ = fs::remove_file(&public_path);
-            e
-        })?;
-
-        // Write public key
-        fs::write(&public_path, public_key)?;
-
-        // Update SSH config
-        let config_service = SshConfigService::new()?;
-        let mut config = config_service.read()?;
-
-        // The alias is used both as the `Host` pattern and as the key for
-        // matching an existing stanza below. Legacy vaults may hold names
-        // that can't be a single Host token (e.g. containing spaces) —
-        // derive a sanitized alias once and use it for both, so a re-deploy
-        // of the same key updates the same stanza instead of creating a new
-        // one each time. New names are already validated at every create
-        // entry point; this is the compatibility path.
-        let host = match host_alias {
-            Some(alias) if crate::crypto::keys::validate_key_name(alias).is_ok() => {
-                alias.to_string()
-            }
-            Some(alias) => crate::crypto::keys::sanitize_key_name(alias),
-            None if crate::crypto::keys::validate_key_name(key_name).is_ok() => {
-                key_name.to_string()
-            }
-            None => crate::crypto::keys::sanitize_key_name(key_name),
+    /// Work out what deploying `keys` would write, without writing anything
+    /// (ruling R3): the preview shows this plan and
+    /// [`SshService::apply_deploy`] carries it out, so the two cannot drift.
+    ///
+    /// Files are `<ssh_dir>/sshspan_<sanitized name>` (+ `.pub`). The alias
+    /// of a key's stanza is the requested alias for a one-key deploy,
+    /// `<alias>-<key name>` when several keys are deployed, and the key name
+    /// when no alias is given - each part passed through [`safe_alias`], so an
+    /// alias holds only letters, digits, `.`, `_` and `-` (ssh_config reads
+    /// quotes, `\`, a leading `#` and `*?!` specially). A later key whose
+    /// alias is already taken in the same deploy gets `-2`, `-3`, ...
+    ///
+    /// A key is refused (`refusal`) when its file is another key's recorded
+    /// deployment, is written by an earlier key of the same deploy, or exists
+    /// (it or its `.pub`) without being this key's recorded deployment: the
+    /// file-name sanitiser is lossy, and `a.b` used to overwrite `a_b`'s
+    /// private key without a word (A2-46 / A7-59). Re-deploying a key over its
+    /// own file is fine. It is also refused when the managed config's stanza
+    /// for its alias points at another key's recorded deployment - that
+    /// stanza used to be re-pointed silently, leaving the other key
+    /// "deployed" with no stanza.
+    pub fn plan_deploy(
+        target: &DeployTarget,
+        keys: &[DeployKey],
+        recorded: &[RecordedDeployment],
+        fields: &DeployHostFields,
+    ) -> Result<DeployPlan> {
+        let base = {
+            let _no_writer = managed_config_lock();
+            SshConfigService::at(target.config_path.clone()).read()?
         };
-
-        // Check if host already exists. An existing match is a legitimate
-        // update (re-deploy of the same key): the alias can only come from a
-        // validated key name or the sanitize mapping above, both of which
-        // are single Host tokens, so a match cannot hijack an unrelated
-        // stanza the user didn't already associate with this key.
-        if let Some(existing) = config.hosts.iter_mut().find(|h| h.host == host) {
-            existing.identity_file = Some(private_path.to_string_lossy().to_string());
-            existing.identities_only = Some(true);
-            if let Some(strict) = strict_host_key {
-                existing.extra.insert(
-                    "stricthostkeychecking".to_string(),
-                    if strict {
-                        "yes".to_string()
-                    } else {
-                        "no".to_string()
-                    },
-                );
-            }
-            if let Some(h) = hostname {
-                existing.hostname = Some(h.to_string());
-            }
-            if let Some(u) = user {
-                existing.user = Some(u.to_string());
-            }
-            if let Some(p) = port {
-                existing.port = Some(p);
-            }
-        } else {
-            config.hosts.push(SshHostConfig {
-                host: host.to_string(),
-                hostname: hostname.map(|s| s.to_string()),
-                user: user.map(|s| s.to_string()),
-                port,
-                identity_file: Some(private_path.to_string_lossy().to_string()),
-                identities_only: Some(true),
-                forward_agent: Some(false),
-                proxy_jump: None,
-                extra: {
-                    let mut extra = std::collections::HashMap::new();
-                    if let Some(strict) = strict_host_key {
-                        extra.insert(
-                            "stricthostkeychecking".to_string(),
-                            if strict {
-                                "yes".to_string()
-                            } else {
-                                "no".to_string()
-                            },
-                        );
-                    }
-                    extra
-                },
+        let several = keys.len() > 1;
+        let mut planned: Vec<PlannedKey> = Vec::with_capacity(keys.len());
+        let mut aliases_taken: Vec<String> = Vec::new();
+        for key in keys {
+            let stem = format!("sshspan_{}", sanitize_filename(&key.name));
+            let file = target.ssh_dir.join(&stem);
+            let pub_file = target.ssh_dir.join(format!("{stem}.pub"));
+            let file_text = file.display().to_string();
+            let own_record = key
+                .deploy_path
+                .as_deref()
+                .is_some_and(|p| same_path(Path::new(p), &file));
+            let earlier = planned
+                .iter()
+                .find(|p| p.refusal.is_none() && same_path(Path::new(&p.file), &file))
+                .map(|p| p.name.clone());
+            let owner = recorded
+                .iter()
+                .find(|r| r.id != key.id && same_path(Path::new(&r.path), &file));
+            // A stray `.pub` is not overwritten either.
+            let existing = [&file, &pub_file]
+                .into_iter()
+                .find(|p| !own_record && fs::symlink_metadata(p).is_ok());
+            let overwrites_file = existing.is_some();
+            let mut refusal = if let Some(other) = &earlier {
+                Some(format!(
+                    "Not deployed: \"{other}\" and \"{}\" would both be written to {file_text}. Rename one of them and deploy it again.",
+                    key.name
+                ))
+            } else if let Some(owner) = owner {
+                Some(format!(
+                    "Not deployed: {file_text} is the deployed key file of \"{}\" - deploying \"{}\" would overwrite it. Rename one of the keys, or remove the other key's deployed copy first.",
+                    owner.name, key.name
+                ))
+            } else if let Some(path) = existing {
+                Some(format!(
+                    "Not deployed: {} already exists and was not written by SSHSpan for \"{}\". Move or delete that file first if it should be replaced.",
+                    path.display(),
+                    key.name
+                ))
+            } else {
+                None
+            };
+            let alias = alias_for(fields.host_alias.as_deref(), &key.name, several);
+            let mut alias_owned_by_other_key = false;
+            let alias = if refusal.is_none() {
+                let alias = distinct_alias(alias, &mut aliases_taken);
+                let alias_owner = base
+                    .hosts
+                    .iter()
+                    .find(|h| h.host == alias)
+                    .and_then(|h| h.identity_file.as_deref())
+                    .and_then(|identity| {
+                        recorded.iter().find(|r| {
+                            r.id != key.id && identity_names(identity, Path::new(&r.path))
+                        })
+                    });
+                if let Some(other) = alias_owner {
+                    alias_owned_by_other_key = true;
+                    refusal = Some(format!(
+                        "Not deployed: the Host alias \"{alias}\" already points at the deployed key \"{}\" ({}). Choose another alias, or remove that key's deployed copy first.",
+                        other.name, other.path
+                    ));
+                    aliases_taken.retain(|taken| *taken != alias.to_lowercase());
+                }
+                alias
+            } else {
+                alias
+            };
+            planned.push(PlannedKey {
+                id: key.id.clone(),
+                name: key.name.clone(),
+                alias,
+                file: file_text,
+                pub_file: pub_file.display().to_string(),
+                overwrites_file,
+                owned_by_other_key: earlier.is_some() || owner.is_some(),
+                alias_owned_by_other_key,
+                refusal,
             });
         }
-
-        config_service.write(&config)?;
-
-        Ok(DeployResult {
-            private_key_path: private_path.to_string_lossy().to_string(),
-            public_key_path: public_path.to_string_lossy().to_string(),
-            host_alias: host.to_string(),
-            config_updated: true,
+        let legacy = find_legacy_host_lines(target, &planned, fields);
+        Ok(DeployPlan {
+            target: target.clone(),
+            fields: fields.clone(),
+            keys: planned,
+            base,
+            legacy,
         })
     }
 
-    /// Remove a deployed key
-    pub fn remove_key(key_name: &str, host_alias: Option<&str>) -> Result<()> {
-        let ssh_dir = get_ssh_dir()?;
-        let key_filename = format!("sshspan_{}", sanitize_filename(key_name));
-        let private_path = ssh_dir.join(&key_filename);
-        let public_path = ssh_dir.join(format!("{}.pub", key_filename));
-
-        // Remove key files
-        if private_path.exists() {
-            fs::remove_file(&private_path)?;
+    /// Carry out a plan. For every key it does not refuse, `material` is asked
+    /// for the key's files (the commands unseal the key there, so a refused
+    /// key is never decrypted), they are written - the private key through
+    /// [`write_secret_file`]: owner-only from the first byte, fail-closed on
+    /// Windows - and finally the managed config is written once, with a
+    /// stanza for each key that was written, by the merge and serializer the
+    /// preview used. A key that is refused or fails is reported and skipped;
+    /// the others still deploy.
+    pub fn apply_deploy(
+        plan: &DeployPlan,
+        mut material: impl FnMut(&PlannedKey) -> std::result::Result<DeployFiles, String>,
+    ) -> DeployOutcome {
+        let mut outcome = DeployOutcome::default();
+        let mut written: Vec<&PlannedKey> = Vec::new();
+        let dir_ready = fs::create_dir_all(&plan.target.ssh_dir)
+            .map_err(|e| format!("Could not create {}: {e}", plan.target.ssh_dir.display()));
+        for key in &plan.keys {
+            let result = match (&key.refusal, &dir_ready) {
+                (Some(refusal), _) => Err(refusal.clone()),
+                (None, Err(e)) => Err(e.clone()),
+                (None, Ok(())) => material(key).and_then(|files| write_key_files(key, &files)),
+            };
+            match result {
+                Ok(()) => {
+                    written.push(key);
+                    outcome.deployed.push(DeployedKey {
+                        id: key.id.clone(),
+                        name: key.name.clone(),
+                        alias: key.alias.clone(),
+                        file: key.file.clone(),
+                        pub_file: key.pub_file.clone(),
+                    });
+                }
+                Err(error) => outcome.errors.push(DeployError {
+                    id: key.id.clone(),
+                    name: key.name.clone(),
+                    error,
+                }),
+            }
         }
-        if public_path.exists() {
-            fs::remove_file(&public_path)?;
+        if !written.is_empty() {
+            // The stanzas go into the file as it is NOW, under the lock every
+            // read-modify-write of it takes. Writing back the copy read when
+            // the deploy was planned - before every key was unsealed - undid
+            // an undeploy that ran meanwhile and dropped the stanzas of a
+            // concurrent deploy.
+            let _writes = managed_config_lock();
+            let service = SshConfigService::at(plan.target.config_path.clone());
+            match service.read() {
+                Ok(current) => {
+                    let (config, taken) = plan.merge_into(current, &written);
+                    outcome.warnings.extend(taken);
+                    if let Err(e) = service.write(&config) {
+                        outcome.warnings.push(format!(
+                            "The key files were written, but {} could not be updated: {e}",
+                            plan.target.config_path.display()
+                        ));
+                    }
+                }
+                Err(e) => outcome.warnings.push(format!(
+                    "The key files were written, but {} could not be read to add their entries: {e}",
+                    plan.target.config_path.display()
+                )),
+            }
         }
-
-        // Update SSH config
-        if let Some(host) = host_alias {
-            let config_service = SshConfigService::new()?;
-            let mut config = config_service.read()?;
-            config.hosts.retain(|h| h.host != host);
-            config_service.write(&config)?;
-        }
-
-        Ok(())
+        outcome
     }
 
-    /// List all deployed keys
-    pub fn list_deployed_keys() -> Result<Vec<DeployedKeyInfo>> {
-        let ssh_dir = get_ssh_dir()?;
-
-        if !ssh_dir.exists() {
-            return Ok(Vec::new());
+    /// Undo one deployment (A7-22): delete the private key file and its
+    /// `.pub`, and every managed-config stanza whose IdentityFile is that key
+    /// file (the alias is the user's choice, so it is not derived from the key
+    /// name). Files already gone are fine. If the private key file cannot be
+    /// deleted nothing else is touched and the error says so - the caller
+    /// keeps the key marked as deployed; problems with the `.pub` or the
+    /// config only produce warnings. Callers check
+    /// [`SshService::is_managed_deploy_path`] first.
+    pub fn remove_key(
+        target: &DeployTarget,
+        deploy_path: &str,
+    ) -> std::result::Result<RemovedDeployment, String> {
+        let mut done = RemovedDeployment::default();
+        match fs::remove_file(deploy_path) {
+            Ok(()) => done.removed.push(deploy_path.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "Could not remove {deploy_path}: {e}. The key is still marked as deployed."
+                ))
+            }
         }
-
-        let mut keys = Vec::new();
-
-        for entry in fs::read_dir(&ssh_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().map_or(false, |ext| ext == "pub") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem.starts_with("sshspan_") {
-                        let key_name = &stem[8..]; // Remove "sshspan_" prefix
-                        let private_path = ssh_dir.join(stem);
-
-                        keys.push(DeployedKeyInfo {
-                            name: key_name.to_string(),
-                            private_key_path: private_path.to_string_lossy().to_string(),
-                            public_key_path: path.to_string_lossy().to_string(),
-                            exists: private_path.exists(),
-                        });
+        let public = format!("{deploy_path}.pub");
+        match fs::remove_file(&public) {
+            Ok(()) => done.removed.push(public),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => done
+                .warnings
+                .push(format!("Could not remove {public}: {e}")),
+        }
+        let service = SshConfigService::at(target.config_path.clone());
+        let _writes = managed_config_lock();
+        match service.read() {
+            Ok(mut config) => {
+                let (gone, kept): (Vec<SshHostConfig>, Vec<SshHostConfig>) =
+                    config.hosts.into_iter().partition(|h| {
+                        h.identity_file
+                            .as_deref()
+                            .is_some_and(|f| identity_names(f, Path::new(deploy_path)))
+                    });
+                config.hosts = kept;
+                if !gone.is_empty() {
+                    match service.write(&config) {
+                        Ok(()) => done.removed_hosts = gone.into_iter().map(|h| h.host).collect(),
+                        Err(e) => done.warnings.push(format!(
+                            "Could not update {}: {e}",
+                            target.config_path.display()
+                        )),
                     }
                 }
             }
+            Err(e) => done.warnings.push(format!(
+                "Could not read {}: {e}",
+                target.config_path.display()
+            )),
         }
-
-        Ok(keys)
+        Ok(done)
     }
 
-    /// Get SSH config hosts
-    pub fn get_config_hosts() -> Result<Vec<SshHostConfig>> {
-        let config_service = SshConfigService::new()?;
-        let config = config_service.read()?;
-        Ok(config.hosts)
+    /// Whether `deploy_path` is a file a deploy writes: a `sshspan_*` file
+    /// directly in the managed SSH directory. Only those are ever deleted on
+    /// undeploy - a recorded path is not trusted on its own (a backup
+    /// restored by an older version, or a hand-edited database, could point it at the
+    /// user's own `id_ed25519`, which used to pass because it is inside
+    /// `~/.ssh`).
+    pub fn is_managed_deploy_path(target: &DeployTarget, deploy_path: &str) -> bool {
+        let path = Path::new(deploy_path);
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        if !name.to_string_lossy().starts_with("sshspan_") {
+            return false;
+        }
+        let canonical = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        same_path(&canonical(parent), &canonical(&target.ssh_dir))
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DeployResult {
-    pub private_key_path: String,
-    pub public_key_path: String,
-    pub host_alias: String,
-    pub config_updated: bool,
+/// Serialises every read-modify-write of the managed config in this process
+/// (deploy, undeploy, and the read a plan starts from): a deploy and an
+/// undeploy running at once each wrote back the file as they had read it, so
+/// one dropped the other's change.
+static MANAGED_CONFIG_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`MANAGED_CONFIG_WRITES`]. Held only around the file's own read and
+/// write - never while keys are unsealed or other work runs.
+fn managed_config_lock() -> std::sync::MutexGuard<'static, ()> {
+    MANAGED_CONFIG_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DeployedKeyInfo {
-    pub name: String,
-    pub private_key_path: String,
-    pub public_key_path: String,
-    pub exists: bool,
+/// `Host` lines of the user's own ssh config (`<ssh dir>/config`) that name
+/// the host of one of `keys` - by the alias this deploy gives it, by the
+/// key's name (older builds used it raw: `Host bob's-key`) or by the alias
+/// that was typed. Case is ignored. Read-only: a missing or unreadable file
+/// yields nothing, and nothing is ever written to it.
+fn find_legacy_host_lines(
+    target: &DeployTarget,
+    keys: &[PlannedKey],
+    fields: &DeployHostFields,
+) -> Vec<LegacyHostLine> {
+    let path = target.ssh_dir.join("config");
+    let Ok(Some(text)) = crate::config::read_config_text(&path) else {
+        return Vec::new();
+    };
+    let file = path.display().to_string();
+    let candidates: Vec<(String, Vec<String>)> = keys
+        .iter()
+        .map(|k| {
+            let mut names = vec![k.alias.to_lowercase(), k.name.to_lowercase()];
+            names.extend(fields.host_alias.iter().map(|a| a.to_lowercase()));
+            (k.name.clone(), names)
+        })
+        .collect();
+    let mut found = Vec::new();
+    for line in crate::config::host_lines(&text) {
+        let words: Vec<String> = match &line.patterns {
+            Some(patterns) => patterns.iter().map(|p| p.to_lowercase()).collect(),
+            // ssh cannot split this line; compare the words as written.
+            None => {
+                let rest = line
+                    .text
+                    .find(|c: char| c.is_whitespace() || c == '=')
+                    .map_or("", |i| line.text[i..].trim_start());
+                let rest = rest.strip_prefix('=').unwrap_or(rest);
+                rest.split_whitespace().map(str::to_lowercase).collect()
+            }
+        };
+        let owner = candidates
+            .iter()
+            .find(|(_, names)| words.iter().any(|w| names.contains(w)));
+        if let Some((key, _)) = owner {
+            found.push(LegacyHostLine {
+                file: file.clone(),
+                line: line.line,
+                text: quoted_config_line(&line.text),
+                key: key.clone(),
+                unreadable: line.patterns.is_none(),
+                written_by_sshspan: line.identity_files.iter().any(|f| is_sshspan_key_file(f)),
+            });
+        }
+    }
+    found
+}
+
+/// How many characters of a line in the user's ssh config the deploy
+/// preview quotes.
+const QUOTED_LINE_MAX_CHARS: usize = 300;
+
+/// A line of the user's ssh config as the deploy preview quotes it - in
+/// `legacyHostLines` and in the warning about it: control characters
+/// dropped, and at most [`QUOTED_LINE_MAX_CHARS`] characters, followed by
+/// "…" when the line was longer (cut between characters). Format and
+/// text-direction characters stay: the renderer spells them out, so the user
+/// can find them in the file. A 50,000-character line came back whole.
+fn quoted_config_line(line: &str) -> String {
+    let mut kept = line.chars().filter(|c| !c.is_control());
+    let quoted: String = kept.by_ref().take(QUOTED_LINE_MAX_CHARS).collect();
+    if kept.next().is_some() {
+        format!("{quoted}\u{2026}")
+    } else {
+        quoted
+    }
+}
+
+/// Write one key's private file (owner-only) and its `.pub`; a failure
+/// leaves neither behind.
+fn write_key_files(key: &PlannedKey, files: &DeployFiles) -> std::result::Result<(), String> {
+    let private = Path::new(&key.file);
+    let public = Path::new(&key.pub_file);
+    write_secret_file(private, files.private_key.as_bytes()).map_err(|e| {
+        let _ = fs::remove_file(public);
+        e.to_string()
+    })?;
+    fs::write(public, &files.public_key).map_err(|e| {
+        let _ = fs::remove_file(private);
+        format!("Could not write {}: {e}", public.display())
+    })
+}
+
+/// The `Host` alias for one key - the rule in [`SshService::plan_deploy`].
+fn alias_for(requested: Option<&str>, key_name: &str, several: bool) -> String {
+    match requested {
+        Some(alias) if several => format!("{}-{}", safe_alias(alias), safe_alias(key_name)),
+        Some(alias) => safe_alias(alias),
+        None => safe_alias(key_name),
+    }
+}
+
+/// A Host alias ssh_config takes literally: letters, digits, `.`, `_` and
+/// `-` - every other character becomes `-` - not starting with `-` or `.`
+/// (`ssh -x` reads an option), never empty. Key names may hold anything
+/// printable, and the old rule (any valid key name) let `'`, `"`, `\`, a
+/// leading `#` and the pattern characters `*?!` into the Host line: "invalid
+/// quotes" stops every ssh command once the file is Included, and `Host *`
+/// matches every host.
+fn safe_alias(raw: &str) -> String {
+    let mapped: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    match mapped.trim_start_matches(['-', '.']) {
+        "" => "key".to_string(),
+        alias => alias.to_string(),
+    }
+}
+
+/// `alias`, or `alias-2`, `alias-3`, ... - the first one not yet taken in
+/// this deploy (compared without case), which is then recorded as taken.
+fn distinct_alias(alias: String, taken: &mut Vec<String>) -> String {
+    let mut candidate = alias.clone();
+    let mut n = 2;
+    while taken.contains(&candidate.to_lowercase()) {
+        candidate = format!("{alias}-{n}");
+        n += 1;
+    }
+    taken.push(candidate.to_lowercase());
+    candidate
+}
+
+/// Point the stanza for `alias` at `identity_file` with the requested
+/// fields: an existing stanza of that alias (an earlier deploy) is updated
+/// in place - fields not given keep their value - otherwise one is added.
+/// The key file path and the host name are meant literally, so their `%`
+/// signs are doubled ([`literal_percent`]); the serializer quotes them when
+/// needed.
+fn merge_stanza(
+    config: &mut SshConfig,
+    alias: &str,
+    identity_file: &str,
+    fields: &DeployHostFields,
+) {
+    let identity_file = literal_percent(identity_file);
+    let hostname = fields.hostname.as_deref().map(literal_percent);
+    let strict = fields
+        .strict_host_key
+        .map(|strict| if strict { "yes" } else { "no" }.to_string());
+    if let Some(existing) = config.hosts.iter_mut().find(|h| h.host == alias) {
+        existing.identity_file = Some(identity_file);
+        existing.identities_only = Some(true);
+        if let Some(value) = strict {
+            existing
+                .extra
+                .insert("stricthostkeychecking".to_string(), value);
+        }
+        if let Some(h) = hostname {
+            existing.hostname = Some(h);
+        }
+        if let Some(u) = &fields.user {
+            existing.user = Some(u.clone());
+        }
+        if let Some(p) = fields.port {
+            existing.port = Some(p);
+        }
+    } else {
+        let mut extra = std::collections::HashMap::new();
+        if let Some(value) = strict {
+            extra.insert("stricthostkeychecking".to_string(), value);
+        }
+        config.hosts.push(SshHostConfig {
+            host: alias.to_string(),
+            hostname,
+            user: fields.user.clone(),
+            port: fields.port,
+            identity_file: Some(identity_file),
+            identities_only: Some(true),
+            forward_agent: Some(false),
+            proxy_jump: None,
+            extra,
+        });
+    }
+}
+
+/// Whether two paths name the same file for a deploy: on Windows names are
+/// case-insensitive and either separator works.
+fn same_path(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let fold = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+        fold(a) == fold(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -288,78 +1031,972 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
-fn get_ssh_dir() -> Result<PathBuf> {
-    if let Some(home) = dirs::home_dir() {
-        Ok(home.join(".ssh"))
-    } else {
-        anyhow::bail!("Could not determine home directory")
-    }
+/// `%SystemRoot%\System32\<name>`, falling back to `C:\Windows` when the
+/// variable is missing.
+///
+/// Absolute on purpose (A6-13): a bare `Command::new("icacls")` is resolved
+/// through the application's own directory before System32, and a per-user
+/// install lives in a user-writable directory - an `icacls.exe` planted
+/// beside SSHSpan.exe would have run instead of the real one and could have
+/// "succeeded" without restricting anything.
+#[cfg(windows)]
+fn system32_exe(name: &str) -> PathBuf {
+    let root = std::env::var("SystemRoot")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| r"C:\Windows".to_string());
+    PathBuf::from(root).join("System32").join(name)
 }
 
+/// The current user's SID from `whoami /user /fo csv /nh` output, i.e. the
+/// last field of the last line (`"domain\user","S-1-5-21-..."`). Taken from
+/// the end because an account name may itself contain a comma, and checked
+/// for SID shape so nothing else is ever handed to icacls as an account.
+#[cfg(any(windows, test))]
+fn parse_whoami_sid(csv: &str) -> Option<String> {
+    let line = csv.lines().rev().find(|l| !l.trim().is_empty())?;
+    let sid = line.rsplit(',').next()?.trim().trim_matches('"');
+    let well_formed = sid.starts_with("S-1-")
+        && sid.len() > 4
+        && sid[4..].bytes().all(|b| b.is_ascii_digit() || b == b'-');
+    well_formed.then(|| sid.to_string())
+}
+
+/// Take every inherited permission off `path` and give the current user full
+/// control. The only other entries left are those Windows gave the new file
+/// at creation, and `/inheritance:r` (inherited entries only) and `/grant:r`
+/// (the user's own entry only) do not touch them. Where the folder passes
+/// permissions down (as `~/.ssh` under the profile normally does), the file
+/// got inherited entries only, so the user is then the only account with
+/// access. Where it passes none down, the file got the creating process's
+/// default entries instead, and SYSTEM and Administrators keep that full
+/// control (seen for an elevated administrator and for a UAC user). OpenSSH
+/// for Windows accepts both on a private key.
+///
+/// ONE icacls call does both halves - `/inheritance:r /grant:r *<SID>:F`.
+/// The old code ran `/inheritance:r` on its own first and then granted the
+/// user by a bare SID, which icacls rejects ("No mapping between account
+/// names and security IDs was done."): a SID must carry the `*` prefix. So
+/// every secret write on Windows (deploy, private-key export, backup export,
+/// audit CSV export) failed after inheritance had already been stripped
+/// (A7-01). In a single invocation a rejected grant cannot leave the file
+/// with an empty DACL, and `write_secret_file` removes the file on any error.
+///
+/// Both children are started with `CREATE_NO_WINDOW`: SSHSpan is a
+/// GUI-subsystem process, so without it Windows opens a console window for
+/// each console program it runs and every secret write flashed them (A7-43).
 #[cfg(windows)]
 pub(crate) fn restrict_windows_file(path: &PathBuf) -> Result<()> {
+    use std::os::windows::process::CommandExt as _;
     use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    // Get current user SID
-    let output = Command::new("whoami")
-        .arg("/user")
-        .arg("/fo")
-        .arg("csv")
+    let whoami = Command::new(system32_exe("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()?;
-
-    if !output.status.success() {
-        anyhow::bail!("whoami /user failed with status {}", output.status);
+    if !whoami.status.success() {
+        anyhow::bail!("whoami /user failed with status {}", whoami.status);
     }
-
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = output_str.lines().collect();
-
-    let sid = if lines.len() >= 2 {
-        let parts: Vec<&str> = lines[1].split(',').collect();
-        if parts.len() >= 2 {
-            Some(parts[1].trim_matches('"').to_string())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let Some(sid) = sid else {
+    let Some(sid) = parse_whoami_sid(&String::from_utf8_lossy(&whoami.stdout)) else {
         anyhow::bail!("could not parse the current user SID from whoami output");
     };
 
-    // Remove inheritance and set explicit permissions. Both steps must
-    // actually succeed — a silently-skipped restriction leaves the private
-    // key under the default (inherited) ACL.
-    let remove_inheritance = Command::new("icacls")
+    let icacls = Command::new(system32_exe("icacls.exe"))
         .arg(path)
         .arg("/inheritance:r")
-        .output()?;
-    if !remove_inheritance.status.success() {
-        anyhow::bail!(
-            "icacls /inheritance:r failed: {}",
-            String::from_utf8_lossy(&remove_inheritance.stderr).trim()
-        );
-    }
-
-    let grant = Command::new("icacls")
-        .arg(path)
         .arg("/grant:r")
-        .arg(format!("{}:F", sid))
+        .arg(format!("*{sid}:F"))
+        .creation_flags(CREATE_NO_WINDOW)
         .output()?;
-    if !grant.status.success() {
-        anyhow::bail!(
-            "icacls /grant:r failed: {}",
-            String::from_utf8_lossy(&grant.stderr).trim()
-        );
+    if !icacls.status.success() {
+        // icacls reports some failures on stdout and others on stderr.
+        let detail = [&icacls.stderr, &icacls.stdout]
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        anyhow::bail!("icacls failed ({}): {detail}", icacls.status);
     }
 
     Ok(())
 }
 
 #[cfg(test)]
+mod deploy_tests {
+    use super::*;
+
+    /// A throwaway `~/.ssh` and managed config file, removed on drop - the
+    /// deploy code never sees the real home directory in a test (A7-56).
+    struct Scratch {
+        root: PathBuf,
+        target: DeployTarget,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "sshspan-deploy-{tag}-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let target = DeployTarget::new(
+                root.join("home").join(".ssh"),
+                root.join("app-config").join("ssh").join("config"),
+            );
+            Self { root, target }
+        }
+        fn file(&self, name: &str) -> PathBuf {
+            self.target.ssh_dir.join(name)
+        }
+        fn config(&self) -> String {
+            fs::read_to_string(&self.target.config_path).unwrap_or_default()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn key(id: &str, name: &str) -> DeployKey {
+        DeployKey {
+            id: id.into(),
+            name: name.into(),
+            deploy_path: None,
+        }
+    }
+
+    fn fields(alias: Option<&str>) -> DeployHostFields {
+        DeployHostFields::parse(alias.map(String::from), None, None, None, None).unwrap()
+    }
+
+    /// Stand-in key material, so the file contents say which key wrote them.
+    fn material(planned: &PlannedKey) -> Result<DeployFiles, String> {
+        Ok(DeployFiles {
+            private_key: zeroize::Zeroizing::new(format!("PRIVATE {}", planned.id)),
+            public_key: format!("ssh-ed25519 AAAAC3Nza {}", planned.id),
+        })
+    }
+
+    fn plan(s: &Scratch, keys: &[DeployKey], f: &DeployHostFields) -> DeployPlan {
+        SshService::plan_deploy(&s.target, keys, &[], f).unwrap()
+    }
+
+    #[test]
+    fn plan_names_files_and_aliases_by_the_documented_rule() {
+        let s = Scratch::new("aliases");
+        let one = plan(&s, &[key("k1", "web")], &fields(Some("prod")));
+        assert_eq!(one.keys[0].alias, "prod");
+        assert_eq!(
+            one.keys[0].file,
+            s.file("sshspan_web").display().to_string()
+        );
+        assert_eq!(
+            one.keys[0].pub_file,
+            s.file("sshspan_web.pub").display().to_string()
+        );
+        // Not a single Host token: sanitized, as for legacy key names.
+        let spaced = plan(&s, &[key("k1", "web")], &fields(Some("my prod")));
+        assert_eq!(spaced.keys[0].alias, "my-prod");
+        let several = plan(
+            &s,
+            &[key("k1", "web"), key("k2", "db")],
+            &fields(Some("prod")),
+        );
+        let aliases: Vec<&str> = several.keys.iter().map(|k| k.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["prod-web", "prod-db"]);
+        let unnamed = plan(&s, &[key("k1", "web"), key("k2", "old key")], &fields(None));
+        let aliases: Vec<&str> = unnamed.keys.iter().map(|k| k.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["web", "old-key"]);
+        assert!(unnamed.keys.iter().all(|k| k.refusal.is_none()));
+    }
+
+    /// Two different files whose keys sanitize to one Host alias get
+    /// distinct stanzas instead of one silently replacing the other.
+    #[test]
+    fn plan_keeps_aliases_distinct_within_one_deploy() {
+        let s = Scratch::new("alias-dupes");
+        let p = plan(&s, &[key("k1", "a b"), key("k2", "a-b")], &fields(None));
+        assert_ne!(p.keys[0].file, p.keys[1].file);
+        let aliases: Vec<&str> = p.keys.iter().map(|k| k.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["a-b", "a-b-2"]);
+    }
+
+    /// R3: the preview's text is exactly what the deploy writes, HostName /
+    /// User / Port included.
+    #[test]
+    fn config_text_is_exactly_what_apply_writes() {
+        let s = Scratch::new("config-text");
+        let f = DeployHostFields::parse(
+            Some("prod".into()),
+            Some("web.example.com".into()),
+            Some("deploy".into()),
+            Some(2222),
+            Some(true),
+        )
+        .unwrap();
+        let p = plan(&s, &[key("k1", "web"), key("k2", "db")], &f);
+        let preview = p.config_text();
+        let outcome = SshService::apply_deploy(&p, material);
+        assert!(outcome.errors.is_empty() && outcome.warnings.is_empty());
+        assert_eq!(s.config(), preview);
+        for line in [
+            "Host prod-web\n",
+            "Host prod-db\n",
+            "    HostName web.example.com\n",
+            "    User deploy\n",
+            "    Port 2222\n",
+            "    IdentitiesOnly yes\n",
+            "    stricthostkeychecking yes\n",
+        ] {
+            assert!(preview.contains(line), "missing {line:?} in\n{preview}");
+        }
+        // Compared parsed: on Windows the path is written quoted and escaped.
+        let parsed = SshConfig::parse(&preview);
+        assert_eq!(
+            parsed.hosts[0].identity_file,
+            Some(s.file("sshspan_web").display().to_string())
+        );
+        assert_eq!(
+            fs::read_to_string(s.file("sshspan_web")).unwrap(),
+            "PRIVATE k1"
+        );
+        assert_eq!(
+            fs::read_to_string(s.file("sshspan_db.pub")).unwrap(),
+            "ssh-ed25519 AAAAC3Nza k2"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_writes_the_private_key_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new("mode");
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        SshService::apply_deploy(&p, material);
+        let mode = fs::metadata(s.file("sshspan_web"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// A2-46 / A7-59: `a.b` and `a_b` both sanitize to `sshspan_a_b`; the
+    /// second must be refused, not written over the first.
+    #[test]
+    fn keys_that_share_a_file_name_collide_and_apply_refuses_the_second() {
+        let s = Scratch::new("batch-collision");
+        let p = plan(&s, &[key("k1", "a.b"), key("k2", "a_b")], &fields(None));
+        assert!(p.keys[0].refusal.is_none());
+        assert!(p.keys[1].owned_by_other_key);
+        let refusal = p.keys[1]
+            .refusal
+            .clone()
+            .expect("the second key is refused");
+        assert!(refusal.contains("\"a.b\""), "{refusal}");
+        assert!(!p.config_text().contains("Host a_b"));
+        let outcome = SshService::apply_deploy(&p, material);
+        assert_eq!(outcome.deployed.len(), 1);
+        assert_eq!(outcome.deployed[0].id, "k1");
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.errors[0].id, "k2");
+        assert_eq!(outcome.errors[0].error, refusal);
+        assert_eq!(
+            fs::read_to_string(s.file("sshspan_a_b")).unwrap(),
+            "PRIVATE k1"
+        );
+        assert!(!s.config().contains("Host a_b"));
+    }
+
+    #[test]
+    fn another_keys_recorded_deploy_path_is_refused() {
+        let s = Scratch::new("recorded");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        fs::write(s.file("sshspan_a_b"), "OLD KEY").unwrap();
+        let recorded = [RecordedDeployment {
+            id: "k-old".into(),
+            name: "a.b".into(),
+            path: s.file("sshspan_a_b").display().to_string(),
+        }];
+        let p = SshService::plan_deploy(&s.target, &[key("k2", "a_b")], &recorded, &fields(None))
+            .unwrap();
+        assert!(p.keys[0].owned_by_other_key);
+        assert!(p.keys[0].overwrites_file);
+        let outcome = SshService::apply_deploy(&p, material);
+        assert!(outcome.deployed.is_empty());
+        assert_eq!(
+            fs::read_to_string(s.file("sshspan_a_b")).unwrap(),
+            "OLD KEY"
+        );
+    }
+
+    /// A file SSHSpan did not record for this key is refused; re-deploying a
+    /// key over its own recorded file is not.
+    #[test]
+    fn a_foreign_file_is_refused_but_a_redeploy_over_the_keys_own_file_is_not() {
+        let s = Scratch::new("foreign");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        fs::write(s.file("sshspan_web"), "FOREIGN").unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        assert!(p.keys[0].overwrites_file && !p.keys[0].owned_by_other_key);
+        assert!(p.keys[0].refusal.is_some());
+        let outcome = SshService::apply_deploy(&p, material);
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(
+            fs::read_to_string(s.file("sshspan_web")).unwrap(),
+            "FOREIGN"
+        );
+
+        let mut own = key("k1", "web");
+        own.deploy_path = Some(s.file("sshspan_web").display().to_string());
+        let p = plan(&s, &[own], &fields(None));
+        assert!(!p.keys[0].overwrites_file && p.keys[0].refusal.is_none());
+        let outcome = SshService::apply_deploy(&p, material);
+        assert_eq!(outcome.deployed.len(), 1);
+        assert_eq!(
+            fs::read_to_string(s.file("sshspan_web")).unwrap(),
+            "PRIVATE k1"
+        );
+    }
+
+    /// Other stanzas in the managed file survive; an existing stanza for the
+    /// same alias is updated in place, and the preview shows that update.
+    #[test]
+    fn apply_keeps_other_stanzas_and_updates_an_existing_alias_in_place() {
+        let s = Scratch::new("merge");
+        fs::create_dir_all(s.target.config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &s.target.config_path,
+            "Host other\n    HostName other.example\n\nHost prod\n    HostName old.example\n    IdentityFile /old/key\n",
+        )
+        .unwrap();
+        let f =
+            DeployHostFields::parse(Some("prod".into()), None, Some("deploy".into()), None, None)
+                .unwrap();
+        let p = plan(&s, &[key("k1", "web")], &f);
+        let preview = p.config_text();
+        assert!(preview.contains("HostName old.example"), "{preview}");
+        SshService::apply_deploy(&p, material);
+        let written = s.config();
+        assert!(
+            written.starts_with("Host other\n    HostName other.example\n"),
+            "{written}"
+        );
+        assert!(written.contains(&preview), "{written}");
+        assert!(!written.contains("/old/key"));
+        assert_eq!(written.matches("Host prod\n").count(), 1);
+    }
+
+    #[test]
+    fn host_fields_are_trimmed_and_checked() {
+        let f = DeployHostFields::parse(
+            Some("  ".into()),
+            Some(" web.example ".into()),
+            Some("deploy".into()),
+            Some(22),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(f.host_alias, None);
+        assert_eq!(f.hostname.as_deref(), Some("web.example"));
+        for (hostname, user, port) in [
+            (Some("web example"), None, None),
+            (None, Some("de\nploy"), None),
+            (None, Some("a\"b"), None),
+            (None, None, Some(0u16)),
+        ] {
+            assert!(
+                DeployHostFields::parse(
+                    None,
+                    hostname.map(String::from),
+                    user.map(String::from),
+                    port,
+                    None
+                )
+                .is_err(),
+                "{hostname:?} {user:?} {port:?}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn include_line_quotes_the_managed_config_path() {
+        let t = DeployTarget::new("/x", "/home/me/My Configs/ssh/config");
+        assert_eq!(
+            t.include_line(),
+            "Include \"/home/me/My Configs/ssh/config\""
+        );
+        let odd = DeployTarget::new("/x", "/tmp/a\\b\"c/config");
+        assert_eq!(odd.include_line(), "Include \"/tmp/a\\\\b\\\"c/config\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn include_line_uses_forward_slashes_on_windows() {
+        let t = DeployTarget::new(
+            r"C:\x",
+            r"C:\Users\Me Too\AppData\Roaming\sshspan\config\ssh\config",
+        );
+        assert_eq!(
+            t.include_line(),
+            "Include \"C:/Users/Me Too/AppData/Roaming/sshspan/config/ssh/config\""
+        );
+    }
+
+    // ── Nothing a deploy writes may stop ssh from parsing ──
+
+    /// Key names the vault accepts can hold characters ssh_config reads as
+    /// quotes, escapes, comments or patterns (`Host bob's-key` -> "invalid
+    /// quotes", which ends every ssh command once the file is Included;
+    /// `Host *` matches every host). Aliases use letters, digits, `.`, `_` and
+    /// `-` only, and never start with `-` (ssh would read an option).
+    #[test]
+    fn aliases_use_only_characters_ssh_config_takes_literally() {
+        let s = Scratch::new("alias-chars");
+        let names = [
+            "bob's-key",
+            "a\"b",
+            "x\\y",
+            "#hash",
+            "web*prod",
+            "who?",
+            "!neg",
+            "me@laptop",
+            "-x",
+        ];
+        let keys: Vec<DeployKey> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| key(&format!("k{i}"), n))
+            .collect();
+        let p = plan(&s, &keys, &fields(None));
+        for planned in &p.keys {
+            assert!(
+                !planned.alias.is_empty()
+                    && !planned.alias.starts_with('-')
+                    && planned
+                        .alias
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-')),
+                "{:?} -> {:?}",
+                planned.name,
+                planned.alias
+            );
+        }
+        assert_eq!(p.keys[0].alias, "bob-s-key");
+        assert_eq!(p.keys[4].alias, "web-prod");
+        let several = plan(
+            &s,
+            &[key("k1", "a'b"), key("k2", "c")],
+            &fields(Some("my prod")),
+        );
+        assert_eq!(several.keys[0].alias, "my-prod-a-b");
+    }
+
+    /// A Host alias the user types is refused when it would be a pattern.
+    #[test]
+    fn a_host_alias_with_pattern_characters_is_refused() {
+        for alias in ["*", "web*", "?x", "!prod", "a b*"] {
+            let err = DeployHostFields::parse(Some(alias.into()), None, None, None, None)
+                .expect_err(alias);
+            assert!(err.contains("*, ? or !"), "{alias}: {err}");
+        }
+        assert!(
+            DeployHostFields::parse(Some("prod.example".into()), None, None, None, None).is_ok()
+        );
+    }
+
+    #[test]
+    fn host_name_and_user_refuse_quotes_and_a_leading_hash() {
+        for (hostname, user) in [
+            (Some("a'b"), None),
+            (Some("#host"), None),
+            (None, Some("o'neil")),
+            (None, Some("#root")),
+        ] {
+            assert!(
+                DeployHostFields::parse(
+                    None,
+                    hostname.map(String::from),
+                    user.map(String::from),
+                    None,
+                    None
+                )
+                .is_err(),
+                "{hostname:?} {user:?}"
+            );
+        }
+        // A Windows domain user keeps its backslash (it is quoted on write).
+        let f = DeployHostFields::parse(None, None, Some(r"CORP\bob".into()), None, None).unwrap();
+        assert_eq!(f.user.as_deref(), Some(r"CORP\bob"));
+    }
+
+    /// `%` starts a token in IdentityFile, HostName and Include; the paths
+    /// and host names a deploy writes are taken literally.
+    #[test]
+    fn percent_signs_are_written_literally() {
+        let s = Scratch {
+            target: DeployTarget::new(
+                std::env::temp_dir().join("sshspan 100%").join(".ssh"),
+                std::env::temp_dir().join("cfg 100%").join("config"),
+            ),
+            root: std::env::temp_dir().join(format!(
+                "sshspan-deploy-percent-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        let f =
+            DeployHostFields::parse(None, Some("fe80::1%eth0".into()), None, None, None).unwrap();
+        let p = plan(&s, &[key("k1", "web")], &f);
+        let text = p.config_text();
+        assert!(text.contains("    HostName fe80::1%%eth0\n"), "{text}");
+        assert!(text.contains("sshspan 100%%"), "{text}");
+        assert!(s.target.include_line().contains("cfg 100%%"));
+    }
+
+    /// Minor 2: an existing stanza with the requested alias that points at
+    /// ANOTHER key's deployed file is not silently re-pointed.
+    #[test]
+    fn an_alias_that_points_at_another_keys_deployment_is_refused() {
+        let s = Scratch::new("alias-takeover");
+        let other = s.file("sshspan_old").display().to_string();
+        fs::create_dir_all(s.target.config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &s.target.config_path,
+            format!("Host prod\n    HostName old.example\n    IdentityFile {other}\n"),
+        )
+        .unwrap();
+        let recorded = [RecordedDeployment {
+            id: "k-old".into(),
+            name: "old".into(),
+            path: other.clone(),
+        }];
+        let p = SshService::plan_deploy(
+            &s.target,
+            &[key("k1", "web")],
+            &recorded,
+            &fields(Some("prod")),
+        )
+        .unwrap();
+        assert!(p.keys[0].alias_owned_by_other_key);
+        let refusal = p.keys[0].refusal.clone().expect("refused");
+        assert!(
+            refusal.contains("\"prod\"") && refusal.contains("\"old\""),
+            "{refusal}"
+        );
+        let outcome = SshService::apply_deploy(&p, material);
+        assert!(outcome.deployed.is_empty());
+        assert!(
+            s.config().contains(&other),
+            "the other key's stanza is untouched"
+        );
+
+        // The same key re-deployed under its own alias is fine.
+        let recorded = [RecordedDeployment {
+            id: "k1".into(),
+            name: "web".into(),
+            path: other.clone(),
+        }];
+        let p = SshService::plan_deploy(
+            &s.target,
+            &[key("k1", "web")],
+            &recorded,
+            &fields(Some("prod")),
+        )
+        .unwrap();
+        assert!(!p.keys[0].alias_owned_by_other_key);
+    }
+
+    /// Minor 7: a stray `sshspan_<name>.pub` that is not this key's is not
+    /// overwritten either.
+    #[test]
+    fn a_foreign_public_key_file_is_refused_too() {
+        let s = Scratch::new("foreign-pub");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        fs::write(s.file("sshspan_web.pub"), "ssh-ed25519 AAAA someone-else").unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        assert!(p.keys[0].overwrites_file);
+        assert!(p.keys[0].refusal.as_deref().unwrap_or("").contains(".pub"));
+        SshService::apply_deploy(&p, material);
+        assert_eq!(
+            fs::read_to_string(s.file("sshspan_web.pub")).unwrap(),
+            "ssh-ed25519 AAAA someone-else"
+        );
+    }
+
+    /// A7-22: undeploy removes both files and every stanza that points at
+    /// the key file, and leaves the rest of the managed config alone.
+    #[test]
+    fn remove_key_deletes_the_files_and_the_stanzas_that_use_them() {
+        let s = Scratch::new("remove");
+        let p = plan(&s, &[key("k1", "web"), key("k2", "db")], &fields(None));
+        SshService::apply_deploy(&p, material);
+        let web = s.file("sshspan_web").display().to_string();
+        let removed = SshService::remove_key(&s.target, &web).unwrap();
+        assert_eq!(removed.removed, vec![web.clone(), format!("{web}.pub")]);
+        assert_eq!(removed.removed_hosts, vec!["web".to_string()]);
+        assert!(removed.warnings.is_empty());
+        assert!(!s.file("sshspan_web").exists() && !s.file("sshspan_web.pub").exists());
+        let config = s.config();
+        assert!(
+            !config.contains("Host web\n") && config.contains("Host db\n"),
+            "{config}"
+        );
+    }
+
+    /// A private key file that cannot be removed is reported and nothing else
+    /// changes - the caller keeps the key marked as deployed.
+    #[test]
+    fn remove_key_reports_a_private_file_it_cannot_delete() {
+        let s = Scratch::new("remove-fails");
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        SshService::apply_deploy(&p, material);
+        let web = s.file("sshspan_web");
+        fs::remove_file(&web).unwrap();
+        fs::create_dir(&web).unwrap(); // remove_file cannot delete a directory
+        let err = SshService::remove_key(&s.target, &web.display().to_string()).unwrap_err();
+        assert!(err.contains(&web.display().to_string()), "{err}");
+        assert!(
+            s.file("sshspan_web.pub").exists(),
+            "nothing else was touched"
+        );
+        assert!(s.config().contains("Host web\n"));
+    }
+
+    // ── HostName and User values OpenSSH would rewrite ──
+
+    /// What OpenSSH would rewrite is refused, like the other HostName / User
+    /// refusals: a leading `=` is eaten as the keyword separator (`HostName
+    /// =evil` connects to `evil`), and OpenSSH 10 expands `%` tokens and
+    /// `${VAR}` in User (`User a%hb` logs in as `a<hostname>b`).
+    #[test]
+    fn ru6a_host_name_and_user_refuse_what_openssh_would_rewrite() {
+        for (hostname, user, needle) in [
+            (Some("=evil.example"), None, "start with ="),
+            (None, Some("=root"), "start with ="),
+            (None, Some("a%hb"), "%"),
+            (None, Some("%"), "%"),
+            (None, Some("x${HOME}"), "${"),
+        ] {
+            let err = DeployHostFields::parse(
+                None,
+                hostname.map(String::from),
+                user.map(String::from),
+                None,
+                None,
+            )
+            .expect_err(&format!("{hostname:?} {user:?}"));
+            assert!(err.contains(needle), "{hostname:?} {user:?}: {err}");
+            assert!(err.ends_with('.'), "a sentence: {err}");
+        }
+        // Still fine: a % in HostName (written doubled), an `=` inside a
+        // value, a lone `$` (Windows machine accounts end in one).
+        let f = DeployHostFields::parse(
+            None,
+            Some("fe80::1%eth0".into()),
+            Some("PC01$".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(f.user.as_deref(), Some("PC01$"));
+        assert!(
+            DeployHostFields::parse(None, Some("a=b".into()), Some("u=v".into()), None, None)
+                .is_ok()
+        );
+    }
+
+    /// Win32-OpenSSH 9.5p1 mishandles the doubled `%%` the Include line needs
+    /// for a `%` in the managed config's path, so the preview says so.
+    #[test]
+    fn ru6a_preview_warns_when_the_managed_config_path_holds_a_percent_sign() {
+        let s = Scratch::new("percent-path");
+        let odd = DeployTarget::new(
+            s.target.ssh_dir.clone(),
+            s.root.join("app 100%").join("ssh").join("config"),
+        );
+        let p = SshService::plan_deploy(&odd, &[key("k1", "web")], &[], &fields(None)).unwrap();
+        let warnings = p.preview_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains('%') && w.contains("Include")),
+            "{warnings:?}"
+        );
+        let plain = plan(&s, &[key("k1", "web")], &fields(None));
+        assert!(
+            plain.preview_warnings().is_empty(),
+            "{:?}",
+            plain.preview_warnings()
+        );
+    }
+
+    /// The managed config is read when the deploy is PLANNED and was written
+    /// back from that copy - after unsealing every key. An undeploy that ran in
+    /// between had its removal undone (and another deploy's stanzas were
+    /// dropped). The write now re-reads the file.
+    #[test]
+    fn ru6a_a_deploy_writes_over_the_current_managed_config_not_the_one_it_planned_from() {
+        let s = Scratch::new("stale-base");
+        let first = plan(&s, &[key("k1", "web")], &fields(None));
+        SshService::apply_deploy(&first, material);
+        assert!(s.config().contains("Host web\n"));
+        // k2's deploy is planned (it reads the file WITH web's stanza)...
+        let second = plan(&s, &[key("k2", "db")], &fields(None));
+        // ...web is undeployed meanwhile...
+        let web = s.file("sshspan_web").display().to_string();
+        SshService::remove_key(&s.target, &web).unwrap();
+        assert!(!s.config().contains("Host web\n"));
+        // ...and k2's deploy finishes.
+        let outcome = SshService::apply_deploy(&second, material);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let config = s.config();
+        assert!(config.contains("Host db\n"), "{config}");
+        assert!(
+            !config.contains("Host web\n"),
+            "the undeployed stanza came back:\n{config}"
+        );
+    }
+
+    /// Concurrent deploys (each holding its key material for a while, as
+    /// unsealing does) used to keep only the stanza of the last one to write.
+    #[test]
+    fn ru6a_concurrent_deploys_keep_every_stanza() {
+        let s = Scratch::new("concurrent");
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let target = s.target.clone();
+                std::thread::spawn(move || {
+                    let k = key(&format!("k{i}"), &format!("key{i}"));
+                    let p = SshService::plan_deploy(&target, &[k], &[], &fields(None)).unwrap();
+                    SshService::apply_deploy(&p, |planned| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        material(planned)
+                    })
+                })
+            })
+            .collect();
+        for worker in workers {
+            let outcome = worker.join().unwrap();
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(outcome.deployed.len(), 1);
+        }
+        let config = s.config();
+        for i in 0..8 {
+            assert!(
+                config.contains(&format!("Host key{i}\n")),
+                "key{i} lost:\n{config}"
+            );
+        }
+    }
+
+    /// Two deploys planned at the same time with the same alias: the one that
+    /// writes second must not re-point the stanza the first just wrote for
+    /// another key. It reports it instead.
+    #[test]
+    fn ru6a_an_alias_another_deploy_took_meanwhile_is_not_repointed() {
+        let s = Scratch::new("alias-race");
+        let mine = plan(&s, &[key("k1", "web")], &fields(Some("prod")));
+        let theirs = plan(&s, &[key("k2", "db")], &fields(Some("prod")));
+        SshService::apply_deploy(&theirs, material);
+        let outcome = SshService::apply_deploy(&mine, material);
+        let db = s.file("sshspan_db").display().to_string();
+        let config = SshConfig::parse(&s.config());
+        let prod = config.hosts.iter().find(|h| h.host == "prod").unwrap();
+        assert_eq!(prod.identity_file.as_deref(), Some(db.as_str()));
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("\"prod\"")),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
+    /// Older builds wrote `Host <raw key name>` lines; `Host bob's-key` makes
+    /// ssh refuse the whole file. The preview lists such lines in the user's
+    /// own `~/.ssh/config` with their line numbers - and nothing ever edits
+    /// that file.
+    #[test]
+    fn ru6a_legacy_host_lines_in_the_users_config_are_reported_not_edited() {
+        let s = Scratch::new("legacy-lines");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        let user_config = s.target.ssh_dir.join("config");
+        let text = "Include \"/elsewhere/config\"\n\n\
+                    Host bob's-key\n    IdentityFile ~/.ssh/sshspan_bob_s_key\n\n\
+                    Host unrelated\n    HostName u.example\n\n\
+                    Host other BOB-S-KEY\n";
+        fs::write(&user_config, text).unwrap();
+        let p = plan(&s, &[key("k1", "bob's-key")], &fields(None));
+        assert_eq!(p.keys[0].alias, "bob-s-key");
+        let found: Vec<(usize, bool, String)> = p
+            .legacy_host_lines()
+            .into_iter()
+            .map(|l| (l.line, l.unreadable, l.key))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (3, true, "bob's-key".to_string()),
+                (9, false, "bob's-key".to_string())
+            ]
+        );
+        let warnings = p.preview_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("line 3") && w.contains("Host bob's-key")),
+            "{warnings:?}"
+        );
+        SshService::apply_deploy(&p, material);
+        assert_eq!(
+            fs::read_to_string(&user_config).unwrap(),
+            text,
+            "the user's own ssh config is never edited"
+        );
+    }
+
+    /// Every Host line naming the alias or the key
+    /// was blamed on "an older SSHSpan" with the advice to remove it - on a
+    /// hand-written `Host github` block that deletes the user's own config.
+    /// Only a block whose IdentityFile is an `sshspan_*` file is SSHSpan's;
+    /// any other is the user's own entry for the same host, described as an
+    /// overlap, never to be removed.
+    #[test]
+    fn ru6a_fix1_only_an_sshspan_key_block_is_blamed_on_an_older_sshspan() {
+        let s = Scratch::new("legacy-owner");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        let text = "Host github\n    HostName github.com\n    IdentityFile ~/.ssh/id_ed25519\n\n\
+                    Host web\n    IdentityFile ~/.ssh/sshspan_web\n\n\
+                    Match host github\n    IdentityFile ~/.ssh/sshspan_web\n";
+        fs::write(s.target.ssh_dir.join("config"), text).unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(Some("github")));
+
+        let lines = serde_json::to_value(p.legacy_host_lines()).unwrap();
+        let owners: Vec<(serde_json::Value, serde_json::Value)> = lines
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| (l["line"].clone(), l["writtenBySshspan"].clone()))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![(1.into(), false.into()), (5.into(), true.into())],
+            "{lines}"
+        );
+        let warnings = p.preview_warnings();
+        let github = warnings.iter().find(|w| w.contains("line 1")).unwrap();
+        assert!(
+            !github.contains("older SSHSpan") && !github.to_lowercase().contains("remove"),
+            "{github}"
+        );
+        assert!(github.contains("your own"), "{github}");
+        let web = warnings.iter().find(|w| w.contains("line 5")).unwrap();
+        assert!(web.contains("older SSHSpan"), "{web}");
+    }
+
+    /// A 50,000-character Host line in the user's own config came back
+    /// whole - in `legacyHostLines` and quoted in its warning. Both quote
+    /// at most 300 characters and "…" now, cut between characters; format
+    /// and direction characters stay (the renderer spells them out).
+    #[test]
+    fn rw_fix4_a_very_long_host_line_is_quoted_capped() {
+        let s = Scratch::new("long-line");
+        fs::create_dir_all(&s.target.ssh_dir).unwrap();
+        let long = format!("Host web {}", "\u{202e}é".repeat(25_000));
+        fs::write(s.target.ssh_dir.join("config"), format!("{long}\n")).unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        let lines = p.legacy_host_lines();
+        assert_eq!(lines.len(), 1, "{:?}", lines.len());
+        let text = &lines[0].text;
+        assert_eq!(text.chars().count(), 301, "300 characters and the ellipsis");
+        assert!(text.ends_with('\u{2026}'), "cut, and says so");
+        assert!(long.starts_with(text.trim_end_matches('\u{2026}')));
+        assert!(text.contains('\u{202e}'), "direction characters stay");
+        let json = serde_json::to_value(p.legacy_host_lines()).unwrap();
+        assert_eq!(json[0]["text"].as_str(), Some(text.as_str()));
+        let warnings = p.preview_warnings();
+        let quoting = warnings
+            .iter()
+            .find(|w| w.contains("line 1"))
+            .expect("a warning about the line");
+        assert!(quoting.contains(text.as_str()), "the same capped text");
+        assert!(
+            quoting.chars().count() < 1_000,
+            "{}",
+            quoting.chars().count()
+        );
+        // A line within the cap is quoted as it is.
+        let short = "Host web other";
+        fs::write(s.target.ssh_dir.join("config"), format!("{short}\n")).unwrap();
+        let p = plan(&s, &[key("k1", "web")], &fields(None));
+        assert_eq!(p.legacy_host_lines()[0].text, short);
+    }
+
+    #[test]
+    fn only_sshspan_files_directly_in_the_ssh_dir_are_managed() {
+        let s = Scratch::new("managed");
+        fs::create_dir_all(s.target.ssh_dir.join("sub")).unwrap();
+        let managed =
+            |p: PathBuf| SshService::is_managed_deploy_path(&s.target, &p.display().to_string());
+        assert!(managed(s.file("sshspan_web")));
+        assert!(!managed(s.file("id_ed25519")), "the user's own key");
+        assert!(!managed(s.target.ssh_dir.join("sub").join("sshspan_web")));
+        assert!(!managed(s.root.join("sshspan_web")));
+    }
+}
+
+#[cfg(test)]
 mod secret_write_tests {
     use super::*;
+
+    /// Windows's inherited ACL must never cover secret bytes - restrict the
+    /// empty file, then write. The same write path is driven with a
+    /// restriction callback here so the test can observe exactly when it is
+    /// called, without mocking the filesystem.
+    #[test]
+    fn secret_file_is_empty_until_permissions_are_restricted() {
+        let dir = std::env::temp_dir().join(format!("sshspan-restrict-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.pem");
+        let result = write_secret_file_restricted(&path, b"SECRET", |p| {
+            // Metadata, not a read: on Windows the file is held with no
+            // sharing, so only access that sharing does not govern works.
+            assert_eq!(
+                fs::metadata(p).unwrap().len(),
+                0,
+                "no secret bytes before the restriction"
+            );
+            Ok(())
+        });
+        let bytes = fs::read(&path);
+        let _ = fs::remove_dir_all(&dir);
+        result.unwrap();
+        assert_eq!(bytes.unwrap(), b"SECRET");
+    }
+
+    /// Fail closed while the file is still empty: a permission-restriction
+    /// failure removes it and never writes the secret.
+    #[test]
+    fn failed_permission_restriction_writes_no_secret_and_removes_the_file() {
+        let dir =
+            std::env::temp_dir().join(format!("sshspan-restrict-fail-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.pem");
+        let result = write_secret_file_restricted(&path, b"SECRET", |p| {
+            assert_eq!(fs::metadata(p).unwrap().len(), 0);
+            anyhow::bail!("restriction refused")
+        });
+        let exists = path.exists();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("restriction refused"));
+        assert!(!exists, "the empty file must be removed on failure");
+    }
 
     /// REGRESSION: the old sequence was
     ///   OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
@@ -429,5 +2066,347 @@ mod secret_write_tests {
             .file_type()
             .is_symlink());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `whoami /user /fo csv /nh` parsing: the SID is the last field of the
+    /// last line, with or without a header line, and nothing that is not
+    /// SID-shaped comes back (it would be handed to icacls as an account).
+    #[test]
+    fn whoami_sid_parser_takes_the_last_sid_shaped_field() {
+        let sid = "S-1-5-21-62050738-523915034-210444172-1001";
+        let row = format!("\"ryzen-main\\andrei\",\"{sid}\"\r\n");
+        assert_eq!(parse_whoami_sid(&row).as_deref(), Some(sid));
+        let with_header = format!("\"User Name\",\"SID\"\r\n{row}");
+        assert_eq!(parse_whoami_sid(&with_header).as_deref(), Some(sid));
+        // A comma inside the account name does not shift the field.
+        let comma = format!("\"corp\\smith, john\",\"{sid}\"");
+        assert_eq!(parse_whoami_sid(&comma).as_deref(), Some(sid));
+        assert_eq!(parse_whoami_sid("\"User Name\",\"SID\""), None);
+        assert_eq!(parse_whoami_sid(""), None);
+        assert_eq!(parse_whoami_sid("\"x\",\"S-1-5 & calc\""), None);
+        assert_eq!(parse_whoami_sid("\"x\",\"S-1-\""), None);
+    }
+
+    /// REGRESSION (A7-01): on Windows every secret write failed. The grant
+    /// named the user by a bare SID (`icacls /grant:r S-1-5-21-...:F`), which
+    /// icacls rejects ("No mapping between account names and security IDs was
+    /// done.") - it only takes a SID with a `*` prefix - and it ran after
+    /// inheritance had already been stripped in a separate call. Deploy,
+    /// private-key export, backup export and the audit CSV export all died
+    /// there. The write must succeed and leave the file with inheritance
+    /// blocked, nothing inherited, allow entries only and full control for
+    /// the current user ([`secret_acl_problem`]). What else may stay depends
+    /// on the folder, so the test writes into two folders it sets up itself
+    /// instead of trusting the ACL of `%TEMP%`:
+    ///
+    /// - A folder that passes permissions down (one inheritable entry, the
+    ///   user's): the new file holds inherited entries only and
+    ///   `/inheritance:r` removes them all, so exactly one entry must be left,
+    ///   the user's full control. A grant to anyone else - SYSTEM and
+    ///   Administrators included - fails here.
+    /// - A folder that passes none down (as CI's temp folder did): Windows
+    ///   gives the new file the creating process's default DACL as explicit
+    ///   entries, which `/inheritance:r` (inherited entries only) and
+    ///   `/grant:r` (the user's own entry only) leave alone - SYSTEM and
+    ///   Administrators with full control, for an elevated administrator and
+    ///   for a UAC user alike. OpenSSH for Windows accepts those beside the
+    ///   owner on a private key, so they may stay; no one else may.
+    ///
+    /// The entries are judged by SID, from the SDDL `icacls /save` writes: the
+    /// account names `icacls` prints are localized (`NT-AUTORITÄT\SYSTEM`).
+    #[cfg(windows)]
+    #[test]
+    fn write_secret_file_leaves_one_full_control_ace_for_the_current_user() {
+        // Resolved here rather than through the code under test, so the test
+        // does not trust the path logic it is checking.
+        let system32 = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+        )
+        .join("System32");
+        // `"domain\user","S-1-5-21-..."`: the SID is read here rather than by
+        // the code under test.
+        let me = std::process::Command::new(system32.join("whoami.exe"))
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .expect("whoami must run");
+        let sids: Vec<&str> = me
+            .split(',')
+            .map(|field| field.trim().trim_matches('"'))
+            .filter(|field| field.starts_with("S-1-"))
+            .collect();
+        let [my_sid] = sids[..] else {
+            panic!("one SID expected from whoami, got {me:?}");
+        };
+        // Removed on drop, so also when the assertion below fails.
+        let scratch = ScratchDir(
+            std::env::temp_dir().join(format!("sshspan-acl-{}", uuid::Uuid::new_v4().simple())),
+        );
+        let failures: Vec<String> = [
+            (
+                "inheriting",
+                format!("*{my_sid}:(OI)(CI)F"),
+                Expected::ExactlyTheUser,
+            ),
+            (
+                "non-inheriting",
+                format!("*{my_sid}:F"),
+                Expected::UserSystemAndAdministrators,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(folder, grant, expected)| {
+            secret_write_in(&system32, &scratch.0.join(folder), &grant, my_sid, expected)
+                .err()
+                .map(|why| format!("{folder} folder: {why}"))
+        })
+        .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A scratch folder, removed with everything in it on drop.
+    #[cfg(windows)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Make `dir` and give it a protected DACL holding only `grant` for the
+    /// user (`icacls <dir> /inheritance:r /grant:r <grant>`), write a secret
+    /// file in it and check the file's DACL against `expected`. The error
+    /// says what is wrong, with the DACL and the names `icacls` prints.
+    #[cfg(windows)]
+    fn secret_write_in(
+        system32: &Path,
+        dir: &Path,
+        grant: &str,
+        user_sid: &str,
+        expected: Expected,
+    ) -> Result<(), String> {
+        let run = |command: &mut std::process::Command| -> Result<String, String> {
+            let out = command
+                .output()
+                .map_err(|e| format!("icacls could not run: {e}"))?;
+            let said = String::from_utf8_lossy(&out.stdout).to_string();
+            if out.status.success() {
+                return Ok(said);
+            }
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(format!("icacls failed: {said} {err}"))
+        };
+        let icacls = || std::process::Command::new(system32.join("icacls.exe"));
+        fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        run(icacls()
+            .arg(dir)
+            .args(["/inheritance:r", "/grant:r", grant]))?;
+        let path = dir.join("key.pem");
+        write_secret_file(&path, b"-----BEGIN OPENSSH PRIVATE KEY-----")
+            .map_err(|e| format!("the secret write failed: {e}"))?;
+        // The account names, for whoever reads a failure; the SDDL, for the
+        // checks. The dump goes beside the folder, not into it.
+        let listing = run(icacls().arg(&path))?;
+        let dump = dir.with_extension("acl");
+        run(icacls().arg(&path).arg("/save").arg(&dump))?;
+        let sddl = fs::read(&dump)
+            .ok()
+            .and_then(|bytes| saved_sddl(&bytes))
+            .ok_or_else(|| format!("no DACL in the icacls /save dump; icacls said: {listing}"))?;
+        match secret_acl_problem(&sddl, user_sid, expected) {
+            Some(problem) => Err(format!(
+                "{problem}; the DACL is {sddl}; icacls said: {listing}"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The DACL line of an `icacls <file> /save <dump>` dump: UTF-16LE text,
+    /// the file's name on the first line and its DACL in SDDL on the second.
+    #[cfg(windows)]
+    fn saved_sddl(dump: &[u8]) -> Option<String> {
+        let units: Vec<u16> = dump
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let text = String::from_utf16(&units).ok()?;
+        let sddl = text.trim_start_matches('\u{feff}').lines().nth(1)?.trim();
+        (!sddl.is_empty()).then(|| sddl.to_string())
+    }
+
+    /// One entry of a DACL in SDDL:
+    /// `(type;flags;rights;object type;inherited object type;account)`.
+    #[derive(Debug)]
+    struct SddlAce<'a> {
+        kind: &'a str,
+        flags: &'a str,
+        rights: &'a str,
+        account: &'a str,
+    }
+
+    /// The flags and the entries of a DACL in SDDL (`D:PAI(A;;FA;;;SY)...`),
+    /// or None for anything else.
+    fn parse_sddl_dacl(sddl: &str) -> Option<(&str, Vec<SddlAce<'_>>)> {
+        let dacl = sddl.trim().strip_prefix("D:")?;
+        let (dacl_flags, mut rest) = dacl.split_at(dacl.find('(').unwrap_or(dacl.len()));
+        let mut aces = Vec::new();
+        while let Some(body) = rest.strip_prefix('(') {
+            let end = body.find(')')?;
+            let fields: Vec<&str> = body[..end].split(';').collect();
+            let [kind, flags, rights, _, _, account] = fields[..] else {
+                return None;
+            };
+            aces.push(SddlAce {
+                kind,
+                flags,
+                rights,
+                account,
+            });
+            rest = &body[end + 1..];
+        }
+        rest.is_empty().then_some((dacl_flags, aces))
+    }
+
+    /// What a secret file's DACL may hold besides the user's full control, by
+    /// the folder the file was written in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expected {
+        /// Nothing: the folder passes permissions down, so the new file held
+        /// inherited entries only, and all of them are gone.
+        ExactlyTheUser,
+        /// SYSTEM and Administrators at most: the folder passes none down, so
+        /// the file keeps the entries Windows gave it at creation.
+        UserSystemAndAdministrators,
+    }
+
+    /// Why the DACL `sddl` is not that of a secret file written by the user
+    /// `user_sid`, if it is not. Required: inheritance blocked (`P`), no
+    /// inherited entry (`ID`), allow entries only, full control (`FA`) for
+    /// the user, and, by `expected`, either exactly that one entry or no
+    /// entry for anyone but the user, SYSTEM (`SY`) and the Administrators
+    /// group (`BA`).
+    fn secret_acl_problem(sddl: &str, user_sid: &str, expected: Expected) -> Option<String> {
+        let Some((dacl_flags, aces)) = parse_sddl_dacl(sddl) else {
+            return Some(format!("not a DACL in SDDL: {sddl:?}"));
+        };
+        if !dacl_flags.contains('P') {
+            return Some("the file still inherits from its folder".to_string());
+        }
+        // SDDL writes the built-in Administrator account (RID 500) as `LA`.
+        let is_user = |account: &str| {
+            account.eq_ignore_ascii_case(user_sid)
+                || (account == "LA" && user_sid.ends_with("-500"))
+        };
+        let is_system_or_administrators =
+            |account: &str| matches!(account, "SY" | "S-1-5-18" | "BA" | "S-1-5-32-544");
+        if let Some(ace) = aces
+            .iter()
+            .find(|ace| ace.flags.as_bytes().chunks(2).any(|flag| flag == b"ID"))
+        {
+            return Some(format!("an inherited entry is left: {ace:?}"));
+        }
+        if let Some(ace) = aces.iter().find(|ace| ace.kind != "A") {
+            return Some(format!("an entry that is not an allow entry: {ace:?}"));
+        }
+        let others_allowed = expected == Expected::UserSystemAndAdministrators;
+        if let Some(ace) = aces.iter().find(|ace| {
+            !is_user(ace.account) && !(others_allowed && is_system_or_administrators(ace.account))
+        }) {
+            let who = if others_allowed {
+                "the user, SYSTEM and Administrators"
+            } else {
+                "the user"
+            };
+            return Some(format!("an entry for someone other than {who}: {ace:?}"));
+        }
+        if !others_allowed && aces.len() != 1 {
+            return Some(format!(
+                "{} entries for the user where exactly one is expected",
+                aces.len()
+            ));
+        }
+        let full_control = aces
+            .iter()
+            .any(|ace| is_user(ace.account) && ace.rights == "FA");
+        (!full_control).then(|| "no full-control entry for the current user".to_string())
+    }
+
+    /// The rule the Windows ACL test applies in a folder that passes no
+    /// permissions down, checked on every platform: what CI's runner leaves
+    /// (SYSTEM and Administrators beside the user), the user alone, the
+    /// built-in Administrator written `LA`; and what it refuses: Users,
+    /// Everyone, Authenticated Users or another account with access, an
+    /// inherited or a deny entry, inheritance left on, a user without full
+    /// control, and what is not a DACL.
+    #[test]
+    fn secret_acl_rule_admits_only_the_user_system_and_administrators() {
+        let problem = |sddl: &str, sid: &str| {
+            secret_acl_problem(sddl, sid, Expected::UserSystemAndAdministrators)
+        };
+        let me = "S-1-5-21-1-2-3-1001";
+        let ci = format!("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{me})");
+        for fine in [
+            ci.clone(),
+            format!("D:PAI(A;;FA;;;{me})"),
+            format!("D:P(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)(A;;FA;;;{me})"),
+        ] {
+            assert_eq!(problem(&fine, me), None, "{fine}");
+        }
+        let admin = "S-1-5-21-1-2-3-500";
+        let as_la = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LA)";
+        assert_eq!(problem(as_la, admin), None);
+        for extra in [
+            "(A;;0x1200a9;;;BU)",            // Users
+            "(A;;FR;;;WD)",                  // Everyone
+            "(A;;FR;;;AU)",                  // Authenticated Users
+            "(A;;FR;;;S-1-5-21-1-2-3-1002)", // another account
+            "(A;;FA;;;LA)",                  // the built-in Administrator, not `me`
+            "(A;ID;FA;;;SY)",                // inherited
+            "(D;;FA;;;SY)",                  // deny
+        ] {
+            let bad = format!("{ci}{extra}");
+            assert!(problem(&bad, me).is_some(), "{bad} must be refused");
+        }
+        for bad in [
+            format!("D:AI(A;;FA;;;{me})"),
+            format!("D:PAI(A;;FR;;;{me})(A;;FA;;;SY)"),
+            "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+            format!("D:PAI(A;;FA;;;{me}"),
+            String::new(),
+        ] {
+            assert!(problem(&bad, me).is_some(), "{bad:?} must be refused");
+        }
+    }
+
+    /// The rule in a folder that passes permissions down, checked on every
+    /// platform: exactly one entry, the user's full control (the built-in
+    /// Administrator written `LA` too). Refused: Administrators or SYSTEM
+    /// granted beside it (what a second grant in `restrict_windows_file`
+    /// would leave), CI's shape, a second entry for the user, an inherited or
+    /// a deny entry, inheritance left on, and the user with read access only.
+    #[test]
+    fn secret_acl_rule_in_an_inheriting_folder_admits_only_the_user() {
+        let problem =
+            |sddl: &str, sid: &str| secret_acl_problem(sddl, sid, Expected::ExactlyTheUser);
+        let me = "S-1-5-21-1-2-3-1001";
+        for fine in [format!("D:PAI(A;;FA;;;{me})"), format!("D:P(A;;FA;;;{me})")] {
+            assert_eq!(problem(&fine, me), None, "{fine}");
+        }
+        let admin = "S-1-5-21-1-2-3-500";
+        assert_eq!(problem("D:PAI(A;;FA;;;LA)", admin), None);
+        for bad in [
+            format!("D:PAI(A;;FA;;;{me})(A;;FA;;;BA)"), // Administrators granted too
+            format!("D:PAI(A;;FA;;;{me})(A;;FA;;;S-1-5-18)"), // SYSTEM granted too
+            format!("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{me})"), // CI's shape
+            format!("D:PAI(A;;FA;;;{me})(A;;FR;;;{me})"), // a second entry
+            format!("D:PAI(A;ID;FA;;;{me})"),           // inherited
+            format!("D:PAI(D;;FA;;;{me})"),             // deny
+            format!("D:AI(A;;FA;;;{me})"),              // inheritance left on
+            format!("D:PAI(A;;FR;;;{me})"),             // read access only
+        ] {
+            assert!(problem(&bad, me).is_some(), "{bad} must be refused");
+        }
     }
 }

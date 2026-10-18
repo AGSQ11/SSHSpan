@@ -22,7 +22,6 @@ use super::{CmdError, CmdResult};
 /// The vault stores the private half as a raw binary OpenSSH blob (not PEM),
 /// so route it through the same load+export path used by key_export/deploy.
 fn key_pem_for_id(
-    app: &AppHandle,
     db: &Database,
     vault_pw: &str,
     key_id: &str,
@@ -31,7 +30,7 @@ fn key_pem_for_id(
         .get_key(key_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Key not found: {key_id}"))?;
-    let key_data = super::load_private_key_data(app, &key, vault_pw)
+    let key_data = super::unseal_key_data(&key, vault_pw)
         .map_err(|e| format!("Could not load vault key \"{}\": {e}", key.name))?;
     let pem = crate::crypto::keys::export_private_key(
         &key_data,
@@ -70,13 +69,12 @@ fn saved_pw_for_server(
 /// so secret material is wiped from memory once the connect/auth path is
 /// done with it.
 fn resolve_for_server(
-    app: &AppHandle,
     db: &Database,
     vault_pw: &str,
     server_id: &str,
     override_username: Option<String>,
     override_key_id: Option<String>,
-    prompt_password: Option<String>,
+    prompt_password: Option<zeroize::Zeroizing<String>>,
 ) -> Result<ResolvedConnection, String> {
     let server = db
         .get_server(server_id)
@@ -92,10 +90,16 @@ fn resolve_for_server(
     // publickey: prefer the override key (from key context menu), then the server's key_id, then its pem_path.
     if auth_method == "publickey" {
         if let Some(kid) = override_key_id.or_else(|| server.key_id.clone()) {
-            key_pem = Some(key_pem_for_id(app, db, vault_pw, &kid)?);
+            key_pem = Some(key_pem_for_id(db, vault_pw, &kid)?);
         } else if let Some(p) = server.pem_path.clone() {
             // Read PEM from disk - leaves the file untouched, treats it as a public key on the SSH server side.
             // This is a stored setting set by the user via the UI; validate it exists and is a regular file.
+            // On Windows only from this computer's drives, asked before the
+            // path is touched: a share would be opened (an NTLM sign-in)
+            // just to look.
+            if let Some(why) = crate::ssh_client::key_path_refusal(&p) {
+                return Err(why.to_string());
+            }
             let path = std::path::Path::new(&p);
             if !path.is_file() {
                 return Err(format!("PEM path does not exist or is not a file: {p}"));
@@ -106,11 +110,18 @@ fn resolve_for_server(
             ));
         }
     } else if auth_method == "password" || auth_method == "keyboard-interactive" {
-        // Prefer the runtime prompt (always), then the saved password.
-        password = prompt_password
-            .filter(|p| !p.is_empty())
-            .map(zeroize::Zeroizing::new)
-            .or(saved_pw_for_server(db, vault_pw, &server)?.filter(|p| !p.is_empty()));
+        // A password typed at the prompt goes wherever this connection goes.
+        // The saved one only to the account it was saved for: the server's
+        // own user name - a renderer-supplied user name must not take it to
+        // another account (`server_save` keeps it bound to host, port, user
+        // name and auth method the same way). Unsealed only when it is used.
+        password = match prompt_password.filter(|p| !p.is_empty()) {
+            Some(typed) => Some(typed),
+            None if username == server.username => {
+                saved_pw_for_server(db, vault_pw, &server)?.filter(|p| !p.is_empty())
+            }
+            None => None,
+        };
     }
 
     Ok(ResolvedConnection {
@@ -120,6 +131,64 @@ fn resolve_for_server(
         key_pem,
         password,
     })
+}
+
+/// What Connect and Test ask for: a saved server, and what the renderer
+/// may vary for one connection.
+pub(crate) struct ConnectRequest {
+    pub server_id: String,
+    pub override_username: Option<String>,
+    pub override_key_id: Option<String>,
+    pub prompt_password: Option<zeroize::Zeroizing<String>>,
+}
+
+/// [`resolve_for_server`] for a command, without the `AppHandle`. It reads a
+/// sealed password or key and unseals it with the master password, so the
+/// rotation guard is taken BEFORE the master password or any sealed row is
+/// read, and held until the secret is unsealed: during a master-password
+/// change it is refused at once ([`super::VAULT_REENCRYPTING`]). It used to
+/// read without the guard, so a change committing in between could pair the
+/// old password with a re-sealed row. Argon2id: callers run it on the
+/// blocking pool ([`resolve_on_blocking_pool`]).
+pub(crate) fn resolve_connection(
+    db: &Database,
+    vault: &super::VaultPasswordStore,
+    rotation: &super::VaultRotationLock,
+    request: ConnectRequest,
+) -> super::CmdResult<ResolvedConnection> {
+    let _rotation = rotation.try_shared()?;
+    let vault_pw = vault.get().unwrap_or_default();
+    if vault_pw.is_empty() {
+        return Err(CmdError("Vault is locked.".into()));
+    }
+    resolve_for_server(
+        db,
+        &vault_pw,
+        &request.server_id,
+        request.override_username,
+        request.override_key_id,
+        request.prompt_password,
+    )
+    .map_err(CmdError)
+}
+
+/// [`resolve_connection`] on the blocking pool: the unseal is an Argon2id
+/// derivation (and a `.pem` path is a file read), which ran on an async
+/// worker before.
+async fn resolve_on_blocking_pool(
+    app: &AppHandle,
+    request: ConnectRequest,
+) -> super::CmdResult<ResolvedConnection> {
+    let app = app.clone();
+    super::run_blocking(move || {
+        resolve_connection(
+            &app.state::<AppState>().db,
+            &app.state::<super::VaultPasswordStore>(),
+            app.state::<super::VaultRotationLock>().inner(),
+            request,
+        )
+    })
+    .await
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -143,28 +212,25 @@ pub async fn terminal_connect(
     override_key_id: Option<String>,
     prompt_password: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    let vault_pw = super::vault_password(&app)?;
-    if vault_pw.is_empty() {
-        return Err(CmdError("Vault is locked.".into()));
-    }
-    // Capture the vault generation BEFORE any network await. If the vault is
-    // locked while the handshake is in flight, `start_interactive` re-checks
-    // this generation at the point it would register the session and aborts,
-    // so a pending connect cannot complete into the locked state.
+    // Capture the vault generation BEFORE any await (this also refuses a
+    // locked vault). If the vault is locked while the handshake is in
+    // flight, `start_interactive` re-checks this generation at the point it
+    // would register the session and aborts, so a pending connect cannot
+    // complete into the locked state.
     let generation = super::capture_vault_generation(&app)?;
     let db = app.state::<AppState>().db.clone();
     let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
 
-    let resolved = resolve_for_server(
+    let resolved = resolve_on_blocking_pool(
         &app,
-        &db,
-        &vault_pw,
-        &server_id,
-        override_username,
-        override_key_id,
-        prompt_password,
+        ConnectRequest {
+            server_id,
+            override_username,
+            override_key_id,
+            prompt_password: prompt_password.map(zeroize::Zeroizing::new),
+        },
     )
-    .map_err(CmdError)?;
+    .await?;
 
     // Welcome banner so the user sees something even before the first
     // shell prompt arrives. If the channel to the webview is broken, FAIL
@@ -189,6 +255,9 @@ pub async fn terminal_connect(
     // Host-key consent is backend-owned: when the host is unpinned (or a
     // backup-imported pin is unconfirmed), the russh handler raises a native
     // dialog with the fingerprint. The renderer has no consent flag to forge.
+    // A refused key, a declined dialog and a timeout already come back as
+    // the message to show (A7-14, A7-15): nothing is guessed from russh's
+    // error text here.
     let session_id = ssh_client::start_interactive(
         app.clone(),
         resolved.clone(),
@@ -196,19 +265,9 @@ pub async fn terminal_connect(
         registry.clone(),
         on_data,
         Some(generation),
-    ).await.map_err(|e| {
-        let msg = e.to_string();
-        let friendly = if msg.contains("Key exchange failed") || msg.contains("key exchange") {
-            "The host rejected the connection during key exchange. If this host's fingerprint changed, forget it in the known_hosts list and retry.".to_string()
-        } else if msg.to_lowercase().contains("host key") {
-            "Host key mismatch. The server presented a different key than the one stored for this host - possible MITM, or the host was rebuilt. Forget it in known_hosts and retry.".to_string()
-        } else if msg.to_lowercase().contains("unknown key") || msg.to_lowercase().contains("not trusted") {
-            "This host is not trusted yet and the trust prompt was not accepted. Reconnect and accept the host-key prompt, or add it via Known Hosts.".to_string()
-        } else {
-            msg
-        };
-        anyhow_cmd(anyhow::anyhow!(friendly))
-    })?;
+    )
+    .await
+    .map_err(anyhow_cmd)?;
 
     // Push initial PTY size to the remote so the shell matches the renderer.
     if cols > 0 && rows > 0 {
@@ -312,62 +371,40 @@ pub async fn server_test(
     server_id: String,
     prompt_password: Option<String>,
 ) -> CmdResult<serde_json::Value> {
-    let vault_pw = super::vault_password(&app)?;
-    if vault_pw.is_empty() {
+    if !app.state::<super::VaultPasswordStore>().is_set() {
         return Err(CmdError("Vault is locked.".into()));
     }
     let db = app.state::<AppState>().db.clone();
 
-    let resolved = resolve_for_server(
+    let resolved = resolve_on_blocking_pool(
         &app,
-        &db,
-        &vault_pw,
-        &server_id,
-        None,
-        None,
-        prompt_password,
+        ConnectRequest {
+            server_id,
+            override_username: None,
+            override_key_id: None,
+            prompt_password: prompt_password.map(zeroize::Zeroizing::new),
+        },
     )
-    .map_err(CmdError)?;
+    .await?;
 
     let started = std::time::Instant::now();
-    // Open + authenticate using the same russh glue as start_interactive,
-    // then drop the channel immediately. We don't want this to land in the
-    // SessionRegistry or persist. Host-key trust behaves identically to a
-    // real connect: the native first-trust dialog comes from the handler.
-    let db_for_handler = db.clone();
-    let host_for_handler = resolved.server.host.clone();
-    let result: anyhow::Result<()> = async {
-        let config = Arc::new(ssh_client::base_client_config_pub());
-        let handler = ssh_client::TerminalHandler {
-            host: host_for_handler,
-            db: db_for_handler,
-            port: resolved.server.port,
-            app: app.clone(),
-        };
-        let mut session = russh::client::connect(
-            config,
-            (resolved.server.host.as_str(), resolved.server.port),
-            handler,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Connect failed: {e}"))?;
-
-        // Mirror the auth path used by start_interactive so the user gets the
-        // same verdict here that they would get on a real connect.
-        ssh_client::authenticate(
-            &mut session,
-            &ssh_client::ConnectParams {
-                server: resolved.server.clone(),
-                username: resolved.username.clone(),
-                auth_method: resolved.auth_method.clone(),
-                key_pem: resolved.key_pem.clone(),
-                password: resolved.password.clone(),
-            },
-        )
-        .await?;
-        Ok(())
-    }
-    .await;
+    // Open + authenticate exactly as a real connect does (same host-key
+    // trust, deadlines and messages), then drop the connection: it never
+    // lands in the SessionRegistry.
+    let result = ssh_client::open_authenticated(
+        &ssh_client::ConnectParams {
+            server: resolved.server.clone(),
+            username: resolved.username.clone(),
+            auth_method: resolved.auth_method.clone(),
+            key_pem: resolved.key_pem.clone(),
+            password: resolved.password.clone(),
+        },
+        &db,
+        ssh_client::native_host_trust_prompt(&app),
+        ssh_client::Deadlines::INTERACTIVE,
+    )
+    .await
+    .map(drop);
 
     let elapsed = started.elapsed().as_millis() as u64;
     match result {
@@ -379,24 +416,9 @@ pub async fn server_test(
             );
             Ok(serde_json::json!({ "ok": true, "latencyMs": elapsed }))
         }
-        Err(e) => {
-            let raw = e.to_string();
-            let friendly = if raw.to_lowercase().contains("host key") {
-                "Host key mismatch. Forget it in known_hosts and retry.".to_string()
-            } else if raw.to_lowercase().contains("unknown key")
-                || raw.to_lowercase().contains("not trusted")
-            {
-                "This host is not trusted yet and the trust prompt was not accepted. Retry and accept the host-key prompt.".to_string()
-            } else if raw.contains("Key exchange") || raw.contains("key exchange") {
-                "Key exchange failed.".to_string()
-            } else if raw.starts_with("Connect failed: ") {
-                // Strip our own wrapper prefix for a cleaner surface.
-                raw.trim_start_matches("Connect failed: ").to_string()
-            } else {
-                raw.clone()
-            };
-            let _ = db.add_audit("server.test_fail", None, &raw);
-            Ok(serde_json::json!({ "ok": false, "error": friendly, "latencyMs": elapsed }))
+        Err(error) => {
+            let _ = db.add_audit("server.test_fail", None, &error);
+            Ok(serde_json::json!({ "ok": false, "error": error, "latencyMs": elapsed }))
         }
     }
 }
@@ -408,44 +430,152 @@ pub fn known_hosts_list(app: AppHandle) -> CmdResult<serde_json::Value> {
         .db
         .list_known_hosts()
         .map_err(|e| e.to_string())?;
-    let arr: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "host": r.host,
-                "fingerprintSha256": r.fingerprint_sha256,
-                "firstSeen": r.first_seen.to_rfc3339(),
-            })
-        })
-        .collect();
+    let arr: Vec<serde_json::Value> = rows.iter().map(known_host_json).collect();
     Ok(serde_json::json!({ "hosts": arr }))
 }
 
-/// Kept as a no-op for IPC compatibility: keepalives are handled at the SSH
-/// protocol level (russh sends `keepalive@openssh.com` global requests every
-/// 30 s via `base_client_config().keepalive_interval`). This command used to
-/// write a NUL byte into the PTY data stream, which interactive programs
-/// received as Ctrl-@ - it must never do that again. The renderer's
-/// `terminalKeepaliveSeconds` setting is retained but has no effect.
-#[tauri::command]
-pub fn terminal_keepalive(app: AppHandle, session_id: String) -> CmdResult<serde_json::Value> {
-    // Verify the session still exists so the call stays honest.
-    let registry = app.state::<Arc<SessionRegistry>>().inner().clone();
-    if registry.get_input_tx(&session_id).is_none() {
-        return Err(CmdError("Session not found.".into()));
-    }
-    Ok(serde_json::json!({ "ok": true }))
+/// One Known hosts row for the renderer. `fingerprintSha256` is
+/// `SHA256:<unpadded base64>`, what `ssh-keygen -lf` prints (A7-46).
+fn known_host_json(r: &db::KnownHost) -> serde_json::Value {
+    serde_json::json!({
+        "host": r.host,
+        "fingerprintSha256": ssh_client::known_host_fingerprint(&r.host_key, &r.fingerprint_sha256),
+        "firstSeen": r.first_seen.to_rfc3339(),
+    })
 }
 
 #[tauri::command]
 pub fn known_hosts_forget(app: AppHandle, host: String) -> CmdResult<serde_json::Value> {
-    app.state::<AppState>()
-        .db
-        .delete_known_host(&host)
-        .map_err(|e| e.to_string())?;
-    let _ = app
-        .state::<AppState>()
-        .db
-        .add_audit("known_hosts.forget", None, &host);
+    known_hosts_forget_in(
+        &app.state::<AppState>().db,
+        &app.state::<super::VaultPasswordStore>(),
+        &host,
+    )
+}
+
+/// [`known_hosts_forget`] without the `AppHandle`, so its lock gate is
+/// testable. Refused while locked (A6-08): forgetting a pin downgrades the
+/// next connection to that host to a first-use trust prompt.
+pub(super) fn known_hosts_forget_in(
+    db: &Database,
+    vault: &super::VaultPasswordStore,
+    host: &str,
+) -> CmdResult<serde_json::Value> {
+    super::require_unlocked(vault)?;
+    db.delete_known_host(host).map_err(|e| e.to_string())?;
+    let _ = db.add_audit("known_hosts.forget", None, host);
     Ok(serde_json::json!({ "ok": true }))
+}
+
+#[cfg(test)]
+mod ru4_tests {
+    use super::*;
+
+    #[test]
+    fn ru4_known_hosts_renderer_json_is_labelled_and_unpadded_even_for_legacy_rows() {
+        use base64ct::Encoding;
+        let blob = b"fixture public key blob";
+        let host_key = base64ct::Base64::encode_string(blob);
+        let want = crate::crypto::utils::ssh_fingerprint_sha256(blob);
+        let old = format!("{}=", &want["SHA256:".len()..]);
+        let row = db::KnownHost {
+            host: "fixture.example:2222".into(),
+            host_key,
+            fingerprint_sha256: old,
+            first_seen: chrono::Utc::now(),
+            source: "connection".into(),
+        };
+        let out = known_host_json(&row);
+        assert_eq!(out["host"], "fixture.example:2222");
+        assert_eq!(out["fingerprintSha256"], want);
+        assert_eq!(out["firstSeen"], row.first_seen.to_rfc3339());
+        assert!(out.get("host_key").is_none());
+    }
+
+    #[test]
+    fn ru4_both_connect_callers_leave_host_key_and_timeout_errors_intact() {
+        let source = include_str!("terminal.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !production.contains("contains(\"host key\")"),
+            "russh Display must not decide which host-key outcome the user sees"
+        );
+        assert!(!production.contains("contains(\"unknown key\")"));
+        assert!(!production.contains("contains(\"key exchange\")"));
+    }
+}
+
+/// Connect and Test read a sealed password (or key) and unseal it with the
+/// master password: like every such command they must not do it while a
+/// master-password change re-encrypts the vault.
+#[cfg(test)]
+mod connect_resolution_tests {
+    use super::*;
+    use crate::commands::{VaultPasswordStore, VaultRotationLock, VAULT_REENCRYPTING};
+
+    #[test]
+    fn rw_b2_connect_resolution_waits_for_no_one_and_reads_nothing_during_a_password_change() {
+        let path =
+            std::env::temp_dir().join(format!("sshspan-rw-connect-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(path.clone()).unwrap();
+        let vault = VaultPasswordStore::new();
+        vault.set("rw-master".into());
+        let now = chrono::Utc::now();
+        db.insert_server(&db::ServerRecord {
+            id: "s1".into(),
+            name: "srv".into(),
+            host: "srv.example".into(),
+            port: 22,
+            username: "u".into(),
+            key_id: None,
+            pem_path: None,
+            auth_method: "password".into(),
+            saved_password: Some(crate::crypto::vault::seal("rw-master", b"pw").unwrap()),
+            category_id: None,
+            color: None,
+            last_connected_at: None,
+            created_at: now,
+            updated_at: now,
+            bitwarden_id: None,
+            bitwarden_revision_ts: None,
+            bitwarden_updated_at: None,
+        })
+        .unwrap();
+        let rotation = VaultRotationLock::new();
+        let request = || ConnectRequest {
+            server_id: "s1".into(),
+            override_username: None,
+            override_key_id: None,
+            prompt_password: None,
+        };
+        let change = rotation
+            .exclusive_within(std::time::Duration::from_secs(1))
+            .unwrap();
+        // A password that cannot open the saved one: a refusal that came only
+        // after an unseal would be another error. (The test used to bound the
+        // refusal at 0.5 s, which a loaded machine could exceed.)
+        let cannot_open = VaultPasswordStore::new();
+        cannot_open.set("not-rw-master".into());
+        let started = std::time::Instant::now();
+        let err = resolve_connection(&db, &cannot_open, &rotation, request())
+            .err()
+            .expect("refused while the vault is re-encrypted");
+        assert_eq!(err.0, VAULT_REENCRYPTING, "refused before any unseal");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "refused at once, without waiting for the change"
+        );
+        drop(change);
+        let resolved = resolve_connection(&db, &vault, &rotation, request()).unwrap();
+        assert_eq!(resolved.password.as_deref().map(String::as_str), Some("pw"));
+        vault.clear();
+        assert_eq!(
+            resolve_connection(&db, &vault, &rotation, request())
+                .err()
+                .unwrap()
+                .0,
+            "Vault is locked."
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

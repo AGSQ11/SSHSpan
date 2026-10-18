@@ -345,7 +345,12 @@ impl reqwest::dns::Resolve for ResolvingDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let records = default_dns_lookup(&host)?;
+            // The system resolver blocks; a slow or failing DNS answer must
+            // not stall an async worker (A7-48).
+            let lookup = host.clone();
+            let records = tokio::task::spawn_blocking(move || default_dns_lookup(&lookup))
+                .await
+                .map_err(|e| format!("DNS lookup for \"{host}\" did not finish: {e}"))??;
             let addrs: Vec<std::net::SocketAddr> = records
                 .into_iter()
                 .filter(|r| !is_restricted_address(&r.address))

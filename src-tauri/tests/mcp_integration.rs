@@ -8,8 +8,12 @@
 //! clamped input_schema persistence), 3xx → hard error, server-to-client SSE
 //! requests answered -32601, static-auth origin binding (the header reaches
 //! the configured origin; a redirect target is never dialed), the 2 MB body
-//! cap, and the vault-generation gate aborting a credential-bearing request
-//! once the vault locks mid-flow.
+//! cap (JSON and SSE), an SSE answer read while the server keeps the stream
+//! open, the unsupported-transport error for legacy HTTP+SSE servers (405 on
+//! initialize, an `endpoint` event), server removal through `remove_server`
+//! (vault-lock gate, bounded best-effort session teardown, the entry deleted
+//! even when the server is unreachable or hung), and the vault-generation
+//! gate aborting a credential-bearing request once the vault locks mid-flow.
 //!
 //! Scope note on the command layer: `request_with_session`, `connect_server`
 //! and the `mcp_*` commands take a concrete `tauri::AppHandle` (i.e.
@@ -19,21 +23,24 @@
 //! request/response code the command layer runs, minus the vault-generation
 //! recheck, with `generation = u64::MAX` marking a test-owned context. The
 //! 404 flow below therefore drives the exact sequence `request_with_session`
-//! performs - the 404 signal from `request_once`, the single re-initialize,
+//! performs - the 404 signal from `request_once_unchecked`, the single re-initialize,
 //! the initialized notification (replayed through its public surface), the
 //! session swap + `McpState` registration, and the retry - against a real
 //! socket, and asserts the wire-level guarantees (single re-init, dead id
-//! never reused, new session/version headers on every later request). What
-//! stays behind the manual smoke checklist: the `#[tauri::command]` entry
-//! points themselves - the access-level gate, the vault-lock session
-//! DELETE, and the connect/call audit trail (the generation recheck and the
-//! McpState registration they perform are mirrored step-for-step here).
+//! never reused, new session/version headers on every later request). The
+//! call gate and the call's audit trail are unit-tested in mcp.rs through
+//! the same pure seams the commands use (`call_gate`, `finish_tool_call`).
+//! What stays behind the manual smoke checklist: the `#[tauri::command]`
+//! wrappers themselves and the vault-lock session DELETE (the generation
+//! recheck and the McpState registration they perform are mirrored
+//! step-for-step here).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use sshspan::assistant::mcp;
+use sshspan::commands::VaultPasswordStore;
 use tokio::io::AsyncReadExt as _;
 use zeroize::Zeroizing;
 
@@ -70,7 +77,28 @@ enum ScriptedResponse {
         status: u16,
         headers: Vec<(String, String)>,
     },
+    /// A 200 `text/event-stream` reply that stays OPEN after the scripted
+    /// events, the way a server that keeps the POST's stream for later
+    /// notifications behaves. `raw` is written verbatim before the events
+    /// (for non-JSON events such as a legacy `endpoint` event).
+    SseOpen { raw: String, events: Vec<Value> },
+    /// Read the request, then never answer (a hung server).
+    Hang,
 }
+
+/// How long the held-open / hung mock connections stay up: far longer than
+/// any test waits.
+const HOLD_OPEN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a test waits for a read that must end WITHOUT the stream closing
+/// (an answer, a legacy endpoint event, the size cap): wide for a machine
+/// saturated by other builds and suites, and far below [`HOLD_OPEN`], so a
+/// read that waits for the close still fails.
+const STREAM_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Room on top of the removal's own teardown limit for a loaded machine -
+/// still far below the 60 s request timeout a removal used to wait out.
+const LOADED_MACHINE_SLACK: std::time::Duration = std::time::Duration::from_secs(25);
 
 impl MockMcpServer {
     /// Spawn the listener on 127.0.0.1:0 and start serving the script.
@@ -216,21 +244,7 @@ async fn write_response(
             headers,
         } => {
             let extra = header_lines(headers);
-            let mut body = String::new();
-            for ev in events {
-                if ev == &json!("__echo__") {
-                    let id = request_body.get("id").cloned().unwrap_or(Value::Null);
-                    body.push_str(&format!(
-                        "event: message\r\ndata: {}\r\n\r\n",
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
-                    ));
-                } else {
-                    body.push_str(&format!(
-                        "event: message\r\ndata: {}\r\n\r\n",
-                        serde_json::to_string(ev).unwrap()
-                    ));
-                }
-            }
+            let body = sse_events(events, request_body);
             stream
                 .write_all(
                     format!("HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\n{extra}Connection: close\r\n\r\n")
@@ -238,6 +252,23 @@ async fn write_response(
                 )
                 .await?;
             stream.write_all(body.as_bytes()).await.map(|_| ())
+        }
+        ScriptedResponse::SseOpen { raw, events } => {
+            let body = format!("{raw}{}", sse_events(events, request_body));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 X\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            stream.write_all(body.as_bytes()).await?;
+            stream.flush().await?;
+            // Keep the stream open: the client must not need EOF to answer.
+            tokio::time::sleep(HOLD_OPEN).await;
+            Ok(())
+        }
+        ScriptedResponse::Hang => {
+            tokio::time::sleep(HOLD_OPEN).await;
+            Ok(())
         }
         ScriptedResponse::Status { status, headers } => stream
             .write_all(
@@ -250,6 +281,22 @@ async fn write_response(
             .await
             .and(stream.flush().await),
     }
+}
+
+/// The SSE text for scripted events; `"__echo__"` answers the request just
+/// received (matching its id).
+fn sse_events(events: &[Value], request_body: &Value) -> String {
+    let mut body = String::new();
+    for ev in events {
+        let data = if ev == &json!("__echo__") {
+            let id = request_body.get("id").cloned().unwrap_or(Value::Null);
+            json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }).to_string()
+        } else {
+            serde_json::to_string(ev).unwrap()
+        };
+        body.push_str(&format!("event: message\r\ndata: {data}\r\n\r\n"));
+    }
+    body
 }
 
 fn header_lines(headers: &[(String, String)]) -> String {
@@ -371,7 +418,7 @@ async fn sse_and_json_responses_are_both_handled() {
     let resp = mcp::post_jsonrpc(&client, &url, &body, None, None, None)
         .await
         .unwrap();
-    let outcome = mcp::read_response(&client, &url, None, None, None, &want_id, resp)
+    let outcome = mcp::read_response(&client, &url, None, None, None, &want_id, &|| Ok(()), resp)
         .await
         .unwrap();
     assert!(outcome.result["result"]["ok"].as_bool().unwrap_or(false));
@@ -398,7 +445,7 @@ async fn sse_and_json_responses_are_both_handled() {
     let resp2 = mcp::post_jsonrpc(&client, &url2, &body2, None, None, None)
         .await
         .unwrap();
-    let outcome2 = mcp::read_response(&client, &url2, None, None, None, &want2, resp2)
+    let outcome2 = mcp::read_response(&client, &url2, None, None, None, &want2, &|| Ok(()), resp2)
         .await
         .unwrap();
     assert_eq!(outcome2.result["result"]["value"], 7);
@@ -407,13 +454,16 @@ async fn sse_and_json_responses_are_both_handled() {
 
 /// 404 on a request with a known session → re-initialize once and retry.
 ///
-/// This drives the EXACT sequence the production command layer runs inside
-/// `request_with_session` (mcp.rs): `request_once` → (404) → `initialize` →
-/// `send_initialized` → session swap + registration in the app's
-/// `McpState` → `request_once` retry. The 404 signal, the re-initialize,
-/// the swap and the retry run through the production test seams (see the
-/// scope note above); the one private helper (`send_initialized`) is replayed
-/// through its single public surface with the same success check.
+/// This drives the steps the production command layer runs inside
+/// `request_with_session` (mcp.rs): `request_once_unchecked` → (404) →
+/// `establish_session` (`initialize_unchecked`, the session's registration
+/// in the app's `McpState`, `send_initialized_unchecked`) →
+/// `request_once_unchecked` retry. The 404 signal, the re-initialize, the
+/// swap and the retry run through the production test seams (see the scope
+/// note above); the one private helper (`send_initialized_unchecked`) is
+/// replayed through its single public surface with the same success check.
+/// (Production registers the session before the notification; neither
+/// order changes what goes over the wire.)
 #[tokio::test]
 async fn session_404_reinitializes_once() {
     // Script: tools/list on the dead session (404) → re-initialize (json,
@@ -465,7 +515,7 @@ async fn session_404_reinitializes_once() {
     let sessions = mcp::McpState::new();
     sessions.set_session("test-server", ctx.session.clone().unwrap());
 
-    // Step 1: the production 404 signal - request_once on the dead session
+    // Step 1: the production 404 signal - request_once_unchecked on the dead session
     // reports None (re-init). `request_with_session` consumes exactly this
     // None to trigger the recovery below.
     let body = json!({ "jsonrpc": "2.0", "id": "t1", "method": "tools/list", "params": {} });
@@ -516,7 +566,7 @@ async fn session_404_reinitializes_once() {
     }
 
     // Step 4: swap the session into ctx AND into the app's McpState - the
-    // same two writes `request_with_session` performs on its AppHandle. The
+    // same two writes `establish_session` performs for `request_with_session`. The
     // retry path then reads the session back from that state, exactly as
     // `load_server_context` does for real commands.
     ctx.session = Some(new_session.clone());
@@ -571,7 +621,7 @@ async fn session_404_reinitializes_once() {
     );
 }
 
-/// Replay of mcp.rs's private `send_initialized`: the same single
+/// Replay of mcp.rs's private `send_initialized_unchecked`: the same single
 /// post_jsonrpc call with the new session/version headers, failing the test
 /// if the server does not accept the notification.
 async fn send_initialized_like_production(ctx: &mcp::ServerContext, session: &mcp::McpSession) {
@@ -640,7 +690,7 @@ async fn list_changed_flag_drives_refetch() {
     let resp = mcp::post_jsonrpc(&client, &url, &body, None, None, None)
         .await
         .unwrap();
-    let outcome = mcp::read_response(&client, &url, None, None, None, &want_id, resp)
+    let outcome = mcp::read_response(&client, &url, None, None, None, &want_id, &|| Ok(()), resp)
         .await
         .unwrap();
     assert!(outcome.list_changed, "the notification must set the flag");
@@ -819,42 +869,16 @@ fn tool_with_pin(def: &Value, enabled: bool) -> sshspan::db::McpToolRecord {
     }
 }
 
-/// A real SQLite database with ONLY the tables these tests exercise
-/// (mcp_servers, audit_log) - the `Database` methods used here touch nothing
-/// else. `Database::migrate` and the `#[cfg(test)]` open path are private to
-/// the crate, so the integration test opens a pool over a fresh temp file and
-/// builds the struct directly (same pattern as tests/integration.rs).
+/// A real database over a fresh temp file, opened with the production
+/// schema through `Database::open_at` (the test/tool entry point). Call it
+/// outside a runtime or inside a multi-thread one: the DB layer blocks on
+/// its queries, which a current-thread runtime cannot host.
 fn test_database() -> sshspan::db::Database {
-    use sqlx::Executor as _;
     let db_path = std::env::temp_dir().join(format!(
         "sshspan_mcp_it_{}.db",
         uuid::Uuid::new_v4().to_string().replace('-', "")
     ));
-    let _ = std::fs::remove_file(&db_path);
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let pool = rt
-        .block_on(async { sqlx::SqlitePool::connect(&db_url).await })
-        .unwrap();
-    rt.block_on(async {
-        // The columns `save_mcp_server` / `get_mcp_server` use, matching
-        // db::migrate's definition exactly.
-        pool.execute(
-            "CREATE TABLE IF NOT EXISTS mcp_servers (\
-               key TEXT PRIMARY KEY, value TEXT NOT NULL, \
-               confirmed INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)",
-        )
-        .await
-        .unwrap();
-        pool.execute(
-            "CREATE TABLE IF NOT EXISTS audit_log (\
-               id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, \
-               key_id TEXT, details TEXT NOT NULL, timestamp TEXT NOT NULL)",
-        )
-        .await
-        .unwrap();
-    });
-    sshspan::db::Database { pool, db_path }
+    sshspan::db::Database::open_at(db_path).expect("open the test database")
 }
 
 /// Static-auth origin binding on the wire: the configured header goes to the
@@ -928,10 +952,11 @@ async fn oversized_response_body_is_refused() {
     )
     .await
     .unwrap();
-    let err = match mcp::read_response(&client, &url, None, None, None, &want, resp).await {
-        Ok(_) => panic!("an oversized body must be refused"),
-        Err(e) => e,
-    };
+    let err =
+        match mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp).await {
+            Ok(_) => panic!("an oversized body must be refused"),
+            Err(e) => e,
+        };
     assert!(err.0.contains("2 MB"), "{err}");
 }
 
@@ -955,7 +980,7 @@ fn mcp_test_tool(name: &str, desc: &str, enabled: bool) -> sshspan::db::McpToolR
 #[tokio::test]
 async fn paginated_tools_list_returns_every_page() {
     // Page mechanics are transport-level: simulate with two scripted
-    // tools/list responses driven through request_once on a session.
+    // tools/list responses driven through request_once_test on a session.
     let server = MockMcpServer::start(vec![
         ScriptedResponse::Json {
             status: 200,
@@ -1088,10 +1113,366 @@ async fn jsonrpc_error_is_surfaced() {
     let resp = mcp::post_jsonrpc(&client, &url, &body, None, None, None)
         .await
         .unwrap();
-    let outcome = mcp::read_response(&client, &url, None, None, None, &want, resp)
+    let outcome = mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp)
         .await
         .unwrap();
     let err = mcp::rpc_result(outcome.result).unwrap_err();
     assert!(err.0.contains("-32602"), "{err}");
     assert!(err.0.contains("Invalid params"));
+}
+
+// ─── Streaming, transport detection, server removal ────────────────────
+
+/// A server may keep a POST's SSE stream open after the response (the spec
+/// only says it SHOULD close it). The answer must be returned as soon as it
+/// arrives, not after the stream closes or the 60 s client timeout (A7-50).
+#[tokio::test]
+async fn an_sse_answer_is_returned_while_the_stream_stays_open() {
+    let want = json!("held-1");
+    let server = MockMcpServer::start(vec![ScriptedResponse::SseOpen {
+        raw: String::new(),
+        events: vec![
+            json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
+            json!("__echo__"),
+        ],
+    }])
+    .await;
+    let url = server.url();
+    let client = client();
+    let body = json!({ "jsonrpc": "2.0", "id": want, "method": "tools/call", "params": {} });
+    let resp = mcp::post_jsonrpc(&client, &url, &body, None, None, None)
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        STREAM_READ_LIMIT,
+        mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp),
+    )
+    .await
+    .expect("the answer arrived - reading must not wait for the stream to close")
+    .unwrap();
+    assert_eq!(outcome.result["id"], want);
+    assert!(outcome.result["result"]["ok"].as_bool().unwrap_or(false));
+    assert!(outcome.list_changed, "events before the answer still count");
+}
+
+/// A legacy HTTP+SSE (2024-11-05) server answers with an `endpoint` event
+/// instead of JSON-RPC: that is reported as the unsupported transport it is,
+/// at once (A4-22 / A8-27).
+#[tokio::test]
+async fn a_legacy_sse_endpoint_event_is_reported_as_an_unsupported_transport() {
+    let want = json!("legacy-1");
+    let server = MockMcpServer::start(vec![ScriptedResponse::SseOpen {
+        raw: "event: endpoint\r\ndata: /messages?sessionId=abc\r\n\r\n".into(),
+        events: Vec::new(),
+    }])
+    .await;
+    let url = server.url();
+    let client = client();
+    let body = json!({ "jsonrpc": "2.0", "id": want, "method": "initialize", "params": {} });
+    let resp = mcp::post_jsonrpc(&client, &url, &body, None, None, None)
+        .await
+        .unwrap();
+    let err = match tokio::time::timeout(
+        STREAM_READ_LIMIT,
+        mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp),
+    )
+    .await
+    .expect("a legacy endpoint event must be recognised without waiting")
+    {
+        Ok(_) => panic!("a legacy SSE server is not a Streamable HTTP server"),
+        Err(e) => e,
+    };
+    assert!(
+        err.0.contains("does not speak MCP Streamable HTTP"),
+        "{err}"
+    );
+}
+
+/// `n` server-to-client requests, each of which the client answers -32601.
+fn server_requests(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| json!({ "jsonrpc": "2.0", "id": 1000 + i, "method": "sampling/createMessage", "params": {} }))
+        .collect()
+}
+
+/// Every -32601 answer is a request carrying the auth header, so one
+/// response may make the client answer at most 8 server requests; a 9th
+/// fails the request.
+#[tokio::test]
+async fn server_requests_inside_one_response_are_capped() {
+    let client = client();
+    for (count, ok) in [(8, true), (9, false)] {
+        let want = json!(format!("capped-{count}"));
+        let mut events = server_requests(count);
+        events.push(json!("__echo__"));
+        let server = MockMcpServer::start(vec![ScriptedResponse::Sse {
+            status: 200,
+            events,
+            headers: Vec::new(),
+        }])
+        .await;
+        let url = server.url();
+        let body = json!({ "jsonrpc": "2.0", "id": want, "method": "tools/call", "params": {} });
+        let resp = mcp::post_jsonrpc(&client, &url, &body, None, None, None)
+            .await
+            .unwrap();
+        let read =
+            mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp).await;
+        match read {
+            Ok(outcome) => {
+                assert!(ok, "{count} server requests must fail the request");
+                assert_eq!(outcome.answered_requests, count);
+            }
+            Err(e) => {
+                assert!(!ok, "{count} server requests are allowed: {e}");
+                assert!(e.0.contains("more than 8"), "{e}");
+            }
+        }
+    }
+}
+
+/// The vault-generation check runs before each -32601 answer: once the vault
+/// has locked, no further request (with its auth header) goes out and the
+/// read fails.
+#[tokio::test]
+async fn a_locked_vault_stops_answers_to_server_requests() {
+    let want = json!("guarded-1");
+    let mut events = server_requests(1);
+    events.push(json!("__echo__"));
+    let server = MockMcpServer::start(vec![ScriptedResponse::Sse {
+        status: 200,
+        events,
+        headers: Vec::new(),
+    }])
+    .await;
+    let url = server.url();
+    let client = client();
+    let body = json!({ "jsonrpc": "2.0", "id": want, "method": "tools/call", "params": {} });
+    let auth = Zeroizing::new("Bearer tok".to_string());
+    let resp = mcp::post_jsonrpc(
+        &client,
+        &url,
+        &body,
+        Some(("Authorization", &auth)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let locked = || -> Result<(), sshspan::commands::CmdError> {
+        Err(sshspan::commands::CmdError(
+            "Vault was locked while the operation was in progress.".into(),
+        ))
+    };
+    let err = match mcp::read_response(
+        &client,
+        &url,
+        Some(("Authorization", &auth)),
+        None,
+        None,
+        &want,
+        &locked,
+        resp,
+    )
+    .await
+    {
+        Ok(_) => panic!("a locked vault must stop the exchange"),
+        Err(e) => e,
+    };
+    assert!(err.0.contains("Vault was locked"), "{err}");
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        1,
+        "only the original request may reach the server - no -32601 answer"
+    );
+}
+
+/// The 2 MB cap holds on the incremental SSE path too: an event stream that
+/// keeps going without answering is cut off, not buffered.
+#[tokio::test]
+async fn an_oversized_sse_stream_is_refused() {
+    let want = json!("big-1");
+    let big = "x".repeat(3 * 1024 * 1024);
+    let server = MockMcpServer::start(vec![ScriptedResponse::SseOpen {
+        raw: format!("data: {{\"filler\":\"{big}\"}}\n\n"),
+        events: Vec::new(),
+    }])
+    .await;
+    let url = server.url();
+    let client = client();
+    let body = json!({ "jsonrpc": "2.0", "id": want, "method": "tools/call", "params": {} });
+    let resp = mcp::post_jsonrpc(&client, &url, &body, None, None, None)
+        .await
+        .unwrap();
+    let err = match tokio::time::timeout(
+        STREAM_READ_LIMIT,
+        mcp::read_response(&client, &url, None, None, None, &want, &|| Ok(()), resp),
+    )
+    .await
+    .expect("the cap must end the read")
+    {
+        Ok(_) => panic!("an oversized stream must be refused"),
+        Err(e) => e,
+    };
+    assert!(err.0.contains("2 MB"), "{err}");
+}
+
+/// A server that answers the initialize POST with 405 (a legacy SSE-only
+/// endpoint takes GET only) gets the documented unsupported-transport error,
+/// not a bare "HTTP 405" (A4-22).
+#[tokio::test]
+async fn initialize_405_names_the_unsupported_transport() {
+    let server = MockMcpServer::start(vec![ScriptedResponse::Status {
+        status: 405,
+        headers: Vec::new(),
+    }])
+    .await;
+    let ctx = mcp::ServerContext {
+        record: test_record("legacy".into(), server.url()),
+        url: server.url(),
+        client: client(),
+        session: None,
+        auth: None,
+        generation: TEST_GENERATION,
+    };
+    let err = mcp::initialize_test(&ctx).await.map(|_| ()).unwrap_err();
+    assert_eq!(
+        err.0,
+        "This server does not speak MCP Streamable HTTP (HTTP 405) - SSHSpan supports Streamable HTTP only."
+    );
+}
+
+fn unlocked_vault() -> VaultPasswordStore {
+    let vault = VaultPasswordStore::new();
+    vault.set("test-master-pw".into());
+    vault
+}
+
+/// A stored server `id` at `url` with a live session registered for it.
+fn server_with_session(db: &sshspan::db::Database, state: &mcp::McpState, id: &str, url: String) {
+    let mut record = test_record(format!("srv-{id}"), url);
+    record.id = id.into();
+    db.save_mcp_server(&record).unwrap();
+    state.set_session(
+        id,
+        mcp::McpSession {
+            session_id: Some("sess-1".into()),
+            protocol_version: "2025-11-25".into(),
+        },
+    );
+}
+
+fn audit_actions(db: &sshspan::db::Database) -> Vec<String> {
+    db.list_audit(50)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.action)
+        .collect()
+}
+
+/// The usual reason to remove a server entry is that the server is gone:
+/// the session teardown fails, is audited, and the entry is removed anyway
+/// on the first click (A4-27 / A7-51).
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_an_unreachable_server_still_deletes_it() {
+    let db = test_database();
+    let state = mcp::McpState::new();
+    // A port nobody listens on (bound, then released).
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    server_with_session(&db, &state, "srv-dead", format!("http://{dead}/mcp"));
+    let out = mcp::remove_server(
+        &db,
+        &state,
+        &unlocked_vault(),
+        "srv-dead",
+        mcp::REMOVE_TEARDOWN_TIMEOUT,
+    )
+    .await
+    .expect("an unreachable server must still be removable");
+    assert!(
+        out["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("teardown"),
+        "{out}"
+    );
+    assert!(db.get_mcp_server("srv-dead").unwrap().is_none());
+    assert!(state.get_session("srv-dead").is_none());
+    let actions = audit_actions(&db);
+    assert!(
+        actions.iter().any(|a| a == "mcp.session_teardown_failed"),
+        "{actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| a == "mcp.server_removed"),
+        "{actions:?}"
+    );
+}
+
+/// A server that accepts the DELETE and never answers holds the removal for
+/// the teardown timeout (5 s), not for the 60 s request timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_hung_server_waits_at_most_the_teardown_timeout() {
+    let server = MockMcpServer::start(vec![ScriptedResponse::Hang]).await;
+    let db = test_database();
+    let state = mcp::McpState::new();
+    server_with_session(&db, &state, "srv-hung", server.url());
+    let started = std::time::Instant::now();
+    let out = tokio::time::timeout(
+        mcp::REMOVE_TEARDOWN_TIMEOUT + LOADED_MACHINE_SLACK,
+        mcp::remove_server(
+            &db,
+            &state,
+            &unlocked_vault(),
+            "srv-hung",
+            mcp::REMOVE_TEARDOWN_TIMEOUT,
+        ),
+    )
+    .await
+    .expect("removal must not wait for the 60 s request timeout")
+    .expect("a hung server must still be removable");
+    assert!(started.elapsed() < mcp::REMOVE_TEARDOWN_TIMEOUT + LOADED_MACHINE_SLACK);
+    assert!(
+        out["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("timed out"),
+        "{out}"
+    );
+    assert!(db.get_mcp_server("srv-hung").unwrap().is_none());
+    // The DELETE itself did go out, carrying the session id.
+    let requests = server.requests.lock().unwrap().clone();
+    assert_eq!(requests[0].method, "DELETE");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("mcp-session-id")
+            .map(String::as_str),
+        Some("sess-1")
+    );
+}
+
+/// Removing a server changes the vault, so it is refused while the vault is
+/// locked (A6-08).
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_server_is_refused_while_the_vault_is_locked() {
+    let db = test_database();
+    let state = mcp::McpState::new();
+    let mut record = test_record("locked".into(), "https://mcp.example.com".into());
+    record.id = "srv-locked".into();
+    db.save_mcp_server(&record).unwrap();
+    let err = mcp::remove_server(
+        &db,
+        &state,
+        &VaultPasswordStore::new(),
+        "srv-locked",
+        mcp::REMOVE_TEARDOWN_TIMEOUT,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, "Vault is locked.");
+    assert!(db.get_mcp_server("srv-locked").unwrap().is_some());
 }

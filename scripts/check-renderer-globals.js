@@ -25,11 +25,15 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
-const FILES = ['src/renderer/app.js', 'src/renderer/sftp.js', 'src/renderer/terminal.js', 'src/renderer/icons.js'];
+// Every renderer script, including the two app.js loads last (assistant.js,
+// mcp.js): a same-named top-level declaration in either would replace app.js's
+// for every caller, and they were the ones not checked (A8-17).
+const FILES = ['src/renderer/app.js', 'src/renderer/sftp.js', 'src/renderer/terminal.js', 'src/renderer/icons.js',
+  'src/renderer/assistant.js', 'src/renderer/mcp.js'];
 
 // Identifiers this project owns. A call to anything else (browser or library
 // globals) is out of scope.
-const OWNED = /^(sftp|terminal|vault|key|category|server|queue|render|refresh|build|show|open|close|update|toast|el|call|ico|escapeHtml|fmt|format|join|state|system|bw)[A-Za-z0-9_]*$/;
+const OWNED = /^(sftp|terminal|vault|key|category|server|queue|render|refresh|build|show|open|close|update|toast|el|call|ico|escapeHtml|fmt|format|join|state|system|bw|ai|mcp|assistant)[A-Za-z0-9_]*$/;
 
 const sources = new Map();
 const rawSources = new Map();

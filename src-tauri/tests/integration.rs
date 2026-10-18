@@ -14,6 +14,17 @@ fn openssh_pub_algo(line: &str) -> &str {
     line.split_whitespace().next().unwrap_or("")
 }
 
+/// Store every set field of `config` the way the app changes the sync
+/// settings: in one transaction over the settings as stored.
+fn store_bitwarden_config(db: &Database, config: &BitwardenConfig) {
+    let config = config.clone();
+    db.update_bitwarden_config(move |stored| {
+        *stored = config;
+        Ok(())
+    })
+    .unwrap();
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  Key Generation
 // ═════════════════════════════════════════════════════════════════════════════
@@ -399,9 +410,10 @@ fn db_bitwarden_config_save_load() {
         device_id: Some("device-1".to_string()),
         last_sync: None,
         last_result: None,
+        confirmed_destination: None,
     };
 
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
     let loaded = db.load_bitwarden_config().unwrap();
 
     assert_eq!(
@@ -431,14 +443,14 @@ fn db_bitwarden_config_overwrite() {
         email: Some("old@example.com".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config1).unwrap();
+    store_bitwarden_config(&db, &config1);
 
     let config2 = BitwardenConfig {
         server_url: Some("https://new.example.com".to_string()),
         email: Some("new@example.com".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config2).unwrap();
+    store_bitwarden_config(&db, &config2);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert_eq!(
@@ -612,40 +624,179 @@ fn vault_lifecycle_full_flow() {
 //  Key Deploy to ~/.ssh
 // ═════════════════════════════════════════════════════════════════════════════
 
-use sshspan::ssh::SshService;
+use sshspan::ssh::{DeployFiles, DeployHostFields, DeployKey, DeployTarget, SshService};
 
+/// The deploy writes into the directories it is given - here a temp dir, never
+/// the real `~/.ssh` (A7-56) - and what it writes is checked: the key files,
+/// owner-only permissions on the private one, and a Host stanza carrying the
+/// HostName / User / Port the deploy sheet collects (A7-04), identical to the
+/// preview text.
 #[test]
 fn key_deploy_creates_files() {
-    let tmp_dir = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().join(format!(
         "sshspan_deploy_test_{}",
-        uuid::Uuid::new_v4().to_string().replace('-', "")
+        uuid::Uuid::new_v4().simple()
     ));
-    fs::create_dir_all(&tmp_dir).unwrap();
-
-    // Generate a key
-    let key = keys::generate_key_pair(KeyType::Ed25519, None, "deploy-test".to_string()).unwrap();
-    let private_pem = String::from_utf8_lossy(&key.private_key).to_string();
-    let public_openssh = keys::export_public_key(&key, KeyFormat::OpenSsh).unwrap();
-
-    // Deploy to temp dir (simulate ~/.ssh)
-    let result = SshService::deploy_key(
-        "deploy-test",
-        &private_pem,
-        &public_openssh,
-        Some("myserver"),
-        None,
-        None,
-        None,
-        None,
+    let target = DeployTarget::new(
+        root.join("home").join(".ssh"),
+        root.join("app-config").join("ssh").join("config"),
     );
+    let key = keys::generate_key_pair(KeyType::Ed25519, None, "deploy-test".to_string()).unwrap();
+    let private_pem = keys::export_private_key(&key, KeyFormat::OpenSsh, None).unwrap();
+    let public_openssh = keys::export_public_key(&key, KeyFormat::OpenSsh).unwrap();
+    let fields = DeployHostFields::parse(
+        Some("myserver".into()),
+        Some("server.example.com".into()),
+        Some("deploy".into()),
+        Some(2222),
+        Some(true),
+    )
+    .unwrap();
+    let request = [DeployKey {
+        id: "k1".into(),
+        name: "deploy-test".into(),
+        deploy_path: None,
+    }];
 
-    // Note: deploy_key writes to ~/.ssh, which may not exist in test env
-    // We just verify it doesn't panic and returns a result
-    // In production, this writes to ~/.ssh/sshspan_deploy-test
-    let _ = result; // May fail in test env if ~/.ssh doesn't exist
+    let plan = SshService::plan_deploy(&target, &request, &[], &fields).unwrap();
+    let preview = plan.config_text();
+    let outcome = SshService::apply_deploy(&plan, |_| {
+        Ok(DeployFiles {
+            private_key: zeroize::Zeroizing::new(private_pem.clone()),
+            public_key: public_openssh.clone(),
+        })
+    });
 
-    // Cleanup
-    let _ = fs::remove_dir_all(&tmp_dir);
+    let private_path = root.join("home").join(".ssh").join("sshspan_deploy-test");
+    let written_private = fs::read_to_string(&private_path);
+    let written_public = fs::read_to_string(private_path.with_extension("pub"));
+    let written_config = fs::read_to_string(&target.config_path);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(&private_path).map(|m| m.permissions().mode() & 0o777)
+    };
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    assert_eq!(outcome.deployed.len(), 1);
+    assert_eq!(outcome.deployed[0].file, private_path.display().to_string());
+    assert_eq!(outcome.deployed[0].alias, "myserver");
+    assert_eq!(written_private.unwrap(), private_pem);
+    assert_eq!(written_public.unwrap(), public_openssh);
+    #[cfg(unix)]
+    assert_eq!(mode.unwrap(), 0o600, "the private key must be owner-only");
+    let config = written_config.unwrap();
+    assert_eq!(config, preview, "the preview is what was written");
+    for line in [
+        "Host myserver\n",
+        "    HostName server.example.com\n",
+        "    User deploy\n",
+        "    Port 2222\n",
+        "    IdentitiesOnly yes\n",
+    ] {
+        assert!(config.contains(line), "missing {line:?} in\n{config}");
+    }
+    // Compared parsed: on Windows the path is written quoted and escaped.
+    assert_eq!(
+        SshConfig::parse(&config).hosts[0].identity_file,
+        Some(private_path.display().to_string())
+    );
+}
+
+/// Users are told to `Include` the managed config from
+/// `~/.ssh/config`, so one line OpenSSH rejects stops EVERY ssh command. Deploy
+/// into a home directory whose path has a space and an apostrophe, with key
+/// names holding quote, backslash and comment characters, then let the real
+/// `ssh -G` read the result through the Include line SSHSpan hands out.
+/// Skipped (passes) when no `ssh` client is installed; Unix only (the WSL /
+/// CI check - Win32-OpenSSH formats `ssh -G` paths its own way).
+#[cfg(unix)]
+#[test]
+fn openssh_parses_the_managed_config_through_the_include_line() {
+    let Ok(version) = std::process::Command::new("ssh").arg("-V").output() else {
+        eprintln!("skipped: no ssh client on PATH");
+        return;
+    };
+    eprintln!(
+        "ssh -V: {}",
+        String::from_utf8_lossy(&version.stderr).trim()
+    );
+    let root =
+        std::env::temp_dir().join(format!("sshspan_ssh_g_{}", uuid::Uuid::new_v4().simple()));
+    let target = DeployTarget::new(
+        root.join("John O'Neil Smith").join(".ssh"),
+        root.join("app config").join("ssh").join("config"),
+    );
+    let names = ["bob's key", "back\\slash", "#hash", "web*prod"];
+    let request: Vec<DeployKey> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| DeployKey {
+            id: format!("k{i}"),
+            name: n.to_string(),
+            deploy_path: None,
+        })
+        .collect();
+    let fields = DeployHostFields::parse(
+        None,
+        Some("server.example.com".into()),
+        Some(r"CORP\deploy".into()),
+        Some(2222),
+        Some(true),
+    )
+    .unwrap();
+    let plan = SshService::plan_deploy(&target, &request, &[], &fields).unwrap();
+    let outcome = SshService::apply_deploy(&plan, |planned| {
+        Ok(DeployFiles {
+            private_key: zeroize::Zeroizing::new(format!("PRIVATE {}", planned.id)),
+            public_key: format!("ssh-ed25519 AAAAC3Nza {}", planned.id),
+        })
+    });
+    let main_config = root.join("user ssh config");
+    fs::write(&main_config, format!("{}\n", target.include_line())).unwrap();
+
+    let mut problems = Vec::new();
+    if !outcome.errors.is_empty() {
+        problems.push(format!("deploy errors: {:?}", outcome.errors));
+    }
+    for deployed in &outcome.deployed {
+        let run = std::process::Command::new("ssh")
+            .arg("-G")
+            .arg("-F")
+            .arg(&main_config)
+            .arg(&deployed.alias)
+            .output()
+            .expect("run ssh -G");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let wanted = [
+            format!("identityfile {}", deployed.file),
+            "hostname server.example.com".to_string(),
+            r"user CORP\deploy".to_string(),
+            "port 2222".to_string(),
+        ];
+        let missing: Vec<&String> = wanted
+            .iter()
+            .filter(|w| !stdout.lines().any(|l| l == w.as_str()))
+            .collect();
+        if !run.status.success() || !missing.is_empty() {
+            problems.push(format!(
+                "ssh -G {:?} -> {}: {} missing {missing:?}",
+                deployed.alias,
+                run.status,
+                String::from_utf8_lossy(&run.stderr).trim()
+            ));
+        }
+    }
+    let config_text = fs::read_to_string(&target.config_path).unwrap_or_default();
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(outcome.deployed.len(), names.len(), "{problems:?}");
+    assert!(
+        problems.is_empty(),
+        "{}\nmanaged config:\n{config_text}",
+        problems.join("\n")
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -663,7 +814,7 @@ fn bitwarden_config_partial_update() {
         folder_name: Some("SSHSpan".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
 
     // Update only server_url and email
     let updated = BitwardenConfig {
@@ -672,7 +823,7 @@ fn bitwarden_config_partial_update() {
         folder_name: Some("SSHSpan".to_string()), // keep same
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&updated).unwrap();
+    store_bitwarden_config(&db, &updated);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert_eq!(
@@ -693,7 +844,7 @@ fn bitwarden_config_last_sync() {
         last_sync: Some(sync_time),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert!(loaded.last_sync.is_some());
@@ -714,7 +865,7 @@ fn bitwarden_config_empty_strings() {
         folder_name: Some("".to_string()),
         ..BitwardenConfig::default()
     };
-    db.save_bitwarden_config(&config).unwrap();
+    store_bitwarden_config(&db, &config);
 
     let loaded = db.load_bitwarden_config().unwrap();
     assert_eq!(loaded.server_url.as_deref(), Some(""));
@@ -763,6 +914,196 @@ fn key_full_roundtrip_ecdsa() {
     let pub_exported = keys::export_public_key(&key, KeyFormat::OpenSsh).unwrap();
     assert!(pub_exported.starts_with("ecdsa-sha2-nistp256 "));
     assert_eq!(openssh_pub_algo(&pub_exported), "ecdsa-sha2-nistp256");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Vault backup -> restore (backups never transit the webview)
+// ═════════════════════════════════════════════════════════════════════════════
+
+use sshspan::commands::{apply_restore, build_backup_document, RestoreOutcome};
+use sshspan::db::KeyRecord;
+
+/// A fresh, fully migrated database in a temp file (the real schema, not a
+/// hand-copied subset - backup and restore touch nearly every table).
+fn fresh_db(tag: &str) -> Database {
+    Database::open_at(std::env::temp_dir().join(format!(
+        "sshspan_it_{tag}_{}.db",
+        uuid::Uuid::new_v4().simple()
+    )))
+    .expect("open test database")
+}
+
+fn backup_key(id: &str, name: &str, private_key_encrypted: String) -> KeyRecord {
+    KeyRecord {
+        id: id.into(),
+        name: name.into(),
+        key_type: "ed25519".into(),
+        public_key: format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake {name}"),
+        private_key_encrypted,
+        fingerprint_sha256: format!("SHA256:fake-{id}"),
+        fingerprint_md5: format!("MD5:fake-{id}"),
+        comment: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        deployed: false,
+        deploy_path: None,
+        bitwarden_id: None,
+        bitwarden_sync: false,
+        bitwarden_revision_ts: None,
+        bitwarden_updated_at: None,
+        category_ids: Vec::new(),
+    }
+}
+
+/// Backup -> restore into a fresh database keeps what the old pair dropped:
+/// a key's Bitwarden revision metadata (serialized as JSON numbers, read back
+/// as strings only - A7-27) and the per-server SFTP bookmarks (A7-41), and the
+/// restore leaves its audit row.
+#[test]
+fn backup_restore_round_trip_keeps_key_sync_metadata_bookmarks_and_audit() {
+    let pw = "round-trip-master-pw";
+    let src = fresh_db("backup_src");
+    let mut key = backup_key(
+        "k-linked",
+        "linked",
+        sshspan::crypto::vault::seal(pw, b"fake-private-key").unwrap(),
+    );
+    key.bitwarden_id = Some("cipher-1".into());
+    key.bitwarden_sync = true;
+    key.bitwarden_revision_ts = Some(1_717_000_000_123);
+    key.bitwarden_updated_at = Some(1_717_000_000_456);
+    src.insert_key(&key).unwrap();
+    let bookmarks = serde_json::json!([
+        { "name": "logs", "remotePath": "/var/log", "localPath": null },
+        { "name": "www", "remotePath": "/srv/www", "localPath": "/home/me/www" },
+    ]);
+    src.set_config("sftp.bookmarks.srv-1", &bookmarks.to_string())
+        .unwrap();
+
+    let backup = build_backup_document(&src, pw).expect("build the backup");
+    assert_eq!(backup.counts["sftpBookmarks"], 1);
+    assert!(backup.filename.starts_with("sshspan-backup-") && backup.filename.ends_with(".json"));
+    // The backup carries what is STORED: `settings_get` reports defaults for
+    // unset keys, but a restore must not pin them over the target's choices.
+    let payload: serde_json::Value = serde_json::from_slice(
+        &sshspan::crypto::vault::unseal(pw, backup.document["sealed"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["settings"], serde_json::json!({}));
+
+    let dst = fresh_db("backup_dst");
+    let outcome = apply_restore(&dst, &backup.document, pw, None, &|| Ok(())).expect("restore");
+    let RestoreOutcome::Restored(result) = outcome else {
+        panic!("same master password - no backup password needed: {outcome:?}");
+    };
+    assert_eq!(result["ok"], true);
+
+    let mut lost = Vec::new();
+    let restored = dst.get_key("k-linked").unwrap().expect("key restored");
+    if restored.bitwarden_id.as_deref() != Some("cipher-1") || !restored.bitwarden_sync {
+        lost.push(format!(
+            "bitwarden link: {:?} / {}",
+            restored.bitwarden_id, restored.bitwarden_sync
+        ));
+    }
+    if restored.bitwarden_revision_ts != Some(1_717_000_000_123) {
+        lost.push(format!(
+            "bitwarden_revision_ts: {:?}",
+            restored.bitwarden_revision_ts
+        ));
+    }
+    if restored.bitwarden_updated_at != Some(1_717_000_000_456) {
+        lost.push(format!(
+            "bitwarden_updated_at: {:?}",
+            restored.bitwarden_updated_at
+        ));
+    }
+    if sshspan::crypto::vault::unseal(pw, &restored.private_key_encrypted).ok()
+        != Some(b"fake-private-key".to_vec())
+    {
+        lost.push("private key no longer unseals".into());
+    }
+    let restored_bookmarks = dst
+        .get_config("sftp.bookmarks.srv-1")
+        .unwrap()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    if restored_bookmarks.as_ref() != Some(&bookmarks) {
+        lost.push(format!("sftp bookmarks: {restored_bookmarks:?}"));
+    }
+    if !dst
+        .list_audit(50)
+        .unwrap()
+        .iter()
+        .any(|a| a.action == "vault.backup_restored")
+    {
+        lost.push("no vault.backup_restored audit row".into());
+    }
+    assert!(
+        lost.is_empty(),
+        "the round trip lost:\n  {}",
+        lost.join("\n  ")
+    );
+}
+
+/// A7-25: names that are not valid Host tokens are sanitized on restore and
+/// each rename is audited. The audit row used to be written through a second
+/// pooled connection while the restore's own write transaction held the
+/// SQLite write lock - so every rename after the first write waited out the
+/// busy timeout (5 s then, 30 s now) and then lost its audit row.
+#[test]
+fn restore_with_invalid_key_names_audits_each_rename_without_stalling() {
+    let db = fresh_db("restore_rename");
+    let stamp = chrono::Utc::now().to_rfc3339();
+    let mut keys = Vec::new();
+    for (id, name) in [("k1", "old key one"), ("k2", "old key two")] {
+        let mut k = serde_json::to_value(backup_key(id, name, "x".into())).unwrap();
+        k["category_ids"] = serde_json::json!(["c1"]);
+        keys.push(k);
+    }
+    // The category is written first, so the transaction already holds the
+    // write lock when the first rename is audited.
+    let payload = serde_json::json!({
+        "categories": [{ "id": "c1", "name": "Prod", "scope": "key", "sort_index": 0,
+                         "created_at": stamp, "updated_at": stamp }],
+        "keys": keys,
+    });
+
+    // A stalled rename waits out the whole busy timeout (30 s) and loses its
+    // audit row (counted below). The restore runs on a thread and is waited
+    // for at most 4.5 s, so a stall fails here instead of sitting through
+    // the timeout; the rest is room for a loaded machine.
+    let started = std::time::Instant::now();
+    let (sent, restored) = std::sync::mpsc::channel();
+    let restoring = db.clone();
+    std::thread::spawn(move || {
+        let _ = sent.send(restoring.restore_backup(&payload));
+    });
+    let counts = restored
+        .recv_timeout(std::time::Duration::from_millis(4500))
+        .unwrap_or_else(|_| panic!("restore stalled for {:?}", started.elapsed()))
+        .expect("restore");
+
+    let mut problems = Vec::new();
+    if counts["keys"] != 2 {
+        problems.push(format!("restored keys: {}", counts["keys"]));
+    }
+    let renames = db
+        .list_audit(50)
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.action == "keys.name_sanitized")
+        .count();
+    if renames != 2 {
+        problems.push(format!("keys.name_sanitized audit rows: {renames}, want 2"));
+    }
+    for (id, raw) in [("k1", "old key one"), ("k2", "old key two")] {
+        let name = db.get_key(id).unwrap().map(|k| k.name);
+        let want = keys::sanitize_key_name(raw);
+        if name.as_deref() != Some(want.as_str()) {
+            problems.push(format!("{id} name {name:?}, want {want:?}"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

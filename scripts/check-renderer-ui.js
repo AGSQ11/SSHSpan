@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /*
  * Drives the real renderer in headless Chromium and asserts the behaviour of
- * two paths that have failed silently before: the key list's grouped view and
- * the "use this key to connect..." host picker.
+ * paths that have failed silently before (the key list, the host picker, the
+ * SFTP local pane and queue, the UX refactor, the session surface).
  *
  * The static checkers next to this one can only find shapes we have already
  * been burned by - a call to a function that does not exist, a name declared
@@ -12,222 +12,24 @@
  * empty list from a broken one.
  *
  * Run with `npm run test:ui`. Needs playwright, which is not a devDependency
- * because only this one script uses it:
+ * because only the renderer suites use it:
  *
  *     npm install --no-save playwright@1.56.1 && npx playwright install chromium
  *
- * Without it this skips (exit 0) rather than failing, so a checkout that has
- * not set it up still runs every other check.
+ * Without it the browser checks are skipped rather than failing, so a checkout
+ * that has not set it up still runs every other check. The static checks
+ * (check-ipc-args.js, check-mcp-contract.js, ...) need no browser and run on their own.
  */
 'use strict';
 
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const { failures, check, loadChromium, serve, openPage } = require('./lib/renderer-harness');
 
-// ─── static MCP IPC contract check (no browser, no live provider) ───────────
-//
-// Tauri v2 converts a command's snake_case parameters to camelCase by default
-// and looks up EXACTLY that one key in the payload at runtime; a differently
-// spelled key is not an error for Option<T> parameters - it silently becomes
-// None. That is the bug class scripts/check-ipc-args.js was written for, but
-// its JS_FILES list never covered mcp.js, so every MCP call site was
-// unchecked. This block fails the run if any `mcpCall('<cmd>', {...})`
-// payload in src/renderer/mcp.js carries a top-level key the Rust
-// #[tauri::command] does not declare, or omits a required argument. It also
-  // checks the schema-forwarding half of the contract: the MCP wire field is
-  // `inputSchema` (camelCase), which renderer validation serializes to the
-  // provider-facing `parameters_json`. If tool_view stops forwarding it, every
-  // MCP tool reaches the model with a missing parameter schema.
-//
-// No MCP known-issue pins remain: the renderer now uses camelCase command
-// args and backend tool_view returns the bounded input schema. Any recurrence
-// is a hard failure, not tracked debt.
-const MCP_KNOWN = [];
-
-function mcpContractProblems() {
-  const ROOT = path.resolve(__dirname, '..');
-  const js = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'mcp.js'), 'utf8');
-  const rust = fs.readFileSync(path.join(ROOT, 'src-tauri', 'src', 'assistant', 'mcp.rs'), 'utf8');
-  const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
-
-  // Commands: name -> [{ key, required }], skipping Tauri-injected params.
-  const commands = {};
-  const cmdRe = /#\[tauri::command((?:\([^\]]*\))?)\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(mcp_[a-z_0-9]+)\s*\(([\s\S]*?)\)\s*->/g;
-  let m;
-  while ((m = cmdRe.exec(rust))) {
-    const snakeCmd = /rename_all\s*=\s*"snake_case"/.test(m[1]);
-    const args = [];
-    for (let part of m[3].split(',')) {
-      part = part.split('\n').filter((l) => !/^\s*(\/\/|#\[)/.test(l)).join(' ').trim();
-      if (!part) continue;
-      const pm = part.match(/^(?:mut\s+)?([a-z_0-9]+)\s*:\s*([\s\S]+)$/);
-      if (!pm || /AppHandle|tauri::/.test(pm[2])) continue;
-      args.push({ key: snakeCmd ? pm[1] : toCamel(pm[1]), required: !/^Option</.test(pm[2].trim()) });
-    }
-    commands[m[2]] = args;
-  }
-  if (Object.keys(commands).length < 5) {
-    throw new Error(`MCP contract check: parsed only ${Object.keys(commands).length} mcp_* commands - the regex or mcp.rs moved.`);
-  }
-
-  // Top-level keys of an object literal starting at src[openIdx] === '{'.
-  const literalKeys = (src, openIdx) => {
-    const keys = [];
-    let depth = 0, str = null, tok = '', skipValue = false;
-    for (let j = openIdx; j < src.length; j++) {
-      const c = src[j];
-      if (str) { if (c === '\\') { j++; continue; } if (c === str) str = null; continue; }
-      if (c === "'" || c === '"' || c === '`') { str = c; continue; }
-      if ('([{'.includes(c)) { depth++; continue; }
-      if (')]}'.includes(c)) { depth--; if (depth === 0) { if (!skipValue && /^[A-Za-z_$][\w$]*$/.test(tok.trim())) keys.push(tok.trim()); break; } continue; }
-      if (depth === 1) {
-        if (c === ':') { if (/^[A-Za-z_$][\w$]*$/.test(tok.trim())) keys.push(tok.trim()); tok = ''; skipValue = true; }
-        else if (c === ',') { if (!skipValue && /^[A-Za-z_$][\w$]*$/.test(tok.trim())) keys.push(tok.trim()); tok = ''; skipValue = false; }
-        else tok += c;
-      }
-    }
-    return keys;
-  };
-
-  const problems = [];
-  // Direct literal payloads.
-  const siteRe = /mcpCall\('(mcp_[a-z_0-9]+)',\s*\{/g;
-  while ((m = siteRe.exec(js))) {
-    const line = js.slice(0, m.index).split('\n').length;
-    const keys = literalKeys(js, siteRe.lastIndex - 1);
-    checkSite(m[1], keys, line, commands, problems, toCamel);
-  }
-  // The `const payload = {...}` block passed to mcp_save_server by variable.
-  if (/mcpCall\('mcp_save_server',\s*payload\s*\)/.test(js)) {
-    const def = js.match(/const payload = \{/);
-    const line = js.slice(0, def.index).split('\n').length;
-    checkSite('mcp_save_server', literalKeys(js, def.index + def[0].length - 1), line, commands, problems, toCamel);
-  }
-
-  // Schema forwarding: tool_view must emit the key the renderer reads.
-  const view = rust.match(/fn tool_view\([\s\S]*?json!\(\{([\s\S]*?)\n    \}\)/m);
-  const viewKeys = view ? new Set([...view[1].matchAll(/"(\w+)":/g)].map((x) => x[1])) : null;
-  if (!viewKeys) {
-    problems.push('mcp.rs: tool_view() shape unparseable - the contract check must be updated with it');
-  } else if (/\bt\.inputSchema\b/.test(js) && !viewKeys.has('inputSchema')) {
-    problems.push(`src/renderer/mcp.js reads t.inputSchema but tool_view emits only {${[...viewKeys].join(', ')}} - MCP tool schemas never reach the model`);
-  }
-  return problems;
-}
-
-function checkSite(cmd, keys, line, commands, problems, toCamel) {
-  const def = commands[cmd];
-  if (!def) { problems.push(`mcp.js:${line}  mcpCall('${cmd}') - no such MCP command on the Rust side`); return; }
-  const expected = new Set(def.map((a) => a.key));
-  for (const k of keys) {
-    if (!expected.has(k)) {
-      const hint = expected.has(toCamel(k)) ? ` (did you mean '${toCamel(k)}'? Tauri camelCases parameters)` : '';
-      problems.push(`mcp.js:${line}  '${cmd}' got unexpected arg '${k}'${hint}`);
-    }
-  }
-  for (const a of def) {
-    if (a.required && !keys.includes(a.key)) {
-      problems.push(`mcp.js:${line}  '${cmd}' is missing required arg '${a.key}'`);
-    }
-  }
-}
-
-console.log('mcp IPC contract (static, no browser)');
-let mcpProblems = [];
-try {
-  mcpProblems = mcpContractProblems();
-} catch (e) {
-  mcpProblems = [String(e.message || e)];
-}
-// Apply the ratchet: a problem matching a pin is reported as known debt,
-// not a failure. A pin that matches nothing is a failure - either the bug
-// was fixed and the pin must go, or the check's message drifted and the
-// pin must follow it.
-const mcpKnown = [];
-const mcpNew = [];
-for (const p of mcpProblems) {
-  const pin = MCP_KNOWN.find((k) => k.match(p));
-  if (pin) mcpKnown.push({ p, pin });
-  else mcpNew.push(p);
-}
-const mcpStale = MCP_KNOWN.filter((k) => !mcpKnown.some((m) => m.pin === k));
-for (const m of mcpKnown) console.log(`  known  ${m.p}\n         tracked: ${m.pin.why}`);
-if (mcpStale.length) {
-  for (const k of mcpStale) {
-    console.log(`  FAIL  pinned MCP known-issue no longer reproduces: ${k.why}\n        fix landed - remove the pin from MCP_KNOWN in this file.`);
-    mcpNew.push('stale pin: ' + k.why);
-  }
-}
-if (mcpNew.length) {
-  for (const p of mcpNew) console.log(`  FAIL  ${p}`);
-  console.log('\nTauri v2 silently drops an argument whose key does not match,');
-  console.log('so these fail quietly (or loudly) at runtime.');
-} else if (!mcpKnown.length) {
-  console.log('  ok    all MCP IPC payloads match the Rust command signatures');
-}
-const MCP_FAILED = mcpNew.length > 0;
-
-let chromium;
-try {
-  ({ chromium } = require('playwright'));
-} catch {
-  try {
-    ({ chromium } = require(path.join(
-      require('child_process').execSync('npm root -g', { encoding: 'utf8' }).trim(), 'playwright')));
-  } catch {
-    console.log('playwright not installed - skipping renderer UI checks.');
-    process.exit(MCP_FAILED ? 1 : 0);
-  }
-}
-
-const ROOT = path.join(__dirname, '..', 'src', 'renderer');
-const TYPES = {
-  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2',
-};
-
-const failures = [];
-function check(name, got, want) {
-  const ok = JSON.stringify(got) === JSON.stringify(want);
-  console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${name}`);
-  if (!ok) {
-    console.log(`          got:  ${JSON.stringify(got)}`);
-    console.log(`          want: ${JSON.stringify(want)}`);
-    failures.push(name);
-  }
-}
-
-/// Serve src/renderer over http: file:// would block the module loads.
-function serve() {
-  const server = http.createServer((req, res) => {
-    const rel = decodeURIComponent(req.url.split('?')[0]).replace(/^\/+/, '') || 'index.html';
-    const file = path.join(ROOT, rel);
-    if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-      res.writeHead(404); res.end('not found'); return;
-    }
-    res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
-    res.end(fs.readFileSync(file));
-  });
-  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server)));
-}
-
-/// app.js reads window.__TAURI__ at module scope; without this stub it throws
-/// there and every later top-level const is stuck in the temporal dead zone,
-/// so the page half-initialises and the checks below measure nothing.
-async function openPage(browser, server, replies) {
-  const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
-  await page.addInitScript(({ r }) => {
-    window.__TAURI__ = {
-      core: { invoke: async (cmd) => r[cmd] ?? {} },
-      event: { listen: async () => () => {} },
-    };
-  }, { r: replies });
-  const errors = [];
-  page.on('pageerror', e => errors.push(String(e.message || e)));
-  await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
-  await page.waitForSelector('#keyList .key-row', { timeout: 15000 });
-  return { page, errors };
+// The static server, the Playwright lookup, check() and openPage() live in
+// scripts/lib/renderer-harness.js, shared with the other renderer suites.
+const chromium = loadChromium();
+if (!chromium) {
+  console.log('playwright not installed - skipping renderer UI checks.');
+  process.exit(0);
 }
 
 const KEY = (id, name, cats) => ({
@@ -442,6 +244,9 @@ async function checkSftpLocalPane(browser, server) {
 
   const built = await page.evaluate(async () => {
     const tabId = 't1';
+    // The SFTP shortcuts only act on a panel that is on screen, so show the
+    // Servers view the panel lives in, as the app does.
+    await switchView('connect');
     // Pane-scoped shortcuts (Ctrl+A) resolve the active tab, so the harness has
     // to name one - the same thing activateSessionTab does in the real app.
     state.activeTabId = tabId;
@@ -703,6 +508,16 @@ async function checkUxRefactor(browser, server) {
       core: {
         invoke: async (cmd, args) => {
           if (cmd === 'key_get') return r.key_list.keys.find(k => k.id === args.id);
+          // The deploy sheet shows the backend's own plan (R3): a stand-in that
+          // answers from the fields it is sent, as key_deploy_preview does.
+          if (cmd === 'key_deploy_preview') {
+            return {
+              configPath: '/home/u/.config/sshspan/ssh/config', sshDir: '/home/u/.ssh',
+              includeLine: 'Include "/home/u/.config/sshspan/ssh/config"',
+              keys: args.ids.map((id) => ({ id, name: id, alias: (args.hostAlias || id) + '-' + id, file: '/home/u/.ssh/sshspan_' + id, pubFile: '/home/u/.ssh/sshspan_' + id + '.pub', refusal: null })),
+              configText: args.ids.map((id) => `Host ${(args.hostAlias || id)}-${id}\n  IdentityFile /home/u/.ssh/sshspan_${id}\n  IdentitiesOnly yes\n`).join('\n'),
+            };
+          }
           return r[cmd] ?? {};
         },
       },
@@ -716,7 +531,10 @@ async function checkUxRefactor(browser, server) {
       allKeyCategories: {}, orphans: true, hostOrphans: false,
     },
     server_list: { servers: [SRV('s1', 'web-1', '10.0.0.1', null), SRV('s2', 'db-1', '10.0.0.2', null)] },
-    settings_get: { autoLockMinutes: 15, confirmDelete: true },
+    // No autoLockMinutes on purpose: a fresh install has none saved (settings_get
+    // only returns keys that were written), and the countdown asserted below must
+    // still show the 15-minute default. Seeding 15 here hid that state.
+    settings_get: { confirmDelete: true },
     known_hosts_list: { hosts: [] },
     audit_list: { entries: [] },
     system_paths: { deployDir: '~/.sshspan/keys', sshConfig: '~/.ssh/config', dataDir: '~/.sshspan/sshspan.db' },
@@ -748,6 +566,9 @@ async function checkUxRefactor(browser, server) {
   await page.waitForTimeout(80);
   check('the detail pane opens on Overview', await page.isVisible('#detailPanel-overview'), true);
   await page.click('.detail-tab[data-detail-tab="export"]');
+  // The default OpenSSH format takes an optional passphrase now (A8-12), so
+  // the format that takes none is picked first.
+  await page.click('.format-row[data-format="pkcs8"]');
   check('the passphrase field is hidden for an unencrypted format',
     await page.isHidden('#detailExportPass'), true);
   await page.click('.format-row[data-format="pkcs8-encrypted"]');
@@ -779,8 +600,9 @@ async function checkUxRefactor(browser, server) {
   check('the preview breaks lines instead of printing a literal backslash-n',
     preview.includes('\\n'), false);
   await page.fill('#cfgHost', 'prod-web-1');
-  await page.waitForTimeout(80);
-  check('and follows the form as you type',
+  // The sheet asks the backend once typing pauses (150 ms); allow for it.
+  await page.waitForFunction(() => document.getElementById('configPreview').value.includes('Host prod-web-1'), null, { timeout: 1500 }).catch(() => {});
+  check('and follows the form as you type (asking the backend again)',
     (await page.inputValue('#configPreview')).includes('Host prod-web-1'), true);
   await page.keyboard.press('Escape');
   check('Escape closes the sheet', await page.isHidden('#deployModal'), true);
@@ -921,9 +743,9 @@ async function checkSessionSurface(browser, server) {
     await browser.close();
     server.close();
   }
-  if (failures.length || MCP_FAILED) {
-    const n = failures.length + (MCP_FAILED ? mcpNew.length : 0);
-    console.error(`\n${n} renderer UI / MCP contract check(s) failed.`);
+  if (failures.length) {
+    const n = failures.length;
+    console.error(`\n${n} renderer UI check(s) failed.`);
     process.exit(1);
   }
   console.log('\nAll renderer UI checks passed.');

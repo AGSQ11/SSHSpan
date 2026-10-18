@@ -1,13 +1,31 @@
 #!/usr/bin/env node
 /*
- * check-mcp-contract.js - static + runtime-ish checks for the renderer's
- * MCP contract. Runs in plain Node, no browser required.
+ * check-mcp-contract.js - static checks of the renderer's MCP contract that
+ * check-ipc-args.js cannot make. Runs in plain Node, no browser required:
+ *
+ *     node scripts/check-mcp-contract.js
+ *
+ * Which keys mcp.js sends to which command is enforced by scripts/check-ipc-args.js
+ * against the Rust signatures: a misspelled or camelCase-twin key, and a REQUIRED
+ * (non-Option) argument that is not sent (auth_type; mcp_call_tool's tabId, id, tool,
+ * argumentsJson and approved). This file used to check those a second time, and
+ * check-renderer-ui.js a third (A8-17); the copies drifted, so only that one is kept.
+ * What it cannot enforce is a key whose Rust type is Option<T>, because absent is a
+ * legal call - and for mcp_save_server's three auth fields absent is a SILENT one, so
+ * those presence checks stay here. The payload is read with check-ipc-args.js's own
+ * parser (it exports it), not a second copy.
  *
  * Checks:
- *   1. mcp.js sends camelCase top-level keys to mcp_save_server.
+ *   1. mcp_save_server's payload can be read statically and ALWAYS carries
+ *      auth_header_name, auth_secret and auth_env_var (null keeps the stored value, a
+ *      value replaces it; a payload that stops carrying one leaves the old secret in use
+ *      while the UI says "saved"). mcp_call_tool's call site is found and readable.
  *   2. The custom auth form value is exactly 'custom_header'.
- *   3. Tool schemas validation exists and rejects missing/invalid schemas.
- *   4. mcp_call_tool payload keys are camelCase (tabId, argumentsJson, approved).
+ *   3. Tool schema validation exists and rejects missing/invalid schemas.
+ *   4. mcpCallTool is exposed, and aiRunTool wraps MCP results as untrusted.
+ *   5. Built-in tools come before MCP tools in the model's tool list.
+ *   6. tool_view (Rust) emits the `inputSchema` key mcp.js reads - if it stopped,
+ *      every MCP tool would reach the model without a parameter schema.
  *
  * Exit 0 if all checks pass, 1 otherwise.
  */
@@ -15,9 +33,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const { parseCallSitesIn } = require('./check-ipc-args.js');
 
-const mcpPath = path.join(__dirname, '..', 'src', 'renderer', 'mcp.js');
-const htmlPath = path.join(__dirname, '..', 'src', 'renderer', 'index.html');
+const ROOT = path.join(__dirname, '..');
+const mcpPath = path.join(ROOT, 'src', 'renderer', 'mcp.js');
+const htmlPath = path.join(ROOT, 'src', 'renderer', 'index.html');
+const rustPath = path.join(ROOT, 'src-tauri', 'src', 'assistant', 'mcp.rs');
 const code = fs.readFileSync(mcpPath, 'utf8');
 
 let failures = 0;
@@ -29,32 +50,38 @@ function fail(name, got, want) {
   console.log('       want: ' + want);
 }
 
-console.log('mcp.js contract checks');
+console.log('mcp.js contract checks (argument names and required arguments: scripts/check-ipc-args.js)');
 
-// 1. mcp_save_server payload uses camelCase keys matching Rust command args.
-const payloadMatch = code.match(/const payload = \{[\s\S]*?auth_env_var[\s\S]*?\};/);
-if (!payloadMatch) {
-  fail('mcp_save_server payload found', 'not found', 'payload object');
+// 1. The payloads mcp.js sends. In Rust auth_header_name, auth_secret and auth_env_var
+// are Option<String>, so check-ipc-args.js treats them as optional - but "null keeps
+// the stored value, a value replaces it" only works if the key is always sent.
+const MUST_SEND = ['auth_header_name', 'auth_secret', 'auth_env_var'];
+const sites = parseCallSitesIn(code, 'src/renderer/mcp.js');
+
+const saveSites = sites.filter((s) => s.cmd === 'mcp_save_server');
+if (saveSites.length !== 1) {
+  fail('mcp_save_server payload found', saveSites.length + " mcpCall('mcp_save_server', ...) sites", 'exactly one');
+} else if (saveSites[0].dynamic) {
+  fail('mcp_save_server payload can be read statically', 'a spread, a parameter or a variable that is rebound before the call',
+    "a plain `const payload = { ... }` literal in the same function (or update this check and check-ipc-args.js's parser together)");
 } else {
-  const payload = payloadMatch[0];
-  if (!/auth_type:/.test(payload)) fail('auth_type key present', 'missing', 'auth_type:');
-  else ok('auth_type key present');
-  if (!/auth_header_name:/.test(payload)) fail('auth_header_name key present', 'missing', 'auth_header_name:');
-  else ok('auth_header_name key present');
-  if (!/auth_secret:/.test(payload)) fail('auth_secret key present', 'missing', 'auth_secret:');
-  else ok('auth_secret key present');
-  if (!/auth_env_var:/.test(payload)) fail('auth_env_var key present', 'missing', 'auth_env_var:');
-  else ok('auth_env_var key present');
-  // The command explicitly uses snake_case. A camelCase payload would be
-  // silently dropped by Tauri and is therefore rejected here.
-  if (/authType:/.test(payload)) fail('no camelCase authType in save payload', 'found', 'none');
-  else ok('no camelCase authType in save payload');
-  if (/authHeaderName:/.test(payload)) fail('no camelCase authHeaderName in save payload', 'found', 'none');
-  else ok('no camelCase authHeaderName in save payload');
-  if (/authSecret:/.test(payload)) fail('no camelCase authSecret in save payload', 'found', 'none');
-  else ok('no camelCase authSecret in save payload');
-  if (/authEnvVar:/.test(payload)) fail('no camelCase authEnvVar in save payload', 'found', 'none');
-  else ok('no camelCase authEnvVar in save payload');
+  ok('mcp_save_server payload found and readable (mcp.js:' + saveSites[0].line + ')');
+  for (const key of MUST_SEND) {
+    if (!saveSites[0].keys.includes(key)) {
+      fail(key + ' key present in the mcp_save_server payload', 'missing from {' + saveSites[0].keys.join(', ') + '}',
+        key + ': - without it an edit leaves the stored value in use (null keeps it, a value replaces it)');
+    } else {
+      ok(key + ' key present in the mcp_save_server payload');
+    }
+  }
+}
+
+const callSites = sites.filter((s) => s.cmd === 'mcp_call_tool');
+if (callSites.length !== 1 || callSites[0].dynamic) {
+  fail('mcp_call_tool payload found and readable', callSites.length + ' sites' + (callSites.length === 1 ? ', not an object literal' : ''),
+    "exactly one mcpCall('mcp_call_tool', { ... }) literal (its keys are checked by check-ipc-args.js)");
+} else {
+  ok('mcp_call_tool payload found and readable (mcp.js:' + callSites[0].line + ')');
 }
 
 // 2. The form option value for custom header auth is 'custom_header'.
@@ -92,23 +119,7 @@ if (!/invalid inputSchema/.test(code)) {
   ok('invalid schema produces visible error');
 }
 
-// 4. mcp_call_tool payload uses camelCase keys.
-const callMatch = code.match(/mcpCall\('mcp_call_tool',\s*\{\s*tabId,[\s\S]*?\}\s*\);/m);
-if (!callMatch) {
-  fail('mcp_call_tool payload found', 'not found', 'payload object');
-} else {
-  const callPayload = callMatch[0];
-  if (!/argumentsJson:/.test(callPayload)) fail('argumentsJson key present', 'missing', 'argumentsJson:');
-  else ok('argumentsJson key present in mcp_call_tool');
-  if (!/tabId/.test(callPayload)) fail('tabId key present', 'missing', 'tabId');
-  else ok('tabId key present in mcp_call_tool');
-  if (!/approved:/.test(callPayload)) fail('approved key present', 'missing', 'approved:');
-  else ok('approved key present in mcp_call_tool');
-  if (/arguments_json:/.test(callPayload)) fail('no snake_case arguments_json in call payload', 'found', 'none');
-  else ok('no snake_case arguments_json in call payload');
-}
-
-// 5. mcpCallTool is called by assistant.js and its result is wrapped through
+// 4. mcpCallTool is called by assistant.js and its result is wrapped through
 // aiWrapUntrusted (the runtime contract is enforced in assistant.js, but the
 // helper is invoked there, not in mcp.js).
 if (!/window\.mcpCallTool/.test(code)) {
@@ -117,8 +128,8 @@ if (!/window\.mcpCallTool/.test(code)) {
   ok('mcpCallTool exposed on window');
 }
 
-// 6. aiRunTool still wraps MCP results through aiWrapUntrusted.
-const assistantCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'assistant.js'), 'utf8');
+// aiRunTool still wraps MCP results through aiWrapUntrusted.
+const assistantCode = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'assistant.js'), 'utf8');
 const mcpBranch = assistantCode.match(/if \(name\.lastIndexOf\('mcp__'[\s\S]*?return wrap\(text\);/);
 if (!mcpBranch) {
   fail('MCP branch in aiRunTool found', 'not found', 'mcp__ branch wrapping result');
@@ -131,11 +142,25 @@ if (!mcpBranch) {
   }
 }
 
-// 7. Built-ins-first order is preserved in assistant.js.
+// 5. Built-ins-first order is preserved in assistant.js.
 if (!/window\.mcpGetTools\(\)\.slice\(0, remaining\)/.test(assistantCode)) {
   fail('built-ins-first merge in aiToolsForLevel', 'missing', 'window.mcpGetTools().slice(0, remaining)');
 } else {
   ok('built-ins-first merge preserved in aiToolsForLevel');
+}
+
+// 6. Schema forwarding: the MCP wire field is `inputSchema` (camelCase), which
+// renderer validation serializes to the provider-facing `parameters_json`.
+// tool_view must emit the key the renderer reads.
+const rust = fs.readFileSync(rustPath, 'utf8');
+const view = rust.match(/fn tool_view\([\s\S]*?json!\(\{([\s\S]*?)\n    \}\)/m);
+const viewKeys = view ? new Set([...view[1].matchAll(/"(\w+)":/g)].map((x) => x[1])) : null;
+if (!viewKeys) {
+  fail('tool_view() shape is parseable', 'unparseable', 'json!({ ... }) in fn tool_view of src-tauri/src/assistant/mcp.rs - update this check with it');
+} else if (/\bt\.inputSchema\b/.test(code) && !viewKeys.has('inputSchema')) {
+  fail('tool_view emits the inputSchema that mcp.js reads', '{' + [...viewKeys].join(', ') + '}', 'a "inputSchema" key');
+} else {
+  ok('tool_view emits the inputSchema that mcp.js reads');
 }
 
 if (failures) {

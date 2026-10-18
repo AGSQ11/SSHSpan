@@ -145,6 +145,17 @@ env_logger = "0.11"                # used by examples/dev-sshd.rs + examples/sft
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows only: ShellExecuteExW, called once to start a downloaded installer so
+# a declined UAC prompt is not shown twice (opener retries on any error).
+# 0.59 is already in the tree (Cargo.lock); no new crate is downloaded.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 # Unit-test support for the Bitwarden HTTP hardening: building synthetic
 # reqwest Response values from http::Response (version already in the

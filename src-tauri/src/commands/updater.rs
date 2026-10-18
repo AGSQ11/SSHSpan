@@ -33,12 +33,20 @@ const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 /// The SHA-256 asset digest returned by the GitHub API comes from the same
 /// release that serves the installer, so it only proves the download matches
 /// the release - not that the release itself is trusted. This embedded key
-/// closes that gap: the release workflow signs every installer with the
-/// minisign SECRET key (GitHub secret `MINISIGN_SECRET_KEY`) and uploads the
-/// `.minisig` files as release assets; `update_download_and_run` refuses to
-/// run an installer whose signature does not verify against this PUBLIC key,
-/// which lives in the source tree and cannot be changed by whoever controls
-/// the release.
+/// narrows that gap: the release workflow signs every installer with the
+/// minisign SECRET key (GitHub secret `MINISIGN_SECRET_KEY`), with the
+/// trusted comment `SSHSpan release <tag>`, and uploads the `.minisig` files
+/// as release assets; `update_download_and_run` refuses to run an installer
+/// whose signature does not verify against this PUBLIC key or whose signed
+/// comment names a different release than the one being installed.
+///
+/// What that protects against, honestly: an installer or `.minisig` swapped
+/// in an already-published release, a hostile mirror or proxy, and a genuine
+/// older signed build re-published under a newer tag. What it does NOT: the
+/// release workflow signs whatever a pushed `v*` tag builds, so whoever can
+/// push tags or change the workflow (a repository or token compromise), or
+/// read the Actions secret, can produce validly signed installers. After such
+/// a compromise the key must be rotated (below) and the release re-cut.
 ///
 /// Key provisioned 2026-09-12 (key id D67C45BA942239D8). The secret key is
 /// NOT in the repository - it lives in the `MINISIGN_SECRET_KEY` Actions
@@ -64,12 +72,35 @@ fn minisign_key_provisioned(key: &str) -> bool {
     key != MINISIGN_PUBLIC_KEY_PLACEHOLDER
 }
 
+/// The trusted comment the release workflow signs each installer with:
+/// `minisign -t "SSHSpan release ${GITHUB_REF_NAME}"` in release.yml, where
+/// the ref name is the `v<version>` tag that triggered the build.
+fn release_trusted_comment(version: &str) -> String {
+    format!(
+        "SSHSpan release v{}",
+        version.trim().trim_start_matches('v')
+    )
+}
+
 /// Verify a downloaded installer blob against a minisign `.minisig` file
-/// body using the embedded public key. Fails closed on ANY problem: bad
-/// base64, wrong key id, wrong key, tampered content, or a mangled trusted
-/// comment (the global signature covers both).
-fn verify_minisign_signature(installer: &[u8], sig_body: &str) -> CmdResult<()> {
-    let pubkey = minisign_verify::PublicKey::from_base64(MINISIGN_PUBLIC_KEY)
+/// body using the embedded public key, for the release `version` the URL is
+/// bound to. Fails closed on ANY problem: bad base64, wrong key id, wrong
+/// key, tampered content, a mangled trusted comment (the global signature
+/// covers both), or a valid signature whose trusted comment names another
+/// release (A6-05).
+fn verify_minisign_signature(installer: &[u8], sig_body: &str, version: &str) -> CmdResult<()> {
+    verify_minisign_with_key(MINISIGN_PUBLIC_KEY, installer, sig_body, version)
+}
+
+/// [`verify_minisign_signature`] against a caller-chosen key, so the tests
+/// run the shipped code path with their own keypair.
+fn verify_minisign_with_key(
+    key_b64: &str,
+    installer: &[u8],
+    sig_body: &str,
+    version: &str,
+) -> CmdResult<()> {
+    let pubkey = minisign_verify::PublicKey::from_base64(key_b64)
         .map_err(|e| CmdError(format!("Embedded minisign public key is invalid: {e}")))?;
     let signature = minisign_verify::Signature::decode(sig_body)
         .map_err(|e| CmdError(format!("Release signature is unparseable: {e}")))?;
@@ -78,7 +109,25 @@ fn verify_minisign_signature(installer: &[u8], sig_body: &str) -> CmdResult<()> 
     // else was not produced by it.
     pubkey
         .verify(installer, &signature, false)
-        .map_err(|e| CmdError(format!("Release signature verification FAILED: {e}")))
+        .map_err(|e| CmdError(format!("Release signature verification FAILED: {e}")))?;
+    // The signature proves the bytes are SOME signed release; the signed
+    // comment says WHICH. The version number in the URL and the API answer
+    // is unsigned, so without this a genuine older installer re-published
+    // under a newer tag passed every check (a silent downgrade).
+    let expected = release_trusted_comment(version);
+    let signed_for = signature.trusted_comment();
+    if signed_for != expected {
+        let shown: String = signed_for
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(80)
+            .collect();
+        return Err(CmdError(format!(
+            "Release signature is for \"{shown}\", not \"{expected}\"; refusing to install \
+             a signed build of another release."
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -279,12 +328,24 @@ fn validate_asset_url(raw: &str) -> CmdResult<url::Url> {
 const RELEASE_REPO_PREFIX: &str = "/AGSQ11/SSHSpan/releases/download/";
 
 /// Validate the INITIAL installer URL handed over by the renderer: HTTPS,
-/// GitHub host allowlist, AND the AGSQ11/SSHSpan releases-download path.
+/// GitHub host allowlist, AND exactly
+/// `/AGSQ11/SSHSpan/releases/download/<tag>/<asset>` - no query, no fragment,
+/// no further segments. Everything derived from it (the extension that picks
+/// the launch plan, the `.minisig` sibling) comes from this parsed path, never
+/// from the raw string: `...setup.exe#.AppImage` or `...setup.exe?x=.msi`
+/// used to change how a downloaded file was started.
 fn validate_initial_asset_url(raw: &str) -> CmdResult<url::Url> {
     let parsed = validate_asset_url(raw)?;
     let host_ok = parsed.host_str() == Some("github.com");
-    let path_ok = parsed.path().starts_with(RELEASE_REPO_PREFIX);
-    if !(host_ok && path_ok) {
+    let segments: Vec<&str> = parsed
+        .path_segments()
+        .map(|segments| segments.collect())
+        .unwrap_or_default();
+    let path_ok = parsed.path().starts_with(RELEASE_REPO_PREFIX)
+        && segments.len() == 6
+        && segments.iter().all(|segment| !segment.is_empty());
+    let plain = parsed.query().is_none() && parsed.fragment().is_none();
+    if !(host_ok && path_ok && plain) {
         return Err(CmdError(
             "Refusing to download: the installer URL must be an \
              AGSQ11/SSHSpan GitHub release asset."
@@ -308,6 +369,244 @@ fn sanitize_version_for_filename(version: &str) -> String {
     } else {
         filtered
     }
+}
+
+/// What `update_check` reports about the latest release.
+///
+/// `newerVersion` is the release's version whenever it is newer than the
+/// running one, and null otherwise; `available` is true only when there is
+/// also an installer for this platform. A newer release WITHOUT one used to
+/// come back as plain `available: false`, which the renderer could only read
+/// as "you are on the latest version" (A2-41).
+fn update_check_result(
+    rel: &GhRelease,
+    current: &str,
+    asset: Option<&GhAsset>,
+) -> serde_json::Value {
+    let newer = is_newer(&rel.tag_name, current);
+    let version = rel.tag_name.trim_start_matches('v');
+    let asset = if newer { asset } else { None };
+    serde_json::json!({
+        "available": asset.is_some(),
+        "newerVersion": if newer { Some(version) } else { None },
+        "current": current,
+        "version": version,
+        "notes": rel.body.clone().unwrap_or_default(),
+        "assetUrl": asset.map(|a| a.browser_download_url.clone()),
+        // GitHub-computed SHA-256 of the asset ("sha256:<hex>"). The renderer
+        // passes this back into update_download_and_run so the installer can
+        // be verified before execution.
+        "assetDigest": asset.and_then(|a| a.digest.clone()),
+    })
+}
+
+/// How a verified installer is started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchPlan {
+    /// Windows Installer package: `msiexec /i <file>`. msiexec itself runs
+    /// unelevated and raises UAC when the package needs it.
+    Msiexec,
+    /// Hand the file to the OS shell (`opener::open`: ShellExecuteW "open" on
+    /// Windows, the desktop's package handler on Linux). On Windows this is
+    /// what lets the NSIS installer run at all: `installMode: both` gives it
+    /// a manifest that requires administrator rights, and CreateProcess -
+    /// what `Command::spawn` uses - refuses that from an unelevated app with
+    /// ERROR_ELEVATION_REQUIRED (740), while ShellExecute shows the UAC
+    /// prompt (A7-10).
+    ShellOpen,
+    /// Swap the running AppImage for the downloaded one.
+    ReplaceAppImage,
+}
+
+fn launch_plan(ext: &str) -> LaunchPlan {
+    match ext {
+        ".msi" => LaunchPlan::Msiexec,
+        ".AppImage" => LaunchPlan::ReplaceAppImage,
+        _ => LaunchPlan::ShellOpen,
+    }
+}
+
+/// A downloaded installer on disk, deleted again when this is dropped - on
+/// every early return after the file was created: a refused or broken
+/// download, a digest or signature failure, a launch that did not happen
+/// (A7-42). [`StagedInstaller::keep`] disarms it once the OS has the
+/// installer: it must outlive the app, and a later start prunes it
+/// ([`prune_stale_update_files`]). It only ever removes the file the updater
+/// itself created.
+struct StagedInstaller {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl StagedInstaller {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// The installer is running (or has replaced the AppImage): leave it.
+    fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for StagedInstaller {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Stream `resp` into a NEW file at `dest`, hashing as it goes and enforcing
+/// `max_bytes`, and return the staged file with its `sha256:<hex>` digest.
+/// The file is created exclusively (`create_new`), so a file planted at that
+/// name is refused - never reused, overwritten or deleted. Once it exists, any
+/// failure removes it again.
+async fn download_installer_to(
+    resp: &mut reqwest::Response,
+    dest: &std::path::Path,
+    max_bytes: u64,
+) -> CmdResult<(StagedInstaller, String)> {
+    let file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(dest)
+        .await
+        .map_err(|e| CmdError(format!("Could not create the installer file: {e}")))?;
+    let staged = StagedInstaller::new(dest.to_path_buf());
+    // `file` moves into the helper and is closed when it returns, before
+    // `staged` can delete the path on an error.
+    let digest = stream_installer(resp, file, max_bytes).await?;
+    Ok((staged, digest))
+}
+
+/// The body of [`download_installer_to`]: the size cap (declared length and
+/// running total), the running SHA-256, and the writes.
+async fn stream_installer(
+    resp: &mut reqwest::Response,
+    mut file: tokio::fs::File,
+    max_bytes: u64,
+) -> CmdResult<String> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes {
+            return Err(CmdError(format!(
+                "Installer too large ({len} bytes, limit {max_bytes})."
+            )));
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| CmdError(format!("Download failed: {e}")))?
+    {
+        downloaded += chunk.len() as u64;
+        if downloaded > max_bytes {
+            return Err(CmdError(format!(
+                "Installer exceeded the {max_bytes} byte limit."
+            )));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| CmdError(e.to_string()))?;
+    }
+    file.flush().await.map_err(|e| CmdError(e.to_string()))?;
+    if downloaded == 0 {
+        return Err(CmdError("Downloaded installer is empty.".into()));
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// How old a staged installer must be before a later start deletes it.
+pub const STALE_UPDATE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The extensions [`update_download_and_run`] stages installers with.
+const STAGED_INSTALLER_EXTS: [&str; 5] = [".exe", ".msi", ".deb", ".rpm", ".AppImage"];
+
+/// Exactly the names [`update_download_and_run`] stages installers under:
+/// `sshspan-<version>-update-<32 lowercase hex><ext>` - the version filtered
+/// by [`sanitize_version_for_filename`], the random part a simple UUID, the
+/// extension one of [`STAGED_INSTALLER_EXTS`]. Anything else in the temp or
+/// AppImage folder is not ours to delete (`sshspan-notes-update-2026.txt`
+/// matched the old prefix test).
+fn is_staged_installer_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("sshspan-") else {
+        return false;
+    };
+    let Some(stem) = STAGED_INSTALLER_EXTS
+        .iter()
+        .find_map(|ext| rest.strip_suffix(ext))
+    else {
+        return false;
+    };
+    let Some((version, random)) = stem.rsplit_once("-update-") else {
+        return false;
+    };
+    !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+        && random.len() == 32
+        && random.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// Where installers get staged: the temp directory, plus the running
+/// AppImage's own directory (an AppImage update is staged beside it so the
+/// final rename stays on one filesystem).
+pub fn update_staging_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![std::env::temp_dir()];
+    if let Some(dir) = std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .and_then(|image| image.parent().map(std::path::Path::to_path_buf))
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        dirs.push(dir);
+    }
+    dirs
+}
+
+/// Delete staged installers (`sshspan-*-update-*`) older than `max_age` from
+/// `dir`, returning how many were removed. A successful update leaves its
+/// installer behind (it must outlive the app) and a crash can leave a partial
+/// one; this runs at startup so neither stays forever (A7-42). Only plain
+/// files directly inside `dir` - never directories, never symlinks, never
+/// anything else - and failures (a file still in use) are skipped.
+pub fn prune_stale_update_files(dir: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_staged_installer_name)
+        {
+            continue;
+        }
+        // DirEntry::file_type does not follow symlinks.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Check GitHub for the latest release and, if newer, report the asset URL for
@@ -338,25 +637,12 @@ pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
     let rel: GhRelease = serde_json::from_slice(&bytes)
         .map_err(|e| CmdError(format!("Could not parse GitHub response: {e}")))?;
 
-    let available = is_newer(&rel.tag_name, &current);
-    let (asset_url, asset_digest) = if available {
+    let asset = if is_newer(&rel.tag_name, &current) {
         pick_asset_for_os(&rel.assets)
-            .map(|a| (Some(a.browser_download_url.clone()), a.digest.clone()))
-            .unwrap_or((None, None))
     } else {
-        (None, None)
+        None
     };
-    Ok(serde_json::json!({
-        "available": available && asset_url.is_some(),
-        "current": current,
-        "version": rel.tag_name.trim_start_matches('v'),
-        "notes": rel.body.unwrap_or_default(),
-        "assetUrl": asset_url,
-        // GitHub-computed SHA-256 of the asset ("sha256:<hex>"). The renderer
-        // passes this back into update_download_and_run so the installer can
-        // be verified before execution.
-        "assetDigest": asset_digest,
-    }))
+    Ok(update_check_result(&rel, &current, asset))
 }
 
 /// Download the `<installer>.minisig` sibling asset through the same
@@ -375,13 +661,22 @@ pub async fn update_check(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// `?...`, not on the path). Appending the suffix to the original release URL
 /// names the sibling asset, and its own redirect hop below is followed and
 /// re-validated independently.
+/// The `.minisig` sibling of a validated release-asset URL, built on the
+/// parsed path (no query or fragment can carry the suffix elsewhere).
+fn minisig_url(release_url: &url::Url) -> url::Url {
+    let mut sig = release_url.clone();
+    sig.set_query(None);
+    sig.set_fragment(None);
+    let path = format!("{}.minisig", release_url.path());
+    sig.set_path(&path);
+    sig
+}
+
 async fn download_minisig(
     client: &reqwest::Client,
     original_release_url: &url::Url,
 ) -> CmdResult<String> {
-    let mut sig_url_str = original_release_url.as_str().to_string();
-    sig_url_str.push_str(".minisig");
-    let mut current_url = validate_asset_url(&sig_url_str)?;
+    let mut current_url = validate_asset_url(minisig_url(original_release_url).as_str())?;
 
     // Same single-manual-redirect loop as the installer download: every hop
     // re-validated against the same allowlist.
@@ -446,7 +741,7 @@ pub async fn update_download_and_run(
     let mut current_url = validate_initial_asset_url(&url)?;
     // Preserve the repo-pinned release URL before the redirect loop mutates
     // `current_url` into the CDN object URL: the `.minisig` sibling must be
-    // resolved from THIS release-asset URL, not the redirected one (F7).
+    // resolved from THIS release-asset URL, not the redirected one.
     let original_release_url = current_url.clone();
 
     // Rollback guard. `update_check` compares versions, but this command takes
@@ -468,26 +763,14 @@ pub async fn update_download_and_run(
     // OLDER (still genuinely signed) asset URL - every signature check passes
     // while the install is a silent downgrade. The metadata (version number)
     // is not itself signed, so tie it to the URL that selects the signed
-    // bytes. This is checked at the same decision point as the rollback guard.
-    {
-        let tag_segment = original_release_url
-            .path_segments()
-            .and_then(|mut segs| {
-                // .../releases/download/<tag>/<asset>
-                segs.nth_back(1)
-            })
-            .unwrap_or("");
-        let claimed = version.trim().trim_start_matches('v');
-        let tag = tag_segment.trim_start_matches('v');
-        if tag.is_empty() || tag != claimed {
-            return Err(CmdError(format!(
-                "Refusing to install: the claimed version {version} does not match the \
-                 release tag in the asset URL ({tag_segment})."
-            )));
-        }
-    }
+    // bytes. This is checked at the same decision point as the rollback guard,
+    // and the signed trusted comment is checked against the same version.
+    let release_version = release_version_bound_to_url(&original_release_url, &version)?;
 
-    let ext = installer_ext(&url);
+    // From the validated, parsed path - never the raw string (see
+    // validate_initial_asset_url).
+    let ext = installer_ext(original_release_url.path());
+    let plan = launch_plan(ext);
 
     // AppImage self-replace: when the running app IS an AppImage (the
     // AppImage runtime exports `APPIMAGE` = absolute path of the running
@@ -495,7 +778,7 @@ pub async fn update_download_and_run(
     // opening it would just start a second instance. Stage the download in
     // the SAME directory as the running image so the final rename is atomic
     // on one filesystem, and refuse early if that path is unknown.
-    let appimage_target = if ext == ".AppImage" {
+    let appimage_target = if plan == LaunchPlan::ReplaceAppImage {
         match std::env::var("APPIMAGE") {
             Ok(p) if !p.trim().is_empty() && std::path::Path::new(p.trim()).is_file() => {
                 Some(std::path::PathBuf::from(p.trim()))
@@ -520,14 +803,17 @@ pub async fn update_download_and_run(
     // so it is filtered to filename-safe characters first - a hostile value
     // must not be able to steer the temp path outside the destination
     // directory.
-    let version = sanitize_version_for_filename(&version);
+    let file_version = sanitize_version_for_filename(&release_version);
     let rand_suffix = uuid::Uuid::new_v4().simple().to_string();
     let dest_dir = appimage_target
         .as_ref()
         .and_then(|t| t.parent())
         .map(|d| d.to_path_buf())
         .unwrap_or_else(std::env::temp_dir);
-    let dest = dest_dir.join(format!("sshspan-{}-update-{}{}", version, rand_suffix, ext));
+    let dest = dest_dir.join(format!(
+        "sshspan-{}-update-{}{}",
+        file_version, rand_suffix, ext
+    ));
 
     let client = reqwest::Client::builder()
         .user_agent("SSHSpan-Update-Download")
@@ -574,54 +860,16 @@ pub async fn update_download_and_run(
     })?;
 
     // Stream the body to disk with a hard size cap instead of buffering the
-    // whole installer in RAM.
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&dest)
-        .await
-        .map_err(|e| CmdError(e.to_string()))?;
-    use tokio::io::AsyncWriteExt;
-    let mut hasher = Sha256::new();
-    let mut downloaded: u64 = 0;
-    if let Some(len) = resp.content_length() {
-        if len > MAX_INSTALLER_BYTES {
-            return Err(CmdError(format!(
-                "Installer too large ({len} bytes, limit {MAX_INSTALLER_BYTES})."
-            )));
-        }
-    }
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| CmdError(format!("Download failed: {e}")))?
-    {
-        downloaded += chunk.len() as u64;
-        if downloaded > MAX_INSTALLER_BYTES {
-            return Err(CmdError(format!(
-                "Installer exceeded the {MAX_INSTALLER_BYTES} byte limit."
-            )));
-        }
-        hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| CmdError(e.to_string()))?;
-    }
-    file.flush().await.map_err(|e| CmdError(e.to_string()))?;
-    drop(file);
-
-    if downloaded == 0 {
-        let _ = tokio::fs::remove_file(&dest).await;
-        return Err(CmdError("Downloaded installer is empty.".into()));
-    }
+    // whole installer in RAM. From here on `staged` deletes the file again on
+    // every early return - a download, digest, signature or launch failure -
+    // instead of leaving up to 512 MiB behind per attempt (A7-42).
+    let (staged, actual) = download_installer_to(&mut resp, &dest, MAX_INSTALLER_BYTES).await?;
 
     // Integrity verification: refuse to execute anything whose SHA-256 does
     // not match the digest GitHub computed for the release asset.
-    let actual = format!("sha256:{:x}", hasher.finalize());
     match expected_sha256.as_deref() {
         Some(expected) if expected.eq_ignore_ascii_case(&actual) => { /* verified */ }
         Some(expected) => {
-            let _ = tokio::fs::remove_file(&dest).await;
             return Err(CmdError(format!(
                 "Installer integrity check FAILED (expected {expected}, got {actual}); \
                  refusing to run a possibly tampered download."
@@ -632,7 +880,6 @@ pub async fn update_download_and_run(
         // boundary, so an optional integrity check is one an attacker just
         // declines to supply. `update_check` always returns the digest.
         None => {
-            let _ = tokio::fs::remove_file(&dest).await;
             return Err(CmdError(
                 "Installer integrity check skipped: no expected digest was supplied. \
                  Re-run the update check and try again."
@@ -644,38 +891,25 @@ pub async fn update_download_and_run(
     // Signature verification: the digest above proves the download matches
     // the release, but both the binary and its digest come from the same
     // GitHub API response - whoever can alter one can alter the other. The
-    // minisign signature closes that gap by binding the installer to a key
-    // embedded in this binary. With the key provisioned this is fail-closed
+    // minisign signature binds the installer, and the release it is for, to
+    // a key embedded in this binary (see MINISIGN_PUBLIC_KEY for what that
+    // does and does not cover). With the key provisioned this is fail-closed
     // (missing/invalid signature = delete the installer and refuse to run);
     // until then it is skipped with a warning (digest check only), so
     // pre-provisioning builds keep updating.
     if minisign_key_provisioned(MINISIGN_PUBLIC_KEY) {
         // ANY signature problem - 404 (unsigned asset), network failure,
-        // oversized body, unparseable or invalid signature - deletes the
-        // installer and refuses to run it. There is deliberately no
-        // "unsigned release, carry on" path once the key is provisioned.
-        let sig = match download_minisig(&client, &original_release_url).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&dest).await;
-                return Err(e);
-            }
-        };
+        // oversized body, unparseable or invalid signature, a signature for
+        // another release - deletes the installer and refuses to run it.
+        // There is deliberately no "unsigned release, carry on" path once the
+        // key is provisioned.
+        let sig = download_minisig(&client, &original_release_url).await?;
         // The installer was streamed to disk; re-read it for verification
         // (bounded by the size cap already enforced during download).
-        let installer = match tokio::fs::read(&dest).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&dest).await;
-                return Err(CmdError(format!(
-                    "Could not re-read downloaded installer: {e}"
-                )));
-            }
-        };
-        if let Err(e) = verify_minisign_signature(&installer, &sig) {
-            let _ = tokio::fs::remove_file(&dest).await;
-            return Err(e);
-        }
+        let installer = tokio::fs::read(staged.path())
+            .await
+            .map_err(|e| CmdError(format!("Could not re-read downloaded installer: {e}")))?;
+        verify_minisign_signature(&installer, &sig, &release_version)?;
     } else {
         log::warn!(
             "MINISIGN_PUBLIC_KEY is still the build-time placeholder; \
@@ -683,54 +917,14 @@ pub async fn update_download_and_run(
         );
     }
 
-    // Launch the installer detached.
-    #[cfg(target_os = "windows")]
-    {
-        if ext == ".msi" {
-            std::process::Command::new("msiexec")
-                .args(["/i", &dest.display().to_string()])
-                .spawn()
-                .map_err(|e| CmdError(e.to_string()))?;
-        } else {
-            std::process::Command::new(&dest)
-                .spawn()
-                .map_err(|e| CmdError(e.to_string()))?;
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if ext == ".AppImage" {
-            // Self-replace the running AppImage: the new image was staged in
-            // the SAME directory (atomic same-filesystem rename), so make it
-            // executable and swap it over the running one. The old image's
-            // mount keeps its inode alive until this process exits, so the
-            // swap is safe mid-run; the user restarts into the new version.
-            use std::os::unix::fs::PermissionsExt;
-            let Some(target) = appimage_target.as_ref() else {
-                let _ = tokio::fs::remove_file(&dest).await;
-                return Err(CmdError(
-                    "AppImage update refused: the running image path is unknown.".into(),
-                ));
-            };
-            tokio::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-                .await
-                .map_err(|e| CmdError(e.to_string()))?;
-            tokio::fs::rename(&dest, target).await.map_err(|e| {
-                CmdError(format!(
-                    "Could not replace the running AppImage ({}): {e}",
-                    target.display()
-                ))
-            })?;
-        } else {
-            // Open with the desktop's package-installer handler (GNOME Software /
-            // KDE Discover handle .deb/.rpm), which prompts for the root password.
-            opener::open(&dest).map_err(|e| CmdError(e.to_string()))?;
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        opener::open(&dest).map_err(|e| CmdError(e.to_string()))?;
-    }
+    launch_installer(plan, staged.path(), appimage_target.as_deref()).await?;
+    let installed_path = match appimage_target.as_ref() {
+        Some(target) => target.display().to_string(),
+        None => dest.display().to_string(),
+    };
+    // The OS has the installer now (or it replaced the AppImage): it must
+    // outlive this process. A later start prunes it once it is a day old.
+    staged.keep();
 
     // Respond to the renderer first, then exit so our files unlock and the
     // installer (already running detached) takes over.
@@ -739,15 +933,162 @@ pub async fn update_download_and_run(
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         app_for_exit.exit(0);
     });
-    let installed_path = if cfg!(target_os = "linux") && ext == ".AppImage" {
-        appimage_target
-            .as_ref()
-            .map(|t| t.display().to_string())
-            .unwrap_or_else(|| dest.display().to_string())
-    } else {
-        dest.display().to_string()
-    };
     Ok(serde_json::json!({ "ok": true, "installer": installed_path }))
+}
+
+/// The release version an installer URL is bound to: the `<tag>` segment of
+/// `.../releases/download/<tag>/<asset>`, which must equal the claimed
+/// `version` (a leading `v` ignored on both sides). Returned without the `v`.
+fn release_version_bound_to_url(release_url: &url::Url, version: &str) -> CmdResult<String> {
+    let tag_segment = release_url
+        .path_segments()
+        // .../releases/download/<tag>/<asset>
+        .and_then(|mut segs| segs.nth_back(1))
+        .unwrap_or("");
+    let claimed = version.trim().trim_start_matches('v');
+    let tag = tag_segment.trim_start_matches('v');
+    if tag.is_empty() || tag != claimed {
+        return Err(CmdError(format!(
+            "Refusing to install: the claimed version {version} does not match the \
+             release tag in the asset URL ({tag_segment})."
+        )));
+    }
+    Ok(claimed.to_string())
+}
+
+/// Start the verified installer at `installer` the way `plan` says.
+///
+/// Accepted risk: the installer is started by path from
+/// a folder the user can write to (the temp folder, or the AppImage's folder),
+/// re-opened after its digest and signature were checked. Another process
+/// running as the same user could swap the file in between. That process can
+/// already run code as the user, and the UAC prompt the NSIS installer raises
+/// is not a security boundary against same-user code, so this is not closed
+/// here.
+async fn launch_installer(
+    plan: LaunchPlan,
+    installer: &std::path::Path,
+    appimage_target: Option<&std::path::Path>,
+) -> CmdResult<()> {
+    match plan {
+        LaunchPlan::Msiexec => launch_msi(installer),
+        LaunchPlan::ShellOpen => {
+            // ShellExecute does not return while the UAC prompt is up, so it
+            // runs on the blocking pool. On Linux this is the desktop's
+            // package-installer handler (GNOME Software / KDE Discover open
+            // .deb/.rpm and ask for the root password).
+            let path = installer.to_path_buf();
+            tauri::async_runtime::spawn_blocking(move || shell_open_installer(&path))
+                .await
+                .map_err(|e| CmdError(format!("Could not start the installer: {e}")))?
+        }
+        LaunchPlan::ReplaceAppImage => replace_running_appimage(installer, appimage_target).await,
+    }
+}
+
+/// Windows' "the user declined" error (UAC prompt answered No).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const ERROR_CANCELLED: i32 = 1223;
+
+/// The error for an installer the OS shell did not start.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn installer_launch_error(error: &std::io::Error) -> CmdError {
+    if error.raw_os_error() == Some(ERROR_CANCELLED) {
+        CmdError("Update cancelled - Windows did not get permission to run the installer.".into())
+    } else {
+        CmdError(format!("Could not start the installer: {error}"))
+    }
+}
+
+/// Hand the installer to the shell exactly once: ShellExecuteExW "open",
+/// which raises the UAC prompt. `opener::open` retried ShellExecuteW on ANY
+/// error, so a declined prompt was shown a second time.
+#[cfg(target_os = "windows")]
+fn shell_open_installer(installer: &std::path::Path) -> CmdResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
+    let file: Vec<u16> = installer
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: SHELLEXECUTEINFOW is plain data for which all-zero is a valid
+    // value; the fields set below are the required ones.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    // SW_SHOWNORMAL
+    info.nShow = 1;
+    // SAFETY: `info` is initialized and its string pointers (`file`, `verb`)
+    // are NUL-terminated buffers that outlive the call.
+    if unsafe { ShellExecuteExW(&mut info) } != 0 {
+        Ok(())
+    } else {
+        Err(installer_launch_error(&std::io::Error::last_os_error()))
+    }
+}
+
+/// Elsewhere the desktop's handler opens the package (`xdg-open` and kin).
+#[cfg(not(target_os = "windows"))]
+fn shell_open_installer(installer: &std::path::Path) -> CmdResult<()> {
+    opener::open(installer).map_err(|e| CmdError(format!("Could not start the installer: {e}")))
+}
+
+#[cfg(target_os = "windows")]
+fn launch_msi(installer: &std::path::Path) -> CmdResult<()> {
+    std::process::Command::new("msiexec")
+        .arg("/i")
+        .arg(installer)
+        .spawn()
+        .map(drop)
+        .map_err(|e| CmdError(format!("Could not start the installer: {e}")))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn launch_msi(_installer: &std::path::Path) -> CmdResult<()> {
+    Err(CmdError(
+        "A Windows Installer package cannot be installed on this system.".into(),
+    ))
+}
+
+/// Self-replace the running AppImage: the new image was staged in the SAME
+/// directory (atomic same-filesystem rename), so make it executable and swap
+/// it over the running one. The old image's mount keeps its inode alive until
+/// this process exits, so the swap is safe mid-run; the user restarts into
+/// the new version.
+#[cfg(target_os = "linux")]
+async fn replace_running_appimage(
+    staged: &std::path::Path,
+    target: Option<&std::path::Path>,
+) -> CmdResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(target) = target else {
+        return Err(CmdError(
+            "AppImage update refused: the running image path is unknown.".into(),
+        ));
+    };
+    tokio::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o755))
+        .await
+        .map_err(|e| CmdError(e.to_string()))?;
+    tokio::fs::rename(staged, target).await.map_err(|e| {
+        CmdError(format!(
+            "Could not replace the running AppImage ({}): {e}",
+            target.display()
+        ))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn replace_running_appimage(
+    _staged: &std::path::Path,
+    _target: Option<&std::path::Path>,
+) -> CmdResult<()> {
+    Err(CmdError(
+        "An AppImage update can only be installed on Linux.".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -804,6 +1145,97 @@ mod tests {
             assert!(
                 validate_initial_asset_url(url).is_err(),
                 "expected rejection of {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_url_must_be_exactly_a_release_asset() {
+        // A fragment or query changed the launch plan and the .minisig
+        // URL, which were derived from the raw string.
+        for url in [
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/SSHSpan_1.10.0_x64-setup.exe#.AppImage",
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/SSHSpan_1.10.0_x64-setup.exe?x=.msi",
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/sub/x.exe",
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/",
+            "https://github.com/AGSQ11/SSHSpan/releases/download//x.exe",
+        ] {
+            assert!(validate_initial_asset_url(url).is_err(), "{url}");
+        }
+        let ok = validate_initial_asset_url(
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/SSHSpan_1.10.0_x64-setup.exe",
+        )
+        .unwrap();
+        assert_eq!(installer_ext(ok.path()), ".exe");
+    }
+
+    #[test]
+    fn minisig_url_is_built_on_the_parsed_path() {
+        let url = validate_initial_asset_url(
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/SSHSpan_1.10.0_x64-setup.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            minisig_url(&url).as_str(),
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/SSHSpan_1.10.0_x64-setup.exe.minisig"
+        );
+    }
+
+    #[test]
+    fn declined_uac_prompt_reads_as_cancelled() {
+        let declined = std::io::Error::from_raw_os_error(1223);
+        assert_eq!(
+            installer_launch_error(&declined).0,
+            "Update cancelled - Windows did not get permission to run the installer."
+        );
+        let other = std::io::Error::from_raw_os_error(2);
+        assert!(installer_launch_error(&other)
+            .0
+            .starts_with("Could not start the installer: "));
+    }
+
+    #[test]
+    fn staged_installer_names_match_only_the_generated_shape() {
+        // The old prefix test matched files that are not ours.
+        for foreign in [
+            "sshspan-notes-update-2026.txt",
+            "sshspan--update-",
+            "sshspan-1.9.2-update-0123abcd.exe",
+            "sshspan-1.9.2-update-0123456789ABCDEF0123456789ABCDEF.exe",
+            "sshspan-1.9.2-update-0123456789abcdef0123456789abcdef.exe.bak",
+            "sshspan--update-0123456789abcdef0123456789abcdef.exe",
+        ] {
+            assert!(!is_staged_installer_name(foreign), "{foreign}");
+        }
+        for ours in [
+            "sshspan-1.9.2-update-0123456789abcdef0123456789abcdef.exe",
+            "sshspan-1.10.0-rc1-update-fedcba9876543210fedcba9876543210.AppImage",
+            "sshspan-unknown-update-00000000000000000000000000000000.msi",
+        ] {
+            assert!(is_staged_installer_name(ours), "{ours}");
+        }
+    }
+
+    #[test]
+    fn asset_url_tag_binds_the_claimed_version() {
+        let url = validate_initial_asset_url(
+            "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/SSHSpan_1.10.0_x64-setup.exe",
+        )
+        .unwrap();
+        // The bound version is what the signed trusted comment is checked
+        // against, without the tag's `v`.
+        assert_eq!(
+            release_version_bound_to_url(&url, "1.10.0").unwrap(),
+            "1.10.0"
+        );
+        assert_eq!(
+            release_version_bound_to_url(&url, "v1.10.0").unwrap(),
+            "1.10.0"
+        );
+        for other in ["1.9.0", "1.10", "", "1.10.0.1"] {
+            assert!(
+                release_version_bound_to_url(&url, other).is_err(),
+                "{other:?}"
             );
         }
     }
@@ -1161,17 +1593,277 @@ RURZlujGKpcBlV9Y3Of2Aq8JpnTqJciEKaKsGZN1PEnSLAvM32YiLeMCo5j0nqtZFXxi79QXGTljTGHW
 trusted comment: sshspan-updater-test
 SWYMI+zOPB2iL5kCX2udBtoWCA9aGT7AvUVmT4Xa1CDTDUadQKeArHOsgGjFxnV/3xtgKHY5t3aUFcma2FDgBg==";
 
-    /// verify_with_key runs the same verification update_download_and_run
-    /// performs, but against a caller-chosen key so tests can exercise the
-    /// provisioned path without touching the shipped placeholder const.
+    /// Valid signature over TEST_BLOB whose trusted comment is the one the
+    /// release workflow writes for tag v1.8.0 (`-t "SSHSpan release v1.8.0"`):
+    /// `make_sig(TEST_BLOB, b"SSHSpan release v1.8.0")` in
+    /// scripts/gen_minisign_test_vector.py. Same signature line as
+    /// TEST_SIG_GOOD - only the comment and the global signature differ.
+    const TEST_SIG_RELEASE_1_8_0: &str = "untrusted comment: signature from minisign secret key
+RURZlujGKpcBldENeLIUcGNlFb9xFwGX+iU02JbswtWWQcwT/WyI+zphVZmp33Z68qq7K87GPIrQ5pq8bDM5D5cq4jrREOolrw4=
+trusted comment: SSHSpan release v1.8.0
+uZHs1rxpejlQPSqtY5OIsWoGXMtzkT6Ac4PgoGlqPqltUpAed6uknY84aGivUuEWW6tHflTgt7iFPCgiqm/mAQ==";
+
+    /// The shipped verification (`verify_minisign_with_key`) against a
+    /// caller-chosen key, for an installer claimed to be v1.8.0.
     fn verify_with_key(key_b64: &str, blob: &[u8], sig_body: &str) -> Result<(), String> {
-        let pubkey =
-            minisign_verify::PublicKey::from_base64(key_b64).map_err(|e| format!("key: {e}"))?;
-        let signature =
-            minisign_verify::Signature::decode(sig_body).map_err(|e| format!("sig: {e}"))?;
-        pubkey
-            .verify(blob, &signature, false)
-            .map_err(|e| e.to_string())
+        verify_minisign_with_key(key_b64, blob, sig_body, "1.8.0").map_err(|e| e.0)
+    }
+
+    // ── Signature bound to the claimed release (A6-05) ──────────────────────
+
+    #[test]
+    fn release_signature_verifies_for_the_version_it_names() {
+        for claimed in ["1.8.0", "v1.8.0", " 1.8.0 "] {
+            verify_minisign_with_key(
+                TEST_MINISIGN_PUBKEY,
+                TEST_BLOB,
+                TEST_SIG_RELEASE_1_8_0,
+                claimed,
+            )
+            .unwrap_or_else(|e| panic!("{claimed:?}: {}", e.0));
+        }
+    }
+
+    #[test]
+    fn genuine_signature_of_another_release_is_refused() {
+        // The replay A6-05 describes: the genuine v1.8.0 installer and its
+        // genuine .minisig re-published under tag v1.10.0. Bytes, digest and
+        // signature are all real; only the signed comment tells the truth.
+        let err = verify_minisign_with_key(
+            TEST_MINISIGN_PUBKEY,
+            TEST_BLOB,
+            TEST_SIG_RELEASE_1_8_0,
+            "1.10.0",
+        )
+        .expect_err("a signature for v1.8.0 must not install as v1.10.0");
+        assert!(err.0.contains("SSHSpan release v1.10.0"), "{}", err.0);
+        assert!(err.0.contains("SSHSpan release v1.8.0"), "{}", err.0);
+        // Near misses do not match either.
+        for claimed in ["1.8", "1.8.0.1", "1.8.00", "1.8.0-rc1", ""] {
+            assert!(
+                verify_minisign_with_key(
+                    TEST_MINISIGN_PUBKEY,
+                    TEST_BLOB,
+                    TEST_SIG_RELEASE_1_8_0,
+                    claimed
+                )
+                .is_err(),
+                "{claimed:?}"
+            );
+        }
+        // A valid signature whose comment is not a release comment at all.
+        assert!(
+            verify_minisign_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, TEST_SIG_GOOD, "1.8.0")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn edited_trusted_comment_breaks_the_signature() {
+        // Rewriting the comment to name the claimed version is caught by the
+        // global signature, which covers the comment.
+        let forged =
+            TEST_SIG_RELEASE_1_8_0.replace("SSHSpan release v1.8.0", "SSHSpan release v1.10.0");
+        let err = verify_minisign_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, &forged, "1.10.0")
+            .expect_err("an edited trusted comment must fail");
+        assert!(err.0.contains("FAILED"), "{}", err.0);
+    }
+
+    // ── Update check: newer release, no installer for this OS (A2-41) ───────
+
+    fn release(tag: &str) -> GhRelease {
+        GhRelease {
+            tag_name: tag.to_string(),
+            body: Some("release notes".into()),
+            assets: Vec::new(),
+        }
+    }
+
+    fn release_asset(name: &str) -> GhAsset {
+        GhAsset {
+            name: name.to_string(),
+            browser_download_url: format!(
+                "https://github.com/AGSQ11/SSHSpan/releases/download/v1.10.0/{name}"
+            ),
+            digest: Some("sha256:00ff".into()),
+        }
+    }
+
+    #[test]
+    fn newer_release_without_an_installer_reports_newer_version() {
+        let out = update_check_result(&release("v1.10.0"), "1.9.1", None);
+        assert_eq!(out["available"], false);
+        assert_eq!(out["newerVersion"], "1.10.0");
+        assert_eq!(out["version"], "1.10.0");
+        assert_eq!(out["assetUrl"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn newer_release_with_an_installer_is_available() {
+        let asset = release_asset("SSHSpan_1.10.0_x64-setup.exe");
+        let out = update_check_result(&release("v1.10.0"), "1.9.1", Some(&asset));
+        assert_eq!(out["available"], true);
+        assert_eq!(out["newerVersion"], "1.10.0");
+        assert_eq!(out["assetUrl"], asset.browser_download_url.as_str());
+        assert_eq!(out["assetDigest"], "sha256:00ff");
+        assert_eq!(out["current"], "1.9.1");
+        assert_eq!(out["notes"], "release notes");
+    }
+
+    #[test]
+    fn current_older_or_unknown_release_has_no_newer_version() {
+        let asset = release_asset("SSHSpan_1.9.1_x64-setup.exe");
+        for tag in ["v1.9.1", "v1.8.0", "nightly"] {
+            let out = update_check_result(&release(tag), "1.9.1", Some(&asset));
+            assert_eq!(out["available"], false, "{tag}");
+            assert_eq!(out["newerVersion"], serde_json::Value::Null, "{tag}");
+            assert_eq!(out["assetUrl"], serde_json::Value::Null, "{tag}");
+        }
+    }
+
+    // ── How the installer is started (A7-10) ────────────────────────────────
+
+    #[test]
+    fn nsis_installer_is_started_through_the_shell() {
+        // `installMode: both` gives the NSIS installer a manifest that needs
+        // administrator rights. CreateProcess (Command::spawn) cannot start
+        // that from an unelevated app (error 740); ShellExecute can, because
+        // it raises the UAC prompt.
+        assert_eq!(launch_plan(".exe"), LaunchPlan::ShellOpen);
+        assert_eq!(launch_plan(".msi"), LaunchPlan::Msiexec);
+        assert_eq!(launch_plan(".AppImage"), LaunchPlan::ReplaceAppImage);
+        assert_eq!(launch_plan(".deb"), LaunchPlan::ShellOpen);
+        assert_eq!(launch_plan(".rpm"), LaunchPlan::ShellOpen);
+    }
+
+    // ── Downloaded installers are cleaned up (A7-42) ────────────────────────
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sshspan-ru5-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn refused_download_leaves_no_partial_installer() {
+        let dir = scratch_dir("partial");
+        let dest = dir.join("sshspan-1.10.0-update-x.exe");
+        // 33 bytes against a 32-byte cap, refused after the file was created.
+        let mut resp = make_response(200, &[], vec![b'a'; 33]);
+        let err = download_installer_to(&mut resp, &dest, 32)
+            .await
+            .err()
+            .expect("an over-cap download must fail");
+        assert!(
+            err.0.contains("too large") || err.0.contains("exceeded"),
+            "{}",
+            err.0
+        );
+        assert!(!dest.exists(), "the partial installer must be deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_download_leaves_no_file() {
+        let dir = scratch_dir("empty");
+        let dest = dir.join("sshspan-1.10.0-update-x.exe");
+        let mut resp = make_response(200, &[], Vec::new());
+        let err = download_installer_to(&mut resp, &dest, 32)
+            .await
+            .err()
+            .expect("an empty download must fail");
+        assert!(err.0.contains("empty"), "{}", err.0);
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn staged_installer_is_deleted_unless_kept() {
+        let dir = scratch_dir("staged");
+        // Dropped without keep(): a later digest, signature or launch failure.
+        let dest = dir.join("sshspan-1.10.0-update-a.exe");
+        let mut resp = make_response(200, &[], b"installer bytes".to_vec());
+        let (staged, digest) = download_installer_to(&mut resp, &dest, 1024).await.unwrap();
+        assert_eq!(digest, sha256_hex(b"installer bytes"));
+        assert_eq!(staged.path(), dest.as_path());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"installer bytes");
+        drop(staged);
+        assert!(
+            !dest.exists(),
+            "an installer that never ran must be deleted"
+        );
+        // Kept: the installer must outlive the app (a later start prunes it).
+        let kept = dir.join("sshspan-1.10.0-update-b.exe");
+        let mut resp = make_response(200, &[], b"installer bytes".to_vec());
+        let (staged, _) = download_installer_to(&mut resp, &kept, 1024).await.unwrap();
+        staged.keep();
+        assert!(kept.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_file_already_at_the_staging_path_is_refused_and_left_alone() {
+        let dir = scratch_dir("planted");
+        let dest = dir.join("sshspan-1.10.0-update-x.exe");
+        std::fs::write(&dest, b"not ours").unwrap();
+        let mut resp = make_response(200, &[], b"installer".to_vec());
+        assert!(download_installer_to(&mut resp, &dest, 1024).await.is_err());
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"not ours",
+            "a file the updater did not create must never be overwritten or deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_prune_removes_only_stale_staged_installers() {
+        let dir = scratch_dir("prune");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        let make = |name: &str, modified: Option<std::time::SystemTime>| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            if let Some(t) = modified {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap();
+            }
+            path
+        };
+        let stale_exe = make(
+            "sshspan-1.9.2-update-0123456789abcdef0123456789abcdef.exe",
+            Some(old),
+        );
+        let stale_appimage = make(
+            "sshspan-1.9.2-update-89ef89ef89ef89ef89ef89ef89ef89ef.AppImage",
+            Some(old),
+        );
+        let fresh = make(
+            "sshspan-1.9.2-update-45674567456745674567456745674567.exe",
+            None,
+        );
+        let unrelated = make("othertool-1.0-update-1.exe", Some(old));
+        let ours_but_not_an_update = make("sshspan-notes.txt", Some(old));
+        let folder = dir.join("sshspan-1.0.0-update-dddddddddddddddddddddddddddddddd.exe");
+        std::fs::create_dir(&folder).unwrap();
+
+        assert_eq!(prune_stale_update_files(&dir, STALE_UPDATE_MAX_AGE), 2);
+        assert!(!stale_exe.exists() && !stale_appimage.exists());
+        assert!(fresh.exists(), "a fresh installer may still be running");
+        assert!(unrelated.exists() && ours_but_not_an_update.exists());
+        assert!(folder.is_dir(), "directories are never touched");
+        // A missing directory is simply nothing to prune.
+        assert_eq!(
+            prune_stale_update_files(&dir.join("absent"), STALE_UPDATE_MAX_AGE),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Installer extension derivation ──────────────────────────────────────
@@ -1282,7 +1974,7 @@ SWYMI+zOPB2iL5kCX2udBtoWCA9aGT7AvUVmT4Xa1CDTDUadQKeArHOsgGjFxnV/3xtgKHY5t3aUFcma
 
     #[test]
     fn minisign_good_signature_verifies() {
-        verify_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, TEST_SIG_GOOD)
+        verify_with_key(TEST_MINISIGN_PUBKEY, TEST_BLOB, TEST_SIG_RELEASE_1_8_0)
             .expect("a real minisign pre-hashed signature over the exact bytes must verify");
     }
 

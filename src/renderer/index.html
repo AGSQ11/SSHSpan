@@ -88,19 +88,31 @@
           <!-- The category filter used to live here as well as in the sidebar
                tree AND in a modal picker: three controls over one piece of
                state. The tree is now the only place you filter; the breadcrumb
-               in the topbar says what is filtered and clears it. -->
+               in the topbar says what is filtered and clears it. Below 900px
+               the sidebar is a narrow rail with no room for the tree, so this
+               button opens the same tree as a drawer (A1-06). -->
+          <button id="catDrawerBtn" class="ghost-btn cat-drawer-btn" type="button" aria-controls="catPanel" aria-expanded="false" title="Show the category tree"><span data-ico="folder"></span>Categories</button>
           <span class="spacer"></span>
           <span class="count-chip" id="keyCount" hidden></span>
-          <button id="newKeyBtn" class="primary-btn"><span data-ico="plus"></span>New key</button>
+          <button id="newKeyBtn" class="primary-btn" title="New key (Ctrl+N)"><span data-ico="plus"></span><span class="btn-label">New key</span></button>
         </div>
         <div class="keys-layout">
           <div class="key-list-col">
+            <!-- Select every key shown (A5-34): a bulk deploy was one click per
+                 key. It acts on what the search and filters leave visible. -->
+            <div class="key-list-head" id="keyListHead" hidden>
+              <label class="select-all"><input type="checkbox" id="selectAllKeys" /><span id="selectAllLabel">Select all</span></label>
+            </div>
             <div class="key-list" id="keyList"></div>
+            <!-- No keys to show: the first-run card, or - while the vault is
+                 locked or there is none yet - what to do first
+                 (paintEmptyKeys, app.js). -->
             <div class="empty-state" id="emptyState" hidden>
               <div class="empty-ico" data-ico="key-round"></div>
-              <h3>No keys yet</h3>
-              <p>Generate or import your first SSH key pair.</p>
-              <button id="emptyNewBtn" class="ghost-btn">+ New Key</button>
+              <h3 id="emptyTitle">No keys yet</h3>
+              <p id="emptyText">Generate or import your first SSH key pair.</p>
+              <button id="emptyNewBtn" class="ghost-btn">+ New key</button>
+              <button id="emptyUnlockBtn" class="primary-btn" hidden>Unlock</button>
             </div>
             <!-- Selection acts here, where the selection is. Deploy used to be a
                  separate top-level view whose own copy read "select keys using
@@ -125,21 +137,25 @@
                  out of the vault. It used to sit below "Copy public key" at the
                  same weight, with a passphrase box permanently on screen even
                  for the formats that ignore it. It gets its own tab. -->
-            <div class="detail-tabs" role="tablist">
-              <button class="detail-tab active" data-detail-tab="overview" role="tab" aria-selected="true">Overview</button>
-              <button class="detail-tab" data-detail-tab="export" role="tab" aria-selected="false"><span data-ico="download"></span>Export</button>
+            <!-- A full tab pattern (A1-36): one tab stop, arrow keys, and each tab
+                 names the panel it shows. -->
+            <div class="detail-tabs" role="tablist" aria-label="Key details">
+              <button class="detail-tab active" id="detailTab-overview" data-detail-tab="overview" role="tab" aria-selected="true" aria-controls="detailPanel-overview" tabindex="0">Overview</button>
+              <button class="detail-tab" id="detailTab-export" data-detail-tab="export" role="tab" aria-selected="false" aria-controls="detailPanel-export" tabindex="-1"><span data-ico="download"></span>Export</button>
             </div>
 
-            <div class="detail-panel" id="detailPanel-overview">
+            <div class="detail-panel" id="detailPanel-overview" role="tabpanel" aria-labelledby="detailTab-overview">
               <dl class="detail-meta" id="detailMeta"></dl>
-              <label class="detail-label">Categories</label>
+              <!-- Deploy's inverse (A7-22 / A5-43): only for a deployed key. -->
+              <button id="detailUndeployBtn" class="ghost-btn undeploy-btn" type="button" hidden title="Delete the deployed key file and its Host block; the key stays in the vault"><span data-ico="trash-2"></span>Remove deployed copy</button>
+              <h3 class="detail-label">Categories</h3>
               <div class="cat-chips" id="detailCategories"></div>
-              <label class="detail-label">Fingerprint</label>
+              <h3 class="detail-label">Fingerprint</h3>
               <div class="copy-row">
                 <code class="mono" id="detailFingerprint">-</code>
                 <button class="icon-btn" id="detailCopyFprBtn" title="Copy fingerprint"></button>
               </div>
-              <label class="detail-label">Public key (authorized_keys)</label>
+              <h3 class="detail-label">Public key (authorized_keys)</h3>
               <div class="copy-row block">
                 <textarea class="mono" id="detailAuthorized" rows="3" readonly spellcheck="false" aria-label="authorized_keys line for this key"></textarea>
                 <button class="ghost-btn copy-float" id="detailCopyPublicBtn"><span data-ico="copy"></span>Copy</button>
@@ -151,12 +167,12 @@
               </div>
             </div>
 
-            <div class="detail-panel" id="detailPanel-export" hidden>
+            <div class="detail-panel" id="detailPanel-export" role="tabpanel" aria-labelledby="detailTab-export" hidden>
               <div class="warn-note">
                 <span data-ico="triangle-alert"></span>
                 <span>Exporting writes key material outside the vault. Anyone who can read the file can use the key. The export is recorded in the audit log.</span>
               </div>
-              <label class="detail-label">Format</label>
+              <h3 class="detail-label">Format</h3>
               <div class="format-list" id="exportFormatList" role="radiogroup" aria-label="Export format"></div>
               <!-- Kept for the existing export path, which reads .value off both.
                    They mirror the radio list rather than being a second control. -->
@@ -168,8 +184,8 @@
                 <option value="public-pem">Public key PEM (SPKI)</option>
                 <option value="authorized_keys">authorized_keys line</option>
               </select>
-              <label class="detail-label" id="exportPassLabel" hidden>Passphrase for the exported file</label>
-              <input type="password" id="detailExportPass" placeholder="Required for an encrypted export" hidden />
+              <label class="detail-label" id="exportPassLabel" for="detailExportPass" hidden>Passphrase for the exported file</label>
+              <input type="password" id="detailExportPass" placeholder="Required for an encrypted export" autocomplete="off" hidden />
               <button id="detailExportBtn" class="primary-btn wide"><span data-ico="download"></span><span id="detailExportBtnLabel">Choose where to save...</span></button>
               <p class="hint" id="exportHint">Private material is serialised in the Rust process and written straight to the file you pick - it never crosses into this window.</p>
             </div>
@@ -185,8 +201,9 @@
                 <span class="search-ico" data-ico="search"></span>
                 <input type="search" id="serverSearch" placeholder="Search servers..." />
               </div>
-              <button id="serverImportBtn" class="ghost-btn" title="Import a Host block from ~/.ssh/config"><span data-ico="file-text"></span>Config</button>
+              <button id="serverImportBtn" class="ghost-btn" title="Import a Host block from ~/.ssh/config" aria-haspopup="menu" aria-expanded="false"><span data-ico="file-text"></span>Config</button>
               <button id="serverNewBtn" class="primary-btn" title="New server"><span data-ico="plus"></span>New</button>
+              <button id="serverCatDrawerBtn" class="ghost-btn cat-drawer-btn" type="button" aria-controls="catPanel" aria-expanded="false" aria-label="Categories" title="Server categories"><span data-ico="folder"></span></button>
             </div>
             <div class="server-list" id="serverList"></div>
             <div class="empty-state small" id="serverEmpty" hidden>
@@ -207,19 +224,29 @@
                      at the shell, so the label was unreadable either way. Split
                      exists because editing a file and running a command is one
                      task, not two modes. -->
+                <!-- Every label is a .btn-label: in a narrow header the buttons
+                     show their icons only, the label still their name and the
+                     title a tooltip (they used to be clipped). -->
                 <div class="seg mode-seg" id="termModeSeg" hidden role="tablist" aria-label="Session surface">
-                  <button type="button" class="seg-btn active" data-mode="ssh" role="tab" title="Terminal only (Ctrl+Shift+1)"><span data-ico="terminal"></span>Shell</button>
-                  <button type="button" class="seg-btn" data-mode="sftp" role="tab" title="File browser only (Ctrl+Shift+2)"><span data-ico="folder-tree"></span>Files</button>
-                  <button type="button" class="seg-btn" data-mode="split" role="tab" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span>Split</button>
+                  <button type="button" class="seg-btn active" data-mode="ssh" role="tab" aria-selected="true" aria-controls="sessionSurface" tabindex="0" title="Terminal only (Ctrl+Shift+1)"><span data-ico="terminal"></span><span class="btn-label">Shell</span></button>
+                  <button type="button" class="seg-btn" data-mode="sftp" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="File browser only (Ctrl+Shift+2)"><span data-ico="folder-tree"></span><span class="btn-label">Files</span></button>
+                  <button type="button" class="seg-btn" data-mode="split" role="tab" aria-selected="false" aria-controls="sessionSurface" tabindex="-1" title="Both, side by side (Ctrl+Shift+3)"><span data-ico="columns-2"></span><span class="btn-label">Split</span></button>
                 </div>
-                <button id="termTestBtn" class="ghost-btn" hidden><span data-ico="plug-zap"></span>Test</button>
-                <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)"><span data-ico="message-square"></span>Assistant</button>
-                <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span>Reconnect</button>
-                <button id="termDisconnectBtn" class="danger-btn" hidden><span data-ico="x"></span>Disconnect</button>
+                <button id="termTestBtn" class="ghost-btn" title="Test the connection to this server" hidden><span data-ico="plug-zap"></span><span class="btn-label">Test</span></button>
+                <button id="assistantToggleBtn" class="ghost-btn" title="AI assistant (Ctrl+Shift+A)" aria-pressed="false" aria-controls="assistantPanel"><span data-ico="message-square"></span><span class="btn-label">Assistant</span></button>
+                <!-- While a tab connects (A5-10): the backend cannot abort a
+                     handshake, but the tab gives up on it and a session that
+                     still arrives is disconnected. -->
+                <button id="termCancelBtn" class="ghost-btn" title="Cancel connecting" hidden><span data-ico="x"></span><span class="btn-label">Cancel</span></button>
+                <button id="termReconnectBtn" class="ghost-btn" hidden><span data-ico="refresh-cw"></span><span class="btn-label">Reconnect</span></button>
+                <button id="termDisconnectBtn" class="danger-btn" title="Disconnect this session" hidden><span data-ico="x"></span><span class="btn-label">Disconnect</span></button>
+                <!-- In the header, not floating over the last column of the
+                     terminal at 35% opacity (A1-38). -->
+                <button id="termMaxBtn" class="icon-btn term-max-btn" type="button" title="Expand the terminal to the whole window (Ctrl+Shift+M)" aria-label="Maximize terminal" aria-pressed="false" data-ico="maximize-2"></button>
               </div>
             </div>
             <div class="term-tabs" id="termTabs">
-              <div class="term-tab-add" id="termTabAdd" title="New connection - pick a server from the list"><span data-ico="plus"></span></div>
+              <button type="button" class="term-tab-add" id="termTabAdd" title="New connection - pick a server from the list" aria-label="New session - pick a server from the list"><span data-ico="plus"></span></button>
             </div>
             <!-- Wrapper so the two surfaces can sit side by side in split mode;
                  the column itself stacks, so they could only ever swap before. -->
@@ -227,34 +254,45 @@
               <div class="terminal-body" id="terminalBody"></div>
               <div class="surface-splitter" id="surfaceSplitter" hidden></div>
               <div class="sftp-body" id="sftpBody"></div>
-              <aside class="assistant-panel" id="assistantPanel" hidden>
+              <aside class="assistant-panel" id="assistantPanel" aria-label="AI assistant" hidden>
                 <header class="ai-head">
                   <span class="ai-title"><span data-ico="message-square"></span>AI assistant</span>
                   <span class="ai-yolo-badge" id="assistantYoloBadge" hidden>YOLO</span>
-                  <button class="icon-btn ai-close" id="assistantCloseBtn" title="Close assistant" data-ico="x"></button>
+                  <!-- Clears this tab's conversation and the context resent to
+                       the model; the access level stays (A4-16). -->
+                  <button type="button" class="ghost-btn ai-new-chat" id="assistantNewChatBtn" title="Start a new conversation in this tab (the access level stays)">New chat</button>
+                  <button type="button" class="icon-btn ai-close" id="assistantCloseBtn" title="Close assistant" aria-label="Close assistant" data-ico="x"></button>
                 </header>
                 <div class="ai-levels">
-                  <div class="seg ai-level-seg" id="assistantLevelSeg" role="tablist" aria-label="Assistant access level">
-                    <button type="button" class="seg-btn level-read active" data-level="read" role="tab" title="Advise only">Read</button>
-                    <button type="button" class="seg-btn level-draft" data-level="draft" role="tab" title="Type, never submit">Draft</button>
-                    <button type="button" class="seg-btn level-execute" data-level="execute" role="tab" title="Run with approval">Execute</button>
-                    <button type="button" class="seg-btn level-yolo" data-level="yolo" role="tab" title="Full autonomy - dangerous">YOLO</button>
+                  <!-- Radio semantics (A1-36): one tab stop, arrows move the
+                       focus, Enter/Space choose - manual, since YOLO opens a
+                       confirmation dialog. -->
+                  <div class="seg ai-level-seg" id="assistantLevelSeg" role="radiogroup" aria-label="Assistant access level" aria-describedby="assistantLevelCaption">
+                    <button type="button" class="seg-btn level-read active" data-level="read" role="radio" aria-checked="true" tabindex="0" title="Advise only">Read</button>
+                    <button type="button" class="seg-btn level-draft" data-level="draft" role="radio" aria-checked="false" tabindex="-1" title="Type, never submit">Draft</button>
+                    <button type="button" class="seg-btn level-execute" data-level="execute" role="radio" aria-checked="false" tabindex="-1" title="Run with approval">Execute</button>
+                    <button type="button" class="seg-btn level-yolo" data-level="yolo" role="radio" aria-checked="false" tabindex="-1" title="Full autonomy - dangerous">YOLO</button>
                   </div>
                   <div class="ai-level-caption level-read" id="assistantLevelCaption">Advise only - AI can read the terminal, never touch it.</div>
                 </div>
-                <div class="ai-messages" id="assistantMessages"></div>
-                <div class="ai-thinking" id="assistantThinking" hidden>
-                  <span class="ai-thinking-dot"></span><span>thinking...</span>
-                  <button class="ghost-btn" id="assistantStopBtn">Stop</button>
+                <!-- First open without a provider (A5-36). -->
+                <div class="ai-setup" id="assistantSetup" hidden>
+                  <p class="ai-setup-title">Set up the assistant</p>
+                  <p class="ai-setup-text">Choose a provider, a model and an API key in Settings &gt; AI assistant. Nothing is sent to a provider until then.</p>
+                  <button type="button" class="primary-btn" id="assistantSetupBtn">Open assistant settings</button>
+                </div>
+                <div class="ai-messages" id="assistantMessages" role="log" aria-live="polite" aria-label="Assistant conversation"></div>
+                <div class="ai-thinking" id="assistantThinking" role="status" hidden>
+                  <span class="ai-thinking-dot" aria-hidden="true"></span><span>thinking...</span>
+                  <button type="button" class="ghost-btn" id="assistantStopBtn">Stop</button>
                 </div>
                 <footer class="ai-foot">
-                  <textarea id="assistantInput" rows="2" placeholder="Ask about this session... (Enter sends, Shift+Enter for a newline)"></textarea>
-                  <button class="primary-btn ai-send" id="assistantSendBtn" title="Send"><span data-ico="send"></span></button>
+                  <textarea id="assistantInput" rows="2" aria-label="Message to the assistant" placeholder="Ask about this session... (Enter sends, Shift+Enter for a newline)"></textarea>
+                  <button type="button" class="primary-btn ai-send" id="assistantSendBtn" title="Send" aria-label="Send"><span data-ico="send"></span></button>
                 </footer>
               </aside>
             </div>
-            <button id="termMaxBtn" class="term-max-btn" title="Expand terminal to full window" data-ico="maximize-2"></button>
-            <div class="terminal-strip" id="termStrip">Ready.</div>
+            <div class="terminal-strip" id="termStrip" role="status" aria-live="polite">Ready.</div>
           </section>
         </div>
       </div>
@@ -317,7 +355,7 @@
               <div class="card-head">
                 <div>
                   <h2>Backup &amp; restore</h2>
-                  <p class="card-sub">Exports your entire vault - keys (still encrypted), categories, saved servers, known hosts, and settings - as a single sealed file. Restoring requires the master password that was current when the backup was taken.</p>
+                  <p class="card-sub">Saves your keys (still encrypted), categories, saved servers, known hosts, settings, MCP servers and SFTP bookmarks as one sealed file, written by SSHSpan itself - the vault never passes through this window. Not included: Bitwarden sync settings and AI-assistant settings, so set those up again after restoring on another machine. Restored MCP servers stay switched off until you confirm them. Restoring needs the master password that was current when the backup was taken.</p>
                 </div>
               </div>
               <div class="bw-actions">
@@ -332,22 +370,30 @@
                 <div>
                   <h2>Bitwarden / Vaultwarden sync</h2>
                   <p class="card-sub">
-                    Keeps your SSH keys mirrored as SSH key items in your own vault (folder
-                    <code>SSHSpan</code> by default). Two-way: changes sync in both directions,
-                    newest wins; deletions are never propagated automatically. Self-hosted servers
-                    must use a public hostname &mdash; private, LAN and localhost addresses are
-                    refused for safety. The stored vault password is sealed with your SSHSpan
-                    master password and only readable while the vault is unlocked.
+                    Keeps your SSH keys and saved servers mirrored as items in your own vault
+                    (folders <code>SSHSpan_Keys</code> and <code>SSHSpan_Servers</code> by default).
+                    Two-way: changes sync in both directions, newest wins; changes coming from
+                    Bitwarden that would replace or add data here wait for your approval, and
+                    deletions are never propagated automatically. Self-hosted servers must use a
+                    public hostname - private, LAN and localhost addresses are refused for safety.
+                    The stored vault password is sealed with your SSHSpan master password and only
+                    readable while the vault is unlocked.
                   </p>
                 </div>
               </div>
               <div class="settings-grid" id="bwGrid"></div>
+              <!-- A stored server and account the sync may not upload to yet
+                   (paintBwDestination, app.js). Filled with text only. -->
+              <p class="bw-unconfirmed" id="bwUnconfirmed" hidden></p>
               <div class="bw-actions">
                 <button id="bwSaveBtn" class="primary-btn"><span data-ico="cloud-cog"></span>Save</button>
                 <button id="bwTestBtn" class="ghost-btn"><span data-ico="server-cog"></span>Test connection</button>
                 <button id="bwSyncNowBtn" class="primary-btn"><span data-ico="refresh-cw"></span>Sync now</button>
+                <button id="bwAllowBtn" class="ghost-btn" aria-describedby="bwUnconfirmed" hidden>Allow syncing...</button>
               </div>
-              <div class="status-strip" id="bwStatus">Not configured yet.</div>
+              <div class="status-strip" id="bwStatus" role="status" aria-live="polite">Not configured yet.</div>
+              <!-- A sync's failed items, one per line (A2-08). -->
+              <ul class="bw-errors" id="bwErrors" aria-label="Items the last sync could not handle" hidden></ul>
             </section>
 
             <section class="card settings-section" data-section="assistant" hidden>
@@ -367,37 +413,43 @@
               <div class="settings-grid">
                 <label>Provider
                   <select id="aiProvider">
-                    <option value="openai" selected>[OI]-compatible (chat/completions)</option>
+                    <option value="openai" selected>OpenAI-compatible (chat/completions)</option>
                     <option value="anthropic">Anthropic-compatible (messages)</option>
                   </select>
                 </label>
-                <label>Base URL
+                <!-- The preset select has its own name: inside the Base URL
+                     label it became part of the field's name (A4-24). A
+                     preset sets the provider too (A4-14). -->
+                <div class="ai-field">
+                  <label for="aiBaseUrl">Base URL</label>
                   <div class="ai-urlrow">
-                    <input type="text" id="aiBaseUrl" placeholder="https://api.openai.com/v1" spellcheck="false" />
-                    <select id="aiBaseUrlPreset" title="Preset base URLs">
+                    <input type="text" id="aiBaseUrl" placeholder="https://api.openai.com/v1" spellcheck="false" autocomplete="off" />
+                    <select id="aiBaseUrlPreset" title="Fill in a known provider" aria-label="Preset: fill in a known provider and base URL">
                       <option value="" selected>Preset...</option>
-                      <option value="https://api.openai.com/v1">[OI]</option>
-                      <option value="https://openrouter.ai/api/v1">OpenRouter</option>
-                      <option value="https://api.groq.com/openai/v1">Groq</option>
-                      <option value="http://localhost:11434/v1">Ollama (local)</option>
-                      <option value="http://localhost:1234/v1">LM Studio (local)</option>
-                      <option value="https://api.anthropic.com">Anthropic</option>
+                      <option value="https://api.openai.com/v1" data-provider="openai">OpenAI</option>
+                      <option value="https://openrouter.ai/api/v1" data-provider="openai">OpenRouter</option>
+                      <option value="https://api.groq.com/openai/v1" data-provider="openai">Groq</option>
+                      <option value="http://localhost:11434/v1" data-provider="openai">Ollama (local)</option>
+                      <option value="http://localhost:1234/v1" data-provider="openai">LM Studio (local)</option>
+                      <option value="https://api.anthropic.com" data-provider="anthropic">Anthropic</option>
                     </select>
                   </div>
-                </label>
+                </div>
                 <label>Model
-                  <input type="text" id="aiModel" placeholder="gpt-4o-mini / " spellcheck="false" />
+                  <input type="text" id="aiModel" placeholder="e.g. gpt-4o-mini or claude-sonnet-4-5" spellcheck="false" autocomplete="off" />
                 </label>
                 <label>API key
-                  <input type="password" id="aiApiKey" placeholder="Leave blank to keep the stored key" autocomplete="off" />
+                  <input type="password" id="aiApiKey" placeholder="Leave blank to keep the stored key" autocomplete="off" aria-describedby="aiKeyHint" />
                   <span class="hint ai-key-hint" id="aiKeyHint"></span>
                 </label>
               </div>
               <div class="bw-actions">
-                <button id="aiSaveBtn" class="primary-btn">Save</button>
-                <button id="aiTestBtn" class="ghost-btn"><span data-ico="plug-zap"></span>Test connection</button>
+                <button type="button" id="aiSaveBtn" class="primary-btn">Save</button>
+                <!-- Tests what is on screen: it saves first (A4-14). -->
+                <button type="button" id="aiTestBtn" class="ghost-btn"><span data-ico="plug-zap"></span>Save &amp; test</button>
+                <button type="button" id="aiRemoveKeyBtn" class="ghost-btn" hidden><span data-ico="trash-2"></span>Remove stored key</button>
               </div>
-              <div class="status-strip" id="aiStatus">Works with [OI], OpenRouter, Groq, Anthropic, and local servers like Ollama / LM Studio.</div>
+              <div class="status-strip" id="aiStatus" role="status">Works with OpenAI, OpenRouter, Groq, Anthropic, and local servers like Ollama / LM Studio.</div>
 
               <!-- MCP servers: the assistant's tool belt beyond this app. Each
                    server is added by you, every tool is off until you approve
@@ -429,12 +481,15 @@
                       <input type="text" id="mcpName" placeholder="github" spellcheck="false" />
                     </label>
                     <label>URL
-                      <input type="text" id="mcpUrl" placeholder="https://mcp.example.com/sse" spellcheck="false" />
+                      <input type="text" id="mcpUrl" placeholder="https://mcp.example.com/mcp" spellcheck="false" autocomplete="off" aria-describedby="mcpUrlError mcpUrlWarn" aria-invalid="false" />
                     </label>
                     <p class="mcp-url-warn" id="mcpUrlWarn" hidden>
                       Plain HTTP on a loopback address - traffic to this server is not encrypted or authenticated. Fine for a local proxy, not for anything remote.
                     </p>
-                    <p class="mcp-url-error" id="mcpUrlError" hidden></p>
+                    <p class="mcp-url-error" id="mcpUrlError" role="alert" hidden></p>
+                    <!-- Editing the URL or the auth settings drops a stored
+                         secret (origin binding); said before Save (A4-07). -->
+                    <p class="mcp-rebind-warn" id="mcpRebindWarn" hidden></p>
                     <label>Auth type
                       <select id="mcpAuthType">
                         <option value="none" selected>None</option>
@@ -452,7 +507,7 @@
                       <input type="text" id="mcpHeaderName" placeholder="X-Api-Key" spellcheck="false" />
                     </label>
                     <label id="mcpSecretRow" hidden>Secret
-                      <input type="password" id="mcpAuthSecret" placeholder="Leave blank to keep the stored one" autocomplete="off" />
+                      <input type="password" id="mcpAuthSecret" placeholder="Enter the token" autocomplete="off" aria-describedby="mcpSecretHint" />
                       <span class="hint" id="mcpSecretHint"></span>
                     </label>
                     <label id="mcpEnvRow" hidden>Environment variable name
@@ -465,13 +520,13 @@
                     </label>
                   </div>
                   <div class="bw-actions">
-                    <button id="mcpSaveBtn" class="primary-btn">Save server</button>
-                    <button id="mcpCancelBtn" class="ghost-btn">Cancel</button>
+                    <button type="button" id="mcpSaveBtn" class="primary-btn">Save server</button>
+                    <button type="button" id="mcpCancelBtn" class="ghost-btn">Cancel</button>
                   </div>
                 </div>
 
                 <div id="mcpToolsHost" class="mcp-tools"></div>
-                <div class="status-strip" id="mcpStatus">MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.</div>
+                <div class="status-strip" id="mcpStatus" role="status">MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.</div>
               </div>
             </section>
 
@@ -488,11 +543,27 @@
                 <button id="auditClearBtn" class="ghost-btn"><span data-ico="trash-2"></span>Clear log</button>
               </div>
               <p class="hint" id="auditCapHint"></p>
+              <!-- Find one event without exporting the whole log (A5-16): both
+                   filters work on the entries loaded so far; "Load older"
+                   loads more. -->
+              <div class="audit-filters">
+                <select id="auditEventFilter" aria-label="Show events of type">
+                  <option value="">All events</option>
+                </select>
+                <div class="search-wrap">
+                  <span class="search-ico" data-ico="search"></span>
+                  <input type="search" id="auditTextFilter" placeholder="Filter by event, key or detail..." aria-label="Filter the audit log" spellcheck="false" autocomplete="off" />
+                </div>
+                <span class="hint" id="auditFilterHint"></span>
+              </div>
               <div class="table-wrap">
                 <table class="audit-table">
                   <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
                   <tbody id="auditBody"></tbody>
                 </table>
+              </div>
+              <div class="audit-more">
+                <button id="auditMoreBtn" class="ghost-btn" hidden><span data-ico="history"></span>Load older entries</button>
               </div>
             </section>
           </div>
@@ -503,7 +574,7 @@
 
   <!-- Modal: enable YOLO access level (deliberately hard to miss) -->
   <div class="modal-backdrop" id="yoloModal" hidden>
-    <div class="modal modal-sm assistant-yolo-modal" role="alertdialog" aria-modal="true" aria-labelledby="yoloTitle">
+    <div class="modal modal-sm assistant-yolo-modal" role="alertdialog" aria-modal="true" aria-labelledby="yoloTitle" aria-describedby="yoloTarget yoloDesc">
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico yolo-ico" data-ico="triangle-alert"></span>
@@ -511,7 +582,9 @@
         </div>
       </header>
       <div class="modal-body">
-        <p>
+        <!-- Which session this arms - filled in when the dialog opens (A4-21). -->
+        <p class="yolo-target" id="yoloTarget"></p>
+        <p id="yoloDesc">
           At YOLO the assistant runs commands <strong>without asking you each
           time</strong>. It has full autonomous control of the live SSH session: it
           can read and change anything the account you connected with can reach,
@@ -546,17 +619,17 @@
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="key-square"></span>
-          <h2 id="modalTitle">New Key</h2>
+          <h2 id="modalTitle">New key</h2>
         </div>
         <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
-        <div class="tabs">
-          <button data-tab="generate" class="tab active"><span data-ico="key-round"></span>Generate</button>
-          <button data-tab="import" class="tab"><span data-ico="file-up"></span>Import</button>
+        <div class="tabs" role="tablist" aria-label="New key">
+          <button data-tab="generate" class="tab active" id="tabBtn-generate" role="tab" aria-selected="true" aria-controls="tab-generate" tabindex="0"><span data-ico="key-round"></span>Generate</button>
+          <button data-tab="import" class="tab" id="tabBtn-import" role="tab" aria-selected="false" aria-controls="tab-import" tabindex="-1"><span data-ico="file-up"></span>Import</button>
         </div>
-        <div class="tab-panel" id="tab-generate">
-          <label>Name <input type="text" id="genName" placeholder="my-laptop" /></label>
+        <div class="tab-panel" id="tab-generate" role="tabpanel" aria-labelledby="tabBtn-generate">
+          <label>Name <input type="text" id="genName" placeholder="my-laptop" spellcheck="false" autocomplete="off" /></label>
           <label>Type
             <select id="genType">
               <option value="ed25519" selected>Ed25519 (recommended)</option>
@@ -565,36 +638,44 @@
             </select>
           </label>
           <label id="genBitsRow">Bits
-            <select id="genBits">
+            <select id="genBits" aria-describedby="genBitsHint">
               <option value="3072">3072</option>
               <option value="4096" selected>4096</option>
               <option value="8192">8192</option>
             </select>
           </label>
+          <!-- Outside the label: a description, not part of the select's name. -->
+          <p class="hint gen-bits-hint" id="genBitsHint">RSA 4096 and 8192 can take a minute or longer to generate. The window stays usable while the key is being created.</p>
+          <!-- The values are the curve tags the backend's key types use
+               (ecdsa-p256 ...); the nistp* names stay as the labels (A2-02). -->
           <label id="genCurveRow" hidden>Curve
             <select id="genCurve">
-              <option value="nistp256" selected>nistp256</option>
-              <option value="nistp384">nistp384</option>
-              <option value="nistp521">nistp521</option>
+              <option value="p256" selected>nistp256</option>
+              <option value="p384">nistp384</option>
+              <option value="p521">nistp521</option>
             </select>
           </label>
-          <label>Comment <input type="text" id="genComment" placeholder="user@host" /></label>
+          <label>Comment <input type="text" id="genComment" placeholder="user@host" spellcheck="false" autocomplete="off" /></label>
           <div class="cat-field">
             <span class="cat-field-label">Categories</span>
             <div class="cat-chips" id="genCategories"></div>
             <button type="button" id="genBrowseCategoriesBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories...</button>
           </div>
         </div>
-        <div class="tab-panel" id="tab-import" hidden>
-          <label>Name <input type="text" id="importName" placeholder="work-server" /></label>
+        <div class="tab-panel" id="tab-import" role="tabpanel" aria-labelledby="tabBtn-import" hidden>
+          <label>Name <input type="text" id="importName" placeholder="work-server" spellcheck="false" autocomplete="off" /></label>
           <div class="import-source">
             <button type="button" id="importBrowseBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse for key file...</button>
             <span class="hint" id="importFileHint">or paste the key material below</span>
           </div>
-          <label>Paste key material (OpenSSH / PKCS#8 / PEM private key, PuTTY .ppk v3, SPKI public PEM, or authorized_keys line)
-            <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."></textarea>
+          <!-- The two formats key_import reads (ruling R9). Anything else that
+               is recognisable gets the backend's conversion advice in
+               #importFormatMsg before it is sent anywhere. -->
+          <label>Paste an OpenSSH private key or a PuTTY .ppk file
+            <textarea id="importPem" rows="9" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ... or PuTTY-User-Key-File-3: ..." aria-describedby="importFormatMsg"></textarea>
           </label>
-          <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" /></label>
+          <p class="hint import-format-msg" id="importFormatMsg" role="alert" hidden></p>
+          <label>Passphrase (only if the pasted key is encrypted) <input type="password" id="importPass" placeholder="required for encrypted keys" autocomplete="off" /></label>
           <div class="cat-field">
             <span class="cat-field-label">Categories</span>
             <div class="cat-chips" id="importCategories"></div>
@@ -620,9 +701,12 @@
       </header>
       <div class="modal-body">
         <p id="vaultModalText">Set a master password to encrypt your private keys at rest.</p>
+        <!-- Document order is the tab order and the reading order. The current
+             password only shows when changing the master password, and there it
+             comes FIRST (new, then confirm); create and unlock never show it. -->
+        <input type="password" id="vaultPasswordCurrent" placeholder="Current password" autocomplete="off" hidden />
         <input type="password" id="vaultPassword" placeholder="Master password" autocomplete="off" />
         <input type="password" id="vaultPasswordConfirm" placeholder="Confirm password" autocomplete="off" hidden />
-        <input type="password" id="vaultPasswordCurrent" placeholder="Current password" autocomplete="off" hidden />
       </div>
       <footer class="modal-footer">
         <button data-close class="ghost-btn" id="vaultCancelBtn">Cancel</button>
@@ -637,7 +721,7 @@
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="key-round"></span>
-          <h2 id="connectPwTitle">Enter Password</h2>
+          <h2 id="connectPwTitle">Enter password</h2>
         </div>
       </header>
       <div class="modal-body">
@@ -663,7 +747,7 @@
           <span class="modal-title-ico" data-ico="shield-check"></span>
           <div>
             <h2 id="deployModalTitle">Deploy keys</h2>
-            <p class="modal-sub">Writes the private keys to disk and adds a matching Host block to your SSH config.</p>
+            <p class="modal-sub">Writes each private key into your ~/.ssh folder and a Host block into SSHSpan's own ssh config file, which ssh reads once ~/.ssh/config includes it.</p>
           </div>
         </div>
         <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
@@ -671,11 +755,15 @@
       <div class="modal-body deploy-body">
         <div class="deploy-form">
           <div class="cat-chips" id="deployKeyChips"></div>
+          <!-- Every field goes into the Host block key_deploy writes (R3);
+               the preview beside them is the backend's own text for them. -->
           <div class="deploy-grid">
-            <label class="span-2">Host alias <input type="text" id="cfgHost" placeholder="myserver" /></label>
-            <label>User <input type="text" id="cfgUser" placeholder="deploy" /></label>
+            <label class="span-2">Host alias <input type="text" id="cfgHost" placeholder="myserver" spellcheck="false" autocomplete="off" /></label>
+            <label class="span-2">HostName <input type="text" id="cfgHostname" placeholder="192.0.2.10 or host.example.com" spellcheck="false" autocomplete="off" /></label>
+            <label>User <input type="text" id="cfgUser" placeholder="deploy" spellcheck="false" autocomplete="off" /></label>
             <label>Port <input type="number" id="cfgPort" placeholder="22" min="1" max="65535" /></label>
           </div>
+          <p class="field-error" id="deployFieldError" role="alert" hidden></p>
           <div class="opt-list">
             <label class="opt-row">
               <input type="checkbox" id="strictHostKeyToggle" checked /><span class="toggle-box"></span>
@@ -691,12 +779,12 @@
                 <span class="opt-sub">You will be asked for it on every connection.</span>
               </span>
             </label>
-            <input type="password" id="keyPassphraseInput" placeholder="Deployed-key passphrase" hidden />
+            <input type="password" id="keyPassphraseInput" placeholder="Deployed-key passphrase" autocomplete="off" hidden />
             <label class="opt-row">
               <input type="checkbox" id="deployRegisterToggle" /><span class="toggle-box"></span>
               <span class="opt-text">
                 <span class="opt-title">Also save these as servers in SSHSpan</span>
-                <span class="opt-sub">They appear under Servers, ready to connect.</span>
+                <span class="opt-sub" id="deployRegisterHint">They appear under Servers, ready to connect. Needs a Host alias and a User.</span>
               </span>
             </label>
           </div>
@@ -708,11 +796,29 @@
             <span class="spacer"></span>
             <span class="hint">updates as you type</span>
           </div>
-          <p class="hint deploy-paths">
-            Keys go to <code id="deployDirHint">&hellip;</code>, owner-only. Host blocks go in
-            <code id="sshConfigHint">&hellip;</code> between <code># &gt;&gt;&gt; SSHSpan managed &gt;&gt;&gt;</code> markers.
-          </p>
-          <textarea id="configPreview" readonly spellcheck="false" placeholder="# Select at least one key"></textarea>
+          <div class="hint deploy-paths">
+            <p>Key files go to <code id="deployDirHint">&hellip;</code>, readable by you only:</p>
+            <ul class="deploy-plan" id="deployPlan" hidden></ul>
+            <!-- What the backend's plan warns about, and the Host lines of
+                 the user's own ~/.ssh/config that name these hosts (SSHSpan
+                 never edits that file). Filled with text only. -->
+            <div class="deploy-notes" id="deployWarnings" hidden>
+              <p class="deploy-notes-head">Check before you deploy:</p>
+              <ul id="deployWarningList"></ul>
+            </div>
+            <div class="deploy-notes" id="deployLegacy" hidden>
+              <p class="deploy-notes-head">Host lines in your own ssh config that name these hosts:</p>
+              <ul id="deployLegacyList"></ul>
+            </div>
+            <p>Host blocks go in SSHSpan's own config file <code id="sshConfigHint">&hellip;</code>.
+              ssh reads it only through an Include line: put this line at the top of
+              ~/.ssh/config, before any Host block.</p>
+            <div class="include-row">
+              <code id="deployIncludeLine">&hellip;</code>
+              <button id="copyIncludeBtn" class="ghost-btn" type="button" title="Copy the Include line"><span data-ico="copy"></span>Copy</button>
+            </div>
+          </div>
+          <textarea id="configPreview" readonly spellcheck="false" placeholder="# Select at least one key" aria-label="The Host blocks this deploy writes"></textarea>
         </div>
       </div>
       <footer class="modal-footer">
@@ -779,39 +885,57 @@
       <header class="modal-header">
         <div class="modal-title">
           <span class="modal-title-ico" data-ico="server"></span>
-          <h2 id="serverModalTitle">New Server</h2>
+          <h2 id="serverModalTitle">New server</h2>
         </div>
         <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
         <div class="server-grid">
-          <label class="span-2">Name <input type="text" id="srvName" placeholder="prod-web-1" /></label>
-          <label>Host <input type="text" id="srvHost" placeholder="192.0.2.10 or host.example.com" /></label>
-          <label>Port <input type="number" id="srvPort" placeholder="22" min="1" max="65535" /></label>
-          <label>Username <input type="text" id="srvUser" placeholder="deploy" /></label>
-          <label class="span-2 auth-method-row">Auth method
+          <label class="span-2">Name <input type="text" id="srvName" placeholder="prod-web-1" spellcheck="false" autocomplete="off" /></label>
+          <label>Host <input type="text" id="srvHost" placeholder="192.0.2.10 or host.example.com" spellcheck="false" autocomplete="off" /></label>
+          <!-- Checked on Save, the reason shown under it (A5-30) - outside
+               the label, so it does not become part of the field's name. -->
+          <div class="port-field">
+            <label>Port <input type="number" id="srvPort" placeholder="22" min="1" max="65535" autocomplete="off" aria-describedby="srvPortMsg" /></label>
+            <p class="field-error" id="srvPortMsg" role="alert" hidden></p>
+          </div>
+          <label>Username <input type="text" id="srvUser" placeholder="deploy" spellcheck="false" autocomplete="off" /></label>
+          <!-- A radio group, not a <label>: a label forwarded every click on its
+               blank space to the first button inside (Key), so a stray click
+               beside the segments changed the server's auth method (A1-05). -->
+          <div class="span-2 auth-method-row" role="radiogroup" aria-labelledby="srvAuthLabel">
+            <span class="field-label" id="srvAuthLabel">Auth method</span>
             <div class="seg">
-              <button type="button" data-auth="publickey" class="seg-btn active">Key</button>
-              <button type="button" data-auth="password" class="seg-btn">Password</button>
-              <button type="button" data-auth="keyboard-interactive" class="seg-btn">Kbd-int</button>
+              <button type="button" data-auth="publickey" class="seg-btn active" role="radio" aria-checked="true" tabindex="0">Key</button>
+              <button type="button" data-auth="password" class="seg-btn" role="radio" aria-checked="false" tabindex="-1">Password</button>
+              <button type="button" data-auth="keyboard-interactive" class="seg-btn" role="radio" aria-checked="false" tabindex="-1">Keyboard-interactive</button>
             </div>
-          </label>
-          <div class="span-2 key-row" id="srvKeyRow">
+          </div>
+          <!-- Its own class (A1-21): as "key-row" it was drawn as a key-list
+               card and squeezed the .pem path to a few characters. The key
+               and the path are alternatives, one above the other. -->
+          <div class="span-2 server-key-row" id="srvKeyRow">
             <label>Vault key
               <select id="srvKeyId">
                 <option value="">- select a key -</option>
               </select>
             </label>
             <div class="pem-row">
-              <input type="text" id="srvPemPath" placeholder="...or pick a .pem file on disk" />
+              <input type="text" id="srvPemPath" aria-label="Key file (.pem) on disk" placeholder="...or pick a .pem file on disk" spellcheck="false" autocomplete="off" />
               <button type="button" id="srvBrowsePemBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse</button>
             </div>
           </div>
           <div class="span-2 pw-row" id="srvPwRow" hidden>
-            <label>Password (optional, only used at connect time)
-              <input type="password" id="srvPassword" placeholder="leave blank to type at connect time" autocomplete="off" />
+            <label>Password (optional)
+              <input type="password" id="srvPassword" placeholder="Leave blank to type it when you connect" autocomplete="off" aria-describedby="srvPwSavedHint srvPwMsg" />
             </label>
-            <label class="toggle-chip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
+            <!-- A saved password is kept unless replaced or removed (A5-03) -
+                 and only for its own server and account: a changed host, port,
+                 user or sign-in method needs it again. -->
+            <p class="hint" id="srvPwSavedHint" hidden></p>
+            <p class="field-error" id="srvPwMsg" role="alert" hidden></p>
+            <button type="button" class="ghost-btn" id="srvClearPwBtn" aria-pressed="false" hidden>Remove saved password</button>
+            <label class="toggle-chip" id="srvSavePwChip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
           </div>
           <div class="span-2 cat-field">
             <span class="cat-field-label">Category</span>
@@ -839,7 +963,7 @@
       </header>
       <div class="modal-body">
         <p id="promptMessage" class="hint"></p>
-        <input type="text" id="promptInput" aria-labelledby="promptMessage" />
+        <input type="text" id="promptInput" aria-labelledby="promptMessage" spellcheck="false" autocomplete="off" />
       </div>
       <footer class="modal-footer">
         <button id="promptCancelBtn" class="ghost-btn">Cancel</button>
@@ -859,6 +983,13 @@
       </header>
       <div class="modal-body">
         <p id="confirmMessage" class="hint"></p>
+        <!-- One optional choice that goes with the answer (confirmWithOption),
+             e.g. also removing a deleted key's deployed files. Hidden for
+             every other question. -->
+        <label class="toggle-chip confirm-option" id="confirmOptionRow" hidden>
+          <input type="checkbox" id="confirmOption" /><span class="toggle-box"></span>
+          <span id="confirmOptionLabel"></span>
+        </label>
       </div>
       <footer class="modal-footer">
         <button id="confirmCancelBtn" class="ghost-btn">Cancel</button>
@@ -878,9 +1009,12 @@
       </header>
       <div class="modal-body">
         <p id="deleteMessage" class="hint"></p>
-        <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;">
-          <input type="checkbox" id="deleteSkipSession" />
-          <span>Don't prompt me for this session anymore.</span>
+        <!-- The toggle every other dialog option uses (A1-33): the inline-styled
+             row lost to the global label column rule and drew a white native
+             box above its caption. -->
+        <label class="toggle-chip">
+          <input type="checkbox" id="deleteSkipSession" /><span class="toggle-box"></span>
+          <span id="deleteSkipLabel">Don't ask again for remote deletes this session.</span>
         </label>
       </div>
       <footer class="modal-footer">
@@ -898,7 +1032,7 @@
           <span class="modal-title-ico" data-ico="settings"></span>
           <h2 id="chmodTitle">Permissions</h2>
         </div>
-        <button class="icon-btn" data-close title="Close" data-ico-x=""></button>
+        <button class="icon-btn" data-close title="Close" aria-label="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
         <table class="chmod-grid">
@@ -920,7 +1054,9 @@
               <td><input type="checkbox" id="chmod-other-x" aria-label="Other execute" /></td></tr>
           </tbody>
         </table>
-        <label>Numeric value <input type="text" id="chmodOctal" maxlength="3" placeholder="644" /></label>
+        <label>Numeric value <input type="text" id="chmodOctal" maxlength="4" placeholder="644" spellcheck="false" autocomplete="off" /></label>
+        <p class="hint">A leading fourth digit is setuid/setgid/sticky (2775 = setgid); typing three digits clears them.</p>
+        <p class="hint" id="chmodHint" role="alert" hidden></p>
         <label class="toggle-chip"><input type="checkbox" id="chmodRecurse" /><span class="toggle-box"></span>Recurse into subdirectories</label>
         <label>Apply to
           <select id="chmodApplyTo">
@@ -945,7 +1081,9 @@
           <span class="modal-title-ico" data-ico="file-text"></span>
           <h2 id="conflictTitle">Target file already exists</h2>
         </div>
-        <button class="icon-btn" id="conflictCloseBtn" title="Close"></button>
+        <!-- The shared X (A1-28c): it rendered empty and was named only by
+             its tooltip. -->
+        <button class="icon-btn" id="conflictCloseBtn" title="Close" aria-label="Close" data-ico-x=""></button>
       </header>
       <div class="modal-body">
         <p id="conflictSummary" class="hint"></p>
@@ -960,6 +1098,37 @@
         <span class="hint" id="conflictHint">Skip removes a file from this batch.</span>
         <button id="conflictCancelBtn" class="ghost-btn">Cancel</button>
         <button id="conflictApplyBtn" class="primary-btn">Continue</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- SFTP edit conflict (A7-19): a file open in an external editor changed,
+       or was deleted, on the server since it was opened. It asks about one
+       file at a time: a newer conflict for the file on screen replaces the
+       question, one for another file waits its turn (the note under the
+       question counts them). Filled with text and <bdi> only (sftp.js
+       sftpShowEditConflict); the polite live region says when the question
+       changes while the prompt is open. -->
+  <div class="modal-backdrop" id="editConflictModal" hidden>
+    <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="editConflictTitle" aria-describedby="editConflictMessage editConflictDetail">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="triangle-alert"></span>
+          <h2 id="editConflictTitle">Changed on the server</h2>
+        </div>
+      </header>
+      <div class="modal-body">
+        <p id="editConflictMessage"></p>
+        <p id="editConflictDetail" class="hint"></p>
+        <p id="editConflictServer" class="hint"></p>
+        <p class="field-error" id="editConflictError" role="alert" hidden></p>
+        <p id="editConflictQueue" class="hint edit-conflict-queue" hidden></p>
+        <p id="editConflictLive" class="sftp-live" role="status" aria-live="polite"></p>
+      </div>
+      <footer class="modal-footer">
+        <button id="editConflictCancelBtn" class="ghost-btn">Cancel</button>
+        <button id="editConflictReloadBtn" class="ghost-btn">Reload</button>
+        <button id="editConflictOverwriteBtn" class="danger-btn">Overwrite</button>
       </footer>
     </div>
   </div>

@@ -9,6 +9,10 @@
 /* ---- design tokens ------------------------------------------------------ */
 
 :root {
+  /* A dark-only UI: native widgets (number spinners, validation bubbles,
+     select popups) follow it instead of drawing light (A1-37). */
+  color-scheme: dark;
+
   /* base surfaces (deep, cool, slightly desaturated) */
   --bg:            #0b0e14;
   --bg-elev:       #0e1219;
@@ -24,12 +28,13 @@
   /* text */
   --text:          #e8ecf3;
   --text-dim:      #9aa4b8;
-  --text-faint:    #667085;
+  /* At least 4.5:1 on every surface from --bg to --panel-3 (WCAG AA for
+     the 10-12px text it is used for); #667085 was 3.2-3.9:1 (A1-13). */
+  --text-faint:    #808a9e;
 
   /* brand / status */
   --accent:        #6ea8ff;
   --accent-rgb:    110, 168, 255;
-  --accent-strong: #4f8ef7;
   --accent-weak:   rgba(110, 168, 255, 0.12);
   --ok:            #34d399;
   --ok-rgb:        52, 211, 153;
@@ -53,7 +58,6 @@
   --r-lg: 15px;
   --shadow-1: 0 1px 2px rgba(0,0,0,0.35);
   --shadow-2: 0 8px 28px rgba(0,0,0,0.42);
-  --shadow-glow: 0 0 0 1px rgba(var(--accent-rgb), 0.4), 0 0 0 4px rgba(var(--accent-rgb), 0.15);
   --ring: 0 0 0 2px rgba(var(--accent-rgb), 0.55);
 
   --mono: 'Cascadia Code', 'Consolas', 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Menlo, monospace;
@@ -66,7 +70,6 @@
 /* ---- reset -------------------------------------------------------------- */
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { height: 100%; }
 html, body { height: 100%; }
 
 body {
@@ -90,7 +93,16 @@ body {
 [hidden] { display: none !important; }
 
 button { font-family: inherit; }
-button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: none; }
+/* One focus ring for everything operated from the keyboard (A1-10): the old
+   rule removed the outline from every button and put nothing back. Fields
+   keep their own ring (accent border + glow, below). :where() keeps this at
+   zero specificity, so a component that draws its own focus state wins. */
+:where(button, a[href], [role="button"], [role="tab"], [role="radio"], [role="menuitem"],
+  [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: none; }
 
 /* generic inline icon sizing (every <svg> injected from icons.js) */
 svg { width: 16px; height: 16px; flex: none; }
@@ -139,7 +151,7 @@ img.logo {
   letter-spacing: 0.4px; flex: none;
 }
 
-.nav { display: flex; flex-direction: column; gap: 3px; flex: 1; overflow-y: auto; }
+.nav { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; }
 
 .nav-item {
   appearance: none; border: none; cursor: pointer; text-align: left;
@@ -162,6 +174,8 @@ img.logo {
   border-color: rgba(var(--accent-rgb), 0.22);
 }
 .nav-item.active svg { opacity: 1; }
+/* The nav column scrolls (overflow), which would clip a ring drawn outside. */
+.nav-item:focus-visible { outline-offset: -2px; }
 .nav-item .nav-label { min-width: 0; }
 
 .sidebar-bottom {
@@ -282,6 +296,22 @@ select {
 }
 select option { background: var(--panel-2); color: var(--text); }
 
+/* Show/hide for password fields (A5-35): the eye sits inside the field's
+   right edge; the wrapper follows the field when the field is hidden. */
+.secret-field { position: relative; display: flex; align-items: center; min-width: 0; }
+.secret-field > input { flex: 1 1 auto; min-width: 0; }
+.secret-field:has(> .reveal-btn:not([hidden])) > input { padding-right: 34px; }
+.secret-field:has(> input[hidden]) { display: none; }
+.reveal-btn {
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  width: 26px; height: 26px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  appearance: none; background: transparent; border: 0; border-radius: 6px; cursor: pointer;
+  color: var(--text-faint);
+}
+.reveal-btn:hover { color: var(--text); background: var(--panel-3); }
+.reveal-btn svg { width: 15px; height: 15px; }
+
 textarea { resize: vertical; }
 textarea.mono, code.mono, .mono { font-family: var(--mono); font-size: 12px; letter-spacing: 0; }
 code.mono.block {
@@ -299,7 +329,6 @@ label:focus-within { color: var(--text); }
 
 .spacer { flex: 1; }
 .hint { font-size: 11.5px; color: var(--text-faint); }
-.sep { border: none; border-top: 1px solid var(--line); margin: 14px 0; }
 
 /* ==========================================================================
    Content shell
@@ -395,7 +424,8 @@ label:focus-within { color: var(--text); }
   background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.09), rgba(var(--accent-rgb), 0.04)), var(--panel);
   box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.12);
 }
-.key-row input[type="checkbox"] {
+.key-row input[type="checkbox"],
+.key-list-head input[type="checkbox"] {
   appearance: none; cursor: pointer;
   width: 16px; height: 16px; flex: none;
   border: 1.5px solid var(--line-strong);
@@ -404,13 +434,37 @@ label:focus-within { color: var(--text); }
   display: grid; place-content: center;
   transition: border-color 0.12s ease, background 0.12s ease;
 }
-.key-row input[type="checkbox"]:hover { border-color: var(--text-faint); }
-.key-row input[type="checkbox"]:checked {
+.key-row input[type="checkbox"]:hover,
+.key-list-head input[type="checkbox"]:hover { border-color: var(--text-faint); }
+.key-row input[type="checkbox"]:checked,
+.key-list-head input[type="checkbox"]:checked,
+.key-list-head input[type="checkbox"]:indeterminate {
   background: var(--accent); border-color: var(--accent);
 }
-.key-row input[type="checkbox"]:checked::after {
+.key-row input[type="checkbox"]:checked::after,
+.key-list-head input[type="checkbox"]:checked::after {
   content: ""; width: 8px; height: 8px;
   background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230b1020' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E") center/contain no-repeat;
+}
+/* Some of the keys shown are selected: a bar instead of a tick. */
+.key-list-head input[type="checkbox"]:indeterminate::after {
+  content: ""; width: 8px; height: 2px; border-radius: 1px; background: #0b1020;
+}
+
+/* Select all, over the list (A5-34): lined up with the rows' boxes. */
+.key-list-head { display: flex; align-items: center; padding: 0 13px; }
+.key-list-head .select-all {
+  flex-direction: row; align-items: center; gap: 10px;
+  cursor: pointer; font-size: 12px; color: var(--text-dim);
+}
+
+/* A search or filter that matches nothing (A2-26). */
+.key-list-nomatch, .server-list-nomatch {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 14px 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  color: var(--text-dim); font-size: 12.5px;
 }
 
 /* key-type avatar (built in JS) */
@@ -434,7 +488,10 @@ label:focus-within { color: var(--text); }
   min-width: 0;
   color: var(--text);
 }
-.key-row-name > :first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* One line, cut with "..." (A1-07). This rule sat on the name's first child,
+   which a bare text node is not, so long names wrapped mid-word; the name
+   has its own element now and its full text in the tooltip. */
+.key-row-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .key-row-sub {
   color: var(--text-faint); font-size: 11px;
@@ -451,7 +508,9 @@ label:focus-within { color: var(--text); }
 .badge[data-kind="ed25519"] { background: var(--t-ed25519-bg); color: var(--t-ed25519); }
 .badge[data-kind="rsa"]     { background: var(--t-rsa-bg);      color: var(--t-rsa); }
 .badge[data-kind="ecdsa"]   { background: var(--t-ecdsa-bg);    color: var(--t-ecdsa); }
-.badge.pub, .badge.ghost    { background: rgba(245, 181, 68, 0.13); color: var(--warn); }
+/* .warn is the server list's "key missing": an error state, drawn in the
+   warning colour - it fell back to the green ed25519 tint (A1-40). */
+.badge.pub, .badge.warn    { background: rgba(245, 181, 68, 0.13); color: var(--warn); }
 .badge.dim                 { background: var(--panel-3); color: var(--text-dim); }
 
 /* ---- empty state -------------------------------------------------------- */
@@ -475,9 +534,19 @@ label:focus-within { color: var(--text); }
 .empty-state .empty-ico svg { width: 22px; height: 22px; }
 .empty-state h3 { color: var(--text); font-weight: 650; font-size: 14px; }
 .empty-state p { font-size: 12.5px; color: var(--text-faint); margin-bottom: 6px; }
+/* A list that could not be loaded (A5-21): the same card, marked as an error,
+   with the backend's message and a Retry instead of the first-run copy. */
+.empty-state.load-error { border-style: solid; border-color: rgba(var(--danger-rgb), 0.45); }
+.empty-state.load-error .empty-ico { color: var(--danger); }
+.load-error-msg { max-width: 520px; overflow-wrap: anywhere; }
 
 /* ---- detail pane -------------------------------------------------------- */
 
+/* Beside the list the pane stays in view while the list scrolls, and scrolls
+   on its own when it is taller than the window (A1-24): with a long list,
+   the pane of a key near the end was scrolled away above the window. Stacked
+   under the list (narrow windows) it is static, and selectKey scrolls it into
+   view instead. */
 .detail-pane {
   flex: 1 1 350px;
   min-width: 0;
@@ -487,7 +556,12 @@ label:focus-within { color: var(--text); }
   padding: 18px;
   display: flex; flex-direction: column; gap: 10px;
   box-shadow: var(--shadow-1);
+  position: sticky; top: 0;
+  max-height: calc(100vh - var(--topbar-h) - 44px);
+  overflow-y: auto;
 }
+.detail-pane > * { flex-shrink: 0; }
+.undeploy-btn { align-self: flex-start; }
 
 .detail-head { display: flex; align-items: center; gap: 11px; }
 .detail-head h2 { font-size: 16px; font-weight: 650; min-width: 0; overflow-wrap: anywhere; flex: 1; }
@@ -518,28 +592,33 @@ label:focus-within { color: var(--text); }
 
 .import-source { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .import-source .hint { min-width: 0; overflow-wrap: anywhere; }
+/* What the backend says about a key in a format it cannot import (R9): its
+   conversion advice, beside the pasted key. */
+.import-format-msg {
+  padding: 9px 11px; line-height: 1.5; overflow-wrap: anywhere;
+  color: var(--text-dim);
+  background: rgba(var(--warn-rgb), 0.08);
+  border: 1px solid rgba(var(--warn-rgb), 0.28);
+  border-radius: var(--r-sm);
+}
 
-.export-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.export-row select { flex: 1.2; min-width: 170px; }
-.export-row input { flex: 1; min-width: 130px; }
-.export-row .primary-btn { flex: none; margin-left: auto; }
+/* The confirmation's one optional choice (confirmWithOption): its label is a
+   sentence, so it wraps inside the small dialog. */
+.toggle-chip.confirm-option { white-space: normal; align-items: flex-start; margin-top: 10px; }
+.toggle-chip.confirm-option .toggle-box { margin-top: 1px; }
+
 
 /* ==========================================================================
    Deploy / config view
    ========================================================================== */
 
-.config-view { max-width: 880px; }
-
-.deploy-options {
-  display: flex; flex-wrap: wrap; gap: 10px;
-  margin-bottom: 12px; align-items: flex-end;
-}
-.deploy-options label:not(.toggle-chip) { min-width: 140px; flex: 1 1 140px; }
-.deploy-options input[type="text"], .deploy-options input[type="number"] { width: 100%; }
-
+/* A row, over the column the global `label` rule (and .server-grid label)
+   gives every label - by specificity, not !important (A1-29). */
+label.toggle-chip,
+.server-grid label.toggle-chip { flex-direction: row; }
 .toggle-chip {
   appearance: none; cursor: pointer;
-  flex-direction: row !important; align-items: center; gap: 8px;
+  align-items: center; gap: 8px;
   font-size: 12.5px; color: var(--text-dim); font-weight: 500;
   border: 1px solid var(--line-strong);
   background: var(--bg-elev);
@@ -569,20 +648,10 @@ label:focus-within { color: var(--text); }
 .toggle-chip input:focus-visible + .toggle-box { box-shadow: var(--ring); }
 .toggle-chip:has(input:checked) { color: var(--text); border-color: rgba(var(--accent-rgb), 0.5); }
 
-#configPreview { margin-top: 4px; width: 100%; }
-
-.config-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-
 /* ==========================================================================
    Settings
    ========================================================================== */
 
-.settings-view { max-width: 780px; }
-.settings-view > h2 {
-  font-size: 12px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.9px; color: var(--text-faint);
-  margin: 2px 0 10px 2px;
-}
 .settings-grid { display: flex; flex-direction: column; gap: 10px; margin-bottom: 8px; }
 /* multi-control settings row (bandwidth throttle: Unlimited + number + unit) */
 .settings-combo { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -601,6 +670,7 @@ label:focus-within { color: var(--text); }
   transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 .settings-combo-tag:hover { border-color: #39445a; color: var(--text); }
+.settings-combo input[type="checkbox"]:focus-visible + .settings-combo-tag { box-shadow: var(--ring); }
 .settings-combo-tag.active {
   background: var(--accent-weak);
   border-color: rgba(var(--accent-rgb), 0.5);
@@ -608,22 +678,9 @@ label:focus-within { color: var(--text); }
   font-weight: 600;
 }
 
-.setting-row {
-  display: flex; align-items: center; justify-content: space-between; gap: 16px;
-  background: var(--bg-elev);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  padding: 11px 13px;
-  transition: border-color 0.12s ease;
-}
-.setting-row:hover { border-color: var(--line-strong); }
-.setting-row .setting-name { font-weight: 600; color: var(--text); font-size: 13px; }
-.setting-row .setting-desc { color: var(--text-faint); font-size: 11.5px; margin-top: 2px; }
-.setting-row > div:first-child { min-width: 0; }
-.setting-row input[type="number"], .setting-row select { width: 180px; }
-.setting-row input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
-
 .bw-actions { display: flex; gap: 8px; margin: 10px 0 4px; flex-wrap: wrap; }
+/* A destination SSHSpan does not sync with until it is allowed. */
+.bw-unconfirmed { margin: 8px 0 0; font-size: 12px; color: var(--warn); }
 
 .status-strip {
   display: flex; align-items: center; gap: 8px;
@@ -647,13 +704,37 @@ label:focus-within { color: var(--text); }
 .status-strip.info::before { background: var(--accent); animation: pulse 1.4s ease infinite; }
 .status-strip.syncing { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.4); }
 .status-strip.syncing::before { background: var(--accent); animation: pulse 1s ease infinite; }
+/* Done, with failures (a Bitwarden sync with errors - A2-08). */
+.status-strip.warn { color: var(--warn); border-color: rgba(var(--warn-rgb), 0.4); }
+.status-strip.warn::before { background: var(--warn); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* A Bitwarden sync's failed items, under its status line. */
+/* The changes a Bitwarden sync waits to apply, listed under its question
+   (app.js bwPendingList): one entry each, every value in a <bdi>. */
+.bw-pending { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--text-dim); }
+.bw-pending .bw-pending-head { margin: 4px 0 0; font-weight: 600; color: var(--text); }
+.bw-pending ul { margin: 0; padding-left: 18px; }
+.bw-pending li { overflow-wrap: anywhere; }
+.bw-pending bdi { color: var(--text); }
+.bw-pending .bw-pending-note { margin: 4px 0 0; color: var(--warn); }
+
+.bw-errors {
+  margin: 6px 0 0; padding: 8px 12px 8px 28px;
+  max-height: 180px; overflow-y: auto;
+  font-size: 12px; line-height: 1.5; color: var(--text-dim);
+  background: var(--bg-elev);
+  border: 1px solid rgba(var(--warn-rgb), 0.3);
+  border-radius: var(--r-sm);
+  overflow-wrap: anywhere;
+}
+/* What a field's blank or current value means (the Bitwarden password). */
+.field-hint { font-size: 11.5px; color: var(--text-faint); font-weight: 400; }
 
 /* ==========================================================================
    Audit
    ========================================================================== */
 
-.audit-view { max-width: 980px; }
 .table-wrap { overflow-x: auto; }
 .audit-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .audit-table th {
@@ -665,6 +746,9 @@ label:focus-within { color: var(--text); }
   padding: 8px 12px; border-bottom: 1px solid var(--line-soft);
   color: var(--text-dim);
   vertical-align: top;
+  /* Host names, fingerprints and paths have no spaces: wrap them rather than
+     push the table's last column (Forget) off the side (A1-08). */
+  overflow-wrap: anywhere;
 }
 .audit-table tbody tr { transition: background 0.1s ease; }
 .audit-table tbody tr:hover { background: rgba(255,255,255,0.015); }
@@ -673,6 +757,17 @@ label:focus-within { color: var(--text); }
   white-space: nowrap;
 }
 .audit-table td.ts { white-space: nowrap; color: var(--text-faint); font-size: 11.5px; font-family: var(--mono); }
+/* Filters and paging for the audit log (A5-16). */
+.audit-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0 8px; }
+.audit-filters select { width: auto; min-width: 160px; }
+.audit-filters .search-wrap { flex: 1 1 220px; }
+.audit-more { display: flex; justify-content: center; margin-top: 10px; }
+.audit-more:has(> [hidden]) { display: none; }
+.audit-table tr.audit-error td { color: var(--danger); }
+.audit-table tr.audit-error .ghost-btn { margin-left: 10px; }
+/* The pinned-hosts table when the list could not be read (A2-29). */
+tr.load-error-row td { color: var(--danger); }
+tr.load-error-row .ghost-btn { margin-left: 10px; }
 
 /* ==========================================================================
    Modals
@@ -688,19 +783,25 @@ label:focus-within { color: var(--text); }
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-/* The category picker is a SECONDARY modal: it opens on top of the host and
-   key modals, which are .modal-backdrop too. Equal z-index means DOM order
-   decides what paints on top, and #serverModal is declared after #pickerModal,
-   so the picker rendered behind the host form - invisible and unclickable,
-   which made it impossible to assign a category while adding a server. Give it
-   its own layer above every other backdrop (and above .cat-menu at 60), but
-   below the toast layer at 99 so errors stay readable over it. */
-#pickerModal { z-index: 70; }
+/* Dialogs stack in the order they were OPENED, not the order they are declared
+   in index.html. With every backdrop at 50 the one declared last painted on
+   top: the category picker rendered behind the host form it was opened from
+   (once worked around with a z-index of its own), and a vault gate or palette
+   opened over the server form was hidden behind it while still taking the
+   keyboard focus. app.js (layerModals) now gives each open backdrop an inline
+   z-index of 50 + its position in the open-order stack, which stays below the
+   toast layer at 99 so errors remain readable over any dialog. While a dialog
+   is open the toasts let clicks through to it, and turn see-through where
+   they are in its way (Toast, below). */
 
+/* A column: the header and footer stay put and only the body scrolls, so
+   Create / Save / Import are on screen at the minimum window size instead of
+   below the fold of a dialog that scrolled as a whole (A1-22 / A5-15). */
 .modal {
   width: 560px; max-width: calc(100vw - 40px);
   max-height: calc(100vh - 60px);
-  overflow: auto;
+  display: flex; flex-direction: column;
+  overflow: hidden;
   background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent 180px), var(--panel);
   border: 1px solid var(--line-strong);
   border-radius: 14px;
@@ -710,10 +811,15 @@ label:focus-within { color: var(--text); }
 @keyframes popIn { from { opacity: 0; transform: translateY(6px) scale(0.985); } to { opacity: 1; transform: none; } }
 .modal-sm { width: 420px; }
 
+/* Confirmation text carries line breaks (a list of key names, release notes)
+   and long unbroken strings (paths, fingerprints): keep both readable. */
+#confirmMessage { white-space: pre-wrap; overflow-wrap: anywhere; }
+
 .modal-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 15px 18px;
   border-bottom: 1px solid var(--line);
+  flex: none;
 }
 .modal-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .modal-title-ico {
@@ -726,7 +832,13 @@ label:focus-within { color: var(--text); }
 .modal-title-ico svg { width: 16px; height: 16px; }
 .modal-header h2 { font-size: 14.5px; font-weight: 650; }
 
-.modal-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 13px; }
+.modal-body {
+  padding: 16px 18px; display: flex; flex-direction: column; gap: 13px;
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+}
+/* The body scrolls; its parts keep their size (a textarea would otherwise
+   shrink to nothing first). */
+.modal-body > * { flex-shrink: 0; }
 .modal-body p { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
 
 .modal-footer {
@@ -734,6 +846,7 @@ label:focus-within { color: var(--text); }
   padding: 13px 18px;
   border-top: 1px solid var(--line);
   background: rgba(255,255,255,0.008);
+  flex: none;
 }
 
 /* ---- tabs --------------------------------------------------------------- */
@@ -759,7 +872,6 @@ label:focus-within { color: var(--text); }
 .tab.active { background: var(--panel-3); color: var(--accent); font-weight: 600; box-shadow: var(--shadow-1); }
 
 .tab-panel { display: flex; flex-direction: column; gap: 13px; }
-.tab-panel[hidden] { display: none; }
 
 /* ==========================================================================
    Toast
@@ -792,6 +904,7 @@ label:focus-within { color: var(--text); }
   display: flex; align-items: center; gap: 9px;
   max-width: 100%;
   animation: toastIn 0.18s ease;
+  transition: opacity 0.12s ease;
 }
 @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 .toast-item.leaving { opacity: 0; transition: opacity 0.18s ease; }
@@ -806,14 +919,40 @@ label:focus-within { color: var(--text); }
   flex: none; background: none; border: 0; cursor: pointer;
   color: var(--text-faint); font-size: 16px; line-height: 1;
   padding: 2px 4px; border-radius: 5px;
+  /* 24x24 to click (A1-36). */
+  min-width: 24px; min-height: 24px; margin: -2px 0;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .toast-dismiss:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+/* How many times the same message arrived while it was on screen (A5-21). */
+.toast-count {
+  flex: none; font-size: 11px; font-weight: 700; line-height: 1;
+  padding: 3px 6px; border-radius: 999px;
+  background: rgba(255,255,255,0.08); color: var(--text-dim);
+}
 .toast-item.err  { border-color: rgba(var(--danger-rgb), 0.5); color: #fecaca; }
 .toast-item.err::before  { background: var(--danger); }
 .toast-item.warn { border-color: rgba(var(--warn-rgb), 0.45); }
 .toast-item.warn::before { background: var(--warn); }
 .toast-item.ok   { border-color: rgba(var(--ok-rgb), 0.4); }
 .toast-item.ok::before   { background: var(--ok); }
+
+/* Over an open dialog. A tall dialog's footer reaches the bottom of the
+   window, under the toasts: its Create or Save could not be clicked while a
+   toast showed, and a control focused from the keyboard could be hidden
+   outright (WCAG 2.4.11). The dialog is not moved out of the way - it would
+   shift under the pointer - and the toasts stay where they are, above it.
+   While a dialog is open, app.js (toastsOverDialogs) marks #toast
+   .over-dialog: a toast then takes no pointer input except on its ×, so a
+   click anywhere else on it reaches the dialog beneath (where it lies over
+   the backdrop instead, app.js keeps the click from closing the dialog). A
+   toast under the pointer, or over the control that has the keyboard focus,
+   turns see-through (.peek) - but not while the pointer is on its ×, since a
+   click there dismisses the toast. With no dialog open, toasts are as
+   before. */
+#toast.over-dialog .toast-item { pointer-events: none; }
+#toast.over-dialog .toast-dismiss { pointer-events: auto; }
+.toast-item.peek:not(.leaving) { opacity: 0.12; }
 
 /* ==========================================================================
    Scrollbars
@@ -833,6 +972,9 @@ label:focus-within { color: var(--text); }
    Responsive
    ========================================================================== */
 
+/* The category drawer's toggles exist in the narrow layout only. */
+.cat-drawer-btn { display: none; }
+
 @media (max-width: 900px) {
   .sidebar { width: 66px; min-width: 66px; padding: 12px 8px; }
   .brand { justify-content: center; padding: 4px 0 12px; }
@@ -840,18 +982,36 @@ label:focus-within { color: var(--text); }
   .nav-item { justify-content: center; padding: 9px 4px; }
   .nav-item .nav-label { display: none; }
   .vault-status { justify-content: center; padding: 8px 0; }
-  .vault-status .vault-label { display: none; }
-  #newKeyBtn { font-size: 0; gap: 0; padding: 8px 0; }
-  #newKeyBtn::before { content: '+'; font-size: 17px; }
+  /* Icon only; the state and countdown move into its name and tooltip. The
+     label was hidden but not the countdown, which wrapped into three lines
+     in the 66px rail (A1-19). */
+  .vault-status .vault-text, .vault-status .vault-caret { display: none; }
+  /* One plus: the label is kept for assistive tech, just not drawn. */
+  #newKeyBtn { position: relative; padding: 8px 10px; }
+  #newKeyBtn .btn-label {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
   .keys-layout { flex-direction: column; }
   .detail-pane, .key-list-col { flex: 1 1 auto; width: 100%; }
-  /* The sidebar drops to 66px here and every other label is hidden with it,
-     but the category tree was left rendering full-width rows - long category
-     names then spilled out of the sidebar across the key list. The Keys page
-     keeps its own "All categories" filter button, so the tree is redundant at
-     this width rather than lost. Note the window minimum is 880px, so this
-     breakpoint is always active at the smallest allowed size. */
-  .cat-panel { display: none !important; }
+  /* Stacked under the list: part of the page, scrolled into view on select. */
+  .detail-pane { position: static; max-height: none; overflow: visible; }
+  /* The 66px rail has no room for the category tree (its rows spilled out
+     across the key list), so it opens as a drawer over the page from the
+     Categories buttons instead (A1-06 / A5-13). The window minimum is 880px,
+     so this layout is always the smallest size - and the default size at an
+     Interface scale of 125% or more. */
+  .cat-drawer-btn { display: inline-flex; }
+  .server-list-head .ghost-btn.cat-drawer-btn { flex: none; justify-content: center; }
+  .sidebar .cat-panel { display: none; }
+  #app.cat-drawer-open .sidebar .cat-panel {
+    display: flex; position: fixed; z-index: 45;
+    top: 0; bottom: 0; left: 66px; width: 260px;
+    margin: 0; padding: 14px 10px;
+    background: var(--bg-elev);
+    border-right: 1px solid var(--line-strong);
+    box-shadow: var(--shadow-2);
+  }
 }
 
 @media (max-width: 620px) {
@@ -859,10 +1019,7 @@ label:focus-within { color: var(--text); }
   .topbar { padding: 0 14px; }
   .toolbar input[type="search"] { max-width: none; }
   .toolbar select { width: 100%; }
-  .setting-row { flex-direction: column; align-items: stretch; }
-  .setting-row input[type="number"], .setting-row select { width: 100%; }
-  .export-row .primary-btn { margin-left: 0; width: 100%; }
-  .detail-actions, .config-actions, .bw-actions { flex-wrap: wrap; }
+  .detail-actions, .bw-actions { flex-wrap: wrap; }
 }
 
 /* ==========================================================================
@@ -903,9 +1060,11 @@ label:focus-within { color: var(--text); }
   font-weight: 600;
 }
 .cat-node.dragging { opacity: 0.4; }
-.cat-node[draggable="true"] { -webkit-user-drag: element; }
+/* Keyboard focus (A1-11): inside the scrolling tree, so the ring sits inside. */
+.cat-node:focus-visible, .cat-chevron:focus-visible, .cat-actions-btn:focus-visible { outline-offset: -2px; }
 
 .cat-chevron {
+  appearance: none; background: transparent; border: 0; padding: 0; font: inherit;
   width: 14px; height: 14px; flex: none;
   display: inline-flex; align-items: center; justify-content: center;
   color: var(--text-faint);
@@ -941,9 +1100,16 @@ label:focus-within { color: var(--text); }
   transition: opacity 0.1s ease, color 0.1s ease, background 0.1s ease;
 }
 .cat-node:hover .cat-actions-btn,
-.cat-node.active .cat-actions-btn { opacity: 1; }
+.cat-node.active .cat-actions-btn,
+.cat-node:focus-within .cat-actions-btn { opacity: 1; }
 .cat-actions-btn:hover { color: var(--text); background: var(--panel-2); }
+/* 24x24 to click (WCAG 2.5.8), in the same 16px of the row's layout (A1-36). */
+.cat-actions-btn { width: 24px; height: 24px; margin: -4px; padding: 0; align-items: center; justify-content: center; }
+.cat-chevron:not(.leaf) { width: 24px; height: 24px; margin: -5px; }
 .cat-actions-btn svg { width: 14px; height: 14px; }
+/* Locked vault (A6-08): the menu's actions are refused, its tooltip says why. */
+.cat-actions-btn:disabled { cursor: not-allowed; }
+.cat-actions-btn:disabled:hover { color: var(--text-faint); background: transparent; }
 
 .cat-children {
   display: flex; flex-direction: column; gap: 1px;
@@ -951,47 +1117,16 @@ label:focus-within { color: var(--text); }
   border-left: 1px solid var(--line);
   padding-left: 4px;
 }
-.cat-children[hidden] { display: none; }
 
 /* drop indicators */
 .cat-node.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
 .cat-node.drop-after  { box-shadow: inset 0 -2px 0 var(--accent); }
 .cat-node.drop-into   { outline: 1px dashed var(--accent); outline-offset: -1px; background: rgba(var(--accent-rgb), 0.06); }
 
-/* small menu for the ... button */
-.cat-menu {
-  position: absolute; right: 4px; top: 100%;
-  z-index: 60;
-  background: var(--panel-2);
-  border: 1px solid var(--line-strong);
-  border-radius: 8px;
-  box-shadow: 0 12px 30px rgba(0,0,0,0.5);
-  padding: 4px;
-  min-width: 160px;
-  display: flex; flex-direction: column;
-}
-.cat-menu button {
-  appearance: none; background: transparent; border: none; cursor: pointer;
-  text-align: left;
-  color: var(--text-dim);
-  font-size: 12.5px; font-family: inherit;
-  padding: 6px 10px; border-radius: 5px;
-  display: flex; align-items: center; gap: 8px;
-}
-.cat-menu button:hover { background: var(--panel-3); color: var(--text); }
-.cat-menu button.danger { color: var(--danger); }
-.cat-menu button.danger:hover { background: rgba(var(--danger-rgb), 0.12); }
-.cat-menu button svg { width: 14px; height: 14px; }
+/* (The "..." button opens the shared .ctx-menu - see openMenu in app.js.) */
 
 /* Uncategorized (virtual root) */
 .cat-node.uncategorized .cat-ico { color: var(--warn); }
-
-/* ==========================================================================
-   Toolbar category-filter button
-   ========================================================================== */
-.cat-filter-btn { max-width: 220px; }
-.cat-filter-btn.active { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.5); background: var(--accent-weak); }
-.cat-filter-btn #catFilterLabel { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
 
 /* ==========================================================================
    Category chips (in detail pane + new-key modal + breadcrumb)
@@ -1064,6 +1199,9 @@ label:focus-within { color: var(--text); }
    Grouped key list
    ========================================================================== */
 .key-group { display: flex; flex-direction: column; gap: 6px; }
+/* A collapsed group keeps its header and hides its rows; the toggle only
+   swapped its icon (A1-12). */
+.key-group.collapsed > .key-row { display: none; }
 .key-group + .key-group { margin-top: 14px; }
 .key-group-head {
   display: flex; align-items: center; gap: 8px;
@@ -1124,11 +1262,13 @@ label:focus-within { color: var(--text); }
   appearance: none; border: 0; background: transparent; cursor: pointer;
   color: var(--text-faint); padding: 1px; line-height: 1;
 }
-.picker-chip-remove { width: 15px; height: 15px; }
+/* 24x24 to click, without making the chip taller (A1-36). */
+.picker-chip-remove {
+  width: 24px; height: 24px; margin: -5px -5px -5px -3px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
 .picker-chip-remove:hover, .picker-clear:hover { color: var(--text); }
 .picker-clear { font-size: 11px; text-decoration: underline; margin-left: auto; }
-.picker-row.partial .picker-box { background: var(--accent); }
-.picker-row.partial .picker-box::after { background: var(--bg); }
 .picker-row[data-depth="0"] { font-weight: 600; color: var(--text); }
 .picker-row .picker-box {
   width: 14px; height: 14px; flex: none;
@@ -1147,7 +1287,6 @@ label:focus-within { color: var(--text); }
 }
 .picker-row .picker-indent { display: inline-block; flex: none; }
 .picker-row .picker-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.picker-row.dimmed { opacity: 0.4; }
 
 
 /* ─── Connect view ──────────────────────────────────────────────────────────── */
@@ -1176,7 +1315,6 @@ label:focus-within { color: var(--text); }
   border-bottom: 1px solid var(--line);
   align-items: center;
 }
-.server-list-head .search-wrap { flex: 1; min-width: 0; }
 .server-list {
   overflow-y: auto;
   padding: 6px;
@@ -1184,6 +1322,7 @@ label:focus-within { color: var(--text); }
   min-height: 0;
 }
 .server-row {
+  position: relative;
   padding: 8px 10px;
   border-radius: 8px;
   cursor: pointer;
@@ -1195,24 +1334,49 @@ label:focus-within { color: var(--text); }
   background: var(--accent-weak);
   border-color: var(--accent);
 }
+/* The name right after its dot and as wide as the row allows; it used to be
+   pushed toward the middle (space-between) and cut short by the room an
+   invisible Connect button kept (A1-20). */
 .server-row-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  justify-content: space-between;
 }
 .server-name {
+  flex: 1;
+  min-width: 0;
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Connect and "..." (A5-28) sit over the row's right end, shown on hover and
+   focus - out of the layout, so they take no width from the name. */
+.server-row-actions {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 8px;
+  /* Opaque, the row's own colour in each state: the name runs under it. */
+  background: var(--panel);
+  opacity: 0;
+}
+.server-row:hover .server-row-actions,
+.server-row.selected .server-row-actions,
+.server-row:focus-within .server-row-actions { opacity: 1; }
+.server-row:hover .server-row-actions { background: var(--hover); }
+.server-row.selected .server-row-actions { background: linear-gradient(var(--accent-weak), var(--accent-weak)), var(--panel); }
+.server-row-more { width: 24px; height: 24px; }
+.server-row-more svg { width: 14px; height: 14px; }
 .server-row-sub {
   font-size: 12px;
   color: var(--text-dim);
   margin-top: 2px;
-  font-family: 'JetBrains Mono', 'Menlo', monospace;
+  font-family: var(--mono);
 }
 .server-row-auth {
   font-size: 11px;
@@ -1234,60 +1398,62 @@ label:focus-within { color: var(--text); }
   min-height: 0;
   position: relative;
 }
+/* The header never clips its controls: with a live tab the
+   actions were wider than the column at the default 1100x720 window, and the
+   column hides overflow, so the maximize button and half of Disconnect were
+   cut off. The title gives way first (an ellipsis); in a header narrower than
+   760 px the action buttons show their icons only - the label stays their
+   accessible name and the title their tooltip; and should that still not fit,
+   the actions wrap under the title instead of running off. */
 .terminal-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
+  container-type: inline-size;
 }
 .terminal-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 0;
+  flex: 1 1 0;
+  min-width: 96px;
 }
 .terminal-title strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.terminal-actions { display: flex; gap: 6px; }
+.terminal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-left: auto; max-width: 100%; }
+@container (max-width: 760px) {
+  .terminal-actions .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .terminal-actions .ghost-btn, .terminal-actions .danger-btn { padding: 7px 8px; }
+  .terminal-actions .seg-btn { padding: 6px 9px; }
+}
 .terminal-host {
   flex: 1;
   background: #0f1115;
-  /* No padding: xterm measures the host box exactly; padding skews FitAddon. */
-  padding: 4px;
+  /* No padding here: FitAddon measures this box (its border box) and took the
+     padding for room, so the last row was clipped at some heights (A1-38).
+     The breathing space is the .xterm element's own padding, below, which
+     FitAddon subtracts. */
+  padding: 0;
   min-height: 0;
   overflow: hidden;
 }
+.terminal-host .xterm { padding: 4px; }
 /* xterm sizes its own rows/cols; FitAddon picks dimensions that fill this box.
    Do NOT force heights on .xterm-* elements - that breaks rendering. */
 
-/* Floating maximize/restore (<>) control, lower-right above the strip. */
-.term-max-btn {
-  position: absolute;
-  right: 8px;
-  bottom: 34px;
-  z-index: 30;
-  width: 26px;
-  height: 26px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(18, 22, 31, 0.85);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  color: var(--text-dim);
-  cursor: pointer;
-  opacity: 0.35;
-  padding: 0;
-}
-.term-max-btn:hover {
-  opacity: 1;
-  color: var(--text);
-  border-color: var(--line-strong);
-}
+/* Maximize/restore, in the terminal header with the other actions: it used to
+   float over the terminal's last column at 35% opacity (A1-38). */
+.term-max-btn { width: 28px; height: 28px; }
 .term-max-btn svg { width: 14px; height: 14px; }
 
 /* ─── xterm.js core rules missing from the vendored xterm.css ────────────────
@@ -1361,6 +1527,11 @@ label:focus-within { color: var(--text); }
   font-size: 12px;
   color: var(--text-dim);
 }
+/* The auth-method radio group laid out like the labelled fields around it. */
+.server-grid .auth-method-row {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; font-weight: 500; color: var(--text-dim);
+}
 .server-grid input,
 .server-grid select {
   background: var(--panel-2);
@@ -1386,16 +1557,26 @@ label:focus-within { color: var(--text); }
   font-size: 12px;
   cursor: pointer;
 }
+/* Dark text on the light accent fill: white on it was 2.41:1 (A1-14). */
 .seg-btn.active {
   background: var(--accent);
-  color: white;
+  color: #0a1120;
 }
+/* Inside the segment's rounded, overflow-hidden frame the ring sits inside. */
+.seg-btn:focus-visible { outline-offset: -2px; }
+/* The vault key and the .pem path are alternatives: one above the other, each
+   the row's full width (A1-21 - side by side the path got ~70px). */
+.server-key-row { display: flex; flex-direction: column; gap: 0; min-width: 0; }
+.server-key-row select { width: 100%; min-width: 0; }
+.server-grid .port-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pw-row #srvPwSavedHint { margin: 6px 0; }
+.pw-row #srvClearPwBtn { margin-bottom: 6px; }
 .pem-row {
   display: flex;
   gap: 6px;
   margin-top: 8px;
 }
-.pem-row input { flex: 1; }
+.pem-row input { flex: 1; min-width: 0; text-overflow: ellipsis; }
 
 /* ─── Context menu (key right-click + server right-click) ─────────────── */
 
@@ -1430,10 +1611,21 @@ label:focus-within { color: var(--text); }
   width: 100%;
   flex: none; /* a scrolling menu must not squash its own rows */
 }
-.ctx-item:hover { background: var(--hover); }
+.ctx-item:hover, .ctx-item:focus-visible { background: var(--hover); }
+.ctx-item:focus-visible { outline-offset: -2px; }
+.ctx-item:disabled { opacity: 0.45; cursor: default; }
+.ctx-item:disabled:hover { background: transparent; }
+.ctx-item.danger { color: var(--danger); }
+.ctx-item.danger:hover, .ctx-item.danger:focus-visible { background: rgba(var(--danger-rgb), 0.12); }
 .ctx-item svg { width: 14px; height: 14px; flex: none; }
 .ctx-item small { color: var(--text-dim); font-size: 11px; }
-.ctx-sep { height: 1px; background: var(--line); margin: 4px 6px; flex: none; }
+/* A line of explanation in a menu (the key picker's left-out servers). */
+/* A line of text in a menu (the host picker says why some servers are not
+   listed): readable, not an item - 4.9:1 on the menu background. */
+.ctx-menu .ctx-note { margin: 0; padding: 6px 10px; white-space: normal; max-width: 280px; font-size: 11.5px; color: var(--text-faint); }
+/* One rule for every separator, whatever its tag: border 0, so an <hr> does
+   not draw the browser's inset double line (A1-28). */
+.ctx-sep { height: 1px; border: 0; background: var(--line); margin: 4px 6px; flex: none; }
 
 /* Host picker: a category row opens a flyout with its subcategories and hosts. */
 .ctx-item.has-sub { padding-right: 6px; }
@@ -1488,15 +1680,24 @@ label:focus-within { color: var(--text); }
   flex: none;
 }
 .term-tab-dot.live { background: var(--ok); }
+/* Connecting (A5-10): the dot pulses until the session is there. */
+.term-tab.connecting .term-tab-dot { background: var(--accent); animation: pulse 1s ease infinite; }
+/* The visual bell (A3-26): the chip lights up briefly. */
+.term-tab.bell-flash { background: rgba(var(--warn-rgb), 0.28); border-color: var(--warn); color: var(--text); }
 .term-tab-name { overflow: hidden; text-overflow: ellipsis; }
 .term-tab-close {
+  appearance: none; background: transparent; border: 0; font: inherit; line-height: 1; cursor: pointer;
   color: var(--text-faint);
   font-weight: 700;
-  padding: 0 2px;
+  padding: 0;
   border-radius: 4px;
+  /* 24x24 to click, in the tab's existing height (A1-36). */
+  min-width: 24px; min-height: 24px; margin: -4px -6px -4px -2px;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .term-tab-close:hover { color: var(--danger); background: var(--hover); }
 .term-tab-add {
+  appearance: none; background: transparent; padding: 0; font: inherit;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1511,15 +1712,25 @@ label:focus-within { color: var(--text); }
 .term-tab-add svg { width: 14px; height: 14px; }
 
 .terminal-body { display: flex; flex: 1; min-height: 0; flex-direction: column; }
-.sftp-body { display: none; flex: 1; min-height: 0; overflow: auto; flex-direction: column; }
+/* The file surface never scrolls sideways (A1-02): everything in it shrinks
+   to its width - the listing scrolls inside its own pane instead. Its size
+   comes from the window alone, so it can be a size container: the transfer
+   panel's restored-transfer banner reads its height. */
+.sftp-body { display: none; flex: 1; min-height: 0; min-width: 0; overflow: auto; flex-direction: column; container: sftp-body / size; }
 .sftp-body.visible { display: flex; }
+/* Scrolls up and down itself only when even the list's floor (.sftp-pane)
+   does not fit - a tiny window in Split - instead of the list running over
+   the status bar and the transfer panel below it. */
 .sftp-panel {
-  padding: 10px 12px;
+  padding: 8px 12px 6px;
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  gap: 8px;
+  min-width: 0;
+  overflow: hidden auto;
+  gap: 6px;
+  container: sftp-panel / inline-size;
 }
 /* Toolbar: labelled buttons; wraps instead of clipping. */
 .sftp-toolbar {
@@ -1527,6 +1738,23 @@ label:focus-within { color: var(--text); }
 }
 .sftp-toolbar .ghost-btn { white-space: nowrap; }
 .sftp-toolbar .ghost-btn.active { border-color: var(--accent); color: var(--accent); }
+.sftp-toolbar .sftp-more-btn { display: none; }
+.sftp-toolbar .sftp-more-btn[aria-expanded="true"] { border-color: var(--accent); color: var(--text); }
+/* A5-07 / A1-01: on a panel narrower than this the toolbar keeps to one row,
+   so the file list keeps its room - it took three rows at the default window
+   and left no row of the listing on screen. The secondary buttons (Columns,
+   Dual, Log, Compare, Sync browse) fold into More, which offers them by name,
+   and the rest show their icons: the label stays each button's name, the
+   title its tooltip. */
+@container sftp-panel (max-width: 900px) {
+  .sftp-toolbar .sftp-tb-secondary { display: none; }
+  .sftp-toolbar .sftp-more-btn { display: inline-flex; }
+  .sftp-toolbar .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .sftp-toolbar .ghost-btn { padding: 6px 8px; }
+}
 .sftp-path {
   flex: 1; min-width: 80px;
   background: var(--panel-2);
@@ -1534,7 +1762,7 @@ label:focus-within { color: var(--text); }
   border-radius: 6px;
   padding: 5px 9px;
   color: var(--text);
-  font-family: 'JetBrains Mono', 'Menlo', monospace;
+  font-family: var(--mono);
   font-size: 12px;
 }
 .sftp-path:focus {
@@ -1562,26 +1790,51 @@ label:focus-within { color: var(--text); }
 }
 
 /* panes (dual mode) */
-.sftp-paneswrap { position: relative; display: flex; flex: 1; min-height: 0; }
-.sftp-panes { display: flex; flex: 1; min-height: 0; gap: 0; }
+.sftp-paneswrap { position: relative; display: flex; flex: 1; min-height: 150px; min-width: 0; }
+.sftp-panes { display: flex; flex: 1; min-height: 0; min-width: 0; gap: 0; }
+/* A floor (A1-01): the header, the column titles and two whole rows - the
+   list was squeezed to nothing under the toolbar and the transfer panel (and
+   to one row with jobs listed, in the smallest window). Two, not three: in
+   that window a third row would leave the transfer list no room for a job.
+   The quick-find indicator is placed over the pane (position: relative). */
 .sftp-pane {
-  flex: 1; min-width: 0; display: flex; flex-direction: column;
+  flex: 1 1 0; min-width: 0; min-height: 150px; display: flex; flex-direction: column;
   border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  position: relative;
+  container: sftp-pane / inline-size;
 }
 .sftp-pane .sftp-panehead { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; }
+/* A narrow pane (dual, or Split) gives its header to the path: no "Local
+   site" / "Remote site" title, Up and Home as icons (named by their label). */
+@container sftp-pane (max-width: 420px) {
+  .sftp-panehead .sftp-panetitle { display: none; }
+  .sftp-panehead .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .sftp-panehead .ghost-btn { padding: 3px 6px; }
+}
 .sftp-tablewrap { overflow: auto; flex: 1; min-height: 0; }
-.sftp-splitter {
+/* Both splitters (A1-15) are separators: dragged, or moved with the arrow
+   keys once focused. */
+.sftp-splitter, .surface-splitter {
   flex: none; width: 6px; cursor: col-resize;
   background: transparent; position: relative;
+  touch-action: none;
 }
-.sftp-splitter::after {
+.sftp-splitter::after, .surface-splitter::after {
   content: ''; position: absolute; left: 2px; top: 10%; bottom: 10%; width: 2px;
   background: var(--line-strong); border-radius: 2px;
 }
-.sftp-splitter:hover::after { background: var(--accent); }
+.sftp-splitter:hover::after, .surface-splitter:hover::after,
+.sftp-splitter.dragging::after, .surface-splitter.dragging::after,
+.sftp-splitter:focus-visible::after, .surface-splitter:focus-visible::after { background: var(--accent); }
+.sftp-splitter:focus-visible, .surface-splitter:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .sftp-panel:not(.dual) .sftp-local,
 .sftp-panel:not(.dual) .sftp-splitter { display: none; }
-.sftp-panel.dual .sftp-remote { flex: 0 0 var(--remote-pct, 50%); }
+/* ONE share (A1-15): the local pane takes --local-pct, the splitter its 6px,
+   and the remote pane what is left (.sftp-pane: flex 1 1 0). Each side used
+   to have its own 50%, so a drag pushed the remote pane past the edge. */
 .sftp-panel.dual .sftp-local { flex: 0 0 var(--local-pct, 50%); }
 
 /* sortable table */
@@ -1590,6 +1843,7 @@ label:focus-within { color: var(--text); }
   text-align: left; padding: 6px 8px; font-size: 11px; text-transform: uppercase;
   letter-spacing: 0.04em; color: var(--text-faint); border-bottom: 1px solid var(--line);
   cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel);
+  white-space: nowrap;
 }
 .sftp-table th.sorted { color: var(--accent); }
 
@@ -1602,15 +1856,57 @@ label:focus-within { color: var(--text); }
 .sftp-panel.show-owner-cols .col-extra { display: table-cell; }
 .sftp-table th.sorted::after { content: ' ↑'; }
 .sftp-table th.sorted.desc::after { content: ' ↓'; }
-.sftp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); }
+/* One line per row (A1-16): no cell wraps. */
+.sftp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); color: var(--text); white-space: nowrap; }
 .sftp-entry { cursor: default; user-select: none; outline: none; }
 .sftp-entry.sftp-dir { cursor: pointer; }
 .sftp-entry.sftp-file { cursor: pointer; }
-.sftp-tdname { display: flex; align-items: center; gap: 7px; overflow: hidden; text-overflow: ellipsis; }
+/* The Name cell stays a table cell (A1-16: it was the flex box itself, out of
+   the column layout) and takes the room the other columns leave; icon and
+   name sit in the wrapper, and a long name is cut, whole on hover. */
+.sftp-table td.sftp-tdname { width: 100%; max-width: 0; min-width: 120px; }
+.sftp-namewrap { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.sftp-name { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* An unusual name - characters spelled out, or nothing but dots - is flagged;
+   its tooltip says why (sftp.js sftpNameCell). */
+.sftp-name-flag {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  min-width: 14px; height: 14px; border-radius: 7px;
+  font-size: 10px; font-weight: 700; line-height: 1; color: #0a1120; background: var(--warn);
+}
 /* entry icon: folder color cue via CSS (no emoji) */
-.sftp-eicon { display: inline-flex; align-items: center; flex: none; color: var(--text-faint); }
+.sftp-eicon { display: inline-flex; align-items: center; flex: none; color: var(--text-faint); position: relative; }
 .sftp-eicon svg { width: 15px; height: 15px; }
 .sftp-eicon.is-dir { color: var(--accent); }
+/* A1-17: a symbolic link carries a corner badge (the row's tooltip says what
+   it is), and one found broken when opened gets a warning one instead. */
+.sftp-eicon.is-link::after {
+  content: "\2197" / "";
+  position: absolute; right: -5px; bottom: -4px;
+  min-width: 10px; padding: 0 1px; border-radius: 3px;
+  font-size: 9px; font-weight: 700; line-height: 10px; text-align: center;
+  color: var(--accent); background: var(--panel);
+}
+.sftp-eicon.is-link.broken::after { content: "!" / ""; color: #0a1120; background: var(--danger); }
+/* A folder being sized (Calculate size): a turning ring in its Size cell. */
+.sftp-spinner {
+  display: inline-block; width: 12px; height: 12px; vertical-align: -2px;
+  border: 2px solid var(--line-strong); border-top-color: var(--accent); border-radius: 50%;
+  animation: sftpSpin 0.8s linear infinite;
+}
+@keyframes sftpSpin { to { transform: rotate(360deg); } }
+/* Type-to-filter's indicator (A1-17): over the pane, opaque, out of the
+   list's way - it had no style, so it took a row's height from the list. */
+.sftp-quickfind {
+  position: absolute; right: 10px; bottom: 10px; z-index: 3;
+  max-width: calc(100% - 20px);
+  padding: 4px 10px; border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--panel-2); color: var(--text);
+  font-family: var(--mono); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
 /* directory Size cell: muted placeholder reads as intentional */
 td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .sftp-entry.sftp-dir td:first-child { color: var(--accent); font-weight: 600; }
@@ -1620,12 +1916,11 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 
 /* search bar */
 .sftp-searchbar { display: flex; flex-direction: column; gap: 4px; }
-.sftp-searchbar[hidden] { display: none; }
 .sftp-searchbar input {
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
   padding: 6px 9px; color: var(--text); font-size: 13px;
 }
-.sftp-searchstatus { font-size: 11px; color: var(--text-dim); }
+.sftp-searchhint, .sftp-searchstatus { font-size: 11px; color: var(--text-dim); }
 .sftp-searchresults { max-height: 160px; overflow: auto; display: flex; flex-direction: column; gap: 2px; }
 .sftp-searchitem {
   padding: 4px 8px; border-radius: 6px; font-size: 12px; cursor: pointer;
@@ -1643,7 +1938,6 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   padding: 8px 10px; font-size: 11px; color: var(--text-dim);
   font-family: var(--mono); white-space: pre-wrap;
 }
-.sftp-log[hidden] { display: none; }
 
 /* status bar (FileZilla-esque: counts left, free space right) */
 .sftp-statusbar {
@@ -1656,49 +1950,99 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 }
 .sftp-statusbar .sftp-status-left { overflow: hidden; text-overflow: ellipsis; }
 
-/* transfer queue: resizable table-like panel */
+/* transfer queue: resizable table-like panel. A1-01: at most about a third of
+   the file surface until the user resizes it (sftp.js sets --q-h, and lifts
+   --q-cap, when they do) - a fixed 220px left the file list no rows at the
+   default window - and only its header while the queue is empty. */
 .sftp-queuepanel {
-  flex: none; height: 220px; min-height: 120px;
+  flex: none;
+  /* ...and never so tall that the file list loses its floor: the panel
+     gives way first, down to its header and one job of its list, in the
+     smallest window (--q-floor is the file list's floor with its toolbar,
+     header and status line). A height the user chose gives way too: the
+     resize handle (sftp.js) reads these to offer only heights that take
+     effect. */
+  --q-least: 60px;
+  --q-floor: 226px;
+  --q-row: 28px; /* one job row (.sftp-queueitem) */
+  height: clamp(var(--q-least), calc(100% - var(--q-floor)), min(var(--q-h, 200px), var(--q-cap, 35%)));
+  /* Never under its head and one job, though (A1-02) - the job list counts
+     one row in min-content (below). With Linux fonts the head wrapped and
+     left the list 0px, so no job's Pause/Cancel/Retry could be reached;
+     text that needs more room than the clamp leaves now takes it from the
+     file list, which scrolls. */
+  min-height: min-content;
   display: flex; flex-direction: column;
   border-top: 1px solid var(--line); background: var(--panel);
-  padding: 0 12px 8px; gap: 6px;
+  padding: 2px 12px 6px; gap: 4px;
   position: relative;
+  container: sftp-queue / inline-size;
 }
+.sftp-queuepanel.empty { height: auto; }
+.sftp-queuepanel.empty > :not(.sftp-queuehead),
+.sftp-queuepanel.empty .sftp-queuetabs,
+.sftp-queuepanel.empty .sftp-queueactions-head { display: none; }
+/* The resize handle lies over the panel's top edge, taking no room. */
 .sftp-queuehandle {
-  flex: none; height: 7px; margin: 0 -12px;
-  cursor: ns-resize; position: relative;
+  position: absolute; left: 0; right: 0; top: -4px; height: 9px; z-index: 2;
+  cursor: ns-resize; touch-action: none;
 }
 .sftp-queuehandle::after {
   content: ''; position: absolute; left: 50%; top: 3px; transform: translateX(-50%);
   width: 48px; height: 2px; border-radius: 2px; background: var(--line-strong);
 }
-.sftp-queuehandle:hover::after { background: var(--accent); }
-.sftp-queuehead { display: flex; align-items: center; gap: 10px; min-height: 26px; }
-.sftp-queuetitle { font-size: 12px; font-weight: 600; color: var(--text); }
-.sftp-queuesummary { font-size: 11px; color: var(--text-dim); flex: 1; }
-.sftp-queuetabs { display: flex; gap: 4px; }
+.sftp-queuehandle:hover::after, .sftp-queuehandle:focus-visible::after, .sftp-queuehandle.dragging::after { background: var(--accent); }
+.sftp-queuehandle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* A1-02: wraps rather than running off; the summary is one line, cut short. */
+.sftp-queuehead { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-height: 24px; }
+.sftp-queuetitle { flex: none; font-size: 12px; font-weight: 600; color: var(--text); }
+/* Never squeezed below a few words (it was down to one character in a
+   narrow Split): rather than that, the tabs and actions wrap to a line of
+   their own. */
+.sftp-queuesummary {
+  flex: 1 1 8em; min-width: 6em; font-size: 11px; line-height: 16px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sftp-queuetabs { display: flex; gap: 4px; flex: none; }
 .sftp-queuetab {
   background: transparent; border: 1px solid transparent; border-radius: 6px;
   color: var(--text-dim); font-size: 11px; padding: 3px 8px; cursor: pointer;
 }
 .sftp-queuetab.active { color: var(--accent); border-color: var(--accent); }
 /* extensible action area in the head (pause/priority controls append here) */
-.sftp-queueactions-head { display: flex; align-items: center; gap: 6px; }
-.sftp-queueactions-head .ghost-btn { padding: 3px 10px; font-size: 11px; }
+.sftp-queueactions-head { display: flex; align-items: center; gap: 6px; flex: none; }
+.sftp-queueactions-head .ghost-btn { padding: 3px 10px; font-size: 11px; gap: 5px; }
+.sftp-queueactions-head .ghost-btn svg { width: 12px; height: 12px; }
 
 /* restored-transfer banner (Task 5) - hidden unless a paused job's session
-   died with the previous run */
+   died with the previous run. The head's last item (sftp.js): a line of its
+   own where there is room for one. */
 .sftp-queuebanner {
-  flex: none; font-size: 11px; color: var(--warn);
+  flex: 1 1 100%; font-size: 11px; color: var(--warn);
   background: rgba(var(--accent-rgb), 0.08);
   border: 1px solid var(--line); border-radius: var(--r-sm);
-  padding: 5px 10px;
+  padding: 4px 10px;
+  /* One line, whole in its tooltip: two lines of it took most of a small
+     transfer panel's height from the jobs (A1-01). */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* A1-02: in a short file surface (under 420px the panel is too low for a
+   wrapped head, this line and a job) a line of its own left the job list
+   less than one job - none where Linux fonts wrap the head - with the first
+   job's buttons under the banner. There it is thinner and takes what the
+   head's last line leaves (beside the actions when the head wraps). */
+@container sftp-body (max-height: 420px) {
+  .sftp-queuebanner { flex: 1 1 8em; min-width: 6em; padding: 1px 8px; }
 }
 
-/* column grid shared by the header row and job rows */
+/* column grid shared by the header row and job rows. A1-02: its minimum was
+   742px, so in a narrower panel the list scrolled sideways and each job's
+   Pause/Cancel/Retry sat off screen. It now fits: the full grid where there
+   is room, then without Route/Speed/ETA (the name's tooltip and the summary
+   keep the rate), then two lines per job. */
 .sftp-queuecols, .sftp-queueitem {
   display: grid;
-  grid-template-columns: 26px minmax(120px, 2fr) minmax(110px, 1.4fr) minmax(150px, 1.6fr) 76px 64px minmax(80px, 1fr) 60px;
+  grid-template-columns: 22px minmax(100px, 2fr) minmax(70px, 1.1fr) minmax(130px, 1.6fr) 72px 56px minmax(60px, 1fr) 60px;
   gap: 8px; align-items: center;
 }
 .sftp-queuecols {
@@ -1707,9 +2051,46 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   border-bottom: 1px solid var(--line);
   padding-bottom: 3px;
 }
-.sftp-queuelist { overflow: auto; display: flex; flex-direction: column; gap: 2px; flex: 1; min-height: 0; }
-.sftp-queueitem { font-size: 12px; color: var(--text); min-height: 30px; }
-.q-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Room for one job whatever else the panel holds (A1-02). A basis of 0px,
+   not flex: 1's 0%: the panel's min-content then counts that one row of the
+   list, not all of it. */
+.sftp-queuelist { overflow: auto; display: flex; flex-direction: column; gap: 2px; flex: 1 1 0px; min-height: var(--q-row); }
+.sftp-queueitem { font-size: 12px; color: var(--text); min-height: var(--q-row); }
+.q-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+@container sftp-queue (max-width: 720px) {
+  .sftp-queuecols, .sftp-queueitem {
+    grid-template-columns: 22px minmax(80px, 2fr) minmax(120px, 1.5fr) minmax(50px, 1fr) 60px;
+  }
+  .sftp-queuecols .q-route, .sftp-queuecols .q-speed, .sftp-queuecols .q-eta,
+  .sftp-queueitem .q-route, .sftp-queueitem .q-speed, .sftp-queueitem .q-eta { display: none; }
+  .sftp-queueactions-head .btn-label {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  .sftp-queueactions-head .ghost-btn { padding: 5px 7px; }
+}
+/* In a very narrow panel (Split) the tabs and the bulk actions share one line
+   under the title and the summary. */
+@container sftp-queue (max-width: 300px) {
+  .sftp-queuetabs { gap: 2px; }
+  .sftp-queuetab { padding: 3px 5px; }
+  .sftp-queueactions-head { gap: 2px; }
+  .sftp-queueactions-head .ghost-btn { padding: 4px 5px; }
+}
+@container sftp-queue (max-width: 480px) {
+  .sftp-queuecols { display: none; }
+  .sftp-queueitem {
+    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr) 60px;
+    grid-template-areas: "dir name name act" ". prog err err";
+    row-gap: 0; padding: 2px 0;
+  }
+  .sftp-queueitem .q-dir { grid-area: dir; }
+  .sftp-queueitem .q-name { grid-area: name; }
+  .sftp-queueitem .q-act { grid-area: act; }
+  .sftp-queueitem .q-prog { grid-area: prog; }
+  .sftp-queueitem .q-err { grid-area: err; }
+  .sftp-queuelist .sftp-queuegroup { min-height: 22px; }
+}
 
 /* Grouping: a server header, then one row per remote directory, then the
    transfers themselves. Depth is carried as --q-depth and spent on the name
@@ -1744,11 +2125,13 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .q-cell.q-name { color: var(--text); }
 .q-cell.q-route, .q-cell.q-speed, .q-cell.q-eta { color: var(--text-dim); font-size: 11px; }
 .q-cell.q-prog { display: flex; align-items: center; gap: 8px; }
-.q-progtext { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.q-progtext { font-size: 11px; color: var(--text-dim); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .q-cell.q-err { color: var(--danger); font-size: 11px; }
 .q-cell.q-err.retrying { color: var(--warn); } /* auto-retry backoff - expected, not a failure */
 .q-cell.q-err.info { color: var(--text-dim); } /* restored/paused note - informational */
-.q-cell.q-act { display: flex; justify-content: flex-end; }
+/* Always reachable (A1-02): pinned to the list's right edge, should anything
+   ever make the list wider than the panel. */
+.q-cell.q-act { display: flex; justify-content: flex-end; position: sticky; right: 0; background: var(--panel); }
 .sftp-queuebar {
   flex: none; width: 70px; height: 6px; border-radius: 3px;
   background: var(--panel-3); overflow: hidden;
@@ -1794,7 +2177,7 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .conflict-cmp {
   display: flex; flex-wrap: wrap; column-gap: 14px; row-gap: 2px;
   font-size: 11px; color: var(--text-dim);
-  font-family: var(--mono, 'JetBrains Mono', 'Menlo', monospace);
+  font-family: var(--mono);
 }
 .conflict-note { color: var(--warn); }
 .conflict-actions { display: flex; flex-wrap: wrap; gap: 6px 12px; padding-top: 2px; }
@@ -1821,9 +2204,42 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   padding: 12px;
 }
 .sftp-drop-hint.dragover { display: flex; }
-.sftp-upload-row td { color: var(--warn) !important; font-style: italic; }
 
-/* ─── directory comparison tints (agent-e) ─────────────────────────────
+/* In-page drags by the pointer (A3-23 - app.js beginPointerDrag):
+   a ghost follows the pointer, dimmed where nothing takes the drop; the folder
+   row or pane under it is lit. Shared by the category tree. */
+.drag-ghost {
+  position: fixed; left: 0; top: 0; z-index: 1000; pointer-events: none;
+  max-width: 280px; padding: 4px 10px;
+  border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--panel-3); color: var(--text);
+  font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.drag-ghost.no-drop { opacity: 0.6; border-color: var(--line-strong); }
+body.pointer-dragging, body.pointer-dragging * { cursor: grabbing !important; user-select: none; }
+.sftp-pane.drag-over { outline: 2px dashed var(--accent); outline-offset: -4px; background: var(--accent-weak); }
+.sftp-entry.drop-target td { background: var(--accent-weak); box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent); }
+.sftp-entry.drop-target td:first-child { box-shadow: inset 3px 0 0 var(--accent), inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent); }
+.sftp-entry.sftp-dragging { opacity: 0.55; }
+
+/* The edit-conflict prompt (A7-19): how many other files wait for an
+   answer, and a status line only screen readers hear, for a question that
+   changes while the prompt is open. */
+.edit-conflict-queue { color: var(--warn); }
+/* One height whatever the question says, so Cancel, Reload and Overwrite stay
+   where they were when the question changes or the next file's comes up (the
+   body scrolls if a long name needs more room). */
+#editConflictModal .modal { height: min(360px, calc(100vh - 60px)); }
+/* Cancel waits a moment when the prompt has moved on to another file: shown
+   like a disabled button, still focusable (aria-disabled, sftp.js). */
+#editConflictModal .ghost-btn[aria-disabled="true"] { opacity: 0.5; cursor: default; }
+.sftp-live {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* ─── directory comparison tints ───────────────────────────────────────
    FileZilla-style: yellow = only on this side, red = differs between
    sides, green = identical. Subtle background tint + thin left border,
    consistent with .sftp-entry.selected. */
@@ -1879,7 +2295,6 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .vault-status {
   appearance: none; cursor: pointer; text-align: left; width: 100%;
   font-family: inherit;
-  gap: 9px;
 }
 .vault-status:hover { border-color: var(--line-strong); }
 .vault-text { display: flex; flex-direction: column; flex: 1; min-width: 0; line-height: 1.25; }
@@ -1887,8 +2302,6 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .vault-caret { display: inline-flex; color: var(--text-faint); flex: none; }
 .vault-caret svg { width: 14px; height: 14px; }
 .vault-status.unlocked .vault-sub { color: var(--text-faint); }
-
-.ctx-sep { height: 1px; background: var(--line); margin: 4px 6px; }
 
 /* ---- topbar search pill ------------------------------------------------- */
 
@@ -1993,11 +2406,17 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 /* ---- key rows: actions on the right ------------------------------------- */
 
 .key-row-actions { display: flex; align-items: center; gap: 7px; flex: none; }
-.key-row .row-btn { opacity: 0; padding: 5px 10px; font-size: 12px; }
+/* Connect shows on hover, on the selected row and on keyboard focus, and
+   takes no room otherwise (A1-07): invisible, it still reserved 88px and
+   squeezed the name into wrapping mid-word. Collapsed rather than
+   display:none, so Tab still reaches it - and it opens up when it does. */
+.key-row .row-btn {
+  max-width: 0; padding: 0; border-width: 0; overflow: hidden;
+  opacity: 0; font-size: 12px;
+}
 .key-row:hover .row-btn,
 .key-row.selected .row-btn,
-.key-row .row-btn:focus-visible { opacity: 1; }
-.key-row-sub[hidden] { display: none !important; }
+.key-row .row-btn:focus-visible { max-width: 140px; padding: 5px 10px; border-width: 1px; opacity: 1; }
 
 .chip {
   display: inline-flex; align-items: center; gap: 5px;
@@ -2010,9 +2429,11 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 
 /* ---- selection action bar ----------------------------------------------- */
 
+/* Wraps in a narrow key column: the actions used to run on under the detail
+   pane, which painted over Deploy and Clear (A1-18). */
 .selection-bar {
   position: sticky; bottom: 0;
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 10px 12px 10px 16px;
   background: var(--panel-2);
   border: 1px solid var(--line-strong);
@@ -2045,7 +2466,6 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .detail-tab.active { background: var(--active); color: var(--text); font-weight: 600; }
 
 .detail-panel { display: flex; flex-direction: column; gap: 10px; }
-.detail-panel[hidden] { display: none !important; }
 
 .copy-row {
   display: flex; align-items: center; gap: 8px;
@@ -2054,10 +2474,12 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
 }
+/* The fingerprint is what you compare here, so all of it is shown: it wraps
+   instead of losing its tail to an ellipsis (A1-35). */
 .copy-row code {
   flex: 1; min-width: 0;
   font-family: var(--mono); font-size: 12px; color: var(--text-dim);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .copy-row.block { position: relative; padding: 0; border: none; background: transparent; }
 /* Room for the floating Copy button, or the key runs underneath it. */
@@ -2148,12 +2570,16 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   border-right: 1px solid var(--line);
   overflow-y: auto;
 }
+/* The form scrolls when it is taller than the sheet; its parts keep their
+   size (the key chips were squeezed under the first field). */
+.deploy-form > * { flex-shrink: 0; }
 .deploy-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .deploy-grid .span-2 { grid-column: span 2; }
 
 .opt-list { display: flex; flex-direction: column; gap: 8px; }
+label.opt-row { flex-direction: row; }
 .opt-row {
-  flex-direction: row !important; align-items: flex-start; gap: 10px;
+  align-items: flex-start; gap: 10px;
   cursor: pointer; user-select: none;
   padding: 9px 11px;
   background: var(--bg-elev);
@@ -2162,6 +2588,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   transition: border-color 0.12s ease;
 }
 .opt-row:hover { border-color: #39445a; }
+/* A passphrase disables saving deployed files as servers (A7-32). The row needs
+   the same visible disabled affordance as a settings toggle, not a live hand. */
+.opt-row:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
 .opt-row input[type="checkbox"] { position: absolute; opacity: 0; pointer-events: none; }
 .opt-row .toggle-box { margin-top: 1px; }
 /* The checked rules were scoped to .toggle-chip, so these read as permanently
@@ -2174,27 +2603,57 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .opt-sub { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
 .opt-sub.mono { font-family: var(--mono); }
 
+/* The preview side scrolls as a whole when the plan (one entry per key, with
+   any refusal) and the config text do not fit, rather than clipping either. */
 .deploy-preview {
   flex: 1; min-width: 0;
   display: flex; flex-direction: column;
   background: var(--bg-elev);
+  overflow-y: auto;
 }
+.deploy-preview > * { flex-shrink: 0; }
 .deploy-preview-head {
   display: flex; align-items: center; gap: 8px;
   padding: 11px 16px;
   border-bottom: 1px solid var(--line);
 }
 .deploy-preview-head .detail-label { margin-top: 0; }
-.deploy-paths { padding: 12px 16px 0; }
+.deploy-paths { padding: 12px 16px 0; display: flex; flex-direction: column; gap: 8px; overflow-wrap: anywhere; }
 .deploy-paths code {
   font-family: var(--mono); font-size: 11px; color: var(--accent);
   background: rgba(var(--accent-rgb), 0.08);
   padding: 1px 5px; border-radius: 4px;
 }
+/* Each key's real files and alias, from the backend's plan (R3), and the
+   reason a key will be refused (A2-46). */
+.deploy-plan { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.deploy-plan-item { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.deploy-plan-name { color: var(--text-dim); font-weight: 600; }
+.deploy-plan-item.refused code { color: var(--text-faint); background: var(--panel-3); text-decoration: line-through; }
+.deploy-plan-refusal { color: var(--danger); }
+/* What the deploy preview warns about, and the Host lines of the user's own
+   config that name these hosts: text in the warning colour, a line that
+   breaks ssh in the danger colour. */
+.deploy-notes { display: flex; flex-direction: column; gap: 4px; }
+.deploy-notes-head { margin: 0; color: var(--warn); font-weight: 600; }
+.deploy-notes ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; color: var(--warn); overflow-wrap: anywhere; }
+.deploy-legacy-what { color: var(--text-dim); }
+.deploy-legacy-what.breaks { color: var(--danger); }
+/* The Include line for ~/.ssh/config, with its Copy button (A5-05). */
+.include-row { display: flex; align-items: center; gap: 8px; }
+.include-row code { flex: 1; min-width: 0; }
+.include-row .ghost-btn { padding: 4px 9px; font-size: 11.5px; flex: none; }
+/* Why the sheet's fields cannot be deployed as they stand (A2-33). Scoped to
+   the dialog body so its own paragraph colour does not win. */
+.modal-body .field-error { color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
+/* Grows into the room left, never below a readable height, inside the side
+   margins. A leftover "#configPreview { width: 100% }" from the old Deploy
+   view overrode this rule, so the box ran 16px past the sheet's edge and
+   lost its right border; it is gone (seen in review). */
 .deploy-preview textarea {
-  flex: 1; min-height: 0;
+  flex: 1 0 160px;
   margin: 12px 16px 16px;
-  width: auto;
+  width: calc(100% - 32px);
   resize: none;
   font-family: var(--mono); font-size: 11.5px; line-height: 1.7;
   background: var(--bg);
@@ -2223,15 +2682,15 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .settings-nav-item.active svg { opacity: 1; }
 
 .settings-panel { flex: 1; min-width: 0; max-width: 880px; display: flex; flex-direction: column; gap: 18px; }
-.settings-section[hidden] { display: none !important; }
 .settings-section .card-head { margin-bottom: 0; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
 
 .settings-rows { display: flex; flex-direction: column; }
+/* A <div> (A1-05): only the caption <label for> and the switch act on the
+   field, so the row needs no !important to beat the global label rule. */
 .settings-row {
-  flex-direction: row !important; align-items: center; gap: 24px;
+  display: flex; flex-direction: row; align-items: center; gap: 24px;
   padding: 14px 0;
   border-bottom: 1px solid var(--line-soft);
-  cursor: default;
 }
 .settings-row:last-child { border-bottom: none; }
 .settings-row-text { display: flex; flex-direction: column; flex: 1; min-width: 0; }
@@ -2243,11 +2702,18 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 }
 .settings-row-control input[type="number"] { width: 110px; }
 .settings-row-control select { width: auto; min-width: 140px; }
-.settings-row:has(.toggle-input) { cursor: pointer; }
+.settings-toggle { display: inline-flex; flex-direction: row; align-items: center; cursor: pointer; }
+.settings-row:has(.toggle-input) .settings-row-title { cursor: pointer; }
 .settings-row-control .toggle-input { position: absolute; opacity: 0; pointer-events: none; }
 .settings-row-control .toggle-input:checked + .toggle-box { background: rgba(var(--accent-rgb), 0.25); border-color: var(--accent); }
 .settings-row-control .toggle-input:checked + .toggle-box::after { transform: translateX(13px); background: var(--accent); }
 .settings-row-control .toggle-input:focus-visible + .toggle-box { box-shadow: var(--ring); }
+/* A security setting while the vault is locked (A6-08): disabled, and the row
+   says why. */
+.settings-row-locked { font-size: 11.5px; color: var(--warn); margin-top: 3px; }
+.settings-row:has(.toggle-input:disabled) .settings-row-title,
+.settings-row:has(.toggle-input:disabled) .settings-toggle { cursor: default; }
+.settings-row-control .toggle-input:disabled + .toggle-box { opacity: 0.45; }
 
 .settings-foot {
   display: flex; align-items: center; gap: 10px;
@@ -2260,22 +2726,21 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 
 .session-surface { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .session-surface.split { flex-direction: row; }
-.session-surface.split .terminal-body { flex: 0 0 var(--split-pct, 54%); min-width: 240px; }
-.session-surface.split .sftp-body { flex: 1; min-width: 280px; }
-.surface-splitter {
-  flex: none; width: 6px; cursor: col-resize; position: relative;
-  background: transparent;
-}
-.surface-splitter[hidden] { display: none !important; }
-.surface-splitter::after {
-  content: ''; position: absolute; left: 2px; top: 10%; bottom: 10%; width: 2px;
-  background: var(--line-strong); border-radius: 2px;
-}
-.surface-splitter:hover::after { background: var(--accent); }
+/* A1-03: the two sides share the surface's width and never overflow its
+   column - fixed floors of 240px + 280px pushed the file browser out of a
+   460px column. --split-pct is the terminal's share (the splitter, sftp.js,
+   keeps it within the floors); the file browser takes the rest. In a very
+   narrow surface the floors give way to percentages. */
+.session-surface.split .terminal-body { flex: 0 1 var(--split-pct, 54%); min-width: min(180px, 40%); }
+.session-surface.split .sftp-body { flex: 1 1 0; min-width: min(260px, 55%); }
 
 .mode-seg .seg-btn { display: inline-flex; align-items: center; gap: 6px; }
 .mode-seg .seg-btn svg { width: 13px; height: 13px; }
 .mode-seg .seg-btn.active { color: #0a1120; font-weight: 600; }
+/* A5-12(b): the file browser is opening - the surface asked for pulses until
+   it is ready, and more clicks wait for the same request. */
+.mode-seg[aria-busy="true"] { cursor: progress; }
+.mode-seg .seg-btn.pending { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); animation: pulse 1.1s ease-in-out infinite; }
 
 /* ---- server rows: live state + connect affordance ----------------------- */
 
@@ -2285,15 +2750,12 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 }
 .server-dot.live { background: var(--ok); box-shadow: 0 0 0 3px rgba(var(--ok-rgb), 0.15); }
 .server-row:focus-visible { outline: none; box-shadow: var(--ring); }
+/* Shown with its row's actions (.server-row-actions), never on its own. */
 .server-go {
-  opacity: 0;
   padding: 3px 9px; font-size: 11px;
   flex: none;
 }
 .server-go svg { width: 11px; height: 11px; }
-.server-row:hover .server-go,
-.server-row.selected .server-go,
-.server-go:focus-visible { opacity: 1; }
 
 /* ---- remote path breadcrumb (replaces the bare text field) --------------- */
 
@@ -2308,7 +2770,6 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   transition: background 0.12s ease, border-color 0.12s ease;
 }
 .sftp-crumbs:hover { background: var(--panel-2); border-color: var(--line); }
-.sftp-crumbs[hidden] { display: none !important; }
 .sftp-crumb {
   appearance: none; border: none; cursor: pointer; font-family: inherit;
   font-size: 12px;
@@ -2332,16 +2793,32 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
    Docks at the right of the session surface; the surface is a column by
    default and a row when .split, so .assistant-open flips it to a row in
    either case and the terminal/SFTP share what is left. */
-.session-surface.assistant-open { flex-direction: row; }
+.session-surface.assistant-open { flex-direction: row; position: relative; }
 .assistant-open .terminal-body { flex: 1; min-width: 0; }
 
+/* A1-03: docked at a fixed 380px the panel left the terminal 9-17 columns at
+   the default window, and in Split it was pushed out of the clipping column
+   (Execute/YOLO and Send unreachable even at 1600px). It now OVERLAYS the
+   session surface - the terminal keeps its columns - and docks beside it only
+   when the window is wide enough for both, shrinking before the terminal
+   does. In Split the panel always overlays: the split surface keeps its own
+   layout (owned by the SFTP layout work) and the panel never adds to it. */
 .assistant-panel {
-  flex: 0 0 380px;
+  position: absolute; top: 0; right: 0; bottom: 0; z-index: 20;
+  width: min(380px, calc(100% - 24px));
   display: flex; flex-direction: column; min-width: 0;
   border-left: 1px solid var(--line);
   background: var(--bg-elev);
+  box-shadow: -10px 0 28px rgba(0, 0, 0, 0.38);
 }
-.assistant-panel[hidden] { display: none !important; }
+@media (min-width: 1500px) {
+  .session-surface.assistant-open:not(.split) .assistant-panel {
+    position: static; width: auto; flex: 0 1 380px; min-width: 260px; box-shadow: none;
+  }
+  .session-surface.assistant-open:not(.split) .terminal-body { min-width: 320px; }
+}
+/* (A4-04's rule moving the floating maximize button off the panel's Send
+   button is gone with the floating button: it sits in the header now.) */
 
 .ai-head {
   display: flex; align-items: center; gap: 8px;
@@ -2355,20 +2832,59 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .ai-yolo-badge {
   padding: 1px 7px; border-radius: 999px;
   font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
-  color: #fff; background: var(--danger);
+  /* Dark on the light red: white on it was 2.80:1 (A1-14). */
+  color: #0a1120; background: var(--danger);
 }
-.ai-yolo-badge[hidden] { display: none !important; }
-.ai-close { margin-left: auto; }
+/* New chat takes the free space, so it and Close sit at the right edge. */
+.ai-new-chat { margin-left: auto; font-size: 11px; padding: 3px 9px; }
+
+/* First-open setup card (A5-36). */
+.ai-setup {
+  margin: 10px 10px 0; padding: 10px 12px; border-radius: var(--r-sm);
+  border: 1px solid rgba(var(--accent-rgb), 0.45); background: var(--panel);
+  display: flex; flex-direction: column; gap: 6px; font-size: 12px;
+}
+.ai-setup p { margin: 0; }
+.ai-setup-title { font-weight: 700; color: var(--text); }
+.ai-setup-text { color: var(--text-dim); }
+.ai-setup button { align-self: flex-start; font-size: 12px; padding: 5px 11px; }
+
+/* One row per tool call, for every approval path (A4-17): what ran, where,
+   who approved it, and how it ended. Read-only - no controls. */
+.ai-tool-event {
+  font-size: 11.5px; line-height: 1.4; padding: 5px 8px;
+  border-left: 3px solid var(--line-strong); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--panel); color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.ai-tool-event.ok { border-left-color: var(--accent); }
+.ai-tool-event.error { border-left-color: var(--danger); }
+.ai-tool-event.denied, .ai-tool-event.cancelled { border-left-color: var(--warn); }
+.ai-tool-event-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+.ai-tool-event-name { color: var(--text); font-weight: 600; font-family: var(--mono); }
+.ai-tool-event-src { font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; }
+.ai-tool-event-src.yolo { color: var(--danger); }
+.ai-tool-event-src.auto { color: var(--warn); }
+.ai-tool-event pre {
+  margin: 4px 0 0; padding: 4px 6px; max-height: 160px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font-family: var(--mono); font-size: 11px; color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+}
+.ai-tool-event-warn { margin-top: 3px; color: var(--warn); }
+.ai-card-error { margin-top: 4px; color: var(--danger); font-size: 11.5px; overflow-wrap: anywhere; }
+.ai-msg-actions { margin-top: 4px; }
+.ai-msg-actions button { font-size: 11px; padding: 3px 10px; }
 
 .ai-levels { padding: 8px 10px 6px; border-bottom: 1px solid var(--line-soft); }
 .ai-level-seg { width: 100%; }
 .ai-level-seg .seg-btn { flex: 1; font-size: 11.5px; padding: 6px 0; }
 /* The active level is filled with that level's own colour, with dark text on
-   it - the same treatment `.mode-seg` already uses for Shell/Files/Split. The
-   text colour must be set explicitly: the older base `.seg-btn.active` paints
-   `color: white`, and a first version of this rule overrode only the colour,
-   which put accent-on-accent and made the label vanish. All three tokens are
-   light pastels on a dark theme, so dark text is readable on every fill. */
+   it - the base `.seg-btn.active` treatment (it painted white text until
+   A1-14). A first version of this rule recoloured only the fill to the
+   accent, which once put accent-on-accent and made the label vanish. All
+   three tokens are light pastels on a dark theme, so dark text is readable on
+   every fill. */
 .ai-level-seg .seg-btn.active { color: #0a1120; font-weight: 600; }
 .ai-level-seg .seg-btn.active.level-read,
 .ai-level-seg .seg-btn.active.level-draft { background: var(--accent); }
@@ -2381,7 +2897,6 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 
 .ai-messages { flex: 1; overflow-y: auto; padding: 10px; min-height: 0; }
 .ai-tab-list { display: flex; flex-direction: column; gap: 8px; }
-.ai-tab-list[hidden] { display: none !important; }
 
 .ai-msg { font-size: 12.5px; line-height: 1.45; max-width: 100%; }
 .ai-msg .ai-text { white-space: pre-wrap; word-break: break-word; }
@@ -2429,10 +2944,23 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 .ai-card pre code { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
 /* Long commands wrap rather than scroll sideways: the panel is 380px wide,
    and a one-line command with a long path is the common case. */
-.ai-cmd { white-space: pre-wrap; word-break: break-word; }
+/* A command or its arguments are laid out in the order they are sent, left to
+   right, whatever letters they hold: with every direction
+   control escaped, right-to-left letters could still reorder the characters
+   around them on screen. */
+.ai-cmd { white-space: pre-wrap; word-break: break-word; unicode-bidi: bidi-override; direction: ltr; }
+/* An invisible or direction-changing character in a command or argument,
+   shown as its code point: marked so it cannot pass for text. */
+.ai-hidden-char {
+  color: var(--warn); background: rgba(var(--warn-rgb), 0.14);
+  border-radius: 3px; padding: 0 2px;
+}
 .ai-card-actions { display: flex; gap: 6px; }
 .ai-card-actions button { font-size: 11px; padding: 3px 10px; }
 .ai-card.confirm { border-color: var(--warn); }
+/* A pending card takes the focus itself (not its Approve button): show it. */
+.ai-card.confirm:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ai-args-all summary { cursor: pointer; color: var(--accent); font-size: 11px; margin: -2px 0 6px; }
 .ai-card.approved { border-color: var(--accent); opacity: 0.75; }
 .ai-card.denied { opacity: 0.55; }
 
@@ -2441,7 +2969,6 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   padding: 6px 10px; border-top: 1px solid var(--line-soft);
   font-size: 12px; color: var(--text-dim);
 }
-.ai-thinking[hidden] { display: none !important; }
 .ai-thinking-dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--accent);
@@ -2460,7 +2987,9 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   background: var(--panel); border: 1px solid var(--line);
   color: var(--text); font-family: inherit; font-size: 12.5px;
 }
-.ai-foot textarea:focus { outline: none; border-color: var(--ring); }
+/* var(--ring) is a box-shadow, not a colour: as a border colour it was
+   invalid and fell back to an off-palette one (A1-32). */
+.ai-foot textarea:focus { border-color: var(--accent); }
 .ai-send { flex: 0 0 auto; }
 .ai-send svg { width: 14px; height: 14px; }
 
@@ -2487,7 +3016,10 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
   background: #f6858f; border-color: #f6858f;
 }
 
-/* Settings section bits. */
+/* Settings section bits. .ai-field lays out like the settings labels: the
+   Base URL caption is its own <label> so the preset keeps its own name. */
+.ai-field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-dim); font-weight: 500; }
+.ai-field:focus-within > label { color: var(--text); }
 .ai-urlrow { display: flex; gap: 6px; }
 .ai-urlrow input { flex: 1; }
 .ai-urlrow select { flex: 0 0 130px; }
@@ -2533,6 +3065,8 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 /* Status dot reuses the server-dot geometry with an MCP error state. */
 .mcp-dot.err { background: var(--danger); box-shadow: 0 0 0 3px rgba(var(--danger-rgb), 0.15); }
 .mcp-loopback-warn { font-size: 11.5px; color: var(--warn); }
+/* A server SSHSpan keeps switched off until its credential is allowed. */
+.mcp-unconfirmed { font-size: 11.5px; color: var(--warn); }
 .mcp-server-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .mcp-server-actions button { font-size: 11px; padding: 3px 10px; }
 
@@ -2576,3 +3110,33 @@ td.sftp-dirsize { color: var(--text-faint); font-size: 12px; }
 }
 .mcp-tool-changed { font-size: 11.5px; color: var(--warn); font-weight: 600; }
 .mcp-tool-toggles { display: flex; gap: 8px; flex-wrap: wrap; }
+/* A4-08: a toggle that cannot be used looks it. */
+.mcp-tool-toggles .toggle-chip:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.mcp-tool-schema {
+  margin: 0; padding: 5px 7px; max-height: 140px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  white-space: pre-wrap; word-break: break-word;
+}
+.mcp-status-text { flex: none; font-size: 11px; color: var(--text-dim); }
+.mcp-badge {
+  flex: none; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 1px 7px; border-radius: 999px;
+  border: 1px solid rgba(var(--warn-rgb), 0.5); color: var(--warn);
+}
+.mcp-server-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--text-faint); }
+.mcp-server-error { font-size: 11.5px; color: var(--danger); overflow-wrap: anywhere; }
+.mcp-rebind-warn { color: var(--warn); font-size: 11.5px; margin: 0; }
+
+/* ==========================================================================
+   Reduced motion: every animation and transition here is decoration, so when
+   the system asks for less motion nothing pops, slides, fades or pulses
+   (A1-36).
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
