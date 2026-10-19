@@ -43,3 +43,7 @@ src-tauri/target/
 
 # Codegraph index (never commit; contains a local SQLite index)
 .codegraph/
+
+# Superpowers plans and specs from local agent sessions (never commit new ones;
+# the 2026-10-09 remediation plan already there stays tracked)
+docs/superpowers/
