@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-10-25  
 **Status:** describes v1.10.0, the PuTTY session import and how the names of saved servers and the
-remote names in the transfer queue are shown; the last two are not released yet (Unreleased in
-the CHANGELOG). The passages about the
+remote names in the transfer queue and the activity log are shown; the last two are not released
+yet (Unreleased in the CHANGELOG). The passages about the
 import - in [Vault lock and locked-state policy](#vault-lock-and-locked-state-policy) the sentence
 on an import a lock stops and the bullet on the two listings of hosts, and the PuTTY session import
 section - are checked against committed source at `a75b533`; the Names of saved servers section
