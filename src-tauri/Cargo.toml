@@ -51,21 +51,36 @@ minisign-verify = "0.2"           # minisign/Ed25519 updater signature verificat
 # ─── Crypto: asymmetric keys ────────────────────────────────────────────────
 rsa = { version = "0.9", features = ["pem"] }
 ed25519-dalek = "2"               # Ed25519 signing
-p256 = "0.13"                     # ECDSA P-256
-p384 = "0.13"                     # ECDSA P-384
-p521 = "0.13"                     # ECDSA P-521
+p256 = "0.14"                     # ECDSA P-256
+p384 = "0.14"                     # ECDSA P-384
+p521 = "0.14"                     # ECDSA P-521
 x25519-dalek = "2"                # X25519 key exchange
 
 # ─── SSH key format (audited, RustCrypto) ────────────────────────────────────
-# Handles OpenSSH parse/serialize, key generation (all algorithms incl.
-# P-384/P-521), and correct SHA-256 fingerprints. Used as the source of
-# truth for key material instead of hand-rolled wire-format encoding.
+# Handles OpenSSH parse/serialize, RSA and Ed25519 key generation, and
+# correct SHA-256 fingerprints. Used as the source of truth for key material
+# instead of hand-rolled wire-format encoding.
 # (PPK is not supported by this crate; handled separately in crypto/putty.rs
 # against the authoritative spec in PuTTY's own documentation.)
-ssh-key = { version = "0.6", features = [
-    "std", "alloc", "getrandom", "rand_core",
-    "ed25519", "rsa", "p256", "p384", "p521", "encryption",
+#
+# Its p256/p384/p521 features are off on purpose: they pull in
+# elliptic-curve 0.13 and with it crypto-bigint 0.5, whose constant-time
+# advisory (RUSTSEC-2026-0387) is fixed only in 0.7.6+. Its `std` feature is
+# off too (default-features = false): it names `p256?/std` and the like, and
+# Cargo writes such weak dependencies into Cargo.lock although nothing builds
+# them - which is the file cargo audit reads. `std` only adds things this app
+# does not use: file, certificate-time and signing helpers, and
+# std::error::Error for its error type (whose messages already include the
+# inner error). ECDSA keys still parse and serialize; generating one and
+# checking a scalar use p256/p384/p521 0.14 above, and `ecdsa_keypair` in
+# crypto/keys.rs hands the result to ssh-key through its wire-format decoder
+# - hence `ssh-encoding`, the same 0.2 ssh-key uses (`alloc` for its Vec
+# writer).
+ssh-key = { version = "0.6", default-features = false, features = [
+    "alloc", "ecdsa", "getrandom", "rand_core",
+    "ed25519", "rsa", "encryption",
 ] }
+ssh-encoding = { version = "0.2", features = ["alloc"] }
 
 # ─── Crypto: encoding / utilities ───────────────────────────────────────────
 base64ct = "1.6"                  # Base64 (CT-safe, no alloc)
