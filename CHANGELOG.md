@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it only to generate an ECDSA key, import an ECDSA `.ppk` and export one as PKCS#8 (private or
   public); SSH sessions already used 0.7. Those now use `p256`/`p384`/`p521` 0.14, and a PPK import
   or PKCS#8 export gives the same bytes as before. (#90)
+- **An MCP tool cannot pass for another on the approval card.** A tool's name and display name are
+  the MCP server's choice and were shown as they are, so a text-direction override (U+202E) turned
+  what followed it around and a zero-width space went unseen - on the card that approves a call
+  too. The renderer now spells such characters out (`<U+202E>`), each name in a text-direction
+  isolate of its own, on the approval card (its accessible name spelled out too), in the tools list,
+  in the assistant's record of each call and in the notices that name a tool. That record also
+  shows a call's result and the backend's warning with these characters marked, the result's line
+  breaks kept. The card, that record and the schema notice spell out the server's own name too,
+  since a backup restores it unchecked. The MCP settings' server list and the audit log still show
+  these names as stored. The model, the backend and the stored record still get every name and
+  result as they are (see `docs/SECURITY.md`).
 
 ## [1.10.0] - 2026-10-18
 

@@ -31,6 +31,22 @@ const MCP = (more = {}) => ({
   status: 'connected', tool_count: 1, tools: [TOOL()], ...more,
 });
 const TC = (id, name = 'get_session_info', args = {}) => ({ id, name, arguments_json: JSON.stringify(args) });
+// Names an MCP server chooses, holding a text-direction override and a
+// zero-width space, and how the renderer must show them. The characters are
+// built from their code points, so this file holds none of them itself.
+const RLO = String.fromCodePoint(0x202E);
+const ZWSP = String.fromCodePoint(0x200B);
+const FSI = String.fromCodePoint(0x2068);
+const PDI = String.fromCodePoint(0x2069);
+const RLO_TOOL = 'echo' + RLO + 'txt.exe';
+const RLO_SHOWN = 'echo<U+202E>txt.exe';
+const ZWSP_DISPLAY = 'Ec' + ZWSP + 'ho';
+const ZWSP_SHOWN = 'Ec<U+200B>ho';
+// A server's own name is checked when it is saved, not when a backup restores it.
+const RESTORED_SERVER = 'svc' + RLO + 'x';
+const RESTORED_SHOWN = 'svc<U+202E>x';
+const hidesAny = (text) => text.includes(RLO) || text.includes(ZWSP);
+const SPELLED_MCP = (name = 'svc') => MCP({ name, tools: [TOOL({ name: RLO_TOOL, display_name: ZWSP_DISPLAY, exposed_name: 'mcp__svc__echo_txt_exe' })] });
 // Argument names a server may choose for anything - credential-looking ones
 // included - with the values the user must see on the approval card.
 const FULL_ARGS = {
@@ -923,6 +939,125 @@ async function mcpConfirmChecks(browser, server) {
   });
 }
 
+// An MCP server chooses its tools' names and display names, and the results:
+// shown spelled out on the approval card, in the tools list, in the tool log
+// and in the notices that name a tool, so a tool cannot read as another -
+// while the backend, the model and the stored record get them as they are.
+async function spelledNameChecks(browser, server) {
+  await fixture(browser, server, 'MCP tool names in the tools list and its notices are spelled out', async (app) => {
+    const { page } = app;
+    await settings(page); await page.evaluate(() => mcpShowToolsFor('m1'));
+    const name = page.locator('.mcp-tool-name');
+    ok('the display name and the name, spelled out', await name.textContent(), ZWSP_SHOWN + ' (' + RLO_SHOWN + ')');
+    ok('each in a text-direction isolate of its own', await name.locator('bdi').allTextContents(), [ZWSP_SHOWN, RLO_SHOWN]);
+    ok('the model is told both names as they are', await page.evaluate(() => mcpGetTools().map((t) => t.description)),
+      [ZWSP_DISPLAY + ' (MCP server "svc", tool "' + RLO_TOOL + '")']);
+    await page.evaluate((refusal) => {
+      Object.assign(window.__replies.mcp_list_servers[0].tools[0], { display_name: null, enabled: false });
+      window.__replies.mcp_set_tool_state = { $reject: refusal };
+      return mcpLoadSettings();
+    }, "This tool's definition changed - review it and approve again.");
+    ok('a name shown alone is spelled out too', await name.textContent(), RLO_SHOWN);
+    await page.locator('.mcp-tool-row label').filter({ hasText: /^Enable$/ }).click();
+    await page.waitForFunction(() => /was not approved/.test(document.getElementById('mcpStatus').textContent));
+    ok('the backend is asked about the tool by its name as it is', (await app.calls('mcp_set_tool_state')).at(-1).args.tool, RLO_TOOL);
+    const refused = await page.locator('#mcpStatus').textContent();
+    expect('a refused approval names the tool spelled out, kept to itself',
+      refused.includes('Tool "' + FSI + RLO_SHOWN + PDI + '" was not approved') && !hidesAny(refused));
+    // The backend's refusals can quote the tool ("Tool '...' not found").
+    await page.evaluate((refusal) => { window.__replies.mcp_set_tool_state = { $reject: refusal }; },
+      "Tool '" + RLO_TOOL + "' not found on this MCP server.");
+    await page.locator('.mcp-tool-row label').filter({ hasText: /^Enable$/ }).click();
+    await page.waitForFunction(() => [...document.querySelectorAll('#toast .toast-text')].some((n) => /not found on this MCP server/.test(n.textContent)));
+    expect('a refusal that quotes the tool is spelled out',
+      (await toasts(page)).includes("Tool '" + RLO_SHOWN + "' not found on this MCP server."));
+    await page.evaluate((tool) => {
+      window.__replies.mcp_test_connection = { tools: [], changed: [tool] };
+      return mcpTestConnection('m1');
+    }, RLO_TOOL);
+    const changed = await page.locator('#mcpStatus').textContent();
+    expect('a tool that changed on the server is named spelled out, kept to itself',
+      changed.includes(FSI + RLO_SHOWN + PDI) && !hidesAny(changed));
+  }, { replies: { mcp_list_servers: [SPELLED_MCP()] } });
+  await fixture(browser, server, 'MCP names on the approval card and in the tool log are spelled out', async (app) => {
+    const { page } = app; const id = await panel(app);
+    const card = () => page.locator('.ai-card.confirm').last();
+    const call = (callId) => page.evaluate(({ t, c }) => {
+      window.__toolTask = aiRunTool(t, { id: c, name: 'mcp__svc__echo_txt_exe', arguments_json: '{"text":"hi"}' });
+    }, { t: id, c: callId });
+    const result = 'first' + RLO + 'tsal\nzero' + ZWSP + 'width';
+    const warning = 'The tool ran, but refreshing its tool list failed: tool "x' + RLO + 'y" is invalid';
+    await page.evaluate(({ content, warn }) => {
+      window.__replies.mcp_call_tool = { ok: true, content, is_error: false, warning: warn };
+    }, { content: result, warn: warning });
+    await call('denied');
+    await card().waitFor();
+    ok('the card\'s accessible name spells the tool and the server out', await card().getAttribute('aria-label'),
+      'Approval needed: call tool ' + RLO_SHOWN + ' on MCP server ' + RESTORED_SHOWN);
+    const target = card().locator('.ai-card-why').nth(1);
+    ok('the card names the server and the tool, spelled out', await target.textContent(),
+      'Server "' + RESTORED_SHOWN + '" - tool ' + RLO_SHOWN + ' (server claims: read-only)');
+    ok('each in a text-direction isolate of its own', await target.locator('bdi').allTextContents(), [RESTORED_SHOWN, RLO_SHOWN]);
+    expect('nothing on the card is an override or a zero-width space left unshown', !hidesAny(await card().textContent()));
+    await card().locator('button').filter({ hasText: /^Deny$/ }).click();
+    ok('the denied call is answered', await page.evaluate(() => window.__toolTask), 'denied by user');
+    ok('and its row names the server and the tool, spelled out',
+      await page.locator('.ai-tool-event-name').last().textContent(), 'MCP ' + RESTORED_SHOWN + ' - ' + RLO_SHOWN);
+    await call('approved');
+    await page.waitForFunction(() => document.querySelectorAll('.ai-card.confirm').length === 2);
+    await card().locator('button').filter({ hasText: /^Approve$/ }).click();
+    const sent = await page.evaluate(() => window.__toolTask);
+    ok('the backend is asked for the tool by its name as it is', (await app.calls('mcp_call_tool')).at(-1).args.tool, RLO_TOOL);
+    expect('the model gets the result and the warning as they are', sent.includes(result) && sent.includes(warning));
+    const row = page.locator('.ai-tool-event').last();
+    const head = row.locator('.ai-tool-event-name');
+    ok('the row names the server and the tool, spelled out', await head.textContent(), 'MCP ' + RESTORED_SHOWN + ' - ' + RLO_SHOWN);
+    ok('each in a text-direction isolate of its own', await head.locator('bdi').allTextContents(), [RESTORED_SHOWN, RLO_SHOWN]);
+    const shown = row.locator('pre').last();
+    ok('the result shows each such character as its code point, its lines kept', await shown.textContent(),
+      'Result: first<U+202E>tsal\nzero<U+200B>width');
+    ok('each one marked, so it cannot pass for text', await shown.locator('.ai-hidden-char').allTextContents(), ['<U+202E>', '<U+200B>']);
+    expect('the warning is spelled out too', (await row.locator('.ai-tool-event-warn').textContent()).includes('tool "x<U+202E>y" is invalid'));
+    expect('nothing in the row is an override or a zero-width space left unshown', !hidesAny(await row.textContent()));
+    // A tool name the model made up: answered as it was called, shown spelled out.
+    const madeUp = 'get_session_info' + RLO;
+    ok('the model is answered with the name as it called it',
+      await page.evaluate(({ t, n }) => aiRunTool(t, { id: 'odd', name: n, arguments_json: '{}' }), { t: id, n: madeUp }), 'unknown tool: ' + madeUp);
+    ok('its row spells it out', await page.locator('.ai-tool-event-name').last().textContent(), 'get_session_info<U+202E>');
+    // A call the turn never reached (Stop) is logged by the name the model gave it.
+    await page.evaluate((n) => {
+      let k = 0;
+      window.__replies.assistant_chat = () => ++k === 1 ? { text: '', tool_calls: [
+        { id: 'first', name: 'mcp__svc__echo_txt_exe', arguments_json: '{}' },
+        { id: 'second', name: n, arguments_json: '{}' },
+      ] } : { text: 'Done.', tool_calls: [] };
+    }, madeUp);
+    await send(page);
+    await page.waitForFunction(() => document.querySelectorAll('.ai-card.confirm:not(.approved):not(.denied)').length === 1);
+    await page.click('#assistantStopBtn'); await idle(page);
+    ok('a call the turn never reached is logged by its name, spelled out',
+      await page.locator('.ai-tool-event.cancelled .ai-tool-event-name').last().textContent(), 'get_session_info<U+202E>');
+  }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
+  await fixture(browser, server, 'A tool schema error names the tool spelled out', async (app) => {
+    const { page } = app;
+    // The JSON parser's error quotes the schema, so one holds an override
+    // where a value should be (quoted twice: as the token and in the text).
+    const errors = await page.evaluate(({ server, tool, rlo }) => [undefined, '{"a":' + rlo + '}', 42, '[]'].map((schema) => {
+      try { mcpValidateToolSchema({ inputSchema: schema }, server, tool); return 'accepted'; } catch (e) { return e.message; }
+    }), { server: RESTORED_SERVER, tool: RLO_TOOL, rlo: RLO });
+    const named = 'MCP tool "' + FSI + RLO_SHOWN + PDI + '" from server "' + FSI + RESTORED_SHOWN + PDI + '"';
+    expect('each one spells the tool and the server out, each kept to itself', errors.length === 4
+      && errors.every((m) => m.startsWith(named) && !hidesAny(m)));
+    expect('and the quoted schema is spelled out too', /<U\+202E>/.test(errors[1].slice(errors[1].indexOf('inputSchema:'))));
+    await panel(app);
+    await page.evaluate(() => { delete window.__replies.mcp_list_servers[0].tools[0].inputSchema; return mcpRefresh(); });
+    await send(page); await idle(page);
+    const text = await transcript(page);
+    expect('the turn it stops says so, the names spelled out',
+      text.includes(RLO_SHOWN) && text.includes(RESTORED_SHOWN) && !hidesAny(text));
+  }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
+}
+
 async function focusChecks(browser, server) {
   await fixture(browser, server, 'A new approval card takes the focus only from the panel or the page', async (app) => {
     const { page } = app; const id = await panel(app);
@@ -997,7 +1132,7 @@ async function focusChecks(browser, server) {
   if (!chromium) { console.error('Playwright is required for test:assistant; no silent skip.'); process.exit(1); }
   const server = await serve(rendererDir()); const browser = await chromium.launch({ headless: true });
   try {
-    for (const fn of [approvalChecks, typingChecks, historyChecks, lifecycleChecks, mcpSettingsChecks, mcpConfirmChecks, providerChecks, lockedSettingsChecks, setupChecks, panelChecks, focusChecks]) {
+    for (const fn of [approvalChecks, typingChecks, historyChecks, lifecycleChecks, mcpSettingsChecks, mcpConfirmChecks, spelledNameChecks, providerChecks, lockedSettingsChecks, setupChecks, panelChecks, focusChecks]) {
       // ASSISTANT_ONLY=<group> runs one group while iterating; CI runs all.
       if (process.env.ASSISTANT_ONLY && fn.name !== process.env.ASSISTANT_ONLY) continue;
       console.log('\n' + fn.name); await fn(browser, server);

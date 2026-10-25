@@ -1,8 +1,10 @@
 # SSHSpan security model
 
-**Last updated:** 2026-10-18  
+**Last updated:** 2026-10-25  
 **Status:** describes v1.10.0; checked against committed source at `6c19b1b`, the
-release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since  
+release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since. It
+also describes how MCP tool names and results are shown, which is not released yet (Unreleased in
+the CHANGELOG)  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -494,6 +496,30 @@ The renderer's CSP is `script-src 'self'` with no inline or eval script, dynamic
 `textContent` or the project's escaping helper, and the approval card shows the arguments with
 invisible and text-direction characters spelled out (values up to 1,500 characters as they are; a
 longer set is shortened, and "Show all arguments (N characters)" opens the complete text).
+
+An MCP server chooses its tools' names and display names and what a call returns. The renderer
+spells out control, invisible, zero-width and text-direction characters and spaces other than
+U+0020 in such a name as `<U+XXXX>`, and keeps each name in a text-direction isolate of its own (a
+`<bdi>`, or U+2068 ... U+2069 in plain text), in:
+
+- the MCP approval card (its accessible name is spelled out too);
+- the tools list a tool is reviewed in before it is enabled, and the notices that name a tool: a
+  refused approval (the backend's refusal, which can quote the tool, is spelled out whole), the
+  tools that changed on the server, and an input schema that cannot be used;
+- the record the assistant keeps of every tool call, which spells out a tool name the model made up
+  as well. The result and the backend's warning in it show format, default-ignorable and control
+  characters (tab and line feed aside) as marked code points, as the card shows arguments; the
+  result keeps its lines.
+
+The card, the record and the schema notice show the server's own name the same way: it is checked
+when it is saved (RFC 7230 token characters) but not when a backup restores it. So a tool whose
+name holds a direction override (U+202E) or a zero-width space (U+200B) cannot read as another tool
+on the card that approves its call. Only the display changes: the model, the backend and the stored
+record get every name and result as they are. Two places still show these names as they are stored:
+
+- the MCP settings, for a server's name: its row, the heading of its tools, and the notices and the
+  removal question that name it;
+- the audit log, whose `mcp.tool_call` and `mcp.tool_approved` rows quote the server and the tool.
 
 ### Names a server chooses
 
