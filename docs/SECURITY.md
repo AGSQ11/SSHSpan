@@ -2,8 +2,8 @@
 
 **Last updated:** 2026-10-25  
 **Status:** describes v1.10.0, the PuTTY session import and how the names of saved servers and the
-remote names in the transfer queue and the activity log are shown; the last two are not released
-yet (Unreleased in the CHANGELOG). The passages about the
+remote names in the transfer queue and the activity log are shown; the import and the names are
+not released yet (Unreleased in the CHANGELOG). The passages about the
 import - in [Vault lock and locked-state policy](#vault-lock-and-locked-state-policy) the sentence
 on an import a lock stops and the bullet on the two listings of hosts, and the PuTTY session import
 section - are checked against committed source at `a75b533`; the Names of saved servers section
@@ -548,9 +548,9 @@ longer set is shortened, and "Show all arguments (N characters)" opens the compl
 
 ### Names a server chooses
 
-A file name in the file browser is whatever the server's owner chose. Wherever the renderer shows
-one (the lists, the path bar, the transfer queue, questions, toasts and the activity log) it spells
-out control, invisible, zero-width and text-direction characters, unusual spaces, the dots that
+A file name in the file browser is whatever the server's owner chose. Where the renderer shows one
+(the lists, the path bar, the transfer queue, questions, toasts and the activity log, save the
+places named further down) it spells out control, invisible, zero-width and text-direction characters, unusual spaces, the dots that
 only stand in for
 "." and leading, trailing and repeated spaces as `<U+XXXX>` (and a line break as `\n`); a name that
 shows nothing (blank, mark or format characters only, U+2800 and U+1D159 included) is spelled out
