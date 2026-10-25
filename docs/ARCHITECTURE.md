@@ -1,8 +1,12 @@
 # SSHSpan architecture
 
-**Last updated:** 2026-10-18  
-**Status:** describes v1.10.0; checked against committed source at `6c19b1b`;
-nothing it describes has changed since (later changes are listed in the CHANGELOG)  
+**Last updated:** 2026-10-25  
+**Status:** describes v1.10.0 and the PuTTY session import, which is not released yet (Unreleased
+in the CHANGELOG). The import's passages - its line in the system diagram, its row in the module
+table, the IPC count (111) and the Servers group, its mention where the renderer shows
+`server_save`'s key-file warning, and the PuTTY session import section - are checked against
+committed source at `a75b533`; everything else against `6c19b1b`, and nothing else it describes
+has changed since (later changes are listed in the CHANGELOG)  
 **Platforms:** Windows and Linux  
 **Entry points:** `src-tauri/src/main.rs`, `src-tauri/src/lib.rs`, `src/renderer/index.html`,
 `src/renderer/app.js`
@@ -38,6 +42,7 @@ names and numbers can be re-derived with the commands in the sections that quote
 │ bitwarden/      HTTPS client, SSRF guard and sync                        │
 │ assistant/      model-provider client and MCP Streamable HTTP client     │
 │ config/         managed SSH config plus parser/serializer                │
+│ putty_sessions/ PuTTY's saved sessions as servers to save                │
 └──────────────────────────────────────────────────────────────────────────┘
                                 │
                 SQLite, filesystem, SSH/SFTP, HTTPS
@@ -80,6 +85,7 @@ liabilities; see [Large files and deferred splits](#large-files-and-deferred-spl
 | App lifecycle | `lib.rs`, `main.rs` | Tauri builder, handlers, tray, close-to-tray, exit teardown, startup-failure dialog |
 | General commands | `commands/mod.rs` | vault, keys, categories, deploy, backups, settings, audit, system dialogs and files, the Bitwarden commands, `ssh_config_list_hosts`, `app_info`, `heartbeat` and the idle watchdog, shared helpers (`run_blocking`, `audit_or_warn`, the rotation lock, the pool helpers, the native credential question) |
 | Server/terminal | `commands/server.rs`, `commands/terminal.rs`, `ssh_client/mod.rs` | server CRUD, connection/authentication, terminal registry, host keys |
+| PuTTY import | `putty_sessions/mod.rs`, `putty_sessions/registry.rs` | PuTTY's saved sessions as servers to save: the registry reader (Windows only) and the listing rules (every platform); the command, `putty_list_sessions`, is in `commands/server.rs`. Not the PPK parser, which is `crypto/putty.rs` |
 | SFTP | `commands/sftp.rs`, `sftp/mod.rs`, `sftp/queue.rs`, `sftp/testkit.rs` | SFTP IPC, edit sessions, local-path policy, bounded walks, persistent queue; the in-process test server |
 | Crypto | `crypto/*.rs` | Argon2id/AES-GCM vault, SSH formats, PPK, PKCS#8, Bitwarden primitives |
 | Persistence | `db/mod.rs` | schema, migrations, queries, transactions and the backup restore transaction |
@@ -104,7 +110,7 @@ Tauri-managed state created in `lib.rs`:
 
 ## IPC surface
 
-`tauri::generate_handler!` registers **110 commands**. Default Tauri parameter mapping uses
+`tauri::generate_handler!` registers **111 commands**. Default Tauri parameter mapping uses
 camelCase on the JavaScript wire. `mcp_save_server` and `mcp_set_tool_state` explicitly use snake_case;
 `scripts/check-ipc-args.js` is the enforced source of truth and also rejects renderer calls to
 commands absent from `generate_handler!`. A command that takes `Option<T>` silently reads a
@@ -117,7 +123,7 @@ misspelled key as `None`, which is why that check exists.
 | Keys/deploy (10) | `key_import`, `key_export`, `key_export_to_file`, `key_delete`, `key_rename`, `key_list`, `key_get`, `key_deploy`, `key_deploy_preview`, `key_remove_deployed` |
 | Categories (8) | `category_list`, `category_create`, `category_rename`, `category_reparent`, `category_set_order`, `category_delete`, `key_set_categories`, `key_create_with_categories` |
 | SSH config (1) | `ssh_config_list_hosts` |
-| Servers (3) | `server_list`, `server_save`, `server_delete` |
+| Servers (4) | `server_list`, `server_save`, `putty_list_sessions`, `server_delete` |
 | Terminal/host keys (8) | `terminal_connect`, `terminal_send`, `terminal_resize`, `terminal_disconnect`, `terminal_list`, `server_test`, `known_hosts_list`, `known_hosts_forget` |
 | Activity (1) | `heartbeat` |
 | SFTP (37) | `sftp_open`, `sftp_list_dir`, `sftp_resolve_link`, `sftp_dir_size`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `sftp_download`, `sftp_open_for_edit`, `sftp_close_edit`, `sftp_edit_resolve`, `sftp_chmod`, `sftp_get_permissions`, `sftp_touch`, `sftp_fs_info`, `sftp_keepalive_start`, `sftp_queue_add`, `sftp_queue_list`, `sftp_queue_cancel`, `sftp_queue_retry`, `sftp_queue_pause`, `sftp_queue_resume`, `sftp_queue_pause_all`, `sftp_queue_resume_all`, `sftp_queue_set_rate_limit`, `sftp_queue_clear_finished`, `sftp_server_copy`, `sftp_search`, `sftp_search_cancel`, `sftp_bookmarks_list`, `sftp_bookmarks_save`, `sftp_local_list`, `sftp_local_mkdir`, `sftp_local_rename`, `sftp_local_remove`, `sftp_local_open_folder`, `sftp_close` |
@@ -293,8 +299,10 @@ What the newer commands do:
   that opens a network connection to the share, hands it an NTLM sign-in and can stall. The
   renderer shows the warning, spelled out, as a warning toast of its own after the save report: at
   the server dialog (the ssh config import only prefills that dialog, and its Save is the
-  dialog's) and at the deploy's "Also save these as servers" (one toast, a line
-  `<server>: <warning>` for each server saved with a warning). On Windows `key_file_warning` first
+  dialog's), and at the deploy's "Also save these as servers" and the PuTTY import (one toast, a
+  line `<server>: <warning>` for each server saved with a warning; a PuTTY import stopped by a
+  vault lock says only how many, see [PuTTY session import](#putty-session-import)). On Windows
+  `key_file_warning` first
   asks `ssh_client::key_path_refusal`, which answers `KEY_FILE_NOT_LOCAL`, "SSHSpan reads key files
   only from this computer's drives (like C:\...). Copy the key to a local folder, or import it
   under Keys.", for a path that is not on this computer's drives, and then the file is not
@@ -531,6 +539,63 @@ only `sshspan_*` files directly in `~/.ssh`. `ssh_config_list_hosts` is the read
 parses the user's real `~/.ssh/config` (one `Include` level, bounded globbing, `Match` blocks and
 patterns skipped) with the same keyword rules as OpenSSH, so the Servers "Config" import offers real
 hosts.
+
+### PuTTY session import
+
+`putty_list_sessions` (no arguments) lists PuTTY's saved sessions for the Servers "PuTTY" import.
+It is registered on every platform and reads only on Windows; elsewhere it fails with "PuTTY's
+saved sessions are read from the Windows registry, so this works on Windows only." It is refused
+while the vault is locked (`require_unlocked`, before the registry is read: the list is an
+inventory of hosts, accounts and key paths) and runs on the blocking pool (`run_blocking`). The
+reader, `putty_sessions::read_sessions`, opens `HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions`
+and each session's subkey for reading only (`KEY_READ`), queries only the ten values the listing
+uses (`VALUE_NAMES`: `HostName`, `PortNumber`, `Protocol`, `UserName`, `UserNameFromEnvironment`,
+`PublicKeyFile`, `ProxyMethod`, `PortForwardings`, `AgentFwd`, `X11Forward`) and writes nothing. A
+value is read as a REG_SZ string or a 4-byte REG_DWORD; any other type counts as absent. No
+`Sessions` key means no sessions; any other error on that key fails the listing with "Could not
+read PuTTY's saved sessions: <OS error>", while a session subkey that cannot be opened is one
+skipped entry, "could not be read (<OS error>)".
+
+The rules (`build_listing`, tested on every platform) turn each subkey into a server or a skipped
+entry. PuTTY's template for new sessions, "Default Settings", is not a session and is never
+listed, not even as skipped. A subkey name is unescaped the way PuTTY escapes it (`%` and two hex
+digits is that byte, any other `%` is itself) and decoded as UTF-8, or else with the system's ANSI
+code page (`MultiByteToWideChar(CP_ACP)`), which older PuTTY wrote names in. Only SSH sessions are
+offered (`Protocol` absent, empty or `ssh`, PuTTY's default). The host is `HostName` cleaned up the
+way PuTTY does before it connects: trimmed; a user name before the last `@` split off; a colon that
+is the only one outside square brackets dropped with what follows (two or more are an IPv6
+address, kept); spaces and tabs removed; a bracketed IPv6 address stored without its brackets,
+because SSHSpan connects with `TcpStream::connect((host, port))`, which takes a bare one, and any
+other bracketed host skipped. The port is `PortNumber`, 22 when it is absent or 0. The user name is
+the one before the `@`, else `UserName` (trimmed), else the local Windows user name (`USERNAME`)
+when `UserNameFromEnvironment` is on, else none (`null`). `PublicKeyFile` (trimmed) is reported as
+a path string only - nothing in the listing opens, stats or resolves it, and a test checks the
+module's source for file-system calls - and makes `authMethod` `publickey` (`password` without
+one). `notes` names what PuTTY uses and SSHSpan does not: `proxy` (`ProxyMethod` nonzero),
+`portForwarding` (`PortForwardings` not empty), `agentForwarding` (`AgentFwd`) and `x11Forwarding`
+(`X11Forward`), these booleans on when nonzero, as PuTTY reads them. `alreadySaved` is true when a
+saved server has the same host (trimmed, ASCII case ignored), port and user name (trimmed, exact),
+or, for a session without a user name, the same host and port. Sessions and skipped entries
+(`{ name, reason }`) are sorted by name, case ignored.
+
+Bounds: at most 1,000 sessions are listed (`truncated` beyond). Every subkey enumerated is one
+session, so the reader enumerates at most 1,002: one more, to tell that there were more, and the
+template. A REG_SZ with more than 8 KiB of data, its NUL included, is not read. For the five
+string values that is too long, not absent: a too-long host, protocol, key file path or
+`UserName` (when it would be used) skips the session, and a too-long `PortForwardings` is a
+`portForwarding` note. A session is skipped, with its reason, when its name has a control
+character or more than 256 characters, it is not an SSH session, its host once cleaned up is
+empty, has a control character or more than 255 characters, or is bracketed without being an IPv6
+address, its port is above 65535, its user name has more than 256 characters, its key file path
+more than 4,095, or its subkey cannot be opened.
+
+The renderer (`openPuttyImport` and `#puttyImportModal`) saves the ticked sessions one at a time
+with `server_save`, as `saveDeployedAsServers` does: `{ id: null, name, host, port, username,
+authMethod, keyId: null, pemPath: keyFile, savedPassword: null, categoryId: null, color: null }`,
+the username taken from the session's row when Import is clicked. The import has no save command
+of its own, so `server_save`'s checks and its key-file warning apply. Closing the dialog or a
+vault lock stops an import before its next save; after a lock it reports counts only, and closing
+the dialog empties it.
 
 ### SFTP
 

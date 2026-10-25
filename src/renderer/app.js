@@ -65,7 +65,9 @@ function spellChar(ch) {
   return '<U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0') + '>';
 }
 
-/// `text` with every character of SPELLED_CHARS spelled out (spellChar).
+/// `text` with every character of SPELLED_CHARS spelled out (spellChar). A
+/// missing value - null or undefined - is the empty string, so a field that
+/// may be absent is passed as it is.
 function spellOut(text) {
   return String(text == null ? '' : text).replace(SPELLED_CHARS, spellChar);
 }
@@ -2435,6 +2437,9 @@ const LOCK_GATE_HINTS = {
   // ssh_config_list_hosts refuses while locked (R4): the user's ssh config is
   // an inventory of hosts, accounts and key paths.
   sshconfig: 'Unlock the vault to import servers from your SSH config.',
+  // putty_list_sessions refuses while locked for the same reason: PuTTY's
+  // saved sessions are an inventory of hosts, accounts and key paths.
+  putty: 'Unlock the vault to import servers from PuTTY.',
   keys: 'Unlock the vault to create or import keys.',
   bitwarden: 'Unlock the vault to save, test or run the Bitwarden sync.',
   bitwardenAllow: 'Unlock the vault to allow the Bitwarden sync.',
@@ -4540,6 +4545,436 @@ async function importFromSshConfig(anchorEl) {
   } catch (e) { toast(errText(e), 'err'); }
 }
 
+// ─── import the sessions saved in PuTTY (Windows) ─────────────────────────
+//
+// PuTTY keeps its saved sessions in the Windows registry. The backend reads
+// them (putty_list_sessions) and this dialog lists every SSH one, ticked
+// unless a saved server already matches it; one button saves the ticked ones
+// through server_save, one at a time - the one save path every server takes,
+// with its checks and warnings. Everything in the listing - names, hosts,
+// user names, key paths, skip reasons - comes from the registry, which any
+// program can write: it is shown spelled out (spellOut), each value in a
+// <bdi> of its own, and set as text only; it is saved as it is. So a name or
+// host with a character that does not show starts unticked, and a user name
+// with one is not put in its field - the field holds what is saved, and what
+// cannot be seen there is not saved unseen. Closing the dialog or a vault
+// lock stops an import before its next save, and once the vault is locked
+// nothing from the listing is said: counts at most.
+
+/// What a PuTTY setting SSHSpan does not use means for the imported server
+/// (the listing's `notes`).
+const PUTTY_NOTES = {
+  proxy: 'PuTTY connects through a proxy or jump host - SSHSpan connects directly.',
+  portForwarding: 'Port forwarding is not imported.',
+  agentForwarding: 'Agent forwarding is not supported.',
+  x11Forwarding: 'X11 forwarding is not supported.',
+};
+
+/// The dialog's state: a record per row; the import that is running, if any
+/// ({ rows, stop } - `stop` says why it stops: 'closed', or 'locked' when a
+/// vault lock closed the dialog); whether a listing is being read; what the
+/// alert line is about ('names' while it asks for user names, 'failed'); and
+/// the Import button's label, held here because the busy helper takes it out
+/// of the button while an import runs and puts the same node back after.
+const puttyDialog = { rows: [], run: null, listing: false, said: '', label: null };
+
+/// Shown on Windows only - where PuTTY keeps its sessions and the backend
+/// reads them - once app_info has said so; hidden while it has not answered,
+/// and when it fails.
+function updatePuttyButton() {
+  const btn = el('serverPuttyBtn');
+  if (btn) btn.hidden = !(state.appInfo && state.appInfo.platform === 'windows');
+}
+
+/// The sessions PuTTY has that are not listed, counted.
+function puttySkippedText(count) {
+  return count === 1 ? '1 other session is not an SSH session or could not be read.'
+    : `${count} other sessions are not SSH sessions or could not be read.`;
+}
+
+/// Whether `text` holds a character spellOut spells out - one that does not
+/// show as itself: a direction mark, a zero-width character, a control, a
+/// space other than the plain one.
+function hasSpelledChars(text) {
+  const s = String(text == null ? '' : text);
+  return spellOut(s) !== s;
+}
+
+/// The PuTTY button: PuTTY's SSH sessions in the import dialog, or a toast
+/// when there is none to import.
+async function openPuttyImport() {
+  // An inventory of hosts, accounts and key paths: the backend refuses it
+  // while the vault is locked, and the button says so.
+  if (!lockGateOpen('putty')) return;
+  // An import still saving: a new listing would show its sessions as not yet
+  // in SSHSpan, and a second Import would save them twice.
+  if (puttyDialog.run) {
+    toast('The PuTTY import is still finishing.', 'info');
+    return;
+  }
+  // A second click while the registry is being read does not read it again.
+  if (puttyDialog.listing) return;
+  puttyDialog.listing = true;
+  let res;
+  try {
+    res = await call('putty_list_sessions');
+  } catch (e) {
+    toast(errText(e), 'err');
+    return;
+  } finally {
+    puttyDialog.listing = false;
+  }
+  // Locked while it was read: the listing is not shown.
+  if (!state.unlocked) return;
+  const sessions = arrayOrEmpty(res && res.sessions).filter((s) => s && typeof s === 'object');
+  const skipped = arrayOrEmpty(res && res.skipped);
+  if (!sessions.length) {
+    const none = 'No SSH sessions are saved in PuTTY.';
+    toast(skipped.length ? none + ' ' + puttySkippedText(skipped.length) : none, 'info');
+    return;
+  }
+  fillPuttyDialog(sessions, skipped, !!(res && res.truncated));
+  el('puttyImportModal').hidden = false;
+  // Once the dialog stack has seen which control opened the dialog (the
+  // focus goes back there when it closes): the fill field when there are
+  // user names to type, else the first session's checkbox.
+  setTimeout(() => {
+    if (el('puttyImportModal').hidden) return;
+    const first = puttyDialog.rows[0];
+    if (!el('puttyFill').hidden) el('puttyFillInput').focus();
+    else if (first) first.box.focus();
+  }, 0);
+}
+
+/// The dialog for a listing: how many sessions, the ones not listed with
+/// their reasons (collapsed), a note when the listing was cut off, the fill
+/// control when a session comes without a user name, and a row per session.
+function fillPuttyDialog(sessions, skipped, truncated) {
+  el('puttyImportSummary').textContent = plural(sessions.length, 'SSH session') + ' in PuTTY';
+  const others = el('puttyImportSkipped');
+  others.open = false;
+  others.hidden = !skipped.length;
+  el('puttyImportSkippedSummary').textContent = skipped.length ? puttySkippedText(skipped.length) : '';
+  el('puttyImportSkippedList').replaceChildren(...skipped.map((s) => {
+    const li = document.createElement('li');
+    li.append(bdiOf(spellOut(s && s.name)), ': ', bdiOf(spellOut(s && s.reason)));
+    return li;
+  }));
+  el('puttyImportTruncated').hidden = !truncated;
+  puttyDialog.rows = sessions.map(puttyRow);
+  el('puttyImportList').replaceChildren(...puttyDialog.rows.map((r) => r.li));
+  el('puttyFill').hidden = !puttyDialog.rows.some((r) => !r.user.value);
+  el('puttyFillInput').value = '';
+  sayPutty('', '');
+  updatePuttyFooter();
+}
+
+/// One session's row: a checkbox labelled with its name; a user name field,
+/// prefilled from PuTTY; where it connects and how it signs in; what the row
+/// has to say - characters that do not show, what PuTTY does that SSHSpan
+/// will not; "Already in SSHSpan" when a saved server matches it; and a line
+/// for what went wrong with it.
+function puttyRow(session, index) {
+  const name = spellOut(session.name);
+  const nameHides = hasSpelledChars(session.name);
+  const hostHides = hasSpelledChars(session.host);
+  const userHides = hasSpelledChars(session.username);
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  // Ticked to be imported as it reads - not when what it reads hides something.
+  box.checked = !session.alreadySaved && !nameHides && !hostHides;
+  box.addEventListener('change', updatePuttyFooter);
+  const title = bdiOf(name);
+  title.className = 'server-name';
+  title.title = name; // cut with "..." when long
+  const pick = document.createElement('label');
+  pick.className = 'putty-pick';
+  pick.append(box, title);
+
+  // The user name itself, never spelled-out text: the field holds what is
+  // saved. One with a character that does not show is not put there.
+  const user = document.createElement('input');
+  user.type = 'text';
+  user.value = session.username && !userHides ? String(session.username) : '';
+  user.placeholder = 'username';
+  user.spellcheck = false;
+  user.autocomplete = 'off';
+  user.setAttribute('aria-label', 'Username for ' + name);
+  const address = document.createElement('span');
+  address.append('@', bdiOf(spellOut(session.host)), ':' + session.port);
+  const target = document.createElement('div');
+  target.className = 'putty-target server-row-sub';
+  target.append(user, address);
+
+  const how = document.createElement('div');
+  how.className = 'putty-how server-row-auth';
+  if (session.keyFile) how.append('key ', bdiOf(spellOut(session.keyFile)));
+  else how.append('password');
+
+  const said = [];
+  const describedBy = [];
+  if (nameHides) said.push(puttyNoteItem(['Its name has characters that do not show.']));
+  if (hostHides) said.push(puttyNoteItem(['Its host has characters that do not show.']));
+  if (userHides) {
+    const item = puttyNoteItem(['PuTTY\'s username for it has characters that do not show: ', bdiOf(spellOut(session.username))]);
+    item.id = 'puttyRowUser' + index;
+    describedBy.push(item.id);
+    said.push(item);
+  }
+  for (const n of arrayOrEmpty(session.notes)) {
+    // A note this version does not know is shown as it came, spelled out.
+    said.push(puttyNoteItem([Object.prototype.hasOwnProperty.call(PUTTY_NOTES, n) ? PUTTY_NOTES[n] : bdiOf(spellOut(n))]));
+  }
+
+  const note = document.createElement('p');
+  note.className = 'field-error';
+  note.id = 'puttyRowNote' + index;
+  note.hidden = true;
+  describedBy.push(note.id);
+  user.setAttribute('aria-describedby', describedBy.join(' '));
+
+  const li = document.createElement('li');
+  li.className = 'putty-row';
+  li.append(pick, target, how);
+  if (said.length) {
+    const list = document.createElement('ul');
+    list.className = 'putty-notes';
+    list.id = 'puttyRowNotes' + index;
+    list.append(...said);
+    li.append(list);
+    // The checkbox hears what the row says, so a reason to start unticked
+    // is heard by whoever tabs through the checkboxes, not only seen.
+    box.setAttribute('aria-describedby', list.id);
+  }
+  li.append(note);
+  const row = { session, li, box, user, how, note, index };
+  if (session.alreadySaved) markPuttyRowSaved(row);
+  user.addEventListener('input', () => { if (user.hasAttribute('aria-invalid')) setPuttyRowNote(row, []); });
+  return row;
+}
+
+function puttyNoteItem(parts) {
+  const item = document.createElement('li');
+  item.append(...parts);
+  return item;
+}
+
+/// Mark a row as in SSHSpan - from the listing, or saved by an import that
+/// failed for another row - and say so to its checkbox first: it is the
+/// reason the row is unticked.
+function markPuttyRowSaved(row) {
+  if (row.how.querySelector('.putty-saved')) return;
+  const mark = document.createElement('span');
+  mark.className = 'badge dim putty-saved';
+  mark.id = 'puttyRowSaved' + row.index;
+  mark.textContent = 'Already in SSHSpan';
+  row.how.append(mark);
+  const described = row.box.getAttribute('aria-describedby');
+  row.box.setAttribute('aria-describedby', described ? mark.id + ' ' + described : mark.id);
+}
+
+/// What went wrong with a row - no user name, or why its save failed - under
+/// it, as the user name field's description: `parts` are text and <bdi>
+/// nodes (none clears it).
+function setPuttyRowNote(row, parts, userMissing) {
+  row.note.replaceChildren(...parts);
+  row.note.hidden = !parts.length;
+  if (userMissing) row.user.setAttribute('aria-invalid', 'true');
+  else row.user.removeAttribute('aria-invalid');
+}
+
+/// The dialog's alert line, and what it is about (`kind`), so that Fill can
+/// take back a request for user names it has answered.
+function sayPutty(text, kind) {
+  puttyDialog.said = text ? kind : '';
+  showFieldMessage('puttyImportMsg', text);
+}
+
+/// The footer follows the ticks: how many, and an Import button that says
+/// how many servers it saves, disabled while none is ticked.
+function updatePuttyFooter() {
+  const ticked = puttyDialog.rows.filter((r) => r.box.checked).length;
+  el('puttyImportCount').textContent = ticked + ' selected';
+  (puttyDialog.label || el('puttyImportBtnLabel')).textContent = 'Import ' + plural(ticked, 'server');
+  setDisabledFor(el('puttyImportBtn'), 'none-ticked', ticked === 0);
+}
+
+/// Fill: the user name in the fill field goes into every empty username
+/// field, ticked or not; a field that has one keeps it. The rows it fills no
+/// longer ask for one.
+function fillPuttyUsernames() {
+  const value = el('puttyFillInput').value.trim();
+  if (!value) {
+    el('puttyFillInput').focus();
+    return;
+  }
+  for (const r of puttyDialog.rows) {
+    if (r.user.value.trim()) continue;
+    r.user.value = value;
+    setPuttyRowNote(r, []);
+  }
+  if (puttyDialog.said === 'names' && !puttyDialog.rows.some((r) => r.box.checked && !r.user.value.trim())) sayPutty('', '');
+}
+
+/// Import: every ticked session is saved as a server, in the order listed.
+/// Each needs a user name - PuTTY asks "login as:" when it has none - so the
+/// ticked rows without one are all marked at once, and nothing is saved.
+async function importPuttySessions() {
+  const ticked = puttyDialog.rows.filter((r) => r.box.checked);
+  if (!ticked.length || puttyDialog.run) return;
+  for (const r of puttyDialog.rows) setPuttyRowNote(r, []);
+  sayPutty('', '');
+  const nameless = ticked.filter((r) => !r.user.value.trim());
+  if (nameless.length) {
+    for (const r of nameless) setPuttyRowNote(r, ['Type a username for ', bdiOf(spellOut(r.session.name)), '.'], true);
+    sayPutty(el('puttyFill').hidden ? 'Type a username for each marked session.'
+      : 'Type a username for each marked session, or use Fill above the list.', 'names');
+    nameless[0].user.focus();
+    return;
+  }
+  // Taken now: an import saves what the rows said when Import was clicked.
+  const picks = ticked.map((row) => ({ row, username: row.user.value.trim() }));
+  // One import at a time: a double click must not save every server twice.
+  await withBusy(el('puttyImportBtn'), 'Importing…', () => savePuttyPicks(picks));
+}
+
+/// Save the picked rows one at a time with server_save - while the rows are
+/// fixed, and only while the dialog is open and the vault unlocked: each save
+/// waits for the one before it, and none is begun after either changes. Then
+/// say what happened.
+async function savePuttyPicks(picks) {
+  const run = { rows: puttyDialog.rows, stop: null };
+  puttyDialog.run = run;
+  setPuttyRowsBusy(run.rows, true);
+  const done = [];
+  const failed = [];
+  const warned = [];
+  try {
+    for (const pick of picks) {
+      if (puttyStop(run)) break;
+      const s = pick.row.session;
+      try {
+        const r = await call('server_save', {
+          id: null,
+          name: s.name,
+          host: s.host,
+          port: s.port,
+          username: pick.username,
+          authMethod: s.authMethod,
+          keyId: null,
+          pemPath: s.keyFile || null,
+          savedPassword: null,
+          categoryId: null,
+          color: null,
+        });
+        done.push(pick.row);
+        const warning = warningSpelled(r);
+        if (warning) warned.push(spellOut(s.name) + ': ' + warning);
+      } catch (e) {
+        failed.push({ row: pick.row, error: errSpelled(e) });
+      }
+    }
+    if (done.length) await loadServers();
+  } finally {
+    puttyDialog.run = null;
+    setPuttyRowsBusy(run.rows, false);
+  }
+  reportPuttyImport(puttyStop(run), picks.length, done, failed, warned);
+}
+
+/// Why an import stops before its next save: 'locked' (the vault is locked,
+/// or a lock closed the dialog), 'closed' (the dialog was closed), or ''.
+function puttyStop(run) {
+  if (run.stop === 'locked' || !state.unlocked) return 'locked';
+  if (run.stop || el('puttyImportModal').hidden) return 'closed';
+  return '';
+}
+
+/// The rows and the fill control while an import runs: fixed, since what it
+/// saves was taken when Import was clicked.
+function setPuttyRowsBusy(rows, on) {
+  for (const r of rows) {
+    setDisabledFor(r.box, 'importing', on);
+    setDisabledFor(r.user, 'importing', on);
+  }
+  setDisabledFor(el('puttyFillInput'), 'importing', on);
+  setDisabledFor(el('puttyFillBtn'), 'importing', on);
+}
+
+/// What an import says when it ends; the saved ones are counted the way
+/// saveDeployedAsServers counts them. Stopped by a lock: counts only - no
+/// name, host or key path from the listing on a locked screen. Stopped by
+/// closing the dialog: what failed, by name, and how many were not imported.
+/// Otherwise the open dialog shows what is left to do.
+function reportPuttyImport(stop, total, done, failed, warned) {
+  if (done.length) toast(`${done.length} server(s) saved under Servers.`, 'ok');
+  const missed = total - done.length;
+  if (stop === 'locked') {
+    const n = warned.length;
+    if (n) {
+      toast(n === 1 ? '1 saved server has a warning about its key file - save it again under Servers to see it.'
+        : `${n} saved servers have warnings about their key files - save them again under Servers to see them.`, 'warn');
+    }
+    if (missed) toast(`The vault was locked, so ${plural(missed, 'session')} from PuTTY ${missed === 1 ? 'was' : 'were'} not imported.`, 'info');
+    return;
+  }
+  if (warned.length) toast(warned.join('\n'), 'warn');
+  if (stop === 'closed') {
+    if (failed.length) {
+      toast('Not saved as servers:\n' + failed.map((f) => spellOut(f.row.session.name) + ': ' + f.error).join('\n'), 'err');
+    }
+    if (missed > failed.length) {
+      toast(`The PuTTY import stopped when its dialog was closed: ${plural(missed, 'session')} ${missed === 1 ? 'was' : 'were'} not imported.`, 'info');
+    }
+    return;
+  }
+  showPuttyResult(done, failed);
+}
+
+/// After an import with the dialog still open. Everything saved: the dialog
+/// closes. Otherwise it stays with what is left to do - the saved rows
+/// unticked and marked as in SSHSpan, as a new listing would show them, each
+/// failed row marked with its error, and how many failed.
+function showPuttyResult(done, failed) {
+  if (!failed.length) {
+    closePuttyImport();
+    return;
+  }
+  for (const row of done) {
+    row.box.checked = false;
+    markPuttyRowSaved(row);
+  }
+  for (const f of failed) setPuttyRowNote(f.row, [f.error]);
+  sayPutty(plural(failed.length, 'server') + ' could not be saved.', 'failed');
+  updatePuttyFooter();
+}
+
+/// Close the dialog and empty it: the listing is an inventory of hosts,
+/// accounts and key paths, and none of it stays behind in a closed dialog.
+/// Escape, Cancel, the X, a click outside and a vault lock close it here, and
+/// an import still running stops before its next save; the dialog stack gives
+/// the focus back to the PuTTY button.
+function closePuttyImport() {
+  if (puttyDialog.run && !puttyDialog.run.stop) puttyDialog.run.stop = 'closed';
+  puttyDialog.rows = [];
+  el('puttyImportModal').hidden = true;
+  el('puttyImportSummary').textContent = '';
+  el('puttyImportSkippedSummary').textContent = '';
+  el('puttyImportSkippedList').replaceChildren();
+  el('puttyImportList').replaceChildren();
+  el('puttyFillInput').value = '';
+  sayPutty('', '');
+}
+
+/// A vault lock (closeDialogsForLock, before it closes the dialogs): an
+/// import still running stops before its next save and says counts only -
+/// whether its dialog is still open or was closed before the lock. Lock now
+/// gets here while the vault still reads as unlocked, so the import cannot
+/// tell by state.unlocked alone.
+function stopPuttyImportForLock() {
+  if (puttyDialog.run) puttyDialog.run.stop = 'locked';
+}
+
 async function copyConfig() {
   // Fields typed within the preview delay are not shown yet: ask now rather
   // than copy the text of older fields.
@@ -6112,6 +6547,7 @@ function wire() {
   registerModalCloser(el('pickerModal'), closeCategoryPicker);
   registerModalCloser(el('promptModal'), closePrompt);
   registerModalCloser(el('connectPwModal'), () => closeConnectPwModal(null));
+  registerModalCloser(el('puttyImportModal'), closePuttyImport);
 
   // nav
   for (const b of document.querySelectorAll('.nav-item')) {
@@ -6572,6 +7008,22 @@ function wire() {
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
   el('serverImportBtn').addEventListener('click', (ev) => importFromSshConfig(ev.currentTarget));
   lockGate(el('serverImportBtn'), 'sshconfig');
+  el('serverPuttyBtn').addEventListener('click', () => openPuttyImport());
+  lockGate(el('serverPuttyBtn'), 'putty');
+  puttyDialog.label = el('puttyImportBtnLabel');
+  el('puttyImportBtn').addEventListener('click', () => importPuttySessions());
+  el('puttyFillBtn').addEventListener('click', fillPuttyUsernames);
+  el('puttyFillInput').addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' || ev.isComposing) return;
+    ev.preventDefault();
+    fillPuttyUsernames();
+  });
+  for (const b of el('puttyImportModal').querySelectorAll('[data-close]')) {
+    b.addEventListener('click', closePuttyImport);
+  }
+  el('puttyImportModal').addEventListener('click', (ev) => {
+    if (ev.target === el('puttyImportModal')) closePuttyImport();
+  });
   el('serverSearch').addEventListener('input', renderServerList);
   el('termDisconnectBtn').addEventListener('click', disconnectActiveTab);
   const termMaxBtn = el('termMaxBtn');
@@ -6815,6 +7267,9 @@ function closeDialogsForLock() {
   // An open menu goes too: a category's Rename / Delete or a key's Connect,
   // over a tree and a list the lock empties.
   closeKeyConnectMenu();
+  // An import from PuTTY still saving stops too, its dialog open or already
+  // closed: the loop below reaches open dialogs only.
+  stopPuttyImportForLock();
   const rank = (n) => modalStack.findIndex((m) => m.node === n);
   const open = [...document.querySelectorAll('.modal-backdrop')]
     .filter((n) => !n.hidden && n !== el('vaultModal'))
@@ -8499,6 +8954,7 @@ async function loadAppInfo() {
   const brandSub = document.querySelector('.brand-sub');
   if (brandSub) brandSub.textContent = version ? 'Key manager · v' + version : 'Key manager';
   if (version) document.title = 'SSHSpan ' + version;
+  updatePuttyButton();
 }
 
 (async function main() {
