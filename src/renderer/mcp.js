@@ -23,8 +23,11 @@
  * mcpNameInText), and so is the server's own name, which a backup restores
  * unchecked, so a direction override or a zero-width character cannot make
  * one tool or server read as another; the model, the backend and the stored
- * record get them as they are. Annotations may be SHOWN in the approval card
- * but never bypass it; only the user-set auto_approve flag does that.
+ * record get them as they are. A server's URL and the name of the environment
+ * variable its token comes from, which a backup restores unchecked too, are
+ * spelled out where this file shows them; the edit form's fields keep them as
+ * stored, since a save sends them. Annotations may be SHOWN in the approval
+ * card but never bypass it; only the user-set auto_approve flag does that.
  *
  * Loaded by app.js right after assistant.js; bridges through window.*.
  */
@@ -184,12 +187,14 @@ async function mcpCallTool(tabId, name, args, approved) {
   };
 }
 
-/// A name an MCP server chose inside a sentence of plain text (an error, the
-/// status strip, a toast, a question): a tool's, or the server's own, which
-/// is checked when it is saved but not when it is restored from a backup.
-/// Spelled out (spellOut, app.js), then kept to itself between FIRST STRONG
-/// ISOLATE and POP DIRECTIONAL ISOLATE, as bdiOf keeps a name in a line of
-/// the page, so it cannot read as another name or turn the words around it.
+/// A name inside a sentence of plain text (an error, the status strip, a
+/// toast, a question): a tool's, which its MCP server chose, or one a server
+/// record holds - the server's own, or that of the environment variable its
+/// token comes from - which is checked when it is saved but not when it is
+/// restored from a backup. Spelled out (spellOut, app.js), then kept to
+/// itself between FIRST STRONG ISOLATE and POP DIRECTIONAL ISOLATE, as bdiOf
+/// keeps a name in a line of the page, so it cannot read as another name or
+/// turn the words around it.
 function mcpNameInText(name) {
   return '\u2068' + spellOut(name) + '\u2069';
 }
@@ -329,8 +334,10 @@ function mcpServerRow(sv) {
   head.appendChild(name);
   const url = document.createElement('span');
   url.className = 'mcp-server-url mono';
-  url.textContent = sv.url || '';
-  url.title = sv.url || '';
+  // Spelled out, tooltip too: a backup restores the URL unchecked as well,
+  // and only a save normalizes it.
+  url.textContent = spellOut(sv.url || '');
+  url.title = url.textContent;
   head.appendChild(url);
   // Only `confirmed: true` is confirmed - the same rule as a save's answer
   // (mcpSaveOutcome): a record that says nothing of it fails closed.
@@ -574,16 +581,18 @@ function mcpRebindCheck() {
   const keepsSecret = !!(sv && sv.has_secret) && !rebound && withSecret;
   if (hint) hint.textContent = keepsSecret ? 'A secret is stored - leave this blank to keep it.' : '';
   if (secretInput) secretInput.placeholder = keepsSecret ? 'Leave blank to keep the stored secret' : 'Enter the token';
+  // The variable is named as stored, which a backup restores unchecked:
+  // spelled out (mcpNameInText).
   let text = '';
   if (sv && rebound && withSecret) {
     if (sv.has_secret) {
       text = 'Changing the URL or the auth settings discards the stored secret - enter it again below before saving.';
     } else if (sv.auth_env_var && mcpSecretKind() === 'env') {
       text = 'Changing the URL or the auth settings sends the token from environment variable '
-        + sv.auth_env_var + ' to the new settings - change the variable name if that is not intended.';
+        + mcpNameInText(sv.auth_env_var) + ' to the new settings - change the variable name if that is not intended.';
     }
   } else if (mcpEnvVarStays()) {
-    text = 'No secret entered: the environment variable ' + sv.auth_env_var
+    text = 'No secret entered: the environment variable ' + mcpNameInText(sv.auth_env_var)
       + ' stays in effect. Type a secret to replace it with a stored one.';
   }
   if (warn) { warn.textContent = text; warn.hidden = !text; }
@@ -673,7 +682,9 @@ async function mcpSaveServer() {
     const secretValue = secretInput ? secretInput.value.trim() : '';
     const authProblem = mcpAuthProblem(kind, source, val('mcpHeaderName'), secretValue, val('mcpAuthEnvVar'));
     if (authProblem) { toast(authProblem, 'err'); return; }
-    const keptEnv = mcpEnvVarStays() ? mcpEditing.auth_env_var : null;
+    // As the form's notices name it (mcpNameInText); the save itself sends
+    // no variable - null keeps the stored one.
+    const keptEnv = mcpEnvVarStays() ? mcpNameInText(mcpEditing.auth_env_var) : null;
     try {
       // null keeps what is stored; a value replaces it (mcp_save_server).
       const r = await mcpSendSave({
@@ -794,7 +805,10 @@ async function mcpTestConnection(id) {
           + changed.map(mcpNameInText).join(', ') + '.', 'err');
       }
     } catch (e) {
-      const msg = errText(e);
+      // Spelled out: a failed Test can quote what the server answered (a
+      // JSON-RPC error, a protocol version) or the stored variable's name,
+      // which a save before v1.10.0 did not check (check_env_var_name).
+      const msg = errSpelled(e);
       // Shown beside the row (the list has the status, not the reason) and
       // the row is redrawn from the backend, which now says "error".
       mcpLastErrors.set(id, msg);

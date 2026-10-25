@@ -3,7 +3,8 @@
 **Last updated:** 2026-10-25  
 **Status:** describes v1.10.0; checked against committed source at `6c19b1b`, the
 release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since. It
-also describes how MCP tool and server names and MCP results are shown, which is not released yet
+also describes how MCP tool and server names, MCP results and Test connection errors, and a
+restored MCP server's URL and environment variable name are shown, which is not released yet
 (Unreleased in the CHANGELOG)  
 **Platforms:** Windows and Linux
 
@@ -521,6 +522,18 @@ as another tool on the card that approves its call, nor a restored server as ano
 MCP settings. Only the display changes: the model, the backend and the stored record get every name
 and result as they are. One place still shows these names as they are stored: the audit log, whose
 `mcp.tool_call` and `mcp.tool_approved` rows quote the server and the tool.
+
+A restore does not check the rest of a server record either: its URL, its custom header's name and
+the name of the environment variable its token comes from stay as the backup has them until a save
+checks them (the URL normalized, its path percent-encoded; the header's name an RFC 7230 token once
+trimmed and the variable's name 1 to 128 visible ASCII characters, kept ones included). The MCP
+settings spell out the URL in the server's row and its tooltip, and the variable's name, in a
+text-direction isolate, in the form's notices about it and in the status line and toast after a
+save that kept it. A failed Test connection, beside the row and in its toast, is spelled out whole:
+it can quote what the server answered, and a variable's name that a version before v1.10.0 saved
+unchecked (such a server stays confirmed). The edit form's fields still hold the values as stored,
+since they are what a save sends. Only the display changes: the backend and the stored record get
+these values as they are.
 
 ### Names a server chooses
 

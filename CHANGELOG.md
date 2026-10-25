@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spelled out whole. A restore still keeps the name as it is - such an entry stays switched off
   until it is saved, and a save refuses the name - and the model, the backend and the stored record
   still get it as it is (see `docs/SECURITY.md`).
+- **A restored MCP server's URL and environment variable are spelled out in the MCP settings.** A
+  backup restores a server's URL and the name of the environment variable its token comes from
+  unchecked as well, and the MCP settings showed them as stored: the URL in the server's row and
+  its tooltip, the variable's name in the form's notices about it. A failed Test connection was
+  shown as worded, and it can quote what the server answered and a variable's name that a version
+  before v1.10.0 saved unchecked. These now spell out invisible and text-direction characters
+  (`<U+202E>`) too, the variable's name kept in a text-direction isolate in a sentence - as does
+  what the form says after a save that kept the variable, although a save refuses such a name. The
+  edit form still holds the values as stored, since a save sends them. The backend and the stored
+  record still get them as they are (see `docs/SECURITY.md`).
 
 ## [1.10.0] - 2026-10-18
 
