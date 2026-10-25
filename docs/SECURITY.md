@@ -3,8 +3,8 @@
 **Last updated:** 2026-10-25  
 **Status:** describes v1.10.0; checked against committed source at `6c19b1b`, the
 release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since. It
-also describes how the names of saved servers are shown, which is not released yet (Unreleased in
-the CHANGELOG)  
+also describes how the names of saved servers and the remote names in the transfer queue are
+shown, which is not released yet (Unreleased in the CHANGELOG)  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -500,8 +500,9 @@ longer set is shortened, and "Show all arguments (N characters)" opens the compl
 ### Names a server chooses
 
 A file name in the file browser is whatever the server's owner chose. Wherever the renderer shows
-one (the lists, the path bar, questions, toasts and the activity log) it spells out control,
-invisible, zero-width and text-direction characters, unusual spaces, the dots that only stand in for
+one (the lists, the path bar, the transfer queue, questions, toasts and the activity log) it spells
+out control, invisible, zero-width and text-direction characters, unusual spaces, the dots that
+only stand in for
 "." and leading, trailing and repeated spaces as `<U+XXXX>` (and a line break as `\n`); a name that
 shows nothing (blank, mark or format characters only, U+2800 and U+1D159 included) is spelled out
 whole, and a name that is nothing but dots, spaces and look-alikes of dots has those look-alikes and
@@ -515,8 +516,9 @@ dropped onto a remote folder with a flagged name, from the OS or from the local 
 and a move says which folder it goes into and which folder that is in. So a hostile name cannot pass
 for the parent folder, reorder the words of a question or add lines to it. The backend's own texts
 in the SFTP edit flow (a refusal to open an edit, a Stop editing answer that is not ok, a failed
-save-back, a refused answer to a conflict) are shown spelled out in the same way. This is display
-and confirmation hygiene in the renderer: the backend still
+save-back, a refused answer to a conflict), its notes on what it skipped or renamed when it queued
+a transfer, a refusal to queue or send one and the reason a transfer failed are shown spelled out
+in the same way. This is display and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).
 
