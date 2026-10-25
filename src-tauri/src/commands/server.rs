@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use super::{CmdError, CmdResult};
 use crate::db::{self, ServerRecord};
+use crate::putty_sessions::{build_listing, PuttyListing, RawSession, SavedServer};
 use crate::AppState;
 
 /// Build the JSON a server row is returned as, resolving the referenced vault
@@ -414,6 +415,80 @@ pub fn server_delete(app: AppHandle, id: String) -> CmdResult<serde_json::Value>
     db.delete_server(&id).map_err(|e| e.to_string())?;
     let _ = db.add_audit("server.delete", None, &name);
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// PuTTY's saved sessions, for importing them as servers: each SSH session
+/// as the server it would be saved as (the renderer saves the ones the user
+/// picks with `server_save`, one at a time), whether a saved server already
+/// has its account, and the sessions that cannot be imported, with the
+/// reason.
+///
+/// Refused while the vault is locked: the list is an inventory of hosts,
+/// accounts and key paths. Windows only - PuTTY keeps its sessions in the
+/// registry - and read on the blocking pool. Key files are reported as
+/// paths and never looked at: `server_save` decides whether to warn about
+/// one, without touching a path that is not on this computer's drives.
+#[tauri::command]
+pub async fn putty_list_sessions(app: AppHandle) -> CmdResult<PuttyListing> {
+    let local_user = crate::putty_sessions::local_user_name();
+    super::run_blocking(move || {
+        putty_sessions_in(
+            &app.state::<super::VaultPasswordStore>(),
+            &app.state::<AppState>().db,
+            local_user.as_deref(),
+            read_putty_sessions,
+        )
+    })
+    .await
+}
+
+/// What [`putty_list_sessions`] answers off Windows.
+#[cfg(not(windows))]
+const PUTTY_WINDOWS_ONLY: &str =
+    "PuTTY's saved sessions are read from the Windows registry, so this works on Windows only.";
+
+/// [`putty_list_sessions`] with the registry reader given. `local_user` is
+/// who a session set to log in as the local user logs in as. The lock is
+/// checked before `read` runs.
+fn putty_sessions_in(
+    vault: &super::VaultPasswordStore,
+    db: &db::Database,
+    local_user: Option<&str>,
+    read: impl FnOnce() -> CmdResult<Vec<RawSession>>,
+) -> CmdResult<PuttyListing> {
+    super::require_unlocked(vault)?;
+    let raw = read()?;
+    let servers = db.list_servers().map_err(|e| e.to_string())?;
+    let saved: Vec<SavedServer<'_>> = servers
+        .iter()
+        .map(|server| SavedServer {
+            host: &server.host,
+            port: server.port,
+            username: &server.username,
+        })
+        .collect();
+    Ok(build_listing(raw, &saved, local_user))
+}
+
+/// What the user is told when PuTTY's sessions key cannot be read (a session
+/// that cannot be read is one skipped entry instead). Built on every
+/// platform for the tests.
+#[cfg(any(windows, test))]
+fn putty_read_error(error: std::io::Error) -> CmdError {
+    CmdError(format!("Could not read PuTTY's saved sessions: {error}"))
+}
+
+/// PuTTY's sessions, from the current user's registry.
+#[cfg(windows)]
+fn read_putty_sessions() -> CmdResult<Vec<RawSession>> {
+    crate::putty_sessions::read_sessions(crate::putty_sessions::SESSIONS_KEY)
+        .map_err(putty_read_error)
+}
+
+/// Off Windows there is no registry to read them from.
+#[cfg(not(windows))]
+fn read_putty_sessions() -> CmdResult<Vec<RawSession>> {
+    Err(CmdError(PUTTY_WINDOWS_ONLY.into()))
 }
 
 #[cfg(test)]
@@ -1102,5 +1177,189 @@ mod saved_password_binding_tests {
             assert_eq!(key_file_warning(&skipped), None, "{skipped}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod putty_list_sessions_tests {
+    use super::*;
+    use crate::commands::{VaultPasswordStore, VaultRotationLock};
+    use crate::putty_sessions::RegValue;
+
+    struct Fixture {
+        db: db::Database,
+        vault: VaultPasswordStore,
+        path: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("sshspan-putty-list-{}.db", Uuid::new_v4()));
+            let db = db::Database::open_at(path.clone()).unwrap();
+            let vault = VaultPasswordStore::new();
+            vault.set("putty-fixture-master".into());
+            Self { db, vault, path }
+        }
+
+        /// Save `deploy@prod.example:22` the way the dialog saves a server.
+        fn save_prod(&self) {
+            let request = SaveServerRequest {
+                id: None,
+                name: "prod".into(),
+                host: "prod.example".into(),
+                port: Some(22),
+                username: "deploy".into(),
+                auth_method: Some("password".into()),
+                key_id: None,
+                pem_path: None,
+                saved_password: None,
+                clear_saved_password: None,
+                category_id: None,
+                color: None,
+            };
+            server_save_in(&self.db, &self.vault, &VaultRotationLock::new(), request).unwrap();
+        }
+
+        fn list(
+            &self,
+            local_user: Option<&str>,
+            read: impl FnOnce() -> CmdResult<Vec<RawSession>>,
+        ) -> CmdResult<PuttyListing> {
+            putty_sessions_in(&self.vault, &self.db, local_user, read)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn session(key_name: &str, values: &[(&str, RegValue)]) -> RawSession {
+        RawSession {
+            key_name: key_name.into(),
+            values: values
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect(),
+            unreadable: None,
+        }
+    }
+
+    fn host(name: &str) -> (&'static str, RegValue) {
+        ("HostName", RegValue::Str(name.into()))
+    }
+
+    #[test]
+    fn a_locked_vault_is_refused_before_the_registry_is_read() {
+        let f = Fixture::new();
+        f.vault.clear();
+        let ran = std::cell::Cell::new(false);
+        let err = f
+            .list(None, || {
+                ran.set(true);
+                Ok(vec![session("s", &[host("h")])])
+            })
+            .unwrap_err();
+        assert_eq!(err.0, "Vault is locked.");
+        assert!(
+            !ran.get(),
+            "the registry was read while the vault was locked"
+        );
+    }
+
+    #[test]
+    fn sessions_whose_account_is_saved_are_marked() {
+        let f = Fixture::new();
+        f.save_prod();
+        let from_env = ("UserNameFromEnvironment", RegValue::Dword(1));
+        let listing = f
+            .list(Some("deploy"), || {
+                Ok(vec![
+                    session("prod", &[host("deploy@PROD.example")]),
+                    session("prod as root", &[host("root@prod.example")]),
+                    session("prod, no user", &[host("prod.example:22")]),
+                    session("prod as me", &[host("prod.example"), from_env]),
+                    session("other", &[host("deploy@other.example")]),
+                    session(
+                        "telnet",
+                        &[
+                            host("prod.example"),
+                            ("Protocol", RegValue::Str("telnet".into())),
+                        ],
+                    ),
+                ])
+            })
+            .unwrap();
+        let flags: Vec<(&str, bool)> = listing
+            .sessions
+            .iter()
+            .map(|s| (s.name.as_str(), s.already_saved))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("other", false),
+                ("prod", true),
+                ("prod as me", true),
+                ("prod as root", false),
+                ("prod, no user", true),
+            ]
+        );
+        assert_eq!(listing.skipped.len(), 1);
+        assert!(!listing.truncated);
+        assert_eq!(f.db.list_servers().unwrap().len(), 1, "nothing is saved");
+    }
+
+    /// What the user is told when PuTTY's sessions key cannot be read: the
+    /// mapping the Windows reader uses, checked on every platform.
+    #[test]
+    fn a_registry_that_cannot_be_read_says_what_and_why() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        assert_eq!(
+            putty_read_error(denied).0,
+            "Could not read PuTTY's saved sessions: access denied"
+        );
+        let os = std::io::Error::from_raw_os_error(5);
+        let text = os.to_string();
+        assert_eq!(
+            putty_read_error(os).0,
+            format!("Could not read PuTTY's saved sessions: {text}")
+        );
+        let f = Fixture::new();
+        let err = f
+            .list(None, || {
+                Err(putty_read_error(std::io::Error::other("boom")))
+            })
+            .unwrap_err();
+        assert_eq!(err.0, "Could not read PuTTY's saved sessions: boom");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_the_command_says_it_works_on_windows_only() {
+        let f = Fixture::new();
+        let err = f.list(None, read_putty_sessions).unwrap_err();
+        assert_eq!(
+            err.0,
+            "PuTTY's saved sessions are read from the Windows registry, so this works on Windows only."
+        );
+        assert_eq!(err.0, PUTTY_WINDOWS_ONLY);
+    }
+
+    /// The real reader, on PuTTY's own key: whatever is saved there (on a
+    /// machine without PuTTY, nothing) is listed, and nothing is written.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_command_reads_puttys_key() {
+        let f = Fixture::new();
+        let listing = f
+            .list(None, read_putty_sessions)
+            .expect("PuTTY's sessions key could be read");
+        for session in &listing.sessions {
+            assert!(!session.host.is_empty() && session.port > 0, "{session:?}");
+        }
+        assert!(listing.skipped.iter().all(|s| !s.reason.is_empty()));
     }
 }
