@@ -550,7 +550,8 @@ longer set is shortened, and "Show all arguments (N characters)" opens the compl
 
 A file name in the file browser is whatever the server's owner chose. Where the renderer shows one
 (the lists, the path bar, the transfer queue, questions, toasts and the activity log, save the
-places named further down) it spells out control, invisible, zero-width and text-direction characters, unusual spaces, the dots that
+places named further down) it spells out control, invisible, zero-width and text-direction
+characters, unusual spaces, the dots that
 only stand in for
 "." and leading, trailing and repeated spaces as `<U+XXXX>` (and a line break as `\n`); a name that
 shows nothing (blank, mark or format characters only, U+2800 and U+1D159 included) is spelled out
