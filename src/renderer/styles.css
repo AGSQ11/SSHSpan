@@ -2659,6 +2659,49 @@ label.opt-row { flex-direction: row; }
   background: var(--bg);
 }
 
+/* ---- PuTTY import dialog ------------------------------------------------- */
+
+/* Wider than a form dialog: a row holds a name, a user name field, the host,
+   the key file and its notes. Only the list scrolls - the count and the fill
+   control over it and the footer under it stay on screen at the 880x560
+   minimum window. A row is
+   one line where it fits (the name a fixed width, so the addresses line up)
+   and wraps where it does not, at a larger interface scale. The rows reuse
+   the server list's name, address and sign-in styles. */
+.putty-modal { width: min(720px, calc(100vw - 40px)); }
+.putty-body .putty-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px;
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+}
+.putty-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--panel-2);
+}
+label.putty-pick { flex: 0 1 170px; flex-direction: row; align-items: center; gap: 8px; min-width: 0; cursor: pointer; font-size: 13px; }
+.putty-pick input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; flex: none; }
+.putty-row .putty-target, .putty-row .putty-how { margin-top: 0; min-width: 0; overflow-wrap: anywhere; }
+.putty-target { display: flex; align-items: center; }
+.putty-target input[type="text"] { width: 140px; flex: none; padding: 3px 8px; font-size: 12px; font-family: var(--mono); }
+/* Text, not a row of boxes: "key <path>" and the badge wrap as words do. */
+.putty-row .putty-how { flex: 1 1 150px; display: block; }
+.putty-notes, .putty-row > .field-error { flex: 1 1 100%; }
+/* "Already in SSHSpan" keeps the product name's casing; other badges are
+   upper case. */
+.putty-saved { text-transform: none; letter-spacing: 0; margin-left: 6px; display: inline-block; white-space: nowrap; }
+.putty-notes { margin: 0; padding-left: 18px; color: var(--warn); font-size: 11.5px; }
+/* One username for every session without one: the label, the field, Fill. */
+.putty-fill { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.putty-fill input[type="text"] { width: 180px; padding: 4px 8px; font-size: 12px; font-family: var(--mono); }
+.putty-fill .ghost-btn { padding: 4px 12px; }
+.putty-skipped summary { cursor: pointer; color: var(--text-dim); font-size: 12px; }
+.putty-skipped ul {
+  margin: 6px 0 0; padding-left: 18px; max-height: 96px; overflow-y: auto;
+  color: var(--text-dim); font-size: 12px; overflow-wrap: anywhere;
+}
+
 /* ---- settings: section rail + two-column rows --------------------------- */
 
 .settings-view { display: flex; gap: 22px; align-items: flex-start; }
