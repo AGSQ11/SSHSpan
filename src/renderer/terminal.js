@@ -677,8 +677,9 @@ function terminalSetStatus(text) {
 }
 
 /// Open the SSH session for a tab. Resolves with the sessionId; rejects with
-/// the backend's message as it is, or with CONNECT_ABANDONED when the
-/// attempt was closed, cancelled or replaced before it finished.
+/// the backend's message spelled out (errSpelled, app.js - it can quote the
+/// host), or with CONNECT_ABANDONED when the attempt was closed, cancelled or
+/// replaced before it finished.
 function terminalConnectInTab(tabId, server, opts) {
   return new Promise(async (resolve, reject) => {
     let rec = tabRecord(tabId);
