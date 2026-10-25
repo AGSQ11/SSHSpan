@@ -173,6 +173,8 @@ const rowEvent = (page, type, name, o) => page.evaluate(({ type: ty, name: n, o:
   return true;
 }, { type, name, o: o || {} });
 const queueAdds = async (app) => (await app.calls('sftp_queue_add')).map((c) => c.args);
+/// The activity log's lines (of tab t1 unless named), without their times.
+const logOf = (page, tabId) => page.evaluate((t) => state.sessions.get(t).log.map((l) => l.replace(/^\[[^\]]*\] /, '')), tabId || 't1');
 const settle = (page, ms) => page.waitForTimeout(ms || 120);
 
 // ─── scenarios ──────────────────────────────────────────────────────────────
@@ -1019,8 +1021,6 @@ async function scenarioQueueNames(browser, server) {
     const name = el.querySelector('.q-name');
     return [name.textContent, name.title];
   }));
-  /// The activity log's lines, without their times.
-  const logOf = (page) => page.evaluate(() => state.sessions.get('t1').log.map((l) => l.replace(/^\[[^\]]*\] /, '')));
 
   await withFiles(browser, server, spec, 'queue names spelled out', async (app) => {
     const { page } = app;
@@ -1154,6 +1154,111 @@ async function scenarioQueueNames(browser, server) {
     await page.evaluate((n) => sftpSendTo('t1', '/home/u/' + n, state.sessions.get('t2')), RLO);
     await settle(page);
     yes('and so does a "Send to"', (await toasts(page)).includes(stat('invoice<U+202E>txt.exe')), JSON.stringify(await toasts(page)));
+    check('no page errors', app.errors, []);
+  });
+}
+
+// ─── the activity log: names a server chooses ───────────────────────────────
+//
+// The activity log shows a remote name the way the listing does (sftpSpell),
+// and a name a line quotes is kept to itself too (sftpInText): the folder
+// SFTP opened at, what New folder and New file made, a rename, the size of a
+// folder, a search and the folder it looked in, a bookmark, and the two
+// folders synchronized browsing is anchored at - the local one as well, as a
+// download keeps the name the server gave it. The Upload... picker names its
+// folder the same way in its title. The names the backend acts on are still
+// sent as they are, and a bookmark keeps its name as it is.
+
+async function scenarioLogNames(browser, server) {
+  const RLO = 'reports\u202Efdp.exe'; // a folder that reads as "reportsexe.pdf"
+  const LISU = '\uA4F8\uA4F8'; // LISU LETTER TONE MYA TI, twice: reads as ".."
+  const GAPS = 'two  spaces';
+  const HERE = '/home/u/' + RLO;
+  const SHOWN = '/home/u/reports<U+202E>fdp.exe';
+  // A Windows folder on this computer with names a server chose (a download
+  // keeps them): an override, and two U+A4F8 that read as "..".
+  const LOCAL = 'C:\\Users\\me\\\u202Edl\\\uA4F8\uA4F8';
+  const spec = {
+    remote: { '/home/u': [RLO + '/'], [HERE]: [LISU + '/', GAPS + '/', 'notes.txt'], [HERE + '/' + LISU]: [], [HERE + '/' + GAPS]: [] },
+    local: { [LOCAL]: [] },
+    home: LOCAL,
+  };
+  /// A name the way a line quotes it: spelled out, between U+2068 and U+2069.
+  const inText = (shown) => '\u2068' + shown + '\u2069';
+  /// The lines of a tab's activity log that start with `start`.
+  const lines = async (page, start, tabId) => (await logOf(page, tabId)).filter((l) => l.startsWith(start));
+  /// OK on the prompt that is open, with `value` typed in, or with what it
+  /// offers.
+  const answer = async (page, value) => {
+    await waitVisible(page, '#promptModal');
+    if (value !== undefined) await page.fill('#promptInput', value);
+    await page.click('#promptOkBtn');
+    await settle(page, 250);
+  };
+
+  await withFiles(browser, server, spec, 'the folder SFTP opens at, spelled out', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => switchView('connect'));
+    const tabId = await openLiveTab(app);
+    await page.evaluate((cwd) => { window.__replies.sftp_open = { ok: true, cwd }; }, HERE);
+    await page.click('#termModeSeg .seg-btn[data-mode="sftp"]');
+    await settle(page, 400);
+    check('the folder SFTP opened at is spelled out in the activity log', await lines(page, 'SFTP opened', tabId), [`SFTP opened at ${SHOWN}`]);
+    check('no page errors', app.errors, []);
+  });
+
+  await withFiles(browser, server, spec, 'activity log names spelled out', async (app) => {
+    const { page } = app;
+    await openFilesTab(page, { tab: { sftpPath: HERE } });
+    await page.evaluate(() => sftpMkdirPrompt('t1'));
+    await answer(page, 'new\u200Bdir');
+    await page.evaluate(() => sftpTouchPrompt('t1'));
+    await answer(page, 'x\u202Etxt.exe');
+    check('New folder and New file: the path is spelled out in the log', (await logOf(page)).filter((l) => /^(mkdir|touch) /.test(l)),
+      [`mkdir ${SHOWN}/new<U+200B>dir`, `touch ${SHOWN}/x<U+202E>txt.exe`]);
+    check('and made as it is', [...await app.calls('sftp_mkdir'), ...await app.calls('sftp_touch')].map((c) => c.args.path),
+      [HERE + '/new\u200Bdir', HERE + '/x\u202Etxt.exe']);
+
+    await page.evaluate((n) => sftpRenamePrompt('t1', state.sessions.get('t1')._entryMap.get(n)), LISU);
+    await answer(page, 'up\u200B');
+    check('a rename: the old name and the new, spelled out', await lines(page, 'rename '), ['rename <U+A4F8><U+A4F8> \u2192 up<U+200B>']);
+    check('and renamed as they are', (await app.calls('sftp_rename')).map((c) => [c.args.from, c.args.to]), [[HERE + '/' + LISU, HERE + '/up\u200B']]);
+
+    await page.evaluate(() => { window.__replies.sftp_dir_size = { ok: true, bytes: 2048, files: 2, dirs: 1, truncated: false }; });
+    await page.evaluate((n) => sftpCalcDirSize('t1', n), GAPS);
+    check('the size of a folder: its name spelled out', await lines(page, 'size '), ['size two<U+0020><U+0020>spaces: 2.0 KB (2 files, 1 dirs)']);
+
+    const QUERY = 'in\u202Evoice';
+    await page.evaluate((q) => runSearch('t1', q), QUERY);
+    check('a search: what it looks for kept to itself, the folder it looks in spelled out', await lines(page, 'search '),
+      [`search "${inText('in<U+202E>voice')}" under ${SHOWN}`]);
+    check('and it looks for the text as it is, in the folder as it is', (await app.calls('sftp_search')).map((c) => [c.args.query, c.args.rootPath]), [[QUERY, HERE]]);
+
+    // A bookmark is offered the folder's own name.
+    await page.evaluate(() => openBookmarkMenu({ currentTarget: [...document.querySelectorAll('#sftpPanel-t1 button')].find((b) => b.title === 'Bookmarks') }, 't1'));
+    await settle(page, 80);
+    await clickMenuItem(page, 'Bookmark this directory...');
+    await answer(page);
+    check('a bookmark: its name kept to itself, its folder spelled out', await lines(page, 'bookmark '),
+      [`bookmark "${inText('reports<U+202E>fdp.exe')}" \u2192 ${SHOWN}`]);
+    check('and saved as they are', (await app.calls('sftp_bookmarks_save')).map((c) => c.args.bookmarks.map((b) => [b.name, b.remotePath])), [[[RLO, HERE]]]);
+
+    await page.evaluate(() => { window.__replies.system_pick_files = { canceled: true, paths: [] }; });
+    await page.evaluate(() => sftpUploadSelected('t1'));
+    check('the Upload... picker names the folder in its title, spelled out', (await app.calls('system_pick_files')).map((c) => c.args.title), [`Upload to ${SHOWN}`]);
+
+    await openDual(page);
+    await page.evaluate(() => sftpSyncToggle('t1'));
+    check('synchronized browsing: the two folders it is anchored at, spelled out - the Windows one name by name', await lines(page, 'synchronized browsing: on'),
+      [`synchronized browsing: on (anchored at C:\\Users\\me\\<U+202E>dl\\<U+A4F8><U+A4F8> \u21C4 ${SHOWN})`]);
+    // A folder with no mirror on this computer: the remote side goes in, and
+    // synchronized browsing stops.
+    await rowEvent(page, 'dblclick', LISU);
+    await settle(page, 250);
+    check('and when it stops, the folder with no mirror kept to itself', await lines(page, 'synchronized browsing suspended'),
+      [`synchronized browsing suspended: local "${inText('<U+A4F8><U+A4F8>')}" has no mirror`]);
+    yes('no line of the log holds an override, a zero-width space or a look-alike dot as it is',
+      !(await logOf(page)).some((l) => /[\u202E\u200B\uA4F8]/.test(l)), JSON.stringify(await logOf(page)));
     check('no page errors', app.errors, []);
   });
 }
@@ -3758,6 +3863,7 @@ const SCENARIOS = [
   ['chmod dialog (A3-20)', scenarioChmod],
   ['transfer queue (A3-02 A3-03 A3-12 A3-21 A3-33 A3-34)', scenarioQueue],
   ['transfer queue: names a server chooses, spelled out', scenarioQueueNames],
+  ['activity log: names a server chooses, spelled out', scenarioLogNames],
   ['shortcuts and OS drops (A5-46 A3-22)', scenarioShortcuts],
   ['background tabs (A3-37)', scenarioBackgroundTab],
   ['search ids (Task 10 contract, A3-34)', scenarioSearch],
