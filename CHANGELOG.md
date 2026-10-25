@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the vault is locked. Closing the dialog or locking the vault stops an import before its next
   save. (#89)
 
+### Fixed
+
+- **Editing an MCP server on an IPv6 address no longer asks for its secret again.** The MCP
+  settings form compares its URL with the stored one to tell whether an edit discards the stored
+  credential, and it wrote an IPv6 host without its brackets (`http://::1:8080/mcp`), where the
+  backend has kept them since v1.10.0 (`http://[::1]:8080/mcp`). Such a server with a stored
+  secret looked changed on every edit: the form said the secret would be discarded and refused to
+  save until it was entered again, even with nothing changed. The form now writes the URL the way
+  the backend stores it, path included: Chromium (the Windows webview) writes `|` as `%7C`, `^` as
+  `%5E` and a `%2E` inside a path segment as a dot, where the backend keeps all three as typed, so
+  a server with one of them in its path had the same problem. (#98)
+
 ### Security
 
 - **Dependency advisories.** `crypto-bigint` 0.7.5 -> 0.7.7 (RUSTSEC-2026-0387: operations meant

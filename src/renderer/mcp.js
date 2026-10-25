@@ -511,13 +511,45 @@ function mcpUrlProblem(raw) {
 }
 
 /// The URL as the backend stores it (classify_url: scheme://host[:port]path,
-/// no trailing slash), to tell a real change from a re-typed equal URL.
+/// no trailing slash), to tell a real change from a re-typed equal URL. The
+/// browser writes scheme, host and port the way the url crate does - an IPv6
+/// address in its brackets, `http://[::1]:8080/mcp`; without them a server on
+/// ::1 looked changed on every edit, and Save asked for its secret again -
+/// except that Chromium writes a * in a host as %2A; the path is mcpUrlPath's.
+/// This and classify_url are checked against the same cases
+/// (src-tauri/src/assistant/mcp_url_cases.json). One difference is left, on
+/// the safe side: Rust's trim also drops a U+0085 at either end, so a URL
+/// typed with one reads as changed.
 function mcpNormalizedUrl(raw) {
+  const text = String(raw || '').trim();
   let p;
-  try { p = new URL(String(raw || '').trim()); } catch (e) { return String(raw || '').trim(); }
-  const host = p.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  const path = p.pathname.replace(/\/+$/, '');
-  return p.protocol + '//' + host + (p.port ? ':' + p.port : '') + (path === '/' ? '' : path);
+  try { p = new URL(text); } catch (e) { return text; }
+  const host = p.hostname.toLowerCase().replace(/%2a/g, '*');
+  return p.protocol + '//' + host + (p.port ? ':' + p.port : '') + mcpUrlPath(text);
+}
+
+/// The path of the URL `text` as classify_url stores it - the url crate's,
+/// without trailing slashes ('' for the root) - and not the browser's, which
+/// differs: Chromium writes | as %7C, ^ as %5E and a %2E inside a segment as a
+/// dot, where the url crate keeps all three as typed. The crate's rules: tabs
+/// and newlines dropped, C0 controls and spaces at either end too, \ read as /,
+/// "." and ".." segments resolved (a dot may be written %2e), and only C0
+/// controls, space, " # < > ? ` { }, DEL and non-ASCII characters
+/// percent-encoded, as UTF-8.
+function mcpUrlPath(text) {
+  // Both ends in one pass from the start: `[\x00-\x20]+$` would rescan every
+  // run of spaces inside the URL, at a cost growing with its square.
+  const bare = /^[\x00-\x20]*([\s\S]*[^\x00-\x20])?/.exec(text.replace(/[\t\n\r]/g, ''))[1] || '';
+  const rest = bare.replace(/^[a-z][a-z\d+.-]*:[\/\\]*[^\/\\?#]*/i, '').replace(/[?#][\s\S]*$/, '');
+  const utf8 = new TextEncoder();
+  const encode = (chars) => Array.from(utf8.encode(chars), (b) => '%' + b.toString(16).toUpperCase().padStart(2, '0')).join('');
+  const path = [];
+  for (const s of rest.split(/[\/\\]/).slice(1)) {
+    if (/^(\.|%2e){2}$/i.test(s)) path.pop();
+    else if (!/^(\.|%2e)$/i.test(s)) path.push(s.replace(/(?:[\x00-\x20\x22#<>?\x60{}\x7f]|[^\x00-\x7f])+/gu, encode));
+  }
+  while (path.length && path[path.length - 1] === '') path.pop();
+  return path.map((s) => '/' + s).join('');
 }
 
 function mcpUrlCheck() {

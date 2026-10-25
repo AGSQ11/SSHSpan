@@ -1,0 +1,26 @@
+{
+  "about": "MCP server URLs as typed, and the URL classify_url (mcp.rs) stores for each. The MCP settings form tells a real URL change from an unchanged one by writing the URL the same way (mcpNormalizedUrl in src/renderer/mcp.js). mcp.rs's tests check classify_url against these cases and scripts/check-assistant-ui.js checks mcpNormalizedUrl, so a url crate that writes one differently fails both until both are changed.",
+  "cases": [
+    { "typed": "http://[::1]:8080/mcp", "stored": "http://[::1]:8080/mcp", "why": "an IPv6 address keeps its brackets" },
+    { "typed": "HTTP://[0:0:0:0:0:0:0:1]:8080/mcp/", "stored": "http://[::1]:8080/mcp", "why": "an IPv6 address written out in full" },
+    { "typed": "https://[2001:DB8::1]:443/mcp", "stored": "https://[2001:db8::1]/mcp", "why": "IPv6 hex in lower case, the default port dropped" },
+    { "typed": "  HTTPS://MCP.Example.TEST:8443/Mcp//  ", "stored": "https://mcp.example.test:8443/Mcp", "why": "trimmed, scheme and host in lower case, the path's case kept, trailing slashes dropped" },
+    { "typed": "http://localhost:80", "stored": "http://localhost", "why": "the default port dropped, no path" },
+    { "typed": "http://127.1:9999/", "stored": "http://127.0.0.1:9999", "why": "a short IPv4 address written out" },
+    { "typed": "https:mcp.example.test/mcp", "stored": "https://mcp.example.test/mcp", "why": "no slashes after the scheme" },
+    { "typed": "https://*.Example.test/mcp", "stored": "https://*.example.test/mcp", "why": "a * in the host kept, though Chromium writes %2A" },
+    { "typed": "https://mcp.example.test/a|b^c", "stored": "https://mcp.example.test/a|b^c", "why": "| and ^ in the path kept, though Chromium writes %7C and %5E" },
+    { "typed": "https://mcp.example.test/v%2E1/x%2e", "stored": "https://mcp.example.test/v%2E1/x%2e", "why": "a %2E inside a segment kept, though Chromium writes a dot" },
+    { "typed": "https://mcp.example.test/a/./b/../c/", "stored": "https://mcp.example.test/a/c", "why": "dot segments resolved" },
+    { "typed": "https://mcp.example.test/a/%2e%2E/b/%2e", "stored": "https://mcp.example.test/b", "why": "dot segments written %2e resolved" },
+    { "typed": "https://mcp.example.test/a/..", "stored": "https://mcp.example.test", "why": "a last .. leaves the root" },
+    { "typed": "https://mcp.example.test\\a\\b", "stored": "https://mcp.example.test/a/b", "why": "a backslash read as a slash" },
+    { "typed": "https://mcp.example.test/m\tc\np", "stored": "https://mcp.example.test/mcp", "why": "tabs and newlines dropped" },
+    { "typed": "https://mcp.example.test/a b\"<>{}`x", "stored": "https://mcp.example.test/a%20b%22%3C%3E%7B%7D%60x", "why": "space, quote, < > { } and the backtick percent-encoded" },
+    { "typed": "https://mcp.example.test/a\u0001b\u007f", "stored": "https://mcp.example.test/a%01b%7F", "why": "C0 controls and DEL percent-encoded" },
+    { "typed": "https://mcp.example.test/\u00e9/\u65e5\u672c/\ud83d\ude00", "stored": "https://mcp.example.test/%C3%A9/%E6%97%A5%E6%9C%AC/%F0%9F%98%80", "why": "non-ASCII percent-encoded as UTF-8" },
+    { "typed": "https://mcp.example.test/%c3%a9%41%zz%", "stored": "https://mcp.example.test/%c3%a9%41%zz%", "why": "percent escapes kept as typed, broken ones too" },
+    { "typed": "https://mcp.example.test/a[b]c;d=e,f!$&'()*+@:~_-.g", "stored": "https://mcp.example.test/a[b]c;d=e,f!$&'()*+@:~_-.g", "why": "other characters kept as typed" },
+    { "typed": "\u0001https://mcp.example.test/mcp\u0001", "stored": "https://mcp.example.test/mcp", "why": "C0 controls at either end dropped" }
+  ]
+}
