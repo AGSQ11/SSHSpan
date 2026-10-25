@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PuTTY import (Windows).** A PuTTY button beside Config under Servers lists the SSH sessions
+  saved in PuTTY (up to 1,000), each with its name, host, port, username and key file and a
+  checkbox. A session already saved as a server is marked and starts unticked, and so does one
+  whose name or host has characters that do not show (they are spelled out). A username PuTTY
+  does not have is typed in the session's row, or put in every empty username field with Fill.
+  Import saves the ticked sessions one at a time with the server dialog's save (`server_save`),
+  so its key-file checks and warnings apply. A proxy or jump host, port forwarding, agent
+  forwarding and X11 forwarding are not imported, and the row says so; sessions that cannot be
+  imported are listed with the reason. PuTTY's settings are read from the registry and never
+  changed, the key files they name are not opened while listing, and the import is refused while
+  the vault is locked. Closing the dialog or locking the vault stops an import before its next
+  save. (#89)
+
 ### Security
 
 - **Dependency advisories.** `crypto-bigint` 0.7.5 -> 0.7.7 (RUSTSEC-2026-0387: operations meant
