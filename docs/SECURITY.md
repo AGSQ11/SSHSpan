@@ -1,10 +1,15 @@
 # SSHSpan security model
 
 **Last updated:** 2026-10-25  
-**Status:** describes v1.10.0; checked against committed source at `6c19b1b`, the
-release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since. It
-also describes how MCP tool names and results are shown, which is not released yet (Unreleased in
-the CHANGELOG)  
+**Status:** describes v1.10.0 and two changes that are not released yet (Unreleased in the
+CHANGELOG): the PuTTY session import and how MCP tool names and results are shown. The passages
+about the import - in [Vault lock and locked-state policy](#vault-lock-and-locked-state-policy) the
+sentence on an import a lock stops and the bullet on the two listings of hosts, the PuTTY session
+import section, and the accepted limitation on how the server list shows names - are checked
+against committed source at `a75b533`; the passage on MCP tool names in [Renderer-attested
+approvals](#renderer-attested-approvals) against `370be24`; the release-signing and Windows CI
+passages against `38e586e`; everything else against `6c19b1b`, and nothing else it describes has
+changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -217,7 +222,9 @@ watchdog and every exit:
 
 After the renderer observes the lock, it closes dialogs, wipes password and import fields,
 destroys terminal tabs (discarding terminal scrollback), and clears each tab's assistant
-conversation, pending approval and access level.
+conversation, pending approval and access level. A PuTTY import that is saving stops before its
+next save (a save already sent finishes), and what it reports afterwards is counts only, with no
+session name, host, user name or key path.
 
 Every exit - the tray's Quit, `app_quit`, the updater handing over to an installer, closing a
 tray-less window - passes `RunEvent::ExitRequested`, which runs the same lock path once (while the
@@ -229,6 +236,11 @@ Locked state protects integrity as well as secret reads, but only where security
 
 - key/category mutations, audit clearing, known-host forgetting, MCP server removal/tool state,
   the Bitwarden "Allow syncing..." question, and sealed-data writes refuse while locked;
+- both listings that read hosts and accounts from outside the vault, each an inventory of hosts,
+  accounts and key paths, refuse while locked: the hosts of the user's own ssh config
+  (`ssh_config_list_hosts`) and PuTTY's saved sessions (`putty_list_sessions`). Each checks the
+  lock before the file or the registry is read: `require_unlocked` is the first step of
+  `ssh_config_hosts_in` and of `putty_sessions_in`;
 - `autoLockMinutes`, `confirmDelete`, `autoUpdateCheck`, and `confirmMultiLinePaste` cannot change
   while locked;
 - harmless display, terminal, and file-browser preferences remain editable while locked. This is
@@ -340,6 +352,42 @@ and the file is never touched: saving the server (it is saved all the same) warn
 key files only from this computer's drives (like C:\...). Copy the key to a local folder, or
 import it under Keys.", and Connect and Test connection refuse with the same text before the path
 is opened. On Linux and macOS this rule does not apply.
+
+### PuTTY session import
+
+On Windows the Servers view can import the sessions saved in PuTTY: `putty_list_sessions` lists
+them and the renderer saves the ones the user ticks. A session is a set of registry values that any
+program running as the user can write, so the listing treats every one as untrusted:
+
+- **The registry is only read.** Only the current user's sessions are read
+  (`HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions`). That key and each session's key are
+  opened for reading only (`KEY_READ`), only the ten values the listing uses are queried, and
+  nothing is ever written. The listing is refused while the vault is locked (see [Vault lock and
+  locked-state policy](#vault-lock-and-locked-state-policy)).
+- **The listing is bounded.** At most 1,000 sessions are listed, and every subkey counts as one, so
+  the reader enumerates and opens at most 1,002 subkeys however many there are. A text value (the
+  host, protocol, user name, key file path or port forwardings) with more than 8 KiB of data is
+  not read, and counts as too long, never as absent. A session whose name is longer than 256
+  characters, host longer than 255, user name longer than 256 or key file path longer than 4,095
+  is skipped with that reason, and a session whose registry key cannot be opened is skipped with
+  the OS error, so one unreadable session does not fail the listing.
+- **Key files are never touched while listing.** A session's key file path is passed on as a
+  string: the listing never opens, stats or resolves it (a test checks the module's source for
+  file-system calls). On Windows a look at a UNC path (`\\server\share\...`) would open an SMB
+  connection to that server and hand it an NTLM sign-in.
+- **Saving is the ordinary save.** The ticked sessions are saved one at a time with `server_save`,
+  with its checks and its rule for key files on Windows: a key file path that is not on this
+  computer's drives is saved with a warning and never touched (see [SSH host keys and
+  connections](#ssh-host-keys-and-connections)).
+- **Hostile values.** A session whose name, or whose host once cleaned up the way PuTTY cleans it,
+  has a control character (C0, C1 or DEL) is skipped. Every other character that does not show - a
+  text-direction override, a zero-width character, a space other than the plain one - is spelled
+  out in the dialog (`<U+202E>`), and each name, host and key file path is set as text only, in a
+  text-direction isolate of its own. A session whose name or host has such a character starts
+  unticked and its row says so. A user name with one (a control character included) is not put in
+  the username field, which holds what is saved; the row shows it spelled out instead. A session
+  can still be ticked, and its name and host are then saved as they are, those characters included
+  (`server_save` trims only white space at either end, as for every server).
 
 ### SFTP remote-side controls
 
@@ -810,6 +858,11 @@ Each is a known, deliberate state, with the reason it was left.
 - **`SSHSPAN_DB` exists in debug builds only.** It is compiled out of release builds.
 - **MCP tool arguments get no backend disguising-character check.** The model chooses them; the
   approval card's escaping of invisible and text-direction characters is the control.
+- **The server list shows names as they are.** A row of the server list shows the server's name and
+  `user@host:port` as they are, without spelling out characters that do not show, so a name with a
+  text-direction override (U+202E) takes effect there. This is older than the PuTTY import, which
+  starts a session whose name or host has such a character unticked, so saving one as a server
+  takes a deliberate tick.
 - **A revoke that commits while `tools/call` is on the wire cannot stop that call.** The gate is
   checked right before the request is sent, and a request already sent cannot be recalled.
 - **`definition_changed` clears if a server reverts** to the approved definition; the tool stays
