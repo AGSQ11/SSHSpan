@@ -1176,13 +1176,14 @@ async function scenarioLogNames(browser, server) {
   const RLO = 'reports\u202Efdp.exe'; // a folder that reads as "reportsexe.pdf"
   const LISU = '\uA4F8\uA4F8'; // LISU LETTER TONE MYA TI, twice: reads as ".."
   const GAPS = 'two  spaces';
+  const PADDED = ' padded.txt ';
   const HERE = '/home/u/' + RLO;
   const SHOWN = '/home/u/reports<U+202E>fdp.exe';
   // A Windows folder on this computer with names a server chose (a download
   // keeps them): an override, and two U+A4F8 that read as "..".
   const LOCAL = 'C:\\Users\\me\\\u202Edl\\\uA4F8\uA4F8';
   const spec = {
-    remote: { '/home/u': [RLO + '/'], [HERE]: [LISU + '/', GAPS + '/', 'notes.txt'], [HERE + '/' + LISU]: [], [HERE + '/' + GAPS]: [] },
+    remote: { '/home/u': [RLO + '/'], [HERE]: [LISU + '/', GAPS + '/', PADDED, 'notes.txt'], [HERE + '/' + LISU]: [], [HERE + '/' + GAPS]: [] },
     local: { [LOCAL]: [] },
     home: LOCAL,
   };
@@ -1246,11 +1247,13 @@ async function scenarioLogNames(browser, server) {
     check('and made as it is', [...await app.calls('sftp_mkdir'), ...await app.calls('sftp_touch')].map((c) => c.args.path),
       [HERE + '/new\u200Bdir', HERE + '/x\u202Etxt.exe']);
 
-    await page.evaluate((n) => sftpRenamePrompt('t1', state.sessions.get('t1')._entryMap.get(n)), LISU);
+    // A file used for nothing else: the fake server keeps listing a name it
+    // was asked to rename.
+    await page.evaluate((n) => sftpRenamePrompt('t1', state.sessions.get('t1')._entryMap.get(n)), PADDED);
     await answer(page, 'up\u200B');
     check('a rename: the old name and the new, spelled out, each kept to itself', await lines(page, 'rename '),
-      [`rename ${inText('<U+A4F8><U+A4F8>')} \u2192 ${inText('up<U+200B>')}`]);
-    check('and renamed as they are', (await app.calls('sftp_rename')).map((c) => [c.args.from, c.args.to]), [[HERE + '/' + LISU, HERE + '/up\u200B']]);
+      [`rename ${inText('<U+0020>padded.txt<U+0020>')} \u2192 ${inText('up<U+200B>')}`]);
+    check('and renamed as they are', (await app.calls('sftp_rename')).map((c) => [c.args.from, c.args.to]), [[HERE + '/' + PADDED, HERE + '/up\u200B']]);
 
     await page.evaluate(() => { window.__replies.sftp_dir_size = { ok: true, bytes: 2048, files: 2, dirs: 1, truncated: false }; });
     await page.evaluate((n) => sftpCalcDirSize('t1', n), GAPS);
@@ -1283,10 +1286,18 @@ async function scenarioLogNames(browser, server) {
       [`synchronized browsing: on (anchored at ${inText('C:\\Users\\me\\<U+202E>dl\\<U+A4F8><U+A4F8>')} \u21C4 ${inText(SHOWN)})`]);
     // A folder with no mirror on this computer: the remote side goes in, and
     // synchronized browsing stops.
-    await rowEvent(page, 'dblclick', LISU);
+    yes('(set-up) the folder is listed, to double-click', await rowEvent(page, 'dblclick', LISU));
     await settle(page, 250);
     check('and when it stops, the folder with no mirror kept to itself', await lines(page, 'synchronized browsing suspended'),
       [`synchronized browsing suspended: local "${inText('<U+A4F8><U+A4F8>')}" has no mirror`]);
+    // A failed transfer with no remote path is named by its local one, spelled
+    // out name by name as well.
+    await emitJobs(page, [JOB(1, 'f.txt', 'failed', { remotePath: '', localPath: LOCAL + '\\f.txt', error: 'gone' })]);
+    await settle(page);
+    check('a failed transfer named by its local path: spelled out name by name and kept to itself', await lines(page, 'transfer failed'),
+      [`transfer failed: ${inText('C:\\Users\\me\\<U+202E>dl\\<U+A4F8><U+A4F8>\\f.txt')} - gone`]);
+    check('a drive root and a UNC path are left as they are', await page.evaluate(() => [sftpSpellLocal('C:\\'), sftpSpellLocal('\\\\srv\\share')]),
+      ['C:\\', '\\\\srv\\share']);
     yes('no line of the log holds an override, a zero-width space or a look-alike dot as it is',
       !(await logOf(page)).some((l) => /[\u202E\u200B\uA4F8]/.test(l)), JSON.stringify(await logOf(page)));
     check('no page errors', app.errors, []);

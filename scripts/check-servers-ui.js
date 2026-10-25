@@ -28,7 +28,8 @@
  *   5. the lock: a manual lock with live work asks, an idle lock warns;
  *   6. the updater dialog; 7. Bitwarden sync honesty; 8. the Upload picker;
  *   9. approval cards show invisible characters;
- *   plus the leftovers: busy buttons, dead code, copy, stylesheet hygiene.
+ *   plus the leftovers: busy buttons, dead code, copy, stylesheet hygiene;
+ *   and, on Windows, the import of the sessions saved in PuTTY.
  *
  * Run with `npm run test:servers`. Needs playwright (see check-renderer-ui.js);
  * without it only the static checks run. `--only <text>` runs the scenarios
@@ -967,7 +968,11 @@ async function scenarioSpelledNames(browser, server) {
     const labels = await menuLabels(page);
     yes('the ~/.ssh/config import names a host spelled out, its user and host name kept to themselves',
       labels.includes(`${RLO_NAME_SHOWN} (${kept(ZW_USER_SHOWN)}@${kept(RLO_HOST_SHOWN)}:2222)`), JSON.stringify(labels));
-    if (await clickMenuItem(page, /^db-/)) {
+    // A host that cannot be picked fails here rather than skipping the
+    // checks of the form below.
+    const picked = await clickMenuItem(page, /^db-/);
+    yes('(set-up) the host can be picked from the import menu', picked, JSON.stringify(labels));
+    if (picked) {
       yes('(set-up) it opens the server form', await waitVisible(page, '#serverModal'));
       check('which gets them as they are', await page.evaluate(() => [el('srvName').value, el('srvHost').value, el('srvUser').value]),
         [RLO_NAME, RLO_HOST, ZW_USER]);
@@ -3779,6 +3784,722 @@ async function scenarioHostScopeReload(browser, server) {
   });
 }
 
+// ─── PuTTY session import (Windows) ─────────────────────────────────────────
+//
+// On Windows the Connect view offers the SSH sessions saved in PuTTY
+// (putty_list_sessions: { sessions, skipped, truncated }): one dialog lists
+// them all - ticked unless already in SSHSpan or named or hosted with a
+// character that does not show, a missing user name typed in its row or
+// filled into every empty one at once - and one button saves the ticked ones
+// through server_save, one at a time, with the argument set the deploy
+// sheet's "save as servers" uses (puttySave below). Every name, host, user
+// name, key path and reason comes from the registry, which any program can
+// write: all of it is shown spelled out, each kept to itself, and saved as it
+// is. Closing the dialog or a vault lock stops an import before its next save,
+// and once the vault is locked nothing from the listing is said.
+
+const RLO = '\u{202E}';
+const ZWNJ = '\u{200C}';
+const ZWSP = '\u{200B}';
+const PUTTY_EVIL = 'evil' + RLO + 'gpj.exe';
+const PUTTY_EVIL_SHOWN = 'evil<U+202E>gpj.exe';
+// A Persian user name: the zero-width non-joiner is part of how it is
+// written, and does not show.
+const PERSIAN = '\u0639\u0644\u06CC' + ZWNJ + '\u0631\u0636\u0627';
+const PERSIAN_SHOWN = '\u0639\u0644\u06CC<U+200C>\u0631\u0636\u0627';
+const PUTTY_LISTING = {
+  sessions: [
+    { name: 'backup', host: 'backup.lan', port: 2222, username: null, keyFile: null, authMethod: 'password', notes: [], alreadySaved: false },
+    { name: PUTTY_EVIL, host: 'nas.lan', port: 22, username: 'root', keyFile: 'D:\\nas.ppk', authMethod: 'publickey', notes: ['portForwarding', 'x11Forwarding'], alreadySaved: false },
+    { name: 'fa-box', host: 'fa.lan', port: 22, username: PERSIAN, keyFile: null, authMethod: 'password', notes: [], alreadySaved: false },
+    { name: 'mirror', host: 'mirror' + ZWSP + '.lan', port: 22, username: 'pi', keyFile: null, authMethod: 'password', notes: [], alreadySaved: false },
+    { name: 'prod-web', host: '10.0.0.5', port: 22, username: 'deploy', keyFile: 'C:\\keys\\pr' + RLO + 'od.ppk', authMethod: 'publickey', notes: ['proxy', 'agentForwarding'], alreadySaved: false },
+    { name: 'router', host: '192.168.1.1', port: 22, username: null, keyFile: null, authMethod: 'password', notes: [], alreadySaved: true },
+  ],
+  skipped: [
+    { name: 'console', reason: 'not an SSH session (serial)' },
+    { name: 'tel' + RLO + 'net', reason: 'not an SSH session (tel' + RLO + 'net)' },
+  ],
+  truncated: false,
+};
+const WINDOWS = { app_info: { version: '1.10.0', platform: 'windows' } };
+const puttyOpts = (listing) => ({ replies: Object.assign({ putty_list_sessions: listing || PUTTY_LISTING }, WINDOWS) });
+const PUTTY_TITLE = 'Import the sessions saved in PuTTY';
+const PUTTY_LOCKED = 'Unlock the vault to import servers from PuTTY.';
+const PUTTY_FILL_LABEL = 'Username for the sessions without one';
+/// What each PuTTY setting SSHSpan does not use means for the connection.
+const PUTTY_NOTE = {
+  proxy: 'PuTTY connects through a proxy or jump host - SSHSpan connects directly.',
+  portForwarding: 'Port forwarding is not imported.',
+  agentForwarding: 'Agent forwarding is not supported.',
+  x11Forwarding: 'X11 forwarding is not supported.',
+};
+/// What a row says about a name, host or user name that does not show as it is.
+const HIDDEN = {
+  name: 'Its name has characters that do not show.',
+  host: 'Its host has characters that do not show.',
+  user: 'PuTTY\'s username for it has characters that do not show: ',
+};
+
+/// server_save's arguments for a PuTTY session: a new server, no vault key,
+/// the session's key file as the .pem path (null without one), no saved
+/// password, no category, no colour.
+const puttySave = (s, username) => ({
+  id: null, name: s.name, host: s.host, port: s.port, username, authMethod: s.authMethod,
+  keyId: null, pemPath: s.keyFile, savedPassword: null, categoryId: null, color: null,
+});
+/// An object with its keys sorted: arguments compared as a set of names and values.
+const sortedKeys = (o) => (o && typeof o === 'object' ? Object.fromEntries(Object.keys(o).sort().map((k) => [k, o[k]])) : o);
+
+/// Click a control the way a user does; false at once when it is missing or
+/// hidden, so a build without it fails its checks instead of waiting out a
+/// timeout.
+async function clickShown(page, sel) {
+  if (!(await visible(page, sel))) return false;
+  await page.click(sel);
+  return true;
+}
+
+/// The PuTTY button as it stands (null when there is none).
+const puttyButton = (page) => page.evaluate(() => {
+  const b = document.getElementById('serverPuttyBtn');
+  if (!b) return null;
+  return {
+    shown: !b.hidden && b.getClientRects().length > 0, label: b.textContent.trim(), title: b.title,
+    afterConfig: !!b.previousElementSibling && b.previousElementSibling.id === 'serverImportBtn',
+    ghost: b.classList.contains('ghost-btn'), icon: !!b.querySelector('svg'),
+  };
+});
+const puttyGate = (page) => page.evaluate(() => {
+  const b = document.getElementById('serverPuttyBtn');
+  return b ? [b.disabled, b.title] : null;
+});
+/// The dialog's rows as they read: the name its checkbox is labelled with,
+/// whether it is ticked, its user name field (value, and whether it is marked
+/// invalid) and the row's text.
+const puttyRows = (page) => page.evaluate(() => [...document.querySelectorAll('#puttyImportList > li')].map((li) => {
+  const box = li.querySelector('input[type="checkbox"]');
+  const user = li.querySelector('input[type="text"]');
+  return {
+    name: box && box.labels && box.labels.length ? box.labels[0].textContent.replace(/\s+/g, ' ').trim() : null,
+    ticked: !!box && box.checked,
+    user: user ? user.value : null,
+    invalid: !!user && user.getAttribute('aria-invalid') === 'true',
+    text: li.textContent.replace(/\s+/g, ' ').trim(),
+  };
+}));
+/// The dialog's text as shown - hidden parts left out - every run of white
+/// space one space ('' when there is none).
+const puttyText = (page) => page.evaluate(() => {
+  const m = document.getElementById('puttyImportModal');
+  return m ? m.innerText.replace(/\s+/g, ' ').trim() : '';
+});
+/// The footer: how many are ticked, the Import button's label, and whether it is disabled.
+const puttyFooter = (page) => page.evaluate(() => {
+  const n = document.getElementById('puttyImportCount');
+  const b = document.getElementById('puttyImportBtn');
+  return n && b ? { count: n.textContent.trim(), label: b.textContent.trim(), disabled: b.disabled } : null;
+});
+const puttyOpen = (page) => page.evaluate(() => {
+  const m = document.getElementById('puttyImportModal');
+  return !!m && !m.hidden;
+});
+/// Tick or untick a session with a real click; false when there is no such checkbox.
+const tickPutty = (page, name, on) => page.getByRole('checkbox', { name, exact: true })
+  .setChecked(on, { timeout: 1000 }).then(() => true, () => false);
+const typeUser = (page, name, value) => page.getByRole('textbox', { name: 'Username for ' + name, exact: true })
+  .fill(value, { timeout: 1000 }).then(() => true, () => false);
+/// Type a user name into the fill field; `how` 'enter' presses Enter there,
+/// 'click' clicks Fill. False when there is no fill field.
+async function fillUsers(page, value, how) {
+  const field = page.getByRole('textbox', { name: PUTTY_FILL_LABEL, exact: true });
+  if (!(await field.fill(value, { timeout: 1000 }).then(() => true, () => false))) return false;
+  if (how === 'click') return page.locator('#puttyImportModal').getByRole('button', { name: 'Fill', exact: true }).click({ timeout: 1000 }).then(() => true, () => false);
+  await field.press('Enter');
+  return true;
+}
+/// The toasts on screen, oldest first, each as [kind, text].
+const saidToasts = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item:not(.leaving)')]
+  .map((n) => [['ok', 'warn', 'err', 'info'].find((k) => n.classList.contains(k)) || '?', n.querySelector('.toast-text').textContent]));
+const dropToasts = (page) => page.evaluate(() => [...document.querySelectorAll('#toast .toast-item')].forEach((t) => t.remove()));
+const dialogClosed = (page) => page.waitForFunction(() => {
+  const m = document.getElementById('puttyImportModal');
+  return !m || m.hidden;
+}, null, { timeout: 2500, polling: 25 }).catch(() => {});
+const savesMade = (page, n) => page.waitForFunction((k) => window.__calls.filter((c) => c.cmd === 'server_save').length >= k, n,
+  { timeout: 2000, polling: 25 }).catch(() => {});
+const savedNames = async (app) => (await app.calls('server_save')).map((c) => c.args.name);
+
+/// server_save as the backend does it - a saved server is in the next
+/// server_list - refusing the session named `o.reject` with `o.error`,
+/// answering one named in `o.warnings` with its warning, and holding the save
+/// of the one named `o.hold` until releaseSave().
+const stubPuttySaves = (page, o = {}) => page.evaluate(({ list, reject, error, warnings, held }) => {
+  window.__servers = window.__servers || list;
+  window.__heldSave = new Promise((r) => { window.__releaseSave = r; });
+  window.__replies.server_list = () => ({ servers: window.__servers });
+  window.__replies.server_save = async (a) => {
+    if (a.name === held) await window.__heldSave;
+    if (a.name === reject) throw error;
+    const id = 's-putty-' + (window.__servers.length + 1);
+    window.__servers = window.__servers.concat([{
+      id, name: a.name, host: a.host, port: a.port, username: a.username, authMethod: a.authMethod,
+      hasSavedPassword: false, categoryId: null, keyId: null, pemPath: a.pemPath,
+    }]);
+    return { ok: true, id, warning: (warnings && warnings[a.name]) || null };
+  };
+}, { list: [SERVER('s1', 'web-1')], reject: o.reject || null, error: o.error || 'Could not save.', warnings: o.warnings || null, held: o.hold || null });
+const releaseSave = (page) => page.evaluate(() => window.__releaseSave && window.__releaseSave());
+
+/// Show the Servers view on a Windows app and open the import dialog; says whether it opened.
+async function openPuttyDialog(page) {
+  await serversView(page);
+  await waitVisible(page, '#serverPuttyBtn');
+  return (await clickShown(page, '#serverPuttyBtn')) && waitVisible(page, '#puttyImportModal');
+}
+
+async function scenarioPuttyButton(browser, server) {
+  await withApp(browser, server, { replies: { app_info: { version: '1.10.0', platform: 'linux' } } }, 'PuTTY import: the button on Linux', async (app) => {
+    await serversView(app.page);
+    await app.page.waitForTimeout(100);
+    const b = await puttyButton(app.page);
+    check('the PuTTY button is in the markup, and hidden off Windows', b ? b.shown : 'missing', false);
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { replies: { app_info: { $reject: 'app_info is not available' } } }, 'PuTTY import: the button when app_info fails', async (app) => {
+    await serversView(app.page);
+    await app.page.waitForTimeout(100);
+    const b = await puttyButton(app.page);
+    check('hidden when app_info fails', b ? b.shown : 'missing', false);
+    check('no page errors', app.errors, []);
+  });
+  await withApp(browser, server, { replies: WINDOWS }, 'PuTTY import: the button on Windows', async (app) => {
+    await serversView(app.page);
+    await waitVisible(app.page, '#serverPuttyBtn');
+    check('shown on Windows: a ghost button with an icon, next to Config, saying what it does', await puttyButton(app.page),
+      { shown: true, label: 'PuTTY', title: PUTTY_TITLE, afterConfig: true, ghost: true, icon: true });
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyLock(browser, server) {
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: the vault lock', async (app) => {
+    const { page } = app;
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    // The listing is an inventory of hosts, accounts and key paths.
+    await page.evaluate(() => { window.__backend.unlocked = false; return refreshVaultStatus(); });
+    await page.waitForTimeout(150);
+    check('a lock closes the dialog, and nothing of the listing stays behind', await page.evaluate(() => {
+      const m = document.getElementById('puttyImportModal');
+      const list = document.getElementById('puttyImportList');
+      return m && list ? [m.hidden, list.children.length, /backup|prod-web|console/.test(m.textContent)] : null;
+    }), [true, 0, false]);
+    if (await app.open('vaultModal')) await page.click('#vaultCancelBtn');
+    check('locked: the PuTTY button is disabled and says why', await puttyGate(page), [true, PUTTY_LOCKED]);
+    const n = await app.count('putty_list_sessions');
+    await dropToasts(page);
+    await page.evaluate(() => (typeof openPuttyImport === 'function' ? openPuttyImport() : null));
+    await page.waitForTimeout(100);
+    check('locked: nothing is read from PuTTY', await app.count('putty_list_sessions'), n);
+    yes('and the reason is said', (await toasts(page)).includes(PUTTY_LOCKED), JSON.stringify(await toasts(page)));
+    await page.evaluate(() => { window.__backend.unlocked = true; return refreshVaultStatus(); });
+    await page.waitForTimeout(150);
+    check('unlocked again: it works again, with its own title', await puttyGate(page), [false, PUTTY_TITLE]);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyList(browser, server) {
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: the listing', async (app) => {
+    const { page } = app;
+    yes('the PuTTY button opens the import dialog', await openPuttyDialog(page));
+    yes('with sessions that have no username, it opens with the focus in the fill field', await focusIs(page, 'puttyFillInput'));
+    check('the sessions are asked for once, with no arguments', (await app.calls('putty_list_sessions')).map((c) => c.args), [{}]);
+    check('a modal dialog named by its title', await page.evaluate(() => {
+      const d = document.querySelector('#puttyImportModal [role="dialog"]');
+      const h = d && document.getElementById(d.getAttribute('aria-labelledby'));
+      return d ? [d.getAttribute('aria-modal'), h ? h.tagName + ' ' + h.textContent : null] : null;
+    }), ['true', 'H2 Import from PuTTY']);
+    const text = await puttyText(page);
+    yes('it counts the SSH sessions', text.includes('6 SSH sessions in PuTTY'), text);
+    const rows = await puttyRows(page);
+    check('every session is listed, in the order given, its checkbox labelled with its name - spelled out',
+      rows.map((r) => r.name), ['backup', PUTTY_EVIL_SHOWN, 'fa-box', 'mirror', 'prod-web', 'router']);
+    check('ticked unless already in SSHSpan, or its name or host has characters that do not show', rows.map((r) => r.ticked),
+      [true, false, true, false, true, false]);
+    check('the session already in SSHSpan says so, and only it', rows.map((r) => r.text.includes('Already in SSHSpan')),
+      [false, false, false, false, false, true]);
+    check('each username field holds the username itself - none where PuTTY has none, or one that does not show',
+      rows.map((r) => r.user), ['', 'root', '', 'pi', 'deploy', '']);
+    const at = (name) => (rows.find((r) => r.name === name) || {}).text || '';
+    check('a name or a host with characters that do not show is said on its row, and only there', [
+      at(PUTTY_EVIL_SHOWN).includes(HIDDEN.name) && !at(PUTTY_EVIL_SHOWN).includes(HIDDEN.host),
+      at('mirror').includes(HIDDEN.host) && !at('mirror').includes(HIDDEN.name),
+      ['backup', 'fa-box', 'prod-web', 'router'].some((n) => at(n).includes(HIDDEN.name) || at(n).includes(HIDDEN.host)),
+    ], [true, true, false]);
+    check('a username that does not show is not put in the field; its row says so, spelled out', [
+      at('fa-box').includes(HIDDEN.user + PERSIAN_SHOWN),
+      rows.filter((r) => r.text.includes(HIDDEN.user)).map((r) => r.name),
+    ], [true, ['fa-box']]);
+    check('a key path that does not show changes nothing: prod-web stays ticked, its path spelled out',
+      [(rows.find((r) => r.name === 'prod-web') || {}).ticked, at('prod-web').includes('key C:\\keys\\pr<U+202E>od.ppk')], [true, true]);
+    const described = await axOf(page, '#puttyImportList input[aria-label="Username for fa-box"]');
+    yes('the username field there is described by that note', !!described && described.description.includes(HIDDEN.user.trim()),
+      JSON.stringify(described));
+    // Tabbing through the checkboxes, a row's reason to start unticked is heard, not only seen.
+    const boxSaid = async (n) => ((await axOf(page, `#puttyImportList > li:nth-child(${n}) input[type="checkbox"]`)) || {}).description || '';
+    check('each checkbox is described by what its row says - why it starts unticked included', [
+      (await boxSaid(2)).includes(HIDDEN.name), (await boxSaid(4)).includes(HIDDEN.host),
+      (await boxSaid(5)).includes(PUTTY_NOTE.proxy), (await boxSaid(6)).includes('Already in SSHSpan'), await boxSaid(1),
+    ], [true, true, true, true, '']);
+    check('while the username field keeps its own description', [(await axOf(page, '#puttyImportList input[aria-label="Username for prod-web"]') || {}).description],
+      ['']);
+    const named = (role, name) => page.getByRole(role, { name, exact: true }).count();
+    check('assistive tech hears each checkbox by its session, each field as "Username for <name>"', [
+      await named('checkbox', PUTTY_EVIL_SHOWN), await named('checkbox', 'router'),
+      await named('textbox', 'Username for ' + PUTTY_EVIL_SHOWN), await named('textbox', 'Username for fa-box'),
+    ], [1, 1, 1, 1]);
+    check('each row says where it connects and how it signs in', [
+      at('backup').includes('@backup.lan:2222') && at('backup').includes('password'),
+      at(PUTTY_EVIL_SHOWN).includes('@nas.lan:22') && at(PUTTY_EVIL_SHOWN).includes('key D:\\nas.ppk'),
+      at('mirror').includes('@mirror<U+200B>.lan:22'),
+      at('prod-web').includes('@10.0.0.5:22'),
+      at('router').includes('@192.168.1.1:22') && at('router').includes('password'),
+    ], [true, true, true, true, true]);
+    check('what PuTTY does that SSHSpan will not is said, each in words', [
+      [PUTTY_NOTE.portForwarding, PUTTY_NOTE.x11Forwarding].every((n) => at(PUTTY_EVIL_SHOWN).includes(n)),
+      [PUTTY_NOTE.proxy, PUTTY_NOTE.agentForwarding].every((n) => at('prod-web').includes(n)),
+      Object.values(PUTTY_NOTE).some((n) => at('backup').includes(n)),
+    ], [true, true, false]);
+    check('no character that does not show reaches the dialog - its text, attributes or fields', await page.evaluate((hidden) => {
+      const m = document.getElementById('puttyImportModal');
+      if (!m) return null;
+      const said = [m.textContent];
+      for (const n of m.querySelectorAll('*')) for (const a of n.attributes) said.push(a.value);
+      for (const i of m.querySelectorAll('input')) said.push(i.value);
+      return said.some((t) => hidden.some((h) => t.includes(h)));
+    }, [RLO, ZWNJ, ZWSP]), false);
+    const bdis = await page.evaluate(() => [...document.querySelectorAll('#puttyImportModal bdi')].map((b) => b.textContent));
+    yes('names, hosts, user names, key paths and skip reasons are each kept to themselves (<bdi>)', [PUTTY_EVIL_SHOWN,
+      'mirror<U+200B>.lan', 'C:\\keys\\pr<U+202E>od.ppk', PERSIAN_SHOWN, 'console', 'not an SSH session (serial)', 'tel<U+202E>net',
+      'not an SSH session (tel<U+202E>net)'].every((t) => bdis.includes(t)), JSON.stringify(bdis));
+    check('the skipped sessions, collapsed, each with its reason', await page.evaluate(() => {
+      const d = document.querySelector('#puttyImportModal details');
+      if (!d || d.hidden) return null;
+      const s = d.querySelector('summary');
+      return { open: d.open, summary: s ? s.textContent.trim() : null, items: [...d.querySelectorAll('li')].map((li) => li.textContent.trim()) };
+    }), { open: false, summary: '2 other sessions are not SSH sessions or could not be read.',
+      items: ['console: not an SSH session (serial)', 'tel<U+202E>net: not an SSH session (tel<U+202E>net)'] });
+    yes('nothing says the listing was cut off', !text.includes('1,000'), text);
+    check('sessions without a username: a labelled fill field and a Fill button, over the list', await page.evaluate((label) => {
+      const field = [...document.querySelectorAll('#puttyImportModal input')].find((i) => i.labels && [...i.labels].some((l) => l.textContent.trim() === label));
+      const fill = [...document.querySelectorAll('#puttyImportModal button')].find((b) => b.textContent.trim() === 'Fill');
+      const list = document.getElementById('puttyImportList');
+      const shown = (n) => !!n && !n.closest('[hidden]') && n.getClientRects().length > 0;
+      return [shown(field), shown(fill), !!field && !!list && !!(field.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING)];
+    }, PUTTY_FILL_LABEL), [true, true, true]);
+    check('no page errors', app.errors, []);
+  });
+  const named = { sessions: PUTTY_LISTING.sessions.slice(3, 5), skipped: [], truncated: false };
+  await withApp(browser, server, puttyOpts(named), 'PuTTY import: every session has a username', async (app) => {
+    const { page } = app;
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    yes('it opens with the focus on the first session\'s checkbox', await page.waitForFunction(() => {
+      const first = document.querySelector('#puttyImportList > li input[type="checkbox"]');
+      return !!first && document.activeElement === first;
+    }, null, { timeout: 1500, polling: 25 }).then(() => true, () => false));
+    check('then there is nothing to fill: no fill field', await page.evaluate((label) =>
+      [...document.querySelectorAll('#puttyImportModal input')].some((i) => i.labels && [...i.labels].some((l) => l.textContent.trim() === label)
+        && !i.closest('[hidden]') && i.getClientRects().length > 0), PUTTY_FILL_LABEL), false);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyTicks(browser, server) {
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: the ticks', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, {});
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    check('the footer counts the ticked sessions', await puttyFooter(page), { count: '3 selected', label: 'Import 3 servers', disabled: false });
+    await tickPutty(page, 'prod-web', false);
+    await tickPutty(page, 'backup', false);
+    check('and follows the ticks - in the singular too', await puttyFooter(page), { count: '1 selected', label: 'Import 1 server', disabled: false });
+    await tickPutty(page, 'fa-box', false);
+    check('nothing ticked: Import is disabled', await puttyFooter(page), { count: '0 selected', label: 'Import 0 servers', disabled: true });
+    await tickPutty(page, 'router', true);
+    check('a session already in SSHSpan can still be ticked', await puttyFooter(page), { count: '1 selected', label: 'Import 1 server', disabled: false });
+    await tickPutty(page, 'router', false);
+    await tickPutty(page, PUTTY_EVIL_SHOWN, true);
+    check('so can one whose name has characters that do not show', await puttyFooter(page), { count: '1 selected', label: 'Import 1 server', disabled: false });
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyUsernames(browser, server) {
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: missing usernames, and Fill', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, {});
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    // Ticked: backup (no username in PuTTY), fa-box (one that does not show) and prod-web.
+    await clickShown(page, '#puttyImportBtn');
+    await page.waitForTimeout(200);
+    check('ticked sessions without a username stop the import: nothing is saved', await app.count('server_save'), 0);
+    let rows = await puttyRows(page);
+    check('every one of them is marked at once - its message, its field invalid - and no other',
+      rows.map((r) => [r.name, r.text.includes('Type a username for ' + r.name + '.'), r.invalid]),
+      [['backup', true, true], [PUTTY_EVIL_SHOWN, false, false], ['fa-box', true, true], ['mirror', false, false], ['prod-web', false, false], ['router', false, false]]);
+    check('the focus goes to the first one\'s field', await page.evaluate(() => document.activeElement && document.activeElement.getAttribute('aria-label')), 'Username for backup');
+    yes('and the dialog says what to do', (await puttyText(page)).includes('Type a username for each marked session, or use Fill above the list.'), await puttyText(page));
+    check('the dialog stays open', await puttyOpen(page), true);
+    await typeUser(page, 'backup', '   ');
+    await clickShown(page, '#puttyImportBtn');
+    await page.waitForTimeout(200);
+    check('spaces are no username: still nothing saved, still marked', [await app.count('server_save'), ((await puttyRows(page))[0] || {}).invalid], [0, true]);
+    // Fill puts one username in every empty field, ticked or not, and nowhere else.
+    yes('(set-up) a username typed in the fill field, Enter pressed', await fillUsers(page, 'ops', 'enter'));
+    rows = await puttyRows(page);
+    check('Fill puts it in every empty username field - ticked or not - and leaves the others alone', rows.map((r) => r.user),
+      ['ops', 'root', 'ops', 'pi', 'deploy', 'ops']);
+    check('and the rows it filled are no longer marked', rows.map((r) => r.invalid || r.text.includes('Type a username')),
+      [false, false, false, false, false, false]);
+    yes('nor does the dialog still ask for usernames', !(await puttyText(page)).includes('Type a username for each marked session'), await puttyText(page));
+    yes('what a row says about a username that does not show stays', ((rows[2] || {}).text || '').includes(HIDDEN.user + PERSIAN_SHOWN));
+    await typeUser(page, 'backup', '');
+    yes('(set-up) another username typed in the fill field, Fill clicked', await fillUsers(page, 'admin2', 'click'));
+    check('the Fill button does the same: only the empty field takes it', (await puttyRows(page)).map((r) => r.user),
+      ['admin2', 'root', 'ops', 'pi', 'deploy', 'ops']);
+    await typeUser(page, 'prod-web', '');
+    await fillUsers(page, '', 'click');
+    check('an empty fill field fills nothing', ((await puttyRows(page))[4] || {}).user, '');
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyImport(browser, server) {
+  const S = PUTTY_LISTING.sessions;
+  const NOT_HERE = 'This key file is not on this computer' + RLO + '.';
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: the ticked sessions are saved', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, { warnings: { [PUTTY_EVIL]: NOT_HERE, 'prod-web': PASSPHRASE_KEY } });
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    yes('(set-up) usernames filled in', await fillUsers(page, 'ops', 'enter'));
+    // The user types fa-box's username themselves - with its non-joiner.
+    yes('(set-up) fa-box\'s username typed', await typeUser(page, 'fa-box', PERSIAN));
+    yes('(set-up) the session whose name does not show ticked', await tickPutty(page, PUTTY_EVIL_SHOWN, true));
+    const lists = await app.count('server_list');
+    await dropToasts(page);
+    await clickShown(page, '#puttyImportBtn');
+    await dialogClosed(page);
+    check('one server_save per ticked session, in order, with exactly the contract\'s arguments - names, hosts, usernames and key paths as they are',
+      (await app.calls('server_save')).map((c) => sortedKeys(c.args)),
+      [puttySave(S[0], 'ops'), puttySave(S[1], 'root'), puttySave(S[2], PERSIAN), puttySave(S[4], 'deploy')].map(sortedKeys));
+    yes('the server list is read again', (await app.count('server_list')) > lists);
+    check('everything saved: the dialog closes', await puttyOpen(page), false);
+    yes('and the focus returns to the PuTTY button', await focusIs(page, 'serverPuttyBtn'));
+    check('the count in the deploy sheet\'s words, then one warning toast, a line per server, spelled out', await saidToasts(page), [
+      ['ok', '4 server(s) saved under Servers.'],
+      ['warn', PUTTY_EVIL_SHOWN + ': This key file is not on this computer<U+202E>.\nprod-web: ' + PASSPHRASE_KEY],
+    ]);
+    yes('the imported servers are in the list', await page.evaluate(() => ['backup', 'prod-web'].every((n) =>
+      [...document.querySelectorAll('#serverList .server-name')].some((s) => s.textContent === n))));
+    check('no page errors', app.errors, []);
+  });
+  const REFUSED = 'Could not save "prod' + RLO + '-web": the database is busy.';
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: a session that cannot be saved', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, { reject: 'prod-web', error: REFUSED });
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    await fillUsers(page, 'ops', 'enter');
+    const lists = await app.count('server_list');
+    await dropToasts(page);
+    await clickShown(page, '#puttyImportBtn');
+    await savesMade(page, 3);
+    await page.waitForTimeout(250);
+    check('each ticked session was tried, in order', await savedNames(app), ['backup', 'fa-box', 'prod-web']);
+    check('the dialog stays open', await puttyOpen(page), true);
+    const rows = await puttyRows(page);
+    const row = (n) => rows.find((r) => r.name === n) || { text: '' };
+    check('the saved ones are unticked and marked as in SSHSpan', [row('backup'), row('fa-box')].map((r) => [r.ticked, r.text.includes('Already in SSHSpan')]),
+      [[false, true], [false, true]]);
+    const savedBox = await axOf(page, '#puttyImportList > li:nth-child(1) input[type="checkbox"]');
+    yes('and a row saved by the import says so to its checkbox', !!savedBox && savedBox.description.includes('Already in SSHSpan'), JSON.stringify(savedBox));
+    check('the one that failed stays ticked, marked with its error spelled out',
+      [row('prod-web').ticked, row('prod-web').text.includes('Could not save "prod<U+202E>-web": the database is busy.')], [true, true]);
+    yes('the dialog says how many failed', (await puttyText(page)).includes('1 server could not be saved.'), await puttyText(page));
+    check('the footer is left with the one that failed', await puttyFooter(page), { count: '1 selected', label: 'Import 1 server', disabled: false });
+    check('the rows can be changed again once the import is over', await page.evaluate(() => {
+      const inputs = [...document.querySelectorAll('#puttyImportList input')];
+      const usable = (id) => { const n = document.getElementById(id); return !!n && !n.disabled; };
+      return [inputs.length > 0 && inputs.every((i) => !i.disabled), usable('puttyFillInput'), usable('puttyFillBtn')];
+    }), [true, true, true]);
+    check('the ones saved are reported', await saidToasts(page), [['ok', '2 server(s) saved under Servers.']]);
+    yes('and the server list is read again', (await app.count('server_list')) > lists);
+    await stubPuttySaves(page, {});
+    await clickShown(page, '#puttyImportBtn');
+    await dialogClosed(page);
+    check('the next import saves the one left, and only it', (await savedNames(app)).slice(3), ['prod-web']);
+    check('then the dialog closes', await puttyOpen(page), false);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyFixed(browser, server) {
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: the rows are fixed while it saves', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, { hold: 'backup' });
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    await fillUsers(page, 'ops', 'enter');
+    await clickShown(page, '#puttyImportBtn');
+    await savesMade(page, 1);
+    check('while it saves, every checkbox and username field and the fill control are disabled, and Import is busy', await page.evaluate(() => {
+      const inputs = [...document.querySelectorAll('#puttyImportList input')];
+      const fill = [document.getElementById('puttyFillInput'), document.getElementById('puttyFillBtn')];
+      return [inputs.length > 0 && inputs.every((i) => i.disabled), fill.every((n) => !!n && n.disabled),
+        document.getElementById('puttyImportBtn').getAttribute('aria-busy')];
+    }), [true, true, 'true']);
+    // What a script can still change under the disabled controls is not what is saved.
+    await page.evaluate(() => {
+      const user = document.querySelector('#puttyImportList input[aria-label="Username for prod-web"]');
+      if (user) user.value = 'changed';
+      const box = [...document.querySelectorAll('#puttyImportList input[type="checkbox"]')].find((b) => b.labels[0].textContent.trim() === 'fa-box');
+      if (box) box.checked = false;
+    });
+    await releaseSave(page);
+    await dialogClosed(page);
+    check('what is saved is what the rows said when Import was clicked', (await app.calls('server_save')).map((c) => [c.args.name, c.args.username]),
+      [['backup', 'ops'], ['fa-box', 'ops'], ['prod-web', 'deploy']]);
+    check('no page errors', app.errors, []);
+  });
+}
+
+/// Every toast that names something from the listing: a session, a host or a
+/// key path - or lists the failed ones.
+const NAMED = ['backup', 'fa-box', 'prod-web', 'mirror', 'evil', '.lan', '10.0.0.5', 'C:\\', 'Not saved as servers'];
+const naming = (said) => said.filter(([, t]) => NAMED.some((n) => t.includes(n))).map(([, t]) => t);
+
+async function scenarioPuttyStop(browser, server) {
+  const DISK = 'Could not save "backup": the disk is full.';
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: closing the dialog stops it', async (app) => {
+    const { page } = app;
+    // backup fails, fa-box is still saving when the dialog closes, prod-web is next.
+    await stubPuttySaves(page, { reject: 'backup', error: DISK, hold: 'fa-box' });
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    await fillUsers(page, 'ops', 'enter');
+    await dropToasts(page);
+    await clickShown(page, '#puttyImportBtn');
+    await savesMade(page, 2);
+    await page.keyboard.press('Escape');
+    check('(set-up) Escape closes the dialog while a save is still running', await puttyOpen(page), false);
+    const lists = await app.count('putty_list_sessions');
+    await dropToasts(page);
+    await clickShown(page, '#serverPuttyBtn');
+    await page.waitForTimeout(150);
+    check('the PuTTY button does not list again while the import is finishing, and says so',
+      [await app.count('putty_list_sessions'), await puttyOpen(page), await saidToasts(page)],
+      [lists, false, [['info', 'The PuTTY import is still finishing.']]]);
+    await dropToasts(page);
+    await releaseSave(page);
+    await page.waitForTimeout(300);
+    check('the import stops before its next save: prod-web is not saved', await savedNames(app), ['backup', 'fa-box']);
+    check('it says what was saved, what failed (named - the vault is unlocked), and how many were not imported', await saidToasts(page), [
+      ['ok', '1 server(s) saved under Servers.'],
+      ['err', 'Not saved as servers:\nbackup: ' + DISK],
+      ['info', 'The PuTTY import stopped when its dialog was closed: 2 sessions were not imported.'],
+    ]);
+    await clickShown(page, '#serverPuttyBtn');
+    yes('once it has finished, the PuTTY button lists again', await waitVisible(page, '#puttyImportModal'));
+    check('reading PuTTY again', await app.count('putty_list_sessions'), lists + 1);
+    check('no page errors', app.errors, []);
+  });
+  // Locked from the tray or the watchdog: the vault is locked before the dialog closes.
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: a vault lock stops it, and says no name', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, { reject: 'backup', error: DISK, hold: 'fa-box', warnings: { 'fa-box': PASSPHRASE_KEY } });
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    await fillUsers(page, 'ops', 'enter');
+    await dropToasts(page);
+    await clickShown(page, '#puttyImportBtn');
+    await savesMade(page, 2);
+    await page.evaluate(() => { window.__backend.unlocked = false; return refreshVaultStatus(); });
+    await page.waitForTimeout(150);
+    check('(set-up) the lock closed the dialog', await puttyOpen(page), false);
+    await releaseSave(page);
+    await page.waitForTimeout(300);
+    check('the import stops before its next save', await savedNames(app), ['backup', 'fa-box']);
+    const said = await saidToasts(page);
+    check('it says how many were saved and how many not - counts only', said.filter(([k]) => k !== 'err'), [
+      ['ok', '1 server(s) saved under Servers.'],
+      ['warn', '1 saved server has a warning about its key file - save it again under Servers to see it.'],
+      ['info', 'The vault was locked, so 2 sessions from PuTTY were not imported.'],
+    ]);
+    check('no toast names a session, host, username or key path, and none lists failures', [naming(said), said.filter(([k]) => k === 'err')], [[], []]);
+    check('no page errors', app.errors, []);
+  });
+  // Lock now: the dialog is closed for the lock before the vault reads as locked.
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: Lock now while it saves', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, { reject: 'backup', error: DISK, hold: 'fa-box', warnings: { 'fa-box': PASSPHRASE_KEY } });
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    await fillUsers(page, 'ops', 'enter');
+    await dropToasts(page);
+    await clickShown(page, '#puttyImportBtn');
+    await savesMade(page, 2);
+    await hold(page, 'vault_lock');
+    await page.evaluate(() => { window.__locking = lockNow(); });
+    await page.waitForTimeout(100);
+    check('(set-up) the dialog is closed for the lock while the vault still reads as unlocked',
+      [await puttyOpen(page), await page.evaluate(() => state.unlocked)], [false, true]);
+    await releaseSave(page);
+    await page.waitForTimeout(300);
+    check('the import stops before its next save', await savedNames(app), ['backup', 'fa-box']);
+    const said = await saidToasts(page);
+    check('it says counts only', said, [
+      ['ok', '1 server(s) saved under Servers.'],
+      ['warn', '1 saved server has a warning about its key file - save it again under Servers to see it.'],
+      ['info', 'The vault was locked, so 2 sessions from PuTTY were not imported.'],
+    ]);
+    check('no toast names anything from the listing', naming(said), []);
+    await letGo(page, 'vault_lock');
+    await page.evaluate(() => window.__locking);
+    check('no page errors', app.errors, []);
+  });
+  // Escape first, then Lock now: the dialog is already closed, so the lock
+  // finds no dialog to close - it must still reach the import.
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: Lock now after the dialog was closed', async (app) => {
+    const { page } = app;
+    await stubPuttySaves(page, { reject: 'backup', error: DISK, hold: 'fa-box' });
+    yes('(set-up) the dialog opens', await openPuttyDialog(page));
+    await fillUsers(page, 'ops', 'enter');
+    await dropToasts(page);
+    await clickShown(page, '#puttyImportBtn');
+    await savesMade(page, 2);
+    await page.keyboard.press('Escape');
+    check('(set-up) Escape closed the dialog while fa-box is still saving', await puttyOpen(page), false);
+    await hold(page, 'vault_lock');
+    await page.evaluate(() => { window.__locking = lockNow(); });
+    await page.waitForTimeout(100);
+    check('(set-up) Lock now is under way and the vault still reads as unlocked', await page.evaluate(() => state.unlocked), true);
+    await releaseSave(page);
+    await page.waitForTimeout(300);
+    check('the import stops before its next save', await savedNames(app), ['backup', 'fa-box']);
+    const said = await saidToasts(page);
+    check('it says counts only - not the failure by name', said, [
+      ['ok', '1 server(s) saved under Servers.'],
+      ['info', 'The vault was locked, so 2 sessions from PuTTY were not imported.'],
+    ]);
+    check('no toast names anything from the listing', naming(said), []);
+    await letGo(page, 'vault_lock');
+    await page.evaluate(() => window.__locking);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyKeyboard(browser, server) {
+  await withApp(browser, server, puttyOpts(), 'PuTTY import: the dialog and the keyboard', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    await waitVisible(page, '#serverPuttyBtn');
+    await page.focus('#serverPuttyBtn', { timeout: 1000 }).catch(() => {});
+    await page.keyboard.press('Enter');
+    yes('Enter on the PuTTY button opens the dialog', await waitVisible(page, '#puttyImportModal'));
+    yes('the focus moves into it', await page.waitForFunction(() => {
+      const m = document.getElementById('puttyImportModal');
+      return !!m && !m.hidden && m.contains(document.activeElement);
+    }, null, { timeout: 1500, polling: 25 }).then(() => true, () => false));
+    await page.focus('#puttyImportBtn', { timeout: 1000 }).catch(() => {});
+    await page.keyboard.press('Tab');
+    yes('Tab from its last control stays inside', await page.evaluate(() => {
+      const m = document.getElementById('puttyImportModal');
+      return !!m && m.contains(document.activeElement);
+    }));
+    await page.keyboard.press('Shift+Tab');
+    check('and Shift+Tab goes back round to the last', await page.evaluate(() => document.activeElement && document.activeElement.id), 'puttyImportBtn');
+    await page.keyboard.press('Escape');
+    check('Escape closes it', await puttyOpen(page), false);
+    yes('and the focus returns to the PuTTY button', await focusIs(page, 'serverPuttyBtn'));
+    await page.keyboard.press('Enter');
+    yes('(set-up) open again', await waitVisible(page, '#puttyImportModal'));
+    await page.locator('#puttyImportModal').getByRole('button', { name: 'Cancel', exact: true }).click({ timeout: 1000 }).catch(() => {});
+    check('Cancel closes it', await puttyOpen(page), false);
+    yes('and the focus returns to the PuTTY button', await focusIs(page, 'serverPuttyBtn'));
+    check('nothing was saved', await app.count('server_save'), 0);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyEmpty(browser, server) {
+  const EMPTY = { sessions: [], skipped: [{ name: 'console', reason: 'not an SSH session (serial)' }, { name: 'tty', reason: 'not an SSH session (raw)' }], truncated: false };
+  await withApp(browser, server, puttyOpts(EMPTY), 'PuTTY import: nothing to import', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    await waitVisible(page, '#serverPuttyBtn');
+    const ask = async (listing) => {
+      await dropToasts(page);
+      await page.evaluate((l) => { window.__replies.putty_list_sessions = l; }, listing);
+      await clickShown(page, '#serverPuttyBtn');
+      await page.waitForTimeout(200);
+      return [await saidToasts(page), await puttyOpen(page)];
+    };
+    check('no SSH session: an info toast says so, and how many others there are - and no dialog', await ask(EMPTY),
+      [[['info', 'No SSH sessions are saved in PuTTY. 2 other sessions are not SSH sessions or could not be read.']], false]);
+    check('one other, in the singular', await ask({ sessions: [], skipped: [{ name: 'tty', reason: 'no host name' }], truncated: false }),
+      [[['info', 'No SSH sessions are saved in PuTTY. 1 other session is not an SSH session or could not be read.']], false]);
+    check('none at all', await ask({ sessions: [], skipped: [], truncated: false }), [[['info', 'No SSH sessions are saved in PuTTY.']], false]);
+    const OFF = 'PuTTY\'s saved sessions are read from the Windows registry, so this works on Windows only.';
+    check('a refusal is said in the backend\'s words, and no dialog opens', await ask({ $reject: OFF }), [[['err', OFF]], false]);
+    check('no page errors', app.errors, []);
+  });
+}
+
+async function scenarioPuttyLayout(browser, server) {
+  const many = {
+    sessions: Array.from({ length: 40 }, (_, i) => ({
+      name: 'host-' + String(i + 1).padStart(2, '0'), host: '10.1.0.' + (i + 1), port: 22, username: i % 3 ? 'ops' : null,
+      keyFile: i % 2 ? 'C:\\Users\\ops\\keys\\host-' + (i + 1) + '.ppk' : null, authMethod: i % 2 ? 'publickey' : 'password',
+      notes: i % 5 ? [] : ['proxy'], alreadySaved: i % 7 === 0,
+    })),
+    skipped: [{ name: 'console', reason: 'not an SSH session (serial)' }],
+    truncated: true,
+  };
+  await withApp(browser, server, puttyOpts(many), 'PuTTY import: the dialog at 880x560', async (app) => {
+    const { page } = app;
+    await page.setViewportSize({ width: 880, height: 560 });
+    await serversView(page);
+    await waitVisible(page, '#serverPuttyBtn');
+    check('the server list head keeps every button whole and inside the column, PuTTY beside Config', await page.evaluate(() => {
+      const head = document.querySelector('.server-list-head').getBoundingClientRect();
+      const shown = [...document.querySelectorAll('.server-list-head button')].filter((b) => b.getClientRects().length);
+      const clipped = shown.filter((b) => {
+        const r = b.getBoundingClientRect();
+        return r.left < head.left - 0.5 || r.right > head.right + 0.5 || b.scrollWidth > b.clientWidth + 1;
+      }).map((b) => b.id || b.className);
+      const top = (id) => { const n = document.getElementById(id); return n && n.getClientRects().length ? Math.round(n.getBoundingClientRect().top) : null; };
+      return { clipped, besideConfig: top('serverPuttyBtn') !== null && top('serverPuttyBtn') === top('serverImportBtn') };
+    }), { clipped: [], besideConfig: true });
+    yes('(set-up) the dialog opens', (await clickShown(page, '#serverPuttyBtn')) && await waitVisible(page, '#puttyImportModal'));
+    yes('a listing cut off at 1,000 sessions says so', (await puttyText(page)).includes('Only the first 1,000 sessions saved in PuTTY are listed.'), await puttyText(page));
+    const fit = () => page.evaluate(() => {
+      const list = document.getElementById('puttyImportList');
+      const btn = document.getElementById('puttyImportBtn');
+      const head = document.querySelector('#puttyImportModal .modal-header');
+      const fill = document.getElementById('puttyFillBtn');
+      if (!list || !btn || !head || !fill) return null;
+      const b = btn.getBoundingClientRect();
+      const h = head.getBoundingClientRect();
+      const f = fill.getBoundingClientRect();
+      return {
+        scrolls: list.scrollHeight > list.clientHeight + 1, tall: list.clientHeight >= 100, header: h.top >= 0,
+        footer: b.top >= 0 && b.bottom <= innerHeight, fill: f.width > 0 && f.top >= h.bottom && f.bottom <= list.getBoundingClientRect().top,
+      };
+    });
+    const whole = { scrolls: true, tall: true, header: true, footer: true, fill: true };
+    check('the list scrolls inside the dialog; the header, the fill control and the footer stay on screen', await fit(), whole);
+    await page.evaluate(() => { const l = document.getElementById('puttyImportList'); if (l) l.scrollTop = l.scrollHeight; });
+    check('scrolled to its end, they are all still there', await fit(), whole);
+    check('no page errors', app.errors, []);
+  });
+}
+
 // ─── runner ─────────────────────────────────────────────────────────────────
 
 const SCENARIOS = [
@@ -3847,6 +4568,17 @@ const SCENARIOS = [
   ['new server in a filtered list (A5-42 J5)', scenarioServerNewInFilter],
   ['server save warning (R10 J6)', scenarioServerSaveWarning],
   ['bitwarden texts spelled out (J7)', scenarioBwSpelled],
+  ['PuTTY import: the button, on Windows only', scenarioPuttyButton],
+  ['PuTTY import: the vault lock', scenarioPuttyLock],
+  ['PuTTY import: the listing, spelled out', scenarioPuttyList],
+  ['PuTTY import: the ticks', scenarioPuttyTicks],
+  ['PuTTY import: missing usernames and Fill', scenarioPuttyUsernames],
+  ['PuTTY import: saving the ticked sessions', scenarioPuttyImport],
+  ['PuTTY import: the rows are fixed while it saves', scenarioPuttyFixed],
+  ['PuTTY import: closing or a lock stops it', scenarioPuttyStop],
+  ['PuTTY import: the keyboard', scenarioPuttyKeyboard],
+  ['PuTTY import: nothing to import', scenarioPuttyEmpty],
+  ['PuTTY import: the dialog at the smallest window', scenarioPuttyLayout],
 ];
 
 (async () => {

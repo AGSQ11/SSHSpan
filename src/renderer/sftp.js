@@ -951,7 +951,8 @@ function sftpInText(text) {
 /// remote one: a download keeps the name the server gave it. A Windows path -
 /// backslashes and no forward slash, the way joinPlatformPath (app.js) tells
 /// one - is taken apart at its backslashes, so a folder in it of look-alike
-/// dots, or padded with spaces, is spelled out there too.
+/// dots, or padded with spaces, is spelled out there too. The empty parts of a
+/// drive root or a UNC path stay empty: sftpSpellName leaves "" as it is.
 function sftpSpellLocal(path) {
   const p = String(path == null ? '' : path);
   return p.includes('\\') && !p.includes('/') ? p.split('\\').map(sftpSpellName).join('\\') : sftpSpell(p);
@@ -4236,13 +4237,14 @@ function wireQueueEvents() {
       queueJobs.set(j.id, j);
       // Mirror failures into the tab's log + status strip, once per failure
       // (a retried job that fails again is logged again). The path is spelled
-      // out as the listing spells it, the backend's reason as its other texts
-      // are (spellOut, app.js).
+      // out as the listing spells it - a job with no remote path is named by
+      // its local one, name by name too (sftpLocalInText) - and the backend's
+      // reason as its other texts are (spellOut, app.js).
       if (j.state !== 'failed') { sftpQueueLoggedFailures.delete(j.id); continue; }
       if (sftpQueueLoggedFailures.has(j.id)) continue;
       sftpQueueLoggedFailures.add(j.id);
       const tab = [...state.sessions.values()].find(t => t.sessionId === j.sessionId);
-      if (tab) sftpLog(tab.tabId, `transfer failed: ${sftpInText(j.remotePath || j.localPath)} - ${spellOut(j.error || 'error')}`);
+      if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath ? sftpInText(j.remotePath) : sftpLocalInText(j.localPath)} - ${spellOut(j.error || 'error')}`);
     }
     renderQueuePanel();
   }).then(() => {
