@@ -202,6 +202,9 @@
                 <input type="search" id="serverSearch" placeholder="Search servers..." />
               </div>
               <button id="serverImportBtn" class="ghost-btn" title="Import a Host block from ~/.ssh/config" aria-haspopup="menu" aria-expanded="false"><span data-ico="file-text"></span>Config</button>
+              <!-- Windows only (app.js shows it once app_info names the
+                   platform): PuTTY keeps its sessions in the Windows registry. -->
+              <button id="serverPuttyBtn" class="ghost-btn" title="Import the sessions saved in PuTTY" hidden><span data-ico="terminal"></span>PuTTY</button>
               <button id="serverNewBtn" class="primary-btn" title="New server"><span data-ico="plus"></span>New</button>
               <button id="serverCatDrawerBtn" class="ghost-btn cat-drawer-btn" type="button" aria-controls="catPanel" aria-expanded="false" aria-label="Categories" title="Server categories"><span data-ico="folder"></span></button>
             </div>
@@ -948,6 +951,45 @@
       <footer class="modal-footer">
         <button data-close class="ghost-btn">Cancel</button>
         <button id="srvSaveBtn" class="primary-btn">Save</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal: import the SSH sessions saved in PuTTY (Windows). Filled with
+       text and <bdi> only (app.js fillPuttyDialog): every name, host, user
+       name, key path and reason in it comes from the registry, which any
+       program can write. -->
+  <div class="modal-backdrop" id="puttyImportModal" hidden>
+    <div class="modal putty-modal" role="dialog" aria-modal="true" aria-labelledby="puttyImportTitle">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="terminal"></span>
+          <h2 id="puttyImportTitle">Import from PuTTY</h2>
+        </div>
+        <button class="icon-btn" data-close title="Close" aria-label="Close" data-ico-x=""></button>
+      </header>
+      <div class="modal-body putty-body">
+        <p id="puttyImportSummary"></p>
+        <details class="putty-skipped" id="puttyImportSkipped" hidden>
+          <summary id="puttyImportSkippedSummary"></summary>
+          <ul id="puttyImportSkippedList"></ul>
+        </details>
+        <p class="hint" id="puttyImportTruncated" hidden>Only the first 1,000 sessions saved in PuTTY are listed.</p>
+        <!-- Shown when a session comes without a username, as most do: PuTTY
+             saves none unless it is told to. Enter in the field fills too. -->
+        <div class="putty-fill" id="puttyFill" hidden>
+          <label for="puttyFillInput">Username for the sessions without one</label>
+          <input type="text" id="puttyFillInput" spellcheck="false" autocomplete="off" />
+          <button type="button" id="puttyFillBtn" class="ghost-btn" title="Put this username in every empty username field">Fill</button>
+        </div>
+        <ul class="putty-list" id="puttyImportList" aria-labelledby="puttyImportSummary"></ul>
+        <p class="field-error" id="puttyImportMsg" role="alert" hidden></p>
+      </div>
+      <footer class="modal-footer">
+        <span class="hint" id="puttyImportCount"></span>
+        <span class="spacer"></span>
+        <button data-close class="ghost-btn">Cancel</button>
+        <button id="puttyImportBtn" class="primary-btn"><span id="puttyImportBtnLabel">Import</span></button>
       </footer>
     </div>
   </div>
