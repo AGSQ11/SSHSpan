@@ -511,7 +511,9 @@ still read as `..`). The listing flags such a name, and the name `~` (it can rea
 folder), with a "!" and says why on hover; single-character emoji, symbols and punctuation are
 visible content and are not flagged (an emoji written with a variation selector or a zero-width
 joiner is spelled out and flagged). Inside a sentence a name is kept in its own text-direction
-isolate. A file
+isolate. A text field that edits a name or a path (Rename's, the remote path bar's while it is typed
+in, the local pane's path field, Move to...'s and a new bookmark's) holds it as it is, since that is
+what is renamed, opened or saved. A file
 dropped onto a remote folder with a flagged name, from the OS or from the local pane, asks first,
 and a move says which folder it goes into and which folder that is in. So a hostile name cannot pass
 for the parent folder, reorder the words of a question or add lines to it. The backend's own texts
