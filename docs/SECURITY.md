@@ -1,9 +1,13 @@
 # SSHSpan security model
 
 **Last updated:** 2026-10-25  
-**Status:** describes v1.10.0; checked against committed source at `6c19b1b`, the
-release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since. It
-also describes the PuTTY session import, which is not released yet (Unreleased in the CHANGELOG)  
+**Status:** describes v1.10.0 and the PuTTY session import, which is not released yet (Unreleased
+in the CHANGELOG). The passages about the import - in [Vault lock and locked-state
+policy](#vault-lock-and-locked-state-policy) the sentence on an import a lock stops and the bullet
+on the two listings of hosts, the PuTTY session import section, and the accepted limitation on how
+the server list shows names - are checked against committed source at `a75b533`; the
+release-signing and Windows CI passages against `38e586e`; everything else against `6c19b1b`, and
+nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -230,10 +234,11 @@ Locked state protects integrity as well as secret reads, but only where security
 
 - key/category mutations, audit clearing, known-host forgetting, MCP server removal/tool state,
   the Bitwarden "Allow syncing..." question, and sealed-data writes refuse while locked;
-- both listings that read hosts and accounts from outside the vault - the hosts of the user's own
-  ssh config (`ssh_config_list_hosts`) and PuTTY's saved sessions (`putty_list_sessions`) - refuse
-  while locked, before the file or the registry is read: each is an inventory of hosts, accounts
-  and key paths;
+- both listings that read hosts and accounts from outside the vault, each an inventory of hosts,
+  accounts and key paths, refuse while locked: the hosts of the user's own ssh config
+  (`ssh_config_list_hosts`) and PuTTY's saved sessions (`putty_list_sessions`). Each checks the
+  lock before the file or the registry is read: `require_unlocked` is the first step of
+  `ssh_config_hosts_in` and of `putty_sessions_in`;
 - `autoLockMinutes`, `confirmDelete`, `autoUpdateCheck`, and `confirmMultiLinePaste` cannot change
   while locked;
 - harmless display, terminal, and file-browser preferences remain editable while locked. This is
