@@ -7,6 +7,7 @@ pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod putty_sessions;
 pub mod sftp;
 pub mod ssh;
 pub mod ssh_client;
@@ -184,6 +185,9 @@ pub fn run() {
             // Saved server CRUD
             server_list,
             server_save,
+            // PuTTY's saved sessions, to save as servers (Windows; refused
+            // elsewhere with a message saying so)
+            putty_list_sessions,
             server_delete,
             // Connect / interactive SSH terminal
             terminal_connect,
