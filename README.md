@@ -334,6 +334,17 @@ two shots no longer match a view you can navigate to.
 - **Config import** reads your own `~/.ssh/config` (read-only, one level of `Include`, patterns
   and `Match` blocks skipped) and names the file it read; the host you pick prefills the server
   form, and that form's Save saves it.
+- **PuTTY import** (Windows) - the PuTTY button lists the SSH sessions saved in PuTTY (up to
+  1,000) with their name, host, port, username and key file, each with a checkbox. A session
+  already saved as a server is marked "Already in SSHSpan" and starts unticked, and so does a
+  session whose name or host has characters that do not show (they are spelled out, like
+  `<U+202E>`). A username PuTTY does not have is typed in the session's username field, or put in
+  every empty one with Fill. Import saves the ticked sessions one at a time with the server
+  dialog's save, so the key-file rules and warnings below apply. A proxy or jump host (SSHSpan
+  connects directly), port forwarding, agent forwarding and X11 forwarding are not imported, and
+  the row says so; sessions that cannot be imported (another protocol, no host name, ...) are
+  listed with the reason. It reads PuTTY's settings without changing them, never opens a key file
+  while listing, and is refused while the vault is locked.
 - **Key files** - a server can sign in with a key file (a `.pem` path) instead of a vault key.
   SSHSpan cannot ask for a passphrase while connecting, so a key file protected by one (OpenSSH,
   PKCS#8, traditional PEM or PuTTY) is refused at connect with "This key file is protected by a
@@ -341,7 +352,9 @@ two shots no longer match a view you can navigate to.
   (New key > Import asks for the passphrase) and choose that key for the server, or remove the
   passphrase from the file. Saving such a server saves it all the same, and the answer to the save
   carries the same advice as a warning, which the server dialog (the Config import only prefills
-  it) and the deploy's "Also save these as servers" show. On Windows SSHSpan reads a key file only
+  it), the deploy's "Also save these as servers" and the PuTTY import show (the last two in one
+  toast with the server's name on each line; after a vault lock the PuTTY import only says how
+  many). On Windows SSHSpan reads a key file only
   from this computer's drives: a path like `C:\...` (a mapped drive too) is read; any other
   spelling - a network or device path (`\\server\share\...` and the like), another prefix or a
   relative path (`key`, `D:key`) - is never opened. Saving such a server saves it and
