@@ -4,10 +4,13 @@
 //! delegated to the audited `ssh-key` crate (RustCrypto) rather than
 //! hand-rolled wire-format encoding, so RSA/ECDSA/Ed25519 keys this app
 //! produces are byte-correct and parseable by real `ssh-keygen`/OpenSSH.
+//! ECDSA generation is the exception: the RustCrypto `p256`/`p384`/`p521`
+//! crates make the key and [`ecdsa_keypair`] hands it to `ssh-key` (its doc
+//! says why).
 //! PKCS#8 and PuTTY PPK export still need custom encoding since `ssh-key`
 //! doesn't cover those; that logic lives here and in `crypto::putty`.
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::utils::{generate_random_vec, ssh_fingerprint_md5, ssh_fingerprint_sha256};
 use base64ct::{Base64, Encoding};
@@ -261,6 +264,8 @@ pub fn generate_key_pair(
     bits: Option<u32>,
     comment: String,
 ) -> anyhow::Result<PrivateKeyData> {
+    use p256::elliptic_curve::{sec1::ToSec1Point as _, Generate as _};
+
     let mut rng = OsRng;
     let comment = sanitize_key_comment(&comment);
 
@@ -270,15 +275,34 @@ pub fn generate_key_pair(
             KeypairData::Rsa(RsaKeypair::random(&mut rng, bits).map_err(|e| anyhow::anyhow!(e))?)
         }
         KeyType::Ed25519 => KeypairData::Ed25519(Ed25519Keypair::random(&mut rng)),
-        KeyType::EcdsaP256 => KeypairData::Ecdsa(
-            EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP256).map_err(|e| anyhow::anyhow!(e))?,
-        ),
-        KeyType::EcdsaP384 => KeypairData::Ecdsa(
-            EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP384).map_err(|e| anyhow::anyhow!(e))?,
-        ),
-        KeyType::EcdsaP521 => KeypairData::Ecdsa(
-            EcdsaKeypair::random(&mut rng, EcdsaCurve::NistP521).map_err(|e| anyhow::anyhow!(e))?,
-        ),
+        // ECDSA: the scalar comes from `NonZeroScalar`, because `SecretKey`'s
+        // own generator can (however unlikely) return zero; the point is
+        // uncompressed, as OpenSSH requires; the scalar is at the curve's full
+        // width, as `ecdsa_keypair` expects.
+        KeyType::EcdsaP256 => {
+            let nonzero = p256::NonZeroScalar::try_generate().map_err(|e| anyhow::anyhow!(e))?;
+            let sk = p256::SecretKey::from(nonzero);
+            let public = sk.public_key().to_sec1_point(false);
+            let scalar = Zeroizing::new(sk.to_bytes());
+            let keypair = ecdsa_keypair(EcdsaCurve::NistP256, public.as_bytes(), &scalar)?;
+            KeypairData::Ecdsa(keypair)
+        }
+        KeyType::EcdsaP384 => {
+            let nonzero = p384::NonZeroScalar::try_generate().map_err(|e| anyhow::anyhow!(e))?;
+            let sk = p384::SecretKey::from(nonzero);
+            let public = sk.public_key().to_sec1_point(false);
+            let scalar = Zeroizing::new(sk.to_bytes());
+            let keypair = ecdsa_keypair(EcdsaCurve::NistP384, public.as_bytes(), &scalar)?;
+            KeypairData::Ecdsa(keypair)
+        }
+        KeyType::EcdsaP521 => {
+            let nonzero = p521::NonZeroScalar::try_generate().map_err(|e| anyhow::anyhow!(e))?;
+            let sk = p521::SecretKey::from(nonzero);
+            let public = sk.public_key().to_sec1_point(false);
+            let scalar = Zeroizing::new(sk.to_bytes());
+            let keypair = ecdsa_keypair(EcdsaCurve::NistP521, public.as_bytes(), &scalar)?;
+            KeypairData::Ecdsa(keypair)
+        }
     };
 
     let private_key =
@@ -299,6 +323,46 @@ pub fn generate_key_pair(
         public_bytes,
         comment,
     ))
+}
+
+/// Assemble `ssh-key`'s [`EcdsaKeypair`] from a SEC1 public point and the
+/// private scalar as big-endian bytes at the curve's full width (32, 48 or 66).
+///
+/// `ssh-key` 0.6 makes ECDSA keys itself (`EcdsaKeypair::random`, and
+/// `EcdsaPrivateKey`'s `From<p256::SecretKey>`) only with its p256/p384/p521
+/// features, which pull in elliptic-curve 0.13 and with it crypto-bigint 0.5:
+/// secret-dependent timing (RUSTSEC-2026-0387), fixed only from crypto-bigint
+/// 0.7.6. Those features are off (Cargo.toml) - `EcdsaKeypair::random` and
+/// `PrivateKey::random` still compile, but fail for ECDSA - so the curve
+/// arithmetic is done by p256/p384/p521 0.14, and the key reaches `ssh-key`
+/// through its wire-format decoder: the curve name, Q and d as three strings,
+/// the order an OpenSSH private key stores them in. The decoder takes the
+/// bytes as they are: it checks neither that the point is on the curve nor
+/// that the scalar is in range and belongs to the point.
+pub(crate) fn ecdsa_keypair(
+    curve: EcdsaCurve,
+    public_sec1: &[u8],
+    scalar: &[u8],
+) -> anyhow::Result<EcdsaKeypair> {
+    use ssh_encoding::{Decode as _, Encode as _};
+
+    let name = curve.as_str();
+    // Sized up front: the buffer holds the scalar, and growing it would leave
+    // a copy behind that is never zeroized.
+    let mut wire = Zeroizing::new(Vec::with_capacity(
+        12 + name.len() + public_sec1.len() + scalar.len(),
+    ));
+    for field in [name.as_bytes(), public_sec1, scalar] {
+        field.encode(&mut *wire).map_err(|e| anyhow::anyhow!(e))?;
+    }
+
+    let mut reader = wire.as_slice();
+    let keypair = EcdsaKeypair::decode(&mut reader)
+        .map_err(|e| anyhow::anyhow!("Invalid {name} key: {e}"))?;
+    // The decoder reads the scalar's first 32/48/66 bytes and leaves any
+    // more unread rather than failing.
+    anyhow::ensure!(reader.is_empty(), "The {name} private scalar is too long");
+    Ok(keypair)
 }
 
 /// Import a key from an OpenSSH-formatted PEM private key (`-----BEGIN
@@ -746,6 +810,29 @@ mod tests {
                 format!("RSA key size must be between 2048 and 8192 bits (got {bad}).")
             );
         }
+    }
+
+    // ── RUSTSEC-2026-0387: ECDSA keys reach ssh-key through its wire decoder ──
+
+    #[test]
+    fn ecdsa_keypair_keeps_the_bytes_and_refuses_other_widths() {
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+
+        let sk = p256::SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let point = sk.public_key().to_sec1_point(false);
+        let scalar = sk.to_bytes();
+
+        let keypair = ecdsa_keypair(EcdsaCurve::NistP256, point.as_bytes(), &scalar).unwrap();
+        assert_eq!(keypair.public_key_bytes(), point.as_bytes());
+        assert_eq!(keypair.private_key_bytes(), &scalar[..]);
+
+        // Left to the decoder, a longer scalar would lose its last bytes.
+        let long = [&scalar[..], &[0, 0]].concat();
+        let err = ecdsa_keypair(EcdsaCurve::NistP256, point.as_bytes(), &long).unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
+        assert!(ecdsa_keypair(EcdsaCurve::NistP256, point.as_bytes(), &scalar[1..]).is_err());
+        // A P-256 point under the P-384 name.
+        assert!(ecdsa_keypair(EcdsaCurve::NistP384, point.as_bytes(), &scalar).is_err());
     }
 
     // ── A7-03 / A5-39 / R9: the import error names what was pasted ──

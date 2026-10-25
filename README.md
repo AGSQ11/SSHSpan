@@ -274,7 +274,8 @@ two shots no longer match a view you can navigate to.
 
 ### Keys
 - **Generate** - RSA (the dialog offers 3072, 4096 and 8192 bits; the backend accepts
-  2048-8192), Ed25519, ECDSA (nistp256/384/521), via the audited `ssh-key` Rust crate.
+  2048-8192), Ed25519, ECDSA (nistp256/384/521), via the audited RustCrypto crates (`ssh-key`,
+  and `p256`/`p384`/`p521` for ECDSA).
 - **Import** - browse or paste an **OpenSSH private key** (passphrase-protected too) or a
   **PuTTY `.ppk`** (v3 and legacy v2, passphrase-protected too). Nothing else is imported:
   PKCS#1/SEC1/PKCS#8 PEM, public keys and `authorized_keys` lines are refused with a message

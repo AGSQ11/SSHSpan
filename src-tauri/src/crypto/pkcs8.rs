@@ -109,9 +109,11 @@ fn rsa_public_to_spki(pub_key: &ssh_key::public::RsaPublicKey) -> anyhow::Result
 }
 
 // ─── ECDSA (P-256 / P-384 / P-521) ─────────────────────────────────────────
+// The curve crates are 0.14 and implement pkcs8 0.11's traits, hence
+// `p256::pkcs8` here; the `pkcs8` dependency itself is 0.10, for rsa 0.9.
 
 fn ecdsa_private_to_pkcs8(kp: &ssh_key::private::EcdsaKeypair) -> anyhow::Result<Vec<u8>> {
-    use pkcs8::EncodePrivateKey;
+    use p256::pkcs8::EncodePrivateKey;
 
     let scalar = kp.private_key_bytes();
     match kp {
@@ -143,7 +145,7 @@ fn ecdsa_private_to_pkcs8(kp: &ssh_key::private::EcdsaKeypair) -> anyhow::Result
 }
 
 fn ecdsa_public_to_spki(pub_key: &ssh_key::public::EcdsaPublicKey) -> anyhow::Result<Vec<u8>> {
-    use pkcs8::EncodePublicKey;
+    use p256::pkcs8::EncodePublicKey;
 
     let sec1 = pub_key.as_sec1_bytes();
     match pub_key {
@@ -409,7 +411,9 @@ mod tests {
     /// same shape as [`public_from_ssh`].
     fn public_from_pkcs8(der_bytes: &[u8], key_type: KeyType) -> Vec<u8> {
         use der::Decode as _;
-        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+        // pkcs8 0.11 for the curve crates, 0.10 for rsa (see above).
+        use p256::pkcs8::DecodePrivateKey as _;
         use pkcs8::DecodePrivateKey as _;
         use rsa::traits::PublicKeyParts as _;
         match key_type {
@@ -420,19 +424,19 @@ mod tests {
             KeyType::EcdsaP256 => p256::SecretKey::from_pkcs8_der(der_bytes)
                 .unwrap()
                 .public_key()
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec(),
             KeyType::EcdsaP384 => p384::SecretKey::from_pkcs8_der(der_bytes)
                 .unwrap()
                 .public_key()
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec(),
             KeyType::EcdsaP521 => p521::SecretKey::from_pkcs8_der(der_bytes)
                 .unwrap()
                 .public_key()
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec(),
             KeyType::Ed25519 => {

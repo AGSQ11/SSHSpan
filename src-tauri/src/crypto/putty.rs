@@ -32,13 +32,13 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use ssh_key::{
     private::{
-        EcdsaKeypair, EcdsaPrivateKey, Ed25519Keypair, Ed25519PrivateKey, KeypairData, RsaKeypair,
+        Ed25519Keypair, Ed25519PrivateKey, KeypairData, RsaKeypair,
         RsaPrivateKey as SshRsaPrivateKey,
     },
-    Mpint, PrivateKey, PublicKey,
+    EcdsaCurve, Mpint, PrivateKey, PublicKey,
 };
 
-use crate::crypto::keys::{sanitize_key_comment, KeyType, PrivateKeyData};
+use crate::crypto::keys::{ecdsa_keypair, sanitize_key_comment, KeyType, PrivateKeyData};
 use crate::crypto::utils::{constant_time_eq, generate_random_vec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -538,44 +538,34 @@ fn build_keypair_data(
                 .clone();
             let scalar = read_mpint_bytes(plaintext_private_blob, &mut pos)?;
 
+            // The curve crate only range-checks the scalar (1 <= d < n);
+            // `ecdsa_keypair` stores it as it is, with the file's public point.
             let (key_type, keypair) = match &ecdsa_pub {
                 ssh_key::public::EcdsaPublicKey::NistP256(point) => {
                     let bytes = mpint_to_fixed_be(&scalar, 32)?;
-                    let sk = p256::SecretKey::from_slice(&bytes)
+                    p256::SecretKey::from_slice(&bytes)
                         .map_err(|e| anyhow::anyhow!("Invalid P-256 scalar: {e}"))?;
-                    let private: EcdsaPrivateKey<32> = sk.into();
                     (
                         KeyType::EcdsaP256,
-                        EcdsaKeypair::NistP256 {
-                            public: point.clone(),
-                            private,
-                        },
+                        ecdsa_keypair(EcdsaCurve::NistP256, point.as_bytes(), &bytes)?,
                     )
                 }
                 ssh_key::public::EcdsaPublicKey::NistP384(point) => {
                     let bytes = mpint_to_fixed_be(&scalar, 48)?;
-                    let sk = p384::SecretKey::from_slice(&bytes)
+                    p384::SecretKey::from_slice(&bytes)
                         .map_err(|e| anyhow::anyhow!("Invalid P-384 scalar: {e}"))?;
-                    let private: EcdsaPrivateKey<48> = sk.into();
                     (
                         KeyType::EcdsaP384,
-                        EcdsaKeypair::NistP384 {
-                            public: point.clone(),
-                            private,
-                        },
+                        ecdsa_keypair(EcdsaCurve::NistP384, point.as_bytes(), &bytes)?,
                     )
                 }
                 ssh_key::public::EcdsaPublicKey::NistP521(point) => {
                     let bytes = mpint_to_fixed_be(&scalar, 66)?;
-                    let sk = p521::SecretKey::from_slice(&bytes)
+                    p521::SecretKey::from_slice(&bytes)
                         .map_err(|e| anyhow::anyhow!("Invalid P-521 scalar: {e}"))?;
-                    let private: EcdsaPrivateKey<66> = sk.into();
                     (
                         KeyType::EcdsaP521,
-                        EcdsaKeypair::NistP521 {
-                            public: point.clone(),
-                            private,
-                        },
+                        ecdsa_keypair(EcdsaCurve::NistP521, point.as_bytes(), &bytes)?,
                     )
                 }
             };
