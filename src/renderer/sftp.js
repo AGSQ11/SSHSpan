@@ -945,7 +945,8 @@ function sftpInText(text) {
 /// remote one: a download keeps the name the server gave it. A Windows path -
 /// backslashes and no forward slash, the way joinPlatformPath (app.js) tells
 /// one - is taken apart at its backslashes, so a folder in it of look-alike
-/// dots, or padded with spaces, is spelled out there too.
+/// dots, or padded with spaces, is spelled out there too. The empty parts of a
+/// drive root or a UNC path stay empty: sftpSpellName leaves "" as it is.
 function sftpSpellLocal(path) {
   const p = String(path == null ? '' : path);
   return p.includes('\\') && !p.includes('/') ? p.split('\\').map(sftpSpellName).join('\\') : sftpSpell(p);
