@@ -573,7 +573,10 @@ is broken, for the size of a folder that could not be computed and for synchroni
 pauses; the New folder, New file and bookmark questions; the search results and the Bookmarks
 menu; the permissions dialog's note on a path it could not read; and the backend's errors that
 quote a path when a listing, a new folder or file, a rename, a size, a permission change, a move
-or a delete fails. This is display and confirmation hygiene in the renderer: the backend still
+or a delete fails. The activity log's lines with a name on each side of an arrow (a move, a
+rename, the two folders synchronized browsing is anchored at) spell the names out but do not keep
+each in an isolate of its own, so two names written right to left can turn the arrow around. This
+is display and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).
 
