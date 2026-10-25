@@ -1,8 +1,10 @@
 # SSHSpan security model
 
-**Last updated:** 2026-10-18  
+**Last updated:** 2026-10-25  
 **Status:** describes v1.10.0; checked against committed source at `6c19b1b`, the
-release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since  
+release-signing and Windows CI passages at `38e586e`; nothing it describes has changed since. It
+also describes how the names of saved servers are shown, which is not released yet (Unreleased in
+the CHANGELOG)  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -517,6 +519,39 @@ save-back, a refused answer to a conflict) are shown spelled out in the same way
 and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).
+
+### Names of saved servers
+
+A saved server's name, host and user name come from the server form, the `~/.ssh/config` import,
+a Bitwarden sync or a backup. The renderer shows them the way it shows a name a server chooses:
+control, invisible, zero-width and text-direction characters and spaces other than U+0020 are
+spelled out as `<U+XXXX>`, and the value is kept in a text-direction isolate of its own (a `<bdi>`,
+or U+2068 ... U+2069 in plain text). It does so in:
+
+- the server list and the command palette;
+- the terminal header, tabs and status line, and the password prompt;
+- the questions before deleting a server, closing or restarting a session and forgetting a pinned
+  host key, and toasts;
+- the "Use this key to connect" picker, the `~/.ssh/config` import menu, Known hosts and the audit
+  log;
+- the file browser's "Send to", the transfer queue (its notes included) and the edit-conflict
+  question;
+- the YOLO question and the assistant's record of what `get_session_info` returned.
+
+So a name with a direction override (U+202E) or a zero-width space cannot read as another server's
+or turn the words around it. A backend message that can quote the host (a failed connect or
+connection test) is spelled out whole, and a tooltip says what its element shows.
+
+Only the display changes: the vault, the server form's fields, what a save sends and what the
+assistant's model is given keep every value as it is. Two kinds of text treat these characters
+differently:
+
+- the Bitwarden sync's approval list strips them (see
+  [Bitwarden / Vaultwarden](#bitwarden--vaultwarden));
+- the backend's own texts - the native host-key question and the lines it writes into the terminal
+  as it connects ("Connecting to", "Connected to ... as ...", "Trusted new host key for") - drop
+  control characters from the host, the user name and the server's name but do not spell out the
+  others.
 
 ## Network clients
 

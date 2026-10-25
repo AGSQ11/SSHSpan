@@ -105,6 +105,20 @@ function bdiOf(text) {
   return b;
 }
 
+/// A saved server's name, host or user name inside a sentence of plain text
+/// (a toast, a question, the status line, a tooltip). They come from outside
+/// as much as from the server form - the ~/.ssh/config import, a Bitwarden
+/// sync, a backup - and a direction override or a zero-width character in
+/// one would let it read as another server's. So it is spelled out
+/// (spellOut), then kept to itself between FIRST STRONG ISOLATE and POP
+/// DIRECTIONAL ISOLATE, as bdiOf keeps it in a line of the page. Alone in an
+/// element it is shown as spellOut gives it; in a line of nodes, in a <bdi>
+/// (bdiOf). Only what is shown changes: the vault and the server form's
+/// fields keep the value as it is.
+function serverInText(text) {
+  return '\u2068' + spellOut(text) + '\u2069';
+}
+
 /// Boolean settings read. The backend's collect_settings returns every
 /// value as a JSON string, so a stored false arrives as "false" - and the
 /// strict comparisons this replaces ("!== false") never matched it, which
@@ -3637,8 +3651,9 @@ function paletteCandidates() {
   for (const s of state.servers) {
     const live = [...state.sessions.values()].some(t => t.serverId === s.id && window.tabSessionLive(t.tabId));
     out.push({
-      group: 'Servers', icon: 'server', name: s.name || '(unnamed)',
-      sub: `${s.username || '?'}@${s.host || '?'}:${s.port || 22}` + (live ? ' · session open' : ''),
+      // Shown spelled out (see serverInText); the search terms stay as they are.
+      group: 'Servers', icon: 'server', name: spellOut(s.name || '(unnamed)'),
+      sub: `${serverInText(s.username || '?')}@${serverInText(s.host || '?')}:${s.port || 22}` + (live ? ' · session open' : ''),
       hint: live ? 'Switch to session' : 'Connect', live,
       terms: [s.name, s.host, s.username, s.keyName],
       run: () => {
@@ -4488,8 +4503,10 @@ async function importFromSshConfig(anchorEl) {
     const hosts = res.hosts || [];
     const file = res.path || '~/.ssh/config';
     if (hosts.length === 0) { toast('No Host blocks found in ' + file + '.', 'info'); return; }
+    // Shown spelled out, as once saved (see serverInText); the form gets them
+    // as they are.
     const items = hosts.map((h) => ({
-      label: h.host, sub: `(${h.user || '?'}@${h.hostname || h.host}:${h.port || 22})`, icon: 'server',
+      label: spellOut(h.host), sub: `(${serverInText(h.user || '?')}@${serverInText(h.hostname || h.host)}:${h.port || 22})`, icon: 'server',
       onSelect: () => {
         openServerModal({
           prefill: {
@@ -5790,7 +5807,7 @@ async function loadKnownHosts() {
   for (const h of hosts) {
     const tr = document.createElement('tr');
     const tdHost = document.createElement('td');
-    tdHost.textContent = h.host;
+    tdHost.textContent = spellOut(h.host); // spelled out, as a server's host is (see serverInText)
     const tdFp = document.createElement('td');
     const code = document.createElement('code');
     code.className = 'mono';
@@ -5807,7 +5824,7 @@ async function loadKnownHosts() {
     forget.addEventListener('click', async () => {
       if (!lockGateOpen('hosts')) return;
       const forgetIt = await confirmModal('Forget host key',
-        `Forget the pinned key for "${h.host}"?\n\nThe next connection will re-accept whatever key the server presents.`,
+        `Forget the pinned key for "${serverInText(h.host)}"?\n\nThe next connection will re-accept whatever key the server presents.`,
         'Forget');
       if (!forgetIt) return;
       try {
@@ -5914,7 +5931,9 @@ function renderAuditRows() {
     const tr = document.createElement('tr');
     [fmtTime(r.ts), r.event, r.detail].forEach((v, i) => {
       const td = document.createElement('td');
-      td.textContent = v === undefined || v === null ? '' : String(v);
+      // The detail quotes names from outside - a server's name, host and
+      // user name (see serverInText), a file name - so it is spelled out.
+      td.textContent = v === undefined || v === null ? '' : i === 2 ? spellOut(v) : String(v);
       if (i === 0) td.className = 'ts';
       if (i === 1) td.className = 'ev';
       tr.appendChild(td);
@@ -7207,7 +7226,7 @@ function askConnectPassword(server, callback, purpose) {
   if (state._connectPwCallback) closeConnectPwModal(null);
   modal.hidden = false;
   const label = document.getElementById('connectPwLabel');
-  if (label) label.textContent = `Password for ${server.username}@${server.host}:`;
+  if (label) label.replaceChildren('Password for ', bdiOf(spellOut(server.username)), '@', bdiOf(spellOut(server.host)), ':');
   const ok = document.getElementById('connectPwOkBtn');
   if (ok) ok.textContent = purpose === 'test' ? 'Test' : 'Connect';
   const inp = document.getElementById('connectPwInput');
@@ -7348,7 +7367,9 @@ function renderServerList() {
     head.appendChild(dot);
     const name = document.createElement('span');
     name.className = 'server-name';
-    name.textContent = s.name || '(unnamed)';
+    // The name, user name and host spelled out (see serverInText): a row
+    // cannot read as another server's.
+    name.textContent = spellOut(s.name || '(unnamed)');
     name.title = name.textContent; // ellipsised when long (A1-35)
     head.appendChild(name);
     if (s.keyMissing) {
@@ -7361,7 +7382,7 @@ function renderServerList() {
 
     const sub = document.createElement('div');
     sub.className = 'server-row-sub';
-    sub.textContent = `${s.username || '?'}@${s.host || '?'}:${s.port || 22}`;
+    sub.append(bdiOf(spellOut(s.username || '?')), '@', bdiOf(spellOut(s.host || '?')), ':' + (s.port || 22));
     row.appendChild(sub);
 
     const auth = document.createElement('div');
@@ -7401,7 +7422,7 @@ function renderServerList() {
     more.className = 'icon-btn server-row-more';
     more.innerHTML = ico('ellipsis');
     more.title = 'Connect, edit or delete';
-    more.setAttribute('aria-label', 'Actions for ' + (s.name || s.host || 'this server'));
+    more.setAttribute('aria-label', 'Actions for ' + spellOut(s.name || s.host || 'this server'));
     more.setAttribute('aria-haspopup', 'menu');
     more.setAttribute('aria-expanded', 'false');
     // Not a row click as well: that re-renders the list, and the menu would
@@ -7443,7 +7464,7 @@ function serverMenuItems(srv) {
     { label: 'Test connection', icon: 'server-cog', onSelect: () => testSelectedServer(srv) },
     { label: 'Edit', icon: 'pencil', onSelect: () => openServerModal({ id: srv.id }) },
     { label: 'Delete', icon: 'trash-2', onSelect: async () => {
-      if (!(await confirmModal('Delete server', `Delete server "${srv.name}"?`, 'Delete'))) return;
+      if (!(await confirmModal('Delete server', `Delete server "${serverInText(srv.name)}"?`, 'Delete'))) return;
       try {
         await call('server_delete', { id: srv.id });
         if (state.connectSelectedId === srv.id) selectServer(null);
@@ -7460,7 +7481,7 @@ function openServerContextMenu(x, y, srv) {
 
 /// The row's "..." button: the same menu, anchored under it.
 function openServerMenu(anchor, srv) {
-  openMenu(anchor, serverMenuItems(srv), { label: 'Server ' + (srv.name || srv.host || ''), alignRight: true });
+  openMenu(anchor, serverMenuItems(srv), { label: 'Server ' + spellOut(srv.name || srv.host || ''), alignRight: true });
 }
 
 // ─── Server modal ───────────────────────────────────────────────────────────
@@ -7844,8 +7865,12 @@ function buildHostPickerLevel(menu, depth, nodes, hosts, key) {
   for (const s of hosts) {
     const b = document.createElement('button');
     b.className = 'ctx-item';
-    b.innerHTML = `${ico('server')}<span>${escapeHtml(s.name || s.host)} `
-      + `<small>(${escapeHtml(s.username)}@${escapeHtml(s.host)})</small></span>`;
+    b.innerHTML = ico('server');
+    const account = document.createElement('small');
+    account.append('(', bdiOf(spellOut(s.username)), '@', bdiOf(spellOut(s.host)), ')');
+    const text = document.createElement('span');
+    text.append(bdiOf(spellOut(s.name || s.host)), ' ', account);
+    b.appendChild(text);
     b.addEventListener('mouseenter', () => hostPickerScheduleClose(depth + 1));
     b.addEventListener('click', () => {
       closeKeyConnectMenu();
@@ -7981,10 +8006,10 @@ async function runServerTest(srv) {
       const result = await call('server_test', { serverId: srv.id, promptPassword });
       if (result && result.ok === false) throw new Error(result.error || 'Connection test failed.');
       const ms = result && result.latencyMs != null ? ` (${result.latencyMs} ms)` : '';
-      toast(`Connection to ${srv.name || srv.host} succeeded${ms}.`, 'ok');
+      toast(`Connection to ${serverInText(srv.name || srv.host)} succeeded${ms}.`, 'ok');
     } catch (e) {
-      // The backend's own words, as they are.
-      toast(errText(e), 'err');
+      // The backend's own words, spelled out: they can quote the host.
+      toast(errSpelled(e), 'err');
     }
   });
 }
@@ -8064,10 +8089,10 @@ async function openSessionTab(srv, opts = {}) {
 async function connectTab(tab, srv, { fresh, beforeConnect } = {}) {
   const seq = tab.connectSeq = (tab.connectSeq || 0) + 1;
   const ours = () => state.sessions.get(tab.tabId) === tab && tab.connectSeq === seq;
-  const target = `${srv.host}:${srv.port || 22}`;
+  const target = `${serverInText(srv.host)}:${srv.port || 22}`;
   let promptPassword = null;
   if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
-    setTabStatus(tab.tabId, `Password needed for ${srv.username}@${target}`);
+    setTabStatus(tab.tabId, `Password needed for ${serverInText(srv.username)}@${target}`);
     promptPassword = await new Promise((resolve) => askConnectPassword(srv, resolve, 'connect'));
     if (!ours()) return;
     if (promptPassword === null || promptPassword === undefined) {
@@ -8100,9 +8125,10 @@ async function connectTab(tab, srv, { fresh, beforeConnect } = {}) {
     if (!ours()) return;
     tab.connecting = false;
     tab.ended = true;
-    // The backend's words as they are: a host-key mismatch, a declined
-    // key, a timeout - "Failed: " in front of them added nothing.
-    const msg = errText(e);
+    // The backend's words, spelled out (they can quote the host): a
+    // host-key mismatch, a declined key, a timeout - "Failed: " in front of
+    // them added nothing.
+    const msg = errSpelled(e);
     setTabStatus(tab.tabId, msg);
     toast(msg, 'err');
   }
@@ -8187,7 +8213,7 @@ async function reconnectActiveTab() {
   let beforeConnect;
   if (window.tabSessionLive(tab.tabId)) {
     const ok = await confirmModal('Restart session?',
-      `Restart the session to ${tab.serverName}? Its shell ends - anything running in it stops - and a new one starts in this tab.`,
+      `Restart the session to ${serverInText(tab.serverName)}? Its shell ends - anything running in it stops - and a new one starts in this tab.`,
       'Restart session');
     if (!ok) return;
     // Asked, not frozen: the tab can have closed, ended or started connecting.
@@ -8239,7 +8265,7 @@ async function closeSessionTab(tabId, { skipConfirm = false } = {}) {
   // Only a live shell is worth asking about. With nothing to ask (or skipConfirm)
   // nothing is awaited, so the whole close still runs synchronously, as before.
   if (live && !skipConfirm) {
-    const ok = await confirmModal('Close session', `Close the session to ${tab.serverName}?`, 'Close session');
+    const ok = await confirmModal('Close session', `Close the session to ${serverInText(tab.serverName)}?`, 'Close session');
     if (!ok) return;
     // The dialog is modal, not frozen: the session can end, or the vault lock
     // and tear every tab down, while it is open. Act on what is true now.
@@ -8311,14 +8337,14 @@ function renderTermTabs() {
     dot.className = 'term-tab-dot' + (window.tabSessionLive(tabId) ? ' live' : '');
     const name = document.createElement('span');
     name.className = 'term-tab-name';
-    name.textContent = tab.serverName;
-    name.title = `${tab.serverName} (${tab.host}:${tab.port})`;
+    name.textContent = spellOut(tab.serverName);
+    name.title = `${serverInText(tab.serverName)} (${serverInText(tab.host)}:${tab.port})`;
     const close = document.createElement('button');
     close.type = 'button';
     close.className = 'term-tab-close';
     close.textContent = '×';
     close.title = 'Close session';
-    close.setAttribute('aria-label', 'Close the session to ' + tab.serverName);
+    close.setAttribute('aria-label', 'Close the session to ' + spellOut(tab.serverName));
     close.addEventListener('click', (ev) => { ev.stopPropagation(); closeSessionTab(tabId); });
     chip.appendChild(dot);
     chip.appendChild(name);
@@ -8351,10 +8377,10 @@ function updateTerminalHead() {
   el('termTestBtn').hidden = !headServer();
   el('termCancelBtn').hidden = !(tab && tab.connecting);
   // "Cancel" alone does not say what it cancels.
-  if (tab && tab.connecting) el('termCancelBtn').setAttribute('aria-label', 'Cancel connecting to ' + tab.serverName);
+  if (tab && tab.connecting) el('termCancelBtn').setAttribute('aria-label', 'Cancel connecting to ' + spellOut(tab.serverName));
   if (tab) {
-    el('termTitle').textContent = tab.serverName;
-    el('termBadge').textContent = `${tab.host}:${tab.port}`;
+    el('termTitle').textContent = spellOut(tab.serverName);
+    el('termBadge').replaceChildren(bdiOf(spellOut(tab.host)), ':' + tab.port);
     el('termBadge').hidden = false;
     const live = window.tabSessionLive(tab.tabId);
     el('termDisconnectBtn').hidden = !live;
@@ -8362,8 +8388,8 @@ function updateTerminalHead() {
     setReconnectLabel('Reconnect');
     setModeSeg(live, tab.mode);
   } else if (srv) {
-    el('termTitle').textContent = srv.name;
-    el('termBadge').textContent = `${srv.host}:${srv.port}`;
+    el('termTitle').textContent = spellOut(srv.name);
+    el('termBadge').replaceChildren(bdiOf(spellOut(srv.host)), ':' + srv.port);
     el('termBadge').hidden = false;
     el('termDisconnectBtn').hidden = true;
     el('termReconnectBtn').hidden = false;

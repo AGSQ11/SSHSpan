@@ -2370,7 +2370,7 @@ function openSftpFileMenu(x, y, tabId, entry) {
     t.tabId !== tabId && window.tabSessionLive(t.tabId) && t.sftpReady);
   if (others.length > 0 && !multi) {
     items.push('sep');
-    for (const other of others) mk('Send to ' + other.serverName, 'send', () => sftpSendTo(tabId, fullPath, other));
+    for (const other of others) mk('Send to ' + spellOut(other.serverName), 'send', () => sftpSendTo(tabId, fullPath, other));
   }
 
   openMenu({ x, y }, items, { label: multi ? selected.length + ' items' : 'File ' + sftpSpell(entry.name) });
@@ -3159,7 +3159,7 @@ function sftpSetLocalDirDefault(tabId) {
   // state.settings follows only a write that went through (sftpSaveSetting),
   // so a refused one is not used for the rest of the session either.
   sftpSaveSetting(key, dir).then((saved) => {
-    if (saved) toast(`Default local directory for ${tab.serverName || 'this server'} set to ${dir}`, 'ok');
+    if (saved) toast(`Default local directory for ${tab.serverName ? serverInText(tab.serverName) : 'this server'} set to ${dir}`, 'ok');
   });
 }
 
@@ -3833,7 +3833,7 @@ function sftpOnEditSync(ev) {
       sftpCacheInvalidate(tab, sftpParent(remote));
       tab._listingDirty = true;
     }
-    toast(`Saved "${sftpInText(name)}" to ${(tab && tab.serverName) || 'the server'}.`, 'ok');
+    toast(`Saved "${sftpInText(name)}" to ${tab && tab.serverName ? serverInText(tab.serverName) : 'the server'}.`, 'ok');
   } else {
     const why = spellOut(p.error || 'unknown error');
     if (tab) sftpLog(tab.tabId, `save of ${sftpSpell(remote)} FAILED: ${why}`);
@@ -3934,7 +3934,8 @@ function sftpShowEditConflict(c, why) {
   const now = !deleted && (c.remoteSize != null || c.remoteModifiedMs)
     ? ` - now ${c.remoteSize != null ? formatSftpSize(c.remoteSize) : 'size unknown'}${c.remoteModifiedMs ? `, modified ${fmtSftpTime(c.remoteModifiedMs)}` : ''}`
     : '';
-  document.getElementById('editConflictServer').replaceChildren(`${(tab && tab.serverName) || 'Server'}: `, sftpBdi(c.remote), now);
+  document.getElementById('editConflictServer').replaceChildren(
+    tab && tab.serverName ? bdiOf(spellOut(tab.serverName)) : 'Server', ': ', sftpBdi(c.remote), now);
   const err = document.getElementById('editConflictError');
   err.textContent = '';
   err.hidden = true;
@@ -4104,20 +4105,22 @@ async function sftpAnswerEditConflict(action) {
 // source and uploads to the target on fresh SFTP channels (the interactive
 // browse sessions are never used - some servers fail reads on the
 // long-lived channel). Progress shows in the transfer queue panel - the call
-// only queues it, so nothing says "Sent" (the job may yet fail). The name is
-// spelled out and kept to itself, as in every sentence here.
+// only queues it, so nothing says "Sent" (the job may yet fail). The file's
+// name and the server's are spelled out and kept to themselves, as in every
+// sentence here.
 async function sftpSendTo(fromTabId, fullPath, targetTab) {
   try {
     const name = sftpInText(fullPath.split('/').filter(Boolean).pop() || 'file');
-    terminalSetStatus(`Queueing ${name} for sending to ${targetTab.serverName}...`);
+    const to = serverInText(targetTab.serverName);
+    terminalSetStatus(`Queueing ${name} for sending to ${to}...`);
     await sftpCall('sftp_server_copy', {
       fromSessionId: state.sessions.get(fromTabId)?.sessionId,
       remote: fullPath,
       targetSessionId: targetTab.sessionId,
       targetDir: targetTab.sftpPath || '/',
     });
-    terminalSetStatus(`Queued ${name} for sending to ${targetTab.serverName}.`);
-    toast(`Queued ${name} for sending to ${targetTab.serverName} - see Transfers.`, 'ok');
+    terminalSetStatus(`Queued ${name} for sending to ${to}.`);
+    toast(`Queued ${name} for sending to ${to} - see Transfers.`, 'ok');
   } catch (e) { toast(errText(e), 'err'); }
 }
 
@@ -4493,7 +4496,9 @@ function sftpQueueCountJobs(node) {
   return n;
 }
 
-/// One header row. Clicking it collapses or expands the branch beneath.
+/// One header row. Clicking it collapses or expands the branch beneath. A
+/// server's row is named by the saved server's name, spelled out (see
+/// serverInText, app.js).
 function sftpQueueGroupEl(kind, label, key, depth, count) {
   const row = document.createElement('button');
   const collapsed = sftpQueueCollapsed.has(key);
@@ -4501,7 +4506,7 @@ function sftpQueueGroupEl(kind, label, key, depth, count) {
   row.style.setProperty('--q-depth', String(depth));
   row.innerHTML = `<span class="q-twisty">${ico('chevron-right')}</span>`
     + `<span class="q-groupicon">${ico(kind === 'server' ? 'server' : 'folder')}</span>`
-    + `<span class="q-grouplabel">${escapeHtml(label)}</span>`
+    + `<span class="q-grouplabel">${escapeHtml(kind === 'server' ? spellOut(label) : label)}</span>`
     + `<span class="q-groupcount">${count}</span>`;
   row.addEventListener('click', () => {
     if (sftpQueueCollapsed.has(key)) sftpQueueCollapsed.delete(key);
@@ -4590,11 +4595,16 @@ function sftpQueueBuildRow(j) {
     name.appendChild(badge);
   }
   name.appendChild(document.createTextNode(nameText));
+  // The saved servers' names, spelled out and each kept to itself (see
+  // serverInText, app.js); the tooltip says the same.
   const route = cell('q-route');
-  route.textContent = j.kind === 'serverCopy' && j.targetServerName
-    ? `${j.serverName || ''} → ${j.targetServerName}`
-    : (j.serverName || '');
-  route.title = route.textContent;
+  if (j.kind === 'serverCopy' && j.targetServerName) {
+    route.append(bdiOf(spellOut(j.serverName)), ' → ', bdiOf(spellOut(j.targetServerName)));
+    route.title = `${serverInText(j.serverName)} → ${serverInText(j.targetServerName)}`;
+  } else {
+    route.textContent = spellOut(j.serverName);
+    route.title = route.textContent;
+  }
   const prog = cell('q-prog');
   const bar = document.createElement('span');
   bar.className = 'sftp-queuebar';
@@ -4646,7 +4656,11 @@ function sftpQueueFillRow(row, j, depth) {
   const retrySecs = (j.state === 'queued' && j.retryAt)
     ? Math.max(0, Math.ceil((j.retryAt - Date.now()) / 1000))
     : null;
-  let errDisplay = j.error || (j.state === 'cancelled' ? 'Cancelled' : '');
+  // The backend's note is spelled out, in the cell and its tooltip: it can
+  // quote the saved server's name ('Reconnect to "..." to resume.') or a
+  // remote path.
+  const note = spellOut(j.error);
+  let errDisplay = note || (j.state === 'cancelled' ? 'Cancelled' : '');
   let errClass = '';
   if (retrySecs !== null) {
     const m = errDisplay.match(/\((\d+\/\d+)\)\s*$/);
@@ -4656,7 +4670,7 @@ function sftpQueueFillRow(row, j, depth) {
     errClass = ' info'; // a paused note or a cancel, not a failure - don't paint it red
   }
   q.err.className = 'q-cell q-err' + errClass;
-  q.err.title = j.error || '';
+  q.err.title = note;
   q.err.textContent = errDisplay;
   // The buttons are rebuilt only when what they OFFER changes - not on every
   // state change: queued -> active offers the same Pause/Cancel, and
@@ -4694,7 +4708,7 @@ function sftpQueueActionButtons(j, resumable) {
     } else {
       // No connected tab on the job's server - resume_job would leave it
       // paused anyway. Disabled, not wired.
-      resume = btn(`Reconnect to "${j.serverName || 'the server'}" to resume`, Q_ICON_RESUME, null);
+      resume = btn(`Reconnect to "${j.serverName ? serverInText(j.serverName) : 'the server'}" to resume`, Q_ICON_RESUME, null);
       resume.className = 'icon-btn disabled';
       resume.disabled = true;
     }

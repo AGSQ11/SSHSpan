@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A server's name cannot pass for another's.** A saved server's name, host and user name were
+  shown as they are, so a text-direction override (U+202E) turned what followed it around and a
+  zero-width space went unseen. The renderer now spells such characters out (`<U+202E>`), each
+  value in a text-direction isolate of its own, in:
+  - the server list, the palette, the terminal header, tabs and status line, and the password
+    prompt;
+  - the questions, toasts, the "Use this key to connect" picker and the `~/.ssh/config` import;
+  - Known hosts, the audit log, the file browser, the transfer queue and the assistant's tool log.
+
+  A connect or connection-test error that quotes the host is spelled out too. The vault and the
+  server form keep the values as they are. The Bitwarden approval list still strips these
+  characters, and the backend's host-key question and terminal lines still only drop control
+  characters (see `docs/SECURITY.md`).
+
 ## [1.10.0] - 2026-10-18
 
 Changes since v1.9.1: a flaw-remediation release driven by an eight-area internal audit on
