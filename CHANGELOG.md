@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency advisories.** `crypto-bigint` 0.7.5 -> 0.7.7 (RUSTSEC-2026-0387: operations meant
+  to run in constant time could branch on secret values), `ctutils` 0.4.2 -> 0.4.5
+  (RUSTSEC-2026-0385, the same kind of flaw), `rustls-webpki` 0.103.15 -> 0.103.16
+  (RUSTSEC-2026-0382: certificate checks could accept distrusted intermediates) and `webpki-roots`
+  1.0.9 -> 1.0.11 (RUSTSEC-2026-0381: distrusted emSign intermediates). The older `crypto-bigint`
+  0.5.5 has no fixed release, so the elliptic-curve 0.13 line it came with is gone. The app used
+  it only to generate an ECDSA key, import an ECDSA `.ppk` and export one as PKCS#8 (private or
+  public); SSH sessions already used 0.7. Those now use `p256`/`p384`/`p521` 0.14, and a PPK import
+  or PKCS#8 export gives the same bytes as before. (#90)
+
 ## [1.10.0] - 2026-10-18
 
 Changes since v1.9.1: a flaw-remediation release driven by an eight-area internal audit on
