@@ -29,8 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A connect or connection-test error that quotes the host is spelled out too. The vault and the
   server form keep the values as they are. The Bitwarden approval list still strips these
-  characters, and the backend's host-key question and terminal lines still only drop control
   characters (see `docs/SECURITY.md`). (#91)
+- **The host-key question and the connect lines spell names out too.** The native host-key
+  question and the lines SSHSpan writes into the terminal as it connects ("Connecting to",
+  "Connected to ... as ...", "Trusted new host key for") only dropped control characters from a
+  server's host, user name and name, so a direction override (U+202E) in a host turned the rest of
+  the question around. The backend now spells these characters out by the renderer's rule
+  (`<U+202E>`, a line break as `\n`), and so do the connect errors that quote the host or the
+  user name. Control characters are spelled out instead of dropped. (#93)
 
 ## [1.10.0] - 2026-10-18
 

@@ -236,15 +236,15 @@ pub async fn terminal_connect(
     // shell prompt arrives. If the channel to the webview is broken, FAIL
     // LOUDLY - a silent failure here looks exactly like a connected-but-blank
     // terminal, which cost us a debugging cycle already. Host/username/auth
-    // are server-derived strings: control characters are stripped so this
-    // app-composed line can never carry an injected escape sequence.
+    // are server-derived strings: `connecting_banner` spells out their
+    // control, invisible and direction characters, so this app-composed line
+    // can never carry an injected escape sequence.
     on_data
-        .send(format!(
-            "\r\n\x1b[1;36mConnecting to {}:{} as {} (auth={})\x1b[0m\r\n",
-            ssh_client::sanitize_terminal_text(&resolved.server.host),
+        .send(ssh_client::connecting_banner(
+            &resolved.server.host,
             resolved.server.port,
-            ssh_client::sanitize_terminal_text(&resolved.username),
-            ssh_client::sanitize_terminal_text(&resolved.auth_method)
+            &resolved.username,
+            &resolved.auth_method,
         ))
         .map_err(|e| {
             CmdError(format!(

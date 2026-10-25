@@ -217,9 +217,10 @@ impl HostKeyRefusal {
 }
 
 /// `host:port` for a message: IPv6 literals bracketed (the known-hosts form)
-/// and control characters removed (the text can end up in the terminal).
+/// and the host spelled out ([`spell_out`] - the text can end up in the
+/// terminal).
 fn display_target(host: &str, port: u16) -> String {
-    known_host_key(&sanitize_terminal_text(host), port)
+    known_host_key(&spell_out(host), port)
 }
 
 /// A mutex lock that survives a panic elsewhere: the handshake state below
@@ -458,8 +459,29 @@ fn ask_host_trust_native(
     imported: bool,
 ) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-    let shown_host = sanitize_terminal_text(host);
-    let message = if imported {
+    app.dialog()
+        .message(host_trust_message(
+            host,
+            port,
+            fingerprint_display,
+            imported,
+        ))
+        .title("SSHSpan - Host key verification")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Trust && connect".to_string(),
+            "Refuse".to_string(),
+        ))
+        .blocking_show()
+}
+
+/// What [`ask_host_trust_native`] asks about the key `host` presented. The
+/// host is spelled out ([`spell_out`]): the OS lays the question out by the
+/// bidi algorithm, so a direction override (U+202E) in the host turned the
+/// rest of the sentence around, and a line break added a paragraph.
+fn host_trust_message(host: &str, port: u16, fingerprint_display: &str, imported: bool) -> String {
+    let shown_host = spell_out(host);
+    if imported {
         format!(
             "A host key for {shown_host}:{port} came from a vault backup, \
              but this is its first real connection.\n\n\
@@ -473,26 +495,44 @@ fn ask_host_trust_native(
              Trust this host key and connect? \
              Compare the fingerprint out-of-band if you can."
         )
-    };
-    app.dialog()
-        .message(message)
-        .title("SSHSpan - Host key verification")
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Trust && connect".to_string(),
-            "Refuse".to_string(),
-        ))
-        .blocking_show()
+    }
 }
 
-/// Strip control characters (C0, DEL, C1) from app-composed text that is
-/// written into the terminal stream. App-composed strings interpolate
-/// server-derived substrings (hostnames, usernames, server names); without
-/// stripping, those become an ANSI injection channel where the APP is the
-/// origin of escape sequences it never intended. Untrusted terminal output
-/// itself is rendered by xterm.js by design and is not handled here.
-pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+/// Whether [`spell_out`] spells `c` out: the renderer's `SPELLED_CHARS`
+/// (src/renderer/app.js) - controls (C0, DEL, C1), format and
+/// default-ignorable characters and the line and paragraph separators
+/// ([`crate::assistant::is_disguising`]), spaces other than U+0020, and
+/// BRAILLE PATTERN BLANK and MUSICAL SYMBOL NULL NOTEHEAD, which show as
+/// nothing.
+fn is_spelled(c: char) -> bool {
+    c.is_control()
+        || crate::assistant::is_disguising(c)
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c, '\u{2800}' | '\u{1D159}')
+}
+
+/// `text` - a host, user name or server name that SSHSpan's own text quotes
+/// (the host-key question, the lines written into the terminal as a session
+/// connects, a connect error) - with every [`is_spelled`] character spelled
+/// out the way the renderer's `spellOut` does: a line break, a carriage
+/// return and a tab as `\n`, `\r` and `\t`, any other as `<U+XXXX>`. Passed
+/// on as they are, a control character would make the APP the origin of an
+/// escape sequence it never intended, and a direction override (U+202E) or a
+/// zero-width character would turn the text around it or hide part of the
+/// value. Untrusted terminal output itself is rendered by xterm.js by design
+/// and is not handled here.
+pub(crate) fn spell_out(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if is_spelled(c) => out.push_str(&format!("<U+{:04X}>", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The fingerprint of a base64 wire-format host-key blob in the one form the
@@ -586,7 +626,8 @@ impl Utf8Stream {
 /// key during the handshake. `pre_connect_known_host` is the lookup made
 /// BEFORE `client::connect` (the race between the two is benign - the notice
 /// is informational, and the authoritative record is the
-/// `known_hosts.trust_on_first_use` audit entry).
+/// `known_hosts.trust_on_first_use` audit entry). The host and the
+/// fingerprint, read back from Known hosts, are spelled out ([`spell_out`]).
 pub fn first_trust_notice(
     pre_connect_known_host: Option<&crate::db::KnownHost>,
     host: &str,
@@ -596,9 +637,42 @@ pub fn first_trust_notice(
         return None;
     }
     Some(format!(
-        "\r\n\x1b[1;33mTrusted new host key for {} ({fingerprint_display}) - manage in Known Hosts.\x1b[0m\r\n",
-        sanitize_terminal_text(host)
+        "\r\n\x1b[1;33mTrusted new host key for {} ({}) - manage in Known Hosts.\x1b[0m\r\n",
+        spell_out(host),
+        spell_out(fingerprint_display)
     ))
+}
+
+/// The line a connect writes into the terminal before the handshake, so the
+/// user sees something before the first prompt arrives. The host, the user
+/// name and the auth method are server-derived and spelled out
+/// ([`spell_out`]).
+pub(crate) fn connecting_banner(
+    host: &str,
+    port: u16,
+    username: &str,
+    auth_method: &str,
+) -> String {
+    format!(
+        "\r\n\x1b[1;36mConnecting to {}:{port} as {} (auth={})\x1b[0m\r\n",
+        spell_out(host),
+        spell_out(username),
+        spell_out(auth_method)
+    )
+}
+
+/// The line written into the terminal once the session is up. App-composed
+/// text interpolates server-derived values (host, username, server name):
+/// each is spelled out ([`spell_out`]), so the app never becomes the origin
+/// of an escape sequence a server smuggled into its own identity, and a
+/// direction override or a zero-width character shows as `<U+XXXX>`.
+fn connected_banner(host: &str, port: u16, username: &str, server_name: &str) -> String {
+    format!(
+        "\r\n\x1b[1;32mConnected to {}:{port} as {} ({})\x1b[0m\r\n",
+        spell_out(host),
+        spell_out(username),
+        spell_out(server_name)
+    )
 }
 
 /// Everything needed to open one connection.
@@ -875,7 +949,10 @@ pub async fn authenticate(
                 )
                 .await?;
             if !auth.success() {
-                return Err(anyhow::anyhow!("Public-key authentication failed: the server rejected the key for user \"{user}\"."));
+                return Err(anyhow::anyhow!(
+                    "Public-key authentication failed: the server rejected the key for user \"{}\".",
+                    spell_out(&user)
+                ));
             }
         }
         "password" => {
@@ -893,7 +970,8 @@ pub async fn authenticate(
             let auth = session.authenticate_password(&user, pw).await?;
             if !auth.success() {
                 return Err(anyhow::anyhow!(
-                    "Password authentication failed for user \"{user}\"."
+                    "Password authentication failed for user \"{}\".",
+                    spell_out(&user)
                 ));
             }
         }
@@ -1084,15 +1162,7 @@ pub async fn start_interactive(
     let server_name = params.server.name.clone();
     let reg_session_id = session_id.clone();
     let registry2 = registry.clone();
-    // App-composed text interpolates server-derived values (host, username,
-    // server name) - strip control characters so the app never becomes the
-    // origin of an escape sequence a server smuggled into its own identity.
-    let banner = format!(
-        "\r\n\x1b[1;32mConnected to {}:{target_port} as {} ({})\x1b[0m\r\n",
-        sanitize_terminal_text(&target_host),
-        sanitize_terminal_text(&params.username),
-        sanitize_terminal_text(&server_name)
-    );
+    let banner = connected_banner(&target_host, target_port, &params.username, &server_name);
     if let Err(e) = on_data.send(banner) {
         eprintln!("[sshspan-terminal] channel send failed right after connect: {e}");
     }
@@ -1277,6 +1347,184 @@ mod tests {
         // Host already known before connecting => no notice.
         let known = known_host();
         assert!(first_trust_notice(Some(&known), "example.com", "SHA256:abc123").is_none());
+    }
+
+    /// A host with a direction override and a user name with a zero-width
+    /// space, as the server form, an import or a vault item can bring them.
+    /// Passed on, the host reads "db-prod-1" and the user name "root".
+    const OVERRIDE_HOST: &str = "db-\u{202E}1-dorp";
+    const ZERO_WIDTH_USER: &str = "ro\u{200B}ot";
+
+    /// Whether `text` holds a format, default-ignorable or separator
+    /// character ([`crate::assistant::is_disguising`]).
+    fn has_disguise(text: &str) -> bool {
+        text.chars().any(crate::assistant::is_disguising)
+    }
+
+    /// The renderer's `spellOut` (src/renderer/app.js), character for
+    /// character: a line break, a carriage return and a tab as `\n`, `\r` and
+    /// `\t`, any other character it spells out as `<U+XXXX>` (at least four
+    /// hex digits), and the rest - letters of any script, U+0020 - as it is.
+    #[test]
+    fn spell_out_writes_each_character_the_way_the_renderer_does() {
+        for (given, shown) in [
+            (OVERRIDE_HOST, "db-<U+202E>1-dorp"),
+            (ZERO_WIDTH_USER, "ro<U+200B>ot"),
+            ("a\nb\rc\td", r"a\nb\rc\td"),
+            (
+                "\u{1b}[2J\u{7f}\u{9b}\u{0}",
+                "<U+001B>[2J<U+007F><U+009B><U+0000>",
+            ),
+            ("a\u{a0}b\u{3000}c\u{2028}d", "a<U+00A0>b<U+3000>c<U+2028>d"),
+            (
+                "\u{feff}\u{2066}\u{34f}\u{3164}",
+                "<U+FEFF><U+2066><U+034F><U+3164>",
+            ),
+            ("\u{2800}\u{1d159}\u{e0041}", "<U+2800><U+1D159><U+E0041>"),
+            ("prod db.example", "prod db.example"),
+            ("münchen.例え.jp", "münchen.例え.jp"),
+        ] {
+            assert_eq!(spell_out(given), shown, "{given:?}");
+        }
+    }
+
+    /// [`spell_out`] spells out exactly the renderer's `SPELLED_CHARS`, so a
+    /// host reads the same in the server list and in the host-key question:
+    /// the class's ranges, \p{Cf} and \p{Default_Ignorable_Code_Point}
+    /// (`is_disguising`'s table), and no other code point. The class is
+    /// pinned as app.js writes it, so editing it fails this test until the
+    /// Rust rule follows.
+    #[test]
+    fn spell_out_spells_the_renderers_class_and_nothing_else() {
+        let app_js = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/renderer/app.js"),
+        )
+        .expect("read src/renderer/app.js");
+        assert!(
+            app_js.contains(concat!(
+                r"const SPELLED_CHARS = /[\x00-\x1F\x7F-\x9F\p{Cf}",
+                r"\p{Default_Ignorable_Code_Point}\u{2028}\u{2029}",
+                r"\xA0\u{1680}\u{2000}-\u{200A}\u{202F}\u{205F}\u{3000}",
+                r"\u{2800}\u{1D159}]/gu;"
+            )),
+            "SPELLED_CHARS changed in app.js: change spell_out to match"
+        );
+        let ranges = [
+            ('\u{0}', '\u{1f}'),
+            ('\u{7f}', '\u{9f}'),
+            ('\u{2028}', '\u{2029}'),
+            ('\u{a0}', '\u{a0}'),
+            ('\u{1680}', '\u{1680}'),
+            ('\u{2000}', '\u{200a}'),
+            ('\u{202f}', '\u{202f}'),
+            ('\u{205f}', '\u{205f}'),
+            ('\u{3000}', '\u{3000}'),
+            ('\u{2800}', '\u{2800}'),
+            ('\u{1d159}', '\u{1d159}'),
+        ];
+        let in_class = |c: char| {
+            crate::assistant::is_disguising(c)
+                || ranges
+                    .iter()
+                    .any(|&(first, last)| (first..=last).contains(&c))
+        };
+        let mut wrong = Vec::new();
+        for c in (0..=0x10FFFF_u32).filter_map(char::from_u32) {
+            let mut buf = [0; 4];
+            let text: &str = c.encode_utf8(&mut buf);
+            if (spell_out(text) != text) != in_class(c) {
+                wrong.push(format!("U+{:04X}", c as u32));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "spelled out or not, unlike the renderer: {wrong:?}"
+        );
+    }
+
+    /// The host-key question quotes the host spelled out: a direction
+    /// override cannot turn its sentence around, nor a line break add a
+    /// paragraph of the host's own.
+    #[test]
+    fn the_host_key_question_spells_out_the_host() {
+        for imported in [false, true] {
+            let question = host_trust_message(OVERRIDE_HOST, 22, "SHA256:abc", imported);
+            assert!(question.contains(" db-<U+202E>1-dorp:22 "), "{question:?}");
+            assert!(!has_disguise(&question), "{question:?}");
+            let plain = host_trust_message("prod.example", 22, "SHA256:abc", imported);
+            let forged = host_trust_message("evil\n\nApproved by IT.", 22, "SHA256:abc", imported);
+            assert_eq!(forged.lines().count(), plain.lines().count(), "{forged:?}");
+            assert!(
+                forged.contains(r" evil\n\nApproved by IT.:22 "),
+                "{forged:?}"
+            );
+        }
+    }
+
+    /// The lines written into the terminal as a session connects quote the
+    /// host, the user name and the server's name spelled out.
+    #[test]
+    fn the_connect_lines_spell_out_host_user_name_and_name() {
+        let connecting = connecting_banner(OVERRIDE_HOST, 22, ZERO_WIDTH_USER, "password");
+        assert!(
+            connecting
+                .contains("Connecting to db-<U+202E>1-dorp:22 as ro<U+200B>ot (auth=password)"),
+            "{connecting:?}"
+        );
+        let connected = connected_banner(OVERRIDE_HOST, 22, ZERO_WIDTH_USER, "web\u{200B}-1");
+        assert!(
+            connected.contains("Connected to db-<U+202E>1-dorp:22 as ro<U+200B>ot (web<U+200B>-1)"),
+            "{connected:?}"
+        );
+        let trusted = first_trust_notice(None, OVERRIDE_HOST, "SHA256:abc").unwrap();
+        assert!(
+            trusted.contains("Trusted new host key for db-<U+202E>1-dorp (SHA256:abc)"),
+            "{trusted:?}"
+        );
+        for line in [&connecting, &connected, &trusted] {
+            assert!(!has_disguise(line), "{line:?}");
+        }
+    }
+
+    /// A value carrying an escape sequence or line breaks adds no control
+    /// character to those lines: each holds only its own line breaks, colour
+    /// and reset, and shows the value's controls spelled out. That includes
+    /// the fingerprint the "Trusted new host key" line quotes, which it reads
+    /// back from Known hosts.
+    #[test]
+    fn the_connect_lines_carry_no_control_character_of_a_value() {
+        let value = "x\u{1b}]0;owned\u{7}\u{9b}2J\r\n";
+        for line in [
+            connecting_banner(value, 22, value, value),
+            connected_banner(value, 22, value, value),
+            first_trust_notice(None, value, value).unwrap(),
+        ] {
+            let controls: Vec<char> = line.chars().filter(|c| c.is_control()).collect();
+            assert_eq!(
+                controls,
+                ['\r', '\n', '\u{1b}', '\u{1b}', '\r', '\n'],
+                "{line:?}"
+            );
+            assert!(
+                line.contains(r"x<U+001B>]0;owned<U+0007><U+009B>2J\r\n"),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// A connect error that quotes the host spells it out too, and an IPv6
+    /// literal is still bracketed.
+    #[test]
+    fn connect_errors_spell_out_the_host() {
+        for message in [
+            HostKeyRefusal::Mismatch.message(OVERRIDE_HOST, 22),
+            HostKeyRefusal::StoreUnavailable.message(OVERRIDE_HOST, 22),
+        ] {
+            assert!(message.contains(" db-<U+202E>1-dorp:22 "), "{message:?}");
+            assert!(!has_disguise(&message), "{message:?}");
+        }
+        assert_eq!(display_target(OVERRIDE_HOST, 22), "db-<U+202E>1-dorp:22");
+        assert_eq!(display_target("2001:db8::1", 22), "[2001:db8::1]:22");
     }
 
     fn session(session_id: &str, server_id: &str, started_at_ms: i64) -> SessionHandle {
@@ -2160,6 +2408,47 @@ mod ru4_tests {
         let (no_prompt, _) = prompt(true, Duration::ZERO);
         let session = open(&t.db, with_key(&files.plain), no_prompt).await;
         assert!(session.is_ok(), "{:?}", session.err());
+    }
+
+    /// A refused sign-in names the user spelled out ([`spell_out`]), for a
+    /// password and for a key: a zero-width space in the user name shows as
+    /// `<U+200B>`, so "ro<U+200B>ot" cannot read as "root".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_sign_in_names_the_user_spelled_out() {
+        let server = start_server(Behaviour::default()).await;
+        let t = test_db();
+        pin(&t.db, server.port, &server.blob_b64);
+        let as_user = |auth_method: &str| ConnectParams {
+            username: "ro\u{200B}ot".into(),
+            ..params(server.port, auth_method)
+        };
+        let wrong_password = ConnectParams {
+            password: Some(Zeroizing::new("not the password".into())),
+            ..as_user("password")
+        };
+        let refused_key = ConnectParams {
+            key_pem: Some(Zeroizing::new(key_files().plain)),
+            password: None,
+            ..as_user("publickey")
+        };
+        for (attempt, said) in [
+            (
+                wrong_password,
+                "Password authentication failed for user \"ro<U+200B>ot\".",
+            ),
+            (
+                refused_key,
+                "Public-key authentication failed: the server rejected the key for user \
+                 \"ro<U+200B>ot\".",
+            ),
+        ] {
+            let (no_prompt, _) = prompt(true, Duration::ZERO);
+            let err = open(&t.db, attempt, no_prompt)
+                .await
+                .err()
+                .expect("refused");
+            assert_eq!(err, said);
+        }
     }
 
     // ── Key files only from this computer's drives (Windows) ───────────────
