@@ -2,11 +2,11 @@
 
 **Last updated:** 2026-10-25  
 **Status:** describes v1.10.0 and the PuTTY session import, which is not released yet (Unreleased
-in the CHANGELOG). The import's passages - its row in the module table, the IPC count (111) and
-the Servers group, its mention where the renderer shows `server_save`'s key-file warning, and the
-PuTTY session import section - are checked against committed source at `a75b533`; everything else
-against `6c19b1b`, and nothing else it describes has changed since (later changes are listed in
-the CHANGELOG)  
+in the CHANGELOG). The import's passages - its line in the system diagram, its row in the module
+table, the IPC count (111) and the Servers group, its mention where the renderer shows
+`server_save`'s key-file warning, and the PuTTY session import section - are checked against
+committed source at `a75b533`; everything else against `6c19b1b`, and nothing else it describes
+has changed since (later changes are listed in the CHANGELOG)  
 **Platforms:** Windows and Linux  
 **Entry points:** `src-tauri/src/main.rs`, `src-tauri/src/lib.rs`, `src/renderer/index.html`,
 `src/renderer/app.js`
@@ -42,6 +42,7 @@ names and numbers can be re-derived with the commands in the sections that quote
 │ bitwarden/      HTTPS client, SSRF guard and sync                        │
 │ assistant/      model-provider client and MCP Streamable HTTP client     │
 │ config/         managed SSH config plus parser/serializer                │
+│ putty_sessions/ PuTTY's saved sessions as servers to save                │
 └──────────────────────────────────────────────────────────────────────────┘
                                 │
                 SQLite, filesystem, SSH/SFTP, HTTPS
