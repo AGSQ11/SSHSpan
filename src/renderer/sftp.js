@@ -4218,13 +4218,14 @@ function wireQueueEvents() {
       queueJobs.set(j.id, j);
       // Mirror failures into the tab's log + status strip, once per failure
       // (a retried job that fails again is logged again). The path is spelled
-      // out as the listing spells it, the backend's reason as its other texts
-      // are (spellOut, app.js).
+      // out as the listing spells it - a job with no remote path is named by
+      // its local one, name by name too (sftpSpellLocal) - and the backend's
+      // reason as its other texts are (spellOut, app.js).
       if (j.state !== 'failed') { sftpQueueLoggedFailures.delete(j.id); continue; }
       if (sftpQueueLoggedFailures.has(j.id)) continue;
       sftpQueueLoggedFailures.add(j.id);
       const tab = [...state.sessions.values()].find(t => t.sessionId === j.sessionId);
-      if (tab) sftpLog(tab.tabId, `transfer failed: ${sftpSpell(j.remotePath || j.localPath)} - ${spellOut(j.error || 'error')}`);
+      if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath ? sftpSpell(j.remotePath) : sftpSpellLocal(j.localPath)} - ${spellOut(j.error || 'error')}`);
     }
     renderQueuePanel();
   }).then(() => {
