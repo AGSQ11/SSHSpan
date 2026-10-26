@@ -90,9 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the assistant's record of each call and in the notices that name a tool. That record also
   shows a call's result and the backend's warning with these characters marked, the result's line
   breaks kept. The card, that record and the schema notice spell out the server's own name too,
-  since a backup restores it unchecked. The audit log still shows these names as stored. The model,
-  the backend and the stored record still get every name and result as they are (see
-  `docs/SECURITY.md`).
+  since a backup restores it unchecked. The model, the backend and the stored record still get
+  every name and result as they are (see `docs/SECURITY.md`).
 - **A server restored from a backup cannot pass for another in the MCP settings.** A server's name
   is checked when it is saved, not when a backup restores it, and the MCP settings showed it as
   stored: in its row, in the heading of its tools, in the question that removes it and in the
@@ -100,9 +99,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to save another server whose tool names it would share, a removal warning). These now spell out
   invisible and text-direction characters (`<U+202E>`) too; in a sentence of the renderer's own the
   name is also kept in a text-direction isolate, and a refusal or warning the backend words is
-  spelled out whole. A restore still keeps the name as it is - such an entry stays switched off
-  until it is saved, and a save refuses the name - and the model, the backend and the stored record
-  still get it as it is (see `docs/SECURITY.md`).
+  spelled out whole. The edit form's name field still holds the name as stored, since a save sends
+  it. A restore still keeps the name as it is - such an entry stays switched off until it is saved,
+  and a save refuses the name - and the model, the backend and the stored record still get it as it
+  is (see `docs/SECURITY.md`).
+- **A restored MCP server's URL and environment variable are spelled out in the MCP settings.** A
+  backup restores a server's URL and the name of the environment variable its token comes from
+  unchecked as well, and the MCP settings showed them as stored: the URL in the server's row and
+  its tooltip, the variable's name in the form's notices about it. A failed Test connection was
+  shown as worded, and it can quote what the server answered and a variable's name that a version
+  before v1.10.0 saved unchecked. These now spell out invisible and text-direction characters
+  (`<U+202E>`) too, the variable's name kept in a text-direction isolate in a sentence - as does
+  what the form says after a save that kept the variable, although a save refuses such a name. The
+  edit form still holds the values as stored, since a save sends them. The backend and the stored
+  record still get them as they are (see `docs/SECURITY.md`).
 
 ## [1.10.0] - 2026-10-18
 

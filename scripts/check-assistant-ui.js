@@ -49,6 +49,13 @@ const RESTORED_SHOWN = 'svc<U+202E>x';
 // first one's (both sanitize to svc_x).
 const PADDED_SERVER = 'svc-x' + String.fromCodePoint(0xA0);
 const PADDED_SHOWN = 'svc-x<U+00A0>';
+// Nor are the URL, the custom header's name and the name of the environment
+// variable a token comes from: a save normalizes the URL and checks the rest.
+const RESTORED_URL = 'https://mcp.example.test/m' + RLO + 'cp';
+const RESTORED_URL_SHOWN = 'https://mcp.example.test/m<U+202E>cp';
+const RESTORED_HEADER = 'X-Fixture' + RLO + 'Key';
+const RESTORED_ENV = 'FIXTURE' + RLO + '_TOKEN';
+const RESTORED_ENV_SHOWN = 'FIXTURE<U+202E>_TOKEN';
 const hidesAny = (text) => text.includes(RLO) || text.includes(ZWSP);
 const SPELLED_MCP = (name = 'svc') => MCP({ name, tools: [TOOL({ name: RLO_TOOL, display_name: ZWSP_DISPLAY, exposed_name: 'mcp__svc__echo_txt_exe' })] });
 // Argument names a server may choose for anything - credential-looking ones
@@ -66,10 +73,14 @@ const KEY_MOVE_DECLINED = 'Enter the API key for the new address.';
 const KEY_MOVE_CHANGED = 'The assistant settings changed while you were deciding - save them again.';
 const KEY_MOVE_TOO_QUICK = 'The question about sending the stored API key was answered within a second of opening - too fast to be a decision. Save again to be asked again.';
 const QUESTION_OPEN = 'Another question about sending a credential is still open - answer it, then save again.';
-// mcp_save_server's refusals (src-tauri/src/assistant/mcp.rs check_save_fields, save_server).
+// mcp_save_server's refusals (src-tauri/src/assistant/mcp.rs check_save_fields, save_server,
+// check_env_var_name).
 const NAME_RULE = "Server name must be non-empty and use only letters, digits and ! # $ % & ' * + - . ^ _ ` | ~ (no spaces).";
 const NAME_TAKEN = (other, name) => "An MCP server named '" + other + "' already exists and '" + name
   + "' would share its model-facing tool names - choose a different name.";
+const ENV_RULE = "The environment variable name must be 1 to 128 visible ASCII characters, without spaces or '='.";
+// What a connect says when the variable a bearer token comes from is not set (resolve_secret_value).
+const ENV_UNSET = (name) => "Environment variable '" + name + "' (MCP auth for header 'Authorization') is not set.";
 // What a server row says while its credential is not allowed yet.
 const NOT_CONFIRMED = 'Not confirmed - SSHSpan will not send this credential until you allow it';
 const MCP_SAVED_NOT_CONFIRMED_TEXT = 'Saved, but not confirmed - SSHSpan will not send its credential until you allow it.';
@@ -952,7 +963,8 @@ async function mcpConfirmChecks(browser, server) {
 // and in the notices that name a tool, so a tool cannot read as another -
 // while the backend, the model and the stored record get them as they are.
 // A server's own name that a backup restored unchecked is shown the same way,
-// there and in the MCP settings.
+// there and in the MCP settings, and so are the URL and the environment
+// variable's name restored with it.
 async function spelledNameChecks(browser, server) {
   await fixture(browser, server, 'MCP tool names in the tools list and its notices are spelled out', async (app) => {
     const { page } = app;
@@ -1062,9 +1074,10 @@ async function spelledNameChecks(browser, server) {
     await panel(app);
     await page.evaluate(() => { delete window.__replies.mcp_list_servers[0].tools[0].inputSchema; return mcpRefresh(); });
     await send(page); await idle(page);
-    const text = await transcript(page);
-    expect('the turn it stops says so, the names spelled out',
-      text.includes(RLO_SHOWN) && text.includes(RESTORED_SHOWN) && !hidesAny(text));
+    // Shown as it is worded (aiError): the names are spelled out once, so the
+    // isolates around them stay isolates and never read <U+2068> ... <U+2069>.
+    ok('the turn it stops says so, each name spelled out once and kept to itself',
+      await page.locator('.ai-msg.error').last().textContent(), named + ' has no inputSchema.');
   }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
   await fixture(browser, server, 'A restored MCP server\'s name is spelled out in the MCP settings', async (app) => {
     const { page } = app;
@@ -1083,6 +1096,10 @@ async function spelledNameChecks(browser, server) {
     const refuseSaves = (refusal) => page.evaluate((r) => { window.__replies.mcp_save_server = { $reject: r }; }, refusal);
     ok('its row names it spelled out', await row(0).locator('.mcp-server-name').textContent(), RESTORED_SHOWN);
     expect('nothing in the row is an override left unshown', !hidesAny(await row(0).textContent()));
+    // The form holds what a save sends: the name as stored.
+    await row(0).locator('button').filter({ hasText: /^Edit$/ }).click();
+    ok('its edit form holds the name as stored', await page.inputValue('#mcpName'), RESTORED_SERVER);
+    await page.click('#mcpCancelBtn');
     await row(0).locator('button').filter({ hasText: /^Review tools$/ }).click();
     const title = page.locator('.mcp-tools-title');
     ok('the heading of its tools names it spelled out', await title.textContent(),
@@ -1141,6 +1158,82 @@ async function spelledNameChecks(browser, server) {
     ok('the confirmation names it spelled out, kept to itself', await toastText(/is confirmed/),
       'MCP server "' + FSI + PADDED_SHOWN + PDI + '" is confirmed - SSHSpan may send its credential now.');
     ok('the backend is sent that name as it is', (await app.calls('mcp_save_server')).at(-1).args.name, PADDED_SERVER);
+  });
+  await fixture(browser, server, 'A restored MCP server\'s URL and environment variable are spelled out in the MCP settings', async (app) => {
+    const { page } = app;
+    // As a restore stores them: switched off, the token's source kept, the
+    // URL and the names as the backup had them.
+    const restored = (more) => MCP({ auth_type: 'bearer', auth_env_var: RESTORED_ENV, confirmed: false, status: 'unknown', protocol_version: null, tools: [], ...more });
+    await emulateCredentialQuestion(page, [
+      restored({ url: RESTORED_URL, auth_type: 'custom_header', auth_header_name: RESTORED_HEADER }),
+      restored({ id: 'm2', name: 'env-svc' }),
+      // Restored and saved before a save checked variable names (v1.10.0):
+      // confirmed, the name unchecked.
+      MCP({ id: 'm3', name: 'old-svc', auth_type: 'bearer', auth_env_var: RESTORED_ENV, tools: [] }),
+    ]);
+    await settings(page);
+    const row = page.locator('.mcp-server-row').first();
+    const url = row.locator('.mcp-server-url');
+    ok('its row shows the URL spelled out', await url.textContent(), RESTORED_URL_SHOWN);
+    ok('so does the URL\'s tooltip', await url.getAttribute('title'), RESTORED_URL_SHOWN);
+    expect('nothing in the row is an override left unshown', !hidesAny(await row.textContent()));
+    // The form holds what a save sends: the values as stored.
+    await row.locator('button').filter({ hasText: /^Edit$/ }).click();
+    ok('the form holds the URL and the names as stored',
+      [await page.inputValue('#mcpUrl'), await page.inputValue('#mcpHeaderName'), await page.inputValue('#mcpAuthEnvVar')],
+      [RESTORED_URL, RESTORED_HEADER, RESTORED_ENV]);
+    // A save stores the URL normalized (its path percent-encoded), so the form
+    // counts it as a new URL and says where the variable's token goes.
+    const notice = page.locator('#mcpRebindWarn');
+    ok('the notice that the token goes to the new settings names the variable spelled out, kept to itself',
+      await notice.textContent(), 'Changing the URL or the auth settings sends the token from environment variable '
+        + FSI + RESTORED_ENV_SHOWN + PDI + ' to the new settings - change the variable name if that is not intended.');
+    // The backend refuses such a variable's name, typed or kept.
+    await page.evaluate((refusal) => {
+      window.__emulatedSave = window.__replies.mcp_save_server;
+      window.__replies.mcp_save_server = { $reject: refusal };
+      return mcpSaveServer();
+    }, ENV_RULE);
+    ok('the backend is sent the URL and the names as they are', (await app.calls('mcp_save_server')).at(-1).args, {
+      id: 'm1', name: 'svc', url: RESTORED_URL, auth_type: 'custom_header',
+      auth_header_name: RESTORED_HEADER, auth_secret: null, auth_env_var: RESTORED_ENV,
+    });
+    // A Test of the record an older version confirmed quotes the variable
+    // when it is not set.
+    await page.evaluate((refusal) => {
+      window.__replies.mcp_test_connection = { $reject: refusal };
+      return mcpTestConnection('m3');
+    }, ENV_UNSET(RESTORED_ENV));
+    ok('a failed Test that quotes it is spelled out beside the row',
+      await page.locator('.mcp-server-row').nth(2).locator('.mcp-server-error').textContent(), 'Last test failed: ' + ENV_UNSET(RESTORED_ENV_SHOWN));
+    ok('and in its toast', (await toasts(page)).filter((t) => /is not set/.test(t)), [ENV_UNSET(RESTORED_ENV_SHOWN)]);
+    // A record whose URL a save keeps: with no secret typed, its variable
+    // stays in effect, which the form says.
+    await page.click('#mcpCancelBtn');
+    await page.locator('.mcp-server-row').nth(1).locator('button').filter({ hasText: /^Edit$/ }).click();
+    await page.selectOption('#mcpSecretSource', 'stored');
+    const kept = FSI + RESTORED_ENV_SHOWN + PDI;
+    ok('the notice that the variable stays in effect names it spelled out, kept to itself', await notice.textContent(),
+      'No secret entered: the environment variable ' + kept + ' stays in effect. Type a secret to replace it with a stored one.');
+    // The backend refuses to keep it too: save_server checks a kept
+    // variable's name as well.
+    await page.evaluate(() => mcpSaveServer());
+    ok('a save that keeps it sends no variable', (await app.calls('mcp_save_server')).at(-1).args, {
+      id: 'm2', name: 'env-svc', url: 'https://mcp.example.test/mcp', auth_type: 'bearer',
+      auth_header_name: null, auth_secret: null, auth_env_var: null,
+    });
+    // The stub then answers the same save as if it had kept the variable, to
+    // show the renderer does not count on that refusal: what it says next
+    // names the variable spelled out too.
+    await page.evaluate(() => {
+      window.__replies.mcp_save_server = window.__emulatedSave;
+      window.__answer = 'allow';
+      return mcpSaveServer();
+    });
+    ok('the toast that says it stays in effect names it spelled out, kept to itself',
+      (await toasts(page)).filter((t) => /stays in effect/.test(t)), ['MCP server saved - the environment variable ' + kept + ' stays in effect.']);
+    ok('so does the status line', await page.textContent('#mcpStatus'),
+      'Saved. No secret was entered, so the environment variable ' + kept + ' stays in effect.');
   });
 }
 
