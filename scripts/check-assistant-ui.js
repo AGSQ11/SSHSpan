@@ -1074,9 +1074,10 @@ async function spelledNameChecks(browser, server) {
     await panel(app);
     await page.evaluate(() => { delete window.__replies.mcp_list_servers[0].tools[0].inputSchema; return mcpRefresh(); });
     await send(page); await idle(page);
-    const text = await transcript(page);
-    expect('the turn it stops says so, the names spelled out',
-      text.includes(RLO_SHOWN) && text.includes(RESTORED_SHOWN) && !hidesAny(text));
+    // Shown as it is worded (aiError): the names are spelled out once, so the
+    // isolates around them stay isolates and never read <U+2068> ... <U+2069>.
+    ok('the turn it stops says so, each name spelled out once and kept to itself',
+      await page.locator('.ai-msg.error').last().textContent(), named + ' has no inputSchema.');
   }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
   await fixture(browser, server, 'A restored MCP server\'s name is spelled out in the MCP settings', async (app) => {
     const { page } = app;
