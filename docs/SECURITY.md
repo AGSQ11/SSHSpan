@@ -1,16 +1,10 @@
 # SSHSpan security model
 
-**Last updated:** 2026-10-25  
-**Status:** describes v1.10.0 and three changes that are not released yet (Unreleased in the
-CHANGELOG): the PuTTY session import, how MCP tool names and results are shown, and how the MCP
-settings show a server's name restored from a backup. The passages about the import - in [Vault
-lock and locked-state policy](#vault-lock-and-locked-state-policy) the sentence on an import a lock
-stops and the bullet on the two listings of hosts, the PuTTY session import section, and the
-accepted limitation on how the server list shows names - are checked against committed source at
-`a75b533`; the passage on MCP tool names in [Renderer-attested
-approvals](#renderer-attested-approvals) against `370be24`, and its paragraph on the server's own
-name against `a49f76b`; the release-signing and Windows CI passages against `38e586e`; everything
-else against `6c19b1b`, and nothing else it describes has changed since  
+**Last updated:** 2026-10-26  
+**Status:** describes v1.10.0 and the changes listed under Unreleased in the CHANGELOG. The
+passages about those changes are checked against the pull request that made each (#89, #91,
+#92, #94, #95, #96, #99); the release-signing and Windows CI passages against `38e586e`;
+everything else against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -388,7 +382,8 @@ program running as the user can write, so the listing treats every one as untrus
   unticked and its row says so. A user name with one (a control character included) is not put in
   the username field, which holds what is saved; the row shows it spelled out instead. A session
   can still be ticked, and its name and host are then saved as they are, those characters included
-  (`server_save` trims only white space at either end, as for every server).
+  (`server_save` trims only white space at either end, as for every server), and shown spelled out
+  (see [Names of saved servers](#names-of-saved-servers)).
 
 ### SFTP remote-side controls
 
@@ -573,9 +568,11 @@ and result as they are. One place still shows these names as they are stored: th
 
 ### Names a server chooses
 
-A file name in the file browser is whatever the server's owner chose. Wherever the renderer shows
-one (the lists, the path bar, questions, toasts and the activity log) it spells out control,
-invisible, zero-width and text-direction characters, unusual spaces, the dots that only stand in for
+A file name in the file browser is whatever the server's owner chose. Where the renderer shows one
+(the lists, the path bar, the transfer queue, questions, toasts and the activity log, save the
+places named further down) it spells out control, invisible, zero-width and text-direction
+characters, unusual spaces, the dots that
+only stand in for
 "." and leading, trailing and repeated spaces as `<U+XXXX>` (and a line break as `\n`); a name that
 shows nothing (blank, mark or format characters only, U+2800 and U+1D159 included) is spelled out
 whole, and a name that is nothing but dots, spaces and look-alikes of dots has those look-alikes and
@@ -584,15 +581,53 @@ still read as `..`). The listing flags such a name, and the name `~` (it can rea
 folder), with a "!" and says why on hover; single-character emoji, symbols and punctuation are
 visible content and are not flagged (an emoji written with a variation selector or a zero-width
 joiner is spelled out and flagged). Inside a sentence a name is kept in its own text-direction
-isolate. A file
+isolate. A text field that edits a name or a path (Rename's, the remote path bar's while it is typed
+in, the local pane's path field, Move to...'s and a new bookmark's) holds it as it is, since that is
+what is renamed, opened or saved. A file
 dropped onto a remote folder with a flagged name, from the OS or from the local pane, asks first,
 and a move says which folder it goes into and which folder that is in. So a hostile name cannot pass
 for the parent folder, reorder the words of a question or add lines to it. The backend's own texts
 in the SFTP edit flow (a refusal to open an edit, a Stop editing answer that is not ok, a failed
-save-back, a refused answer to a conflict) are shown spelled out in the same way. This is display
-and confirmation hygiene in the renderer: the backend still
+save-back, a refused answer to a conflict), its notes on what it skipped or renamed when it queued
+a transfer, a refusal to queue or send one, the reason a transfer failed and its errors when a
+listing, a new folder or file, a rename, a move, a delete, a permission change, a folder size, a
+search or a download fails are shown spelled out in the same way. This
+is display and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).
+
+### Names of saved servers
+
+A saved server's name, host and user name come from the server form, the `~/.ssh/config` and
+PuTTY imports, a Bitwarden sync or a backup. The renderer shows them the way it shows a name a
+server chooses: control, invisible, zero-width and text-direction characters and spaces other than
+U+0020 are spelled out as `<U+XXXX>`, and the value is kept in a text-direction isolate of its own
+(a `<bdi>`, or U+2068 ... U+2069 in plain text). It does so in:
+
+- the server list and the command palette;
+- the terminal header, tabs and status line, and the password prompt;
+- the questions before deleting a server, closing or restarting a session and forgetting a pinned
+  host key, and toasts;
+- the "Use this key to connect" picker, the `~/.ssh/config` import menu, Known hosts and the audit
+  log;
+- the file browser's "Send to", the transfer queue (its notes included) and the edit-conflict
+  question;
+- the YOLO question and the assistant's record of what `get_session_info` returned.
+
+So a name with a direction override (U+202E) or a zero-width space cannot read as another server's
+or turn the words around it. A backend message that can quote the host (a failed connect or
+connection test) is spelled out whole, and a tooltip says what its element shows.
+
+Only the display changes: the vault, the server form's fields, what a save sends and what the
+assistant's model is given keep every value as it is. Two kinds of text treat these characters
+differently:
+
+- the Bitwarden sync's approval list strips them (see
+  [Bitwarden / Vaultwarden](#bitwarden--vaultwarden));
+- the backend's own texts - the native host-key question and the lines it writes into the terminal
+  as it connects ("Connecting to", "Connected to ... as ...", "Trusted new host key for") - drop
+  control characters from the host, the user name and the server's name but do not spell out the
+  others.
 
 ## Network clients
 
@@ -860,11 +895,6 @@ Each is a known, deliberate state, with the reason it was left.
 - **`SSHSPAN_DB` exists in debug builds only.** It is compiled out of release builds.
 - **MCP tool arguments get no backend disguising-character check.** The model chooses them; the
   approval card's escaping of invisible and text-direction characters is the control.
-- **The server list shows names as they are.** A row of the server list shows the server's name and
-  `user@host:port` as they are, without spelling out characters that do not show, so a name with a
-  text-direction override (U+202E) takes effect there. This is older than the PuTTY import, which
-  starts a session whose name or host has such a character unticked, so saving one as a server
-  takes a deliberate tick.
 - **A revoke that commits while `tools/call` is on the wire cannot stop that call.** The gate is
   checked right before the request is sent, and a request already sent cannot be recalled.
 - **`definition_changed` clears if a server reverts** to the approved definition; the tool stays

@@ -219,13 +219,16 @@ async function aiCommitLevel(tabId, level, prev) {
 }
 
 /// Which session a YOLO switch arms, in words: with several tabs open the
-/// dialog must say which host it hands over (A4-21).
+/// dialog must say which host it hands over (A4-21). The server's name, user
+/// name and host are spelled out and each kept to itself (serverInText,
+/// app.js), so they cannot read as another server's.
 function aiYoloTargetText(tabId) {
   const tab = (window.state && window.state.sessions && window.state.sessions.get(tabId)) || null;
   if (!tab) return 'This arms YOLO for the current session tab only.';
   const server = window.state.servers ? window.state.servers.find((sv) => sv.id === tab.serverId) : null;
-  const who = (server && server.username ? server.username + '@' : '') + (tab.host || '?') + (tab.port ? ':' + tab.port : '');
-  return 'This arms YOLO for one session tab only: "' + (tab.serverName || 'session') + '" (' + who + ').';
+  const who = (server && server.username ? serverInText(server.username) + '@' : '') + serverInText(tab.host || '?')
+    + (tab.port ? ':' + tab.port : '');
+  return 'This arms YOLO for one session tab only: "' + (tab.serverName ? serverInText(tab.serverName) : 'session') + '" (' + who + ').';
 }
 
 function aiOpenYoloModal(tabId, prev) {
@@ -983,7 +986,10 @@ async function aiRunTool(tabId, tc) {
   }
   if (name === 'get_session_info') {
     const info = aiGetSessionInfo(tabId);
-    event({ source: 'none', outcome: 'ok', result: info });
+    // The model gets the values as they are; the row shows them spelled out
+    // - the server's name, host and user name among them (see serverInText,
+    // app.js).
+    event({ source: 'none', outcome: 'ok', result: spellOut(info) });
     return info;
   }
   if (name === 'propose_command') {
