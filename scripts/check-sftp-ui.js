@@ -1057,6 +1057,58 @@ async function scenarioQueueNames(browser, server) {
     check('no page errors', app.errors, []);
   });
 
+  // A folder row can name a run of folders ("var/www/html"). Its label is
+  // spelled out name by name, as a path is (sftpSpell takes it apart at "/"),
+  // so a folder with a space at its end, or named with look-alike dots, is
+  // spelled out inside a run too.
+  await withFiles(browser, server, spec, 'queue folder runs spelled out name by name', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await emitJobs(page, [
+      JOB(1, 'y.txt', 'queued', { remotePath: '/data/docs /sub/y.txt' }),
+      JOB(2, 'z.txt', 'queued', { remotePath: `/var/${LISU}/www/z.txt` }),
+    ]);
+    await settle(page);
+    check('each folder in a run is spelled out on its own: one with a space at its end, one of look-alike dots', await listed(page), [
+      ['host-t1'],
+      ['data/docs<U+0020>/sub'],
+      ['y.txt', 'y.txt'],
+      ['var/<U+A4F8><U+A4F8>/www'],
+      ['z.txt', 'z.txt'],
+    ]);
+    check('no page errors', app.errors, []);
+  });
+
+  // A job without a note (null from the backend while it runs, or none at
+  // all) or without a server name has those cells empty - spellOut (app.js)
+  // gives "" for null and undefined - and a cancelled one without a note says
+  // "Cancelled".
+  await withFiles(browser, server, spec, 'queue fields a job does not have', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    check('a job without a server name or a note shows neither, never "null" or "undefined"', await page.evaluate(() => {
+      const bare = (id, state, extra) => Object.assign({ id, kind: 'download', sessionId: 'sess-t1', remotePath: `/home/u/${id}.txt`, size: 10, bytesDone: 0, state }, extra);
+      return [
+        bare('q', 'queued', { serverName: null, error: null }),
+        bare('a', 'active'),
+        bare('c', 'cancelled'),
+        bare('s', 'queued', { kind: 'serverCopy', targetServerName: 'host-b' }),
+      ].map((j) => {
+        const row = sftpQueueBuildRow(j);
+        sftpQueueFillRow(row, j, 0);
+        const route = row.querySelector('.q-route');
+        const note = row.querySelector('.q-err');
+        return [route.textContent, route.title, note.textContent, note.title];
+      });
+    }), [
+      ['', '', '', ''],
+      ['', '', '', ''],
+      ['', '', 'Cancelled', ''],
+      [' → host-b', inText('') + ' → ' + inText('host-b'), '', ''],
+    ]);
+    check('no page errors', app.errors, []);
+  });
+
   // A literal "<U+202E>abc" and a real U+202E before "abc" read the same once
   // spelled out, but they are two folders. In the order a U+202E counts for
   // nothing (Intl collation), where a spelled-out "<U+202E>" sorts first. The
