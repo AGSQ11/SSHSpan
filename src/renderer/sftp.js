@@ -2403,7 +2403,7 @@ function openSftpFileMenu(x, y, tabId, entry) {
     t.tabId !== tabId && window.tabSessionLive(t.tabId) && t.sftpReady);
   if (others.length > 0 && !multi) {
     items.push('sep');
-    for (const other of others) mk('Send to ' + spellOut(other.serverName), 'send', () => sftpSendTo(tabId, fullPath, other));
+    for (const other of others) mk('Send to ' + serverInText(other.serverName), 'send', () => sftpSendTo(tabId, fullPath, other));
   }
 
   openMenu({ x, y }, items, { label: multi ? selected.length + ' items' : 'File ' + sftpSpell(entry.name) });

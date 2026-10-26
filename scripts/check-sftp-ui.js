@@ -4193,6 +4193,26 @@ async function scenarioSearchCapsSendTo(browser, server) {
       'Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to \u2068host-t2\u2069.');
     yes('and in its toast', (await toasts(page)).includes('Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to \u2068host-t2\u2069 - see Transfers.'),
       JSON.stringify(await toasts(page)));
+    // The file menu's "Send to" item names the server the same way
+    // (serverInText, app.js), so a name written right to left cannot pull
+    // the characters around it into its own direction. The menu offers only
+    // tabs whose shell is live: t2 gets a terminal and a session, as a
+    // connect gives it.
+    await page.evaluate(() => { window.createTabTerminal('t2'); window.setTabSession('t2', 'sess-t2'); });
+    yes('(set-up) t2 is connected', await page.evaluate(() => window.tabSessionLive('t2')));
+    await page.evaluate(() => activateSessionSurface('t1'));
+    await rowEvent(page, 'contextmenu', 'notes.txt');
+    await settle(page, 80);
+    const items = (await menuItems(page)) || [];
+    check('the file menu\'s "Send to" keeps the server\'s name to itself', items.filter((t) => t.startsWith('Send to ')), ['Send to ' + inText('host-t2')]);
+    await page.keyboard.press('Escape');
+    await page.evaluate(() => { state.sessions.get('t2').serverName = 'host\u202Ecba'; });
+    await rowEvent(page, 'contextmenu', 'notes.txt');
+    await settle(page, 80);
+    const turned = (await menuItems(page)) || [];
+    check('a server name with a direction override is spelled out there too', turned.filter((t) => t.startsWith('Send to ')), ['Send to ' + inText('host<U+202E>cba')]);
+    check('and no menu item holds the override as it is', turned.filter((t) => t.includes('\u202E')), []);
+    await page.keyboard.press('Escape');
     check('no page errors', app.errors, []);
   });
   // A path picked in the save dialog inside SSHSpan's own program or data
