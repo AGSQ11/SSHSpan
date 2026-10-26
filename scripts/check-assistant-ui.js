@@ -58,6 +58,11 @@ const RESTORED_URL_SHOWN = 'https://mcp.example.test/m<U+202E>cp';
 const RESTORED_HEADER = 'X-Fixture' + RLO + 'Key';
 const RESTORED_ENV = 'FIXTURE' + RLO + '_TOKEN';
 const RESTORED_ENV_SHOWN = 'FIXTURE<U+202E>_TOKEN';
+// A tool's name that reads like a provider's error ("... (400) {json}"), its
+// message the JSON escape of U+202E: a backslash and u202e, six characters
+// that show as they are.
+const RLO_ESCAPE = String.fromCodePoint(0x5C) + 'u202e';
+const POSING_TOOL = 'x (400) {"message":"' + RLO_ESCAPE + '"}';
 const hidesAny = (text) => text.includes(RLO) || text.includes(ZWSP);
 const SPELLED_MCP = (name = 'svc') => MCP({ name, tools: [TOOL({ name: RLO_TOOL, display_name: ZWSP_DISPLAY, exposed_name: 'mcp__svc__echo_txt_exe' })] });
 // Argument names a server may choose for anything - credential-looking ones
@@ -796,6 +801,37 @@ async function providerChecks(browser, server) {
     expect('not-configured error includes a working setup action', await setup.count() > 0);
     if (await setup.count()) { await setup.last().click(); await page.waitForTimeout(50); expect('setup action opens assistant settings', await page.locator('.settings-section[data-section="assistant"]').isVisible()); }
   });
+  // A provider's error quotes its answer, which the backend only cuts at 300
+  // characters: text from outside, shown spelled out once its message is
+  // read out of it - decoding a JSON escape makes the very characters that
+  // spelling out is for.
+  await fixture(browser, server, 'A provider\'s error reads as its message, spelled out', async (app) => {
+    const { page } = app; await settings(page);
+    await page.evaluate((refusal) => { window.__replies.assistant_test_connection = { $reject: refusal }; },
+      'Provider error (400) {"error":{"message":"bad' + RLO_ESCAPE + 'key"}}');
+    await page.click('#aiTestBtn');
+    await page.waitForFunction(() => document.getElementById('aiStatus').classList.contains('err'));
+    ok('Save & test shows its message, the override its escape stands for spelled out',
+      await page.textContent('#aiStatus'), 'Provider error (400): bad<U+202E>key');
+    await panel(app);
+    const shown = async (refusal) => {
+      await page.evaluate((r) => { window.__replies.assistant_chat = { $reject: r }; }, refusal);
+      await send(page); await idle(page);
+      return page.locator('.ai-msg.error').last().textContent();
+    };
+    ok('a chat\'s provider error is still tidied to its message',
+      await shown('Provider error (400) {"error":{"message":"bad key"}}'), 'Provider error (400): bad key');
+    ok('one whose body was cut short too, the escaped override spelled out',
+      await shown('Provider error (400). {"error":{"message":"bad' + RLO_ESCAPE + 'key","type":"invalid_req'), 'Provider error (400): bad<U+202E>key');
+    ok('a body that is not JSON is shown as it came, spelled out',
+      await shown('Provider server error (502). bad' + RLO + 'gateway'), 'Provider server error (502). bad<U+202E>gateway');
+    ok('so is a JSON body with no message in it',
+      await shown('Provider error (400). {"error":{"code":"x' + RLO + 'y"}}'), 'Provider error (400). {"error":{"code":"x<U+202E>y"}}');
+    // What comes before the message read out can be the provider's as well:
+    // a body that quotes "(123) {...}" further on is read up to there.
+    ok('the provider\'s text before a message read out of its body is spelled out too',
+      await shown('Provider error (400). bad' + RLO + ' request (123) {"message":"m"}'), 'Provider error (400). bad<U+202E> request (123): m');
+  });
 }
 
 async function lockedSettingsChecks(browser, server) {
@@ -1119,6 +1155,14 @@ async function spelledNameChecks(browser, server) {
     // isolates around them stay isolates and never read <U+2068> ... <U+2069>.
     ok('the turn it stops says so, each name spelled out once and kept to itself',
       await page.locator('.ai-msg.error').last().textContent(), named + ' has no inputSchema.');
+    // Nor is it read as a provider's error when the tool is named like one
+    // (POSING_TOOL): cut short at "(400)", it left the isolate around the
+    // name open and decoded the escape into the override it stands for.
+    await page.evaluate((tool) => { window.__replies.mcp_list_servers[0].tools[0].name = tool; return mcpRefresh(); }, POSING_TOOL);
+    await send(page); await idle(page);
+    ok('a tool named like a provider\'s error is named in full, kept to itself',
+      await page.locator('.ai-msg.error').last().textContent(),
+      'MCP tool "' + FSI + POSING_TOOL + PDI + '" from server "' + FSI + RESTORED_SHOWN + PDI + '" has no inputSchema.');
   }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
   await fixture(browser, server, 'A restored MCP server\'s name is spelled out in the MCP settings', async (app) => {
     const { page } = app;

@@ -131,6 +131,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what the form says after a save that kept the variable, although a save refuses such a name. The
   edit form still holds the values as stored, since a save sends them. The backend and the stored
   record still get them as they are (see `docs/SECURITY.md`).
+- **An MCP tool named like a provider's error is no longer read as one.** The assistant shows a
+  provider's error that quotes its answer (`... (400) {json}`) as the provider's own message,
+  decoding the message's JSON escapes, and it treated the notice that an MCP tool's input schema
+  cannot be used the same way. A tool named like `x (400) {"message":"..."}`, with the JSON escape
+  of U+202E as its message, had that notice cut at "(400)": the text-direction isolate around its
+  name was left open and a real direction override (U+202E) reached the transcript. Only a tool
+  whose schema is not an object can do this - only a backup restores one - and only once it is
+  enabled. The notice is now shown as worded; only a provider's refusal is read as one. That
+  refusal is text from outside too (the backend passes on up to 300 characters of the provider's
+  answer as they are), so the transcript and the status line after Save & test now spell it out
+  (`<U+202E>`), an override written as an escape included (see `docs/SECURITY.md`).
 
 ## [1.10.0] - 2026-10-18
 
