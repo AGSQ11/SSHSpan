@@ -1,15 +1,10 @@
 # SSHSpan security model
 
-**Last updated:** 2026-10-25  
-**Status:** describes v1.10.0, the PuTTY session import and how the names of saved servers and the
-remote names in the transfer queue and the activity log are shown; the import and the names are
-not released yet (Unreleased in the CHANGELOG). The passages about the
-import - in [Vault lock and locked-state policy](#vault-lock-and-locked-state-policy) the sentence
-on an import a lock stops and the bullet on the two listings of hosts, and the PuTTY session import
-section - are checked against committed source at `a75b533`; the Names of saved servers section
-against `c2fea62`; the Names a server chooses section against `02547ac`; the release-signing and
-Windows CI passages against `38e586e`; everything else against `6c19b1b`, and nothing else it
-describes has changed since  
+**Last updated:** 2026-10-26  
+**Status:** describes v1.10.0 and the changes listed under Unreleased in the CHANGELOG. The
+passages about those changes are checked against the pull request that made each (#89, #91,
+#94, #96, #99); the release-signing and Windows CI passages against `38e586e`; everything else
+against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
