@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it only to generate an ECDSA key, import an ECDSA `.ppk` and export one as PKCS#8 (private or
   public); SSH sessions already used 0.7. Those now use `p256`/`p384`/`p521` 0.14, and a PPK import
   or PKCS#8 export gives the same bytes as before. (#90)
+- **A server's name cannot pass for another's.** A saved server's name, host and user name were
+  shown as they are, so a text-direction override (U+202E) turned what followed it around and a
+  zero-width space went unseen. The renderer now spells such characters out (`<U+202E>`), each
+  value in a text-direction isolate of its own, in:
+  - the server list, the palette, the terminal header, tabs and status line, and the password
+    prompt;
+  - the questions, toasts, the "Use this key to connect" picker and the `~/.ssh/config` import;
+  - Known hosts, the audit log, the file browser, the transfer queue and the assistant's tool log.
+
+  A connect or connection-test error that quotes the host is spelled out too. The vault and the
+  server form keep the values as they are. The Bitwarden approval list still strips these
+  characters, and the backend's host-key question and terminal lines still only drop control
+  characters (see `docs/SECURITY.md`). (#91)
 
 ## [1.10.0] - 2026-10-18
 

@@ -3467,16 +3467,17 @@ async function scenarioSearchCapsSendTo(browser, server) {
     await page.evaluate(() => { window.__replies.sftp_server_copy = { ok: true, added: 1 }; });
     await page.evaluate(() => sftpSendTo('t1', '/home/u/notes.txt', state.sessions.get('t2')));
     await settle(page);
-    // The name kept to itself (U+2068 ... U+2069), as in every SFTP sentence.
-    check('"Send to" says the file is queued, not sent', await page.textContent('#termStrip'), 'Queued \u2068notes.txt\u2069 for sending to host-t2.');
-    yes('and so does its toast', (await toasts(page)).includes('Queued \u2068notes.txt\u2069 for sending to host-t2 - see Transfers.'), JSON.stringify(await toasts(page)));
+    // The file's name and the server's kept to themselves (U+2068 ...
+    // U+2069), as in every SFTP sentence.
+    check('"Send to" says the file is queued, not sent', await page.textContent('#termStrip'), 'Queued \u2068notes.txt\u2069 for sending to \u2068host-t2\u2069.');
+    yes('and so does its toast', (await toasts(page)).includes('Queued \u2068notes.txt\u2069 for sending to \u2068host-t2\u2069 - see Transfers.'), JSON.stringify(await toasts(page)));
     // A name that is not what it shows: spelled out there too, so the
     // override cannot turn the rest of the sentence around.
     await page.evaluate(() => sftpSendTo('t1', '/home/u/invoice\u202Etxt.exe', state.sessions.get('t2')));
     await settle(page);
     check('a name with a direction override is spelled out in the status line', await page.textContent('#termStrip'),
-      'Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to host-t2.');
-    yes('and in its toast', (await toasts(page)).includes('Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to host-t2 - see Transfers.'),
+      'Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to \u2068host-t2\u2069.');
+    yes('and in its toast', (await toasts(page)).includes('Queued \u2068invoice<U+202E>txt.exe\u2069 for sending to \u2068host-t2\u2069 - see Transfers.'),
       JSON.stringify(await toasts(page)));
     check('no page errors', app.errors, []);
   });

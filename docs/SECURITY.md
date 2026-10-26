@@ -1,13 +1,13 @@
 # SSHSpan security model
 
 **Last updated:** 2026-10-25  
-**Status:** describes v1.10.0 and the PuTTY session import, which is not released yet (Unreleased
-in the CHANGELOG). The passages about the import - in [Vault lock and locked-state
-policy](#vault-lock-and-locked-state-policy) the sentence on an import a lock stops and the bullet
-on the two listings of hosts, the PuTTY session import section, and the accepted limitation on how
-the server list shows names - are checked against committed source at `a75b533`; the
-release-signing and Windows CI passages against `38e586e`; everything else against `6c19b1b`, and
-nothing else it describes has changed since  
+**Status:** describes v1.10.0, the PuTTY session import and how the names of saved servers are
+shown; the last two are not released yet (Unreleased in the CHANGELOG). The passages about the
+import - in [Vault lock and locked-state policy](#vault-lock-and-locked-state-policy) the sentence
+on an import a lock stops and the bullet on the two listings of hosts, and the PuTTY session import
+section - are checked against committed source at `a75b533`; the Names of saved servers section
+against `c2fea62`; the release-signing and Windows CI passages against `38e586e`; everything else
+against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -385,7 +385,8 @@ program running as the user can write, so the listing treats every one as untrus
   unticked and its row says so. A user name with one (a control character included) is not put in
   the username field, which holds what is saved; the row shows it spelled out instead. A session
   can still be ticked, and its name and host are then saved as they are, those characters included
-  (`server_save` trims only white space at either end, as for every server).
+  (`server_save` trims only white space at either end, as for every server), and shown spelled out
+  (see [Names of saved servers](#names-of-saved-servers)).
 
 ### SFTP remote-side controls
 
@@ -565,6 +566,39 @@ save-back, a refused answer to a conflict) are shown spelled out in the same way
 and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).
+
+### Names of saved servers
+
+A saved server's name, host and user name come from the server form, the `~/.ssh/config` and
+PuTTY imports, a Bitwarden sync or a backup. The renderer shows them the way it shows a name a
+server chooses: control, invisible, zero-width and text-direction characters and spaces other than
+U+0020 are spelled out as `<U+XXXX>`, and the value is kept in a text-direction isolate of its own
+(a `<bdi>`, or U+2068 ... U+2069 in plain text). It does so in:
+
+- the server list and the command palette;
+- the terminal header, tabs and status line, and the password prompt;
+- the questions before deleting a server, closing or restarting a session and forgetting a pinned
+  host key, and toasts;
+- the "Use this key to connect" picker, the `~/.ssh/config` import menu, Known hosts and the audit
+  log;
+- the file browser's "Send to", the transfer queue (its notes included) and the edit-conflict
+  question;
+- the YOLO question and the assistant's record of what `get_session_info` returned.
+
+So a name with a direction override (U+202E) or a zero-width space cannot read as another server's
+or turn the words around it. A backend message that can quote the host (a failed connect or
+connection test) is spelled out whole, and a tooltip says what its element shows.
+
+Only the display changes: the vault, the server form's fields, what a save sends and what the
+assistant's model is given keep every value as it is. Two kinds of text treat these characters
+differently:
+
+- the Bitwarden sync's approval list strips them (see
+  [Bitwarden / Vaultwarden](#bitwarden--vaultwarden));
+- the backend's own texts - the native host-key question and the lines it writes into the terminal
+  as it connects ("Connecting to", "Connected to ... as ...", "Trusted new host key for") - drop
+  control characters from the host, the user name and the server's name but do not spell out the
+  others.
 
 ## Network clients
 
@@ -832,11 +866,6 @@ Each is a known, deliberate state, with the reason it was left.
 - **`SSHSPAN_DB` exists in debug builds only.** It is compiled out of release builds.
 - **MCP tool arguments get no backend disguising-character check.** The model chooses them; the
   approval card's escaping of invisible and text-direction characters is the control.
-- **The server list shows names as they are.** A row of the server list shows the server's name and
-  `user@host:port` as they are, without spelling out characters that do not show, so a name with a
-  text-direction override (U+202E) takes effect there. This is older than the PuTTY import, which
-  starts a session whose name or host has such a character unticked, so saving one as a server
-  takes a deliberate tick.
 - **A revoke that commits while `tools/call` is on the wire cannot stop that call.** The gate is
   checked right before the request is sent, and a request already sent cannot be recalled.
 - **`definition_changed` clears if a server reverts** to the approved definition; the tool stays
