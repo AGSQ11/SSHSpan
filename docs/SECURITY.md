@@ -2,13 +2,14 @@
 
 **Last updated:** 2026-10-25  
 **Status:** describes v1.10.0, the PuTTY session import and how the names of saved servers and the
-remote names in the transfer queue are shown; the last two are not released yet (Unreleased in the
-CHANGELOG). The passages about the
+remote names in the transfer queue and the activity log are shown; the import and the names are
+not released yet (Unreleased in the CHANGELOG). The passages about the
 import - in [Vault lock and locked-state policy](#vault-lock-and-locked-state-policy) the sentence
 on an import a lock stops and the bullet on the two listings of hosts, and the PuTTY session import
 section - are checked against committed source at `a75b533`; the Names of saved servers section
-against `c2fea62`; the release-signing and Windows CI passages against `38e586e`; everything else
-against `6c19b1b`, and nothing else it describes has changed since  
+against `c2fea62`; the Names a server chooses section against `577a56b`; the release-signing and
+Windows CI passages against `38e586e`; everything else against `6c19b1b`, and nothing else it
+describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -547,9 +548,10 @@ longer set is shortened, and "Show all arguments (N characters)" opens the compl
 
 ### Names a server chooses
 
-A file name in the file browser is whatever the server's owner chose. Wherever the renderer shows
-one (the lists, the path bar, the transfer queue, questions, toasts and the activity log) it spells
-out control, invisible, zero-width and text-direction characters, unusual spaces, the dots that
+A file name in the file browser is whatever the server's owner chose. Where the renderer shows one
+(the lists, the path bar, the transfer queue, questions, toasts and the activity log, save the
+places named further down) it spells out control, invisible, zero-width and text-direction
+characters, unusual spaces, the dots that
 only stand in for
 "." and leading, trailing and repeated spaces as `<U+XXXX>` (and a line break as `\n`); a name that
 shows nothing (blank, mark or format characters only, U+2800 and U+1D159 included) is spelled out
@@ -566,7 +568,16 @@ for the parent folder, reorder the words of a question or add lines to it. The b
 in the SFTP edit flow (a refusal to open an edit, a Stop editing answer that is not ok, a failed
 save-back, a refused answer to a conflict), its notes on what it skipped or renamed when it queued
 a transfer, a refusal to queue or send one and the reason a transfer failed are shown spelled out
-in the same way. This is display and confirmation hygiene in the renderer: the backend still
+in the same way. Some places in the file browser still show a name as it is, where it can still
+pass for another or reorder the words around it: the toasts for a link that cannot be resolved or
+is broken, for the size of a folder that could not be computed and for synchronized browsing that
+pauses; the New folder, New file and bookmark questions; the search results and the Bookmarks
+menu; the permissions dialog's note on a path it could not read; and the backend's errors that
+quote a path when a listing, a new folder or file, a rename, a size, a permission change, a move
+or a delete fails. The activity log's lines with a name on each side of an arrow (a move, a
+rename, the two folders synchronized browsing is anchored at) spell the names out but do not keep
+each in an isolate of its own, so two names written right to left can turn the arrow around. This
+is display and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).
 
