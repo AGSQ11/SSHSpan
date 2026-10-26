@@ -53,6 +53,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`<U+202E>`, a line break as `\n`), and so do the connect errors that quote the host or the
   user name. Control characters are spelled out instead of dropped. (#93)
 
+- **The transfer queue shows a remote name the way the file list does.** A file or folder name in
+  the transfer queue was shown as it is, so a text-direction override (U+202E) turned it around, a
+  zero-width space went unseen, and a name of look-alike dots (two U+A4F8) or one padded with
+  spaces passed for another. The queue now spells these out as the listing does (`<U+202E>`,
+  `<U+A4F8><U+A4F8>`, `<U+0020>`), in a transfer's row and its tooltip, the folder rows and the
+  activity log line of a failed transfer. The backend's notes on what it skipped or renamed when it
+  queued a transfer, and its refusal to queue or send one at all, quote the paths and are spelled
+  out in their toasts and log lines too. The queue still sorts and groups by the names as they are.
+
+- **The activity log shows a remote name the way the file list does.** Its lines for the folder
+  SFTP opened at, New folder and New file, a rename, the size of a folder, a search, a bookmark and
+  synchronized browsing showed the names in them as they are, so a text-direction override
+  (U+202E) turned the rest of the line around, a zero-width space went unseen and a name of
+  look-alike dots (two U+A4F8) read as "..". They now spell these out as the listing does, and
+  keep what they quote (the text searched for, a bookmark's name, a folder with no mirror) in a
+  text-direction isolate of its own. The local folder synchronized browsing is anchored at is
+  spelled out too, name by name on Windows as well, as a download keeps the name the server gave
+  it. The Upload... picker names its folder the same way in its title. What the backend is asked to
+  create, rename or search for, and the name a bookmark stores, are still the names as they are.
+
 ## [1.10.0] - 2026-10-18
 
 Changes since v1.9.1: a flaw-remediation release driven by an eight-area internal audit on

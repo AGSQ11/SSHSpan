@@ -968,7 +968,11 @@ async function scenarioSpelledNames(browser, server) {
     const labels = await menuLabels(page);
     yes('the ~/.ssh/config import names a host spelled out, its user and host name kept to themselves',
       labels.includes(`${RLO_NAME_SHOWN} (${kept(ZW_USER_SHOWN)}@${kept(RLO_HOST_SHOWN)}:2222)`), JSON.stringify(labels));
-    if (await clickMenuItem(page, /^db-/)) {
+    // A host that cannot be picked fails here rather than skipping the
+    // checks of the form below.
+    const picked = await clickMenuItem(page, /^db-/);
+    yes('(set-up) the host can be picked from the import menu', picked, JSON.stringify(labels));
+    if (picked) {
       yes('(set-up) it opens the server form', await waitVisible(page, '#serverModal'));
       check('which gets them as they are', await page.evaluate(() => [el('srvName').value, el('srvHost').value, el('srvUser').value]),
         [RLO_NAME, RLO_HOST, ZW_USER]);

@@ -65,7 +65,9 @@ function spellChar(ch) {
   return '<U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0') + '>';
 }
 
-/// `text` with every character of SPELLED_CHARS spelled out (spellChar).
+/// `text` with every character of SPELLED_CHARS spelled out (spellChar). A
+/// missing value - null or undefined - is the empty string, so a field that
+/// may be absent is passed as it is.
 function spellOut(text) {
   return String(text == null ? '' : text).replace(SPELLED_CHARS, spellChar);
 }
