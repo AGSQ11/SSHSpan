@@ -995,6 +995,169 @@ async function scenarioQueue(browser, server) {
   });
 }
 
+// ─── the transfer queue: names a server chooses ─────────────────────────────
+//
+// A job's remote path is named by the server's owner, like any name in the
+// listing, and the queue shows it the way the listing does (sftpSpell): the
+// file in its row and the row's tooltip, the folders in their group rows, the
+// path in the activity log when a transfer fails. sftp_queue_add's notes
+// quote the paths they are about (what it skipped or renamed), so they are
+// spelled out in their toast and log lines (spellOut). The queue still sorts
+// and groups by the names as they are.
+
+async function scenarioQueueNames(browser, server) {
+  const RLO = 'invoice\u202Etxt.exe'; // reads as "invoiceexe.txt"
+  const ZWSP = 'a\u200Bb.txt';
+  const PADDED = ' padded.txt ';
+  const LISU = '\uA4F8\uA4F8'; // LISU LETTER TONE MYA TI, twice: reads as ".."
+  const GAPS = 'two  spaces';
+  const spec = { remote: { '/home/u': ['a.txt'] }, local: HOME_ONLY };
+  /// The list from the top: a group row as [its label], a job row as [its
+  /// name, the name's tooltip].
+  const listed = (page) => page.evaluate(() => [...document.getElementById('sftpQueueList').children].map((el) => {
+    if (el.classList.contains('sftp-queuegroup')) return [el.querySelector('.q-grouplabel').textContent];
+    const name = el.querySelector('.q-name');
+    return [name.textContent, name.title];
+  }));
+  /// The activity log's lines, without their times.
+  const logOf = (page) => page.evaluate(() => state.sessions.get('t1').log.map((l) => l.replace(/^\[[^\]]*\] /, '')));
+
+  await withFiles(browser, server, spec, 'queue names spelled out', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await emitJobs(page, [
+      JOB(1, RLO, 'active', { bytesDone: 10 }),
+      JOB(2, ZWSP, 'queued'),
+      JOB(3, PADDED, 'queued', { verify: true }),
+      JOB(4, 'notes.txt', 'queued'),
+      JOB(5, 'app.conf', 'queued', { remotePath: `/home/u/${LISU}/app.conf` }),
+      JOB(6, 'x.txt', 'queued', { remotePath: `/srv/${GAPS}/x.txt` }),
+    ]);
+    await settle(page);
+    check('a file\'s name is spelled out in its row and its tooltip, a folder\'s in its row', await listed(page), [
+      ['host-t1'],
+      ['home/u'],
+      ['<U+A4F8><U+A4F8>'],
+      ['app.conf', 'app.conf'],
+      ['<U+0020>padded.txt<U+0020>', '<U+0020>padded.txt<U+0020>'],
+      ['a<U+200B>b.txt', 'a<U+200B>b.txt'],
+      ['invoice<U+202E>txt.exe', 'invoice<U+202E>txt.exe'],
+      ['notes.txt', 'notes.txt'],
+      // A run of folders is one row, spelled out name by name.
+      ['srv/two<U+0020><U+0020>spaces'],
+      ['x.txt', 'x.txt'],
+    ]);
+    await emitJobs(page, [JOB(1, RLO, 'failed', { bytesDone: 10, error: `write failed: /home/u/${RLO}` })]);
+    await settle(page);
+    check('a failed transfer\'s path is spelled out in the activity log, and so is the backend\'s reason',
+      (await logOf(page)).filter((l) => l.startsWith('transfer failed')),
+      ['transfer failed: /home/u/invoice<U+202E>txt.exe - write failed: /home/u/invoice<U+202E>txt.exe']);
+    check('no page errors', app.errors, []);
+  });
+
+  // A literal "<U+202E>abc" and a real U+202E before "abc" read the same once
+  // spelled out, but they are two folders. In the order a U+202E counts for
+  // nothing (Intl collation), where a spelled-out "<U+202E>" sorts first. The
+  // real one's job comes first, where an order by the spelled-out names (a
+  // tie) would keep it.
+  await withFiles(browser, server, spec, 'queue grouped and sorted by the names as they are', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await emitJobs(page, [
+      JOB(1, 'aa.txt', 'queued'),
+      JOB(2, '\u202Ezz.txt', 'queued'),
+      JOB(4, 'f2.txt', 'queued', { remotePath: '/home/u/\u202Eabc/f2.txt' }),
+      JOB(3, 'f1.txt', 'queued', { remotePath: '/home/u/<U+202E>abc/f1.txt' }),
+    ]);
+    await settle(page);
+    check('two folders that read the same are two rows, and files sort by their names as they are', await listed(page), [
+      ['host-t1'],
+      ['home/u'],
+      ['<U+202E>abc'],
+      ['f1.txt', 'f1.txt'],
+      ['<U+202E>abc'],
+      ['f2.txt', 'f2.txt'],
+      ['aa.txt', 'aa.txt'],
+      ['<U+202E>zz.txt', '<U+202E>zz.txt'],
+    ]);
+    await page.evaluate(() => document.querySelectorAll('#sftpQueueList .q-group-dir')[1].click());
+    await settle(page);
+    check('and each folds on its own', (await listed(page)).filter((r) => r.length === 2).map((r) => r[0]),
+      ['f2.txt', 'aa.txt', '<U+202E>zz.txt']);
+    check('no page errors', app.errors, []);
+  });
+
+  await withFiles(browser, server, spec, 'queue notes spelled out', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    // What sftp_queue_add skipped or renamed, in its words.
+    const UNUSABLE = `skipped /home/u/dir/${RLO}: its name cannot be used as a local file name`;
+    const RENAMED = `${ZWSP} was saved as a\u200Bb (2).txt: another download of this batch has the same local name`;
+    await page.evaluate((w) => {
+      window.__replies.sftp_queue_add = (a) => ({ ok: true, added: a.items.length, warnings: w });
+    }, [UNUSABLE, RENAMED]);
+    await openDual(page);
+    await page.evaluate(() => queueDownloads('t1', ['/home/u/dir']));
+    await settle(page);
+    const unusable = 'skipped /home/u/dir/invoice<U+202E>txt.exe: its name cannot be used as a local file name';
+    const renamed = 'a<U+200B>b.txt was saved as a<U+200B>b (2).txt: another download of this batch has the same local name';
+    yes('a download\'s notes are spelled out in the toast', (await toasts(page)).includes(`${unusable} (and 1 more - see the activity log)`),
+      JSON.stringify(await toasts(page)));
+    check('and in the activity log, every one', (await logOf(page)).filter((l) => l.startsWith('queue: ')),
+      [`queue: ${unusable}`, `queue: ${renamed}`]);
+    // The files Upload... picked (sftpReportPickedUploads): a folder queued
+    // with a note, and a file that was not queued, with why.
+    const LINK = 'skipped /home/me/proj/\u202Eknil: it is a link to a folder';
+    const FIFO = 'skipped /home/me/fi\u200Bfo: it is not a regular file';
+    await page.evaluate(({ link, fifo }) => {
+      window.__replies.system_pick_files = { canceled: false, paths: ['/home/me/proj', '/home/me/fifo'] };
+      window.__replies.sftp_queue_add = { ok: true, added: 2, warnings: [link, fifo], items: [
+        { path: '/home/me/proj', status: 'queued', added: 2, warnings: [link] },
+        { path: '/home/me/fifo', status: 'queued', added: 0, warnings: [fifo] },
+      ] };
+    }, { link: LINK, fifo: FIFO });
+    await page.evaluate(() => sftpUploadSelected('t1'));
+    await settle(page);
+    yes('an upload pick\'s notes are spelled out in the toast',
+      (await toasts(page)).includes('1 of 2 files queued - skipped /home/me/fi<U+200B>fo: it is not a regular file'), JSON.stringify(await toasts(page)));
+    check('and in the activity log', (await logOf(page)).filter((l) => /^(upload | {2})/.test(l)), [
+      'upload queued: /home/me/proj (2 transfers)',
+      '  skipped /home/me/proj/<U+202E>knil: it is a link to a folder',
+      'upload not queued: skipped /home/me/fi<U+200B>fo: it is not a regular file',
+    ]);
+    yes('no toast or log line holds the override or the zero-width space as they are',
+      ![...await toasts(page), ...await logOf(page)].some((t) => /[\u202E\u200B]/.test(t)));
+    check('no page errors', app.errors, []);
+  });
+
+  // When nothing could be queued the call is refused with the backend's
+  // reason for each item, each quoting its path; a "Send to" the same way.
+  await withFiles(browser, server, spec, 'queue refusals spelled out', async (app) => {
+    const { page } = app;
+    await openFilesTab(page);
+    await openDual(page);
+    const refuse = (cmd, msg) => page.evaluate(({ c, m }) => { window.__replies[c] = { $reject: m }; }, { c: cmd, m: msg });
+    const unknown = (n) => `Could not tell whether /home/u/${n} is a file or a folder (the server does not say), so it was not queued.`;
+    await refuse('sftp_queue_add', unknown(RLO));
+    await page.evaluate((n) => queueDownloads('t1', ['/home/u/' + n]), RLO);
+    await settle(page);
+    yes('a download refused outright says why, its path spelled out', (await toasts(page)).includes(unknown('invoice<U+202E>txt.exe')),
+      JSON.stringify(await toasts(page)));
+    const gone = (n) => `/home/me/${n}: could not be read (gone).`;
+    await refuse('sftp_queue_add', gone(ZWSP));
+    await page.evaluate((n) => queueUploads('t1', [{ local: '/home/me/' + n, remote: '/home/u/' + n }]), ZWSP);
+    await settle(page);
+    yes('so does an upload', (await toasts(page)).includes(gone('a<U+200B>b.txt')), JSON.stringify(await toasts(page)));
+    await openFilesTab(page, { tabId: 't2' });
+    const stat = (n) => `stat /home/u/${n}: No such file`;
+    await refuse('sftp_server_copy', stat(RLO));
+    await page.evaluate((n) => sftpSendTo('t1', '/home/u/' + n, state.sessions.get('t2')), RLO);
+    await settle(page);
+    yes('and so does a "Send to"', (await toasts(page)).includes(stat('invoice<U+202E>txt.exe')), JSON.stringify(await toasts(page)));
+    check('no page errors', app.errors, []);
+  });
+}
+
 /// The whole text of a field is selected (what Ctrl+A in a text field means).
 const allSelected = (page, id) => page.evaluate((i) => {
   const n = document.getElementById(i);
@@ -3594,6 +3757,7 @@ const SCENARIOS = [
   ['conflicts: free names, case, safe defaults, fail closed (A3-06 A3-19 A5-47)', scenarioConflicts],
   ['chmod dialog (A3-20)', scenarioChmod],
   ['transfer queue (A3-02 A3-03 A3-12 A3-21 A3-33 A3-34)', scenarioQueue],
+  ['transfer queue: names a server chooses, spelled out', scenarioQueueNames],
   ['shortcuts and OS drops (A5-46 A3-22)', scenarioShortcuts],
   ['background tabs (A3-37)', scenarioBackgroundTab],
   ['search ids (Task 10 contract, A3-34)', scenarioSearch],
