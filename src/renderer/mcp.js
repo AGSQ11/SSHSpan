@@ -18,8 +18,12 @@
  *
  * SECURITY: names, URLs, descriptions and annotations come from MCP servers -
  * fully untrusted. Every one of them is rendered with textContent /
- * createElement, never innerHTML. Annotations may be SHOWN in the approval
- * card but never bypass it; only the user-set auto_approve flag does that.
+ * createElement, never innerHTML. A tool's name and display name are also
+ * spelled out where this file and assistant.js show them (spellOut, app.js;
+ * mcpNameInText), so a direction override or a zero-width character cannot
+ * make one tool read as another; the model, the backend and the stored
+ * record get them as they are. Annotations may be SHOWN in the approval card
+ * but never bypass it; only the user-set auto_approve flag does that.
  *
  * Loaded by app.js right after assistant.js; bridges through window.*.
  */
@@ -179,35 +183,41 @@ async function mcpCallTool(tabId, name, args, approved) {
   };
 }
 
+/// A name an MCP server chose inside a sentence of plain text (an error, the
+/// status strip): a tool's, or the server's own, which is checked when it is
+/// saved but not when it is restored from a backup. Spelled out (spellOut,
+/// app.js), then kept to itself between FIRST STRONG ISOLATE and POP
+/// DIRECTIONAL ISOLATE, as bdiOf keeps a name in a line of the page, so it
+/// cannot read as another name or turn the words around it.
+function mcpNameInText(name) {
+  return '\u2068' + spellOut(name) + '\u2069';
+}
+
 // Validate that a tool schema coming from the backend is usable JSON and not
-// empty. Returns the schema as a JSON string; throws a visible error if missing/invalid.
+// empty. Returns the schema as a JSON string; throws a visible error if
+// missing/invalid. The error is shown, never sent to the model: it names the
+// tool and its server spelled out (mcpNameInText), and a parse error, which
+// can quote the schema, is spelled out too.
 function mcpValidateToolSchema(t, serverName, toolName) {
+  const which = 'MCP tool "' + mcpNameInText(toolName) + '" from server "' + mcpNameInText(serverName) + '"';
   const raw = t && typeof t === 'object' ? t.inputSchema : undefined;
   if (raw == null) {
-    throw new Error(
-      'MCP tool "' + toolName + '" from server "' + serverName + '" has no inputSchema.'
-    );
+    throw new Error(which + ' has no inputSchema.');
   }
   let parsed;
   if (typeof raw === 'string') {
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      throw new Error(
-        'MCP tool "' + toolName + '" from server "' + serverName + '" has invalid inputSchema: ' + errText(e)
-      );
+      throw new Error(which + ' has invalid inputSchema: ' + errSpelled(e));
     }
   } else if (typeof raw === 'object') {
     parsed = raw;
   } else {
-    throw new Error(
-      'MCP tool "' + toolName + '" from server "' + serverName + '" has a non-object inputSchema.'
-    );
+    throw new Error(which + ' has a non-object inputSchema.');
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(
-      'MCP tool "' + toolName + '" from server "' + serverName + '" has a non-object inputSchema.'
-    );
+    throw new Error(which + ' has a non-object inputSchema.');
   }
   return typeof raw === 'string' ? raw : JSON.stringify(raw);
 }
@@ -774,7 +784,7 @@ async function mcpTestConnection(id) {
       const changed = Array.isArray(r && r.changed) ? r.changed : [];
       if (changed.length) {
         mcpSetStatus('These tools changed on the server and were turned off until you review them again: '
-          + changed.map(String).join(', ') + '.', 'err');
+          + changed.map(mcpNameInText).join(', ') + '.', 'err');
       }
     } catch (e) {
       const msg = errText(e);
@@ -830,7 +840,8 @@ async function mcpSetToolState(serverId, t, enabled, autoApprove) {
     // Done, but its audit row could not be written: said as it is.
     warning = r && r.warning ? String(r.warning) : '';
   } catch (e) {
-    refusal = errText(e);
+    // Spelled out: a refusal can quote the tool ("Tool '...' not found").
+    refusal = errSpelled(e);
   } finally {
     mcpToolBusy.delete(key); // before the redraw, or its toggles stay disabled
   }
@@ -841,7 +852,7 @@ async function mcpSetToolState(serverId, t, enabled, autoApprove) {
   }
   if (refusal === null) return;
   if (mcpIsDefinitionRefusal(refusal)) {
-    mcpSetStatus('Tool "' + t.name + '" was not approved: ' + refusal
+    mcpSetStatus('Tool "' + mcpNameInText(t.name) + '" was not approved: ' + refusal
       + ' Its current definition is shown below - review it, then enable it again.', 'err');
   } else {
     toast(refusal, 'err');
@@ -861,7 +872,13 @@ function mcpToolRow(serverId, t) {
   head.className = 'mcp-tool-head';
   const name = document.createElement('code');
   name.className = 'mcp-tool-name';
-  name.textContent = t.display_name && t.display_name !== t.name ? t.display_name + ' (' + t.name + ')' : t.name;
+  // Both names are the server's: spelled out, and each kept to itself when
+  // they share the line, so this tool cannot read as another.
+  if (t.display_name && t.display_name !== t.name) {
+    name.append(bdiOf(spellOut(t.display_name)), ' (', bdiOf(spellOut(t.name)), ')');
+  } else {
+    name.textContent = spellOut(t.name);
+  }
   head.appendChild(name);
   for (const label of mcpAnnotationLabels(t.annotations)) {
     const chip = document.createElement('span');
