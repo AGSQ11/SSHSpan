@@ -1096,6 +1096,10 @@ async function spelledNameChecks(browser, server) {
     const refuseSaves = (refusal) => page.evaluate((r) => { window.__replies.mcp_save_server = { $reject: r }; }, refusal);
     ok('its row names it spelled out', await row(0).locator('.mcp-server-name').textContent(), RESTORED_SHOWN);
     expect('nothing in the row is an override left unshown', !hidesAny(await row(0).textContent()));
+    // The form holds what a save sends: the name as stored.
+    await row(0).locator('button').filter({ hasText: /^Edit$/ }).click();
+    ok('its edit form holds the name as stored', await page.inputValue('#mcpName'), RESTORED_SERVER);
+    await page.click('#mcpCancelBtn');
     await row(0).locator('button').filter({ hasText: /^Review tools$/ }).click();
     const title = page.locator('.mcp-tools-title');
     ok('the heading of its tools names it spelled out', await title.textContent(),

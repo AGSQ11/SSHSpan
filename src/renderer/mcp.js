@@ -25,9 +25,10 @@
  * one tool or server read as another; the model, the backend and the stored
  * record get them as they are. A server's URL and the name of the environment
  * variable its token comes from, which a backup restores unchecked too, are
- * spelled out where this file shows them; the edit form's fields keep them as
- * stored, since a save sends them. Annotations may be SHOWN in the approval
- * card but never bypass it; only the user-set auto_approve flag does that.
+ * spelled out where this file shows them; the edit form's fields keep them,
+ * and the server's name, as stored, since a save sends them. Annotations may
+ * be SHOWN in the approval card but never bypass it; only the user-set
+ * auto_approve flag does that.
  *
  * Loaded by app.js right after assistant.js; bridges through window.*.
  */
