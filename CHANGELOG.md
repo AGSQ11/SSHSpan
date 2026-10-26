@@ -67,6 +67,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. The Upload... picker names its folder the same way in its title. What the backend is asked to
   create, rename or search for, and the name a bookmark stores, are still the names as they are.
 
+- **The rest of the file browser names remote files the way the file list does.** The toasts about
+  a link, a folder's size and synchronized browsing, the questions of New folder, New file, a new
+  bookmark, the permissions dialog and "already exists", the file menu's Rename, the Bookmarks
+  menu and the search results showed a remote name as it is, so a text-direction override
+  (U+202E) turned it around and a zero-width space went unseen. They now spell these out as the
+  listing does, a name inside a sentence in a text-direction isolate of its own. What the backend
+  says when a listing, a new folder, a rename, a move, a delete, a chmod, a folder size, a search
+  or a download fails quotes the path, and is spelled out too, in the local pane as well. A name a
+  line of the activity log quotes in its own words now has an isolate of its own (the backend's
+  words in a line are spelled out whole): two right-to-left names on either side of an arrow read
+  as a rename or a move the other way round, and a number after one was drawn in front of it. A
+  path on this computer in a toast or a log line (where a download goes, the default local folder)
+  is spelled out name by name, as a download keeps the name the server gave it. What is made,
+  renamed or saved is still the name as it is, and so is the text in a field that edits one.
+
 - **An MCP tool cannot pass for another on the approval card.** A tool's name and display name are
   the MCP server's choice and were shown as they are, so a text-direction override (U+202E) turned
   what followed it around and a zero-width space went unseen - on the card that approves a call

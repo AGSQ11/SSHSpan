@@ -2,9 +2,9 @@
 
 **Last updated:** 2026-10-26  
 **Status:** describes v1.10.0 and the changes listed under Unreleased in the CHANGELOG. The
-passages about those changes are checked against the pull request that made each (#89, #91, #92,
-#94, #95, #96, #97); the release-signing and Windows CI passages against `38e586e`; everything
-else against `6c19b1b`, and nothing else it describes has changed since  
+passages about those changes are checked against the pull request that made each (#89, #91,
+#92, #94, #95, #96, #97, #99); the release-signing and Windows CI passages against `38e586e`;
+everything else against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -596,22 +596,17 @@ still read as `..`). The listing flags such a name, and the name `~` (it can rea
 folder), with a "!" and says why on hover; single-character emoji, symbols and punctuation are
 visible content and are not flagged (an emoji written with a variation selector or a zero-width
 joiner is spelled out and flagged). Inside a sentence a name is kept in its own text-direction
-isolate. A file
+isolate. A text field that edits a name or a path (Rename's, the remote path bar's while it is typed
+in, the local pane's path field, Move to...'s and a new bookmark's) holds it as it is, since that is
+what is renamed, opened or saved. A file
 dropped onto a remote folder with a flagged name, from the OS or from the local pane, asks first,
 and a move says which folder it goes into and which folder that is in. So a hostile name cannot pass
 for the parent folder, reorder the words of a question or add lines to it. The backend's own texts
 in the SFTP edit flow (a refusal to open an edit, a Stop editing answer that is not ok, a failed
 save-back, a refused answer to a conflict), its notes on what it skipped or renamed when it queued
-a transfer, a refusal to queue or send one and the reason a transfer failed are shown spelled out
-in the same way. Some places in the file browser still show a name as it is, where it can still
-pass for another or reorder the words around it: the toasts for a link that cannot be resolved or
-is broken, for the size of a folder that could not be computed and for synchronized browsing that
-pauses; the New folder, New file and bookmark questions; the search results and the Bookmarks
-menu; the permissions dialog's note on a path it could not read; and the backend's errors that
-quote a path when a listing, a new folder or file, a rename, a size, a permission change, a move
-or a delete fails. The activity log's lines with a name on each side of an arrow (a move, a
-rename, the two folders synchronized browsing is anchored at) spell the names out but do not keep
-each in an isolate of its own, so two names written right to left can turn the arrow around. This
+a transfer, a refusal to queue or send one, the reason a transfer failed and its errors when a
+listing, a new folder or file, a rename, a move, a delete, a permission change, a folder size, a
+search or a download fails are shown spelled out in the same way. This
 is display and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).
