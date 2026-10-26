@@ -1,18 +1,10 @@
 # SSHSpan security model
 
 **Last updated:** 2026-10-26  
-**Status:** describes v1.10.0 and four changes that are not released yet (Unreleased in the
-CHANGELOG): the PuTTY session import, how MCP tool names and results are shown, how the MCP
-settings show a server's name restored from a backup, and how they show its URL and environment
-variable name and a failed Test connection. The passages about the import - in [Vault lock and
-locked-state policy](#vault-lock-and-locked-state-policy) the sentence on an import a lock stops
-and the bullet on the two listings of hosts, the PuTTY session import section, and the accepted
-limitation on how the server list shows names - are checked against committed source at
-`a75b533`; the passage on MCP tool names in [Renderer-attested
-approvals](#renderer-attested-approvals) against `370be24`, its paragraph on the server's own name
-against `a49f76b`, and the paragraph after it (a restored server's URL and environment variable,
-Test connection errors) against `e3ba562`; the release-signing and Windows CI passages against
-`38e586e`; everything else against `6c19b1b`, and nothing else it describes has changed since  
+**Status:** describes v1.10.0 and the changes listed under Unreleased in the CHANGELOG. The
+passages about those changes are checked against the pull request that made each (#89, #92,
+#95, #97); the release-signing and Windows CI passages against `38e586e`; everything else
+against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
