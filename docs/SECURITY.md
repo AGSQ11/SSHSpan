@@ -549,7 +549,8 @@ U+0020 in such a name as `<U+XXXX>`, and keeps each name in a text-direction iso
 - the MCP approval card (its accessible name is spelled out too);
 - the tools list a tool is reviewed in before it is enabled, and the notices that name a tool: a
   refused approval (the backend's refusal, which can quote the tool, is spelled out whole), the
-  tools that changed on the server, and an input schema that cannot be used;
+  tools that changed on the server, and an input schema that cannot be used (in the assistant's
+  transcript as worded: never read as an AI provider's error, however the tool is named);
 - the record the assistant keeps of every tool call, which spells out a tool name the model made up
   as well. The result and the backend's warning in it show format, default-ignorable and control
   characters (tab and line feed aside) as marked code points, as the card shows arguments; the
@@ -772,6 +773,13 @@ The provider receives user chat, session metadata, tool definitions/results, and
 terminal snapshot (up to 200 lines / 8,192 characters). Terminal and MCP output are wrapped as
 untrusted data with a per-turn nonce and system instructions say only user chat is instruction. This
 is a probabilistic mitigation; a model may still be manipulated.
+
+A provider's refusal quotes up to 300 characters of its answer as they are. The assistant's
+transcript, and the assistant settings' status line after Save & test, show the provider's own
+message when the refusal quotes a JSON body, or the refusal as it came - spelled out either way
+(`<U+XXXX>`), a character the message writes as a JSON escape included. Only a provider's refusal
+is read this way: an error of the page's own, such as the notice about an MCP tool's input schema,
+is shown as worded.
 
 Typing and execution from the assistant pass through Rust gates:
 
