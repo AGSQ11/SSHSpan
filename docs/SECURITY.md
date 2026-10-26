@@ -3,8 +3,8 @@
 **Last updated:** 2026-10-26  
 **Status:** describes v1.10.0 and the changes listed under Unreleased in the CHANGELOG. The
 passages about those changes are checked against the pull request that made each (#89, #91,
-#92, #94, #96, #99); the release-signing and Windows CI passages against `38e586e`; everything
-else against `6c19b1b`, and nothing else it describes has changed since  
+#92, #94, #95, #96, #99); the release-signing and Windows CI passages against `38e586e`;
+everything else against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -555,15 +555,16 @@ U+0020 in such a name as `<U+XXXX>`, and keeps each name in a text-direction iso
   characters (tab and line feed aside) as marked code points, as the card shows arguments; the
   result keeps its lines.
 
-The card, the record and the schema notice show the server's own name the same way: it is checked
-when it is saved (RFC 7230 token characters) but not when a backup restores it. So a tool whose
-name holds a direction override (U+202E) or a zero-width space (U+200B) cannot read as another tool
-on the card that approves its call. Only the display changes: the model, the backend and the stored
-record get every name and result as they are. Two places still show these names as they are stored:
-
-- the MCP settings, for a server's name: its row, the heading of its tools, and the notices and the
-  removal question that name it;
-- the audit log, whose `mcp.tool_call` and `mcp.tool_approved` rows quote the server and the tool.
+The card, the record and the schema notice show the server's own name the same way, and so do the
+MCP settings: its row, the heading of its tools, and the notices and the removal question that name
+it (a refusal or a removal warning the backend words, which can quote it, is spelled out whole). The
+name is checked when it is saved (RFC 7230 token characters) but not when a backup restores it: a
+restore keeps it as it is, and the entry stays switched off until a save, which refuses such a name.
+So a tool whose name holds a direction override (U+202E) or a zero-width space (U+200B) cannot read
+as another tool on the card that approves its call, nor a restored server as another server in the
+MCP settings. Only the display changes: the model, the backend and the stored record get every name
+and result as they are. One place still shows these names as they are stored: the audit log, whose
+`mcp.tool_call` and `mcp.tool_approved` rows quote the server and the tool.
 
 ### Names a server chooses
 

@@ -20,8 +20,9 @@
  * fully untrusted. Every one of them is rendered with textContent /
  * createElement, never innerHTML. A tool's name and display name are also
  * spelled out where this file and assistant.js show them (spellOut, app.js;
- * mcpNameInText), so a direction override or a zero-width character cannot
- * make one tool read as another; the model, the backend and the stored
+ * mcpNameInText), and so is the server's own name, which a backup restores
+ * unchecked, so a direction override or a zero-width character cannot make
+ * one tool or server read as another; the model, the backend and the stored
  * record get them as they are. Annotations may be SHOWN in the approval card
  * but never bypass it; only the user-set auto_approve flag does that.
  *
@@ -184,11 +185,11 @@ async function mcpCallTool(tabId, name, args, approved) {
 }
 
 /// A name an MCP server chose inside a sentence of plain text (an error, the
-/// status strip): a tool's, or the server's own, which is checked when it is
-/// saved but not when it is restored from a backup. Spelled out (spellOut,
-/// app.js), then kept to itself between FIRST STRONG ISOLATE and POP
-/// DIRECTIONAL ISOLATE, as bdiOf keeps a name in a line of the page, so it
-/// cannot read as another name or turn the words around it.
+/// status strip, a toast, a question): a tool's, or the server's own, which
+/// is checked when it is saved but not when it is restored from a backup.
+/// Spelled out (spellOut, app.js), then kept to itself between FIRST STRONG
+/// ISOLATE and POP DIRECTIONAL ISOLATE, as bdiOf keeps a name in a line of
+/// the page, so it cannot read as another name or turn the words around it.
 function mcpNameInText(name) {
   return '\u2068' + spellOut(name) + '\u2069';
 }
@@ -323,7 +324,8 @@ function mcpServerRow(sv) {
   head.appendChild(status);
   const name = document.createElement('span');
   name.className = 'mcp-server-name';
-  name.textContent = sv.name || '(unnamed)';
+  // Spelled out: a backup restores the name unchecked (mcpNameInText).
+  name.textContent = spellOut(sv.name || '(unnamed)');
   head.appendChild(name);
   const url = document.createElement('span');
   url.className = 'mcp-server-url mono';
@@ -418,7 +420,7 @@ async function mcpRemoveServer(sv) {
   if (mcpBusyServers.has(sv.id)) return;
   // The app's own dialog: the native confirm() is not usable here (see
   // confirmModal in app.js), and Cancel / Escape must really mean no.
-  const ok = await confirmModal('Remove MCP server', 'Remove MCP server "' + (sv.name || '') + '"?', 'Remove');
+  const ok = await confirmModal('Remove MCP server', 'Remove MCP server "' + mcpNameInText(sv.name || '') + '"?', 'Remove');
   if (!ok) return;
   await mcpRowAction(sv.id, async () => {
     try {
@@ -429,10 +431,11 @@ async function mcpRemoveServer(sv) {
       // The entry is gone either way; what went wrong around it - a failed
       // session teardown (A4-27), an audit row that could not be written,
       // or both - is said as the backend says it, as text, where it stays
-      // readable.
+      // readable. Spelled out: a teardown that timed out names the server.
       if (r && r.warning) {
-        mcpSetStatus('MCP server removed. ' + r.warning, 'warn');
-        toast('MCP server removed. ' + r.warning, 'warn');
+        const said = 'MCP server removed. ' + spellOut(r.warning);
+        mcpSetStatus(said, 'warn');
+        toast(said, 'warn');
       } else {
         toast('MCP server removed.', 'ok');
       }
@@ -701,7 +704,9 @@ async function mcpSaveServer() {
         toast('MCP server saved.', 'ok');
       }
     } catch (e) {
-      toast(errText(e), 'err');
+      // Spelled out: a refusal can quote another server's name, which a
+      // backup restores unchecked.
+      toast(errSpelled(e), 'err');
     }
   });
 }
@@ -742,7 +747,8 @@ function mcpSaveOutcome(r) {
 /// the backend asks its native question again. The row is busy until that is
 /// answered; then the backend's answer is said as it is.
 async function mcpAllowSending(sv) {
-  const name = sv.name || '';
+  // As the notices name it (mcpNameInText); the save sends sv.name as it is.
+  const name = mcpNameInText(sv.name || '');
   await mcpRowAction(sv.id, async () => {
     mcpSetStatus('Waiting for your answer: SSHSpan asks in its own dialog whether it may send the credential of "'
       + name + '".', 'info');
@@ -750,7 +756,8 @@ async function mcpAllowSending(sv) {
     try {
       r = await mcpSendSave({ id: sv.id, name: sv.name, url: sv.url, authType: sv.auth_type, headerName: null, secret: null, envVar: null });
     } catch (e) {
-      const msg = errText(e);
+      // Spelled out, as the form's refusals are (mcpSaveServer).
+      const msg = errSpelled(e);
       mcpSetStatus(msg, 'err');
       toast(msg, 'err');
       return;
@@ -984,8 +991,9 @@ function mcpRenderToolsFor(id) {
   }
   const title = document.createElement('div');
   title.className = 'mcp-tools-title';
-  title.textContent = 'Tools from "' + (sv.name || '') + '" (' + mcpEnabledCount(sv) + '/' + sv.tools.length
-    + ' enabled) - review each before enabling:';
+  // The server's name spelled out and kept to itself (mcpNameInText).
+  title.append('Tools from "', bdiOf(spellOut(sv.name || '')), '" (' + mcpEnabledCount(sv) + '/' + sv.tools.length
+    + ' enabled) - review each before enabling:');
   host.appendChild(title);
   for (const t of sv.tools) host.appendChild(mcpToolRow(sv.id, t));
 }

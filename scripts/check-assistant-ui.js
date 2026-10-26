@@ -45,6 +45,10 @@ const ZWSP_SHOWN = 'Ec<U+200B>ho';
 // A server's own name is checked when it is saved, not when a backup restores it.
 const RESTORED_SERVER = 'svc' + RLO + 'x';
 const RESTORED_SHOWN = 'svc<U+202E>x';
+// One a save accepts - a token once trimmed - whose tool names would be the
+// first one's (both sanitize to svc_x).
+const PADDED_SERVER = 'svc-x' + String.fromCodePoint(0xA0);
+const PADDED_SHOWN = 'svc-x<U+00A0>';
 const hidesAny = (text) => text.includes(RLO) || text.includes(ZWSP);
 const SPELLED_MCP = (name = 'svc') => MCP({ name, tools: [TOOL({ name: RLO_TOOL, display_name: ZWSP_DISPLAY, exposed_name: 'mcp__svc__echo_txt_exe' })] });
 // Argument names a server may choose for anything - credential-looking ones
@@ -62,6 +66,10 @@ const KEY_MOVE_DECLINED = 'Enter the API key for the new address.';
 const KEY_MOVE_CHANGED = 'The assistant settings changed while you were deciding - save them again.';
 const KEY_MOVE_TOO_QUICK = 'The question about sending the stored API key was answered within a second of opening - too fast to be a decision. Save again to be asked again.';
 const QUESTION_OPEN = 'Another question about sending a credential is still open - answer it, then save again.';
+// mcp_save_server's refusals (src-tauri/src/assistant/mcp.rs check_save_fields, save_server).
+const NAME_RULE = "Server name must be non-empty and use only letters, digits and ! # $ % & ' * + - . ^ _ ` | ~ (no spaces).";
+const NAME_TAKEN = (other, name) => "An MCP server named '" + other + "' already exists and '" + name
+  + "' would share its model-facing tool names - choose a different name.";
 // What a server row says while its credential is not allowed yet.
 const NOT_CONFIRMED = 'Not confirmed - SSHSpan will not send this credential until you allow it';
 const MCP_SAVED_NOT_CONFIRMED_TEXT = 'Saved, but not confirmed - SSHSpan will not send its credential until you allow it.';
@@ -943,6 +951,8 @@ async function mcpConfirmChecks(browser, server) {
 // shown spelled out on the approval card, in the tools list, in the tool log
 // and in the notices that name a tool, so a tool cannot read as another -
 // while the backend, the model and the stored record get them as they are.
+// A server's own name that a backup restored unchecked is shown the same way,
+// there and in the MCP settings.
 async function spelledNameChecks(browser, server) {
   await fixture(browser, server, 'MCP tool names in the tools list and its notices are spelled out', async (app) => {
     const { page } = app;
@@ -1056,6 +1066,82 @@ async function spelledNameChecks(browser, server) {
     expect('the turn it stops says so, the names spelled out',
       text.includes(RLO_SHOWN) && text.includes(RESTORED_SHOWN) && !hidesAny(text));
   }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
+  await fixture(browser, server, 'A restored MCP server\'s name is spelled out in the MCP settings', async (app) => {
+    const { page } = app;
+    // As a restore stores them: switched off, their tools off, their secrets kept.
+    const restored = (more) => MCP({ auth_type: 'bearer', has_secret: true, confirmed: false, status: 'unknown', protocol_version: null, ...more });
+    await emulateCredentialQuestion(page, [
+      restored({ name: RESTORED_SERVER, tools: [TOOL({ enabled: false, pinned: false })] }),
+      restored({ id: 'm2', name: PADDED_SERVER, tools: [] }),
+    ]);
+    await settings(page);
+    const row = (i) => page.locator('.mcp-server-row').nth(i);
+    const allow = (i) => row(i).locator('button').filter({ hasText: /^Allow sending/ });
+    // The text of the toast matching `re`, read as soon as it is shown.
+    const toastText = (re) => page.waitForFunction((src) => [...document.querySelectorAll('#toast .toast-text')]
+      .map((n) => n.textContent).find((t) => new RegExp(src).test(t)), re.source).then((h) => h.jsonValue());
+    const refuseSaves = (refusal) => page.evaluate((r) => { window.__replies.mcp_save_server = { $reject: r }; }, refusal);
+    ok('its row names it spelled out', await row(0).locator('.mcp-server-name').textContent(), RESTORED_SHOWN);
+    expect('nothing in the row is an override left unshown', !hidesAny(await row(0).textContent()));
+    await row(0).locator('button').filter({ hasText: /^Review tools$/ }).click();
+    const title = page.locator('.mcp-tools-title');
+    ok('the heading of its tools names it spelled out', await title.textContent(),
+      'Tools from "' + RESTORED_SHOWN + '" (0/1 enabled) - review each before enabling:');
+    ok('kept to itself', await title.locator('bdi').allTextContents(), [RESTORED_SHOWN]);
+    await page.evaluate(() => { Object.assign(window.__registry[0].tools[0], { enabled: true, pinned: true }); return mcpRefresh(); });
+    ok('the model is told its name as it is', await page.evaluate(() => mcpGetTools().map((t) => t.description)),
+      ['Echo (MCP server "' + RESTORED_SERVER + '", tool "echo")']);
+    // "Allow sending...": the status line names it while the save waits for
+    // the backend, which then refuses the name, as every save does.
+    await page.evaluate(() => { window.__emulatedSave = window.__replies.mcp_save_server; });
+    await hold(page, 'mcp_save_server');
+    await allow(0).click();
+    await page.waitForFunction(() => /Waiting for your answer/.test(document.getElementById('mcpStatus').textContent));
+    ok('the status line waiting for the answer names it spelled out, kept to itself', await page.textContent('#mcpStatus'),
+      'Waiting for your answer: SSHSpan asks in its own dialog whether it may send the credential of "' + FSI + RESTORED_SHOWN + PDI + '".');
+    await refuseSaves(NAME_RULE);
+    await letGo(page, 'mcp_save_server');
+    await toastText(/^Server name must be/);
+    ok('the backend is sent its name as it is', (await app.calls('mcp_save_server')).at(-1).args, {
+      id: 'm1', name: RESTORED_SERVER, url: 'https://mcp.example.test/mcp', auth_type: 'bearer',
+      auth_header_name: null, auth_secret: null, auth_env_var: null,
+    });
+    // A server whose tool names it would share is refused with its name
+    // quoted - asked again from its row, or saved from the form.
+    await refuseSaves(NAME_TAKEN(RESTORED_SERVER, 'svc-x'));
+    await allow(1).click();
+    const taken = NAME_TAKEN(RESTORED_SHOWN, 'svc-x');
+    ok('a refusal that quotes it is spelled out', await toastText(/'svc-x' would share/), taken);
+    ok('on the status line as well', await page.textContent('#mcpStatus'), taken);
+    await refuseSaves(NAME_TAKEN(RESTORED_SERVER, 'svc.x'));
+    await page.click('#mcpAddBtn');
+    await page.fill('#mcpName', 'svc.x'); await page.fill('#mcpUrl', 'https://other.example.test/mcp');
+    await page.click('#mcpSaveBtn');
+    ok('so is the form\'s', await toastText(/'svc\.x' would share/), NAME_TAKEN(RESTORED_SHOWN, 'svc.x'));
+    // Removal: the question, and the backend's warning, which can quote it.
+    await page.evaluate((name) => {
+      window.__replies.mcp_remove_server = (a) => {
+        window.__registry = window.__registry.filter((s) => s.id !== a.id);
+        return { ok: true, warning: "MCP session teardown for '" + name + "' timed out after 2 s." };
+      };
+    }, RESTORED_SERVER);
+    await row(0).locator('button').filter({ hasText: /^Remove$/ }).click();
+    expect('removing it asks first', await waitVisible(page, '#confirmModal', 1200));
+    ok('the removal question names it spelled out, kept to itself', await page.textContent('#confirmMessage'),
+      'Remove MCP server "' + FSI + RESTORED_SHOWN + PDI + '"?');
+    await answerConfirm(page, 'ok');
+    const removed = "MCP server removed. MCP session teardown for '" + RESTORED_SHOWN + "' timed out after 2 s.";
+    ok('a removal warning that quotes it is spelled out', await toastText(/^MCP server removed/), removed);
+    ok('on the status line too', await page.textContent('#mcpStatus'), removed);
+    ok('the backend is asked to remove it by its id', (await app.calls('mcp_remove_server')).at(-1).args, { id: 'm1' });
+    // With that one gone the other one's save goes through, and its
+    // confirmation names it spelled out.
+    await page.evaluate(() => { window.__replies.mcp_save_server = window.__emulatedSave; window.__answer = 'allow'; });
+    await allow(0).click();
+    ok('the confirmation names it spelled out, kept to itself', await toastText(/is confirmed/),
+      'MCP server "' + FSI + PADDED_SHOWN + PDI + '" is confirmed - SSHSpan may send its credential now.');
+    ok('the backend is sent that name as it is', (await app.calls('mcp_save_server')).at(-1).args.name, PADDED_SERVER);
+  });
 }
 
 async function focusChecks(browser, server) {
