@@ -713,8 +713,13 @@ function aiArgsBlock(container, args, label) {
 // they are display-only and NEVER bypass the card; at Read and Draft it is
 // always shown, and only the user's own per-tool auto_approve flag at
 // Execute (or YOLO) skips it, checked in aiRunTool.
+// The tool's name is the MCP server's choice, and the server's own name is
+// checked when it is saved but not when it is restored from a backup: both
+// are spelled out (spellOut, app.js) and each kept to itself (bdiOf), so a
+// direction override or a zero-width character cannot make the card name
+// another tool. The call still goes to the tool by its name as it is.
 function aiConfirmMcpCard(tabId, serverName, toolName, args, annotations) {
-  const label = 'Approval needed: call tool ' + toolName + ' on MCP server ' + serverName;
+  const label = 'Approval needed: call tool ' + spellOut(toolName) + ' on MCP server ' + spellOut(serverName);
   return aiApprovalCard(tabId, label, (row) => {
     const why = document.createElement('div');
     why.className = 'ai-card-why';
@@ -726,8 +731,8 @@ function aiConfirmMcpCard(tabId, serverName, toolName, args, annotations) {
     const ann = annotations || {};
     if (ann.readOnlyHint === true || ann.read_only_hint === true) hints.push('read-only');
     if (ann.destructiveHint === true || ann.destructive_hint === true) hints.push('may be destructive');
-    target.textContent = 'Server "' + serverName + '" - tool ' + toolName
-      + (hints.length ? ' (server claims: ' + hints.join(', ') + ')' : '');
+    target.append('Server "', bdiOf(spellOut(serverName)), '" - tool ', bdiOf(spellOut(toolName)));
+    if (hints.length) target.append(' (server claims: ' + hints.join(', ') + ')');
     row.appendChild(target);
     aiArgsBlock(row, args);
   });
@@ -751,7 +756,13 @@ function aiPreview(text) {
 /// One read-only row per tool call, whatever approved it (A4-17): which
 /// service and tool, every argument as the approval card shows it (nothing is
 /// masked - see aiArgsBlock), who approved it, how it ended, and the start of
-/// the result. All text, no controls.
+/// the result. All text, no controls. Its names, result and warning come from
+/// outside - the MCP server, or the model for a tool it made up - so their
+/// hidden characters are shown as code points: a name spelled out (spellOut,
+/// app.js), an MCP call's server and tool each kept to itself (bdiOf), the
+/// result and the warning marked (aiAppendVisible), the result keeping its
+/// lines. `ev.mcp` ({ server, tool }) names an MCP call; any other row shows
+/// `ev.label`.
 function aiToolEvent(tabId, s, ev) {
   if (aiTabs.get(tabId) !== s) return;
   const row = document.createElement('div');
@@ -763,14 +774,15 @@ function aiToolEvent(tabId, s, ev) {
   src.textContent = AI_SOURCE_LABELS[ev.source] || ev.source;
   const name = document.createElement('span');
   name.className = 'ai-tool-event-name';
-  name.textContent = ev.label;
+  if (ev.mcp) name.append('MCP ', bdiOf(spellOut(ev.mcp.server)), ' - ', bdiOf(spellOut(ev.mcp.tool)));
+  else name.textContent = spellOut(ev.label);
   const outcome = document.createElement('span');
   outcome.textContent = AI_OUTCOME_LABELS[ev.outcome] || ev.outcome;
   head.append(src, name, outcome);
   row.appendChild(head);
   const block = (label, text) => {
     const pre = document.createElement('pre');
-    pre.textContent = label + aiPreview(text);
+    aiAppendVisible(pre, label + aiPreview(text));
     row.appendChild(pre);
   };
   if (ev.args !== undefined) aiArgsBlock(row, ev.args, 'Arguments: ');
@@ -778,7 +790,7 @@ function aiToolEvent(tabId, s, ev) {
   if (ev.warning) {
     const w = document.createElement('div');
     w.className = 'ai-tool-event-warn';
-    w.textContent = 'Warning: ' + ev.warning;
+    aiAppendVisible(w, 'Warning: ' + ev.warning);
     row.appendChild(w);
   }
   const list = aiEnsureList(tabId, s);
@@ -1034,13 +1046,14 @@ async function aiRunTool(tabId, tc) {
       event({ source: 'none', outcome: 'error', args, result: 'Unknown or disabled MCP tool.' });
       return 'error: unknown or disabled MCP tool: ' + name;
     }
-    const label = 'MCP ' + meta.serverName + ' - ' + meta.toolName;
+    // Its row names the server and the tool as the card does (aiToolEvent).
+    const mcp = { server: meta.serverName, tool: meta.toolName };
     let source;
     if (s.level === 'yolo') source = 'yolo';
     else if (meta.autoApprove && i >= AI_LEVEL_INDEX.execute) source = 'auto';
     else {
       const ok = await aiConfirmMcpCard(tabId, meta.serverName, meta.toolName, args, meta.annotations);
-      if (!ok) { event({ label, source: 'denied', outcome: 'denied', args }); return 'denied by user'; }
+      if (!ok) { event({ mcp, source: 'denied', outcome: 'denied', args }); return 'denied by user'; }
       source = 'explicit';
     }
     let text;
@@ -1056,7 +1069,7 @@ async function aiRunTool(tabId, tc) {
       failed = true;
       text = 'error: ' + errText(e);
     }
-    event({ label, source, outcome: failed ? 'error' : 'ok', args, result: text, warning });
+    event({ mcp, source, outcome: failed ? 'error' : 'ok', args, result: text, warning });
     // The backend's warning may quote the server: inside the same block, and
     // first, so a long result cut at the cap cannot drop it.
     if (warning) text = 'SSHSpan warning: ' + warning + '\n\n' + text;

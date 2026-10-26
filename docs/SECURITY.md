@@ -1,15 +1,10 @@
 # SSHSpan security model
 
-**Last updated:** 2026-10-25  
-**Status:** describes v1.10.0, the PuTTY session import and how the names of saved servers and the
-remote names in the transfer queue and the activity log are shown; the import and the names are
-not released yet (Unreleased in the CHANGELOG). The passages about the
-import - in [Vault lock and locked-state policy](#vault-lock-and-locked-state-policy) the sentence
-on an import a lock stops and the bullet on the two listings of hosts, and the PuTTY session import
-section - are checked against committed source at `a75b533`; the Names of saved servers section
-against `c2fea62` (its bullet on the backend's own texts against `18bcef5`); the Names a server
-chooses section against `577a56b`; the release-signing and Windows CI passages against `38e586e`;
-everything else against `6c19b1b`, and nothing else it describes has changed since  
+**Last updated:** 2026-10-26  
+**Status:** describes v1.10.0 and the changes listed under Unreleased in the CHANGELOG. The
+passages about those changes are checked against the pull request that made each (#89, #91,
+#92, #93, #94, #95, #96, #97, #99); the release-signing and Windows CI passages against
+`38e586e`; everything else against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -546,6 +541,46 @@ The renderer's CSP is `script-src 'self'` with no inline or eval script, dynamic
 invisible and text-direction characters spelled out (values up to 1,500 characters as they are; a
 longer set is shortened, and "Show all arguments (N characters)" opens the complete text).
 
+An MCP server chooses its tools' names and display names and what a call returns. The renderer
+spells out control, invisible, zero-width and text-direction characters and spaces other than
+U+0020 in such a name as `<U+XXXX>`, and keeps each name in a text-direction isolate of its own (a
+`<bdi>`, or U+2068 ... U+2069 in plain text), in:
+
+- the MCP approval card (its accessible name is spelled out too);
+- the tools list a tool is reviewed in before it is enabled, and the notices that name a tool: a
+  refused approval (the backend's refusal, which can quote the tool, is spelled out whole), the
+  tools that changed on the server, and an input schema that cannot be used;
+- the record the assistant keeps of every tool call, which spells out a tool name the model made up
+  as well. The result and the backend's warning in it show format, default-ignorable and control
+  characters (tab and line feed aside) as marked code points, as the card shows arguments; the
+  result keeps its lines.
+
+The card, the record and the schema notice show the server's own name the same way, and so do the
+MCP settings: its row, the heading of its tools, and the notices and the removal question that name
+it (a refusal or a removal warning the backend words, which can quote it, is spelled out whole). The
+name is checked when it is saved (RFC 7230 token characters) but not when a backup restores it: a
+restore keeps it as it is, and the entry stays switched off until a save, which refuses such a name.
+So a tool whose name holds a direction override (U+202E) or a zero-width space (U+200B) cannot read
+as another tool on the card that approves its call, nor a restored server as another server in the
+MCP settings outside its edit form. Only the display changes: the model, the backend and the stored
+record get every name and result as they are. The audit log spells out the detail of every row it
+shows, so its rows of MCP server additions, changes and removals, tool calls, approvals and
+definition changes show these names spelled out too (see [Names of saved
+servers](#names-of-saved-servers)). One place still shows them as they are stored: the name field
+of that edit form, which holds the name as stored, since it is what a save sends.
+
+A restore does not check the rest of a server record either: its URL, its custom header's name and
+the name of the environment variable its token comes from stay as the backup has them until a save
+checks them (the URL normalized, its path percent-encoded; the header's name an RFC 7230 token once
+trimmed and the variable's name 1 to 128 visible ASCII characters, kept ones included). The MCP
+settings spell out the URL in the server's row and its tooltip, and the variable's name, in a
+text-direction isolate, in the form's notices about it and in the status line and toast after a
+save that kept it. A failed Test connection, beside the row and in its toast, is spelled out whole:
+it can quote what the server answered, and a variable's name that a version before v1.10.0 saved
+unchecked (such a server stays confirmed). The edit form's fields still hold the values as stored,
+since they are what a save sends. Only the display changes: the backend and the stored record get
+these values as they are.
+
 ### Names a server chooses
 
 A file name in the file browser is whatever the server's owner chose. Where the renderer shows one
@@ -561,22 +596,17 @@ still read as `..`). The listing flags such a name, and the name `~` (it can rea
 folder), with a "!" and says why on hover; single-character emoji, symbols and punctuation are
 visible content and are not flagged (an emoji written with a variation selector or a zero-width
 joiner is spelled out and flagged). Inside a sentence a name is kept in its own text-direction
-isolate. A file
+isolate. A text field that edits a name or a path (Rename's, the remote path bar's while it is typed
+in, the local pane's path field, Move to...'s and a new bookmark's) holds it as it is, since that is
+what is renamed, opened or saved. A file
 dropped onto a remote folder with a flagged name, from the OS or from the local pane, asks first,
 and a move says which folder it goes into and which folder that is in. So a hostile name cannot pass
 for the parent folder, reorder the words of a question or add lines to it. The backend's own texts
 in the SFTP edit flow (a refusal to open an edit, a Stop editing answer that is not ok, a failed
 save-back, a refused answer to a conflict), its notes on what it skipped or renamed when it queued
-a transfer, a refusal to queue or send one and the reason a transfer failed are shown spelled out
-in the same way. Some places in the file browser still show a name as it is, where it can still
-pass for another or reorder the words around it: the toasts for a link that cannot be resolved or
-is broken, for the size of a folder that could not be computed and for synchronized browsing that
-pauses; the New folder, New file and bookmark questions; the search results and the Bookmarks
-menu; the permissions dialog's note on a path it could not read; and the backend's errors that
-quote a path when a listing, a new folder or file, a rename, a size, a permission change, a move
-or a delete fails. The activity log's lines with a name on each side of an arrow (a move, a
-rename, the two folders synchronized browsing is anchored at) spell the names out but do not keep
-each in an isolate of its own, so two names written right to left can turn the arrow around. This
+a transfer, a refusal to queue or send one, the reason a transfer failed and its errors when a
+listing, a new folder or file, a rename, a move, a delete, a permission change, a folder size, a
+search or a download fails are shown spelled out in the same way. This
 is display and confirmation hygiene in the renderer: the backend still
 treats every remote name as untrusted when it builds a local path (see [SFTP remote-side
 controls](#sftp-remote-side-controls)).

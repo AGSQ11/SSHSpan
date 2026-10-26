@@ -31,6 +31,33 @@ const MCP = (more = {}) => ({
   status: 'connected', tool_count: 1, tools: [TOOL()], ...more,
 });
 const TC = (id, name = 'get_session_info', args = {}) => ({ id, name, arguments_json: JSON.stringify(args) });
+// Names an MCP server chooses, holding a text-direction override and a
+// zero-width space, and how the renderer must show them. The characters are
+// built from their code points, so this file holds none of them itself.
+const RLO = String.fromCodePoint(0x202E);
+const ZWSP = String.fromCodePoint(0x200B);
+const FSI = String.fromCodePoint(0x2068);
+const PDI = String.fromCodePoint(0x2069);
+const RLO_TOOL = 'echo' + RLO + 'txt.exe';
+const RLO_SHOWN = 'echo<U+202E>txt.exe';
+const ZWSP_DISPLAY = 'Ec' + ZWSP + 'ho';
+const ZWSP_SHOWN = 'Ec<U+200B>ho';
+// A server's own name is checked when it is saved, not when a backup restores it.
+const RESTORED_SERVER = 'svc' + RLO + 'x';
+const RESTORED_SHOWN = 'svc<U+202E>x';
+// One a save accepts - a token once trimmed - whose tool names would be the
+// first one's (both sanitize to svc_x).
+const PADDED_SERVER = 'svc-x' + String.fromCodePoint(0xA0);
+const PADDED_SHOWN = 'svc-x<U+00A0>';
+// Nor are the URL, the custom header's name and the name of the environment
+// variable a token comes from: a save normalizes the URL and checks the rest.
+const RESTORED_URL = 'https://mcp.example.test/m' + RLO + 'cp';
+const RESTORED_URL_SHOWN = 'https://mcp.example.test/m<U+202E>cp';
+const RESTORED_HEADER = 'X-Fixture' + RLO + 'Key';
+const RESTORED_ENV = 'FIXTURE' + RLO + '_TOKEN';
+const RESTORED_ENV_SHOWN = 'FIXTURE<U+202E>_TOKEN';
+const hidesAny = (text) => text.includes(RLO) || text.includes(ZWSP);
+const SPELLED_MCP = (name = 'svc') => MCP({ name, tools: [TOOL({ name: RLO_TOOL, display_name: ZWSP_DISPLAY, exposed_name: 'mcp__svc__echo_txt_exe' })] });
 // Argument names a server may choose for anything - credential-looking ones
 // included - with the values the user must see on the approval card.
 const FULL_ARGS = {
@@ -46,6 +73,14 @@ const KEY_MOVE_DECLINED = 'Enter the API key for the new address.';
 const KEY_MOVE_CHANGED = 'The assistant settings changed while you were deciding - save them again.';
 const KEY_MOVE_TOO_QUICK = 'The question about sending the stored API key was answered within a second of opening - too fast to be a decision. Save again to be asked again.';
 const QUESTION_OPEN = 'Another question about sending a credential is still open - answer it, then save again.';
+// mcp_save_server's refusals (src-tauri/src/assistant/mcp.rs check_save_fields, save_server,
+// check_env_var_name).
+const NAME_RULE = "Server name must be non-empty and use only letters, digits and ! # $ % & ' * + - . ^ _ ` | ~ (no spaces).";
+const NAME_TAKEN = (other, name) => "An MCP server named '" + other + "' already exists and '" + name
+  + "' would share its model-facing tool names - choose a different name.";
+const ENV_RULE = "The environment variable name must be 1 to 128 visible ASCII characters, without spaces or '='.";
+// What a connect says when the variable a bearer token comes from is not set (resolve_secret_value).
+const ENV_UNSET = (name) => "Environment variable '" + name + "' (MCP auth for header 'Authorization') is not set.";
 // What a server row says while its credential is not allowed yet.
 const NOT_CONFIRMED = 'Not confirmed - SSHSpan will not send this credential until you allow it';
 const MCP_SAVED_NOT_CONFIRMED_TEXT = 'Saved, but not confirmed - SSHSpan will not send its credential until you allow it.';
@@ -923,6 +958,285 @@ async function mcpConfirmChecks(browser, server) {
   });
 }
 
+// An MCP server chooses its tools' names and display names, and the results:
+// shown spelled out on the approval card, in the tools list, in the tool log
+// and in the notices that name a tool, so a tool cannot read as another -
+// while the backend, the model and the stored record get them as they are.
+// A server's own name that a backup restored unchecked is shown the same way,
+// there and in the MCP settings, and so are the URL and the environment
+// variable's name restored with it.
+async function spelledNameChecks(browser, server) {
+  await fixture(browser, server, 'MCP tool names in the tools list and its notices are spelled out', async (app) => {
+    const { page } = app;
+    await settings(page); await page.evaluate(() => mcpShowToolsFor('m1'));
+    const name = page.locator('.mcp-tool-name');
+    ok('the display name and the name, spelled out', await name.textContent(), ZWSP_SHOWN + ' (' + RLO_SHOWN + ')');
+    ok('each in a text-direction isolate of its own', await name.locator('bdi').allTextContents(), [ZWSP_SHOWN, RLO_SHOWN]);
+    ok('the model is told both names as they are', await page.evaluate(() => mcpGetTools().map((t) => t.description)),
+      [ZWSP_DISPLAY + ' (MCP server "svc", tool "' + RLO_TOOL + '")']);
+    await page.evaluate((refusal) => {
+      Object.assign(window.__replies.mcp_list_servers[0].tools[0], { display_name: null, enabled: false });
+      window.__replies.mcp_set_tool_state = { $reject: refusal };
+      return mcpLoadSettings();
+    }, "This tool's definition changed - review it and approve again.");
+    ok('a name shown alone is spelled out too', await name.textContent(), RLO_SHOWN);
+    await page.locator('.mcp-tool-row label').filter({ hasText: /^Enable$/ }).click();
+    await page.waitForFunction(() => /was not approved/.test(document.getElementById('mcpStatus').textContent));
+    ok('the backend is asked about the tool by its name as it is', (await app.calls('mcp_set_tool_state')).at(-1).args.tool, RLO_TOOL);
+    const refused = await page.locator('#mcpStatus').textContent();
+    expect('a refused approval names the tool spelled out, kept to itself',
+      refused.includes('Tool "' + FSI + RLO_SHOWN + PDI + '" was not approved') && !hidesAny(refused));
+    // The backend's refusals can quote the tool ("Tool '...' not found").
+    await page.evaluate((refusal) => { window.__replies.mcp_set_tool_state = { $reject: refusal }; },
+      "Tool '" + RLO_TOOL + "' not found on this MCP server.");
+    await page.locator('.mcp-tool-row label').filter({ hasText: /^Enable$/ }).click();
+    await page.waitForFunction(() => [...document.querySelectorAll('#toast .toast-text')].some((n) => /not found on this MCP server/.test(n.textContent)));
+    expect('a refusal that quotes the tool is spelled out',
+      (await toasts(page)).includes("Tool '" + RLO_SHOWN + "' not found on this MCP server."));
+    await page.evaluate((tool) => {
+      window.__replies.mcp_test_connection = { tools: [], changed: [tool] };
+      return mcpTestConnection('m1');
+    }, RLO_TOOL);
+    const changed = await page.locator('#mcpStatus').textContent();
+    expect('a tool that changed on the server is named spelled out, kept to itself',
+      changed.includes(FSI + RLO_SHOWN + PDI) && !hidesAny(changed));
+  }, { replies: { mcp_list_servers: [SPELLED_MCP()] } });
+  await fixture(browser, server, 'MCP names on the approval card and in the tool log are spelled out', async (app) => {
+    const { page } = app; const id = await panel(app);
+    const card = () => page.locator('.ai-card.confirm').last();
+    const call = (callId) => page.evaluate(({ t, c }) => {
+      window.__toolTask = aiRunTool(t, { id: c, name: 'mcp__svc__echo_txt_exe', arguments_json: '{"text":"hi"}' });
+    }, { t: id, c: callId });
+    const result = 'first' + RLO + 'tsal\nzero' + ZWSP + 'width';
+    const warning = 'The tool ran, but refreshing its tool list failed: tool "x' + RLO + 'y" is invalid';
+    await page.evaluate(({ content, warn }) => {
+      window.__replies.mcp_call_tool = { ok: true, content, is_error: false, warning: warn };
+    }, { content: result, warn: warning });
+    await call('denied');
+    await card().waitFor();
+    ok('the card\'s accessible name spells the tool and the server out', await card().getAttribute('aria-label'),
+      'Approval needed: call tool ' + RLO_SHOWN + ' on MCP server ' + RESTORED_SHOWN);
+    const target = card().locator('.ai-card-why').nth(1);
+    ok('the card names the server and the tool, spelled out', await target.textContent(),
+      'Server "' + RESTORED_SHOWN + '" - tool ' + RLO_SHOWN + ' (server claims: read-only)');
+    ok('each in a text-direction isolate of its own', await target.locator('bdi').allTextContents(), [RESTORED_SHOWN, RLO_SHOWN]);
+    expect('nothing on the card is an override or a zero-width space left unshown', !hidesAny(await card().textContent()));
+    await card().locator('button').filter({ hasText: /^Deny$/ }).click();
+    ok('the denied call is answered', await page.evaluate(() => window.__toolTask), 'denied by user');
+    ok('and its row names the server and the tool, spelled out',
+      await page.locator('.ai-tool-event-name').last().textContent(), 'MCP ' + RESTORED_SHOWN + ' - ' + RLO_SHOWN);
+    await call('approved');
+    await page.waitForFunction(() => document.querySelectorAll('.ai-card.confirm').length === 2);
+    await card().locator('button').filter({ hasText: /^Approve$/ }).click();
+    const sent = await page.evaluate(() => window.__toolTask);
+    ok('the backend is asked for the tool by its name as it is', (await app.calls('mcp_call_tool')).at(-1).args.tool, RLO_TOOL);
+    expect('the model gets the result and the warning as they are', sent.includes(result) && sent.includes(warning));
+    const row = page.locator('.ai-tool-event').last();
+    const head = row.locator('.ai-tool-event-name');
+    ok('the row names the server and the tool, spelled out', await head.textContent(), 'MCP ' + RESTORED_SHOWN + ' - ' + RLO_SHOWN);
+    ok('each in a text-direction isolate of its own', await head.locator('bdi').allTextContents(), [RESTORED_SHOWN, RLO_SHOWN]);
+    const shown = row.locator('pre').last();
+    ok('the result shows each such character as its code point, its lines kept', await shown.textContent(),
+      'Result: first<U+202E>tsal\nzero<U+200B>width');
+    ok('each one marked, so it cannot pass for text', await shown.locator('.ai-hidden-char').allTextContents(), ['<U+202E>', '<U+200B>']);
+    expect('the warning is spelled out too', (await row.locator('.ai-tool-event-warn').textContent()).includes('tool "x<U+202E>y" is invalid'));
+    expect('nothing in the row is an override or a zero-width space left unshown', !hidesAny(await row.textContent()));
+    // A tool name the model made up: answered as it was called, shown spelled out.
+    const madeUp = 'get_session_info' + RLO;
+    ok('the model is answered with the name as it called it',
+      await page.evaluate(({ t, n }) => aiRunTool(t, { id: 'odd', name: n, arguments_json: '{}' }), { t: id, n: madeUp }), 'unknown tool: ' + madeUp);
+    ok('its row spells it out', await page.locator('.ai-tool-event-name').last().textContent(), 'get_session_info<U+202E>');
+    // A call the turn never reached (Stop) is logged by the name the model gave it.
+    await page.evaluate((n) => {
+      let k = 0;
+      window.__replies.assistant_chat = () => ++k === 1 ? { text: '', tool_calls: [
+        { id: 'first', name: 'mcp__svc__echo_txt_exe', arguments_json: '{}' },
+        { id: 'second', name: n, arguments_json: '{}' },
+      ] } : { text: 'Done.', tool_calls: [] };
+    }, madeUp);
+    await send(page);
+    await page.waitForFunction(() => document.querySelectorAll('.ai-card.confirm:not(.approved):not(.denied)').length === 1);
+    await page.click('#assistantStopBtn'); await idle(page);
+    ok('a call the turn never reached is logged by its name, spelled out',
+      await page.locator('.ai-tool-event.cancelled .ai-tool-event-name').last().textContent(), 'get_session_info<U+202E>');
+  }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
+  await fixture(browser, server, 'A tool schema error names the tool spelled out', async (app) => {
+    const { page } = app;
+    // The JSON parser's error quotes the schema, so one holds an override
+    // where a value should be (quoted twice: as the token and in the text).
+    const errors = await page.evaluate(({ server, tool, rlo }) => [undefined, '{"a":' + rlo + '}', 42, '[]'].map((schema) => {
+      try { mcpValidateToolSchema({ inputSchema: schema }, server, tool); return 'accepted'; } catch (e) { return e.message; }
+    }), { server: RESTORED_SERVER, tool: RLO_TOOL, rlo: RLO });
+    const named = 'MCP tool "' + FSI + RLO_SHOWN + PDI + '" from server "' + FSI + RESTORED_SHOWN + PDI + '"';
+    expect('each one spells the tool and the server out, each kept to itself', errors.length === 4
+      && errors.every((m) => m.startsWith(named) && !hidesAny(m)));
+    expect('and the quoted schema is spelled out too', /<U\+202E>/.test(errors[1].slice(errors[1].indexOf('inputSchema:'))));
+    await panel(app);
+    await page.evaluate(() => { delete window.__replies.mcp_list_servers[0].tools[0].inputSchema; return mcpRefresh(); });
+    await send(page); await idle(page);
+    // Shown as it is worded (aiError): the names are spelled out once, so the
+    // isolates around them stay isolates and never read <U+2068> ... <U+2069>.
+    ok('the turn it stops says so, each name spelled out once and kept to itself',
+      await page.locator('.ai-msg.error').last().textContent(), named + ' has no inputSchema.');
+  }, { replies: { mcp_list_servers: [SPELLED_MCP(RESTORED_SERVER)] } });
+  await fixture(browser, server, 'A restored MCP server\'s name is spelled out in the MCP settings', async (app) => {
+    const { page } = app;
+    // As a restore stores them: switched off, their tools off, their secrets kept.
+    const restored = (more) => MCP({ auth_type: 'bearer', has_secret: true, confirmed: false, status: 'unknown', protocol_version: null, ...more });
+    await emulateCredentialQuestion(page, [
+      restored({ name: RESTORED_SERVER, tools: [TOOL({ enabled: false, pinned: false })] }),
+      restored({ id: 'm2', name: PADDED_SERVER, tools: [] }),
+    ]);
+    await settings(page);
+    const row = (i) => page.locator('.mcp-server-row').nth(i);
+    const allow = (i) => row(i).locator('button').filter({ hasText: /^Allow sending/ });
+    // The text of the toast matching `re`, read as soon as it is shown.
+    const toastText = (re) => page.waitForFunction((src) => [...document.querySelectorAll('#toast .toast-text')]
+      .map((n) => n.textContent).find((t) => new RegExp(src).test(t)), re.source).then((h) => h.jsonValue());
+    const refuseSaves = (refusal) => page.evaluate((r) => { window.__replies.mcp_save_server = { $reject: r }; }, refusal);
+    ok('its row names it spelled out', await row(0).locator('.mcp-server-name').textContent(), RESTORED_SHOWN);
+    expect('nothing in the row is an override left unshown', !hidesAny(await row(0).textContent()));
+    // The form holds what a save sends: the name as stored.
+    await row(0).locator('button').filter({ hasText: /^Edit$/ }).click();
+    ok('its edit form holds the name as stored', await page.inputValue('#mcpName'), RESTORED_SERVER);
+    await page.click('#mcpCancelBtn');
+    await row(0).locator('button').filter({ hasText: /^Review tools$/ }).click();
+    const title = page.locator('.mcp-tools-title');
+    ok('the heading of its tools names it spelled out', await title.textContent(),
+      'Tools from "' + RESTORED_SHOWN + '" (0/1 enabled) - review each before enabling:');
+    ok('kept to itself', await title.locator('bdi').allTextContents(), [RESTORED_SHOWN]);
+    await page.evaluate(() => { Object.assign(window.__registry[0].tools[0], { enabled: true, pinned: true }); return mcpRefresh(); });
+    ok('the model is told its name as it is', await page.evaluate(() => mcpGetTools().map((t) => t.description)),
+      ['Echo (MCP server "' + RESTORED_SERVER + '", tool "echo")']);
+    // "Allow sending...": the status line names it while the save waits for
+    // the backend, which then refuses the name, as every save does.
+    await page.evaluate(() => { window.__emulatedSave = window.__replies.mcp_save_server; });
+    await hold(page, 'mcp_save_server');
+    await allow(0).click();
+    await page.waitForFunction(() => /Waiting for your answer/.test(document.getElementById('mcpStatus').textContent));
+    ok('the status line waiting for the answer names it spelled out, kept to itself', await page.textContent('#mcpStatus'),
+      'Waiting for your answer: SSHSpan asks in its own dialog whether it may send the credential of "' + FSI + RESTORED_SHOWN + PDI + '".');
+    await refuseSaves(NAME_RULE);
+    await letGo(page, 'mcp_save_server');
+    await toastText(/^Server name must be/);
+    ok('the backend is sent its name as it is', (await app.calls('mcp_save_server')).at(-1).args, {
+      id: 'm1', name: RESTORED_SERVER, url: 'https://mcp.example.test/mcp', auth_type: 'bearer',
+      auth_header_name: null, auth_secret: null, auth_env_var: null,
+    });
+    // A server whose tool names it would share is refused with its name
+    // quoted - asked again from its row, or saved from the form.
+    await refuseSaves(NAME_TAKEN(RESTORED_SERVER, 'svc-x'));
+    await allow(1).click();
+    const taken = NAME_TAKEN(RESTORED_SHOWN, 'svc-x');
+    ok('a refusal that quotes it is spelled out', await toastText(/'svc-x' would share/), taken);
+    ok('on the status line as well', await page.textContent('#mcpStatus'), taken);
+    await refuseSaves(NAME_TAKEN(RESTORED_SERVER, 'svc.x'));
+    await page.click('#mcpAddBtn');
+    await page.fill('#mcpName', 'svc.x'); await page.fill('#mcpUrl', 'https://other.example.test/mcp');
+    await page.click('#mcpSaveBtn');
+    ok('so is the form\'s', await toastText(/'svc\.x' would share/), NAME_TAKEN(RESTORED_SHOWN, 'svc.x'));
+    // Removal: the question, and the backend's warning, which can quote it.
+    await page.evaluate((name) => {
+      window.__replies.mcp_remove_server = (a) => {
+        window.__registry = window.__registry.filter((s) => s.id !== a.id);
+        return { ok: true, warning: "MCP session teardown for '" + name + "' timed out after 2 s." };
+      };
+    }, RESTORED_SERVER);
+    await row(0).locator('button').filter({ hasText: /^Remove$/ }).click();
+    expect('removing it asks first', await waitVisible(page, '#confirmModal', 1200));
+    ok('the removal question names it spelled out, kept to itself', await page.textContent('#confirmMessage'),
+      'Remove MCP server "' + FSI + RESTORED_SHOWN + PDI + '"?');
+    await answerConfirm(page, 'ok');
+    const removed = "MCP server removed. MCP session teardown for '" + RESTORED_SHOWN + "' timed out after 2 s.";
+    ok('a removal warning that quotes it is spelled out', await toastText(/^MCP server removed/), removed);
+    ok('on the status line too', await page.textContent('#mcpStatus'), removed);
+    ok('the backend is asked to remove it by its id', (await app.calls('mcp_remove_server')).at(-1).args, { id: 'm1' });
+    // With that one gone the other one's save goes through, and its
+    // confirmation names it spelled out.
+    await page.evaluate(() => { window.__replies.mcp_save_server = window.__emulatedSave; window.__answer = 'allow'; });
+    await allow(0).click();
+    ok('the confirmation names it spelled out, kept to itself', await toastText(/is confirmed/),
+      'MCP server "' + FSI + PADDED_SHOWN + PDI + '" is confirmed - SSHSpan may send its credential now.');
+    ok('the backend is sent that name as it is', (await app.calls('mcp_save_server')).at(-1).args.name, PADDED_SERVER);
+  });
+  await fixture(browser, server, 'A restored MCP server\'s URL and environment variable are spelled out in the MCP settings', async (app) => {
+    const { page } = app;
+    // As a restore stores them: switched off, the token's source kept, the
+    // URL and the names as the backup had them.
+    const restored = (more) => MCP({ auth_type: 'bearer', auth_env_var: RESTORED_ENV, confirmed: false, status: 'unknown', protocol_version: null, tools: [], ...more });
+    await emulateCredentialQuestion(page, [
+      restored({ url: RESTORED_URL, auth_type: 'custom_header', auth_header_name: RESTORED_HEADER }),
+      restored({ id: 'm2', name: 'env-svc' }),
+      // Restored and saved before a save checked variable names (v1.10.0):
+      // confirmed, the name unchecked.
+      MCP({ id: 'm3', name: 'old-svc', auth_type: 'bearer', auth_env_var: RESTORED_ENV, tools: [] }),
+    ]);
+    await settings(page);
+    const row = page.locator('.mcp-server-row').first();
+    const url = row.locator('.mcp-server-url');
+    ok('its row shows the URL spelled out', await url.textContent(), RESTORED_URL_SHOWN);
+    ok('so does the URL\'s tooltip', await url.getAttribute('title'), RESTORED_URL_SHOWN);
+    expect('nothing in the row is an override left unshown', !hidesAny(await row.textContent()));
+    // The form holds what a save sends: the values as stored.
+    await row.locator('button').filter({ hasText: /^Edit$/ }).click();
+    ok('the form holds the URL and the names as stored',
+      [await page.inputValue('#mcpUrl'), await page.inputValue('#mcpHeaderName'), await page.inputValue('#mcpAuthEnvVar')],
+      [RESTORED_URL, RESTORED_HEADER, RESTORED_ENV]);
+    // A save stores the URL normalized (its path percent-encoded), so the form
+    // counts it as a new URL and says where the variable's token goes.
+    const notice = page.locator('#mcpRebindWarn');
+    ok('the notice that the token goes to the new settings names the variable spelled out, kept to itself',
+      await notice.textContent(), 'Changing the URL or the auth settings sends the token from environment variable '
+        + FSI + RESTORED_ENV_SHOWN + PDI + ' to the new settings - change the variable name if that is not intended.');
+    // The backend refuses such a variable's name, typed or kept.
+    await page.evaluate((refusal) => {
+      window.__emulatedSave = window.__replies.mcp_save_server;
+      window.__replies.mcp_save_server = { $reject: refusal };
+      return mcpSaveServer();
+    }, ENV_RULE);
+    ok('the backend is sent the URL and the names as they are', (await app.calls('mcp_save_server')).at(-1).args, {
+      id: 'm1', name: 'svc', url: RESTORED_URL, auth_type: 'custom_header',
+      auth_header_name: RESTORED_HEADER, auth_secret: null, auth_env_var: RESTORED_ENV,
+    });
+    // A Test of the record an older version confirmed quotes the variable
+    // when it is not set.
+    await page.evaluate((refusal) => {
+      window.__replies.mcp_test_connection = { $reject: refusal };
+      return mcpTestConnection('m3');
+    }, ENV_UNSET(RESTORED_ENV));
+    ok('a failed Test that quotes it is spelled out beside the row',
+      await page.locator('.mcp-server-row').nth(2).locator('.mcp-server-error').textContent(), 'Last test failed: ' + ENV_UNSET(RESTORED_ENV_SHOWN));
+    ok('and in its toast', (await toasts(page)).filter((t) => /is not set/.test(t)), [ENV_UNSET(RESTORED_ENV_SHOWN)]);
+    // A record whose URL a save keeps: with no secret typed, its variable
+    // stays in effect, which the form says.
+    await page.click('#mcpCancelBtn');
+    await page.locator('.mcp-server-row').nth(1).locator('button').filter({ hasText: /^Edit$/ }).click();
+    await page.selectOption('#mcpSecretSource', 'stored');
+    const kept = FSI + RESTORED_ENV_SHOWN + PDI;
+    ok('the notice that the variable stays in effect names it spelled out, kept to itself', await notice.textContent(),
+      'No secret entered: the environment variable ' + kept + ' stays in effect. Type a secret to replace it with a stored one.');
+    // The backend refuses to keep it too: save_server checks a kept
+    // variable's name as well.
+    await page.evaluate(() => mcpSaveServer());
+    ok('a save that keeps it sends no variable', (await app.calls('mcp_save_server')).at(-1).args, {
+      id: 'm2', name: 'env-svc', url: 'https://mcp.example.test/mcp', auth_type: 'bearer',
+      auth_header_name: null, auth_secret: null, auth_env_var: null,
+    });
+    // The stub then answers the same save as if it had kept the variable, to
+    // show the renderer does not count on that refusal: what it says next
+    // names the variable spelled out too.
+    await page.evaluate(() => {
+      window.__replies.mcp_save_server = window.__emulatedSave;
+      window.__answer = 'allow';
+      return mcpSaveServer();
+    });
+    ok('the toast that says it stays in effect names it spelled out, kept to itself',
+      (await toasts(page)).filter((t) => /stays in effect/.test(t)), ['MCP server saved - the environment variable ' + kept + ' stays in effect.']);
+    ok('so does the status line', await page.textContent('#mcpStatus'),
+      'Saved. No secret was entered, so the environment variable ' + kept + ' stays in effect.');
+  });
+}
+
 async function focusChecks(browser, server) {
   await fixture(browser, server, 'A new approval card takes the focus only from the panel or the page', async (app) => {
     const { page } = app; const id = await panel(app);
@@ -997,7 +1311,7 @@ async function focusChecks(browser, server) {
   if (!chromium) { console.error('Playwright is required for test:assistant; no silent skip.'); process.exit(1); }
   const server = await serve(rendererDir()); const browser = await chromium.launch({ headless: true });
   try {
-    for (const fn of [approvalChecks, typingChecks, historyChecks, lifecycleChecks, mcpSettingsChecks, mcpConfirmChecks, providerChecks, lockedSettingsChecks, setupChecks, panelChecks, focusChecks]) {
+    for (const fn of [approvalChecks, typingChecks, historyChecks, lifecycleChecks, mcpSettingsChecks, mcpConfirmChecks, spelledNameChecks, providerChecks, lockedSettingsChecks, setupChecks, panelChecks, focusChecks]) {
       // ASSISTANT_ONLY=<group> runs one group while iterating; CI runs all.
       if (process.env.ASSISTANT_ONLY && fn.name !== process.env.ASSISTANT_ONLY) continue;
       console.log('\n' + fn.name); await fn(browser, server);

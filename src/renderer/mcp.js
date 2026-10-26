@@ -18,8 +18,17 @@
  *
  * SECURITY: names, URLs, descriptions and annotations come from MCP servers -
  * fully untrusted. Every one of them is rendered with textContent /
- * createElement, never innerHTML. Annotations may be SHOWN in the approval
- * card but never bypass it; only the user-set auto_approve flag does that.
+ * createElement, never innerHTML. A tool's name and display name are also
+ * spelled out where this file and assistant.js show them (spellOut, app.js;
+ * mcpNameInText), and so is the server's own name, which a backup restores
+ * unchecked, so a direction override or a zero-width character cannot make
+ * one tool or server read as another; the model, the backend and the stored
+ * record get them as they are. A server's URL and the name of the environment
+ * variable its token comes from, which a backup restores unchecked too, are
+ * spelled out where this file shows them; the edit form's fields keep them,
+ * and the server's name, as stored, since a save sends them. Annotations may
+ * be SHOWN in the approval card but never bypass it; only the user-set
+ * auto_approve flag does that.
  *
  * Loaded by app.js right after assistant.js; bridges through window.*.
  */
@@ -179,35 +188,43 @@ async function mcpCallTool(tabId, name, args, approved) {
   };
 }
 
+/// A name inside a sentence of plain text (an error, the status strip, a
+/// toast, a question): a tool's, which its MCP server chose, or one a server
+/// record holds - the server's own, or that of the environment variable its
+/// token comes from - which is checked when it is saved but not when it is
+/// restored from a backup. Spelled out (spellOut, app.js), then kept to
+/// itself between FIRST STRONG ISOLATE and POP DIRECTIONAL ISOLATE, as bdiOf
+/// keeps a name in a line of the page, so it cannot read as another name or
+/// turn the words around it.
+function mcpNameInText(name) {
+  return '\u2068' + spellOut(name) + '\u2069';
+}
+
 // Validate that a tool schema coming from the backend is usable JSON and not
-// empty. Returns the schema as a JSON string; throws a visible error if missing/invalid.
+// empty. Returns the schema as a JSON string; throws a visible error if
+// missing/invalid. The error is shown, never sent to the model: it names the
+// tool and its server spelled out (mcpNameInText), and a parse error, which
+// can quote the schema, is spelled out too.
 function mcpValidateToolSchema(t, serverName, toolName) {
+  const which = 'MCP tool "' + mcpNameInText(toolName) + '" from server "' + mcpNameInText(serverName) + '"';
   const raw = t && typeof t === 'object' ? t.inputSchema : undefined;
   if (raw == null) {
-    throw new Error(
-      'MCP tool "' + toolName + '" from server "' + serverName + '" has no inputSchema.'
-    );
+    throw new Error(which + ' has no inputSchema.');
   }
   let parsed;
   if (typeof raw === 'string') {
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      throw new Error(
-        'MCP tool "' + toolName + '" from server "' + serverName + '" has invalid inputSchema: ' + errText(e)
-      );
+      throw new Error(which + ' has invalid inputSchema: ' + errSpelled(e));
     }
   } else if (typeof raw === 'object') {
     parsed = raw;
   } else {
-    throw new Error(
-      'MCP tool "' + toolName + '" from server "' + serverName + '" has a non-object inputSchema.'
-    );
+    throw new Error(which + ' has a non-object inputSchema.');
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(
-      'MCP tool "' + toolName + '" from server "' + serverName + '" has a non-object inputSchema.'
-    );
+    throw new Error(which + ' has a non-object inputSchema.');
   }
   return typeof raw === 'string' ? raw : JSON.stringify(raw);
 }
@@ -313,12 +330,15 @@ function mcpServerRow(sv) {
   head.appendChild(status);
   const name = document.createElement('span');
   name.className = 'mcp-server-name';
-  name.textContent = sv.name || '(unnamed)';
+  // Spelled out: a backup restores the name unchecked (mcpNameInText).
+  name.textContent = spellOut(sv.name || '(unnamed)');
   head.appendChild(name);
   const url = document.createElement('span');
   url.className = 'mcp-server-url mono';
-  url.textContent = sv.url || '';
-  url.title = sv.url || '';
+  // Spelled out, tooltip too: a backup restores the URL unchecked as well,
+  // and only a save normalizes it.
+  url.textContent = spellOut(sv.url || '');
+  url.title = url.textContent;
   head.appendChild(url);
   // Only `confirmed: true` is confirmed - the same rule as a save's answer
   // (mcpSaveOutcome): a record that says nothing of it fails closed.
@@ -408,7 +428,7 @@ async function mcpRemoveServer(sv) {
   if (mcpBusyServers.has(sv.id)) return;
   // The app's own dialog: the native confirm() is not usable here (see
   // confirmModal in app.js), and Cancel / Escape must really mean no.
-  const ok = await confirmModal('Remove MCP server', 'Remove MCP server "' + (sv.name || '') + '"?', 'Remove');
+  const ok = await confirmModal('Remove MCP server', 'Remove MCP server "' + mcpNameInText(sv.name || '') + '"?', 'Remove');
   if (!ok) return;
   await mcpRowAction(sv.id, async () => {
     try {
@@ -419,10 +439,11 @@ async function mcpRemoveServer(sv) {
       // The entry is gone either way; what went wrong around it - a failed
       // session teardown (A4-27), an audit row that could not be written,
       // or both - is said as the backend says it, as text, where it stays
-      // readable.
+      // readable. Spelled out: a teardown that timed out names the server.
       if (r && r.warning) {
-        mcpSetStatus('MCP server removed. ' + r.warning, 'warn');
-        toast('MCP server removed. ' + r.warning, 'warn');
+        const said = 'MCP server removed. ' + spellOut(r.warning);
+        mcpSetStatus(said, 'warn');
+        toast(said, 'warn');
       } else {
         toast('MCP server removed.', 'ok');
       }
@@ -561,16 +582,18 @@ function mcpRebindCheck() {
   const keepsSecret = !!(sv && sv.has_secret) && !rebound && withSecret;
   if (hint) hint.textContent = keepsSecret ? 'A secret is stored - leave this blank to keep it.' : '';
   if (secretInput) secretInput.placeholder = keepsSecret ? 'Leave blank to keep the stored secret' : 'Enter the token';
+  // The variable is named as stored, which a backup restores unchecked:
+  // spelled out (mcpNameInText).
   let text = '';
   if (sv && rebound && withSecret) {
     if (sv.has_secret) {
       text = 'Changing the URL or the auth settings discards the stored secret - enter it again below before saving.';
     } else if (sv.auth_env_var && mcpSecretKind() === 'env') {
       text = 'Changing the URL or the auth settings sends the token from environment variable '
-        + sv.auth_env_var + ' to the new settings - change the variable name if that is not intended.';
+        + mcpNameInText(sv.auth_env_var) + ' to the new settings - change the variable name if that is not intended.';
     }
   } else if (mcpEnvVarStays()) {
-    text = 'No secret entered: the environment variable ' + sv.auth_env_var
+    text = 'No secret entered: the environment variable ' + mcpNameInText(sv.auth_env_var)
       + ' stays in effect. Type a secret to replace it with a stored one.';
   }
   if (warn) { warn.textContent = text; warn.hidden = !text; }
@@ -660,7 +683,9 @@ async function mcpSaveServer() {
     const secretValue = secretInput ? secretInput.value.trim() : '';
     const authProblem = mcpAuthProblem(kind, source, val('mcpHeaderName'), secretValue, val('mcpAuthEnvVar'));
     if (authProblem) { toast(authProblem, 'err'); return; }
-    const keptEnv = mcpEnvVarStays() ? mcpEditing.auth_env_var : null;
+    // As the form's notices name it (mcpNameInText); the save itself sends
+    // no variable - null keeps the stored one.
+    const keptEnv = mcpEnvVarStays() ? mcpNameInText(mcpEditing.auth_env_var) : null;
     try {
       // null keeps what is stored; a value replaces it (mcp_save_server).
       const r = await mcpSendSave({
@@ -691,7 +716,9 @@ async function mcpSaveServer() {
         toast('MCP server saved.', 'ok');
       }
     } catch (e) {
-      toast(errText(e), 'err');
+      // Spelled out: a refusal can quote another server's name, which a
+      // backup restores unchecked.
+      toast(errSpelled(e), 'err');
     }
   });
 }
@@ -732,7 +759,8 @@ function mcpSaveOutcome(r) {
 /// the backend asks its native question again. The row is busy until that is
 /// answered; then the backend's answer is said as it is.
 async function mcpAllowSending(sv) {
-  const name = sv.name || '';
+  // As the notices name it (mcpNameInText); the save sends sv.name as it is.
+  const name = mcpNameInText(sv.name || '');
   await mcpRowAction(sv.id, async () => {
     mcpSetStatus('Waiting for your answer: SSHSpan asks in its own dialog whether it may send the credential of "'
       + name + '".', 'info');
@@ -740,7 +768,8 @@ async function mcpAllowSending(sv) {
     try {
       r = await mcpSendSave({ id: sv.id, name: sv.name, url: sv.url, authType: sv.auth_type, headerName: null, secret: null, envVar: null });
     } catch (e) {
-      const msg = errText(e);
+      // Spelled out, as the form's refusals are (mcpSaveServer).
+      const msg = errSpelled(e);
       mcpSetStatus(msg, 'err');
       toast(msg, 'err');
       return;
@@ -774,10 +803,13 @@ async function mcpTestConnection(id) {
       const changed = Array.isArray(r && r.changed) ? r.changed : [];
       if (changed.length) {
         mcpSetStatus('These tools changed on the server and were turned off until you review them again: '
-          + changed.map(String).join(', ') + '.', 'err');
+          + changed.map(mcpNameInText).join(', ') + '.', 'err');
       }
     } catch (e) {
-      const msg = errText(e);
+      // Spelled out: a failed Test can quote what the server answered (a
+      // JSON-RPC error, a protocol version) or the stored variable's name,
+      // which a save before v1.10.0 did not check (check_env_var_name).
+      const msg = errSpelled(e);
       // Shown beside the row (the list has the status, not the reason) and
       // the row is redrawn from the backend, which now says "error".
       mcpLastErrors.set(id, msg);
@@ -830,7 +862,8 @@ async function mcpSetToolState(serverId, t, enabled, autoApprove) {
     // Done, but its audit row could not be written: said as it is.
     warning = r && r.warning ? String(r.warning) : '';
   } catch (e) {
-    refusal = errText(e);
+    // Spelled out: a refusal can quote the tool ("Tool '...' not found").
+    refusal = errSpelled(e);
   } finally {
     mcpToolBusy.delete(key); // before the redraw, or its toggles stay disabled
   }
@@ -841,7 +874,7 @@ async function mcpSetToolState(serverId, t, enabled, autoApprove) {
   }
   if (refusal === null) return;
   if (mcpIsDefinitionRefusal(refusal)) {
-    mcpSetStatus('Tool "' + t.name + '" was not approved: ' + refusal
+    mcpSetStatus('Tool "' + mcpNameInText(t.name) + '" was not approved: ' + refusal
       + ' Its current definition is shown below - review it, then enable it again.', 'err');
   } else {
     toast(refusal, 'err');
@@ -861,7 +894,13 @@ function mcpToolRow(serverId, t) {
   head.className = 'mcp-tool-head';
   const name = document.createElement('code');
   name.className = 'mcp-tool-name';
-  name.textContent = t.display_name && t.display_name !== t.name ? t.display_name + ' (' + t.name + ')' : t.name;
+  // Both names are the server's: spelled out, and each kept to itself when
+  // they share the line, so this tool cannot read as another.
+  if (t.display_name && t.display_name !== t.name) {
+    name.append(bdiOf(spellOut(t.display_name)), ' (', bdiOf(spellOut(t.name)), ')');
+  } else {
+    name.textContent = spellOut(t.name);
+  }
   head.appendChild(name);
   for (const label of mcpAnnotationLabels(t.annotations)) {
     const chip = document.createElement('span');
@@ -967,8 +1006,9 @@ function mcpRenderToolsFor(id) {
   }
   const title = document.createElement('div');
   title.className = 'mcp-tools-title';
-  title.textContent = 'Tools from "' + (sv.name || '') + '" (' + mcpEnabledCount(sv) + '/' + sv.tools.length
-    + ' enabled) - review each before enabling:';
+  // The server's name spelled out and kept to itself (mcpNameInText).
+  title.append('Tools from "', bdiOf(spellOut(sv.name || '')), '" (' + mcpEnabledCount(sv) + '/' + sv.tools.length
+    + ' enabled) - review each before enabling:');
   host.appendChild(title);
   for (const t of sv.tools) host.appendChild(mcpToolRow(sv.id, t));
 }

@@ -73,6 +73,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. The Upload... picker names its folder the same way in its title. What the backend is asked to
   create, rename or search for, and the name a bookmark stores, are still the names as they are.
 
+- **The rest of the file browser names remote files the way the file list does.** The toasts about
+  a link, a folder's size and synchronized browsing, the questions of New folder, New file, a new
+  bookmark, the permissions dialog and "already exists", the file menu's Rename, the Bookmarks
+  menu and the search results showed a remote name as it is, so a text-direction override
+  (U+202E) turned it around and a zero-width space went unseen. They now spell these out as the
+  listing does, a name inside a sentence in a text-direction isolate of its own. What the backend
+  says when a listing, a new folder, a rename, a move, a delete, a chmod, a folder size, a search
+  or a download fails quotes the path, and is spelled out too, in the local pane as well. A name a
+  line of the activity log quotes in its own words now has an isolate of its own (the backend's
+  words in a line are spelled out whole): two right-to-left names on either side of an arrow read
+  as a rename or a move the other way round, and a number after one was drawn in front of it. A
+  path on this computer in a toast or a log line (where a download goes, the default local folder)
+  is spelled out name by name, as a download keeps the name the server gave it. What is made,
+  renamed or saved is still the name as it is, and so is the text in a field that edits one.
+
+- **An MCP tool cannot pass for another on the approval card.** A tool's name and display name are
+  the MCP server's choice and were shown as they are, so a text-direction override (U+202E) turned
+  what followed it around and a zero-width space went unseen - on the card that approves a call
+  too. The renderer now spells such characters out (`<U+202E>`), each name in a text-direction
+  isolate of its own, on the approval card (its accessible name spelled out too), in the tools list,
+  in the assistant's record of each call and in the notices that name a tool. That record also
+  shows a call's result and the backend's warning with these characters marked, the result's line
+  breaks kept. The card, that record and the schema notice spell out the server's own name too,
+  since a backup restores it unchecked. The model, the backend and the stored record still get
+  every name and result as they are (see `docs/SECURITY.md`).
+- **A server restored from a backup cannot pass for another in the MCP settings.** A server's name
+  is checked when it is saved, not when a backup restores it, and the MCP settings showed it as
+  stored: in its row, in the heading of its tools, in the question that removes it and in the
+  notices that name it (the wait for the answer about its credential, its confirmation, a refusal
+  to save another server whose tool names it would share, a removal warning). These now spell out
+  invisible and text-direction characters (`<U+202E>`) too; in a sentence of the renderer's own the
+  name is also kept in a text-direction isolate, and a refusal or warning the backend words is
+  spelled out whole. The edit form's name field still holds the name as stored, since a save sends
+  it. A restore still keeps the name as it is - such an entry stays switched off until it is saved,
+  and a save refuses the name - and the model, the backend and the stored record still get it as it
+  is (see `docs/SECURITY.md`).
+- **A restored MCP server's URL and environment variable are spelled out in the MCP settings.** A
+  backup restores a server's URL and the name of the environment variable its token comes from
+  unchecked as well, and the MCP settings showed them as stored: the URL in the server's row and
+  its tooltip, the variable's name in the form's notices about it. A failed Test connection was
+  shown as worded, and it can quote what the server answered and a variable's name that a version
+  before v1.10.0 saved unchecked. These now spell out invisible and text-direction characters
+  (`<U+202E>`) too, the variable's name kept in a text-direction isolate in a sentence - as does
+  what the form says after a save that kept the variable, although a save refuses such a name. The
+  edit form still holds the values as stored, since a save sends them. The backend and the stored
+  record still get them as they are (see `docs/SECURITY.md`).
+
 ## [1.10.0] - 2026-10-18
 
 Changes since v1.9.1: a flaw-remediation release driven by an eight-area internal audit on
