@@ -11,6 +11,8 @@
  * about the same way (declined, the save is refused with the backend's text).
  */
 'use strict';
+const fs = require('fs');
+const path = require('path');
 const {
   failures, check, yes, part, loadChromium, serve, rendererDir, openApp,
   openLiveTab, waitVisible, answerConfirm, hold, letGo, toasts, SERVER,
@@ -69,6 +71,9 @@ const FULL_ARG_VALUES = Object.values(FULL_ARGS);
 // assistant/mod.rs save_config_confirmed, commands CREDENTIAL_QUESTION_OPEN).
 const DECLINED = (host) => 'The server was saved but stays switched off, because sending its credential to '
   + host + ' was not allowed. Save it again to be asked again.';
+// MCP server URLs as typed and as classify_url stores them; mcp.rs's tests
+// check the backend against the same file.
+const URL_CASES = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src-tauri', 'src', 'assistant', 'mcp_url_cases.json'), 'utf8')).cases;
 const KEY_MOVE_DECLINED = 'Enter the API key for the new address.';
 const KEY_MOVE_CHANGED = 'The assistant settings changed while you were deciding - save them again.';
 const KEY_MOVE_TOO_QUICK = 'The question about sending the stored API key was answered within a second of opening - too fast to be a decision. Save again to be asked again.';
@@ -575,6 +580,42 @@ async function mcpSettingsChecks(browser, server) {
     expect('URL change warns about discarded credential BEFORE save', /discard|re-enter/i.test(await page.locator('#mcpFormHost').innerText()));
     const prior = await app.count('mcp_save_server'); await page.click('#mcpSaveBtn'); await page.waitForTimeout(40);
     ok('origin change with no re-entered source fails closed', await app.count('mcp_save_server'), prior);
+  });
+  // The URL the form compares is the one the backend stores (classify_url):
+  // an IPv6 address keeps its brackets, and the path is the url crate's -
+  // | and ^ as typed, a %2E inside a segment too, where Chromium writes %7C,
+  // %5E and a dot. Edited and saved unchanged, the server keeps its secret.
+  await fixture(browser, server, 'MCP edit keeps the secret of a URL as the backend stores it', async (app) => {
+    const { page } = app;
+    await settings(page);
+    const edit = async (url) => {
+      await page.evaluate((sv) => { window.__replies.mcp_list_servers = [sv]; return mcpLoadSettings(); },
+        MCP({ url, auth_type: 'bearer', has_secret: true, loopback_insecure: url.startsWith('http:') }));
+      await page.locator('.mcp-server-row button').filter({ hasText: /^Edit$/ }).click();
+    };
+    // Read from the form as shown: an isHidden() of the warning's element
+    // would also pass if that element were gone.
+    const warnsDiscard = async () => /discard/i.test(await page.locator('#mcpFormHost').innerText());
+    for (const url of ['http://[::1]:8080/mcp', 'https://mcp.example.test/a|b', 'https://mcp.example.test/a^b', 'https://mcp.example.test/v%2E1']) {
+      await edit(url);
+      ok(url + ': Edit says the stored secret is kept', (await page.locator('#mcpSecretHint').textContent()).trim(), 'A secret is stored - leave this blank to keep it.');
+      ok(url + ': no warning that it is discarded', await warnsDiscard(), false);
+      const saves = await app.count('mcp_save_server');
+      await page.click('#mcpSaveBtn'); await page.waitForTimeout(40);
+      ok(url + ': saved unchanged, the form does not refuse it', await app.count('mcp_save_server'), saves + 1);
+      ok(url + ': the save sends no secret', (await app.calls('mcp_save_server')).slice(saves).map((c) => c.args.auth_secret), [null]);
+    }
+    // The same address typed another way is no change; another port is one.
+    await edit('http://[::1]:8080/mcp');
+    await page.fill('#mcpUrl', 'HTTP://[0:0:0:0:0:0:0:1]:8080/mcp/');
+    ok('the same IPv6 address typed another way keeps the secret', await warnsDiscard(), false);
+    await page.fill('#mcpUrl', 'http://[::1]:8081/mcp');
+    expect('another port warns that the secret is discarded', await warnsDiscard());
+    const saves = await app.count('mcp_save_server'); await page.click('#mcpSaveBtn'); await page.waitForTimeout(40);
+    ok('and the save is refused until the secret is entered again', await app.count('mcp_save_server'), saves);
+    // Every case classify_url is checked against comes out as it stores it.
+    const written = await page.evaluate((cases) => cases.map((c) => mcpNormalizedUrl(c.typed)), URL_CASES);
+    URL_CASES.forEach((c, i) => ok('MCP URL written as stored - ' + c.why, written[i], c.stored));
   });
   await fixture(browser, server, 'MCP definition compare-and-swap and refreshed pins', async (app) => {
     const { page } = app;

@@ -4582,6 +4582,32 @@ mod tests {
         }
     }
 
+    /// The MCP settings form tells whether an edit keeps the stored
+    /// credential by writing the typed URL the way this stores it
+    /// (mcpNormalizedUrl in src/renderer/mcp.js), and
+    /// scripts/check-assistant-ui.js checks it against these same cases: a
+    /// url crate that writes one differently must change both.
+    #[test]
+    fn stored_urls_match_the_cases_the_settings_form_is_checked_against() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            typed: String,
+            stored: String,
+            why: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Cases {
+            cases: Vec<Case>,
+        }
+        let all: Cases = serde_json::from_str(include_str!("mcp_url_cases.json")).unwrap();
+        assert!(!all.cases.is_empty());
+        for case in &all.cases {
+            let (stored, _) = classify_url(&case.typed)
+                .unwrap_or_else(|e| panic!("{:?} ({}): {e}", case.typed, case.why));
+            assert_eq!(stored, case.stored, "{:?} ({})", case.typed, case.why);
+        }
+    }
+
     // ── Header name validation ──────────────────────────────────────────
 
     #[test]
