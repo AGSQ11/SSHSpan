@@ -174,7 +174,7 @@ function sftpOpenOnce(tab) {
       if (tab.sessionId !== sessionId || !window.tabSessionLive(tab.tabId)) return false;
       tab.sftpReady = true;
       tab.sftpPath = r.cwd || '/';
-      sftpLog(tab.tabId, `SFTP opened at ${tab.sftpPath}`);
+      sftpLog(tab.tabId, `SFTP opened at ${sftpSpell(tab.sftpPath)}`);
       sftpCall('sftp_keepalive_start', { sessionId }).catch(() => {});
       wireQueueEvents();
       return true;
@@ -939,6 +939,17 @@ function sftpSpell(text) {
 /// break out with.
 function sftpInText(text) {
   return '\u2068' + sftpSpell(text) + '\u2069';
+}
+
+/// A path on this computer spelled out name by name, as sftpSpell does a
+/// remote one: a download keeps the name the server gave it. A Windows path -
+/// backslashes and no forward slash, the way joinPlatformPath (app.js) tells
+/// one - is taken apart at its backslashes, so a folder in it of look-alike
+/// dots, or padded with spaces, is spelled out there too. The empty parts of a
+/// drive root or a UNC path stay empty: sftpSpellName leaves "" as it is.
+function sftpSpellLocal(path) {
+  const p = String(path == null ? '' : path);
+  return p.includes('\\') && !p.includes('/') ? p.split('\\').map(sftpSpellName).join('\\') : sftpSpell(p);
 }
 
 /// A name the listing flags: one it spells out anything of; one that shows
@@ -2055,7 +2066,7 @@ function sftpCreatePrompt(tabId, title, ask, initial, create, verb) {
     if (!sftpSameSession(tabId, tab, sessionId)) return;
     try {
       await create(sessionId, sftpJoin(dir, name));
-      sftpLog(tabId, `${verb} ${sftpJoin(dir, name)}`);
+      sftpLog(tabId, `${verb} ${sftpSpell(sftpJoin(dir, name))}`);
       await sftpAfterRemoteChange(tabId, tab, { dirs: [dir] });
     } catch (e) { toast(errText(e), 'err'); }
   });
@@ -2149,7 +2160,7 @@ function sftpRenamePrompt(tabId, entry) {
     if (!sftpSameSession(tabId, tab, sessionId)) return;
     try {
       await sftpCall('sftp_rename', { sessionId, from: fullPath, to: sftpJoin(dir, newName) });
-      sftpLog(tabId, `rename ${entry.name} → ${newName}`);
+      sftpLog(tabId, `rename ${sftpSpell(entry.name)} → ${sftpSpell(newName)}`);
       // Its folder changed; a renamed folder's old subtree is gone.
       await sftpAfterRemoteChange(tabId, tab, { dirs: [dir], trees: entry.isDir ? [fullPath] : [] });
     } catch (e) { toast(errText(e), 'err'); }
@@ -2173,7 +2184,7 @@ async function sftpCalcDirSize(tabId, name) {
   try {
     const r = await sftpCall('sftp_dir_size', { sessionId: tab.sessionId, path: fullPath });
     entry._dirSize = { state: 'done', bytes: r.bytes || 0, files: r.files || 0, dirs: r.dirs || 0, truncated: !!r.truncated };
-    sftpLog(tabId, `size ${name}: ${formatSftpSize(r.bytes || 0)}${r.truncated ? '+ (capped)' : ''} (${r.files} files, ${r.dirs} dirs)`);
+    sftpLog(tabId, `size ${sftpSpell(name)}: ${formatSftpSize(r.bytes || 0)}${r.truncated ? '+ (capped)' : ''} (${r.files} files, ${r.dirs} dirs)`);
   } catch (e) {
     entry._dirSize = { state: 'error', error: errText(e) };
     toast(`Size failed for "${name}": ${errText(e)}`, 'err');
@@ -2218,7 +2229,11 @@ async function sftpUploadSelected(tabId) {
   const dir = tab.sftpPath || '/';
   let pick;
   try {
-    pick = await sftpCall('system_pick_files', { title: 'Upload to ' + dir, multiple: true });
+    // The folder in the picker's title as the listing shows it: the backend
+    // drops control, format and direction characters from a title without a
+    // trace (file_dialog_title) and keeps look-alikes, so a folder named
+    // with two U+A4F8 read as "..".
+    pick = await sftpCall('system_pick_files', { title: 'Upload to ' + sftpSpell(dir), multiple: true });
   } catch (e) {
     toast(errText(e), 'err');
     return;
@@ -2239,8 +2254,9 @@ async function sftpUploadSelected(tabId) {
 /// backend walked and skipped (a FIFO, a link to a folder), its reason in its
 /// warnings. Shown generically: every item and its notes in the activity log,
 /// and a toast that counts what went and names the first that did not (or,
-/// all queued, the first note). Without `items` (an older backend) the usual
-/// queue report is used.
+/// all queued, the first note), the notes spelled out as
+/// sftpReportQueueWarnings spells them. Without `items` (an older backend)
+/// the usual queue report is used.
 function sftpReportPickedUploads(tabId, r) {
   const items = arrayOrEmpty(r && r.items).filter(Boolean);
   if (!items.length) {
@@ -2257,11 +2273,11 @@ function sftpReportPickedUploads(tabId, r) {
   for (const i of items) {
     sftpLog(tabId, queued(i)
       ? `upload queued: ${i.path}${i.added > 1 ? ` (${i.added} transfers)` : ''}`
-      : `upload not queued: ${reasonOf(i)}`);
+      : `upload not queued: ${spellOut(reasonOf(i))}`);
     shown.add(reasonOf(i));
     for (const w of notesOf(i)) {
       if (!queued(i) && w === reasonOf(i)) continue;
-      sftpLog(tabId, `  ${w}`);
+      sftpLog(tabId, `  ${spellOut(w)}`);
       shown.add(w);
     }
     if (i.error) shown.add(i.error);
@@ -2271,9 +2287,9 @@ function sftpReportPickedUploads(tabId, r) {
   const notes = items.filter(queued).flatMap(notesOf);
   const more = (n) => (n > 1 ? ` (and ${n - 1} more - see the activity log)` : '');
   if (left.length) {
-    toast(`${items.length - left.length} of ${items.length} files queued - ${reasonOf(left[0])}${more(left.length)}`, 'warn');
+    toast(`${items.length - left.length} of ${items.length} files queued - ${spellOut(reasonOf(left[0]))}${more(left.length)}`, 'warn');
   } else if (notes.length) {
-    toast(`${plural(items.length, 'file')} queued for upload - ${notes[0]}${more(notes.length)}`, 'warn');
+    toast(`${plural(items.length, 'file')} queued for upload - ${spellOut(notes[0])}${more(notes.length)}`, 'warn');
   } else {
     toast(`${plural(items.length, 'file')} queued for upload.`, 'ok');
   }
@@ -2370,7 +2386,7 @@ function openSftpFileMenu(x, y, tabId, entry) {
     t.tabId !== tabId && window.tabSessionLive(t.tabId) && t.sftpReady);
   if (others.length > 0 && !multi) {
     items.push('sep');
-    for (const other of others) mk('Send to ' + other.serverName, 'send', () => sftpSendTo(tabId, fullPath, other));
+    for (const other of others) mk('Send to ' + spellOut(other.serverName), 'send', () => sftpSendTo(tabId, fullPath, other));
   }
 
   openMenu({ x, y }, items, { label: multi ? selected.length + ' items' : 'File ' + sftpSpell(entry.name) });
@@ -2659,7 +2675,7 @@ async function runSearch(tabId, query) {
   sftpSearches.set(tabId, search);
   results.innerHTML = '';
   status.textContent = 'Searching...';
-  sftpLog(tabId, `search "${query}" under ${tab.sftpPath}`);
+  sftpLog(tabId, `search "${sftpInText(query)}" under ${sftpSpell(tab.sftpPath)}`);
   try {
     await call('sftp_search', { sessionId: tab.sessionId, rootPath: tab.sftpPath, query, searchId: search.id });
   } catch (e) {
@@ -2699,7 +2715,7 @@ async function openBookmarkMenu(ev, tabId) {
         name, remotePath: tab.sftpPath, localPath: tab.dualPane ? tab.localPath : null,
       }];
       await sftpCall('sftp_bookmarks_save', { serverId: tab.serverId, bookmarks: updated });
-      sftpLog(tabId, `bookmark "${name}" → ${tab.sftpPath}`);
+      sftpLog(tabId, `bookmark "${sftpInText(name)}" → ${sftpSpell(tab.sftpPath)}`);
       toast('Bookmark saved.', 'ok');
     }),
   });
@@ -3159,7 +3175,7 @@ function sftpSetLocalDirDefault(tabId) {
   // state.settings follows only a write that went through (sftpSaveSetting),
   // so a refused one is not used for the rest of the session either.
   sftpSaveSetting(key, dir).then((saved) => {
-    if (saved) toast(`Default local directory for ${tab.serverName || 'this server'} set to ${dir}`, 'ok');
+    if (saved) toast(`Default local directory for ${tab.serverName ? serverInText(tab.serverName) : 'this server'} set to ${dir}`, 'ok');
   });
 }
 
@@ -3196,9 +3212,11 @@ function localNavigateUp(tabId) {
 /// What sftp_queue_add left out or changed while expanding a request
 /// (symbolic links and special files skipped, unreadable folders, unusable
 /// names, colliding downloads renamed): every line goes to the activity log
-/// and the first to a toast, so nothing drops out of a transfer unseen.
+/// and the first to a toast, so nothing drops out of a transfer unseen. A
+/// note quotes the path it is about - a remote name the backend could not
+/// use among them - so it is spelled out (spellOut, app.js).
 function sftpReportQueueWarnings(tabId, r) {
-  const warnings = (r && r.warnings) || [];
+  const warnings = ((r && r.warnings) || []).map((w) => spellOut(w));
   if (!warnings.length) return;
   for (const w of warnings) sftpLog(tabId, `queue: ${w}`);
   toast(warnings.length === 1
@@ -3275,7 +3293,11 @@ async function queueDownloads(tabId, remotePaths, into) {
     sftpLog(tabId, `queued ${r.added} download(s) → ${dir}`);
     sftpReportQueueWarnings(tabId, r);
     if (r.added > 0) toast(`${r.added} download(s) → ${dir}`, 'ok');
-  } catch (e) { toast(errText(e), 'err'); }
+  } catch (e) {
+    // A batch whose every item failed is refused with a sentence per item,
+    // each quoting its path: spelled out like the notes (errSpelled, app.js).
+    toast(errSpelled(e), 'err');
+  }
 }
 
 /// `report(r)`, when given, shows the result of sftp_queue_add in place of the
@@ -3344,7 +3366,7 @@ async function queueUploads(tabId, pairs, report) {
     sftpLog(tabId, `queued ${r.added} upload(s)`);
     sftpReportQueueWarnings(tabId, r);
     if (r.added > 0) toast(`${r.added} upload(s) queued.`, 'ok');
-  } catch (e) { toast(errText(e), 'err'); }
+  } catch (e) { toast(errSpelled(e), 'err'); } // as in queueDownloads
 }
 
 // ─── overwrite-conflict handling (FileZilla "file already exists") ──────────
@@ -3833,7 +3855,7 @@ function sftpOnEditSync(ev) {
       sftpCacheInvalidate(tab, sftpParent(remote));
       tab._listingDirty = true;
     }
-    toast(`Saved "${sftpInText(name)}" to ${(tab && tab.serverName) || 'the server'}.`, 'ok');
+    toast(`Saved "${sftpInText(name)}" to ${tab && tab.serverName ? serverInText(tab.serverName) : 'the server'}.`, 'ok');
   } else {
     const why = spellOut(p.error || 'unknown error');
     if (tab) sftpLog(tab.tabId, `save of ${sftpSpell(remote)} FAILED: ${why}`);
@@ -3934,7 +3956,8 @@ function sftpShowEditConflict(c, why) {
   const now = !deleted && (c.remoteSize != null || c.remoteModifiedMs)
     ? ` - now ${c.remoteSize != null ? formatSftpSize(c.remoteSize) : 'size unknown'}${c.remoteModifiedMs ? `, modified ${fmtSftpTime(c.remoteModifiedMs)}` : ''}`
     : '';
-  document.getElementById('editConflictServer').replaceChildren(`${(tab && tab.serverName) || 'Server'}: `, sftpBdi(c.remote), now);
+  document.getElementById('editConflictServer').replaceChildren(
+    tab && tab.serverName ? bdiOf(spellOut(tab.serverName)) : 'Server', ': ', sftpBdi(c.remote), now);
   const err = document.getElementById('editConflictError');
   err.textContent = '';
   err.hidden = true;
@@ -4104,21 +4127,24 @@ async function sftpAnswerEditConflict(action) {
 // source and uploads to the target on fresh SFTP channels (the interactive
 // browse sessions are never used - some servers fail reads on the
 // long-lived channel). Progress shows in the transfer queue panel - the call
-// only queues it, so nothing says "Sent" (the job may yet fail). The name is
-// spelled out and kept to itself, as in every sentence here.
+// only queues it, so nothing says "Sent" (the job may yet fail). The file's
+// name and the server's are spelled out and kept to themselves, as in every
+// sentence here, and a refusal, which quotes the path, is spelled out too
+// (errSpelled, app.js).
 async function sftpSendTo(fromTabId, fullPath, targetTab) {
   try {
     const name = sftpInText(fullPath.split('/').filter(Boolean).pop() || 'file');
-    terminalSetStatus(`Queueing ${name} for sending to ${targetTab.serverName}...`);
+    const to = serverInText(targetTab.serverName);
+    terminalSetStatus(`Queueing ${name} for sending to ${to}...`);
     await sftpCall('sftp_server_copy', {
       fromSessionId: state.sessions.get(fromTabId)?.sessionId,
       remote: fullPath,
       targetSessionId: targetTab.sessionId,
       targetDir: targetTab.sftpPath || '/',
     });
-    terminalSetStatus(`Queued ${name} for sending to ${targetTab.serverName}.`);
-    toast(`Queued ${name} for sending to ${targetTab.serverName} - see Transfers.`, 'ok');
-  } catch (e) { toast(errText(e), 'err'); }
+    terminalSetStatus(`Queued ${name} for sending to ${to}.`);
+    toast(`Queued ${name} for sending to ${to} - see Transfers.`, 'ok');
+  } catch (e) { toast(errSpelled(e), 'err'); }
 }
 
 // ─── transfer queue panel ───────────────────────────────────────────────────
@@ -4192,12 +4218,15 @@ function wireQueueEvents() {
     for (const j of ev.payload.jobs || []) {
       queueJobs.set(j.id, j);
       // Mirror failures into the tab's log + status strip, once per failure
-      // (a retried job that fails again is logged again).
+      // (a retried job that fails again is logged again). The path is spelled
+      // out as the listing spells it - a job with no remote path is named by
+      // its local one, name by name too (sftpSpellLocal) - and the backend's
+      // reason as its other texts are (spellOut, app.js).
       if (j.state !== 'failed') { sftpQueueLoggedFailures.delete(j.id); continue; }
       if (sftpQueueLoggedFailures.has(j.id)) continue;
       sftpQueueLoggedFailures.add(j.id);
       const tab = [...state.sessions.values()].find(t => t.sessionId === j.sessionId);
-      if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath || j.localPath} - ${j.error || 'error'}`);
+      if (tab) sftpLog(tab.tabId, `transfer failed: ${j.remotePath ? sftpSpell(j.remotePath) : sftpSpellLocal(j.localPath)} - ${spellOut(j.error || 'error')}`);
     }
     renderQueuePanel();
   }).then(() => {
@@ -4493,7 +4522,10 @@ function sftpQueueCountJobs(node) {
   return n;
 }
 
-/// One header row. Clicking it collapses or expands the branch beneath.
+/// One header row. Clicking it collapses or expands the branch beneath. A
+/// server's row is named by the saved server's name, spelled out (see
+/// serverInText, app.js); a folder's by its names, spelled out as the listing
+/// spells them (sftpSpell). The key stays the path as it is.
 function sftpQueueGroupEl(kind, label, key, depth, count) {
   const row = document.createElement('button');
   const collapsed = sftpQueueCollapsed.has(key);
@@ -4501,7 +4533,7 @@ function sftpQueueGroupEl(kind, label, key, depth, count) {
   row.style.setProperty('--q-depth', String(depth));
   row.innerHTML = `<span class="q-twisty">${ico('chevron-right')}</span>`
     + `<span class="q-groupicon">${ico(kind === 'server' ? 'server' : 'folder')}</span>`
-    + `<span class="q-grouplabel">${escapeHtml(label)}</span>`
+    + `<span class="q-grouplabel">${escapeHtml(kind === 'server' ? spellOut(label) : sftpSpell(label))}</span>`
     + `<span class="q-groupcount">${count}</span>`;
   row.addEventListener('click', () => {
     if (sftpQueueCollapsed.has(key)) sftpQueueCollapsed.delete(key);
@@ -4577,7 +4609,9 @@ function sftpQueueBuildRow(j) {
       ? `<span class="q-dirarrow copy" title="Server to server">${ico('send')}</span>`
       : `<span class="q-dirarrow down" title="Download">${ico('download')}</span>`;
   const name = cell('q-name');
-  const nameText = sftpQueueJobName(j);
+  // The file's name as the listing shows it (sftpSpell), in the cell and its
+  // tooltip; the list is sorted by the name as it is (sftpQueuePlan).
+  const nameText = sftpSpell(sftpQueueJobName(j));
   name.title = nameText;
   // Verify badge (Task 4): a small marker on jobs that ran (or will run)
   // with post-transfer SHA-256 verification, so the extra traffic/time it
@@ -4590,11 +4624,16 @@ function sftpQueueBuildRow(j) {
     name.appendChild(badge);
   }
   name.appendChild(document.createTextNode(nameText));
+  // The saved servers' names, spelled out and each kept to itself (see
+  // serverInText, app.js); the tooltip says the same.
   const route = cell('q-route');
-  route.textContent = j.kind === 'serverCopy' && j.targetServerName
-    ? `${j.serverName || ''} → ${j.targetServerName}`
-    : (j.serverName || '');
-  route.title = route.textContent;
+  if (j.kind === 'serverCopy' && j.targetServerName) {
+    route.append(bdiOf(spellOut(j.serverName)), ' → ', bdiOf(spellOut(j.targetServerName)));
+    route.title = `${serverInText(j.serverName)} → ${serverInText(j.targetServerName)}`;
+  } else {
+    route.textContent = spellOut(j.serverName);
+    route.title = route.textContent;
+  }
   const prog = cell('q-prog');
   const bar = document.createElement('span');
   bar.className = 'sftp-queuebar';
@@ -4646,7 +4685,11 @@ function sftpQueueFillRow(row, j, depth) {
   const retrySecs = (j.state === 'queued' && j.retryAt)
     ? Math.max(0, Math.ceil((j.retryAt - Date.now()) / 1000))
     : null;
-  let errDisplay = j.error || (j.state === 'cancelled' ? 'Cancelled' : '');
+  // The backend's note is spelled out, in the cell and its tooltip: it can
+  // quote the saved server's name ('Reconnect to "..." to resume.') or a
+  // remote path.
+  const note = spellOut(j.error);
+  let errDisplay = note || (j.state === 'cancelled' ? 'Cancelled' : '');
   let errClass = '';
   if (retrySecs !== null) {
     const m = errDisplay.match(/\((\d+\/\d+)\)\s*$/);
@@ -4656,7 +4699,7 @@ function sftpQueueFillRow(row, j, depth) {
     errClass = ' info'; // a paused note or a cancel, not a failure - don't paint it red
   }
   q.err.className = 'q-cell q-err' + errClass;
-  q.err.title = j.error || '';
+  q.err.title = note;
   q.err.textContent = errDisplay;
   // The buttons are rebuilt only when what they OFFER changes - not on every
   // state change: queued -> active offers the same Pause/Cancel, and
@@ -4694,7 +4737,7 @@ function sftpQueueActionButtons(j, resumable) {
     } else {
       // No connected tab on the job's server - resume_job would leave it
       // paused anyway. Disabled, not wired.
-      resume = btn(`Reconnect to "${j.serverName || 'the server'}" to resume`, Q_ICON_RESUME, null);
+      resume = btn(`Reconnect to "${j.serverName ? serverInText(j.serverName) : 'the server'}" to resume`, Q_ICON_RESUME, null);
       resume.className = 'icon-btn disabled';
       resume.disabled = true;
     }
@@ -5335,7 +5378,9 @@ async function sftpSyncToggle(tabId) {
       return;
     }
     sftpSyncTabs.add(tabId);
-    sftpLog(tabId, `synchronized browsing: on (anchored at ${tab.localPath} ⇄ ${tab.sftpPath})`);
+    // The local folder spelled out too: a download keeps the name the server
+    // gave it, and an override in it would turn the rest of the line around.
+    sftpLog(tabId, `synchronized browsing: on (anchored at ${sftpSpellLocal(tab.localPath)} ⇄ ${sftpSpell(tab.sftpPath)})`);
   }
   sftpSyncUpdateButton(tabId);
 }
@@ -5361,7 +5406,7 @@ function sftpSyncActive(tabId) {
 function sftpSyncSuspend(tabId, side, name) {
   if (!sftpSyncTabs.delete(tabId)) return;
   toast(`${side} ${name} doesn't exist - sync paused for this level`, 'warn');
-  sftpLog(tabId, `synchronized browsing suspended: ${side} "${name}" has no mirror`);
+  sftpLog(tabId, `synchronized browsing suspended: ${side} "${sftpInText(name)}" has no mirror`);
   sftpSyncUpdateButton(tabId);
 }
 

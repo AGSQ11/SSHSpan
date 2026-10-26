@@ -677,8 +677,9 @@ function terminalSetStatus(text) {
 }
 
 /// Open the SSH session for a tab. Resolves with the sessionId; rejects with
-/// the backend's message as it is, or with CONNECT_ABANDONED when the
-/// attempt was closed, cancelled or replaced before it finished.
+/// the backend's message spelled out (errSpelled, app.js - it can quote the
+/// host), or with CONNECT_ABANDONED when the attempt was closed, cancelled or
+/// replaced before it finished.
 function terminalConnectInTab(tabId, server, opts) {
   return new Promise(async (resolve, reject) => {
     let rec = tabRecord(tabId);
@@ -723,9 +724,11 @@ function terminalConnectInTab(tabId, server, opts) {
     // session starts.
     if (attempt > 1) {
       try { t.write('\x1b[?1049l\x1b[!p\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l'); } catch (e) {}
-      terminalNotice(rec, `--- reconnecting to ${server.host}:${server.port || 22} ---`, '90');
+      // The host spelled out (spellOut, app.js), as the tab and the status
+      // line show it; in the trace, too, it carries no control of its own.
+      terminalNotice(rec, `--- reconnecting to ${spellOut(server.host)}:${server.port || 22} ---`, '90');
     }
-    trace(tabId, `[sshspan] xterm ready (${t.cols}x${t.rows}) - connecting to ${server.host}:${server.port} (auth=${server.authMethod || 'publickey'})`);
+    trace(tabId, `[sshspan] xterm ready (${t.cols}x${t.rows}) - connecting to ${spellOut(server.host)}:${server.port} (auth=${server.authMethod || 'publickey'})`);
     const origin = terminalFocusOrigin();
     setTimeout(() => { if (current()) terminalFocus(rec, origin); }, 50);
 
@@ -841,13 +844,14 @@ function terminalConnectInTab(tabId, server, opts) {
       resolve(sessionId);
     } catch (e) {
       dropSubscription();
-      const msg = errText(e);
+      const msg = errSpelled(e);
       if (!current()) { reject(new Error(CONNECT_ABANDONED)); return; }
       rec.connecting = false;
       rec.sessionEnded = true;
       rec.sessionId = null;
-      // The backend's own words, as they are: a host-key mismatch, a
-      // declined key, a timeout - the tab is dead and says why.
+      // The backend's own words, spelled out (they can quote the host): a
+      // host-key mismatch, a declined key, a timeout - the tab is dead and
+      // says why.
       terminalNotice(rec, msg, '1;31');
       reject(new Error(msg));
     }
