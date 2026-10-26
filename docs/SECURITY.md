@@ -3,8 +3,8 @@
 **Last updated:** 2026-10-26  
 **Status:** describes v1.10.0 and the changes listed under Unreleased in the CHANGELOG. The
 passages about those changes are checked against the pull request that made each (#89, #91,
-#92, #94, #95, #96, #97, #99); the release-signing and Windows CI passages against `38e586e`;
-everything else against `6c19b1b`, and nothing else it describes has changed since  
+#92, #93, #94, #95, #96, #97, #99); the release-signing and Windows CI passages against
+`38e586e`; everything else against `6c19b1b`, and nothing else it describes has changed since  
 **Platforms:** Windows and Linux
 
 This is a description of controls and boundaries in the source, not a guarantee that the program
@@ -635,14 +635,17 @@ connection test) is spelled out whole, and a tooltip says what its element shows
 
 Only the display changes: the vault, the server form's fields, what a save sends and what the
 assistant's model is given keep every value as it is. Two kinds of text treat these characters
-differently:
+in a way of their own:
 
 - the Bitwarden sync's approval list strips them (see
   [Bitwarden / Vaultwarden](#bitwarden--vaultwarden));
-- the backend's own texts - the native host-key question and the lines it writes into the terminal
-  as it connects ("Connecting to", "Connected to ... as ...", "Trusted new host key for") - drop
-  control characters from the host, the user name and the server's name but do not spell out the
-  others.
+- the backend's own texts - the native host-key question, the lines it writes into the terminal
+  as it connects ("Connecting to", "Connected to ... as ...", "Trusted new host key for") and a
+  connect error that quotes the host or the user name (a timeout, a refused host key, a refused
+  sign-in) - spell out the host, the user name and the server's name in Rust by the renderer's
+  rule (`<U+202E>`, a line break as `\n`), without an isolate: they are plain text. Control
+  characters are spelled out too, so a value cannot add an escape sequence to the terminal. A
+  test fails if the renderer's `SPELLED_CHARS` is edited and the Rust list is not.
 
 ## Network clients
 
