@@ -33,6 +33,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it only to generate an ECDSA key, import an ECDSA `.ppk` and export one as PKCS#8 (private or
   public); SSH sessions already used 0.7. Those now use `p256`/`p384`/`p521` 0.14, and a PPK import
   or PKCS#8 export gives the same bytes as before. (#90)
+- **A server's name cannot pass for another's.** A saved server's name, host and user name were
+  shown as they are, so a text-direction override (U+202E) turned what followed it around and a
+  zero-width space went unseen. The renderer now spells such characters out (`<U+202E>`), each
+  value in a text-direction isolate of its own, in:
+  - the server list, the palette, the terminal header, tabs and status line, and the password
+    prompt;
+  - the questions, toasts, the "Use this key to connect" picker and the `~/.ssh/config` import;
+  - Known hosts, the audit log, the file browser, the transfer queue and the assistant's tool log.
+
+  A connect or connection-test error that quotes the host is spelled out too. The vault and the
+  server form keep the values as they are. The Bitwarden approval list still strips these
+  characters, and the backend's host-key question and terminal lines still only drop control
+  characters (see `docs/SECURITY.md`). (#91)
+
+- **The transfer queue shows a remote name the way the file list does.** A file or folder name in
+  the transfer queue was shown as it is, so a text-direction override (U+202E) turned it around, a
+  zero-width space went unseen, and a name of look-alike dots (two U+A4F8) or one padded with
+  spaces passed for another. The queue now spells these out as the listing does (`<U+202E>`,
+  `<U+A4F8><U+A4F8>`, `<U+0020>`), in a transfer's row and its tooltip, the folder rows and the
+  activity log line of a failed transfer. The backend's notes on what it skipped or renamed when it
+  queued a transfer, and its refusal to queue or send one at all, quote the paths and are spelled
+  out in their toasts and log lines too. The queue still sorts and groups by the names as they are.
+
+- **The activity log shows a remote name the way the file list does.** Its lines for the folder
+  SFTP opened at, New folder and New file, a rename, the size of a folder, a search, a bookmark and
+  synchronized browsing showed the names in them as they are, so a text-direction override
+  (U+202E) turned the rest of the line around, a zero-width space went unseen and a name of
+  look-alike dots (two U+A4F8) read as "..". They now spell these out as the listing does, and
+  keep what they quote (the text searched for, a bookmark's name, a folder with no mirror) in a
+  text-direction isolate of its own. The local folder synchronized browsing is anchored at is
+  spelled out too, name by name on Windows as well, as a download keeps the name the server gave
+  it. The Upload... picker names its folder the same way in its title. What the backend is asked to
+  create, rename or search for, and the name a bookmark stores, are still the names as they are.
+
+- **The rest of the file browser names remote files the way the file list does.** The toasts about
+  a link, a folder's size and synchronized browsing, the questions of New folder, New file, a new
+  bookmark, the permissions dialog and "already exists", the file menu's Rename, the Bookmarks
+  menu and the search results showed a remote name as it is, so a text-direction override
+  (U+202E) turned it around and a zero-width space went unseen. They now spell these out as the
+  listing does, a name inside a sentence in a text-direction isolate of its own. What the backend
+  says when a listing, a new folder, a rename, a move, a delete, a chmod, a folder size, a search
+  or a download fails quotes the path, and is spelled out too, in the local pane as well. A name a
+  line of the activity log quotes in its own words now has an isolate of its own (the backend's
+  words in a line are spelled out whole): two right-to-left names on either side of an arrow read
+  as a rename or a move the other way round, and a number after one was drawn in front of it. A
+  path on this computer in a toast or a log line (where a download goes, the default local folder)
+  is spelled out name by name, as a download keeps the name the server gave it. What is made,
+  renamed or saved is still the name as it is, and so is the text in a field that edits one.
+
 - **An MCP tool cannot pass for another on the approval card.** A tool's name and display name are
   the MCP server's choice and were shown as they are, so a text-direction override (U+202E) turned
   what followed it around and a zero-width space went unseen - on the card that approves a call

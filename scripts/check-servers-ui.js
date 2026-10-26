@@ -12,7 +12,9 @@
  *   1. the server form and list: a saved password is kept, replaced or
  *      removed on purpose; Test asks for a password; ports are checked;
  *      "Use this key" lists key servers only; a row actions button; the row
- *      and key-row layout; the ~/.ssh/config import;
+ *      and key-row layout; the ~/.ssh/config import; a name, host or user
+ *      name with a direction override or a zero-width space is spelled out
+ *      wherever it is shown, and kept as it is in the form and the vault;
  *   2. the connect lifecycle: a tab closed or cancelled mid-connect leaves no
  *      session behind; the status strip follows the active tab; Reconnect
  *      reconnects the tab it sits beside; a live restart asks first, resets
@@ -775,6 +777,274 @@ async function scenarioConfigImport(browser, server) {
   });
 }
 
+// ─── names, hosts and user names spelled out ────────────────────────────────
+
+/// A saved server whose name, host or user name holds a RIGHT-TO-LEFT
+/// OVERRIDE (U+202E) or a ZERO WIDTH SPACE (U+200B), wherever the app shows
+/// it: spelled out ("<U+202E>") - alone in its element, in a <bdi> in a line
+/// of the page, between U+2068 and U+2069 in a sentence of plain text - so it
+/// cannot read as another server's. The server form and a save keep it as it
+/// is.
+async function scenarioSpelledNames(browser, server) {
+  // Shown as they are, these read "db-prod-1", "db.example.com", "web-1"
+  // and "root".
+  const RLO_NAME = 'db-\u202E1-dorp';
+  const RLO_HOST = '\u202Emoc.elpmaxe.bd';
+  const ZW_NAME = 'web\u200B-1';
+  const ZW_USER = 'ro\u200Bot';
+  const RLO_NAME_SHOWN = 'db-<U+202E>1-dorp';
+  const RLO_HOST_SHOWN = '<U+202E>moc.elpmaxe.bd';
+  const ZW_NAME_SHOWN = 'web<U+200B>-1';
+  const ZW_USER_SHOWN = 'ro<U+200B>ot';
+  /// A value kept to itself in a sentence of plain text.
+  const kept = (s) => '\u2068' + s + '\u2069';
+  /// Direction, isolate and zero-width characters.
+  const HIDDEN_CHARS = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/;
+  const TIMED_OUT = `Timed out connecting to ${RLO_HOST}:22.`;
+  const TIMED_OUT_SHOWN = `Timed out connecting to ${RLO_HOST_SHOWN}:22.`;
+  const rlo = Object.assign(SERVER('s1', RLO_NAME), { host: RLO_HOST, keyId: 'k1' });
+  const zw = Object.assign(SERVER('s2', ZW_NAME, 'password'), { username: ZW_USER });
+  const servers = [rlo, zw, SERVER('s3', 'web-1')];
+
+  await withApp(browser, server, { servers, replies: { server_test: { ok: true, latencyMs: 7 } } },
+    'U+202E and U+200B in the server list, the header, the palette and the questions', async (app) => {
+      const { page } = app;
+      await serversView(page);
+      const rows = await page.evaluate(() => [...document.querySelectorAll('#serverList .server-row')].map((r) => {
+        const name = r.querySelector('.server-name');
+        const sub = r.querySelector('.server-row-sub');
+        return {
+          name: name.textContent, title: name.title, sub: sub.textContent, bdi: [...sub.querySelectorAll('bdi')].map((b) => b.textContent),
+          actions: r.querySelector('.server-row-more').getAttribute('aria-label'),
+        };
+      }));
+      check('a name with U+202E is spelled out in the server list, and its tooltip says the same',
+        rows[0] && [rows[0].name, rows[0].title], [RLO_NAME_SHOWN, RLO_NAME_SHOWN]);
+      check('so is its host; the user name and the host are each in a <bdi>',
+        rows[0] && [rows[0].sub, rows[0].bdi], [`root@${RLO_HOST_SHOWN}:22`, ['root', RLO_HOST_SHOWN]]);
+      check('a name and a user name with U+200B are spelled out: the row does not pass for web-1 and root',
+        rows[1] && [rows[1].name, rows[1].title, rows[1].sub, rows[1].bdi],
+        [ZW_NAME_SHOWN, ZW_NAME_SHOWN, `${ZW_USER_SHOWN}@10.0.0.2:22`, [ZW_USER_SHOWN, '10.0.0.2']]);
+      check('a plain name and address are shown as they are', rows[2] && [rows[2].name, rows[2].sub], ['web-1', 'root@10.0.0.3:22']);
+      check('each actions button is named for its server, spelled out', rows.map((r) => r.actions),
+        ['Actions for ' + RLO_NAME_SHOWN, 'Actions for ' + ZW_NAME_SHOWN, 'Actions for web-1']);
+      check('no direction, isolate or zero-width character reaches the list',
+        await page.evaluate((src) => new RegExp(src).test(document.getElementById('serverList').textContent), HIDDEN_CHARS.source), false);
+
+      await page.evaluate(() => selectServer('s1'));
+      check('the header names the selected server spelled out, its host in a <bdi>', await page.evaluate(() => ({
+        title: el('termTitle').textContent, badge: el('termBadge').textContent, bdi: [...el('termBadge').querySelectorAll('bdi')].map((b) => b.textContent),
+      })), { title: RLO_NAME_SHOWN, badge: RLO_HOST_SHOWN + ':22', bdi: [RLO_HOST_SHOWN] });
+
+      await page.evaluate(() => openPalette());
+      await page.waitForTimeout(80);
+      const palette = await page.evaluate(() => {
+        const out = [];
+        let group = '';
+        for (const n of document.getElementById('paletteResults').children) {
+          if (n.classList.contains('palette-group')) group = n.textContent;
+          else if (group === 'Servers') {
+            const name = n.querySelector('.palette-name');
+            const sub = n.querySelector('.palette-sub');
+            out.push({ name: name.textContent, nameTitle: name.title, sub: sub.textContent, subTitle: sub.title });
+          }
+        }
+        return out;
+      });
+      check('the palette names the servers spelled out, the tooltips the same', palette.map((p) => [p.name, p.nameTitle]),
+        [[RLO_NAME_SHOWN, RLO_NAME_SHOWN], [ZW_NAME_SHOWN, ZW_NAME_SHOWN], ['web-1', 'web-1']]);
+      check('with each user name and host spelled out and kept to itself', palette.slice(0, 2).map((p) => [p.sub, p.subTitle === p.sub]), [
+        [`${kept('root')}@${kept(RLO_HOST_SHOWN)}:22`, true],
+        [`${kept(ZW_USER_SHOWN)}@${kept('10.0.0.2')}:22`, true],
+      ]);
+      await page.evaluate(() => closePalette());
+
+      await page.click('#serverList .server-row[data-id="s1"] .server-row-more');
+      await page.waitForTimeout(60);
+      check('the server menu is named for its server, spelled out',
+        await page.evaluate(() => document.getElementById('keyConnectMenu').getAttribute('aria-label')), 'Server ' + RLO_NAME_SHOWN);
+      await clickMenuItem(page, /^Delete$/);
+      yes('(set-up) Delete asks first', await waitVisible(page, '#confirmModal'));
+      check('the delete question names the server spelled out and kept to itself', (await confirmText(page)).message,
+        `Delete server "${kept(RLO_NAME_SHOWN)}"?`);
+      await answerConfirm(page, 'cancel');
+
+      await page.click('#termTestBtn');
+      await page.waitForTimeout(200);
+      yes('a test names its server spelled out and kept to itself',
+        (await liveToasts(page)).includes(`Connection to ${kept(RLO_NAME_SHOWN)} succeeded (7 ms).`), JSON.stringify(await liveToasts(page)));
+      await page.evaluate((m) => { window.__replies.server_test = { ok: false, error: m }; }, TIMED_OUT);
+      await page.click('#termTestBtn');
+      await page.waitForTimeout(200);
+      yes('a failed test\'s words, which quote the host, are spelled out',
+        (await liveToasts(page)).includes(TIMED_OUT_SHOWN), JSON.stringify(await liveToasts(page)));
+
+      await page.evaluate(() => openServerModal({ id: 's2' }));
+      check('the server form holds a name and a user name as they are',
+        await page.evaluate(() => [el('srvName').value, el('srvUser').value]), [ZW_NAME, ZW_USER]);
+      await page.evaluate(() => closeServerModal());
+      await page.evaluate(() => openServerModal({ id: 's1' }));
+      check('and a name and a host as they are', await page.evaluate(() => [el('srvName').value, el('srvHost').value]), [RLO_NAME, RLO_HOST]);
+      const sent = await saveServerForm(app);
+      check('a save sends them as they are: nothing stored changes', sent && [sent.name, sent.host, sent.username], [RLO_NAME, RLO_HOST, 'root']);
+      check('no page errors', app.errors, []);
+    });
+
+  await withApp(browser, server, { servers }, 'U+202E and U+200B in a session tab, its questions and the status line', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    await page.evaluate((s) => { window.__tabStart = openSessionTab(s); }, zw);
+    yes('(set-up) the password is asked for', await waitVisible(page, '#connectPwModal', 1500));
+    check('the password prompt names the account spelled out, each part in a <bdi>', await page.evaluate(() => {
+      const label = document.getElementById('connectPwLabel');
+      return { text: label.textContent, bdi: [...label.querySelectorAll('bdi')].map((b) => b.textContent) };
+    }), { text: `Password for ${ZW_USER_SHOWN}@10.0.0.2:`, bdi: [ZW_USER_SHOWN, '10.0.0.2'] });
+    check('so does the status line, each part kept to itself', await strip(page), `Password needed for ${kept(ZW_USER_SHOWN)}@${kept('10.0.0.2')}:22`);
+    await answerPassword(page, null);
+    await page.waitForTimeout(100);
+
+    const tab = await openTab(app, rlo);
+    await page.waitForTimeout(100);
+    check('the tab names its server spelled out; the tooltip keeps the name and the host each to itself', await page.evaluate((t) => {
+      const chip = document.querySelector(`#termTabs .term-tab[data-tab-id="${t}"]`);
+      const name = chip.querySelector('.term-tab-name');
+      return { name: name.textContent, title: name.title, close: chip.querySelector('.term-tab-close').getAttribute('aria-label') };
+    }, tab), { name: RLO_NAME_SHOWN, title: `${kept(RLO_NAME_SHOWN)} (${kept(RLO_HOST_SHOWN)}:22)`, close: 'Close the session to ' + RLO_NAME_SHOWN });
+    check('the status line says where the tab is connected, the host kept to itself', await strip(page), `Connected to ${kept(RLO_HOST_SHOWN)}:22`);
+    check('the header follows the tab', await page.evaluate(() => [el('termTitle').textContent, el('termBadge').textContent]),
+      [RLO_NAME_SHOWN, RLO_HOST_SHOWN + ':22']);
+    check('the YOLO question says which server it hands over, spelled out', await page.evaluate((t) => aiYoloTargetText(t), tab),
+      `This arms YOLO for one session tab only: "${kept(RLO_NAME_SHOWN)}" (${kept('root')}@${kept(RLO_HOST_SHOWN)}:22).`);
+    const told = await page.evaluate(async (t) => {
+      const info = await aiRunTool(t, { id: 'info', name: 'get_session_info', arguments_json: '{}' });
+      const shown = [...document.querySelectorAll('.ai-tool-event pre')].pop();
+      return { info, shown: shown ? shown.textContent : null };
+    }, tab);
+    const info = (name, host) => JSON.stringify({ serverName: name, host, port: 22, username: 'root', mode: 'ssh', connected: true });
+    check('the assistant\'s model is told the session\'s name and host as they are', told.info, info(RLO_NAME, RLO_HOST));
+    check('while its tool log shows them spelled out', told.shown, 'Result: ' + info(RLO_NAME_SHOWN, RLO_HOST_SHOWN));
+    await page.evaluate(() => { window.__restart = reconnectActiveTab(); });
+    yes('(set-up) a restart asks first', await waitVisible(page, '#confirmModal'));
+    const restart = (await confirmText(page)).message;
+    yes('the restart question names the server spelled out and kept to itself', restart.startsWith(`Restart the session to ${kept(RLO_NAME_SHOWN)}?`), restart);
+    await answerConfirm(page, 'cancel');
+    await page.evaluate((t) => { window.__closing = closeSessionTab(t); }, tab);
+    yes('(set-up) closing the live tab asks first', await waitVisible(page, '#confirmModal'));
+    check('the close question names the server spelled out and kept to itself', (await confirmText(page)).message,
+      `Close the session to ${kept(RLO_NAME_SHOWN)}?`);
+    await answerConfirm(page, 'cancel');
+    check('no page errors', app.errors, []);
+  });
+
+  const CONFIG = {
+    hosts: [{ host: RLO_NAME, hostname: RLO_HOST, user: ZW_USER, port: 2222, identity_file: null, identities_only: false, forward_agent: false, proxy_jump: null, extra: {} }],
+    path: '/home/u/.ssh/config',
+  };
+  const PINNED = { hosts: [{ host: RLO_HOST + ':22', fingerprintSha256: 'SHA256:abc', firstSeen: '2026-10-01T10:00:00Z' }] };
+  const AUDIT = { rows: [{ ts: '2026-10-25T10:00:00Z', event: 'connect.start', keyId: null, detail: `${RLO_NAME} @ ${RLO_HOST}:22 as ${ZW_USER}` }], total: 1 };
+  const replies = { ssh_config_list_hosts: CONFIG, known_hosts_list: PINNED, audit_list: AUDIT, sftp_server_copy: { ok: true, added: 1 } };
+  await withApp(browser, server, { servers, replies }, 'U+202E and U+200B in the key picker, the imports, Settings, errors and the file browser', async (app) => {
+    const { page } = app;
+    await page.evaluate(() => {
+      const row = document.querySelector('#keyList .key-row');
+      row.focus();
+      row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 300, clientY: 300 }));
+    });
+    await page.click('#keyConnectMenu .ctx-item');
+    await page.waitForFunction(() => document.querySelectorAll('#keyConnectMenu .ctx-item').length > 1);
+    check('"Use this key to connect" names each server spelled out, its user name and host each in a <bdi>', await page.evaluate(() =>
+      [...document.querySelectorAll('#keyConnectMenu .ctx-item')].filter((b) => b.querySelector('bdi')).map((b) => ({
+        text: b.textContent.replace(/\s+/g, ' ').trim(), bdi: [...b.querySelectorAll('bdi')].map((x) => x.textContent),
+      }))), [
+      { text: `${RLO_NAME_SHOWN} (root@${RLO_HOST_SHOWN})`, bdi: [RLO_NAME_SHOWN, 'root', RLO_HOST_SHOWN] },
+      { text: 'web-1 (root@10.0.0.3)', bdi: ['web-1', 'root', '10.0.0.3'] },
+    ]);
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(60);
+
+    await serversView(page);
+    await page.click('#serverImportBtn');
+    await page.waitForSelector('#keyConnectMenu .ctx-item');
+    const labels = await menuLabels(page);
+    yes('the ~/.ssh/config import names a host spelled out, its user and host name kept to themselves',
+      labels.includes(`${RLO_NAME_SHOWN} (${kept(ZW_USER_SHOWN)}@${kept(RLO_HOST_SHOWN)}:2222)`), JSON.stringify(labels));
+    // A host that cannot be picked fails here rather than skipping the
+    // checks of the form below.
+    const picked = await clickMenuItem(page, /^db-/);
+    yes('(set-up) the host can be picked from the import menu', picked, JSON.stringify(labels));
+    if (picked) {
+      yes('(set-up) it opens the server form', await waitVisible(page, '#serverModal'));
+      check('which gets them as they are', await page.evaluate(() => [el('srvName').value, el('srvHost').value, el('srvUser').value]),
+        [RLO_NAME, RLO_HOST, ZW_USER]);
+      await page.evaluate(() => closeServerModal());
+    }
+
+    await page.evaluate(async () => { await switchView('settings'); showSettingsSection('hosts'); await loadKnownHosts(); });
+    check('Known hosts shows a pinned host spelled out',
+      await page.evaluate(() => document.querySelector('#knownHostsBody tr td').textContent), RLO_HOST_SHOWN + ':22');
+    await page.click('#knownHostsBody .ghost-btn');
+    yes('(set-up) Forget asks first', await waitVisible(page, '#confirmModal'));
+    check('the question names the host spelled out and kept to itself', (await confirmText(page)).message,
+      `Forget the pinned key for "${kept(RLO_HOST_SHOWN + ':22')}"?\n\nThe next connection will re-accept whatever key the server presents.`);
+    await answerConfirm(page, 'cancel');
+    await page.evaluate(async () => { showSettingsSection('audit'); await loadAudit(true); });
+    check('the audit log spells out the names its entries quote',
+      await page.evaluate(() => document.querySelector('#auditBody tr td:nth-child(3)').textContent),
+      `${RLO_NAME_SHOWN} @ ${RLO_HOST_SHOWN}:22 as ${ZW_USER_SHOWN}`);
+
+    await page.evaluate((m) => { window.__replies.terminal_connect = { $reject: m }; }, TIMED_OUT);
+    await page.evaluate((s) => { window.__open = openSessionTab(s); }, rlo);
+    await settled(page, () => window.__open, null, 2000);
+    await page.waitForTimeout(100);
+    const dead = await page.evaluate(() => [...state.sessions.keys()].pop());
+    check('a connect error that quotes the host is spelled out in the status line', await strip(page), TIMED_OUT_SHOWN);
+    yes('and in its toast', (await liveToasts(page)).includes(TIMED_OUT_SHOWN), JSON.stringify(await liveToasts(page)));
+    const said = ((await termText(page, dead)) || '').replace(/\n/g, '');
+    yes('and in the tab\'s terminal', said.includes(TIMED_OUT_SHOWN), said.slice(-200));
+
+    await page.evaluate((n) => {
+      state.sessions.set('tx', { tabId: 'tx', sessionId: 'sess-x', serverId: 's1', serverName: n, host: '10.0.0.1', port: 22, mode: 'sftp', sftpReady: true, sftpPath: '/srv', ended: false });
+    }, RLO_NAME);
+    await page.evaluate(() => sftpSendTo('none', '/srv/notes.txt', state.sessions.get('tx')));
+    check('"Send to" names the target server spelled out and kept to itself', await strip(page),
+      `Queued ${kept('notes.txt')} for sending to ${kept(RLO_NAME_SHOWN)}.`);
+    yes('and so does its toast', (await liveToasts(page)).includes(`Queued ${kept('notes.txt')} for sending to ${kept(RLO_NAME_SHOWN)} - see Transfers.`),
+      JSON.stringify(await liveToasts(page)));
+    check('the transfer queue names the servers spelled out, each in a <bdi>, the tooltips keeping each to itself', await page.evaluate(({ a, b }) => {
+      const route = sftpQueueBuildRow({ id: 'j1', kind: 'serverCopy', serverName: a, targetServerName: b, remotePath: '/srv/notes.txt', state: 'queued', size: 10, bytesDone: 0 })
+        .querySelector('.q-route');
+      const group = sftpQueueGroupEl('server', a, 'group-key', 0, 1).querySelector('.q-grouplabel');
+      const [resume] = sftpQueueActionButtons({ id: 'j2', kind: 'download', serverName: a, remotePath: '/srv/notes.txt', state: 'paused' }, null);
+      return { route: route.textContent, bdi: [...route.querySelectorAll('bdi')].map((x) => x.textContent), title: route.title, group: group.textContent, resume: resume.title };
+    }, { a: RLO_NAME, b: ZW_NAME }), {
+      route: `${RLO_NAME_SHOWN} → ${ZW_NAME_SHOWN}`, bdi: [RLO_NAME_SHOWN, ZW_NAME_SHOWN], title: `${kept(RLO_NAME_SHOWN)} → ${kept(ZW_NAME_SHOWN)}`,
+      group: RLO_NAME_SHOWN, resume: `Reconnect to "${kept(RLO_NAME_SHOWN)}" to resume`,
+    });
+    // The note the backend gives a job restored after a restart quotes the
+    // server's name (src-tauri/src/sftp/queue.rs).
+    check('a queued job\'s note that quotes the server is spelled out, in its cell and its tooltip', await page.evaluate((a) => {
+      const j = { id: 'j3', kind: 'download', serverName: a, remotePath: '/srv/notes.txt', state: 'paused', size: 10, bytesDone: 2,
+        error: `Session closed before restart - reconnect to "${a}" and resume.` };
+      const row = sftpQueueBuildRow(j);
+      sftpQueueFillRow(row, j, 0);
+      const cell = row.querySelector('.q-err');
+      return [cell.textContent, cell.title];
+    }, RLO_NAME), [
+      `Session closed before restart - reconnect to "${RLO_NAME_SHOWN}" and resume.`,
+      `Session closed before restart - reconnect to "${RLO_NAME_SHOWN}" and resume.`,
+    ]);
+    await page.evaluate(() => sftpShowEditConflict({
+      editId: 'e1', conflictId: 'c1', reason: 'changed', remote: '/srv/app.conf', name: 'app.conf', sessionId: 'sess-x',
+      remoteSize: null, remoteModifiedMs: null, busy: false, armed: false, dismissable: false,
+    }, ''));
+    check('an edit conflict names the server spelled out, in a <bdi>', await page.evaluate(() => {
+      const line = document.getElementById('editConflictServer');
+      return { text: line.textContent, bdi: line.querySelector('bdi').textContent };
+    }), { text: `${RLO_NAME_SHOWN}: /srv/app.conf`, bdi: RLO_NAME_SHOWN });
+    check('no page errors', app.errors, []);
+  });
+}
+
 // ─── item 2: the connect lifecycle ──────────────────────────────────────────
 
 const connects = (page) => page.evaluate(() => window.__calls.filter((c) => c.cmd === 'terminal_connect').length);
@@ -788,7 +1058,8 @@ async function scenarioCloseMidConnect(browser, server) {
     await page.waitForFunction(() => state.sessions.size === 1 && window.__calls.some((c) => c.cmd === 'terminal_connect'));
     const tabId = await page.evaluate(() => [...state.sessions.keys()][0]);
     check('A5-10 while it connects the header offers Cancel', await visible(page, '#termCancelBtn'), true);
-    yes('A5-10 the status line says it is connecting', /^Connecting to 10\.0\.0\.1:22/.test(await strip(page)), await strip(page));
+    // The host is kept to itself, between U+2068 and U+2069 (serverInText).
+    yes('A5-10 the status line says it is connecting', /^Connecting to \u206810\.0\.0\.1\u2069:22/.test(await strip(page)), await strip(page));
     check('A5-10 and so does the tab chip', await page.evaluate((t) => !!document.querySelector(`#termTabs .term-tab[data-tab-id="${t}"].connecting`), tabId), true);
     await page.evaluate((t) => closeSessionTab(t), tabId);
     await letGo(page, 'terminal_connect');
@@ -832,17 +1103,17 @@ async function scenarioStrip(browser, server) {
     await page.evaluate(() => switchView('keys'));
     await page.evaluate(() => switchView('connect'));
     await page.waitForTimeout(150);
-    yes('A2-25 a view switch while connecting leaves "Connecting..." in place', /^Connecting to 10\.0\.0\.1:22/.test(await strip(page)), await strip(page));
+    yes('A2-25 a view switch while connecting leaves "Connecting..." in place', /^Connecting to \u206810\.0\.0\.1\u2069:22/.test(await strip(page)), await strip(page));
     await letGo(page, 'terminal_connect');
     await page.waitForFunction(() => [...state.sessions.keys()].some((id) => window.tabSessionLive(id)));
     await page.waitForTimeout(100);
     const first = await page.evaluate(() => [...state.sessions.keys()][0]);
-    yes('connected', /^Connected to 10\.0\.0\.1:22/.test(await strip(page)), await strip(page));
+    yes('connected', /^Connected to \u206810\.0\.0\.1\u2069:22/.test(await strip(page)), await strip(page));
     await page.evaluate(() => switchView('settings'));
     await page.evaluate(() => switchView('connect'));
     await page.waitForTimeout(150);
     const back = await strip(page);
-    yes('A3-27 back on Servers the live tab\'s status is shown, not "Ready" or a build id', /^Connected to 10\.0\.0\.1:22/.test(back) && !/Ready|build/.test(back), back);
+    yes('A3-27 back on Servers the live tab\'s status is shown, not "Ready" or a build id', /^Connected to \u206810\.0\.0\.1\u2069:22/.test(back) && !/Ready|build/.test(back), back);
     const second = await openTab(app, servers[1]);
     await page.waitForTimeout(100);
     yes('the new tab\'s status is shown while it is active', /10\.0\.0\.2/.test(await strip(page)), await strip(page));
@@ -4239,6 +4510,7 @@ const SCENARIOS = [
   ['item 1: server rows - actions button, layout (A5-28 A1-20)', scenarioRows],
   ['item 1: server form - key row, titles (A1-21 A8-25)', scenarioServerForm],
   ['item 1: ~/.ssh/config import (R4 A2-43)', scenarioConfigImport],
+  ['item 1: names, hosts and user names spelled out (U+202E, U+200B)', scenarioSpelledNames],
   ['item 2: closing or cancelling mid-connect (A2-12 A5-10)', scenarioCloseMidConnect],
   ['item 2: status line and focus (A2-25 A3-27)', scenarioStrip],
   ['item 2: Reconnect (A2-44 A3-10)', scenarioReconnect],
