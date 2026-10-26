@@ -75,9 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the assistant's record of each call and in the notices that name a tool. That record also
   shows a call's result and the backend's warning with these characters marked, the result's line
   breaks kept. The card, that record and the schema notice spell out the server's own name too,
-  since a backup restores it unchecked. The audit log still shows these names as stored. The model,
-  the backend and the stored record still get every name and result as they are (see
-  `docs/SECURITY.md`).
+  since a backup restores it unchecked. The model, the backend and the stored record still get
+  every name and result as they are (see `docs/SECURITY.md`).
 - **A server restored from a backup cannot pass for another in the MCP settings.** A server's name
   is checked when it is saved, not when a backup restores it, and the MCP settings showed it as
   stored: in its row, in the heading of its tools, in the question that removes it and in the

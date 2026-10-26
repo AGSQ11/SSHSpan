@@ -563,10 +563,11 @@ restore keeps it as it is, and the entry stays switched off until a save, which 
 So a tool whose name holds a direction override (U+202E) or a zero-width space (U+200B) cannot read
 as another tool on the card that approves its call, nor a restored server as another server in the
 MCP settings outside its edit form. Only the display changes: the model, the backend and the stored
-record get every name and result as they are. Two places still show these names as they are
-stored: the audit log, whose rows of MCP server additions, changes and removals, tool calls,
-approvals and definition changes quote them, and the name field of that edit form, which holds the
-name as stored, since it is what a save sends.
+record get every name and result as they are. The audit log spells out the detail of every row it
+shows, so its rows of MCP server additions, changes and removals, tool calls, approvals and
+definition changes show these names spelled out too (see [Names of saved
+servers](#names-of-saved-servers)). One place still shows them as they are stored: the name field
+of that edit form, which holds the name as stored, since it is what a save sends.
 
 A restore does not check the rest of a server record either: its URL, its custom header's name and
 the name of the environment variable its token comes from stay as the backup has them until a save
