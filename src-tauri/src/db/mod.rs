@@ -91,6 +91,20 @@ pub struct ServerRecord {
     pub bitwarden_updated_at: Option<String>,
 }
 
+/// The `servers.origin_*` columns: where a server lives in PMXSpan
+/// (INTEGRATION-SPEC 2.3). Same shape as [`crate::handoff::Origin`].
+pub type ServerOrigin = crate::handoff::Origin;
+
+/// The `servers` origin columns, in the order the migration adds them.
+pub const ORIGIN_COLUMNS: &[&str] = &[
+    "origin_kind",
+    "origin_cluster_id",
+    "origin_cluster_name",
+    "origin_vmid",
+    "origin_node",
+    "origin_guest_kind",
+];
+
 /// What a Bitwarden pull writes into an existing key row
 /// ([`Database::apply_pulled_key`]).
 #[derive(Debug, Clone)]
@@ -914,7 +928,184 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+            // Migration: where a server lives in PMXSpan (INTEGRATION-SPEC
+            // 2.3). Nullable, written only by a save from a PMXSpan link or
+            // bundle (`set_server_origin`), never by the server dialog's own
+            // row writes or by a Bitwarden pull - so the sync ignores them.
+            // Added one at a time, each only when missing.
+            for column in ORIGIN_COLUMNS {
+                let present: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pragma_table_info('servers') WHERE name = ?",
+                )
+                .bind(column)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+                if present == 0 {
+                    let kind = if *column == "origin_vmid" {
+                        "INTEGER"
+                    } else {
+                        "TEXT"
+                    };
+                    sqlx::query(&format!("ALTER TABLE servers ADD COLUMN {column} {kind}"))
+                        .execute(&self.pool)
+                        .await?;
+                }
+            }
+
+            // Host keys PMXSpan proposed for a host (an imported bundle row,
+            // a saved `connect` link): never pins. The host-key check
+            // compares the key a server presents against them
+            // (`ssh_client::verify_host_key`) and deletes them once the
+            // host's pin is settled. Machine-local: not in backups.
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS proposed_host_keys (
+                    host        TEXT NOT NULL,
+                    host_key    TEXT NOT NULL,
+                    rotated_at  INTEGER,
+                    source      TEXT NOT NULL,
+                    proposed_at TEXT NOT NULL,
+                    PRIMARY KEY (host, host_key)
+                )
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+
             Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    // ── PMXSpan origin and proposed host keys ──────────────────────────────
+
+    /// Set (or, with `None`, clear) where server `id` lives in PMXSpan. The
+    /// values were validated by `handoff` (or the backup restore).
+    pub fn set_server_origin(&self, id: &str, origin: Option<&ServerOrigin>) -> Result<bool> {
+        block(async {
+            let res = sqlx::query(
+                "UPDATE servers SET origin_kind = ?, origin_cluster_id = ?, origin_cluster_name = ?, \
+                 origin_vmid = ?, origin_node = ?, origin_guest_kind = ? WHERE id = ?",
+            )
+            .bind(origin.map(|o| o.kind.as_str()))
+            .bind(origin.map(|o| o.cluster_id.as_str()))
+            .bind(origin.and_then(|o| o.cluster_name.as_deref()))
+            .bind(origin.and_then(|o| o.vmid).map(i64::from))
+            .bind(origin.and_then(|o| o.node.as_deref()))
+            .bind(origin.map(|o| o.guest_kind.as_str()))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            Ok(res.rows_affected() == 1)
+        })
+    }
+
+    /// Every server's origin, by server id (servers without one are absent).
+    pub fn server_origins(&self) -> Result<HashMap<String, ServerOrigin>> {
+        block(async {
+            let rows = sqlx::query(
+                "SELECT id, origin_kind, origin_cluster_id, origin_cluster_name, origin_vmid, \
+                 origin_node, origin_guest_kind FROM servers WHERE origin_kind IS NOT NULL \
+                 AND origin_cluster_id IS NOT NULL",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|r| {
+                    let origin = ServerOrigin {
+                        kind: r.get("origin_kind"),
+                        cluster_id: r.get("origin_cluster_id"),
+                        cluster_name: r.get("origin_cluster_name"),
+                        vmid: r
+                            .get::<Option<i64>, _>("origin_vmid")
+                            .and_then(|v| u32::try_from(v).ok()),
+                        node: r.get("origin_node"),
+                        guest_kind: r
+                            .get::<Option<String>, _>("origin_guest_kind")
+                            .unwrap_or_default(),
+                    };
+                    Some((r.get::<String, _>("id"), origin))
+                })
+                .collect())
+        })
+    }
+
+    /// Server `id`'s origin, if it has one.
+    pub fn get_server_origin(&self, id: &str) -> Result<Option<ServerOrigin>> {
+        Ok(self.server_origins()?.remove(id))
+    }
+
+    /// Replace the host keys proposed for `host` (a `known_host_key`).
+    pub fn replace_proposed_host_keys(
+        &self,
+        host: &str,
+        keys: &[String],
+        rotated_at: Option<i64>,
+        source: &str,
+    ) -> Result<()> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            sqlx::query("DELETE FROM proposed_host_keys WHERE host = ?")
+                .bind(host)
+                .execute(&mut *tx)
+                .await?;
+            let now = Utc::now().to_rfc3339();
+            for key in keys {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO proposed_host_keys (host, host_key, rotated_at, source, proposed_at) \
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(host)
+                .bind(key)
+                .bind(rotated_at)
+                .bind(source)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// The host keys proposed for `host`, if any.
+    pub fn get_proposed_host_keys(
+        &self,
+        host: &str,
+    ) -> Result<Option<crate::ssh_client::HostKeyProposal>> {
+        block(async {
+            let rows = sqlx::query(
+                "SELECT host_key, rotated_at FROM proposed_host_keys WHERE host = ? ORDER BY host_key",
+            )
+            .bind(host)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let rotated_at = rows
+                .iter()
+                .filter_map(|r| r.get::<Option<i64>, _>("rotated_at"))
+                .max();
+            Ok(Some(crate::ssh_client::HostKeyProposal {
+                keys: rows
+                    .iter()
+                    .map(|r| r.get::<String, _>("host_key"))
+                    .collect(),
+                rotated_at,
+            }))
+        })
+    }
+
+    /// Forget the host keys proposed for `host`.
+    pub fn delete_proposed_host_keys(&self, host: &str) -> Result<()> {
+        block(async {
+            sqlx::query("DELETE FROM proposed_host_keys WHERE host = ?")
+                .bind(host)
+                .execute(&self.pool)
+                .await?;
+            Ok(())
         })
     }
 
@@ -2868,6 +3059,66 @@ impl Database {
         })
     }
 
+    /// [`Database::add_known_host`] with the pin's `source` given: a key
+    /// verified against a PMXSpan proposal is stored as
+    /// `imported:pmxspan`. True when the pin is (now) that key.
+    pub fn add_known_host_from(
+        &self,
+        host: &str,
+        host_key: &str,
+        fingerprint: &str,
+        source: &str,
+    ) -> Result<bool> {
+        block(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let existing =
+                sqlx::query_scalar::<_, String>("SELECT host_key FROM known_hosts WHERE host = ?")
+                    .bind(host)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match existing {
+                Some(current) => Ok(current == host_key),
+                None => {
+                    sqlx::query(
+                        "INSERT INTO known_hosts (host, host_key, fingerprint_sha256, first_seen, source) VALUES (?, ?, ?, ?, ?)"
+                    )
+                    .bind(host).bind(host_key).bind(fingerprint).bind(chrono::Utc::now().to_rfc3339()).bind(source)
+                    .execute(&mut *tx).await?;
+                    tx.commit().await?;
+                    Ok(true)
+                }
+            }
+        })
+    }
+
+    /// Replace the pin of `host` - only while it is still `old_key` - with
+    /// `new_key` (a rotation the user accepted). False when the pin changed
+    /// meanwhile or is gone.
+    pub fn replace_known_host(
+        &self,
+        host: &str,
+        old_key: &str,
+        new_key: &str,
+        fingerprint: &str,
+        source: &str,
+    ) -> Result<bool> {
+        block(async {
+            let res = sqlx::query(
+                "UPDATE known_hosts SET host_key = ?, fingerprint_sha256 = ?, first_seen = ?, source = ? \
+                 WHERE host = ? AND host_key = ?",
+            )
+            .bind(new_key)
+            .bind(fingerprint)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(source)
+            .bind(host)
+            .bind(old_key)
+            .execute(&self.pool)
+            .await?;
+            Ok(res.rows_affected() == 1)
+        })
+    }
+
     /// Returns the stored host-key blob for a host, if any.
     pub fn get_known_host(&self, host: &str) -> Result<Option<KnownHost>> {
         block(async {
@@ -3237,6 +3488,21 @@ impl Database {
                     .bind(s("bitwarden_id"))
                     .bind(s("bitwarden_revision_ts"))
                     .bind(s("bitwarden_updated_at"))
+                    .execute(&mut *tx).await?;
+                    // Where it lives in PMXSpan, when the backup says so and
+                    // every field passes the contract's rules; otherwise none.
+                    let origin = crate::handoff::Origin::from_backup(sv.get("origin"));
+                    sqlx::query(
+                        "UPDATE servers SET origin_kind = ?, origin_cluster_id = ?, origin_cluster_name = ?, \
+                         origin_vmid = ?, origin_node = ?, origin_guest_kind = ? WHERE id = ?",
+                    )
+                    .bind(origin.as_ref().map(|o| o.kind.clone()))
+                    .bind(origin.as_ref().map(|o| o.cluster_id.clone()))
+                    .bind(origin.as_ref().and_then(|o| o.cluster_name.clone()))
+                    .bind(origin.as_ref().and_then(|o| o.vmid).map(i64::from))
+                    .bind(origin.as_ref().and_then(|o| o.node.clone()))
+                    .bind(origin.as_ref().map(|o| o.guest_kind.clone()))
+                    .bind(id)
                     .execute(&mut *tx).await?;
                     servers_n += 1;
                 }

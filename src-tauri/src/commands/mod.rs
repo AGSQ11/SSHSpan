@@ -2,6 +2,7 @@
 //! Each handler wraps the backend services and returns Result<T, String>.
 //! Frontend calls them via `invoke('command_name', { key: value })`.
 
+pub mod handoff;
 pub mod server;
 pub mod sftp;
 pub mod terminal;
@@ -601,6 +602,13 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) -> bool {
             app.state::<crate::sftp::SftpRegistry>().clear();
             crate::sftp::queue::pause_all(app);
             app.state::<crate::assistant::AssistantLevels>().clear();
+            // Quick connect's unsaved servers (and the passwords typed for
+            // them) and the proposals links handed to dialogs go with the
+            // vault; a link still waiting for an unlock stays.
+            app.state::<crate::quick_connect::EphemeralRegistry>()
+                .clear();
+            app.state::<crate::handoff::state::HandoffState>()
+                .clear_proposals();
             // MCP sessions die with the vault too: HTTP DELETE with
             // Mcp-Session-Id, carrying the static auth header (405 is valid
             // per spec - ignored; other refusals are audited, never
@@ -1200,6 +1208,9 @@ pub(crate) enum QuestionKind {
     AssistantKeyMove,
     /// Uploading keys and passwords to a Bitwarden server and account.
     BitwardenDestination,
+    /// Starting a PMXSpan executable found on this computer for the first
+    /// time (INTEGRATION-SPEC section 1).
+    PmxspanLaunch,
 }
 
 /// How long a credential question answered "Don't allow" or "Cancel" is not
@@ -2770,6 +2781,10 @@ mod tests {
         ("sftpDualPane", &["1", "0"]),
         // next || '' - empty turns the comparison off
         ("sftpCmpMode", &["size", "mtime", ""]),
+        // Quick connect's "Save for future reconnects" tick
+        ("quickConnectSave", &["1", "0"]),
+        // Settings > Integrations: "Register sshspan:// links"
+        ("deepLinkRegister", &["true", "false"]),
         // the local pane's current directory
         (
             "sftpLocalDir:server-1",
@@ -2806,6 +2821,8 @@ mod tests {
         ("sftpDualPane", &["", "yes"]),
         ("sftpCmpMode", &["off", "SIZE", "hash"]),
         ("sftpLocalDir:server-1", &["", "bad\0path"]),
+        ("quickConnectSave", &["", "true", "yes"]),
+        ("deepLinkRegister", &["", "1", "on"]),
     ];
 
     #[test]
@@ -3655,6 +3672,19 @@ pub fn build_backup_document(db: &db::Database, pw: &str) -> CmdResult<BackupDoc
     let keys = db.list_keys_with_categories().map_err(|e| e.to_string())?;
     let categories = db.list_categories().map_err(|e| e.to_string())?;
     let servers = db.list_servers().map_err(|e| e.to_string())?;
+    // Each server with where it lives in PMXSpan (`origin`, absent for most):
+    // the origin columns are not part of the row the rest of the app reads.
+    let origins = db.server_origins().map_err(|e| e.to_string())?;
+    let servers_json: Vec<serde_json::Value> = servers
+        .iter()
+        .map(|s| {
+            let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
+            if let (Some(obj), Some(origin)) = (v.as_object_mut(), origins.get(&s.id)) {
+                obj.insert("origin".into(), serde_json::json!(origin));
+            }
+            v
+        })
+        .collect();
     let known_hosts = db.list_known_hosts().map_err(|e| e.to_string())?;
     // MCP servers travel with the backup (sealed auth secret included, same
     // vault password as everything else). They come back INERT on restore
@@ -3683,7 +3713,7 @@ pub fn build_backup_document(db: &db::Database, pw: &str) -> CmdResult<BackupDoc
     let payload = serde_json::json!({
         "keys": keys,
         "categories": categories,
-        "servers": servers,
+        "servers": servers_json,
         "known_hosts": known_hosts,
         "settings": settings,
         "mcpServers": mcp_servers,
@@ -6878,6 +6908,10 @@ const SETTINGS_KEYS: &[&str] = &[
     "terminalAppKeypad",
     "terminalBell",
     "confirmMultiLinePaste",
+    // Quick connect's "Save for future reconnects" tick, as last left.
+    "quickConnectSave",
+    // "Register sshspan:// links on this computer" (default on).
+    "deepLinkRegister",
 ];
 
 /// Settings that weaken the vault's protection when changed, so they cannot
@@ -6935,7 +6969,10 @@ fn setting_domain(key: &str) -> Option<SettingDomain> {
             min: 0,
             max: SFTP_MAX_BPS_LIMIT,
         },
-        "confirmDelete" | "autoUpdateCheck" | "sftpVerifyTransfers" => OneOf(TRUE_FALSE),
+        "confirmDelete" | "autoUpdateCheck" | "sftpVerifyTransfers" | "deepLinkRegister" => {
+            OneOf(TRUE_FALSE)
+        }
+        "quickConnectSave" => OneOf(ONE_ZERO),
         "confirmMultiLinePaste"
         | "sftpShowHidden"
         | "sftpShowOwnerCols"
@@ -7126,6 +7163,13 @@ fn settings_set_in(
         || (key.starts_with(SFTP_LOCAL_DIR_PREFIX) && key.len() > SFTP_LOCAL_DIR_PREFIX.len());
     if !known {
         return Err(format!("Unknown setting: {key}").into());
+    }
+    // A Quick connect that was not saved leaves nothing in the database.
+    if key.starts_with(&format!(
+        "{SFTP_LOCAL_DIR_PREFIX}{}",
+        crate::quick_connect::EPHEMERAL_PREFIX
+    )) {
+        return Err("Save this server to remember a local folder for it.".into());
     }
     if SECURITY_SETTINGS.contains(&key) {
         require_unlocked(vault)?;
@@ -9566,7 +9610,7 @@ mod fw_tests {
         }
         assert_eq!(
             (file_titles, message_titles),
-            (7, 3),
+            (8, 4),
             "the dialogs that take a title"
         );
     }

@@ -196,6 +196,48 @@ pub enum HostKeyRefusal {
     /// The known-hosts store could not be read or updated, so nothing could
     /// be verified or recorded.
     StoreUnavailable,
+    /// The host is not pinned yet and the key it presented is none of the
+    /// keys PMXSpan proposed for it (spec 2.1). The message with both
+    /// fingerprints is kept in the [`HandshakeWatch`].
+    ProposalMismatch,
+}
+
+/// The start of the message a [`HostKeyRefusal::ProposalMismatch`] gives:
+/// the renderer recognises it and offers the normal first-use check as an
+/// explicit second step (a reconnect with the proposals set aside).
+pub const PROPOSAL_MISMATCH_PREFIX: &str = "PMXSpan reported a different host key";
+
+/// Host keys PMXSpan proposed for one host (a `connect` link or an imported
+/// bundle row): never a pin by themselves. See [`verify_host_key`] for what
+/// the check does with them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostKeyProposal {
+    /// Canonical base64 SSH wire-format keys.
+    pub keys: Vec<String>,
+    /// Unix seconds: PMXSpan says a rebuild changed the key at this time.
+    pub rotated_at: Option<i64>,
+}
+
+/// Asks whether to replace a pin after a rotation PMXSpan reported:
+/// `(host, port, old fingerprint, new fingerprint, rotated at) -> replace`.
+pub type RotationPrompt = Arc<dyn Fn(&str, u16, &str, &str, i64) -> bool + Send + Sync>;
+
+/// What one connection brings to the host-key check besides the store:
+/// proposals from PMXSpan, whether to set them aside (the explicit second
+/// step after a [`HostKeyRefusal::ProposalMismatch`]), the rotation question
+/// and where to say that the key was verified against PMXSpan.
+#[derive(Clone, Default)]
+pub struct HostKeyPolicy {
+    /// In-memory proposals (an unsaved Quick connect from a link). The
+    /// proposals stored for the host (an import, a saved link) are read from
+    /// the database at check time when this is `None`.
+    pub proposal: Option<HostKeyProposal>,
+    /// Ignore every proposal: the plain first-use / pinned-key policy.
+    pub skip_proposals: bool,
+    /// Without it, a claimed rotation is treated as no rotation.
+    pub rotation_prompt: Option<RotationPrompt>,
+    /// Set when the presented key was pinned because it matched a proposal.
+    pub verified: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HostKeyRefusal {
@@ -212,6 +254,9 @@ impl HostKeyRefusal {
                 "Could not check the host key for {target} against Known hosts, so the \
                  connection was refused. Try again."
             ),
+            Self::ProposalMismatch => {
+                format!("{PROPOSAL_MISMATCH_PREFIX} for {target}, so the connection was refused.")
+            }
         }
     }
 }
@@ -236,6 +281,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Default)]
 struct HandshakeWatch {
     refusal: Mutex<Option<HostKeyRefusal>>,
+    /// The full message of a refusal that carries more than its kind (the
+    /// fingerprints of a [`HostKeyRefusal::ProposalMismatch`]).
+    detail: Mutex<Option<String>>,
     dialog: Mutex<DialogClock>,
 }
 
@@ -264,6 +312,20 @@ impl HandshakeWatch {
 
     fn refusal(&self) -> Option<HostKeyRefusal> {
         *lock(&self.refusal)
+    }
+
+    fn record_detail(&self, message: String) {
+        *lock(&self.detail) = Some(message);
+    }
+
+    /// The message for the refusal recorded, if any.
+    fn refusal_message(&self, host: &str, port: u16) -> Option<String> {
+        let why = self.refusal()?;
+        Some(
+            lock(&self.detail)
+                .clone()
+                .unwrap_or_else(|| why.message(host, port)),
+        )
     }
 
     fn dialog_open(&self) -> DialogOpen<'_> {
@@ -309,6 +371,8 @@ pub struct TerminalHandler {
     db: Database,
     /// Raises the trust dialog (the native one outside tests).
     prompt: HostTrustPrompt,
+    /// PMXSpan's proposals and the rotation question.
+    policy: HostKeyPolicy,
     watch: Arc<HandshakeWatch>,
 }
 
@@ -330,19 +394,37 @@ impl client::Handler for TerminalHandler {
             }
         };
         let (host, port, prompt, watch) = (&self.host, self.port, &self.prompt, &self.watch);
+        let rotation = self.policy.rotation_prompt.clone();
         let verdict = verify_host_key(
             &self.db,
             host,
             port,
             &presented_b64,
+            &self.policy,
             |fingerprint, imported| {
                 let _open = watch.dialog_open();
                 prompt(host, port, fingerprint, imported)
             },
+            |old, new, at| match &rotation {
+                Some(ask) => {
+                    let _open = watch.dialog_open();
+                    ask(host, port, old, new, at)
+                }
+                None => false,
+            },
         );
         match verdict {
-            Ok(()) => Ok(true),
-            Err(why) => {
+            Ok(HostKeyVerdict::VerifiedByProposal) => {
+                self.policy
+                    .verified
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            }
+            Ok(_) => Ok(true),
+            Err((why, detail)) => {
+                if let Some(detail) = detail {
+                    watch.record_detail(detail);
+                }
                 watch.record_refusal(why);
                 Ok(false)
             }
@@ -350,23 +432,102 @@ impl client::Handler for TerminalHandler {
     }
 }
 
+/// How a presented host key was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyVerdict {
+    /// It equals the confirmed pin.
+    Pinned,
+    /// The user trusted it in the dialog (first use, an imported pin
+    /// confirmed, or a rotation PMXSpan reported).
+    TrustedByUser,
+    /// The host was not pinned and the key equals a key PMXSpan proposed:
+    /// pinned with source [`crate::handoff::PIN_SOURCE_PMXSPAN`].
+    VerifiedByProposal,
+}
+
+/// A refusal and, when it carries more than its kind, its full message.
+type Refusal = (HostKeyRefusal, Option<String>);
+
 /// The trust decision for one presented host key - the policy documented on
-/// [`TerminalHandler`]. `ask(fingerprint, imported)` raises the trust dialog
-/// and returns the user's answer.
-fn verify_host_key(
+/// [`TerminalHandler`], plus PMXSpan's proposals (spec 2.1):
+///
+/// - host not pinned, live key equals a proposed key: pinned silently with
+///   source `imported:pmxspan` ([`HostKeyVerdict::VerifiedByProposal`]);
+/// - host not pinned, live key differs from every proposed key: refused
+///   with both fingerprints ([`HostKeyRefusal::ProposalMismatch`]); the
+///   normal first-use dialog is the explicit second step (a reconnect with
+///   `skip_proposals`);
+/// - host pinned, live key differs, PMXSpan claims a rotation and the live
+///   key is one it proposed: the rotation question with the old and new
+///   fingerprints and the time - "yes" replaces the pin;
+/// - host pinned, live key differs and no rotation claimed (or the live
+///   key is not a proposed one): the changed-key refusal, unchanged.
+///
+/// `ask(fingerprint, imported)` raises the trust dialog,
+/// `ask_rotation(old, new, rotated_at)` the rotation question.
+pub fn verify_host_key(
     db: &Database,
     host: &str,
     port: u16,
     presented_b64: &str,
+    policy: &HostKeyPolicy,
     mut ask: impl FnMut(&str, bool) -> bool,
-) -> Result<(), HostKeyRefusal> {
+    mut ask_rotation: impl FnMut(&str, &str, i64) -> bool,
+) -> Result<HostKeyVerdict, Refusal> {
     let host_key = known_host_key(host, port);
     let presented_fp = fingerprint_of_blob(presented_b64).unwrap_or_default();
     let shown_fp = hostkey_fingerprint_display(presented_b64);
+    let proposal = if policy.skip_proposals {
+        None
+    } else {
+        match &policy.proposal {
+            Some(p) => Some(p.clone()),
+            None => db.get_proposed_host_keys(&host_key).ok().flatten(),
+        }
+    }
+    .filter(|p| !p.keys.is_empty());
+    let proposed = |key: &str| {
+        proposal
+            .as_ref()
+            .is_some_and(|p| p.keys.iter().any(|k| k == key))
+    };
 
     match db.get_known_host(&host_key) {
         Ok(Some(known)) => {
             if known.host_key != presented_b64 {
+                if let (Some(rotated_at), true) = (
+                    proposal.as_ref().and_then(|p| p.rotated_at),
+                    proposed(presented_b64),
+                ) {
+                    let old_fp = hostkey_fingerprint_display(&known.host_key);
+                    if !ask_rotation(&old_fp, &shown_fp, rotated_at) {
+                        let _ = db.add_audit(
+                            "known_hosts.rotation_refused",
+                            None,
+                            &format!("{} ({} -> {})", &host_key, old_fp, shown_fp),
+                        );
+                        return Err((HostKeyRefusal::Declined, None));
+                    }
+                    if db
+                        .replace_known_host(
+                            &host_key,
+                            &known.host_key,
+                            presented_b64,
+                            &presented_fp,
+                            crate::handoff::PIN_SOURCE_PMXSPAN,
+                        )
+                        .unwrap_or(false)
+                    {
+                        let _ = db.delete_proposed_host_keys(&host_key);
+                        let _ = db.add_audit(
+                            "known_hosts.rotation_accepted",
+                            None,
+                            &format!("{} ({} -> {})", &host_key, old_fp, shown_fp),
+                        );
+                        return Ok(HostKeyVerdict::TrustedByUser);
+                    }
+                    return Err((HostKeyRefusal::StoreUnavailable, None));
+                }
                 // Mismatch is hard-failed - for a confirmed pin AND for an
                 // imported one (a key that differs from any stored anchor is
                 // an attack signal, never an upgrade). No dialog is offered.
@@ -381,10 +542,14 @@ fn verify_host_key(
                         hostkey_fingerprint_display(&known.host_key)
                     ),
                 );
-                return Err(HostKeyRefusal::Mismatch);
+                return Err((HostKeyRefusal::Mismatch, None));
             }
-            if known.source == "connection" {
-                return Ok(());
+            if known.source == "connection" || known.source == crate::handoff::PIN_SOURCE_PMXSPAN {
+                if proposal.is_some() && policy.proposal.is_none() {
+                    // The stored proposals are settled: the pin stands.
+                    let _ = db.delete_proposed_host_keys(&host_key);
+                }
+                return Ok(HostKeyVerdict::Pinned);
             }
             // Exact match against an IMPORTED pin (backup restore, never used
             // against a live connection): not silently trusted. The user
@@ -398,7 +563,7 @@ fn verify_host_key(
                     None,
                     &format!("{} ({})", &host_key, shown_fp),
                 );
-                return Err(HostKeyRefusal::Declined);
+                return Err((HostKeyRefusal::Declined, None));
             }
             match db.confirm_imported_known_host(&host_key, presented_b64) {
                 Ok(true) => {
@@ -407,7 +572,7 @@ fn verify_host_key(
                         None,
                         &format!("{} ({})", &host_key, shown_fp),
                     );
-                    Ok(())
+                    Ok(HostKeyVerdict::TrustedByUser)
                 }
                 _ => {
                     let _ = db.add_audit(
@@ -415,11 +580,58 @@ fn verify_host_key(
                         None,
                         &format!("{} ({})", &host_key, shown_fp),
                     );
-                    Err(HostKeyRefusal::StoreUnavailable)
+                    Err((HostKeyRefusal::StoreUnavailable, None))
                 }
             }
         }
         Ok(None) => {
+            if let Some(p) = &proposal {
+                if proposed(presented_b64) {
+                    // Verified against what PMXSpan read from the guest:
+                    // pinned without a dialog, marked as such.
+                    return match db.add_known_host_from(
+                        &host_key,
+                        presented_b64,
+                        &presented_fp,
+                        crate::handoff::PIN_SOURCE_PMXSPAN,
+                    ) {
+                        Ok(true) => {
+                            let _ = db.delete_proposed_host_keys(&host_key);
+                            let _ = db.add_audit(
+                                "known_hosts.verified_pmxspan",
+                                None,
+                                &format!("{} ({})", &host_key, shown_fp),
+                            );
+                            Ok(HostKeyVerdict::VerifiedByProposal)
+                        }
+                        _ => Err((HostKeyRefusal::StoreUnavailable, None)),
+                    };
+                }
+                let proposed_fps: Vec<String> = p
+                    .keys
+                    .iter()
+                    .map(|k| hostkey_fingerprint_display(k))
+                    .collect();
+                let _ = db.add_audit(
+                    "known_hosts.pmxspan_mismatch",
+                    None,
+                    &format!(
+                        "{} (presented {}, PMXSpan {})",
+                        &host_key,
+                        shown_fp,
+                        proposed_fps.join(", ")
+                    ),
+                );
+                return Err((
+                    HostKeyRefusal::ProposalMismatch,
+                    Some(proposal_mismatch_message(
+                        host,
+                        port,
+                        &shown_fp,
+                        &proposed_fps,
+                    )),
+                ));
+            }
             // First sight: the trust decision is the dialog, with the
             // fingerprint shown before it. Without the user's click the key
             // is refused and nothing is stored.
@@ -430,21 +642,75 @@ fn verify_host_key(
                     None,
                     &format!("{} (presented {})", &host_key, shown_fp),
                 );
-                return Err(HostKeyRefusal::Declined);
+                return Err((HostKeyRefusal::Declined, None));
             }
             // First sight WITH user consent: store and record what was
             // trusted, and let the connect path surface a notice in the
-            // terminal.
+            // terminal. Proposals set aside for this host are settled.
             let _ = db.add_known_host(&host_key, presented_b64, &presented_fp);
+            let _ = db.delete_proposed_host_keys(&host_key);
             let _ = db.add_audit(
                 "known_hosts.trust_on_first_use",
                 None,
                 &format!("{} ({})", &host_key, shown_fp),
             );
-            Ok(())
+            Ok(HostKeyVerdict::TrustedByUser)
         }
-        Err(_) => Err(HostKeyRefusal::StoreUnavailable),
+        Err(_) => Err((HostKeyRefusal::StoreUnavailable, None)),
     }
+}
+
+/// The refusal of a key PMXSpan did not propose: both fingerprints, and
+/// what the second step is.
+pub fn proposal_mismatch_message(
+    host: &str,
+    port: u16,
+    presented_fp: &str,
+    proposed_fps: &[String],
+) -> String {
+    format!(
+        "{PROPOSAL_MISMATCH_PREFIX} for {}, so the connection was refused.\n\
+         The server presented: {presented_fp}\n\
+         PMXSpan reported: {}\n\
+         If the guest was rebuilt, refresh its host keys in PMXSpan. To check the \
+         presented key the usual way instead, choose \"Check this key\".",
+        display_target(host, port),
+        proposed_fps.join(", ")
+    )
+}
+
+/// The native rotation question ([`RotationPrompt`]): the old and the new
+/// fingerprint and when PMXSpan says the key changed. Like the trust
+/// dialog it is raised from the backend while the key is presented.
+pub fn native_rotation_prompt(app: &AppHandle) -> RotationPrompt {
+    let app = app.clone();
+    Arc::new(move |host, port, old, new, rotated_at| {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+        app.dialog()
+            .message(rotation_message(host, port, old, new, rotated_at))
+            .title("SSHSpan - Host key changed")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Replace the pin && connect".to_string(),
+                "Refuse".to_string(),
+            ))
+            .blocking_show()
+    })
+}
+
+/// What the rotation question says.
+pub fn rotation_message(host: &str, port: u16, old: &str, new: &str, rotated_at: i64) -> String {
+    let when = chrono::DateTime::from_timestamp(rotated_at, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| rotated_at.to_string());
+    format!(
+        "The host key of {}:{port} changed. PMXSpan reports that the guest was rebuilt \
+         and its key replaced at {when}.\n\n\
+         Pinned fingerprint:\n{old}\n\n\
+         New fingerprint (reported by PMXSpan and presented now):\n{new}\n\n\
+         Replace the pinned key and connect?",
+        spell_out(host)
+    )
 }
 
 /// Native host-key trust prompt, raised from the backend at the moment the
@@ -685,6 +951,8 @@ pub struct ConnectParams {
     pub key_pem: Option<Zeroizing<String>>,
     /// Password when auth_method == password (plaintext, in-memory only).
     pub password: Option<Zeroizing<String>>,
+    /// PMXSpan's host-key proposals and the rotation question.
+    pub host_keys: HostKeyPolicy,
 }
 
 /// Streamed (interactive) session error sentinel types used across IPC.
@@ -772,6 +1040,7 @@ pub async fn open_authenticated(
         port,
         db: db.clone(),
         prompt,
+        policy: params.host_keys.clone(),
         watch: watch.clone(),
     };
     let config = Arc::new(base_client_config());
@@ -790,8 +1059,8 @@ pub async fn open_authenticated(
             .map_err(|e| format!("Connection failed: {e}"))?;
         client::connect_stream(config, tcp, handler)
             .await
-            .map_err(|e| match watch.refusal() {
-                Some(why) => why.message(host, port),
+            .map_err(|e| match watch.refusal_message(host, port) {
+                Some(message) => message,
                 None => format!("Connection failed: {e}"),
             })
     };
@@ -1043,6 +1312,8 @@ pub struct ResolvedConnection {
     pub auth_method: String,
     pub key_pem: Option<Zeroizing<String>>,
     pub password: Option<Zeroizing<String>>,
+    /// PMXSpan's host-key proposals for this connection.
+    pub host_keys: HostKeyPolicy,
 }
 
 /// Connect, authenticate, request a PTY shell, register the session and stream
@@ -1076,6 +1347,7 @@ pub async fn start_interactive(
             auth_method: params.auth_method.clone(),
             key_pem: params.key_pem.clone(),
             password: params.password.clone(),
+            host_keys: params.host_keys.clone(),
         },
         &db,
         native_host_trust_prompt(&app),
@@ -1980,6 +2252,7 @@ mod ru4_tests {
             auth_method: auth_method.into(),
             key_pem: None,
             password: Some(Zeroizing::new(FIXTURE_PASSWORD.into())),
+            host_keys: HostKeyPolicy::default(),
         }
     }
 
@@ -2548,5 +2821,197 @@ mod ru4_tests {
         assert!(asked < at(connect, "path.is_file()"));
         assert!(asked < at(connect, "connect.pem_path_used"));
         assert!(asked < at(connect, "read_to_string(&p)"));
+    }
+
+    // ── PMXSpan host-key proposals (INTEGRATION-SPEC 2.1) ───────────────────
+
+    mod proposals {
+        use super::super::*;
+
+        fn db() -> (Database, std::path::PathBuf) {
+            let path =
+                std::env::temp_dir().join(format!("sshspan-proposal-{}.db", uuid::Uuid::new_v4()));
+            (Database::open_at(path.clone()).unwrap(), path)
+        }
+
+        fn key(b: u8) -> String {
+            crate::handoff::tests::host_key(b)
+        }
+
+        fn policy(keys: Vec<String>, rotated_at: Option<i64>) -> HostKeyPolicy {
+            HostKeyPolicy {
+                proposal: Some(HostKeyProposal { keys, rotated_at }),
+                ..Default::default()
+            }
+        }
+
+        const HOST: &str = "10.0.1.5";
+
+        fn check(
+            db: &Database,
+            presented: &str,
+            policy: &HostKeyPolicy,
+            trust: bool,
+            rotate: bool,
+        ) -> (
+            Result<HostKeyVerdict, (HostKeyRefusal, Option<String>)>,
+            usize,
+            usize,
+        ) {
+            let (mut asked, mut rotations) = (0, 0);
+            let out = verify_host_key(
+                db,
+                HOST,
+                22,
+                presented,
+                policy,
+                |_, _| {
+                    asked += 1;
+                    trust
+                },
+                |_, _, _| {
+                    rotations += 1;
+                    rotate
+                },
+            );
+            (out, asked, rotations)
+        }
+
+        #[test]
+        fn unknown_host_and_a_proposed_key_is_pinned_silently_as_pmxspan() {
+            let (db, path) = db();
+            let (out, asked, _) = check(
+                &db,
+                &key(1),
+                &policy(vec![key(2), key(1)], None),
+                false,
+                false,
+            );
+            assert_eq!(out.unwrap(), HostKeyVerdict::VerifiedByProposal);
+            assert_eq!(asked, 0, "no dialog");
+            let pin = db
+                .get_known_host(&known_host_key(HOST, 22))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pin.host_key, key(1));
+            assert_eq!(pin.source, crate::handoff::PIN_SOURCE_PMXSPAN);
+            // The pin is trusted on the next connect without a proposal.
+            let (out, asked, _) = check(&db, &key(1), &HostKeyPolicy::default(), false, false);
+            assert_eq!(out.unwrap(), HostKeyVerdict::Pinned);
+            assert_eq!(asked, 0);
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn unknown_host_and_another_key_is_refused_with_both_fingerprints() {
+            let (db, path) = db();
+            let (out, asked, _) = check(&db, &key(3), &policy(vec![key(1)], None), true, false);
+            let (why, detail) = out.unwrap_err();
+            assert_eq!(why, HostKeyRefusal::ProposalMismatch);
+            let detail = detail.unwrap();
+            assert!(detail.starts_with(PROPOSAL_MISMATCH_PREFIX), "{detail}");
+            assert!(
+                detail.contains(&hostkey_fingerprint_display(&key(3))),
+                "{detail}"
+            );
+            assert!(
+                detail.contains(&hostkey_fingerprint_display(&key(1))),
+                "{detail}"
+            );
+            assert_eq!(asked, 0, "the first-use dialog is a separate step");
+            assert!(db
+                .get_known_host(&known_host_key(HOST, 22))
+                .unwrap()
+                .is_none());
+            // The explicit second step: proposals set aside, the normal dialog.
+            let skip = HostKeyPolicy {
+                skip_proposals: true,
+                ..policy(vec![key(1)], None)
+            };
+            let (out, asked, _) = check(&db, &key(3), &skip, true, false);
+            assert_eq!(out.unwrap(), HostKeyVerdict::TrustedByUser);
+            assert_eq!(asked, 1);
+            assert_eq!(
+                db.get_known_host(&known_host_key(HOST, 22))
+                    .unwrap()
+                    .unwrap()
+                    .source,
+                "connection"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn known_host_with_a_claimed_rotation_to_a_proposed_key_asks_to_replace() {
+            let (db, path) = db();
+            let host = known_host_key(HOST, 22);
+            db.add_known_host(&host, &key(1), "fp").unwrap();
+            // Refused: the pin stays.
+            let (out, _, rotations) = check(
+                &db,
+                &key(2),
+                &policy(vec![key(2)], Some(1_762_600_000)),
+                false,
+                false,
+            );
+            assert_eq!(out.unwrap_err().0, HostKeyRefusal::Declined);
+            assert_eq!(rotations, 1);
+            assert_eq!(db.get_known_host(&host).unwrap().unwrap().host_key, key(1));
+            // Accepted: the pin is replaced.
+            let (out, _, _) = check(
+                &db,
+                &key(2),
+                &policy(vec![key(2)], Some(1_762_600_000)),
+                false,
+                true,
+            );
+            assert_eq!(out.unwrap(), HostKeyVerdict::TrustedByUser);
+            let pin = db.get_known_host(&host).unwrap().unwrap();
+            assert_eq!(pin.host_key, key(2));
+            assert_eq!(pin.source, crate::handoff::PIN_SOURCE_PMXSPAN);
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn known_host_and_a_changed_key_without_rotation_is_the_old_refusal() {
+            let (db, path) = db();
+            let host = known_host_key(HOST, 22);
+            db.add_known_host(&host, &key(1), "fp").unwrap();
+            for p in [
+                policy(vec![key(2)], None),
+                // A rotation claimed for a key that is not the presented one.
+                policy(vec![key(5)], Some(1_762_600_000)),
+                HostKeyPolicy::default(),
+            ] {
+                let (out, asked, rotations) = check(&db, &key(2), &p, true, true);
+                assert_eq!(out.unwrap_err(), (HostKeyRefusal::Mismatch, None));
+                assert_eq!((asked, rotations), (0, 0));
+            }
+            assert_eq!(db.get_known_host(&host).unwrap().unwrap().host_key, key(1));
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn stored_proposals_apply_and_are_settled_by_the_pin() {
+            let (db, path) = db();
+            let host = known_host_key(HOST, 22);
+            db.replace_proposed_host_keys(&host, &[key(7)], None, "pmxspan")
+                .unwrap();
+            let (out, _, _) = check(&db, &key(7), &HostKeyPolicy::default(), false, false);
+            assert_eq!(out.unwrap(), HostKeyVerdict::VerifiedByProposal);
+            assert!(
+                db.get_proposed_host_keys(&host).unwrap().is_none(),
+                "settled"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn the_rotation_question_names_both_fingerprints_and_the_time() {
+            let text = rotation_message("evil\u{202E}host", 22, "SHA256:old", "SHA256:new", 0);
+            assert!(text.contains("SHA256:old") && text.contains("SHA256:new"));
+            assert!(text.contains("1970-01-01 00:00 UTC"));
+            assert!(!text.contains('\u{202E}'), "the host is spelled out");
+        }
     }
 }

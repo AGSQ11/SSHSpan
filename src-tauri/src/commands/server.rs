@@ -10,7 +10,11 @@ use crate::AppState;
 
 /// Build the JSON a server row is returned as, resolving the referenced vault
 /// key's name/type so the renderer needs no second round trip.
-fn server_to_json(db: &db::Database, s: &ServerRecord) -> serde_json::Value {
+fn server_to_json(
+    db: &db::Database,
+    s: &ServerRecord,
+    origin: Option<&db::ServerOrigin>,
+) -> serde_json::Value {
     let (key_name, key_type, key_missing) = match &s.key_id {
         Some(kid) => match db.get_key_name(kid) {
             Ok(Some((name, kt))) => (Some(name), Some(kt), false),
@@ -34,6 +38,8 @@ fn server_to_json(db: &db::Database, s: &ServerRecord) -> serde_json::Value {
         "categoryId": s.category_id,
         "color": s.color,
         "lastConnectedAt": s.last_connected_at.map(|d| d.to_rfc3339()),
+        // Where it lives in PMXSpan (INTEGRATION-SPEC 2.3), else null.
+        "origin": origin,
         "createdAt": s.created_at.to_rfc3339(),
         "updatedAt": s.updated_at.to_rfc3339(),
     })
@@ -43,7 +49,11 @@ fn server_to_json(db: &db::Database, s: &ServerRecord) -> serde_json::Value {
 pub fn server_list(app: AppHandle) -> CmdResult<serde_json::Value> {
     let db = &app.state::<AppState>().db;
     let servers = db.list_servers().map_err(|e| e.to_string())?;
-    let arr: Vec<serde_json::Value> = servers.iter().map(|s| server_to_json(db, s)).collect();
+    let origins = db.server_origins().map_err(|e| e.to_string())?;
+    let arr: Vec<serde_json::Value> = servers
+        .iter()
+        .map(|s| server_to_json(db, s, origins.get(&s.id)))
+        .collect();
     Ok(serde_json::json!({ "servers": arr }))
 }
 
@@ -73,7 +83,15 @@ pub fn server_list(app: AppHandle) -> CmdResult<serde_json::Value> {
 /// server's key file is protected by a passphrase, which a connect cannot
 /// ask for, or - on Windows - is not on one of this computer's drives. The
 /// server is saved all the same.
+///
+/// `originToken` names what a PMXSpan link or bundle row proposed
+/// (`handoff_take_pending` handed it to the dialog): once the server is
+/// saved, its PMXSpan origin is stored, and the proposed host keys are kept
+/// as proposals for its host and port - verified at the first connect,
+/// never pins ([`super::handoff::apply_proposal`]). An expired token
+/// refuses the save before anything is written.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn server_save(
     app: AppHandle,
     id: Option<String>,
@@ -88,7 +106,12 @@ pub async fn server_save(
     clear_saved_password: Option<bool>,
     category_id: Option<String>,
     color: Option<String>,
+    origin_token: Option<String>,
 ) -> CmdResult<serde_json::Value> {
+    let proposal = match origin_token.as_deref().filter(|t| !t.is_empty()) {
+        Some(token) => Some(super::handoff::proposal_for(&app, token)?),
+        None => None,
+    };
     let request = SaveServerRequest {
         id,
         name,
@@ -105,12 +128,17 @@ pub async fn server_save(
         color,
     };
     super::run_blocking(move || {
-        server_save_in(
-            &app.state::<AppState>().db,
+        let db = &app.state::<AppState>().db;
+        let saved = server_save_in(
+            db,
             &app.state::<super::VaultPasswordStore>(),
             &app.state::<super::VaultRotationLock>(),
             request,
-        )
+        )?;
+        if let (Some(proposal), Some(id)) = (proposal, saved["id"].as_str()) {
+            super::handoff::apply_proposal(db, id, &proposal)?;
+        }
+        Ok(saved)
     })
     .await
 }
@@ -377,7 +405,7 @@ const KEY_FILE_CHECK_BYTES: u64 = 64 * 1024;
 /// ([`crate::ssh_client::key_path_refusal`]). Elsewhere a UNC or device
 /// path (`\\...`, `//...`) is not looked at either. Opening a share hands it
 /// an NTLM sign-in and can stall - only to find out whether to warn.
-fn key_file_warning(path: &str) -> Option<&'static str> {
+pub(crate) fn key_file_warning(path: &str) -> Option<&'static str> {
     use std::io::Read;
     // On Windows a key file elsewhere than on this computer's drives gets
     // what to do, and is not touched.

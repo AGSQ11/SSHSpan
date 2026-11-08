@@ -23,8 +23,15 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # plugins were registered but never called from the renderer or Rust - dead
 # IPC surface - and were removed.
 tauri-plugin-dialog = "2"
-tauri-plugin-single-instance = "2"
+# `deep-link`: a second instance started with an sshspan:// URL hands it to
+# the running one through the deep-link plugin (registered after this one,
+# as the plugin requires).
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-clipboard-manager = "2"
+# sshspan:// links from PMXSpan (INTEGRATION-SPEC section 1): the OS scheme
+# registration (Linux/Windows at runtime, macOS via the bundle) and the URLs
+# the OS delivers. Rust-side only - no webview permission is granted.
+tauri-plugin-deep-link = "2"
 
 # ─── Crypto: password hashing / KDF ─────────────────────────────────────────
 argon2 = "0.5"                    # Argon2id (PPK v3, vault KDF)

@@ -5794,6 +5794,10 @@ pub fn sftp_bookmarks_save(
     server_id: String,
     bookmarks: serde_json::Value,
 ) -> CmdResult<serde_json::Value> {
+    // A Quick connect that was not saved leaves nothing in the database.
+    if crate::quick_connect::is_ephemeral_id(&server_id) {
+        return Err("Save this server to keep bookmarks for it.".into());
+    }
     let key = format!("sftp.bookmarks.{server_id}");
     let json = serde_json::to_string(&bookmarks).map_err(|e| e.to_string())?;
     app.state::<AppState>()

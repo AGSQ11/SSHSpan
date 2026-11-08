@@ -7,7 +7,10 @@ pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod handoff;
+pub mod pmxspan;
 pub mod putty_sessions;
+pub mod quick_connect;
 pub mod sftp;
 pub mod ssh;
 pub mod ssh_client;
@@ -18,6 +21,7 @@ use tauri::{
     Emitter, Manager,
 };
 
+use commands::handoff::*;
 use commands::server::*;
 use commands::sftp::*;
 use commands::terminal::*;
@@ -43,13 +47,22 @@ impl AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        // Single-instance FIRST (the deep-link plugin requires it): a second
+        // `sshspan` start - PMXSpan spawning `sshspan "sshspan://..."`, or
+        // the OS handler - hands its arguments to this instance. Each
+        // `sshspan:` argument is taken in as a link (validated, held for the
+        // dialog; `commands::handoff::receive`).
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
+            for arg in args.iter().skip(1) {
+                commands::handoff::receive(app, arg);
+            }
         }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let state = match AppState::new(app.handle()) {
@@ -85,6 +98,12 @@ pub fn run() {
             // Live MCP sessions + connect statuses; torn down on vault lock
             // (HTTP DELETE with Mcp-Session-Id where a session exists)
             app.manage(assistant::mcp::McpState::new());
+
+            // Quick connect's unsaved servers; in memory, cleared on lock
+            app.manage(quick_connect::EphemeralRegistry::new());
+            // sshspan:// links: the one waiting for an unlock, and the
+            // proposals handed to dialogs (cleared on lock)
+            app.manage(handoff::state::HandoffState::new());
 
             // Live SSH terminal sessions; cleared on vault lock
             app.manage(std::sync::Arc::new(SessionRegistry::new()));
@@ -133,6 +152,8 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
             }
+
+            start_deep_links(app.handle());
 
             Ok(())
         })
@@ -189,6 +210,19 @@ pub fn run() {
             // elsewhere with a message saying so)
             putty_list_sessions,
             server_delete,
+            // Quick connect (unsaved servers live in memory only)
+            quick_connect_open,
+            quick_connect_forget,
+            // sshspan:// links from PMXSpan, validated in Rust
+            handoff_take_pending,
+            category_ensure_host_path,
+            // PMXSpan discovery and launching (pmxspan:// URLs built in Rust)
+            pmxspan_status,
+            pmxspan_pick_path,
+            pmxspan_clear_path,
+            pmxspan_manage_server,
+            pmxspan_add_key,
+            deep_link_set_registered,
             // Connect / interactive SSH terminal
             terminal_connect,
             terminal_send,
@@ -327,6 +361,46 @@ pub fn run() {
                 exit_teardown(app_handle);
             }
         });
+}
+
+/// Links that reach this (first) instance: the `sshspan:` argument it was
+/// started with, and the URLs the OS delivers while it runs (macOS hands
+/// them over this way; elsewhere the single-instance forwarder delivers
+/// them too, and a duplicate within seconds is dropped). And, when the
+/// setting allows it, the runtime registration of `sshspan://` on Linux and
+/// Windows - off the startup path, a failure logged, never fatal. Nothing
+/// here looks for PMXSpan.
+fn start_deep_links(app: &tauri::AppHandle) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+    for arg in std::env::args().skip(1) {
+        commands::handoff::receive(app, &arg);
+    }
+    let handle = app.clone();
+    app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+            commands::handoff::receive(&handle, url.as_str());
+        }
+    });
+    if let Ok(Some(urls)) = app.deep_link().get_current() {
+        for url in urls {
+            commands::handoff::receive(app, url.as_str());
+        }
+    }
+    let register = app
+        .state::<AppState>()
+        .db
+        .get_config("setting.deepLinkRegister")
+        .ok()
+        .flatten()
+        .is_none_or(|v| v != "false");
+    if register {
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = commands::handoff::apply_deep_link_registration(&handle, true) {
+                log::warn!("[sshspan] {e}");
+            }
+        });
+    }
 }
 
 /// True once a real quit is under way, so the window-close handler can tell
