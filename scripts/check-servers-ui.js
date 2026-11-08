@@ -29,7 +29,8 @@
  *   6. the updater dialog; 7. Bitwarden sync honesty; 8. the Upload picker;
  *   9. approval cards show invisible characters;
  *   plus the leftovers: busy buttons, dead code, copy, stylesheet hygiene;
- *   and, on Windows, the import of the sessions saved in PuTTY.
+ *   and, on Windows, the import of the sessions saved in PuTTY; and the Quick
+ *   connect button (the dialog itself: scripts/check-quickconnect-ui.js).
  *
  * Run with `npm run test:servers`. Needs playwright (see check-renderer-ui.js);
  * without it only the static checks run. `--only <text>` runs the scenarios
@@ -3982,6 +3983,38 @@ async function scenarioPuttyButton(browser, server) {
   });
 }
 
+/// Quick connect beside New (INTEGRATION-SPEC 6): lock-gated, in the
+/// palette, and a vault lock closes its dialog - the typed password with it
+/// - and drops every unsaved server.
+async function scenarioQuickConnectGate(browser, server) {
+  await withApp(browser, server, {}, 'Quick connect: the button, the palette and the lock', async (app) => {
+    const { page } = app;
+    await serversView(page);
+    check('a ghost button between PuTTY and New, saying what it does', await page.evaluate(() => {
+      const b = document.getElementById('serverQuickBtn');
+      return [b.className, b.textContent.trim(), b.nextElementSibling.id, b.title.includes('Ctrl+Shift+N')];
+    }), ['ghost-btn', 'Quick', 'serverNewBtn', true]);
+    const palette = await page.evaluate(() => paletteCandidates().some((i) => i.name === 'Quick connect...'));
+    yes('the palette offers Quick connect', palette);
+    await page.click('#serverQuickBtn');
+    yes('it opens the dialog', await waitVisible(page, '#quickModal'));
+    await page.fill('#qcHost', 'h.example');
+    await page.click('#qcAuthSeg [data-qauth="password"]');
+    await page.fill('#qcPassword', 'secret-typed');
+    await page.evaluate(() => state.ephemeral.set('quick-x', { id: 'quick-x', name: 'u@h', host: 'h', port: 22 }));
+    await page.evaluate(() => { window.__backend.unlocked = false; return refreshVaultStatus(); });
+    await page.waitForTimeout(150);
+    check('a lock closes the dialog', await app.open('quickModal'), false);
+    check('and empties the typed password', await page.inputValue('#qcPassword'), '');
+    check('and drops the unsaved servers', await page.evaluate(() => state.ephemeral.size), 0);
+    check('the button is disabled while locked, saying why', await page.evaluate(() => {
+      const b = document.getElementById('serverQuickBtn');
+      return [b.disabled, b.title];
+    }), [true, 'Unlock the vault to connect.']);
+    check('no page errors', app.errors, []);
+  });
+}
+
 async function scenarioPuttyLock(browser, server) {
   await withApp(browser, server, puttyOpts(), 'PuTTY import: the vault lock', async (app) => {
     const { page } = app;
@@ -4568,6 +4601,7 @@ const SCENARIOS = [
   ['new server in a filtered list (A5-42 J5)', scenarioServerNewInFilter],
   ['server save warning (R10 J6)', scenarioServerSaveWarning],
   ['bitwarden texts spelled out (J7)', scenarioBwSpelled],
+  ['Quick connect: the button, the palette and the lock', scenarioQuickConnectGate],
   ['PuTTY import: the button, on Windows only', scenarioPuttyButton],
   ['PuTTY import: the vault lock', scenarioPuttyLock],
   ['PuTTY import: the listing, spelled out', scenarioPuttyList],

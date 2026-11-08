@@ -163,6 +163,7 @@
               <div class="detail-actions">
                 <button id="detailConnectBtn" class="primary-btn grow"><span data-ico="plug-zap"></span>Connect with this key</button>
                 <button id="detailRenameBtn" class="ghost-btn"><span data-ico="pencil"></span>Rename</button>
+                <button id="detailPmxBtn" class="ghost-btn" title="Offer this key's public half to PMXSpan"><span data-ico="send"></span>Add to PMXSpan...</button>
                 <button id="detailDeleteBtn" class="danger-btn" title="Delete this key"><span data-ico="trash-2"></span></button>
               </div>
             </div>
@@ -205,6 +206,8 @@
               <!-- Windows only (app.js shows it once app_info names the
                    platform): PuTTY keeps its sessions in the Windows registry. -->
               <button id="serverPuttyBtn" class="ghost-btn" title="Import the sessions saved in PuTTY" hidden><span data-ico="terminal"></span>PuTTY</button>
+              <!-- Quick connect: a host without saving it first (Ctrl+Shift+N). -->
+              <button id="serverQuickBtn" class="ghost-btn" title="Quick connect - a host without saving it first (Ctrl+Shift+N)"><span data-ico="plug-zap"></span>Quick</button>
               <button id="serverNewBtn" class="primary-btn" title="New server"><span data-ico="plus"></span>New</button>
               <button id="serverCatDrawerBtn" class="ghost-btn cat-drawer-btn" type="button" aria-controls="catPanel" aria-expanded="false" aria-label="Categories" title="Server categories"><span data-ico="folder"></span></button>
             </div>
@@ -311,6 +314,7 @@
             <button class="settings-nav-item" data-section="backup"><span data-ico="download"></span>Backup &amp; restore</button>
             <button class="settings-nav-item" data-section="sync"><span data-ico="cloud-cog"></span>Bitwarden sync</button>
             <button class="settings-nav-item" data-section="assistant"><span data-ico="message-square"></span>AI assistant</button>
+            <button class="settings-nav-item" data-section="integrations"><span data-ico="send"></span>Integrations</button>
             <button class="settings-nav-item" data-section="audit"><span data-ico="scroll-text"></span>Audit log</button>
           </nav>
 
@@ -531,6 +535,33 @@
                 <div id="mcpToolsHost" class="mcp-tools"></div>
                 <div class="status-strip" id="mcpStatus" role="status">MCP tools are offered to the assistant only when enabled below, stay behind the access level, and (outside YOLO) behind per-call approval.</div>
               </div>
+            </section>
+
+            <!-- PMXSpan (INTEGRATION-SPEC section 1). Everything here is
+                 found and checked by the backend (pmxspan_status); the path is
+                 chosen in a native dialog, never typed into this page. -->
+            <section class="card settings-section" data-section="integrations" hidden>
+              <div class="card-head">
+                <div>
+                  <h2>Integrations</h2>
+                  <p class="card-sub">PMXSpan, the Proxmox VE manager, can send hosts to SSHSpan and receive public keys from it. Only host names, user names, guest ids, host public keys and public keys cross between the two apps - never a password or a private key - and nothing received connects, saves or trusts anything until you confirm it in a dialog. SSHSpan works the same without PMXSpan.</p>
+                </div>
+              </div>
+              <h3 class="settings-subhead">PMXSpan</h3>
+              <p class="status-strip" id="pmxStatus" role="status">Not checked yet.</p>
+              <dl class="detail-meta integration-meta">
+                <dt>Found automatically</dt><dd><code class="mono" id="pmxDetected">-</code></dd>
+                <dt>Path set here</dt><dd><code class="mono" id="pmxUserPath">-</code></dd>
+              </dl>
+              <p class="field-error" id="pmxUserPathMsg" role="alert" hidden></p>
+              <div class="bw-actions">
+                <button id="pmxPickBtn" class="ghost-btn" title="Choose the PMXSpan program file"><span data-ico="folder-open"></span>Choose path...</button>
+                <button id="pmxClearBtn" class="ghost-btn" title="Forget the path set here and use the one found automatically"><span data-ico="x"></span>Clear path</button>
+                <button id="pmxRefreshBtn" class="ghost-btn" title="Look for PMXSpan again"><span data-ico="refresh-cw"></span>Check again</button>
+              </div>
+              <p class="hint">The first time SSHSpan starts a PMXSpan it found by itself, it asks you to confirm the exact path in a system dialog, and asks again if that path changes. A path you choose here is used without asking.</p>
+              <label class="toggle-chip integration-toggle"><input type="checkbox" id="deepLinkToggle" /><span class="toggle-box"></span>Register sshspan:// links on this computer</label>
+              <p class="hint">Lets PMXSpan (or a browser) open sshspan:// links in SSHSpan on Linux and Windows. Links still work without it when PMXSpan starts SSHSpan directly.</p>
             </section>
 
             <section class="card settings-section" data-section="audit" hidden>
@@ -940,6 +971,9 @@
             <button type="button" class="ghost-btn" id="srvClearPwBtn" aria-pressed="false" hidden>Remove saved password</button>
             <label class="toggle-chip" id="srvSavePwChip"><input type="checkbox" id="srvSavePw" /><span class="toggle-box"></span>Save password (sealed with vault)</label>
           </div>
+          <!-- Where the server lives in PMXSpan (shown for servers that came
+               from it; INTEGRATION-SPEC 2.3). Text only. -->
+          <p class="span-2 hint origin-line" id="srvOriginLine" hidden></p>
           <div class="span-2 cat-field">
             <span class="cat-field-label">Category</span>
             <div class="cat-chips" id="srvCategory"></div>
@@ -951,6 +985,106 @@
       <footer class="modal-footer">
         <button data-close class="ghost-btn">Cancel</button>
         <button id="srvSaveBtn" class="primary-btn">Save</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal: Quick connect (INTEGRATION-SPEC section 6) - a host without
+       saving it first, or saved through the server dialog's own save path.
+       Also where an sshspan://connect link from PMXSpan lands, prefilled;
+       every value it shows is set as text (app.js openQuickConnect). -->
+  <div class="modal-backdrop" id="quickModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="quickModalTitle">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="plug-zap"></span>
+          <h2 id="quickModalTitle">Quick connect</h2>
+        </div>
+        <button class="icon-btn" data-close title="Close" aria-label="Close" data-ico-x=""></button>
+      </header>
+      <div class="modal-body">
+        <div class="quick-link" id="qcLinkInfo" hidden></div>
+        <p class="quick-match" id="qcMatch" role="status" hidden></p>
+        <div class="server-grid">
+          <label>Host <input type="text" id="qcHost" placeholder="192.0.2.10 or host.example.com" spellcheck="false" autocomplete="off" /></label>
+          <div class="port-field">
+            <label>Port <input type="number" id="qcPort" placeholder="22" min="1" max="65535" autocomplete="off" aria-describedby="qcPortMsg" /></label>
+            <p class="field-error" id="qcPortMsg" role="alert" hidden></p>
+          </div>
+          <label class="span-2">Username <input type="text" id="qcUser" placeholder="deploy" spellcheck="false" autocomplete="off" /></label>
+          <div class="span-2 auth-method-row" role="radiogroup" aria-labelledby="qcAuthLabel">
+            <span class="field-label" id="qcAuthLabel">Auth method</span>
+            <div class="seg" id="qcAuthSeg">
+              <button type="button" data-qauth="publickey" class="seg-btn active" role="radio" aria-checked="true" tabindex="0">Key</button>
+              <button type="button" data-qauth="password" class="seg-btn" role="radio" aria-checked="false" tabindex="-1">Password</button>
+              <button type="button" data-qauth="keyboard-interactive" class="seg-btn" role="radio" aria-checked="false" tabindex="-1">Keyboard-interactive</button>
+            </div>
+          </div>
+          <div class="span-2 server-key-row" id="qcKeyRow">
+            <label>Vault key
+              <select id="qcKeyId">
+                <option value="">- select a key -</option>
+              </select>
+            </label>
+            <div class="pem-row">
+              <input type="text" id="qcPemPath" aria-label="Key file (.pem) on disk" placeholder="...or pick a .pem file on disk" spellcheck="false" autocomplete="off" />
+              <button type="button" id="qcBrowsePemBtn" class="ghost-btn"><span data-ico="folder-clock"></span>Browse</button>
+            </div>
+          </div>
+          <div class="span-2 pw-row" id="qcPwRow" hidden>
+            <label>Password (optional)
+              <input type="password" id="qcPassword" placeholder="Leave blank to type it when you connect" autocomplete="off" aria-describedby="qcPwHint" />
+            </label>
+            <p class="hint" id="qcPwHint">Kept in memory for this tab only - never saved or sealed.</p>
+          </div>
+          <label class="span-2 toggle-chip"><input type="checkbox" id="qcSave" /><span class="toggle-box"></span>Save for future reconnects</label>
+          <div class="span-2 quick-save" id="qcSaveFields" hidden>
+            <label>Name <input type="text" id="qcName" placeholder="prod-web-1" spellcheck="false" autocomplete="off" /></label>
+            <div class="cat-field">
+              <span class="cat-field-label">Category</span>
+              <div class="cat-chips" id="qcCategory"></div>
+              <button type="button" id="qcBrowseCategoryBtn" class="ghost-btn cat-browse-btn"><span data-ico="folder-plus"></span>Browse categories...</button>
+            </div>
+          </div>
+        </div>
+        <p class="hint">Host keys are checked exactly as for a saved server. Unsaved, the server is forgotten when its last tab closes or the vault locks.</p>
+      </div>
+      <footer class="modal-footer">
+        <button data-close class="ghost-btn">Cancel</button>
+        <button id="qcOpenSavedBtn" class="primary-btn" hidden><span id="qcOpenSavedLabel">Open saved server</span></button>
+        <button id="qcConnectBtn" class="primary-btn"><span id="qcConnectLabel">Connect</span></button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal: import hosts handed over by PMXSpan (sshspan://import). Modelled
+       on the PuTTY import; filled with text and <bdi> only (app.js
+       fillPmxImport): every name, host and category comes from another
+       program. -->
+  <div class="modal-backdrop" id="pmxImportModal" hidden>
+    <div class="modal putty-modal" role="dialog" aria-modal="true" aria-labelledby="pmxImportTitle">
+      <header class="modal-header">
+        <div class="modal-title">
+          <span class="modal-title-ico" data-ico="download"></span>
+          <h2 id="pmxImportTitle">Import from PMXSpan</h2>
+        </div>
+        <button class="icon-btn" data-close title="Close" aria-label="Close" data-ico-x=""></button>
+      </header>
+      <div class="modal-body putty-body">
+        <p id="pmxImportSummary"></p>
+        <div class="putty-fill">
+          <label for="pmxImportAuth">Sign in with</label>
+          <select id="pmxImportAuth"></select>
+        </div>
+        <ul class="putty-list" id="pmxImportList" aria-labelledby="pmxImportSummary"></ul>
+        <p class="hint">Host keys reported by PMXSpan are kept as proposals: each is checked against the key the server presents at the first connect, and only then pinned.</p>
+        <p class="field-error" id="pmxImportMsg" role="alert" hidden></p>
+      </div>
+      <footer class="modal-footer">
+        <span class="hint" id="pmxImportCount"></span>
+        <span class="spacer"></span>
+        <button data-close class="ghost-btn">Cancel</button>
+        <button id="pmxImportBtn" class="primary-btn"><span id="pmxImportBtnLabel">Import</span></button>
       </footer>
     </div>
   </div>

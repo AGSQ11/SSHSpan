@@ -2149,6 +2149,9 @@ const state = window.state = {
   promptSecret: false,
   // connect / saved servers
   servers: [],
+  // Quick connect's unsaved servers, by id (the backend holds the real
+  // record; this copy lets a tab reconnect). Emptied on lock.
+  ephemeral: new Map(),
   connectSelectedId: null,
   connectAuthMethod: 'publickey',
   _pendingConnectServer: null,  // server id set by openServerPickerForKey
@@ -2359,6 +2362,8 @@ async function refreshVaultStatus(silent) {
     // to be closed under the user's hands within 10 s).
     if (state.vaultMode !== 'change') hideVaultModal();
     if (!wasUnlocked || !silent) await loadKeys();
+    // A link that waited for the unlock is taken now.
+    if (!wasUnlocked) pullHandoff();
   }
 }
 
@@ -2440,6 +2445,8 @@ const LOCK_GATE_HINTS = {
   // putty_list_sessions refuses while locked for the same reason: PuTTY's
   // saved sessions are an inventory of hosts, accounts and key paths.
   putty: 'Unlock the vault to import servers from PuTTY.',
+  quick: 'Unlock the vault to connect.',
+  pmximport: 'Unlock the vault to import servers from PMXSpan.',
   keys: 'Unlock the vault to create or import keys.',
   bitwarden: 'Unlock the vault to save, test or run the Bitwarden sync.',
   bitwardenAllow: 'Unlock the vault to allow the Bitwarden sync.',
@@ -2493,6 +2500,9 @@ function lockGateOpen(kind) {
 // Called when the vault locks or while the connect view is shown without an unlocked vault.
 function clearConnectView() {
   state.servers = [];
+  // Quick connect's unsaved servers die with the vault (the backend clears
+  // its registry on lock as well).
+  state.ephemeral.clear();
   state.serversLoadError = null;
   state.connectSelectedId = null;
   if (typeof window.terminalResetActive === 'function') window.terminalResetActive();
@@ -2664,7 +2674,7 @@ function openTerminalContextMenu(x, y, tabId) {
     fn();
     if (typeof window.terminalFocusTab === 'function') window.terminalFocusTab(tabId);
   };
-  const server = () => state.servers.find(s => s.id === tab.serverId);
+  const server = () => serverById(tab.serverId);
   // The mode item says where it goes (A3-31). It used to cycle shell, files,
   // split under a label naming one of them, so "Switch to SFTP" in Split took
   // the file browser away.
@@ -2687,6 +2697,9 @@ function openTerminalContextMenu(x, y, tabId) {
     { label: 'Restart session', icon: 'refresh-cw', disabled: !!tab.connecting, onSelect: () => reconnectActiveTab() },
     { label: mode.label, icon: mode.icon, disabled: !window.tabSessionLive(tabId),
       onSelect: () => { if (typeof window.setSessionMode === 'function') window.setSessionMode(mode.to); } },
+    // A Quick connect tab that was not saved: save it now, and the tab is
+    // bound to the saved server.
+    ...(isEphemeralId(tab.serverId) ? ['sep', { label: 'Save this server...', icon: 'server', onSelect: () => saveEphemeralServer(tab.serverId) }] : []),
   ], { label: 'Terminal' });
 }
 
@@ -3088,8 +3101,11 @@ function keyRowEl(k) {
   return row;
 }
 
-// Tiny right-click menu: "Use this key to connect...".
+// Tiny right-click menu: "Use this key to connect...", "Add to PMXSpan...".
 function openKeyConnectMenu(x, y, key) {
+  // The status as last checked (the detail pane checks it); refreshed for
+  // the next open.
+  ensurePmxspanStatus();
   openMenu({ x, y }, [{
     label: 'Use this key to connect...', icon: 'plug-zap',
     onSelect: async () => {
@@ -3105,7 +3121,7 @@ function openKeyConnectMenu(x, y, key) {
       // populated by switchView('connect').
       await openServerPickerForKey(key, x, y);
     },
-  }], { label: 'Key' });
+  }, pmxMenuItem('Add to PMXSpan...', () => addKeyToPmxspan(key))], { label: 'Key' });
 }
 /// Close whatever menu is open. o.restoreFocus (Escape, a chosen item) puts
 /// the focus back on what had it when the menu opened; a click elsewhere
@@ -3248,6 +3264,7 @@ async function selectKey(id, opts) {
     el('detailFingerprint').textContent = k.fingerprint_sha256 || '\u2014';
     el('detailAuthorized').value = k.public_key || '';
     el('detailConnectBtn').disabled = !k.has_private;
+    paintPmxKeyButton();
     // A deployed key can be taken back off the disk from here (A7-22 / A5-43).
     el('detailUndeployBtn').hidden = !keyIsDeployed(k);
     renderExportFormats(k);
@@ -3697,6 +3714,7 @@ function paletteCandidates() {
   out.push(
     { group: 'Actions', icon: 'plus', name: 'New key...', terms: ['new', 'generate', 'import'], run: openKeyModal },
     { group: 'Actions', icon: 'server', name: 'New server...', terms: ['new', 'server', 'host'], run: () => { switchView('connect'); openServerModal({}); } },
+    { group: 'Actions', icon: 'plug-zap', name: 'Quick connect...', terms: ['quick', 'connect', 'ssh', 'host', 'adhoc'], run: () => { switchView('connect').then(() => openQuickConnect()); } },
     { group: 'Actions', icon: 'shield-check', name: n ? `Deploy ${n} selected key(s)...` : 'Deploy keys (select some first)',
       terms: ['deploy', 'ssh config'], run: () => { switchView('keys'); openDeploySheet(); } },
     { group: 'Actions', icon: 'lock', name: 'Lock the vault', terms: ['lock'], run: lockFromUser },
@@ -3726,6 +3744,7 @@ const PALETTE_SETTINGS_SECTIONS = [
   ['backup', 'Backup & restore', 'download', ['backup', 'restore']],
   ['sync', 'Bitwarden sync', 'cloud-cog', ['bitwarden', 'vaultwarden', 'sync']],
   ['assistant', 'AI assistant', 'message-square', ['assistant', 'ai', 'mcp', 'model']],
+  ['integrations', 'Integrations', 'send', ['pmxspan', 'proxmox', 'integrations', 'links', 'sshspan://']],
   ['audit', 'Audit log', 'scroll-text', ['audit', 'log', 'history']],
 ];
 
@@ -5586,6 +5605,8 @@ function showSettingsSection(section) {
   for (const s of document.querySelectorAll('.settings-section')) {
     s.hidden = s.dataset.section !== section;
   }
+  // PMXSpan is looked for when this section is opened, never at startup.
+  if (section === 'integrations') loadIntegrations(true);
 }
 window.showSettingsSection = showSettingsSection;
 window.switchView = switchView;
@@ -6934,6 +6955,14 @@ function wire() {
       }
       return;
     }
+    // Ctrl+Shift+N: Quick connect (INTEGRATION-SPEC section 6).
+    if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && !ev.altKey && ev.code === 'KeyN') {
+      if (dialogOpen) return;
+      ev.preventDefault();
+      if (!state.unlocked) { lockGateOpen('quick'); return; }
+      switchView('connect').then(() => openQuickConnect());
+      return;
+    }
     if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.shiftKey) return;
     const k = ev.key.toLowerCase();
     // Only a real press counts: a second Ctrl+L or Ctrl+Q is the yes of its
@@ -6982,6 +7011,9 @@ function wire() {
   // Transfers, for the lock and quit questions (A5-09).
   listen('sftp-queue', onQueueEvent);
 
+  // An sshspan:// link reached the backend (validated there): take it.
+  listen('handoff-received', () => { pullHandoff(); });
+
   // The backend idle watchdog locked the vault without us (nothing arrived
   // for autoLockMinutes). The renderer would otherwise find out at the next
   // 10 s poll, leaving keys and sessions on screen for up to that long.
@@ -7006,6 +7038,67 @@ function wire() {
 
   // ─── Connect view wiring ────────────────────────────────────────────────
   el('serverNewBtn').addEventListener('click', () => openServerModal({}));
+  el('serverQuickBtn').addEventListener('click', () => openQuickConnect());
+  lockGate(el('serverQuickBtn'), 'quick');
+  registerModalCloser(el('quickModal'), closeQuickConnect);
+  for (const b of el('quickModal').querySelectorAll('[data-close]')) b.addEventListener('click', closeQuickConnect);
+  el('quickModal').addEventListener('click', (ev) => { if (ev.target === el('quickModal')) closeQuickConnect(); });
+  for (const b of document.querySelectorAll('#qcAuthSeg .seg-btn')) b.addEventListener('click', () => setQuickAuth(b.dataset.qauth));
+  wireRovingGroup(el('qcAuthSeg'), '.seg-btn', true);
+  el('qcSave').addEventListener('change', syncQuickSave);
+  el('qcConnectBtn').addEventListener('click', submitQuickConnect);
+  el('qcOpenSavedBtn').addEventListener('click', quickOpenSaved);
+  el('quickModal').addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' || ev.isComposing || ev.target.tagName === 'BUTTON' || ev.target.tagName === 'SELECT') return;
+    ev.preventDefault();
+    submitQuickConnect();
+  });
+  el('qcBrowsePemBtn').addEventListener('click', async () => {
+    // A path only: the file is not read here.
+    try {
+      const r = await call('system_pick_file_path', { title: 'Select .pem file' });
+      if (r && !r.canceled) el('qcPemPath').value = r.path;
+    } catch (e) { toast(errText(e), 'err'); }
+  });
+  el('qcBrowseCategoryBtn').addEventListener('click', () => {
+    openCategoryPicker({
+      title: 'Server category', scope: 'host', single: true,
+      initial: quickDialog.category ? [quickDialog.category] : [],
+      onSave: (ids) => { quickDialog.category = ids[0] || null; renderQuickCategory(); },
+    });
+  });
+  registerModalCloser(el('pmxImportModal'), closePmxImport);
+  for (const b of el('pmxImportModal').querySelectorAll('[data-close]')) b.addEventListener('click', closePmxImport);
+  el('pmxImportModal').addEventListener('click', (ev) => { if (ev.target === el('pmxImportModal')) closePmxImport(); });
+  el('pmxImportBtn').addEventListener('click', importPmxRows);
+  el('detailPmxBtn').addEventListener('click', () => {
+    const k = state.keys.find((x) => x.id === state.selectedId);
+    if (k) addKeyToPmxspan(k);
+  });
+  el('pmxRefreshBtn').addEventListener('click', () => loadIntegrations(true));
+  el('pmxPickBtn').addEventListener('click', async () => {
+    if (!lockGateOpen('settings')) return;
+    try {
+      const r = await call('pmxspan_pick_path');
+      if (r && !r.canceled) toast('PMXSpan path set.', 'ok');
+    } catch (e) { toast(errSpelled(e), 'err'); }
+    loadIntegrations(true);
+  });
+  lockGate(el('pmxPickBtn'), 'settings');
+  el('pmxClearBtn').addEventListener('click', async () => {
+    if (!lockGateOpen('settings')) return;
+    try { await call('pmxspan_clear_path'); } catch (e) { toast(errText(e), 'err'); }
+    loadIntegrations(true);
+  });
+  el('deepLinkToggle').addEventListener('change', async (ev) => {
+    const on = ev.target.checked;
+    try {
+      const r = await call('deep_link_set_registered', { on });
+      const warning = warningSpelled(r);
+      if (warning) toast(warning, 'warn');
+      else toast(on ? 'sshspan:// links are registered on this computer.' : 'sshspan:// links are no longer registered.', 'ok');
+    } catch (e) { toast(errText(e), 'err'); ev.target.checked = !on; }
+  });
   el('serverImportBtn').addEventListener('click', (ev) => importFromSshConfig(ev.currentTarget));
   lockGate(el('serverImportBtn'), 'sshconfig');
   el('serverPuttyBtn').addEventListener('click', () => openPuttyImport());
@@ -7270,6 +7363,7 @@ function closeDialogsForLock() {
   // An import from PuTTY still saving stops too, its dialog open or already
   // closed: the loop below reaches open dialogs only.
   stopPuttyImportForLock();
+  stopPmxImportForLock();
   const rank = (n) => modalStack.findIndex((m) => m.node === n);
   const open = [...document.querySelectorAll('.modal-backdrop')]
     .filter((n) => !n.hidden && n !== el('vaultModal'))
@@ -7713,6 +7807,9 @@ async function loadServers() {
   }
   renderServerList();
   if (state.view === 'connect') { state.orphans = state.servers.some(s => !s.categoryId); renderCategoryTree(); }
+  // Servers from PMXSpan have a "Manage in PMXSpan" item: its state is
+  // looked up now (only then), for the menus.
+  if (state.servers.some((s) => s.origin)) ensurePmxspanStatus();
 }
 
 function currentSelectedServer() {
@@ -7833,6 +7930,15 @@ function renderServerList() {
       m.textContent = 'key missing';
       head.appendChild(m);
     }
+    // Came from PMXSpan (INTEGRATION-SPEC 2.3): a small badge, where it lives
+    // in the tooltip.
+    if (s.origin && s.origin.kind === 'pmxspan') {
+      const b = document.createElement('span');
+      b.className = 'badge dim pmx-badge';
+      b.textContent = 'PMXSpan';
+      b.title = 'Managed in PMXSpan: ' + pmxOriginText(s.origin);
+      head.appendChild(b);
+    }
     row.appendChild(head);
 
     const sub = document.createElement('div');
@@ -7914,8 +8020,11 @@ function selectServer(id) {
 /// One server's menu: the row's right-click and its "..." button (A5-28).
 /// Test connection tests that row's server, whatever the header shows.
 function serverMenuItems(srv) {
+  const pmx = srv.origin && srv.origin.kind === 'pmxspan'
+    ? [pmxMenuItem('Manage in PMXSpan', () => manageInPmxspan(srv))] : [];
   return [
     { label: 'Connect', icon: 'plug-zap', onSelect: () => openSessionTab(srv) },
+    ...pmx,
     { label: 'Test connection', icon: 'server-cog', onSelect: () => testSelectedServer(srv) },
     { label: 'Edit', icon: 'pencil', onSelect: () => openServerModal({ id: srv.id }) },
     { label: 'Delete', icon: 'trash-2', onSelect: async () => {
@@ -7931,12 +8040,19 @@ function serverMenuItems(srv) {
 }
 
 function openServerContextMenu(x, y, srv) {
+  if (srv.origin) ensurePmxspanStatus();
   openMenu({ x, y }, serverMenuItems(srv), { label: 'Server' });
 }
 
 /// The row's "..." button: the same menu, anchored under it.
 function openServerMenu(anchor, srv) {
+  if (srv.origin) ensurePmxspanStatus();
   openMenu(anchor, serverMenuItems(srv), { label: 'Server ' + spellOut(srv.name || srv.host || ''), alignRight: true });
+}
+
+/// "<cluster> / <vmid or node>" of a PMXSpan origin, spelled out.
+function pmxOriginText(o) {
+  return spellOut(o.clusterName || o.clusterId || '') + ' / ' + spellOut(o.vmid != null ? String(o.vmid) : (o.node || ''));
 }
 
 // ─── Server modal ───────────────────────────────────────────────────────────
@@ -7970,7 +8086,14 @@ function openServerModal({ id, keyId, prefill } = {}) {
   el('srvPemPath').title = el('srvPemPath').value;
   el('srvPassword').value = '';
   el('srvSavePw').checked = false;
-  setConnectAuthMethod(srv ? srv.authMethod : 'publickey');
+  setConnectAuthMethod(srv ? srv.authMethod : (prefill?.authMethod || 'publickey'));
+  // Where it lives in PMXSpan, for a server that came from it (spec 2.3).
+  const originLine = el('srvOriginLine');
+  originLine.hidden = !(srv && srv.origin);
+  originLine.textContent = srv && srv.origin ? 'Managed in PMXSpan: ' + pmxOriginText(srv.origin) : '';
+  // A plain open is never a "Save this server..." of a Quick connect tab.
+  state._rebindEphemeral = null;
+  state._serverOriginToken = null;
   // A password saved for this server stays unless it is replaced or removed
   // on purpose (A2-04 / A5-03): the form used to send savedPassword: null on
   // every edit - a rename too - and the backend erased it.
@@ -8012,6 +8135,8 @@ function renderServerCategoryChips() {
 
 function closeServerModal() {
   el('serverModal').hidden = true;
+  state._rebindEphemeral = null;
+  state._serverOriginToken = null;
   state._editingServerId = null;
   state._pendingServerCategory = null;
   state._editingSavedPw = false;
@@ -8152,10 +8277,18 @@ async function submitServerModal() {
         clearSavedPassword: clearSaved,
         categoryId: state._pendingServerCategory,
         color: null,
+        originToken: state._editingServerId ? null : (state._serverOriginToken || null),
       });
+      const rebind = state._rebindEphemeral;
       closeServerModal();
       await loadServers();
       if (r && r.id) selectServer(r.id);
+      // "Save this server..." of a Quick connect tab: the tab is the saved
+      // server's now.
+      if (rebind && r && r.id) {
+        const saved = state.servers.find((s) => s.id === r.id);
+        if (saved) rebindEphemeral(rebind, saved);
+      }
       // A server the list's filter hides was reported as plainly "saved", and
       // looked lost (A5-42) - said as for a new key.
       const hidden = !!(r && r.id) && state.servers.some((s) => s.id === r.id) && !filteredServers().some((s) => s.id === r.id);
@@ -8416,7 +8549,7 @@ async function openServerPickerForKey(key, x, y) {
 /// selection. Its buttons act on what it shows (A3-10).
 function headServer() {
   const tab = state.sessions.get(state.activeTabId);
-  if (tab) return state.servers.find((s) => s.id === tab.serverId) || null;
+  if (tab) return serverById(tab.serverId);
   return currentSelectedServer();
 }
 
@@ -8530,7 +8663,7 @@ async function openSessionTab(srv, opts = {}) {
   state.sessions.set(tabId, tab);
   window.createTabTerminal(tabId);
   activateSessionSurface(tabId);
-  await connectTab(tab, srv, { fresh: true });
+  await connectTab(tab, srv, { fresh: true, oncePassword: opts.oncePassword || null });
 }
 
 /// Connect a tab - a new one, or a reconnect of the same tab: the password
@@ -8541,12 +8674,14 @@ async function openSessionTab(srv, opts = {}) {
 /// disconnects a session that arrives for it (A2-12). `beforeConnect` runs
 /// once the password is in hand, right before the connect: a restart ends the
 /// running session there, so Cancel at the prompt leaves it running.
-async function connectTab(tab, srv, { fresh, beforeConnect } = {}) {
+async function connectTab(tab, srv, { fresh, beforeConnect, oncePassword, skipProposedHostKeys } = {}) {
   const seq = tab.connectSeq = (tab.connectSeq || 0) + 1;
   const ours = () => state.sessions.get(tab.tabId) === tab && tab.connectSeq === seq;
   const target = `${serverInText(srv.host)}:${srv.port || 22}`;
-  let promptPassword = null;
-  if (srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
+  // A password typed in Quick connect's dialog for a server it just saved:
+  // this first connect only (never kept on the tab).
+  let promptPassword = oncePassword || null;
+  if (!promptPassword && srv.authMethod !== 'publickey' && !srv.hasSavedPassword) {
     setTabStatus(tab.tabId, `Password needed for ${serverInText(srv.username)}@${target}`);
     promptPassword = await new Promise((resolve) => askConnectPassword(srv, resolve, 'connect'));
     if (!ours()) return;
@@ -8571,7 +8706,7 @@ async function connectTab(tab, srv, { fresh, beforeConnect } = {}) {
   renderTermTabs();
   updateTerminalHead();
   try {
-    const sessionId = await window.terminalConnectInTab(tab.tabId, srv, { ...tab.connectOpts, promptPassword });
+    const sessionId = await window.terminalConnectInTab(tab.tabId, srv, { ...tab.connectOpts, promptPassword, skipProposedHostKeys: !!skipProposedHostKeys });
     if (!ours()) return;
     tab.connecting = false;
     tab.sessionId = sessionId;
@@ -8586,6 +8721,9 @@ async function connectTab(tab, srv, { fresh, beforeConnect } = {}) {
     const msg = errSpelled(e);
     setTabStatus(tab.tabId, msg);
     toast(msg, 'err');
+    // PMXSpan reported other host keys: the usual first-use check is offered
+    // as a separate, explicit step.
+    if (msg.startsWith(PMXSPAN_KEY_MISMATCH) && !skipProposedHostKeys) offerUsualHostKeyCheck(tab, srv, msg);
   }
   renderTermTabs();
   updateTerminalHead();
@@ -8663,7 +8801,7 @@ function toggleTermMax() {
 async function reconnectActiveTab() {
   const tab = state.sessions.get(state.activeTabId);
   if (!tab || tab.connecting) return;
-  const srv = state.servers.find(s => s.id === tab.serverId);
+  const srv = serverById(tab.serverId);
   if (!srv) { toast('Server no longer exists.', 'err'); return; }
   let beforeConnect;
   if (window.tabSessionLive(tab.tabId)) {
@@ -8734,6 +8872,7 @@ async function closeSessionTab(tabId, { skipConfirm = false } = {}) {
   const panel = document.getElementById('sftpPanel-' + tabId);
   if (panel) panel.remove();
   state.sessions.delete(tabId);
+  forgetEphemeralIfUnused(tab.serverId);
   // Its assistant conversation, pending approval and access level go too,
   // and any question about a file edited over its session (sftp.js).
   window.assistantClearTab?.(tabId);
@@ -8908,6 +9047,581 @@ function onSessionClosed(tabId) {
 window.onSessionClosed = onSessionClosed;
 window.activateSessionSurface = activateSessionSurface;
 
+// ─── Quick connect (INTEGRATION-SPEC section 6) ────────────────────────────
+//
+// A host without saving it first. Unticked, the backend registers an
+// EPHEMERAL server (quick_connect_open): in its memory only, never in the
+// database, gone when the vault locks; this page keeps a copy in
+// state.ephemeral so the tab's Reconnect, Restart, New session, Files and
+// Split resolve it like any saved server (serverById), and forgets it when
+// the last tab using it closes. A password typed here goes to that backend
+// record and nowhere else. Ticked, the server is saved through server_save
+// - the server dialog's own save, every check and warning included - and
+// then connected. The tick is remembered (setting quickConnectSave).
+//
+// The same dialog is where an sshspan://connect link from PMXSpan lands,
+// prefilled from the values the backend validated (handoff_take_pending).
+// Nothing connects until the user clicks; a saved server that already is
+// that host is offered first ("Open saved server ...").
+
+/// The dialog's state: the auth method shown, the category picked for a
+/// save, and the link it was opened for ({ token, link, match }) or null.
+const quickDialog = { auth: 'publickey', category: null, offer: null };
+
+/// A server by id: a saved one, else one of Quick connect's unsaved ones.
+function serverById(id) {
+  return state.servers.find((s) => s.id === id) || state.ephemeral.get(id) || null;
+}
+window.serverById = serverById;
+
+/// Whether a server id is one of Quick connect's unsaved servers.
+function isEphemeralId(id) {
+  return typeof id === 'string' && id.startsWith('quick-');
+}
+
+function setQuickAuth(method) {
+  quickDialog.auth = method;
+  for (const b of document.querySelectorAll('#qcAuthSeg .seg-btn')) {
+    const on = b.dataset.qauth === method;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
+  }
+  el('qcKeyRow').hidden = method !== 'publickey';
+  el('qcPwRow').hidden = method === 'publickey';
+}
+
+function renderQuickCategory() {
+  const ids = quickDialog.category ? [quickDialog.category] : [];
+  renderCategoryChips(el('qcCategory'), ids, {
+    removable: true,
+    onRemove: () => { quickDialog.category = null; renderQuickCategory(); },
+  });
+}
+
+/// The save fields follow the tick; the button says what it does.
+function syncQuickSave() {
+  const save = el('qcSave').checked;
+  el('qcSaveFields').hidden = !save;
+  el('qcConnectLabel').textContent = save ? 'Save & connect' : 'Connect';
+}
+
+/// Open the dialog - empty, or for a link (`offer`: what
+/// handoff_take_pending returned for it).
+function openQuickConnect(offer) {
+  if (!lockGateOpen('quick')) return;
+  const link = offer && offer.link;
+  quickDialog.offer = offer || null;
+  quickDialog.category = null;
+  const sel = el('qcKeyId');
+  sel.innerHTML = '<option value="">- select a key -</option>';
+  for (const k of state.keys) {
+    if (!k.has_private) continue;
+    const opt = document.createElement('option');
+    opt.value = k.id;
+    opt.textContent = `${k.name} (${String(k.key_type || '').toUpperCase()})`;
+    sel.appendChild(opt);
+  }
+  el('qcHost').value = link ? String(link.host) : '';
+  el('qcPort').value = link ? String(link.port) : '22';
+  el('qcUser').value = link ? String(link.user) : '';
+  el('qcPemPath').value = '';
+  el('qcPassword').value = '';
+  el('qcName').value = link ? String(link.name || link.host) : '';
+  showFieldMessage('qcPortMsg', '');
+  setQuickAuth('publickey');
+  // The last choice, unticked the first time (spec 2.1 / 6).
+  el('qcSave').checked = !!(state.settings && state.settings.quickConnectSave === '1');
+  syncQuickSave();
+  renderQuickCategory();
+  paintQuickLink(offer);
+  el('quickModalTitle').textContent = link ? 'Connect to a host from ' + (link.fromPmxspan ? 'PMXSpan' : 'a link') : 'Quick connect';
+  el('quickModal').hidden = false;
+  setTimeout(() => {
+    if (el('quickModal').hidden) return;
+    if (!el('qcOpenSavedBtn').hidden) el('qcOpenSavedBtn').focus();
+    else if (link) el('qcUser').focus();
+    else el('qcHost').focus();
+  }, 0);
+}
+
+/// What a link adds to the dialog: where it came from, the host keys
+/// PMXSpan reported (fingerprints only), and a saved server that already is
+/// this host - then "Open saved server <name>" is the primary button.
+function paintQuickLink(offer) {
+  const info = el('qcLinkInfo');
+  const link = offer && offer.link;
+  info.replaceChildren();
+  info.hidden = !link;
+  if (link) {
+    const from = document.createElement('p');
+    const origin = link.origin;
+    if (link.fromPmxspan && origin) {
+      from.append('From PMXSpan: ', bdiOf(spellOut(origin.clusterName || origin.clusterId)), ' / ',
+        bdiOf(spellOut(origin.vmid != null ? String(origin.vmid) : (origin.node || ''))));
+    } else {
+      from.append('From ', bdiOf(spellOut(link.source || 'another app')), '.');
+    }
+    info.append(from);
+    const keys = arrayOrEmpty(link.hostKeys);
+    const k = document.createElement('p');
+    k.className = 'hint';
+    if (keys.length) {
+      k.append(`${plural(keys.length, 'host key')} reported - checked against the key the server presents before anything is pinned: `);
+      keys.forEach((hk, i) => {
+        if (i) k.append(', ');
+        const code = document.createElement('code');
+        code.className = 'mono';
+        code.textContent = String(hk.fingerprint || '');
+        k.append(code);
+      });
+    } else {
+      k.textContent = 'No host key reported - the usual first-use check applies.';
+    }
+    info.append(k);
+  }
+  const match = offer && offer.match;
+  const line = el('qcMatch');
+  const open = el('qcOpenSavedBtn');
+  line.hidden = !match;
+  open.hidden = !match;
+  el('qcConnectBtn').className = match ? 'ghost-btn' : 'primary-btn';
+  if (match) {
+    line.replaceChildren('This host is already saved as ', bdiOf(spellOut(match.name)), '.');
+    el('qcOpenSavedLabel').textContent = 'Open saved server ' + spellOut(match.name);
+  }
+}
+
+function closeQuickConnect() {
+  el('quickModal').hidden = true;
+  // A typed password does not stay behind in a hidden field.
+  el('qcPassword').value = '';
+  quickDialog.offer = null;
+}
+
+/// "Open saved server <name>": the saved server, connected as itself.
+async function quickOpenSaved() {
+  const match = quickDialog.offer && quickDialog.offer.match;
+  if (!match) return;
+  closeQuickConnect();
+  await loadServers();
+  const srv = state.servers.find((s) => s.id === match.id);
+  if (!srv) { toast('That saved server no longer exists.', 'err'); return; }
+  selectServer(srv.id);
+  openSessionTab(srv);
+}
+
+/// Connect (or Save & connect).
+async function submitQuickConnect() {
+  const host = el('qcHost').value.trim();
+  const username = el('qcUser').value.trim();
+  const method = quickDialog.auth;
+  if (!host) { toast('Host is required.', 'err'); el('qcHost').focus(); return; }
+  const parsed = serverPortFrom(el('qcPort').value);
+  if (parsed.error) {
+    showFieldMessage('qcPortMsg', parsed.error);
+    el('qcPort').focus();
+    return;
+  }
+  showFieldMessage('qcPortMsg', '');
+  if (!username) { toast('Username is required.', 'err'); el('qcUser').focus(); return; }
+  const keyId = method === 'publickey' ? (el('qcKeyId').value || null) : null;
+  const pemPath = method === 'publickey' ? (el('qcPemPath').value.trim() || null) : null;
+  if (method === 'publickey' && !keyId && !pemPath) { toast('Choose a key or a .pem file.', 'err'); return; }
+  const save = el('qcSave').checked;
+  const name = el('qcName').value.trim();
+  if (save && !name) { toast('Name is required to save the server.', 'err'); el('qcName').focus(); return; }
+  const password = method === 'publickey' ? '' : el('qcPassword').value;
+  const token = quickDialog.offer ? quickDialog.offer.token : null;
+  // The tick, as left (spec: remember the last choice).
+  const tick = save ? '1' : '0';
+  if (!state.settings || state.settings.quickConnectSave !== tick) {
+    call('settings_set', { key: 'quickConnectSave', value: tick })
+      .then(() => { state.settings = Object.assign({}, state.settings, { quickConnectSave: tick }); })
+      .catch(() => {});
+  }
+  await withBusy(el('qcConnectBtn'), save ? 'Saving…' : 'Connecting…', async () => {
+    try {
+      if (save) {
+        // The server dialog's own save: every check and warning applies. A
+        // typed password is used for this connection only, not saved.
+        const r = await call('server_save', {
+          id: null, name, host, port: parsed.port, username,
+          authMethod: method, keyId, pemPath,
+          savedPassword: null, clearSavedPassword: false,
+          categoryId: quickDialog.category, color: null,
+          originToken: token,
+        });
+        closeQuickConnect();
+        await loadServers();
+        const srv = state.servers.find((s) => s.id === r.id);
+        toast('Server saved.', 'ok');
+        const warning = warningSpelled(r);
+        if (warning) toast(warning, 'warn');
+        if (srv) { selectServer(srv.id); openSessionTab(srv, { oncePassword: password || null }); }
+        return;
+      }
+      const r = await call('quick_connect_open', {
+        host, port: parsed.port, username, authMethod: method, keyId, pemPath,
+        password: password || null, handoffToken: token,
+      });
+      closeQuickConnect();
+      const srv = Object.assign({}, r.server, { handoffToken: token });
+      state.ephemeral.set(srv.id, srv);
+      const warning = warningSpelled(r);
+      if (warning) toast(warning, 'warn');
+      openSessionTab(srv);
+    } catch (e) { toast(errText(e), 'err'); }
+  });
+}
+
+/// Forget an unsaved server once no tab uses it (the backend zeroizes its
+/// password as it goes).
+function forgetEphemeralIfUnused(id) {
+  if (!isEphemeralId(id) || !state.ephemeral.has(id)) return;
+  if ([...state.sessions.values()].some((t) => t.serverId === id)) return;
+  state.ephemeral.delete(id);
+  call('quick_connect_forget', { id }).catch(() => {});
+}
+
+/// "Save this server..." from an unsaved tab: the server dialog, prefilled;
+/// once saved, every tab of the unsaved server is bound to the saved one.
+function saveEphemeralServer(id) {
+  const srv = state.ephemeral.get(id);
+  if (!srv) return;
+  openServerModal({
+    keyId: srv.keyId || undefined,
+    prefill: {
+      name: srv.name, host: srv.host, port: srv.port, username: srv.username,
+      pemPath: srv.pemPath, authMethod: srv.authMethod,
+    },
+  });
+  state._rebindEphemeral = id;
+  state._serverOriginToken = srv.handoffToken || null;
+}
+
+/// A saved server took the place of unsaved `oldId`: its tabs now open,
+/// reconnect and save as `saved`.
+function rebindEphemeral(oldId, saved) {
+  for (const tab of state.sessions.values()) {
+    if (tab.serverId !== oldId) continue;
+    tab.serverId = saved.id;
+    tab.serverName = saved.name || saved.host;
+  }
+  state.ephemeral.delete(oldId);
+  call('quick_connect_forget', { id: oldId }).catch(() => {});
+  renderTermTabs();
+  updateTerminalHead();
+}
+
+/// terminal.js: the host key matched one PMXSpan reported and was pinned.
+window.onHostKeyVerifiedByPmxspan = () => toast('Host key verified against PMXSpan.', 'ok');
+
+/// The start of the backend's refusal when a host presents a key PMXSpan did
+/// not report (ssh_client PROPOSAL_MISMATCH_PREFIX).
+const PMXSPAN_KEY_MISMATCH = 'PMXSpan reported a different host key';
+
+/// After that refusal: the normal first-use check as an explicit second
+/// step - a reconnect with PMXSpan's keys set aside, which leads to the
+/// native host-key question (never to trust by itself).
+async function offerUsualHostKeyCheck(tab, srv, message) {
+  const ok = await confirmModal('Host key differs from PMXSpan', message, 'Check this key');
+  if (!ok || state.sessions.get(tab.tabId) !== tab || tab.connecting) return;
+  await connectTab(tab, srv, { skipProposedHostKeys: true });
+}
+
+// ─── sshspan:// links (INTEGRATION-SPEC 2.1 / 2.2) ────────────────────────
+//
+// The backend validates every link and hands out only typed values
+// (handoff_take_pending). A link that arrives while the vault is locked
+// waits there - in memory, ten minutes at most - and is taken after the
+// unlock. Nothing here acts on a link without the user.
+
+let handoffPulling = false;
+
+/// Take the link waiting in the backend, if any, and show its dialog.
+async function pullHandoff() {
+  if (handoffPulling) return;
+  handoffPulling = true;
+  try {
+    const r = await call('handoff_take_pending');
+    if (!r || r.kind === 'none') return;
+    if (r.kind === 'error') { toast(spellOut(String(r.message || 'The link was refused.')), 'err'); return; }
+    if (r.kind === 'waiting') {
+      toast('A link from PMXSpan is waiting - unlock the vault to continue.', 'info');
+      return;
+    }
+    if (!state.unlocked) return;
+    if (r.kind === 'connect') {
+      await switchView('connect');
+      openQuickConnect(r);
+    } else if (r.kind === 'import') {
+      await switchView('connect');
+      openPmxImport(r);
+    }
+  } catch (e) {
+    toast(errText(e), 'err');
+  } finally {
+    handoffPulling = false;
+  }
+}
+
+// ─── Import from PMXSpan (sshspan://import) ────────────────────────────────
+//
+// Modelled on the PuTTY import: a row per host, ticked unless SSHSpan already
+// has it (matched by PMXSpan origin, else host:port + user) or it cannot be
+// imported (the reason is shown); each row's target category is editable
+// and created on import. Import saves the ticked rows one at a time through
+// server_save - with the row's token, so the backend stores its PMXSpan
+// origin and keeps its host keys as proposals - and stops when the dialog
+// closes or the vault locks.
+
+const pmxImport = { rows: [], run: null, cluster: null };
+
+/// What a row's host-key status says.
+function pmxHostKeyText(hk) {
+  const s = hk && hk.status;
+  if (s === 'new') return 'host key: new - verified at the first connect';
+  if (s === 'unchanged') return 'host key: unchanged';
+  if (s === 'rotated') return `host key: rotated: ${hk.old} -> ${hk.new} - you are asked at the next connect`;
+  if (s === 'conflict') return `host key: differs from the pinned ${hk.old} - the connect refuses until the pin is forgotten`;
+  return 'host key: none reported - the usual first-use check applies';
+}
+
+function openPmxImport(listing) {
+  if (!lockGateOpen('pmximport')) return;
+  if (pmxImport.run) { toast('The PMXSpan import is still finishing.', 'info'); return; }
+  const rows = arrayOrEmpty(listing && listing.rows).filter((r) => r && typeof r === 'object');
+  if (!rows.length) { toast('The bundle from PMXSpan holds no hosts.', 'info'); return; }
+  pmxImport.cluster = listing.cluster || null;
+  const cluster = listing.cluster ? (listing.cluster.name || listing.cluster.id) : '';
+  el('pmxImportSummary').textContent = `${plural(rows.length, 'host')} from PMXSpan` + (cluster ? ' (' + spellOut(cluster) + ')' : '');
+  const auth = el('pmxImportAuth');
+  auth.innerHTML = '';
+  const pw = document.createElement('option');
+  pw.value = '';
+  pw.textContent = 'Password (asked when you connect)';
+  auth.appendChild(pw);
+  for (const k of state.keys) {
+    if (!k.has_private) continue;
+    const opt = document.createElement('option');
+    opt.value = k.id;
+    opt.textContent = `Vault key ${k.name} (${String(k.key_type || '').toUpperCase()})`;
+    auth.appendChild(opt);
+  }
+  pmxImport.rows = rows.map(pmxImportRow);
+  el('pmxImportList').replaceChildren(...pmxImport.rows.map((r) => r.li));
+  showFieldMessage('pmxImportMsg', '');
+  updatePmxFooter();
+  el('pmxImportModal').hidden = false;
+  setTimeout(() => {
+    const first = pmxImport.rows.find((r) => !r.box.disabled);
+    if (!el('pmxImportModal').hidden && first) first.box.focus();
+  }, 0);
+}
+
+function pmxImportRow(row, index) {
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  const blocked = !!row.problem;
+  box.checked = !blocked && !row.alreadySaved && !hasSpelledChars(row.name);
+  box.disabled = blocked;
+  box.addEventListener('change', updatePmxFooter);
+  const title = bdiOf(spellOut(row.name));
+  title.className = 'server-name';
+  const pick = document.createElement('label');
+  pick.className = 'putty-pick';
+  pick.append(box, title);
+  const target = document.createElement('div');
+  target.className = 'putty-target server-row-sub';
+  target.append(bdiOf(spellOut(row.user)), '@', bdiOf(spellOut(row.host)), ':' + row.port);
+  const guest = row.kind === 'node' ? ' · node ' + spellOut(row.node || '') : ` · ${row.kind} ${row.vmid}`;
+  target.append(guest);
+  const li = document.createElement('li');
+  li.className = 'putty-row';
+  li.append(pick, target);
+  const category = document.createElement('input');
+  category.type = 'text';
+  category.spellcheck = false;
+  category.autocomplete = 'off';
+  category.value = arrayOrEmpty(row.category).join(' / ');
+  category.placeholder = 'Category (none)';
+  category.setAttribute('aria-label', 'Category for ' + spellOut(row.name));
+  const how = document.createElement('div');
+  how.className = 'putty-how server-row-auth';
+  const note = document.createElement('p');
+  note.className = 'field-error';
+  note.hidden = true;
+  if (blocked) {
+    how.append('Cannot be imported: ', bdiOf(spellOut(row.problem)));
+  } else {
+    const catLabel = document.createElement('label');
+    catLabel.className = 'pmx-category';
+    catLabel.append('Category ', category);
+    li.append(catLabel);
+    how.append(pmxHostKeyText(row.hostKey));
+    if (row.alreadySaved) {
+      const mark = document.createElement('span');
+      mark.className = 'badge dim putty-saved';
+      mark.textContent = 'Already in SSHSpan';
+      mark.title = 'Saved as ' + spellOut(row.alreadySaved.name);
+      how.append(' ', mark);
+    }
+  }
+  li.append(how, note);
+  return { row, li, box, category, note, index };
+}
+
+function updatePmxFooter() {
+  const ticked = pmxImport.rows.filter((r) => r.box.checked && !r.box.disabled).length;
+  el('pmxImportCount').textContent = ticked + ' selected';
+  el('pmxImportBtnLabel').textContent = 'Import ' + plural(ticked, 'server');
+  setDisabledFor(el('pmxImportBtn'), 'none-ticked', ticked === 0);
+}
+
+function pmxStop(run) {
+  if (run.stop === 'locked' || !state.unlocked) return 'locked';
+  if (run.stop || el('pmxImportModal').hidden) return 'closed';
+  return '';
+}
+
+async function importPmxRows() {
+  const ticked = pmxImport.rows.filter((r) => r.box.checked && !r.box.disabled);
+  if (!ticked.length || pmxImport.run) return;
+  const keyId = el('pmxImportAuth').value || null;
+  const picks = ticked.map((r) => ({ r, category: r.category.value.trim() }));
+  await withBusy(el('pmxImportBtn'), 'Importing…', async () => {
+    const run = { stop: null };
+    pmxImport.run = run;
+    const done = [];
+    const failed = [];
+    try {
+      for (const p of picks) {
+        if (pmxStop(run)) break;
+        const row = p.r.row;
+        try {
+          let categoryId = null;
+          if (p.category) {
+            const c = await call('category_ensure_host_path', { path: p.category.split('/').map((s) => s.trim()).filter(Boolean).join('/') });
+            categoryId = (c && c.id) || null;
+          }
+          await call('server_save', {
+            id: null, name: row.name, host: row.host, port: row.port, username: row.user,
+            authMethod: keyId ? 'publickey' : 'password', keyId, pemPath: null,
+            savedPassword: null, clearSavedPassword: false, categoryId, color: null,
+            originToken: row.token,
+          });
+          done.push(p.r);
+        } catch (e) {
+          failed.push({ r: p.r, error: errSpelled(e) });
+        }
+      }
+      if (done.length) { await loadCategories(); await loadServers(); }
+    } finally {
+      pmxImport.run = null;
+    }
+    const stop = pmxStop(run);
+    if (done.length) toast(`${done.length} server(s) saved from PMXSpan. Their host keys are checked at the first connect.`, 'ok');
+    const missed = picks.length - done.length - failed.length;
+    if (stop === 'locked') {
+      if (missed) toast(`The vault was locked, so ${plural(missed, 'host')} from PMXSpan ${missed === 1 ? 'was' : 'were'} not imported.`, 'info');
+      return;
+    }
+    if (stop === 'closed') {
+      if (failed.length) toast('Not saved:\n' + failed.map((f) => spellOut(f.r.row.name) + ': ' + f.error).join('\n'), 'err');
+      if (missed) toast(`The PMXSpan import stopped when its dialog was closed: ${plural(missed, 'host')} not imported.`, 'info');
+      return;
+    }
+    if (!failed.length) { closePmxImport(); return; }
+    for (const r of done) { r.box.checked = false; r.box.disabled = true; }
+    for (const f of failed) { f.r.note.textContent = f.error; f.r.note.hidden = false; }
+    showFieldMessage('pmxImportMsg', plural(failed.length, 'server') + ' could not be saved.');
+    updatePmxFooter();
+  });
+}
+
+/// Close and empty the dialog (an inventory of hosts stays nowhere); an
+/// import still running stops before its next save.
+function closePmxImport() {
+  if (pmxImport.run && !pmxImport.run.stop) pmxImport.run.stop = 'closed';
+  pmxImport.rows = [];
+  el('pmxImportList').replaceChildren();
+  el('pmxImportModal').hidden = true;
+}
+
+function stopPmxImportForLock() {
+  if (pmxImport.run) pmxImport.run.stop = 'locked';
+}
+
+// ─── PMXSpan actions and Settings > Integrations (INTEGRATION-SPEC 1, 3) ───
+//
+// The backend finds PMXSpan, builds every pmxspan:// URL and starts it; this
+// page only asks "open this server / offer this key". When PMXSpan cannot be
+// reached the actions stay in their menus, disabled, with the spec's hint.
+
+/// The last pmxspan_status answer and when it came.
+const pmxspanStatus = { value: null, at: 0 };
+
+/// pmxspan_status, at most every 15 s (it looks at the disk).
+async function ensurePmxspanStatus(force) {
+  if (!force && pmxspanStatus.value && Date.now() - pmxspanStatus.at < 15000) return pmxspanStatus.value;
+  try {
+    pmxspanStatus.value = await call('pmxspan_status');
+    pmxspanStatus.at = Date.now();
+  } catch (e) {
+    pmxspanStatus.value = null;
+  }
+  return pmxspanStatus.value;
+}
+
+const PMXSPAN_NOT_FOUND = 'PMXSpan was not found on this computer. Install it or set its path in Settings.';
+
+/// A menu item for a PMXSpan action: disabled with the hint when PMXSpan
+/// cannot be reached.
+function pmxMenuItem(label, run) {
+  const s = pmxspanStatus.value;
+  const available = !!(s && s.available);
+  return {
+    label, icon: 'send', disabled: !available,
+    sub: available ? undefined : ((s && s.hint) || PMXSPAN_NOT_FOUND),
+    onSelect: run,
+  };
+}
+
+async function manageInPmxspan(srv) {
+  try { await call('pmxspan_manage_server', { serverId: srv.id }); } catch (e) { toast(errSpelled(e), 'err'); }
+}
+
+async function addKeyToPmxspan(key) {
+  try { await call('pmxspan_add_key', { keyId: key.id }); } catch (e) { toast(errSpelled(e), 'err'); }
+}
+
+/// The detail pane's "Add to PMXSpan..." follows the status.
+async function paintPmxKeyButton() {
+  const b = el('detailPmxBtn');
+  if (!b) return;
+  const s = await ensurePmxspanStatus();
+  const available = !!(s && s.available);
+  setDisabledFor(b, 'pmxspan', !available);
+  b.title = available ? 'Offer this key\'s public half to PMXSpan' : ((s && s.hint) || PMXSPAN_NOT_FOUND);
+}
+
+/// The Integrations section.
+async function loadIntegrations(force) {
+  const s = await ensurePmxspanStatus(force !== false);
+  const status = el('pmxStatus');
+  if (!s) { status.textContent = 'Could not check for PMXSpan.'; return; }
+  if (s.route === 'user') status.textContent = 'Found at ' + spellOut(s.path) + ' (the path set here).';
+  else if (s.route === 'detected') status.textContent = 'Found at ' + spellOut(s.path) + (s.approved ? ' (approved).' : ' - you are asked to confirm it the first time it is started.');
+  else if (s.route === 'scheme') status.textContent = 'Found: this computer opens pmxspan:// links.';
+  else status.textContent = 'Not found. ' + PMXSPAN_NOT_FOUND;
+  el('pmxDetected').textContent = s.detectedPath ? spellOut(s.detectedPath) : '-';
+  el('pmxUserPath').textContent = s.userPath ? spellOut(s.userPath) : '-';
+  showFieldMessage('pmxUserPathMsg', s.userPathProblem ? 'The path set here no longer works: ' + spellOut(s.userPathProblem) : '');
+  setDisabledFor(el('pmxClearBtn'), 'nothing', !s.userPath);
+  el('deepLinkToggle').checked = s.registerLinks !== false;
+}
+
 // ─── on-disk paths, HTML escaping ─────────────────────────────────────────
 
 // Real on-disk locations, fetched once. Three UI strings used to hard-code
@@ -9042,6 +9756,9 @@ async function loadAppInfo() {
 
   // Optional update check (only when the setting is ticked; never auto-installs).
   autoUpdateCheckOnBoot();
+
+  // A link the app was started with (or that came before the page listened).
+  pullHandoff();
 
   // Catch auto-locks without user interaction.
   setInterval(() => {

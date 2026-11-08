@@ -3183,3 +3183,16 @@ label.putty-pick { flex: 0 1 170px; flex-direction: row; align-items: center; ga
     scroll-behavior: auto !important;
   }
 }
+
+/* ─── Quick connect, PMXSpan import and Integrations ─────────────────────── */
+.quick-link { border: 1px solid var(--line); border-radius: var(--r-md); padding: 8px 12px; margin-bottom: 12px; }
+.quick-link p { margin: 2px 0; overflow-wrap: anywhere; }
+.quick-match { margin: 0 0 12px; font-weight: 600; }
+.quick-save { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.pmx-badge { margin-left: 6px; flex: none; }
+.pmx-category { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.pmx-category input { flex: 1; min-width: 0; }
+.settings-subhead { margin: 12px 0 6px; font-size: 14px; }
+.integration-meta code { overflow-wrap: anywhere; }
+.integration-toggle { margin-top: 14px; }
+.origin-line { margin: 0; }

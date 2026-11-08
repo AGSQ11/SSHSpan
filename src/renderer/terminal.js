@@ -761,6 +761,11 @@ function terminalConnectInTab(tabId, server, opts) {
       overrideUsername: opts && opts.overrideUsername,
       overrideKeyId: opts && opts.overrideKeyId,
       promptPassword: opts && opts.promptPassword,
+      // Only after "PMXSpan reported a different host key", on the user's
+      // "Check this key": the backend then sets PMXSpan's proposed keys
+      // aside and asks its normal first-use question. It can lead to that
+      // native dialog, never to trust by itself.
+      skipProposedHostKeys: !!(opts && opts.skipProposedHostKeys),
     };
 
     // Host-key consent (StrictHostKeyChecking semantics) is owned by the
@@ -821,6 +826,10 @@ function terminalConnectInTab(tabId, server, opts) {
       }
       rec.connecting = false;
       rec.sessionId = sessionId;
+      // The host key matched one PMXSpan proposed and was pinned (app.js says so).
+      if (r.hostKeyVerified && typeof window.onHostKeyVerifiedByPmxspan === 'function') {
+        window.onHostKeyVerifiedByPmxspan(tabId);
+      }
       trace(tabId, `[sshspan] session established (id=${sessionId.slice(0, 8)}...)`);
       sendTerminalSize(rec, true);
 
