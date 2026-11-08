@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Quick connect.** A Quick button beside New under Servers, a "Quick connect..." palette entry
+  and `Ctrl+Shift+N` open a dialog for a host you have not saved: host, port, user name and the
+  server dialog's sign-in choices and key-file rules. Without "Save for future reconnects" the
+  server is kept in the backend's memory only - never written to the vault, cleared on lock -
+  for as long as a tab uses it, so Reconnect, Restart, New session, Files and Split work; a
+  password typed for it lives there for the tab's lifetime and is never sealed or stored. The tab
+  is titled `user@host` and its menu offers "Save this server...", which saves it through the
+  server dialog and binds the tab to the saved server. With the tick, the server is saved through
+  `server_save` and connected. The tick is remembered (setting `quickConnectSave`). Host-key
+  pinning, the time limits, the vault gate and the audit log (new event `connect.quick`) apply as
+  for saved servers.
+- **PMXSpan integration** (INTEGRATION-SPEC v1). `sshspan://connect` links open Quick connect
+  prefilled and offer "Open saved server <name>" first when a saved server matches;
+  `sshspan://import` links name a bundle file that is checked (absolute path, regular file and not
+  a symbolic link, 4 MiB, SHA-256, format and version, under an hour old) and shown in an "Import
+  from PMXSpan" dialog modelled on the PuTTY import, saving each ticked row through `server_save`.
+  Every link is validated in Rust, held in memory while the vault is locked (one, ten minutes),
+  and refused with a message naming the problem. Host keys PMXSpan reports are proposals checked
+  against the live key: pinned without a dialog as `imported:pmxspan` when they match, refused
+  with both fingerprints when they do not (the usual first-use check is a separate, explicit
+  step), and a reported rebuild asks in a native dialog before a pin is replaced. Servers from
+  PMXSpan keep their origin (new nullable `servers.origin_*` columns, in backups, ignored by the
+  Bitwarden sync), show a PMXSpan badge and get "Manage in PMXSpan"; keys get "Add to PMXSpan...",
+  which offers the public line only. Settings > Integrations shows where PMXSpan was found, lets
+  you choose its path in a system dialog, and has "Register sshspan:// links on this computer"
+  (on by default). The first start of a PMXSpan found automatically asks in a native dialog, and
+  the approved path is remembered. New dependency: `tauri-plugin-deep-link` 2.4;
+  `tauri-plugin-single-instance` now uses its `deep-link` feature.
+
 - **PuTTY import (Windows).** A PuTTY button beside Config under Servers lists the SSH sessions
   saved in PuTTY (up to 1,000), each with its name, host, port, username and key file and a
   checkbox. A session already saved as a server is marked and starts unticked, and so does one

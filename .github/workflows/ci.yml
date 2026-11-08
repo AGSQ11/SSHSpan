@@ -177,6 +177,9 @@ jobs:
           # question ("Allow syncing...") and the backend's texts spelled out,
           # and the Upload picker.
           npm run test:servers
+          # Quick connect, sshspan:// links, the PMXSpan import dialog and the
+          # PMXSpan actions.
+          npm run test:quick
 
   cargo-audit:
     name: Dependency advisories

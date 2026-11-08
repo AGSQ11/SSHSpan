@@ -1,8 +1,11 @@
 # SSHSpan architecture
 
 **Last updated:** 2026-10-25  
-**Status:** describes v1.10.0 and the PuTTY session import, which is not released yet (Unreleased
-in the CHANGELOG). The import's passages - its line in the system diagram, its row in the module
+**Status:** describes v1.10.0, the PuTTY session import, Quick connect and the PMXSpan
+integration, none of which is released yet (Unreleased in the CHANGELOG). Quick connect and the
+PMXSpan integration - their lines in the system diagram, their rows in the module table, the IPC
+count (121) and its groups, the new event, the schema rows and the "Quick connect and PMXSpan
+links" section - are described from the working tree that adds them. The import's passages - its line in the system diagram, its row in the module
 table, the IPC count (111) and the Servers group, its mention where the renderer shows
 `server_save`'s key-file warning, and the PuTTY session import section - are checked against
 committed source at `a75b533`; everything else against `6c19b1b`, and nothing else it describes
@@ -43,9 +46,12 @@ names and numbers can be re-derived with the commands in the sections that quote
 │ assistant/      model-provider client and MCP Streamable HTTP client     │
 │ config/         managed SSH config plus parser/serializer                │
 │ putty_sessions/ PuTTY's saved sessions as servers to save                │
+│ quick_connect   Quick connect's unsaved servers (memory only)            │
+│ handoff/        sshspan:// link and bundle validation, pmxspan:// URLs   │
+│ pmxspan/        finding and starting PMXSpan (spec section 1)            │
 └──────────────────────────────────────────────────────────────────────────┘
                                 │
-                SQLite, filesystem, SSH/SFTP, HTTPS
+     SQLite, filesystem, SSH/SFTP, HTTPS; PMXSpan started locally
 ```
 
 There is one application process. Tauri hosts the OS webview and Tokio runtime. The renderer has
@@ -56,7 +62,7 @@ can use normal development tooling.
 
 | Module | Purpose | Important dependencies |
 | --- | --- | --- |
-| `src/renderer/app.js` | boot, routing, vault gate and auto-lock, keys, categories, deploy sheet, servers and connect, settings, Bitwarden, backups, audit view, dialogs, menus, palette, updater | every renderer module; Tauri core/event APIs |
+| `src/renderer/app.js` | boot, routing, vault gate and auto-lock, keys, categories, deploy sheet, servers and connect, Quick connect, the PMXSpan link dialogs and actions, settings (Integrations included), Bitwarden, backups, audit view, dialogs, menus, palette, updater | every renderer module; Tauri core/event APIs |
 | `src/renderer/sftp.js` | remote/local browser with its splitters and pointer drag and drop, names as shown, queue UI, overwrite and edit-conflict prompts, chmod, search, bookmarks | `app.js` (menus, dialogs, `beginPointerDrag`), SFTP commands/events |
 | `src/renderer/terminal.js` | xterm lifecycle, terminal input/output, links, paste, fit and tab records | vendored xterm/addons, terminal commands |
 | `src/renderer/assistant.js` | per-tab conversation, provider loop, built-in tools, approval cards | terminal state, assistant commands, `mcp.js` |
@@ -85,6 +91,9 @@ liabilities; see [Large files and deferred splits](#large-files-and-deferred-spl
 | App lifecycle | `lib.rs`, `main.rs` | Tauri builder, handlers, tray, close-to-tray, exit teardown, startup-failure dialog |
 | General commands | `commands/mod.rs` | vault, keys, categories, deploy, backups, settings, audit, system dialogs and files, the Bitwarden commands, `ssh_config_list_hosts`, `app_info`, `heartbeat` and the idle watchdog, shared helpers (`run_blocking`, `audit_or_warn`, the rotation lock, the pool helpers, the native credential question) |
 | Server/terminal | `commands/server.rs`, `commands/terminal.rs`, `ssh_client/mod.rs` | server CRUD, connection/authentication, terminal registry, host keys |
+| Quick connect | `quick_connect.rs`, `commands/handoff.rs` | the ephemeral server registry (random `quick-` ids, typed password zeroized, cleared on lock); `quick_connect_open` / `quick_connect_forget`; `commands/terminal.rs` resolves ids from the database or the registry |
+| PMXSpan links | `handoff/mod.rs`, `handoff/state.rs`, `commands/handoff.rs` | `sshspan://connect` / `sshspan://import` parsing and validation, bundle reading, `pmxspan://` URL building; the waiting link and the proposals handed to dialogs; `receive`, `handoff_take_pending`, the import listing and `apply_proposal` |
+| PMXSpan discovery | `pmxspan/mod.rs`, `pmxspan/registry.rs` | the discovery list of INTEGRATION-SPEC section 1 (Uninstall registry entries on Windows), path validation, the `pmxspan://` handler check, the launch question and the detached start; the commands are in `commands/handoff.rs` |
 | PuTTY import | `putty_sessions/mod.rs`, `putty_sessions/registry.rs` | PuTTY's saved sessions as servers to save: the registry reader (Windows only) and the listing rules (every platform); the command, `putty_list_sessions`, is in `commands/server.rs`. Not the PPK parser, which is `crypto/putty.rs` |
 | SFTP | `commands/sftp.rs`, `sftp/mod.rs`, `sftp/queue.rs`, `sftp/testkit.rs` | SFTP IPC, edit sessions, local-path policy, bounded walks, persistent queue; the in-process test server |
 | Crypto | `crypto/*.rs` | Argon2id/AES-GCM vault, SSH formats, PPK, PKCS#8, Bitwarden primitives |
@@ -105,12 +114,14 @@ Tauri-managed state created in `lib.rs`:
   `QuestionKind` the host and time of the latest "no" for the 30-second wait);
 - `AssistantLevels` and `McpState` (live MCP sessions, each bound to the settings it was set up
   with, and the tracked teardown tasks);
+- `EphemeralRegistry` (Quick connect's unsaved servers) and `HandoffState` (the link waiting for
+  an unlock, and the proposals handed to dialogs); both lose their servers and proposals on lock;
 - `SessionRegistry`, `SftpRegistry`, `EditRegistry`, `KeepaliveRegistry`;
 - persistent `TransferQueue`.
 
 ## IPC surface
 
-`tauri::generate_handler!` registers **111 commands**. Default Tauri parameter mapping uses
+`tauri::generate_handler!` registers **121 commands**. Default Tauri parameter mapping uses
 camelCase on the JavaScript wire. `mcp_save_server` and `mcp_set_tool_state` explicitly use snake_case;
 `scripts/check-ipc-args.js` is the enforced source of truth and also rejects renderer calls to
 commands absent from `generate_handler!`. A command that takes `Option<T>` silently reads a
@@ -123,7 +134,7 @@ misspelled key as `None`, which is why that check exists.
 | Keys/deploy (10) | `key_import`, `key_export`, `key_export_to_file`, `key_delete`, `key_rename`, `key_list`, `key_get`, `key_deploy`, `key_deploy_preview`, `key_remove_deployed` |
 | Categories (8) | `category_list`, `category_create`, `category_rename`, `category_reparent`, `category_set_order`, `category_delete`, `key_set_categories`, `key_create_with_categories` |
 | SSH config (1) | `ssh_config_list_hosts` |
-| Servers (4) | `server_list`, `server_save`, `putty_list_sessions`, `server_delete` |
+| Servers (14) | `server_list`, `server_save`, `putty_list_sessions`, `server_delete`, `quick_connect_open`, `quick_connect_forget`, `handoff_take_pending`, `category_ensure_host_path`, `pmxspan_status`, `pmxspan_pick_path`, `pmxspan_clear_path`, `pmxspan_manage_server`, `pmxspan_add_key`, `deep_link_set_registered` |
 | Terminal/host keys (8) | `terminal_connect`, `terminal_send`, `terminal_resize`, `terminal_disconnect`, `terminal_list`, `server_test`, `known_hosts_list`, `known_hosts_forget` |
 | Activity (1) | `heartbeat` |
 | SFTP (37) | `sftp_open`, `sftp_list_dir`, `sftp_resolve_link`, `sftp_dir_size`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `sftp_download`, `sftp_open_for_edit`, `sftp_close_edit`, `sftp_edit_resolve`, `sftp_chmod`, `sftp_get_permissions`, `sftp_touch`, `sftp_fs_info`, `sftp_keepalive_start`, `sftp_queue_add`, `sftp_queue_list`, `sftp_queue_cancel`, `sftp_queue_retry`, `sftp_queue_pause`, `sftp_queue_resume`, `sftp_queue_pause_all`, `sftp_queue_resume_all`, `sftp_queue_set_rate_limit`, `sftp_queue_clear_finished`, `sftp_server_copy`, `sftp_search`, `sftp_search_cancel`, `sftp_bookmarks_list`, `sftp_bookmarks_save`, `sftp_local_list`, `sftp_local_mkdir`, `sftp_local_rename`, `sftp_local_remove`, `sftp_local_open_folder`, `sftp_close` |
@@ -375,6 +386,7 @@ event. These events go to the renderer:
 | `vault-locked-by-watchdog` | idle watchdog in `commands/mod.rs` | none | shows the locked state and disposes tabs |
 | `vault-lock-requested` | the tray's Lock Vault, after Rust has already locked | empty string | shows the locked state |
 | `window-hidden-to-tray` | the first close of a run that hides the window | none | the one-time tray notice |
+| `handoff-received` | `commands::handoff::receive` (a link from the command line, a second instance or the OS) | none | calls `handoff_take_pending` and opens Quick connect or the import dialog |
 
 ## Persistence and platform paths
 
@@ -404,12 +416,13 @@ panics on a pooled connection whose schema is older. The principal tables are:
 | `audit_log` | action, optional key id, details, timestamp; retained to 10,000 rows |
 | `categories` | recursive key/server category tree with `scope` and `sort_index` |
 | `key_categories` | many-to-many key/category links |
-| `servers` | host/auth metadata, sealed optional password, category and Bitwarden metadata |
+| `servers` | host/auth metadata, sealed optional password, category and Bitwarden metadata; nullable `origin_kind`, `origin_cluster_id`, `origin_cluster_name`, `origin_vmid`, `origin_node`, `origin_guest_kind` (where it lives in PMXSpan; written only by `set_server_origin` and the backup restore, in backups, not synced) |
 | `known_hosts` | `host:port` pin, key blob, fingerprint (`SHA256:` form), first-seen time, source |
 | `bitwarden_config` | sync configuration as key/value rows; stored password is sealed; the `confirmed_destination` row holds the server and account the user allowed (a JSON array of the server URL and the trimmed, lower-cased email; empty or missing means none) |
 | `assistant_config` | provider/model configuration; API key is sealed |
 | `mcp_servers` | one JSON record per server, sealed auth secret, tool definitions/pins, confirmation state |
 | `transfer_queue` | persistent queue jobs, state/progress, source/target server ids |
+| `proposed_host_keys` | host keys PMXSpan proposed per `host:port` (key, rotation time, source); deleted once the host's pin is settled; machine-local, not in backups |
 | `sync_category_marks` | per-row marks (kind, id, changed_at) of a category change waiting for the next Bitwarden sync; machine-local, not in backups |
 
 The database file is not wholly encrypted. Sensitive columns are sealed; public keys,
@@ -539,6 +552,48 @@ only `sshspan_*` files directly in `~/.ssh`. `ssh_config_list_hosts` is the read
 parses the user's real `~/.ssh/config` (one `Include` level, bounded globbing, `Match` blocks and
 patterns skipped) with the same keyword rules as OpenSSH, so the Servers "Config" import offers real
 hosts.
+
+### Quick connect and PMXSpan links
+
+Quick connect without the tick calls `quick_connect_open`, which runs the server dialog's checks
+and registers a `ServerRecord` named `user@host` in `EphemeralRegistry` under a random
+`quick-<32 hex>` id - never in SQLite. `resolve_for_server` (`commands/terminal.rs`) looks an id up
+in the database first (never for a `quick-` id) and in the registry otherwise, so every tab action
+that calls `terminal_connect` or `server_test` works; the record's password, when one was typed,
+is used like a saved one for its own user name only. `sftp_bookmarks_save` and an
+`sftpLocalDir:quick-...` setting are refused. `connect.quick` replaces `connect.start` in the audit
+log. The renderer calls `quick_connect_forget` when the last tab of the id closes; the vault lock
+clears the registry.
+
+A link reaches `commands::handoff::receive` from the first instance's arguments, the
+single-instance callback (a second start, registered before the deep-link plugin) or the
+deep-link plugin's `on_open_url`; a duplicate within three seconds is dropped. `receive` parses
+it (`handoff::parse_link`), keeps either the URL or the refusal message in `HandoffState` (one,
+ten minutes), audits `handoff.received`, brings the window forward and emits `handoff-received`.
+`handoff_take_pending` hands out a refusal at once, says `waiting` while the vault is locked, and
+otherwise parses the link again and returns typed data: for `connect`, the values, the proposed
+keys' fingerprints, a matching saved server (origin cluster and guest first, else
+host:port+user) and a proposal token; for `import`, it reads the bundle on the blocking pool
+(`handoff::read_bundle`), deletes the file, and returns one row per host with a token, its
+host-key status against `known_hosts` and its match, or the reason it cannot be imported.
+
+A token names a `Proposal` (host, port, user, origin, proposed keys, rotation time) for an hour or
+until the lock. `server_save` with `originToken` saves as usual, then `apply_proposal` stores the
+origin (`set_server_origin`) and, when the saved server still points at the proposal's host and
+port, its keys in `proposed_host_keys`. `quick_connect_open` with `handoffToken` keeps the keys
+with the ephemeral record instead. `verify_host_key` (`ssh_client`) takes them from the
+connection's `HostKeyPolicy`, else from `proposed_host_keys`, and applies INTEGRATION-SPEC 2.1;
+`skipProposedHostKeys` on `terminal_connect` sets them aside after a mismatch, which leads to the
+normal first-use dialog. The rotation question is a native dialog raised in the handshake like
+the trust dialog, and its time is excluded from the connect deadline.
+
+`pmxspan_manage_server` and `pmxspan_add_key` build the URL in Rust (`handoff::manage_url`,
+`handoff::add_key_url` over `keys::sanitize_public_line`) and call `launch_in`: the user path
+(`config` row `pmxspan.userPath`, set only by `pmxspan_pick_path`'s native dialog), else the
+discovered path - asked once with `ask_native_confirmation` (`QuestionKind::PmxspanLaunch`, the
+one-second rule and the 30-second wait after a "no") and remembered as `pmxspan.approvedPath`
+- else `opener::open` when a `pmxspan://` handler is registered. Each launch is audited
+(`pmxspan.launch`).
 
 ### PuTTY session import
 
@@ -888,6 +943,8 @@ refuses credentials in the base URL.
   loopback HTTP; provider HTTP is limited to local/private addresses.
 - Minisign verifies released asset bytes, not the integrity of the repository or signing workflow.
 - DevTools are not compiled into release builds.
+- `sshspan://` links and PMXSpan bundles are parsed only in `handoff/`; the renderer gets typed,
+  validated values and tokens, never a raw URL, and `pmxspan://` URLs are only built in Rust.
 
 ## Large files and deferred splits
 

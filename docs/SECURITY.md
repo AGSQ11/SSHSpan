@@ -385,7 +385,41 @@ program running as the user can write, so the listing treats every one as untrus
   (`server_save` trims only white space at either end, as for every server), and shown spelled out
   (see [Names of saved servers](#names-of-saved-servers)).
 
-### SFTP remote-side controls
+### Quick connect and PMXSpan links
+
+- **Unsaved servers stay in memory.** Quick connect without saving registers its server in the
+  backend's `EphemeralRegistry` under a random `quick-` id; nothing is written to SQLite. A
+  password typed for it is held there in `Zeroizing` memory for as long as a tab uses it and is
+  never sealed; the vault lock clears the registry before the master password, and the tab's
+  close forgets the record. Host-key pinning, the connect and sign-in deadlines, the vault gate
+  and the audit log (`connect.quick`) are the saved-server paths unchanged.
+- **Links are untrusted input, validated in Rust.** `handoff::parse_link` enforces the version
+  (`v=1`), an 8192-byte cap, strict percent-decoding (no `+` as space, no broken escapes, UTF-8
+  only), one value per field except `hostkey`, DNS-name or IP hosts, ports 1-65535, user names
+  `[A-Za-z0-9._@-]{1,64}`, names of at most 128 characters without control characters, VMIDs
+  100-999999999, host keys that parse as SSH wire-format public keys, and Unix-second rotation
+  times. The renderer receives typed values and opaque tokens only. A link received while the
+  vault is locked is held in memory (one, ten minutes) and never acted on before the unlock.
+- **Bundles are opened defensively.** Absolute path; `symlink_metadata` must show a regular file;
+  the open uses `O_NOFOLLOW | O_NONBLOCK` on Unix and the opened file must be the same inode; at
+  most 4 MiB is read; the SHA-256 from the link must match; format, version and a creation time
+  within the last hour are required. Unknown JSON members are ignored; a malformed host is a row
+  with its reason, not a refusal of the bundle.
+- **Proposed host keys never trust by themselves.** They are compared with the key the server
+  presents inside the native host-key check (`ssh_client::verify_host_key`): a match on an
+  unpinned host is pinned as `imported:pmxspan`; any other key on an unpinned host is refused with
+  both fingerprints, and the first-use dialog is only reachable by a separate reconnect with the
+  proposals set aside; a pinned host's key is replaced only after a native question that shows
+  both fingerprints and the reported rebuild time, and only when the presented key is a proposed
+  one. A backup restore never writes `imported:pmxspan`: restored pins stay `imported`.
+- **What goes to PMXSpan is public and built in Rust.** `pmxspan://guest|node` carry the stored
+  origin's ids; `pmxspan://add-key` carries `keys::sanitize_public_line` of the public key. The
+  executable path is either chosen in a native file dialog (`pmxspan_pick_path`) or discovered and
+  confirmed once in a native question with the one-second rule and the 30-second wait after a "no"
+  (`QuestionKind::PmxspanLaunch`); a changed path asks again. The program is started with the URL
+  as its only argument, with no shell.
+
+
 
 - remote names are sanitized before local use and every local path built from one is confined to
   the folder the user chose;
@@ -882,6 +916,12 @@ constants in `updater.rs`.
 
 Each is a known, deliberate state, with the reason it was left.
 
+- **A local program can send SSHSpan links.** Any program running as the user can start
+  `sshspan "sshspan://..."` or open such a link; SSHSpan cannot tell PMXSpan from another sender.
+  The consequences are bounded to a prefilled dialog: proposed host keys are verified against the
+  live key and refused when they differ, nothing is saved, connected or pinned without the user,
+  and a bundle path is opened only under the checks above. A stored proposal applies to its
+  `host:port` until the host is pinned; Settings > Known hosts does not list proposals.
 - **Renderer-attested approvals gate actions only.** A compromised renderer can claim that a
   human clicked Approve for an AI command, an MCP tool call or an update. Rust cannot observe the
   click. Destinations for secrets are therefore bound in Rust where that matters (native

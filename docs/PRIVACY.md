@@ -23,6 +23,15 @@ user can decide which features to switch on.
 | MCP server | Each user-configured MCP URL | Test connection, tool discovery, calls, and session teardown (on removal, lock, exit and a URL or credential edit) | JSON-RPC traffic, tool arguments selected by the model/user, session id, configured static authentication |
 | Terminal links | The site of a link the user confirms in the terminal | After the user answers the link question | The URL is handed to the operating system's default browser, which then contacts the site |
 
+**PMXSpan (local, no network).** "Manage in PMXSpan" and "Add to PMXSpan..." start the PMXSpan
+program on this computer (or ask the operating system to open a `pmxspan://` link when no program
+path is known) with one link as its only argument. The link carries a PMXSpan profile id and a
+guest id or node name, or a key's public `authorized_keys` line and name - never a private key, a
+password or other vault content. SSHSpan contacts no host to do this; what PMXSpan does next is
+PMXSpan's. Received `sshspan://` links and the bundle files PMXSpan writes are read locally; a
+bundle file is deleted once read. Finding PMXSpan reads the disk (and, on Linux, runs
+`xdg-mime`) only when Settings > Integrations or a PMXSpan action needs it.
+
 No other outbound destination is hard-wired in the source, apart from the base-URL presets the AI
 settings offer (OpenAI, OpenRouter, Groq, Ollama and LM Studio on `localhost`, Anthropic), which
 only fill the field: nothing is contacted until the user saves and tests the settings or sends a
@@ -177,7 +186,8 @@ separate settings file. The project manifests support Windows and Linux only.
   and MCP static auth secrets are sealed with the vault password.
 - The master password is not stored; only an Argon2id verifier is persisted.
 - Public keys, fingerprints, key names/comments, categories, server names/hosts/usernames,
-  known-host pins, settings, SFTP bookmarks, transfer queue metadata and local/remote paths,
+  known-host pins, host keys proposed by PMXSpan, where a server lives in PMXSpan (its origin), the
+  PMXSpan program path you set or approved, settings, SFTP bookmarks, transfer queue metadata and local/remote paths,
   Bitwarden non-secret configuration (including the allowed sync destination: the server URL and
   account email you allowed), the AI provider, base URL and model, MCP server URLs/tool
   definitions with their header and variable names, and audit rows are readable to anyone who can
@@ -194,7 +204,8 @@ Private-key exports and backups are refused in system folders, in the places who
 login or when a program starts, in the folder settings (`user-dirs.dirs`, `user-dirs.locale`) and
 in SSHSpan's own folders (`~/.ssh` stays allowed for them; see
 [SECURITY.md](SECURITY.md)). A backup contains sealed keys, saved-server records, MCP server
-records, known-host pins, categories, links, stored settings, and SFTP bookmarks. It excludes
+records (with their PMXSpan origin), known-host pins, categories, links, stored settings, and
+SFTP bookmarks. Host keys proposed by PMXSpan and the PMXSpan program path stay on the computer. It excludes
 Bitwarden sync configuration, the AI-provider configuration/API key, the audit log, and the
 transfer queue.
 Restored MCP servers are inert until reconfirmed. Exported/backup files are as sensitive as the

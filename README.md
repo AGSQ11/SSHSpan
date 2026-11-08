@@ -223,6 +223,21 @@ which lists every accepted risk; the status of every audit finding is in the
   "Allow" can come early.
 - **Locking.** Locking ends live sessions, so a long unattended job is still cut at the idle
   timeout.
+- **PMXSpan links: registration and discovery.** On Linux the registration writes a desktop entry
+  under `~/.local/share/applications` and asks `xdg-mime` to make it the `sshspan` handler; on
+  Windows it writes `HKCU\Software\Classes\sshspan`. An AppImage or a moved binary registers the
+  path it runs from, so a stale entry can point at an old copy until SSHSpan runs again; a failure
+  is logged, not shown, and links still arrive when PMXSpan starts SSHSpan directly. On macOS the
+  scheme comes from the app bundle only, and whether `pmxspan://` has a handler cannot be checked,
+  so PMXSpan is found by path there. Discovery reads the disk (and runs `xdg-mime` on Linux) only
+  when Settings > Integrations or a PMXSpan action needs it.
+- **PMXSpan: what is attested by whom.** A `connect` link or bundle comes from whatever program
+  started SSHSpan with it; SSHSpan validates its form but cannot tell PMXSpan from another local
+  program. That is why a received host key is only ever a proposal checked against the live key,
+  why a key that differs is refused rather than trusted, and why nothing is saved without the
+  dialog. A proposal stored by an import applies to its `host:port` until that host is pinned;
+  proposals are machine-local and not in backups. An origin (`origin_*` columns) is stored as
+  PMXSpan named it, is in backups, and is not synced to Bitwarden.
 - **What the tests do not exercise.** The renderer suites run in headless Chromium against stubbed
   IPC. Native dialogs, the tray, WebView2 and WebKitGTK rendering, screen readers, and real SSH,
   SFTP, Bitwarden and MCP servers were not exercised. The Rust library and integration tests have
@@ -332,6 +347,19 @@ two shots no longer match a view you can navigate to.
   the password again (the dialog says so at once and Save stops at the password field until you
   type it or remove the saved one; a key sign-in never asks), the backend refuses an edit that
   skips it, and connecting as another user does not use the saved password.
+- **Quick connect** - the Quick button beside New, the command palette and `Ctrl+Shift+N` open a
+  dialog for a host you have not saved: host, port, user name and the server dialog's sign-in
+  choices (vault key, key file, password, keyboard-interactive) with the same key-file rules.
+  Unticked, "Save for future reconnects" connects without writing anything to the vault: the
+  server lives in the backend's memory for as long as a tab uses it (Reconnect, Restart, New
+  session, Files and Split all work), a password typed in the dialog is kept there for that tab
+  only - never sealed or stored - and it is forgotten when its last tab closes or the vault
+  locks. The tab is titled `user@host`, and its menu offers "Save this server..." (the server
+  dialog, prefilled; the tab then belongs to the saved server). Ticked, a name and a category
+  appear and the server is saved through the server dialog's own save - every check and warning
+  applies - and then connected. The dialog remembers the tick. Host-key pinning, the connect and
+  sign-in time limits, the vault gate and the audit log (`connect.quick`) apply as for a saved
+  server; an unsaved server keeps no SFTP bookmarks and no remembered local folder.
 - **Config import** reads your own `~/.ssh/config` (read-only, one level of `Include`, patterns
   and `Match` blocks skipped) and names the file it read; the host you pick prefills the server
   form, and that form's Save saves it.
@@ -395,6 +423,60 @@ two shots no longer match a view you can navigate to.
   one-time notice); without a tray it quits. Locking or quitting from the window with live
   sessions or transfers asks first (the tray's Lock and Quit and the idle lock do not; the idle
   lock warns 60 seconds ahead), and every exit runs the same teardown as a lock.
+
+### PMXSpan integration (optional)
+[PMXSpan](https://github.com/AGSQ11/PMXSpan), the Proxmox VE desktop manager, and SSHSpan can
+hand each other hosts and public keys. Each works fully without the other: nothing at startup or
+in a connection looks for PMXSpan, and its actions are shown disabled with "PMXSpan was not found
+on this computer. Install it or set its path in Settings." when it cannot be found. The shared
+contract is `INTEGRATION-SPEC.md` (v1).
+
+- **What crosses, and what never does.** Host names and addresses, ports, user names, guest ids,
+  node and cluster names, host public keys and public keys. Never a password, a private key, an
+  API token or anything else from the vault. Nothing received connects, saves or trusts anything:
+  it lands in a dialog you confirm.
+- **From PMXSpan: one host** (`sshspan://connect`). Opens Quick connect prefilled. If a saved
+  server already is that host (same PMXSpan cluster and guest, else the same host, port and user)
+  the dialog says so and "Open saved server <name>" is its first button. Saved from there, the
+  server remembers where it lives in PMXSpan.
+- **From PMXSpan: many hosts** (`sshspan://import`). PMXSpan writes a bundle file to its private
+  folder and SSHSpan reads it only when the path is absolute, the file is a regular file and not a
+  symbolic link, at most 4 MiB, its SHA-256 matches the link, its format and version are known and
+  it is less than an hour old; a refusal names the check. The file is deleted once read. The
+  "Import from PMXSpan" dialog lists one row per host with a checkbox, user, host and port, the
+  guest, an editable target category (PMXSpan's suggestion, created on import), the host-key
+  status (`new`, `rotated: old -> new`, `unchanged`, `none`, or a conflict with the pinned key) and
+  "Already in SSHSpan" (those rows start unticked); rows that cannot be imported say why. "Sign in
+  with" picks a vault key or a password asked at connect for the imported servers. Import saves
+  the ticked rows one at a time with the server dialog's save.
+- **Host keys from PMXSpan are proposals, never pins.** At connect: an unpinned host whose key
+  equals one PMXSpan reported is pinned without a dialog (marked `imported:pmxspan`, "Host key
+  verified against PMXSpan"); an unpinned host presenting another key is refused with both
+  fingerprints, and "Check this key" offers the usual first-use dialog as a second step; a pinned
+  host whose key changed is offered a replacement only when PMXSpan reports a rebuild and the new
+  key is the one it read - the native dialog shows both fingerprints and the time; otherwise the
+  changed-key refusal applies as always.
+- **To PMXSpan.** Servers that came from PMXSpan carry a small PMXSpan badge, the server dialog
+  says "Managed in PMXSpan: <cluster> / <guest or node>", and their menu has "Manage in PMXSpan"
+  (opens the guest or node page). A key's menu and detail pane have "Add to PMXSpan...", which
+  offers the key's public `authorized_keys` line and name. The `pmxspan://` links are built in
+  the backend; the page only names the server or the key.
+- **Finding PMXSpan** (Settings > Integrations). A path chosen there (in a system file dialog;
+  absolute, a regular file, `.exe` on Windows) always wins. Otherwise SSHSpan looks in the
+  Windows Uninstall entries named PMXSpan, `%ProgramFiles%\PMXSpan\pmxspan.exe` and `PATH` on
+  Windows; `PATH`, `/usr/bin`, `/usr/local/bin`, `~/.local/bin`, `/opt/PMXSpan/pmxspan`,
+  `~/Applications/PMXSpan*.AppImage` and `/Applications/PMXSpan.app/Contents/MacOS/pmxspan`
+  elsewhere. The first time it starts a PMXSpan it found by itself, a system dialog asks you to
+  confirm the exact path (an answer in the first second does not count); the answer is
+  remembered, and a changed path asks again. Without an executable, a registered `pmxspan://`
+  handler is used. PMXSpan is started locally with the link as its only argument - nothing goes
+  over the network.
+- **Links into SSHSpan.** SSHSpan registers `sshspan://` on Linux and Windows at startup while
+  "Register sshspan:// links on this computer" is on (default); links also work when PMXSpan
+  starts `sshspan "sshspan://..."` directly, and a running SSHSpan takes them over from a second
+  start. Every link is checked in the backend (version 1 only, 8192 bytes at most, every value's
+  rules); a refused one is a toast saying why. While the vault is locked, the last link waits in
+  memory for ten minutes and opens after the unlock.
 
 ### AI assistant (optional, off by default)
 An OpenAI-compatible or Anthropic-compatible chat panel docked beside the terminal

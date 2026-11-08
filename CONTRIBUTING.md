@@ -198,6 +198,12 @@ and say so; `test:assistant` refuses to run.
   ("Not confirmed", "Allow syncing...", where the focus goes) and the backend's Bitwarden texts
   shown spelled out, the Upload picker, and a scan that checks shown text uses " - ", never an em
   dash.
+- `npm run test:quick` (`check-quickconnect-ui.js`): Quick connect unsaved (the ephemeral id, the
+  `user@host` tab, "Save this server..." rebinding, forgetting on close) and saved through
+  `server_save`, the remembered tick, `sshspan://connect` offers ("Open saved server" first,
+  refused and waiting links), the explicit second step after "PMXSpan reported a different host
+  key", the "Import from PMXSpan" dialog, and "Manage in PMXSpan" / "Add to PMXSpan..." disabled
+  with the hint or sent with ids only.
 
 These are not WebView2 or WebKitGTK tests, do not exercise native dialogs, the tray or a screen
 reader, and use fake files and SSH/SFTP responses. State that distinction in reports. Test
