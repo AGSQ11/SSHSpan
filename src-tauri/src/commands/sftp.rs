@@ -142,6 +142,28 @@ fn folder_settings_locations(config: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where the desktop's opener (xdg-open, gio, kde-open) looks up which
+/// program handles a file type or a URL scheme: the desktop entries in the XDG
+/// data folders (`applications`: also `mimeapps.list`, `defaults.list`,
+/// `mimeinfo.cache` and SSHSpan's own `sshspan://` handler entry) and the
+/// `mimeapps.list` files in the XDG config folders. A file written there
+/// decides what SSHSpan's own opener calls start.
+const DATA_HANDLER_DIRS: [&str; 1] = ["applications"];
+
+/// The handler-association locations in the XDG config folders `config` and
+/// data folders `data` ([`DATA_HANDLER_DIRS`]). Pure so the layout can be
+/// unit-tested anywhere.
+fn handler_settings_locations(config: &[PathBuf], data: &[PathBuf]) -> Vec<PathBuf> {
+    config
+        .iter()
+        .map(|c| c.join("mimeapps.list"))
+        .chain(
+            data.iter()
+                .flat_map(|d| DATA_HANDLER_DIRS.iter().map(move |rel| join_parts(d, rel))),
+        )
+        .collect()
+}
+
 /// The user's own command folders, which are (or are typically) on the PATH:
 /// a program planted there runs in place of the one the user meant.
 const HOME_PATH_DIRS: [&str; 2] = [".local/bin", "bin"];
@@ -427,6 +449,11 @@ struct Locations {
     program_files: Vec<PathBuf>,
     /// The XDG user-dirs settings ([`folder_settings_locations`]).
     folder_settings: Vec<PathBuf>,
+    /// Where the desktop looks up the program for a file type or URL scheme
+    /// ([`handler_settings_locations`]).
+    handler_settings: Vec<PathBuf>,
+    /// The XDG config folders, where `<desktop>-mimeapps.list` is read too.
+    config_dirs: Vec<PathBuf>,
     /// SSHSpan's program: the install folder (or the executable), the `.app`
     /// bundle, the running AppImage ([`app_program_locations`]).
     app_program: Vec<PathBuf>,
@@ -452,8 +479,14 @@ impl Locations {
         let path: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|p| std::env::split_paths(&p).collect())
             .unwrap_or_default();
-        let (mut startup_dirs, mut shell_startup, mut program_files, folder_settings) = match &home
-        {
+        let (
+            mut startup_dirs,
+            mut shell_startup,
+            mut program_files,
+            folder_settings,
+            handler_settings,
+            config_dirs,
+        ) = match &home {
             Some(home) => {
                 let config = distinct([Some(home.join(".config")), env_dir("XDG_CONFIG_HOME")]);
                 let data = distinct([
@@ -466,9 +499,11 @@ impl Locations {
                     shell,
                     home_program_locations(home, &config, &path),
                     folder_settings_locations(&config),
+                    handler_settings_locations(&config, &data),
+                    config,
                 )
             }
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            None => Default::default(),
         };
         if cfg!(windows) {
             startup_dirs.extend(windows_startup_dirs(
@@ -532,6 +567,8 @@ impl Locations {
             shell_startup,
             program_files,
             folder_settings,
+            handler_settings,
+            config_dirs,
             app_program: program.files,
             app_program_dll_dirs: program.dll_dirs,
             app_data: app_data_locations(&own, &bases, home.as_deref()),
@@ -552,6 +589,8 @@ impl Locations {
             shell_startup: all(self.shell_startup),
             program_files: all(self.program_files),
             folder_settings: all(self.folder_settings),
+            handler_settings: all(self.handler_settings),
+            config_dirs: all(self.config_dirs),
             app_program: all(self.app_program),
             app_program_dll_dirs: all(self.app_program_dll_dirs),
             app_data: all(self.app_data),
@@ -638,6 +677,10 @@ pub(crate) struct SensitiveLocations {
     shell_startup: Vec<Protected>,
     program_files: Vec<Protected>,
     folder_settings: Vec<Protected>,
+    /// The handler associations ([`handler_settings_locations`]).
+    handler_settings: Vec<Protected>,
+    /// The XDG config folders: `<desktop>-mimeapps.list` directly in one.
+    config_dirs: Vec<Protected>,
     /// SSHSpan's program: refused for writes and deletes - a dialog-approved
     /// write included; reading stays allowed.
     app_program: Vec<Protected>,
@@ -757,12 +800,26 @@ impl SensitiveLocations {
         if any(&self.folder_settings) {
             return Some(WriteHit::FolderSettings);
         }
+        if any(&self.handler_settings) || self.is_desktop_mimeapps(path) {
+            return Some(WriteHit::HandlerSettings);
+        }
         // A DLL beside the executable, a replaced AppImage or a file in the
         // webview's profile loads or runs at SSHSpan's next start.
         if self.holds_program(path) || any(&self.app_data) {
             return Some(WriteHit::AppFiles);
         }
         None
+    }
+
+    /// Whether `path` is a `<desktop>-mimeapps.list` directly in an XDG config
+    /// folder (`gnome-mimeapps.list`, `kde-mimeapps.list`, ...).
+    fn is_desktop_mimeapps(&self, path: &std::path::Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_ascii_lowercase().ends_with("-mimeapps.list"))
+            && path
+                .parent()
+                .is_some_and(|dir| self.config_dirs.iter().any(|c| c.is(dir)))
     }
 
     /// Whether `path` is SSHSpan's program: in the install folder, the
@@ -853,6 +910,9 @@ impl SensitiveLocations {
         if self.folder_settings.iter().any(holds) {
             return Some("your folder settings (user-dirs.dirs)");
         }
+        if self.handler_settings.iter().any(holds) {
+            return Some("your file-type and link handler settings (mimeapps.list, applications)");
+        }
         if self.app_program.iter().any(holds) || self.app_data.iter().any(holds) {
             return Some("SSHSpan's own program or data files");
         }
@@ -878,6 +938,9 @@ const PROGRAM_SETTINGS_REFUSAL: &str = "Your folders on the PATH and settings th
 /// What a write to the XDG user-dirs settings is refused with.
 const FOLDER_SETTINGS_REFUSAL: &str = "Your folder settings (user-dirs.dirs, user-dirs.locale) are off-limits for SFTP downloads and local changes.";
 
+/// What a write to the file-type and link handler settings is refused with.
+const HANDLER_SETTINGS_REFUSAL: &str = "Your file-type and link handler settings (mimeapps.list and the applications folder) are off-limits for SFTP downloads and local changes.";
+
 /// What a text export into SSHSpan's data folder (the vault) is refused
 /// with. (`validate_export_path` refuses it first, in words of its own.)
 const EXPORT_VAULT_REFUSAL: &str =
@@ -897,6 +960,9 @@ const EXPORT_PROGRAM_SETTINGS_REFUSAL: &str = "Your folders on the PATH and sett
 
 /// What a text export to the XDG user-dirs settings is refused with.
 const EXPORT_FOLDER_SETTINGS_REFUSAL: &str = "Your folder settings (user-dirs.dirs, user-dirs.locale) are off-limits for exports - choose another file.";
+
+/// What a text export to the handler settings is refused with.
+const EXPORT_HANDLER_SETTINGS_REFUSAL: &str = "Your file-type and link handler settings (mimeapps.list and the applications folder) are off-limits for exports - choose another file.";
 
 /// What a text export into SSHSpan's own program or data folders is refused
 /// with.
@@ -921,6 +987,8 @@ enum WriteHit {
     ProgramSettings,
     /// The XDG user-dirs settings.
     FolderSettings,
+    /// The file-type and link handler associations.
+    HandlerSettings,
     /// SSHSpan's own program or data folders.
     AppFiles,
 }
@@ -936,6 +1004,7 @@ impl WriteHit {
             Self::ShellStartup => SHELL_STARTUP_REFUSAL,
             Self::ProgramSettings => PROGRAM_SETTINGS_REFUSAL,
             Self::FolderSettings => FOLDER_SETTINGS_REFUSAL,
+            Self::HandlerSettings => HANDLER_SETTINGS_REFUSAL,
             Self::AppFiles => APP_FILES_REFUSAL,
         }
     }
@@ -950,6 +1019,7 @@ impl WriteHit {
             Self::ShellStartup => EXPORT_SHELL_STARTUP_REFUSAL,
             Self::ProgramSettings => EXPORT_PROGRAM_SETTINGS_REFUSAL,
             Self::FolderSettings => EXPORT_FOLDER_SETTINGS_REFUSAL,
+            Self::HandlerSettings => EXPORT_HANDLER_SETTINGS_REFUSAL,
             Self::AppFiles => EXPORT_APP_FILES_REFUSAL,
         }
     }
@@ -10089,6 +10159,8 @@ mod tests {
             shell_startup: vec![base.join("home/.bashrc")],
             program_files: vec![base.join("home/.gitconfig")],
             folder_settings: folder_settings_locations(&[join_parts(base, "home/.config")]),
+            handler_settings: Vec::new(),
+            config_dirs: Vec::new(),
             app_program: vec![
                 base.join("opt/SSHSpan"),
                 base.join("home/Apps/SSHSpan.AppImage"),
@@ -11939,6 +12011,90 @@ mod tests {
                 validate_sftp_local_path(&at(rel), LocalAccess::Write).is_ok(),
                 "{rel} stays writable"
             );
+        }
+    }
+
+    /// The files that decide which program the desktop's opener starts - the
+    /// desktop entries in the XDG data folders and the mimeapps lists in the
+    /// XDG config folders, including the ones an `XDG_*_HOME` moves - are
+    /// refused for writes, picked in the dialog or typed, and for exports,
+    /// and a folder holding them cannot be deleted. Reading stays allowed.
+    #[cfg(unix)]
+    #[test]
+    fn sec_xdg_handler_association_files_are_refused_for_writes() {
+        let base = std::path::PathBuf::from("/fixture");
+        let home = base.join("home");
+        let config = [home.join(".config"), PathBuf::from("/x/cfg")];
+        let data = [join_parts(&home, ".local/share"), PathBuf::from("/x/data")];
+        let s = Locations {
+            handler_settings: handler_settings_locations(&config, &data),
+            config_dirs: config.to_vec(),
+            ..fixture_locations(&base)
+        }
+        .resolve();
+        let refused = [
+            join_parts(&home, ".local/share/applications/evil.desktop"),
+            join_parts(&home, ".local/share/applications/mimeinfo.cache"),
+            join_parts(&home, ".local/share/applications/sshspan-handler.desktop"),
+            join_parts(&home, ".config/mimeapps.list"),
+            join_parts(&home, ".config/gnome-mimeapps.list"),
+            join_parts(&home, ".config/KDE-mimeapps.list"),
+            PathBuf::from("/x/cfg/mimeapps.list"),
+            PathBuf::from("/x/cfg/sway-mimeapps.list"),
+            PathBuf::from("/x/data/applications/evil.desktop"),
+        ];
+        for p in &refused {
+            for access in [LocalAccess::Write, LocalAccess::DialogWrite] {
+                assert_eq!(
+                    s.path_refusal(p, p, access),
+                    Some(HANDLER_SETTINGS_REFUSAL),
+                    "{}",
+                    p.display()
+                );
+            }
+            assert_eq!(
+                export_refusal(p, &s, false),
+                Some(EXPORT_HANDLER_SETTINGS_REFUSAL),
+                "{}",
+                p.display()
+            );
+            assert_eq!(s.path_refusal(p, p, LocalAccess::Read), None, "reads stay");
+        }
+        for p in [
+            join_parts(&home, ".local/share/applicationsx/a"),
+            join_parts(&home, ".local/share/other.desktop"),
+            join_parts(&home, ".config/mimeapps.list.d/a"),
+            join_parts(&home, ".config/sub/gnome-mimeapps.list"),
+            join_parts(&home, ".config/notes.txt"),
+        ] {
+            assert_eq!(
+                s.path_refusal(&p, &p, LocalAccess::Write),
+                None,
+                "{} stays writable",
+                p.display()
+            );
+        }
+        assert!(s
+            .held_by(&join_parts(&home, ".local/share/applications"))
+            .is_some());
+    }
+
+    /// This machine's handler files are on the write deny-list.
+    #[test]
+    fn sec_this_machines_handler_files_are_refused_for_writes() {
+        let Some(home) = dirs::home_dir() else { return };
+        for rel in [
+            ".local/share/applications/evil.desktop",
+            ".config/mimeapps.list",
+            ".config/gnome-mimeapps.list",
+        ] {
+            let p = join_parts(&home, rel).display().to_string();
+            assert_eq!(
+                validate_sftp_local_path(&p, LocalAccess::Write).map_err(|e| e.0),
+                Err(HANDLER_SETTINGS_REFUSAL.to_string()),
+                "{p}"
+            );
+            assert!(validate_sftp_local_path(&p, LocalAccess::Read).is_ok());
         }
     }
 

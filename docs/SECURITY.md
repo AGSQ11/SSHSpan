@@ -478,7 +478,9 @@ a dialog pick exempts nothing from the list. The text exports also need the pick
 a "Download as..." target without one is accepted under the same list.
 `~/.config/user-dirs.dirs` and `user-dirs.locale` are on the deny-list too, for typed and picked
 paths alike: a download over `user-dirs.dirs` could point the Downloads folder, where every save
-dialog opens, at a folder of the attacker's choosing. The private-key export and the vault backup,
+dialog opens, at a folder of the attacker's choosing. So are the file-type handler files the opener
+reads (`applications` in the XDG data folders, `mimeapps.list` and `*-mimeapps.list` in the XDG
+config folders). The private-key export and the vault backup,
 which Rust writes to a path picked in its own save dialog, are checked against the same list too,
 in the words of an export, with one exception: `~/.ssh` stays allowed for them, because exporting
 a private key to `~/.ssh/id_...` is an ordinary thing to do (the text exports still refuse it).
