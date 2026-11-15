@@ -948,8 +948,15 @@ const OWN_SECRET_EXPORTS_MAX: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnSecretExport {
     path: PathBuf,
-    identity: Option<(u64, u64)>,
+    identity: Option<FileIdentity>,
 }
+
+/// (device, inode, length, modified seconds, modified nanoseconds). The
+/// length and time are what stop a *reused* inode - the number a deleted
+/// export leaves behind - from claiming an unrelated file as the export,
+/// while a rename or a hard link of the export (same file, same bytes, same
+/// time) still matches.
+type FileIdentity = (u64, u64, u64, i64, i64);
 
 /// The private-key exports and vault backups SSHSpan wrote. They hold plaintext
 /// private keys or the sealed vault, so - like `~/.ssh` and the vault
@@ -960,11 +967,13 @@ struct OwnSecretExport {
 static OWN_SECRET_EXPORTS: std::sync::Mutex<Vec<OwnSecretExport>> =
     std::sync::Mutex::new(Vec::new());
 
-fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
     }
     #[cfg(not(unix))]
     {
@@ -13584,6 +13593,51 @@ mod tests {
         }
         assert_eq!(readable(&other), Ok(()), "other files are unaffected");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deleted export leaves its inode number behind, and the filesystem
+    /// may hand that number to the next file created. An unrelated file that
+    /// shares only the (device, inode) of a remembered export is not the
+    /// export; the same file under another name still is.
+    #[cfg(unix)]
+    #[test]
+    fn sec_a_reused_inode_does_not_make_an_unrelated_file_an_own_export() {
+        let dir = std::env::temp_dir().join(format!("sshspan-ino-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("unrelated.txt");
+        std::fs::write(&file, b"an ordinary file").unwrap();
+        let (dev, ino, len, sec, nsec) = file_identity(&file).unwrap();
+
+        // What a deleted export would have left: same device and inode, but a
+        // different length (and time).
+        let stale = dir.join("deleted-export.json");
+        let mut list = OWN_SECRET_EXPORTS.lock().unwrap();
+        list.push(OwnSecretExport {
+            path: stale.clone(),
+            identity: Some((dev, ino, len + 7, sec - 3, nsec)),
+        });
+        drop(list);
+        assert!(
+            !is_own_secret_export(&file),
+            "a shared inode number alone is not the export"
+        );
+
+        // The real thing: the same file (same bytes and time) is the export,
+        // whatever it is now called.
+        let mut list = OWN_SECRET_EXPORTS.lock().unwrap();
+        list.retain(|e| e.path != stale);
+        list.push(OwnSecretExport {
+            path: stale.clone(),
+            identity: Some((dev, ino, len, sec, nsec)),
+        });
+        drop(list);
+        assert!(is_own_secret_export(&file), "the export under another name");
+
+        OWN_SECRET_EXPORTS
+            .lock()
+            .unwrap()
+            .retain(|e| e.path != stale);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── SFTP errors say what failed, once ───────────────────────────────
