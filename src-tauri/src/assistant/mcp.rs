@@ -3208,7 +3208,7 @@ fn pending_binding(record: &crate::db::McpServerRecord) -> PendingBinding {
     let host = url::Url::parse(&record.url)
         .map(|u| crate::commands::host_label(&u))
         .unwrap_or_else(|_| record.url.clone());
-    let host = quote(&host, 120);
+    let host = crate::commands::dialog_host(&host, 120);
     let header = match (
         record.auth_type.as_str(),
         record.auth_header_name.as_deref(),
@@ -3235,7 +3235,7 @@ fn pending_binding(record: &crate::db::McpServerRecord) -> PendingBinding {
             message: format!(
                 "SSHSpan will send {what} to {host} as {header}. Allow?\n\n\
                  MCP server: {name}\nAddress: {}",
-                quote(&record.url, 200)
+                crate::commands::dialog_address(&record.url, 200)
             ),
         },
         detail: format!("server={name} host={host} sends={sends}"),

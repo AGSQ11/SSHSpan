@@ -1344,6 +1344,44 @@ pub(crate) fn dialog_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// A host name as a credential question quotes it: cleaned like
+/// [`dialog_text`], and when longer than `max_chars` cut at the START. The
+/// end of a host name (its registrable domain) says who receives the
+/// credential, so that end is never the part that is dropped.
+pub(crate) fn dialog_host(host: &str, max_chars: usize) -> String {
+    let clean = dialog_text(host, usize::MAX);
+    let count = clean.chars().count();
+    if count <= max_chars {
+        return clean;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = clean.chars().skip(count - keep).collect();
+    format!("\u{2026}{}", tail.trim_start())
+}
+
+/// An address as a credential question quotes it: the origin (scheme, host,
+/// port) whole, then the rest of the address capped at `max_rest_chars`.
+/// Text that is not an address is cut from the start like a host.
+pub(crate) fn dialog_address(address: &str, max_rest_chars: usize) -> String {
+    match url::Url::parse(address) {
+        Ok(url) if url.has_host() => {
+            let origin = url.origin().ascii_serialization();
+            let mut rest = &url[url::Position::BeforePath..];
+            // The parser adds the "/" of an empty path; the text was typed
+            // without it.
+            if rest == "/" && !address.trim_end().ends_with('/') {
+                rest = "";
+            }
+            format!(
+                "{}{}",
+                dialog_text(&origin, usize::MAX),
+                dialog_text(rest, max_rest_chars)
+            )
+        }
+        _ => dialog_host(address, max_rest_chars),
+    }
+}
+
 /// The last guard before a message reaches the OS dialog: line breaks stay
 /// (the message's own paragraphs), other whitespace becomes a space, and
 /// every other control, format or text-direction character goes. A NUL cut
@@ -8517,6 +8555,29 @@ mod rw_tests {
         let cut = dialog_text(&"a".repeat(100), 10);
         assert_eq!(cut.chars().count(), 10);
         assert!(cut.ends_with('\u{2026}'), "{cut}");
+    }
+
+    /// A credential question cuts a long host at its start, never at the
+    /// registrable domain that names the recipient.
+    #[test]
+    fn dialog_host_and_address_keep_the_right_end_of_a_long_host() {
+        let host = format!(
+            "api.openai.com.{}.{}.attacker.example",
+            "a".repeat(60),
+            "b".repeat(40)
+        );
+        let quoted = dialog_host(&host, 60);
+        assert_eq!(quoted.chars().count(), 60);
+        assert!(quoted.starts_with('\u{2026}'), "{quoted}");
+        assert!(quoted.ends_with("attacker.example"), "{quoted}");
+        assert_eq!(dialog_host("example.com", 60), "example.com");
+        let address = dialog_address(&format!("https://{host}:8443/v1/{}", "p".repeat(300)), 20);
+        assert!(
+            address.starts_with(&format!("https://{host}:8443/v1/")),
+            "{address}"
+        );
+        assert!(address.ends_with('\u{2026}'), "{address}");
+        assert_eq!(dialog_address("not a url", 40), "not a url");
     }
 
     /// The last guard before the OS dialog: the message's own line breaks
