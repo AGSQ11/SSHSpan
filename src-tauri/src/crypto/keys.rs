@@ -401,6 +401,23 @@ pub fn import_openssh_private(
     ))
 }
 
+/// What a stored private half (`PrivateKey::to_bytes()`, as the vault keeps
+/// it) says its key is: the key type and the SSH wire-format public key
+/// derived from it. Everything that names a key - its type, its
+/// `authorized_keys` line and its fingerprints - can be recomputed from this
+/// instead of being taken from a text that sits beside it.
+pub fn identity_of_private(private_bytes: &[u8]) -> anyhow::Result<(KeyType, Vec<u8>)> {
+    let key = PrivateKey::from_bytes(private_bytes)
+        .map_err(|e| anyhow::anyhow!("Invalid stored private key: {e}"))?;
+    let key_type = KeyType::from_ssh_key_algorithm(&key.algorithm())?;
+    let public = key
+        .public_key()
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .to_vec();
+    Ok((key_type, public))
+}
+
 /// Compute SSH fingerprint (SHA-256) - matches `ssh-keygen -lf` exactly.
 pub fn compute_fingerprint_sha256(public_key: &[u8]) -> String {
     ssh_fingerprint_sha256(public_key)

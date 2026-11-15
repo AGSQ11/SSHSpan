@@ -2288,15 +2288,21 @@ mod tests {
         (root, target)
     }
 
-    /// A real Ed25519 key sealed with [`PW`], stored under `name`.
-    fn insert_real_key(db: &db::Database, id: &str, name: &str) {
+    /// A real Ed25519 key sealed with `pw`, named `name`.
+    fn real_key_record(id: &str, name: &str, pw: &str) -> KeyRecord {
         let data = keys::generate_key_pair(KeyType::Ed25519, None, format!("{name}@test")).unwrap();
-        let mut record = sample_key(id, PW);
+        let mut record = sample_key(id, pw);
         record.name = name.into();
         record.public_key = keys::export_public_key(&data, KeyFormat::OpenSsh).unwrap();
-        record.private_key_encrypted = crate::crypto::vault::seal(PW, &data.private_key).unwrap();
+        record.private_key_encrypted = crate::crypto::vault::seal(pw, &data.private_key).unwrap();
         record.fingerprint_sha256 = keys::compute_fingerprint_sha256(&data.public_key);
-        db.insert_key(&record).unwrap();
+        record.fingerprint_md5 = keys::compute_fingerprint_md5(&data.public_key);
+        record
+    }
+
+    /// A real Ed25519 key sealed with [`PW`], stored under `name`.
+    fn insert_real_key(db: &db::Database, id: &str, name: &str) {
+        db.insert_key(&real_key_record(id, name, PW)).unwrap();
     }
 
     fn host_fields() -> crate::ssh::DeployHostFields {
@@ -3127,7 +3133,8 @@ mod tests {
     fn backup_exported_to_a_file_restores_from_that_file() {
         let pw = "file-round-trip-pw";
         let src = test_db();
-        src.insert_key(&sample_key("k1", pw)).unwrap();
+        src.insert_key(&real_key_record("k1", "key-k1", pw))
+            .unwrap();
         let dir = scratch_dir("backup-file");
         let path = dir.join("vault.json");
         let path_str = path.display().to_string();
@@ -3162,11 +3169,97 @@ mod tests {
         assert!(dst.get_key("k1").unwrap().is_some());
     }
 
+    /// A backup of `keys` (sealed under `pw`), with `tamper` applied to the
+    /// payload before it is sealed - what a backup's author controls.
+    fn backup_of(
+        keys: &[KeyRecord],
+        pw: &str,
+        tamper: impl FnOnce(&mut serde_json::Value),
+    ) -> serde_json::Value {
+        let src = test_db();
+        for k in keys {
+            src.insert_key(k).unwrap();
+        }
+        let built = build_backup_document(&src, pw).unwrap().document;
+        let plain = crate::crypto::vault::unseal(pw, built["sealed"].as_str().unwrap()).unwrap();
+        let mut payload: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        tamper(&mut payload);
+        let sealed = crate::crypto::vault::seal(pw, payload.to_string().as_bytes()).unwrap();
+        serde_json::json!({ "format": "sshspan-backup", "sealed": sealed })
+    }
+
+    fn restored_counts(outcome: CmdResult<RestoreOutcome>) -> serde_json::Value {
+        match outcome.unwrap() {
+            RestoreOutcome::Restored(r) => r["counts"].clone(),
+            other => panic!("expected a restore, got {other:?}"),
+        }
+    }
+
+    /// A restored key's identity comes from its private half. A row that
+    /// claims another key's fingerprint, or a line that is not its own, is
+    /// refused (and counted) while the others still restore; a same-id row
+    /// with another private half does not replace the stored key, and a
+    /// fingerprint another id holds is not stored twice.
+    #[test]
+    fn restore_derives_a_keys_identity_from_its_private_half() {
+        let pw = "identity-pw";
+        let (a, k, b) = (
+            real_key_record("a", "key-a", pw),
+            real_key_record("k", "key-k", pw),
+            real_key_record("b", "key-b", pw),
+        );
+        // Row a: A's private half under K's fingerprint and B's line.
+        let forged = backup_of(&[a.clone(), k.clone(), b.clone()], pw, |payload| {
+            for row in payload["keys"].as_array_mut().unwrap() {
+                if row["id"] == "a" {
+                    row["fingerprint_sha256"] = serde_json::json!(k.fingerprint_sha256);
+                    row["public_key"] = serde_json::json!(b.public_key);
+                }
+            }
+        });
+        let dst = test_db();
+        let counts = restored_counts(apply_restore(&dst, &forged, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(dst.get_key("a").unwrap().is_none(), "the forged row");
+        let stored_k = dst.get_key("k").unwrap().unwrap();
+        assert_eq!(stored_k.fingerprint_sha256, k.fingerprint_sha256);
+        assert!(dst.get_key("b").unwrap().is_some());
+
+        // The same id with another private half (claims that agree with it)
+        // is not stored over the key the vault has.
+        let swapped_in = real_key_record("k", "key-k", pw);
+        let swap = backup_of(std::slice::from_ref(&swapped_in), pw, |_| {});
+        let counts = restored_counts(apply_restore(&dst, &swap, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert_eq!(
+            dst.get_key("k").unwrap().unwrap().fingerprint_sha256,
+            k.fingerprint_sha256,
+            "k keeps its identity"
+        );
+
+        // A fingerprint another id holds: key b's private half under a new id.
+        let mut copy = b.clone();
+        copy.id = "z".into();
+        copy.name = "key-z".into();
+        let dup = backup_of(&[copy], pw, |_| {});
+        let counts = restored_counts(apply_restore(&dst, &dup, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(dst.get_key("z").unwrap().is_none());
+
+        // An honest restore of one's own keys is unaffected.
+        let own = backup_of(&[a, k, b], pw, |_| {});
+        let fresh = test_db();
+        let counts = restored_counts(apply_restore(&fresh, &own, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 0, "{counts}");
+        assert_eq!(counts["keys"], 3);
+    }
+
     #[test]
     fn backup_file_from_another_master_password_needs_that_password() {
         let (old_pw, new_pw) = ("backup-era-pw", "current-master-pw");
         let src = test_db();
-        src.insert_key(&sample_key("k1", old_pw)).unwrap();
+        src.insert_key(&real_key_record("k1", "key-k1", old_pw))
+            .unwrap();
         let dir = scratch_dir("backup-pw");
         let path = dir.join("old.json");
         export_backup_to_path(&src, old_pw, &path.display().to_string(), &|| Ok(())).unwrap();
@@ -3682,7 +3775,8 @@ mod tests {
     fn restore_commits_nothing_when_the_vault_locked_meanwhile() {
         let pw = "restore-lock-pw";
         let src = test_db();
-        src.insert_key(&sample_key("k1", pw)).unwrap();
+        src.insert_key(&real_key_record("k1", "key-k1", pw))
+            .unwrap();
         let dir = scratch_dir("restore-locked");
         let path = dir.join("vault.json");
         export_backup_to_path(&src, pw, &path.display().to_string(), &|| Ok(())).unwrap();
@@ -4237,10 +4331,24 @@ pub fn apply_restore(
         .map(sanitize_backup_settings)
         .unwrap_or(0);
 
+    // A key's type, line and fingerprints are derived from its private half,
+    // never taken from the backup's text (see [`verify_restored_keys`]).
+    let keys_refused = verify_restored_keys(db, &mut data, pw)?;
+
     still_current()?;
     let mut counts = db.restore_backup(&data).map_err(|e| e.to_string())?;
     counts["settingsDropped"] = serde_json::json!(dropped_settings);
+    counts["keysRefused"] = serde_json::json!(keys_refused);
     let _ = db.add_audit("vault.backup_restored", None, &counts.to_string());
+    if keys_refused > 0 {
+        let _ = db.add_audit(
+            "vault.restore_keys_refused",
+            None,
+            &format!(
+                "{keys_refused} key(s) not restored: unreadable, claiming another fingerprint or line than their private key, or a fingerprint another key already holds"
+            ),
+        );
+    }
     if dropped_settings > 0 {
         let _ = db.add_audit(
             "vault.restore_settings_skipped",
@@ -4263,6 +4371,77 @@ pub fn apply_restore(
         "passwordReLinked": reused_backup_password,
         "resealFailures": reseal_failures,
     })))
+}
+
+/// Make every key row of a restore payload say what its private half says.
+/// `data["keys"]` rows with a private half are unsealed with `pw` (the
+/// current master password - the re-seal has run), and the key type, the
+/// authorized_keys line's key and both fingerprints are derived from it,
+/// as the Bitwarden pull does. A row is left out, and counted, when
+///
+/// - its private half cannot be read,
+/// - the fingerprint or the public key it claims is not the derived one,
+/// - the same id already holds another key (its private half would be
+///   swapped behind an unchanged fingerprint), or
+/// - another id - in the vault or earlier in the backup - already holds its
+///   fingerprint (the one-row-per-fingerprint rule of an import).
+///
+/// A public-only row has no private half to derive from and is kept as it is.
+/// Returns the number of rows left out.
+fn verify_restored_keys(
+    db: &db::Database,
+    data: &mut serde_json::Value,
+    pw: &str,
+) -> CmdResult<u32> {
+    let Some(rows) = data.get_mut("keys").and_then(|v| v.as_array_mut()) else {
+        return Ok(0);
+    };
+    let stored = db.list_keys().map_err(|e| e.to_string())?;
+    let mut fingerprint_owner: std::collections::HashMap<String, String> = stored
+        .iter()
+        .map(|k| (k.fingerprint_sha256.clone(), k.id.clone()))
+        .collect();
+    let mut refused = 0u32;
+    let mut kept: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    for mut row in rows.drain(..) {
+        let text = |f: &str| row.get(f).and_then(|v| v.as_str()).map(String::from);
+        let id = text("id").unwrap_or_default();
+        let blob = text("private_key_encrypted").unwrap_or_default();
+        if blob.is_empty() {
+            kept.push(row);
+            continue;
+        }
+        let derived = crate::crypto::vault::unseal(pw, &blob)
+            .map(zeroize::Zeroizing::new)
+            .map_err(|e| e.to_string())
+            .and_then(|private| keys::identity_of_private(&private).map_err(|e| e.to_string()));
+        let Ok((key_type, public)) = derived else {
+            refused += 1;
+            continue;
+        };
+        let fingerprint = keys::compute_fingerprint_sha256(&public);
+        let claims_fingerprint = text("fingerprint_sha256").is_some_and(|f| f == fingerprint);
+        let claims_public = text("public_key")
+            .and_then(|line| parse_openssh_public_line(&line).ok())
+            .is_some_and(|wire| wire == public);
+        let id_holds_other = stored
+            .iter()
+            .any(|k| k.id == id && k.fingerprint_sha256 != fingerprint);
+        let fingerprint_held_by_other = fingerprint_owner
+            .get(&fingerprint)
+            .is_some_and(|owner| *owner != id);
+        if !claims_fingerprint || !claims_public || id_holds_other || fingerprint_held_by_other {
+            refused += 1;
+            continue;
+        }
+        fingerprint_owner.insert(fingerprint.clone(), id);
+        row["key_type"] = serde_json::json!(key_type.db_tag());
+        row["fingerprint_sha256"] = serde_json::json!(fingerprint);
+        row["fingerprint_md5"] = serde_json::json!(keys::compute_fingerprint_md5(&public));
+        kept.push(row);
+    }
+    *rows = kept;
+    Ok(refused)
 }
 
 // ─── File save helpers (public-key and audit-log exports, "Download as") ───
