@@ -352,9 +352,9 @@ two shots no longer match a view you can navigate to.
   choices (vault key, key file, password, keyboard-interactive) with the same key-file rules.
   Unticked, "Save for future reconnects" connects without writing anything to the vault: the
   server lives in the backend's memory for as long as a tab uses it (Reconnect, Restart, New
-  session, Files and Split all work), a password typed in the dialog is kept there for that tab
-  only - never sealed or stored - and it is forgotten when its last tab closes or the vault
-  locks. The tab is titled `user@host`, and its menu offers "Save this server..." (the server
+  session, Files and Split all work), a password typed in the dialog is kept there for that
+  server's tabs only - never sealed or stored - and it is forgotten when its last tab closes or
+  the vault locks. The tab is titled `user@host`, and its menu offers "Save this server..." (the server
   dialog, prefilled; the tab then belongs to the saved server). Ticked, a name and a category
   appear and the server is saved through the server dialog's own save - every check and warning
   applies - and then connected. The dialog remembers the tick. Host-key pinning, the connect and
@@ -398,8 +398,10 @@ two shots no longer match a view you can navigate to.
   settings, and optional SSH keepalive.
 - **Host-key pinning** - the first connection to a host asks for explicit confirmation in a
   native backend dialog; the backend refuses unpinned hosts without it (a
-  `StrictHostKeyChecking=yes` equivalent). Pins are scoped to `host:port`, and any later
-  fingerprint change is refused and recorded in the audit log.
+  `StrictHostKeyChecking=yes` equivalent). The one exception is a key PMXSpan proposed for
+  that host beforehand: when the host presents exactly that key it is pinned without a dialog
+  (see "Host keys from PMXSpan are proposals, never pins" below). Pins are scoped to
+  `host:port`, and any later fingerprint change is refused and recorded in the audit log.
 - **Shell, Files or Split** - a session shows the terminal, the file browser, or both side
   by side; the control is labelled with the surface you are on, not the one you would
   switch to.

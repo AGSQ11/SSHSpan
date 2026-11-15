@@ -1,12 +1,13 @@
 # SSHSpan architecture
 
-**Last updated:** 2026-10-25  
+**Last updated:** 2026-11-15  
 **Status:** describes v1.10.0, the PuTTY session import, Quick connect and the PMXSpan
 integration, none of which is released yet (Unreleased in the CHANGELOG). Quick connect and the
 PMXSpan integration - their lines in the system diagram, their rows in the module table, the IPC
 count (121) and its groups, the new event, the schema rows and the "Quick connect and PMXSpan
 links" section - are described from the working tree that adds them. The import's passages - its line in the system diagram, its row in the module
-table, the IPC count (111) and the Servers group, its mention where the renderer shows
+table, the IPC count at that commit (111, before Quick connect and the PMXSpan integration
+added theirs) and the Servers group, its mention where the renderer shows
 `server_save`'s key-file warning, and the PuTTY session import section - are checked against
 committed source at `a75b533`; everything else against `6c19b1b`, and nothing else it describes
 has changed since (later changes are listed in the CHANGELOG)  

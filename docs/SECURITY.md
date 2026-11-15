@@ -428,7 +428,7 @@ program running as the user can write, so the listing treats every one as untrus
   (`QuestionKind::PmxspanLaunch`); a changed path asks again. The program is started with the URL
   as its only argument, with no shell.
 
-
+### SFTP remote-side controls
 
 - remote names are sanitized before local use and every local path built from one is confined to
   the folder the user chose;

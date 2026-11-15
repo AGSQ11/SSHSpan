@@ -203,8 +203,8 @@ the Downloads folder (the home folder when there is none).
 Private-key exports and backups are refused in system folders, in the places whose contents run at
 login or when a program starts, in the folder settings (`user-dirs.dirs`, `user-dirs.locale`) and
 in SSHSpan's own folders (`~/.ssh` stays allowed for them; see
-[SECURITY.md](SECURITY.md)). A backup contains sealed keys, saved-server records, MCP server
-records (with their PMXSpan origin), known-host pins, categories, links, stored settings, and
+[SECURITY.md](SECURITY.md)). A backup contains sealed keys, saved-server records (with their
+PMXSpan origin), MCP server records, known-host pins, categories, links, stored settings, and
 SFTP bookmarks. Host keys proposed by PMXSpan and the PMXSpan program path stay on the computer. It excludes
 Bitwarden sync configuration, the AI-provider configuration/API key, the audit log, and the
 transfer queue.
