@@ -647,7 +647,24 @@ pub fn verify_host_key(
             // First sight WITH user consent: store and record what was
             // trusted, and let the connect path surface a notice in the
             // terminal. Proposals set aside for this host are settled.
-            let _ = db.add_known_host(&host_key, presented_b64, &presented_fp);
+            // The connection goes on only if the store now pins exactly this
+            // key: another connection to the same host and port may have
+            // pinned a different one while the dialog was open.
+            match db.add_known_host(&host_key, presented_b64, &presented_fp) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = db.add_audit(
+                        "known_hosts.mismatch_rejected",
+                        None,
+                        &format!(
+                            "{} (pinned while the first-use question was open; presented {})",
+                            host_key, shown_fp
+                        ),
+                    );
+                    return Err((HostKeyRefusal::Mismatch, None));
+                }
+                Err(_) => return Err((HostKeyRefusal::StoreUnavailable, None)),
+            }
             let _ = db.delete_proposed_host_keys(&host_key);
             let _ = db.add_audit(
                 "known_hosts.trust_on_first_use",
@@ -2451,6 +2468,53 @@ mod ru4_tests {
             .get_known_host(&known_host_key("127.0.0.1", server.port))
             .unwrap()
             .is_none());
+    }
+
+    /// The first-use question can be open while another connection to the
+    /// same host and port pins another key. The accepted key is then NOT
+    /// trusted over that pin: the connection is refused as a mismatch, the
+    /// pin stays, and the rejection is audited.
+    #[test]
+    fn sec_first_use_trust_does_not_override_a_pin_made_meanwhile() {
+        use crate::handoff::tests::host_key;
+        let path = std::env::temp_dir().join(format!("sshspan-first-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(path.clone()).unwrap();
+        let host = known_host_key("10.0.2.9", 22);
+        let out = verify_host_key(
+            &db,
+            "10.0.2.9",
+            22,
+            &host_key(1),
+            &HostKeyPolicy::default(),
+            |_, _| {
+                // Another handshake pins another key while the question is open.
+                assert!(db.add_known_host(&host, &host_key(2), "fp2").unwrap());
+                true
+            },
+            |_, _, _| false,
+        );
+        assert_eq!(out.unwrap_err(), (HostKeyRefusal::Mismatch, None));
+        assert_eq!(
+            db.get_known_host(&host).unwrap().unwrap().host_key,
+            host_key(2)
+        );
+        assert!(db
+            .list_audit(20)
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "known_hosts.mismatch_rejected"));
+        // The same answer with nothing pinned meanwhile still trusts the key.
+        let out = verify_host_key(
+            &db,
+            "10.0.2.10",
+            22,
+            &host_key(3),
+            &HostKeyPolicy::default(),
+            |_, _| true,
+            |_, _, _| false,
+        );
+        assert_eq!(out.unwrap(), HostKeyVerdict::TrustedByUser);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
