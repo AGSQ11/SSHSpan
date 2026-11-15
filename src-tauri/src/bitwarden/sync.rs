@@ -1040,6 +1040,21 @@ pub async fn run_sync(
     })
 }
 
+/// A response that serves two items under one id is refused whole. Everything
+/// after is keyed by id - the list of remote changes the user approves, and
+/// the item an approved change is applied from - so with two items of one id
+/// the approval could cover one item and the apply store the other.
+fn refuse_duplicate_ids(remote: &crate::bitwarden::SyncResponse) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    match remote.ciphers.iter().find(|c| !seen.insert(c.id.as_str())) {
+        Some(dup) => anyhow::bail!(
+            "the vault served two items with the id {} - nothing was synced",
+            pending_text(&dup.id)
+        ),
+        None => Ok(()),
+    }
+}
+
 /// What every pass of one sync run shares.
 struct SyncRun<'a> {
     db: &'a Database,
@@ -1061,6 +1076,7 @@ impl SyncRun<'_> {
         servers_folder_name: &str,
         report: &mut SyncReport,
     ) -> Result<()> {
+        refuse_duplicate_ids(remote)?;
         let keys_folder = match resolve_keys_folder(
             client,
             &remote.folders,
@@ -4595,6 +4611,43 @@ mod tests {
             .await
             .unwrap();
         report.summary(None)
+    }
+
+    /// A vault that serves two items with one id could make the approval
+    /// cover one of them and the apply store the other (the apply looks the
+    /// item up by id): such a response is refused whole, before anything is
+    /// stored or created.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sec_a_response_with_two_items_of_one_id_is_refused() {
+        let db = test_db();
+        let mut client = offline_client();
+        let listed = login_item(&client, "s2", None);
+        let mut other = login_item(&client, "s2", None);
+        other.login.as_mut().unwrap().uris = Some(vec![crate::bitwarden::LoginUri {
+            uri: Some(enc(&client, "ssh://evil.example.com:22")),
+        }]);
+        let remote = crate::bitwarden::SyncResponse {
+            profile: None,
+            folders: Vec::new(),
+            ciphers: vec![listed, other],
+        };
+        let check = || -> Result<()> { Ok(()) };
+        let run = SyncRun {
+            db: &db,
+            vault_password: TEST_PW,
+            remote_changes: RemoteChanges::ApproveAll,
+            check: &check,
+        };
+        let mut report = SyncReport::default();
+        let err = run
+            .passes(&mut client, &remote, "keys", "servers", &mut report)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("two items with the id s2"),
+            "{err}"
+        );
+        assert!(db.list_servers().unwrap().is_empty());
     }
 
     /// The dry run shows one list; "Apply" re-fetches. A compromised
