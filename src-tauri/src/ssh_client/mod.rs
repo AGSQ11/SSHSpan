@@ -430,6 +430,100 @@ impl client::Handler for TerminalHandler {
             }
         }
     }
+
+    // SSHSpan asks for no port forwarding, agent forwarding, X11 or reverse
+    // session, so a channel the SERVER opens is always refused. russh's
+    // defaults accept every one of them and keep it until the server closes
+    // it: a hostile server could open channels without limit and fill the
+    // memory of the one process that holds every session and the unlocked vault.
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reject_server_channel(reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reject_server_channel(reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reject_server_channel(reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reject_server_channel(reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reject_server_channel(reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reject_server_channel(reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reject_server_channel(reply).await;
+        Ok(())
+    }
+}
+
+/// Refuse a channel the server opened ([`TerminalHandler`]).
+async fn reject_server_channel(reply: client::ChannelOpenHandle) {
+    reply
+        .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+        .await;
 }
 
 /// How a presented host key was accepted.
@@ -2086,9 +2180,16 @@ mod ru4_tests {
         accept_keys: bool,
     }
 
+    /// What the server's attempts to open a channel to the client came to:
+    /// the kind, and whether the client accepted it.
+    type ServerOpens = Arc<Mutex<Vec<(&'static str, bool)>>>;
+
     struct FixtureHandler {
         behaviour: Behaviour,
         kbd_rounds: usize,
+        /// When set, the server tries each kind of channel right after
+        /// authentication and records the outcome.
+        opens: Option<ServerOpens>,
     }
 
     fn password_prompt() -> Auth {
@@ -2149,6 +2250,50 @@ mod ru4_tests {
                 Auth::reject()
             })
         }
+
+        async fn auth_succeeded(
+            &mut self,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(opens) = self.opens.clone() {
+                let handle = session.handle();
+                tokio::spawn(async move {
+                    let record = |kind, opened: bool| opens.lock().unwrap().push((kind, opened));
+                    record("session", handle.channel_open_session().await.is_ok());
+                    record(
+                        "direct-tcpip",
+                        handle
+                            .channel_open_direct_tcpip("127.0.0.1", 9, "127.0.0.1", 1)
+                            .await
+                            .is_ok(),
+                    );
+                    record(
+                        "direct-streamlocal",
+                        handle
+                            .channel_open_direct_streamlocal("/tmp/x")
+                            .await
+                            .is_ok(),
+                    );
+                    record(
+                        "forwarded-tcpip",
+                        handle
+                            .channel_open_forwarded_tcpip("127.0.0.1", 9, "127.0.0.1", 1)
+                            .await
+                            .is_ok(),
+                    );
+                    record(
+                        "forwarded-streamlocal",
+                        handle
+                            .channel_open_forwarded_streamlocal("/tmp/x")
+                            .await
+                            .is_ok(),
+                    );
+                    record("x11", handle.channel_open_x11("127.0.0.1", 1).await.is_ok());
+                    record("agent", handle.channel_open_agent().await.is_ok());
+                });
+            }
+            Ok(())
+        }
     }
 
     struct FixtureServer {
@@ -2158,6 +2303,13 @@ mod ru4_tests {
     }
 
     async fn start_server(behaviour: Behaviour) -> FixtureServer {
+        start_server_opening(behaviour, None).await
+    }
+
+    async fn start_server_opening(
+        behaviour: Behaviour,
+        opens: Option<ServerOpens>,
+    ) -> FixtureServer {
         let key = generate_key_pair(KeyType::Ed25519, None, "ru4-fixture-host".into()).unwrap();
         let pem = export_private_key(&key, KeyFormat::OpenSsh, None).unwrap();
         let host_key = russh::keys::decode_secret_key(&pem, None).unwrap();
@@ -2180,6 +2332,7 @@ mod ru4_tests {
                 let handler = FixtureHandler {
                     behaviour,
                     kbd_rounds: 0,
+                    opens: opens.clone(),
                 };
                 tokio::spawn(async move {
                     if let Ok(running) = russh::server::run_stream(config, socket, handler).await {
@@ -2468,6 +2621,36 @@ mod ru4_tests {
             .get_known_host(&known_host_key("127.0.0.1", server.port))
             .unwrap()
             .is_none());
+    }
+
+    /// SSHSpan requests no forwarding, agent, X11 or reverse session: a
+    /// server that opens any kind of channel to the client is refused every
+    /// time, so it cannot make the client keep channels in memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sec_server_opened_channels_are_all_refused() {
+        let opens: ServerOpens = Arc::new(Mutex::new(Vec::new()));
+        let server = start_server_opening(Behaviour::default(), Some(opens.clone())).await;
+        let t = test_db();
+        let (prompt, _) = prompt(true, Duration::ZERO);
+        let session = open(&t.db, params(server.port, "password"), prompt)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while opens.lock().unwrap().len() < 7 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                opens.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let outcome = opens.lock().unwrap().clone();
+        drop(session);
+        assert_eq!(outcome.len(), 7, "{outcome:?}");
+        assert!(
+            outcome.iter().all(|(_, accepted)| !accepted),
+            "the client accepted a server-opened channel: {outcome:?}"
+        );
     }
 
     /// The first-use question can be open while another connection to the

@@ -323,7 +323,9 @@ keyed by `host:port`; a later mismatch is a hard refusal and is audited, and a c
 and a declined first-trust prompt are different errors. Fingerprints are shown as `SHA256:` base64
 without padding, the form `ssh-keygen -lf` prints. Connecting has a 20-second limit and
 authentication a 30-second limit (the time spent in the trust dialog is excluded) and a timed-out
-handshake shuts its socket down.
+handshake shuts its socket down. After an accepted first-use dialog the connection goes on only if
+the store pins exactly that key (a pin made meanwhile is a mismatch refusal). SSHSpan opens no
+forwarding, agent, X11 or reverse channels, so every channel a server opens to it is refused.
 
 A saved SSH password is unsealed only to use it, and is wiped on every return path. Editing a
 server keeps the saved password unless the user replaces or removes it. A saved password stays
