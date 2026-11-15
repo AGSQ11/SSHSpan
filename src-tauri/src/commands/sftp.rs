@@ -6083,7 +6083,20 @@ fn local_owner_bits(_md: &std::fs::Metadata) -> (Option<u32>, Option<u32>, Optio
 /// command runs on the MAIN thread, so listing a huge directory or an
 /// unresponsive network/removable drive froze the whole window.
 #[tauri::command]
-pub async fn sftp_local_list(path: String) -> CmdResult<serde_json::Value> {
+pub async fn sftp_local_list(app: AppHandle, path: String) -> CmdResult<serde_json::Value> {
+    local_list_in(app.state::<super::VaultPasswordStore>().inner(), path).await
+}
+
+/// [`sftp_local_list`] without the `AppHandle`. Like every other command that
+/// touches the local disk for the user, it needs an unlocked vault: a page
+/// must not enumerate directories on an unattended, auto-locked machine.
+async fn local_list_in(
+    vault: &super::VaultPasswordStore,
+    path: String,
+) -> CmdResult<serde_json::Value> {
+    if vault.get().unwrap_or_default().is_empty() {
+        return Err(CmdError("Vault is locked.".into()));
+    }
     tokio::task::spawn_blocking(move || local_list_blocking(path))
         .await
         .map_err(|e| CmdError(format!("Listing failed: {e}")))?
@@ -9825,7 +9838,11 @@ mod tests {
         std::fs::write(dir.join("b.txt"), b"12345").unwrap();
         std::fs::write(dir.join("a.txt"), b"1").unwrap();
 
-        let v = sftp_local_list(dir.display().to_string()).await.unwrap();
+        let vault = super::super::VaultPasswordStore::new();
+        vault.set("pw".into());
+        let v = local_list_in(&vault, dir.display().to_string())
+            .await
+            .unwrap();
 
         let names: Vec<&str> = v["entries"]
             .as_array()
@@ -9841,9 +9858,15 @@ mod tests {
         assert_eq!(v["entries"][2]["size"], 5);
         assert_eq!(v["entries"][0]["isDir"], true);
         assert_eq!(v["path"], dir.display().to_string());
-        assert!(sftp_local_list(dir.join("missing").display().to_string())
-            .await
-            .is_err());
+        assert!(
+            local_list_in(&vault, dir.join("missing").display().to_string())
+                .await
+                .is_err()
+        );
+        // A locked vault lists nothing: not even a folder that exists.
+        vault.clear();
+        let locked = local_list_in(&vault, dir.display().to_string()).await;
+        assert_eq!(locked.unwrap_err().0, "Vault is locked.");
         std::fs::remove_dir_all(&dir).ok();
     }
 

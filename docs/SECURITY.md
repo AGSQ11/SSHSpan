@@ -942,6 +942,7 @@ Each is a known, deliberate state, with the reason it was left.
   locations listed under [SFTP local-path boundary](#sftp-local-path-boundary) and anything else
   is reachable from a compromised renderer. A grant model needs dialog-picked destinations and
   upload sources, a larger change that was not made.
+  Listing a local folder (`sftp_local_list`) needs an unlocked vault, like every local-pane command.
 - **A network share as a local path can still start a Windows sign-in (part of A6-02).** On
   Windows, a local path that a compromised renderer supplies for an SFTP command, or as the target
   of `system_open_external`, can name a network share (`\\host\...`, `\\?\UNC\...`), and checking
