@@ -1593,8 +1593,34 @@ fn remove_remote_tree<'a>(
                 .await
                 .map_err(|e| format!("rm {path}: {}", sftp_error_detail(e)));
         }
-        remove_tree_below(sftp, path).await
+        let real = sftp
+            .canonicalize(path)
+            .await
+            .map_err(|e| format!("REALPATH {path} failed: {}", sftp_error_detail(e)))?;
+        remove_tree_below(sftp, path, &real).await
     })
+}
+
+/// Whether `path` still resolves to `real`, the REALPATH it had when it was
+/// classified as a folder. SFTP v3 has no calls relative to an open folder, so
+/// every step inside one is a path that is looked up again: another user of a
+/// shared folder can swap the folder - or one of its ancestors - for a link
+/// between two steps. A walk checks this before it lists a folder and right
+/// before each change in it, and stops that folder when it fails. (Server
+/// REALPATH resolves links, as OpenSSH's does; one round trip stays open
+/// between the check and the change - see docs/SECURITY.md.)
+async fn still_resolves_to(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    real: &str,
+) -> Result<(), String> {
+    match sftp.canonicalize(path).await {
+        Ok(now) if now == real => Ok(()),
+        _ => Err(format!(
+            "{path} changed while it was being worked on (it no longer leads to {real}); \
+             nothing more was changed there"
+        )),
+    }
 }
 
 /// Depth-first recursive delete of a remote directory tree. Children are
@@ -1602,12 +1628,19 @@ fn remove_remote_tree<'a>(
 /// unlinked, never followed - `symlink_metadata` classifies the link itself.
 /// An entry whose type the server leaves out is removed by
 /// [`remove_untyped`]: REMOVE first, a folder only if it resolves to itself.
+///
+/// `real` is the REALPATH `path` had when it was classified as a folder
+/// ([`still_resolves_to`]): checked before the listing and before every
+/// change in the folder, so a folder another user swapped for a link stops
+/// the walk instead of being emptied through the link.
 fn remove_tree_below<'a>(
     sftp: &'a russh_sftp::client::SftpSession,
     path: &'a str,
+    real: &'a str,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         let mut first_err: Option<String> = None;
+        still_resolves_to(sftp, path, real).await?;
         let mut entries = sftp
             .read_dir(path)
             .await
@@ -1629,15 +1662,19 @@ fn remove_tree_below<'a>(
                     continue;
                 }
             };
+            // Right before acting on the entry: the folder is still the one
+            // that was classified, so `child` is inside it.
+            still_resolves_to(sftp, path, real).await?;
+            let child_real = join_remote(real, &name);
             let res = match classify_attrs(&md) {
-                Some(EntryKind::Dir) => remove_tree_below(sftp, &child).await,
+                Some(EntryKind::Dir) => remove_tree_below(sftp, &child, &child_real).await,
                 // Links and everything else are unlinked; a link is never
                 // followed.
                 Some(_) => sftp
                     .remove_file(&child)
                     .await
                     .map_err(|e| format!("rm {child}: {}", sftp_error_detail(e))),
-                None => remove_untyped(sftp, &child).await,
+                None => remove_untyped(sftp, &child, &child_real).await,
             };
             if let Err(e) = res {
                 if first_err.is_none() {
@@ -1645,6 +1682,7 @@ fn remove_tree_below<'a>(
                 }
             }
         }
+        still_resolves_to(sftp, path, real).await?;
         // rmdir regardless, so a partially-emptied dir still goes away when it
         // became empty; surface the first child error only if the dir remains.
         if let Err(e) = sftp.remove_dir(path).await {
@@ -1665,7 +1703,11 @@ fn remove_tree_below<'a>(
 /// the entry opened as a folder, and since that follows a link, it is
 /// emptied only when it resolves to itself (see [`resolves_to_itself`]);
 /// anything else is left, with REMOVE's error.
-async fn remove_untyped(sftp: &russh_sftp::client::SftpSession, child: &str) -> Result<(), String> {
+async fn remove_untyped(
+    sftp: &russh_sftp::client::SftpSession,
+    child: &str,
+    child_real: &str,
+) -> Result<(), String> {
     let refused = match sftp.remove_file(child).await {
         Ok(()) => return Ok(()),
         Err(e) => format!("rm {child}: {}", sftp_error_detail(e)),
@@ -1674,7 +1716,7 @@ async fn remove_untyped(sftp: &russh_sftp::client::SftpSession, child: &str) -> 
         return Err(refused);
     }
     match resolves_to_itself(sftp, child, &mut RealFolder::default()).await {
-        Ok(true) => remove_tree_below(sftp, child).await,
+        Ok(true) => remove_tree_below(sftp, child, child_real).await,
         Ok(false) => Err(format!(
             "{refused} (it leads to a folder somewhere else, which was left alone)"
         )),
@@ -4710,10 +4752,18 @@ const CHMOD_MAX_ENTRIES: usize = 200_000;
 /// the first error and leaving a half-applied tree with no account of what
 /// changed. `apply` gets each entry's kind (see [`chmod_path`] for what it
 /// does with it). `root` itself is the caller's business.
-async fn chmod_walk<L, LF, A, AF>(
+///
+/// `root_real` is the REALPATH `root` had when it was classified as a folder;
+/// `verify(dir, real)` says whether a folder still resolves to its `real`
+/// ([`still_resolves_to`]). It is asked before a folder is listed and right
+/// before each change in it: a folder (or an ancestor) another user swapped
+/// for a link stops the walk in that folder, and is recorded.
+async fn chmod_walk<L, LF, A, AF, V, VF>(
     root: &str,
+    root_real: &str,
     mut list: L,
     mut apply: A,
+    mut verify: V,
     apply_files: bool,
     apply_dirs: bool,
 ) -> ChmodOutcome
@@ -4722,11 +4772,18 @@ where
     LF: Future<Output = Result<Vec<ListedEntry>, String>>,
     A: FnMut(String, EntryKind) -> AF,
     AF: Future<Output = Result<(), String>>,
+    V: FnMut(String, String) -> VF,
+    VF: Future<Output = Result<(), String>>,
 {
     let mut out = ChmodOutcome::default();
-    let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
+    let mut stack: Vec<(String, usize, String)> =
+        vec![(root.to_string(), 0, root_real.to_string())];
     let mut seen = 0usize;
-    'walk: while let Some((dir, depth)) = stack.pop() {
+    'walk: while let Some((dir, depth, real)) = stack.pop() {
+        if let Err(e) = verify(dir.clone(), real.clone()).await {
+            out.failed.push(e);
+            continue;
+        }
         let listing = match list(dir.clone()).await {
             Ok(listing) => listing,
             Err(e) => {
@@ -4769,13 +4826,20 @@ where
                 continue;
             }
             if wanted {
+                // Right before the change: the folder is still the one that
+                // was classified, so `child` is inside it.
+                if let Err(e) = verify(dir.clone(), real.clone()).await {
+                    out.failed.push(e);
+                    continue 'walk;
+                }
                 match apply(child.clone(), entry.kind).await {
                     Ok(()) => out.changed += 1,
                     Err(e) => out.failed.push(e),
                 }
             }
             if entry.kind == EntryKind::Dir {
-                stack.push((child, depth + 1));
+                let child_real = join_remote(&real, &entry.name);
+                stack.push((child, depth + 1, child_real));
             }
         }
     }
@@ -6224,6 +6288,12 @@ async fn chmod_path(
     let mut changed = 0u32;
     let mut outcome = ChmodOutcome::default();
     if root == EntryKind::Dir {
+        // Where the picked folder leads now (a link the user picked is
+        // followed, like `chmod -R` on one): the walk stays inside it.
+        let root_real = sftp
+            .canonicalize(path)
+            .await
+            .map_err(|e| format!("REALPATH {path} failed: {}", sftp_error_detail(e)))?;
         // Apply to the root path itself according to the dirs rule, then walk.
         if apply_dirs {
             chmod_one(sftp, path, mode).await?;
@@ -6237,6 +6307,7 @@ async fn chmod_path(
         let file_mode = mode & 0o777;
         outcome = chmod_walk(
             path,
+            &root_real,
             |dir| async move { list_remote_dir(sftp, &dir).await },
             |entry, kind| async move {
                 let mode = if kind == EntryKind::Dir {
@@ -6246,6 +6317,7 @@ async fn chmod_path(
                 };
                 chmod_one(sftp, &entry, mode).await
             },
+            |dir, real| async move { still_resolves_to(sftp, &dir, &real).await },
             apply_files,
             apply_dirs,
         )
@@ -7333,6 +7405,7 @@ mod tests {
         let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let outcome = chmod_walk(
             "/t",
+            "/t",
             |dir: String| {
                 log.borrow_mut().push(format!("list {dir}"));
                 std::future::ready(tree.get(&dir).cloned().unwrap_or_else(|| Ok(Vec::new())))
@@ -7345,6 +7418,7 @@ mod tests {
                     Ok(())
                 })
             },
+            |_dir: String, _real: String| std::future::ready(Ok(())),
             apply_files,
             apply_dirs,
         )
@@ -7470,8 +7544,10 @@ mod tests {
 
         let outcome = chmod_walk(
             "/t",
+            "/t",
             |dir| async move { list_remote_dir(sftp_ref, &dir).await },
             |p, _| async move { chmod_one(sftp_ref, &p, 0o600).await },
+            |dir, real| async move { still_resolves_to(sftp_ref, &dir, &real).await },
             true,
             true,
         )
@@ -12019,6 +12095,62 @@ mod tests {
                 "untyped={untyped}"
             );
             assert_eq!(fx.read("/keep/precious"), b"keep me", "untyped={untyped}");
+        }
+    }
+
+    /// A folder - or one of its ancestors - that another user swaps for a
+    /// link between its classification and its listing is not walked: the
+    /// recursive delete and chmod re-check that the folder still leads where
+    /// it did, so nothing outside the picked folder is removed or changed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sec_recursive_delete_stops_at_a_folder_swapped_for_a_link() {
+        // (folder opened, folder swapped)
+        for (opened, swapped, kept) in [
+            ("/t/a", "/t/a", "/outside/f1"),
+            ("/t/a/b", "/t/a", "/outside/b/f1"),
+        ] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/t/a/b/mine", b"x");
+            fx.write("/t/a/f1", b"x");
+            fx.write("/outside/f1", b"keep");
+            fx.write("/outside/b/f1", b"keep");
+            fx.knobs.lock().unwrap().swap_dir_for_link_on_opendir =
+                Some((opened.into(), swapped.into(), "../outside".into()));
+
+            let result = remove_remote_tree(&sftp, "/t").await;
+
+            assert!(result.is_err(), "{opened}: the swap is reported");
+            assert_eq!(fx.read(kept), b"keep", "{opened}: outside file survives");
+            assert_eq!(fx.read("/outside/f1"), b"keep", "{opened}");
+            assert_eq!(fx.read("/outside/b/f1"), b"keep", "{opened}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sec_recursive_chmod_stops_at_a_folder_swapped_for_a_link() {
+        for (opened, swapped) in [("/t/a", "/t/a"), ("/t/a/b", "/t/a")] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/t/a/b/mine", b"x");
+            fx.write("/t/a/f1", b"x");
+            fx.write("/outside/f1", b"keep");
+            fx.write("/outside/b/f1", b"keep");
+            for f in ["/outside/f1", "/outside/b/f1"] {
+                set_mode(&fx, f, 0o600);
+            }
+            fx.knobs.lock().unwrap().swap_dir_for_link_on_opendir =
+                Some((opened.into(), swapped.into(), "../outside".into()));
+
+            let result = chmod_path(&sftp, "/t", 0o777, true, true, true).await;
+
+            let result = result.unwrap();
+            assert!(
+                result["failedCount"].as_u64().unwrap() >= 1,
+                "{opened}: the swap is reported: {result}"
+            );
+            assert_eq!(fx.mode("/outside/f1"), 0o600, "{opened}");
+            assert_eq!(fx.mode("/outside/b/f1"), 0o600, "{opened}");
         }
     }
 

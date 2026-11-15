@@ -972,6 +972,11 @@ Each is a known, deliberate state, with the reason it was left.
   sent passes the resume check, and a hard link cannot be told from a file over SFTP v3. Replacing
   an existing remote file needs a remove and a rename (OpenSSH refuses a rename onto an existing
   file), so a swap in that one round trip is not prevented.
+- **Recursive remote delete and chmod.** Each folder is re-checked with REALPATH before it is listed
+  and before every change in it, so a folder (or ancestor) another user swaps for a link stops the
+  walk there. SFTP v3 has no calls relative to an open folder, so one round trip stays open between
+  the check and the change, and chmod's SETSTAT follows a link swapped in at the last moment. It
+  needs write permission inside the folder being deleted or changed.
 - **Servers that report no file types.** An entry is accepted as "not a link" when `READLINK` says
   it is not one or `REALPATH` resolves it to itself, and a size match (with the bytes just written)
   decides only when the folder probe is inconclusive; fooling that takes a server that answers those
