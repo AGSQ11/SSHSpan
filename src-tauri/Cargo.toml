@@ -30,7 +30,8 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-clipboard-manager = "2"
 # sshspan:// links from PMXSpan (INTEGRATION-SPEC section 1): the OS scheme
 # registration (Linux/Windows at runtime, macOS via the bundle) and the URLs
-# the OS delivers. Rust-side only - no webview permission is granted.
+# the OS delivers. Rust-side only - no webview permission is granted, and the
+# webview may not emit events either (its listener reads the event bus).
 tauri-plugin-deep-link = "2"
 
 # ─── Crypto: password hashing / KDF ─────────────────────────────────────────

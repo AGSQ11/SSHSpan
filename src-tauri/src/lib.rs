@@ -643,6 +643,38 @@ mod tests {
         }
     }
 
+    /// The deep-link listener reads the event bus, and `plugin:event|emit`
+    /// reaches every Rust listener: a page that could emit
+    /// `deep-link://new-url` would mint an sshspan:// link without the OS.
+    /// The renderer only listens, so the webview may not emit.
+    #[test]
+    fn the_main_webview_cannot_emit_events() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let granted: Vec<&str> = capability["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(
+            !granted.iter().any(|p| matches!(
+                *p,
+                "core:default"
+                    | "core:event:default"
+                    | "core:event:allow-emit"
+                    | "core:event:allow-emit-to"
+            )),
+            "{granted:?}"
+        );
+        for denied in ["core:event:deny-emit", "core:event:deny-emit-to"] {
+            assert!(
+                granted.contains(&denied),
+                "{denied} guards a later core:event:default"
+            );
+        }
+    }
+
     #[test]
     fn hide_notice_is_sent_once_per_run() {
         let flag = std::sync::atomic::AtomicBool::new(false);
