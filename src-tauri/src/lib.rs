@@ -599,6 +599,48 @@ fn create_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// The webview is granted only the core commands the renderer calls.
+    /// `core:default` (and the tray, menu, image, resources and path sets)
+    /// would let a page replace or remove the Rust-built tray, whose Lock
+    /// Vault and Quit items are the backend-enforced lock and exit controls.
+    #[test]
+    fn the_main_webview_gets_no_tray_menu_image_resources_or_path_commands() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let granted: Vec<&str> = capability["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        for denied in [
+            "core:default",
+            "core:tray",
+            "core:menu",
+            "core:image",
+            "core:resources",
+            "core:path",
+            "core:app",
+            "core:window",
+        ] {
+            assert!(
+                !granted
+                    .iter()
+                    .any(|p| *p == denied || p.starts_with(&format!("{denied}:"))),
+                "{denied} must not be granted to the webview: {granted:?}"
+            );
+        }
+        for used in [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:webview:allow-set-webview-zoom",
+            "clipboard-manager:allow-write-text",
+            "clipboard-manager:allow-read-text",
+        ] {
+            assert!(granted.contains(&used), "{used} is used by the renderer");
+        }
+    }
+
     #[test]
     fn hide_notice_is_sent_once_per_run() {
         let flag = std::sync::atomic::AtomicBool::new(false);
