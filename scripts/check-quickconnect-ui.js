@@ -285,7 +285,7 @@ async function scenarioPmxspanActions(browser, server) {
     await page.evaluate(() => [...document.querySelectorAll('#keyConnectMenu .ctx-item')].find((x) => x.textContent.includes('Manage in PMXSpan')).click());
     await page.waitForFunction(() => window.__calls.some((c) => c.cmd === 'pmxspan_manage_server'), null, { polling: 25 });
     check('"Manage in PMXSpan" sends the server id only', (await app.calls('pmxspan_manage_server'))[0].args, { serverId: 's1' });
-    await page.evaluate(() => { switchView('keys'); openKeyConnectMenu(20, 20, state.keys[0]); });
+    await page.evaluate(async () => { await switchView('keys'); openKeyConnectMenu(20, 20, state.keys[0]); });
     await page.waitForSelector('#keyConnectMenu');
     await page.evaluate(() => [...document.querySelectorAll('#keyConnectMenu .ctx-item')].find((x) => x.textContent.includes('Add to PMXSpan')).click());
     await page.waitForFunction(() => window.__calls.some((c) => c.cmd === 'pmxspan_add_key'), null, { polling: 25 });

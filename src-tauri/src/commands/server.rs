@@ -129,14 +129,21 @@ pub async fn server_save(
     };
     super::run_blocking(move || {
         let db = &app.state::<AppState>().db;
-        let saved = server_save_in(
+        let mut saved = server_save_in(
             db,
             &app.state::<super::VaultPasswordStore>(),
             &app.state::<super::VaultRotationLock>(),
             request,
         )?;
-        if let (Some(proposal), Some(id)) = (proposal, saved["id"].as_str()) {
-            super::handoff::apply_proposal(db, id, &proposal)?;
+        // The server is saved by now. A failure to attach the PMXSpan origin or
+        // host-key proposals must not turn that into an error the page reports
+        // as "not saved" (a retry would add the server twice): say so beside
+        // the saved record instead.
+        if let (Some(proposal), Some(id)) = (proposal, saved["id"].as_str().map(String::from)) {
+            if let Err(e) = super::handoff::apply_proposal(db, &id, &proposal) {
+                log::warn!("[sshspan] the PMXSpan origin was not attached to a saved server: {e}");
+                saved["originError"] = serde_json::json!(e.to_string());
+            }
         }
         Ok(saved)
     })

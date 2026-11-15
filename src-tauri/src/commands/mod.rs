@@ -1368,7 +1368,13 @@ pub(crate) fn dialog_host(host: &str, max_chars: usize) -> String {
 pub(crate) fn dialog_address(address: &str, max_rest_chars: usize) -> String {
     match url::Url::parse(address) {
         Ok(url) if url.has_host() => {
-            let origin = url.origin().ascii_serialization();
+            // Not `url.origin()`: that is opaque ("null") for every scheme the
+            // URL standard does not call special (ssh://, git://, ...).
+            let host = url.host_str().unwrap_or_default();
+            let origin = match url.port() {
+                Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                None => format!("{}://{host}", url.scheme()),
+            };
             let mut rest = &url[url::Position::BeforePath..];
             // The parser adds the "/" of an empty path; the text was typed
             // without it.
@@ -3237,6 +3243,24 @@ mod tests {
             "k keeps its identity"
         );
 
+        // A public-only row (empty private half) under an id that holds a key
+        // does not blank that key's private half.
+        let strip = backup_of(std::slice::from_ref(&k), pw, |payload| {
+            for row in payload["keys"].as_array_mut().unwrap() {
+                row["private_key_encrypted"] = serde_json::json!("");
+            }
+        });
+        let counts = restored_counts(apply_restore(&dst, &strip, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(
+            !dst.get_key("k")
+                .unwrap()
+                .unwrap()
+                .private_key_encrypted
+                .is_empty(),
+            "k keeps its private half"
+        );
+
         // A fingerprint another id holds: key b's private half under a new id.
         let mut copy = b.clone();
         copy.id = "z".into();
@@ -4408,6 +4432,22 @@ fn verify_restored_keys(
         let id = text("id").unwrap_or_default();
         let blob = text("private_key_encrypted").unwrap_or_default();
         if blob.is_empty() {
+            // A public-only row carries no private half to derive an identity
+            // from, but restore writes it by id: it must not blank the private
+            // half of a key the vault holds, nor claim a fingerprint another
+            // id already has.
+            let claimed = text("fingerprint_sha256").unwrap_or_default();
+            let strips_a_private_half = stored
+                .iter()
+                .any(|k| k.id == id && !k.private_key_encrypted.is_empty());
+            let takes_anothers_fingerprint = !claimed.is_empty()
+                && fingerprint_owner
+                    .get(&claimed)
+                    .is_some_and(|owner| *owner != id);
+            if strips_a_private_half || takes_anothers_fingerprint {
+                refused += 1;
+                continue;
+            }
             kept.push(row);
             continue;
         }
@@ -8914,6 +8954,13 @@ mod rw_tests {
         );
         assert!(address.ends_with('\u{2026}'), "{address}");
         assert_eq!(dialog_address("not a url", 40), "not a url");
+        // A scheme the URL standard calls non-special has an opaque origin
+        // ("null"); the question must still name the receiving host.
+        assert_eq!(
+            dialog_address("ssh://attacker.example:2222/v1", 20),
+            "ssh://attacker.example:2222/v1"
+        );
+        assert!(dialog_address("git://host.example/x", 20).starts_with("git://host.example"));
     }
 
     /// The last guard before the OS dialog: the message's own line breaks

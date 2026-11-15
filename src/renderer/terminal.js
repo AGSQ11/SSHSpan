@@ -828,7 +828,9 @@ function terminalConnectInTab(tabId, server, opts) {
       rec.sessionId = sessionId;
       // The host key matched one PMXSpan proposed and was pinned (app.js says so).
       if (r.hostKeyVerified && typeof window.onHostKeyVerifiedByPmxspan === 'function') {
-        window.onHostKeyVerifiedByPmxspan(tabId);
+        // A notice only: if it throws, the connect has still succeeded and the
+        // session must not be abandoned for it.
+        try { window.onHostKeyVerifiedByPmxspan(tabId); } catch (e) { /* the notice is lost, the session is not */ }
       }
       trace(tabId, `[sshspan] session established (id=${sessionId.slice(0, 8)}...)`);
       sendTerminalSize(rec, true);
