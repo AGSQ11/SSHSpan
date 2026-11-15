@@ -75,6 +75,8 @@ pub fn run() {
                     return Ok(());
                 }
             };
+            // Private-key exports and backups of earlier runs stay off the upload list
+            commands::sftp::load_own_secret_exports(&state.db);
             app.manage(state);
 
             // Vault password lives in memory only; cleared on lock / quit

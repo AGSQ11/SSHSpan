@@ -754,6 +754,11 @@ impl SensitiveLocations {
         if covered(&self.managed_config_dir) {
             return Some(MANAGED_CONFIG_REFUSAL);
         }
+        // Before the `.pub` allowance below: a file named like a public key
+        // is still what SSHSpan wrote if it is one of its exports.
+        if is_own_secret_export(path) {
+            return Some(OWN_EXPORT_READ_REFUSAL);
+        }
         let public_key = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pub"));
@@ -926,6 +931,118 @@ const APP_FILES_REFUSAL: &str = "SSHSpan's own program and data folders (where i
 /// What a write into `~/.ssh` is refused with.
 const SSH_DIR_WRITE_REFUSAL: &str =
     "The ~/.ssh folder is off-limits for SFTP downloads and local changes.";
+
+/// What an upload of a private-key export or vault backup SSHSpan wrote is
+/// refused with.
+const OWN_EXPORT_READ_REFUSAL: &str =
+    "Private keys and backups that SSHSpan exported cannot be uploaded.";
+
+/// The config row that keeps [`OWN_SECRET_EXPORTS`] across restarts.
+const OWN_SECRET_EXPORTS_KEY: &str = "own_secret_exports";
+
+/// The most exports remembered; the oldest are forgotten first.
+const OWN_SECRET_EXPORTS_MAX: usize = 256;
+
+/// A secret file SSHSpan itself wrote: where, and - where the platform says
+/// it - which file ((device, inode)), so a rename or a link of it is still it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnSecretExport {
+    path: PathBuf,
+    identity: Option<(u64, u64)>,
+}
+
+/// The private-key exports and vault backups SSHSpan wrote. They hold plaintext
+/// private keys or the sealed vault, so - like `~/.ssh` and the vault
+/// database - the renderer cannot make an upload of them: the upload read
+/// rule ([`SensitiveLocations::read_refusal`]) refuses them wherever the
+/// user saved them (Downloads by default). Read live, not from the cached
+/// [`SensitiveLocations`]: an export is covered the moment it is written.
+static OWN_SECRET_EXPORTS: std::sync::Mutex<Vec<OwnSecretExport>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Remember the secret file just written at `path` (in memory), whatever its
+/// name or folder. Returns the list to persist.
+fn remember_own_secret_export(path: &std::path::Path) -> Vec<PathBuf> {
+    let entry = OwnSecretExport {
+        path: resolved_local_path(path),
+        identity: file_identity(path),
+    };
+    let mut list = OWN_SECRET_EXPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    list.retain(|e| e.path != entry.path);
+    list.push(entry);
+    let excess = list.len().saturating_sub(OWN_SECRET_EXPORTS_MAX);
+    list.drain(..excess);
+    list.iter().map(|e| e.path.clone()).collect()
+}
+
+/// Record a private-key export or vault backup SSHSpan just wrote to `path`:
+/// remembered now, and kept in the vault's config for the next start. A
+/// database error is logged - the file is covered for this run regardless.
+pub(crate) fn record_own_secret_export(db: &crate::db::Database, path: &std::path::Path) {
+    let paths = remember_own_secret_export(path);
+    let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    let saved = serde_json::to_string(&text)
+        .map_err(|e| e.to_string())
+        .and_then(|json| {
+            db.set_config(OWN_SECRET_EXPORTS_KEY, &json)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = saved {
+        log::warn!("[sshspan] the exported file could not be remembered for the next start: {e}");
+    }
+}
+
+/// Load the exports of earlier runs (at startup).
+pub(crate) fn load_own_secret_exports(db: &crate::db::Database) {
+    let Ok(Some(json)) = db.get_config(OWN_SECRET_EXPORTS_KEY) else {
+        return;
+    };
+    let Ok(paths) = serde_json::from_str::<Vec<String>>(&json) else {
+        return;
+    };
+    for path in paths {
+        let path = PathBuf::from(path);
+        let mut list = OWN_SECRET_EXPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !list.iter().any(|e| e.path == path) {
+            let identity = file_identity(&path);
+            list.push(OwnSecretExport { path, identity });
+        }
+    }
+}
+
+/// Whether `path` is a secret file SSHSpan wrote: the same path, or the same
+/// file under another name. A comparison against the list in memory, plus one
+/// stat of `path` while the list is not empty.
+fn is_own_secret_export(path: &std::path::Path) -> bool {
+    let list = OWN_SECRET_EXPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if list.is_empty() {
+        return false;
+    }
+    let identity = file_identity(path);
+    list.iter().any(|e| {
+        super::path_starts_with(path, &e.path) && super::path_starts_with(&e.path, path)
+            || (identity.is_some() && identity == e.identity)
+    })
+}
 
 /// What an upload of anything in `~/.ssh` but a public key is refused with.
 const SSH_DIR_READ_REFUSAL: &str =
@@ -13394,6 +13511,56 @@ mod tests {
         assert!(key_export.contains("write_key_export("), "{key_export}");
         assert!(!key_export.contains("write_secret_file("), "{key_export}");
         assert!(body("fn export_backup_to_path(").contains("export_backup_to_path_with("));
+    }
+
+    /// A private-key export or a vault backup that SSHSpan wrote is no upload
+    /// source, wherever it was saved and whatever it is named (a `.pub`
+    /// name does not make it a public key), also after a rename; an ordinary
+    /// neighbour is still uploadable. The audit rows do not say where.
+    #[test]
+    fn sec_own_secret_exports_are_refused_as_upload_sources() {
+        let dir = std::env::temp_dir().join(format!("sshspan-own-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Database::open_at(dir.join("t.db")).unwrap();
+        let readable = |p: &std::path::Path| {
+            validate_sftp_local_path(&p.display().to_string(), LocalAccess::Read).map_err(|e| e.0)
+        };
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, b"hello").unwrap();
+        assert_eq!(readable(&other), Ok(()));
+
+        // A vault backup, through the command's own path.
+        let backup = dir.join("vault-backup.json");
+        assert_eq!(readable(&backup), Ok(()), "nothing is there yet");
+        super::super::export_backup_to_path(&db, "pw", &backup.display().to_string(), &|| Ok(()))
+            .unwrap();
+        assert_eq!(readable(&backup), Err(OWN_EXPORT_READ_REFUSAL.to_string()));
+        let audit = db.list_audit(10).unwrap();
+        assert!(
+            audit.iter().all(|a| !a.details.contains("vault-backup")),
+            "the audit row names no location: {audit:?}"
+        );
+
+        // A private-key export named like a public key.
+        let key = dir.join("id_ed25519.pub");
+        std::fs::write(&key, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        record_own_secret_export(&db, &key);
+        assert_eq!(readable(&key), Err(OWN_EXPORT_READ_REFUSAL.to_string()));
+        // Kept for the next start.
+        let kept = db.get_config(OWN_SECRET_EXPORTS_KEY).unwrap().unwrap();
+        assert!(kept.contains("id_ed25519.pub"), "{kept}");
+        #[cfg(unix)]
+        {
+            let renamed = dir.join("innocent.txt");
+            std::fs::rename(&key, &renamed).unwrap();
+            assert_eq!(
+                readable(&renamed),
+                Err(OWN_EXPORT_READ_REFUSAL.to_string()),
+                "the same file under another name"
+            );
+        }
+        assert_eq!(readable(&other), Ok(()), "other files are unaffected");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── SFTP errors say what failed, once ───────────────────────────────

@@ -453,7 +453,8 @@ refuses:
 - for every access, including a path the user approved in a native dialog: the SSHSpan data
   directory (the vault) and system directories;
 - for reads (an upload source): also SSHSpan's managed config directory and everything under
-  `~/.ssh` except `*.pub`;
+  `~/.ssh` except `*.pub`, and every private-key export and vault backup SSHSpan wrote (remembered by
+  path and file identity, wherever it was saved; the audit rows do not name the location);
 - for writes, renames and deletes (download targets, new folders, the local pane): also SSHSpan's
   managed config directory, `~/.ssh`, startup folders and entries (the per-user and all-users
   Windows Startup folders, autostart entries, systemd user units, launch agents), shell startup

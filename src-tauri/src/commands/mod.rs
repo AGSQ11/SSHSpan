@@ -3967,11 +3967,10 @@ fn export_backup_to_path_with(
     still_current()?;
     crate::ssh::write_secret_file(std::path::Path::new(path), text.as_bytes())
         .map_err(|e| CmdError(e.to_string()))?;
-    let _ = db.add_audit(
-        "vault.backup_created",
-        None,
-        &format!("{} -> {path}", backup.counts),
-    );
+    // The sealed vault is no upload source, and the audit row (which the page
+    // can list) does not say where it is.
+    sftp::record_own_secret_export(db, std::path::Path::new(path));
+    let _ = db.add_audit("vault.backup_created", None, &backup.counts.to_string());
     Ok(serde_json::json!({
         "ok": true, "canceled": false, "path": path, "counts": backup.counts,
     }))
@@ -5168,11 +5167,14 @@ pub async fn key_export_to_file(
         data.as_bytes(),
         &sftp::SensitiveLocations::current(),
     )?;
+    // A plaintext private key is no upload source wherever it was saved, and
+    // the audit row (which the page can list) does not say where it is.
+    sftp::record_own_secret_export(&app.state::<AppState>().db, std::path::Path::new(&path_str));
 
     let _ = app.state::<AppState>().db.add_audit(
         "keys.exported",
         Some(&id),
-        &format!("private material, format {format} -> {path_str}"),
+        &format!("private material, format {format}"),
     );
 
     Ok(serde_json::json!({ "ok": true, "canceled": false, "path": path_str }))
