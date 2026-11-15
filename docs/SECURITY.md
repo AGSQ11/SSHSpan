@@ -305,6 +305,10 @@ and `%` or `${` in User, warn about a `%` in the config path and about the user'
 files/stanzas. Undeploy ("Remove deployed copy") deletes only direct `sshspan_*` files in the
 managed `~/.ssh` directory plus matching stanzas.
 
+A deploy that would turn host-key checking off, write a HostName other than the alias or a Port,
+change an existing stanza's destination, or overlap the user's own `Host` lines is asked about first
+in a native dialog the page cannot answer; "Don't allow" writes nothing.
+
 ## SSH, SFTP, and local paths
 
 ### SSH host keys and connections

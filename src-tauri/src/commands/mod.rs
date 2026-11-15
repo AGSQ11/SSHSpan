@@ -1211,6 +1211,9 @@ pub(crate) enum QuestionKind {
     /// Starting a PMXSpan executable found on this computer for the first
     /// time (INTEGRATION-SPEC section 1).
     PmxspanLaunch,
+    /// Writing `Host` entries that move where the user's own ssh and git
+    /// connect ([`key_deploy`]).
+    KeyDeployHosts,
 }
 
 /// How long a credential question answered "Don't allow" or "Cancel" is not
@@ -2318,10 +2321,12 @@ mod tests {
             db,
             &unlocked_vault(),
             &VaultRotationLock::new(),
+            &CredentialQuestions::new(),
             target,
             &ids,
             None,
             fields,
+            &|_| CredentialAnswer::Allowed,
             &|| Ok(()),
         )
     }
@@ -2443,6 +2448,69 @@ mod tests {
         );
     }
 
+    /// A deploy over IPC that would point a name the user already uses at
+    /// another host, or turn host-key checking off, is asked about in a
+    /// native question first; "no" writes nothing. Plain deploys of a key
+    /// under its own alias ask nothing.
+    #[test]
+    fn deploy_asks_before_it_moves_a_host_name_or_turns_host_key_checking_off() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("hostask");
+        let ids = vec!["k1".to_string()];
+        let attack = crate::ssh::DeployHostFields::parse(
+            Some("github.com".into()),
+            Some("attacker.invalid".into()),
+            None,
+            None,
+            Some(false),
+        )
+        .unwrap();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let run = |fields: &crate::ssh::DeployHostFields, answer: CredentialAnswer| {
+            key_deploy_in(
+                &db,
+                &unlocked_vault(),
+                &VaultRotationLock::new(),
+                &CredentialQuestions::new(),
+                &target,
+                &ids,
+                None,
+                fields,
+                &|p: &CredentialPrompt| {
+                    asked.lock().unwrap().push(p.message.clone());
+                    answer
+                },
+                &|| Ok(()),
+            )
+        };
+        for answer in [CredentialAnswer::NotAllowed, CredentialAnswer::TooQuick] {
+            let refused = run(&attack, answer).unwrap_err();
+            assert!(refused.0.contains("not confirmed"), "{}", refused.0);
+            assert!(
+                !target.config_path.exists() && !target.ssh_dir.join("sshspan_web").exists(),
+                "nothing is written without an allowed answer"
+            );
+        }
+        {
+            let asked = asked.lock().unwrap();
+            assert_eq!(asked.len(), 2);
+            assert!(asked[0].contains("Host github.com -> HostName attacker.invalid"));
+            assert!(asked[0].contains("StrictHostKeyChecking no"));
+        }
+        // Allowed: written. The same fields again change nothing, but the
+        // checking is still off, so it asks again; a plain deploy does not.
+        run(&attack, CredentialAnswer::Allowed).unwrap();
+        let before = asked.lock().unwrap().len();
+        let plain = crate::ssh::DeployHostFields::parse(None, None, None, None, None).unwrap();
+        run(&plain, CredentialAnswer::NotAllowed).unwrap();
+        let after = asked.lock().unwrap().len();
+        let written = std::fs::read_to_string(&target.config_path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(before, after, "a plain deploy asks nothing");
+        assert!(written.contains("attacker.invalid"), "{written}");
+    }
+
     #[test]
     fn deploy_refuses_while_rotating_or_locked_and_stops_at_a_lock() {
         let db = test_db();
@@ -2458,10 +2526,12 @@ mod tests {
             &db,
             &unlocked_vault(),
             &rotation,
+            &CredentialQuestions::new(),
             &target,
             &ids,
             None,
             &fields,
+            &|_| CredentialAnswer::Allowed,
             &|| Ok(()),
         );
         drop(busy);
@@ -2469,20 +2539,24 @@ mod tests {
             &db,
             &locked_vault(),
             &rotation,
+            &CredentialQuestions::new(),
             &target,
             &ids,
             None,
             &fields,
+            &|_| CredentialAnswer::Allowed,
             &|| Ok(()),
         );
         let lock_midway = key_deploy_in(
             &db,
             &unlocked_vault(),
             &rotation,
+            &CredentialQuestions::new(),
             &target,
             &ids,
             None,
             &fields,
+            &|_| CredentialAnswer::Allowed,
             &|| {
                 Err(CmdError(
                     "Vault was locked while the operation was in progress.".into(),
@@ -5370,42 +5444,72 @@ pub async fn key_deploy(
             &worker.state::<AppState>().db,
             worker.state::<VaultPasswordStore>().inner(),
             worker.state::<VaultRotationLock>().inner(),
+            worker.state::<CredentialQuestions>().inner(),
             &target,
             &ids,
             passphrase.as_deref().map(String::as_str),
             &fields,
+            &|prompt| ask_native_confirmation(&worker, prompt),
             &|| require_generation_current(&worker, generation),
         )
     })
     .await
 }
 
+/// What a deploy that would move where the user's own ssh and git connect
+/// says when the question was not allowed.
+const DEPLOY_HOSTS_NOT_ALLOWED: &str =
+    "Not deployed: the Host entries were not confirmed. Deploy again and allow them, or leave the HostName, Port and host-key checking fields empty.";
+
 /// [`key_deploy`] on its blocking worker, without the `AppHandle`.
 /// `still_current` is the vault-generation check, run before each key is
-/// decrypted.
+/// decrypted. When the entries it would write can move where the user's own
+/// ssh and git connect ([`DeployPlan::host_entries_question`]), `ask` - the
+/// native dialog in the app - must allow them first: the page cannot answer
+/// it. It is asked without the rotation lock held, and the deploy is planned
+/// again afterwards; entries that changed meanwhile are not written.
 #[allow(clippy::too_many_arguments)]
 fn key_deploy_in(
     db: &db::Database,
     store: &VaultPasswordStore,
     rotation: &VaultRotationLock,
+    questions: &CredentialQuestions,
     target: &DeployTarget,
     ids: &[String],
     passphrase: Option<&str>,
     fields: &DeployHostFields,
+    ask: ConfirmCredential<'_>,
     still_current: &dyn Fn() -> CmdResult<()>,
 ) -> CmdResult<serde_json::Value> {
     // Unseals with the master password and records the deployment: taken
     // before the first read, not while a master-password change runs.
+    let plan_now = || -> CmdResult<(Vec<KeyRecord>, DeployPlan)> {
+        if store.get().unwrap_or_default().is_empty() {
+            return Err("Vault is locked.".into());
+        }
+        let records = load_deploy_records(db, ids)?;
+        if records.is_empty() {
+            return Err("Select at least one key to deploy.".into());
+        }
+        let plan = plan_key_deploy(db, target, &records, fields)?;
+        Ok((records, plan))
+    };
+    let asked = {
+        let _rotation = rotation.try_shared()?;
+        plan_now()?.1.host_entries_question()
+    };
+    if let Some(question) = &asked {
+        confirm_deploy_hosts(db, questions, question, ask)?;
+        still_current()?;
+    }
     let _rotation = rotation.try_shared()?;
     let pw = store.get().unwrap_or_default();
-    if pw.is_empty() {
-        return Err("Vault is locked.".into());
+    let (records, plan) = plan_now()?;
+    if plan.host_entries_question() != asked {
+        return Err(
+            "Not deployed: the Host entries changed while you were deciding. Deploy again.".into(),
+        );
     }
-    let records = load_deploy_records(db, ids)?;
-    if records.is_empty() {
-        return Err("Select at least one key to deploy.".into());
-    }
-    let plan = plan_key_deploy(db, target, &records, fields)?;
     let by_id: std::collections::HashMap<&str, &KeyRecord> =
         records.iter().map(|k| (k.id.as_str(), k)).collect();
     let passphrase = passphrase.filter(|p| !p.is_empty());
@@ -5440,7 +5544,23 @@ fn key_deploy_in(
             db,
             "keys.deployed",
             None,
-            &format!("{} key(s): {}", files.len(), files.join(", ")),
+            &format!(
+                "{} key(s): {}; aliases {} HostName {} StrictHostKeyChecking {}",
+                files.len(),
+                files.join(", "),
+                outcome
+                    .deployed
+                    .iter()
+                    .map(|d| d.alias.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                fields.hostname.as_deref().unwrap_or("(alias)"),
+                match fields.strict_host_key {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unchanged",
+                },
+            ),
         );
     }
     if !outcome.errors.is_empty() {
@@ -5464,6 +5584,41 @@ fn key_deploy_in(
         "configPath": target.config_path.display().to_string(),
         "includeLine": plan.include_line(),
     }))
+}
+
+/// The native question about the `Host` entries of a deploy, one at a
+/// time, with the back-off after a "no" every credential question has.
+fn confirm_deploy_hosts(
+    db: &db::Database,
+    questions: &CredentialQuestions,
+    question: &str,
+    ask: ConfirmCredential<'_>,
+) -> CmdResult<()> {
+    let Some(_turn) = questions.begin() else {
+        return Err(CREDENTIAL_QUESTION_OPEN.into());
+    };
+    let kind = QuestionKind::KeyDeployHosts;
+    if questions.declined_lately(kind).is_some() {
+        return Err(DEPLOY_HOSTS_NOT_ALLOWED.into());
+    }
+    let prompt = CredentialPrompt {
+        title: "SSHSpan - Change where ssh and git connect?".to_string(),
+        message: question.to_string(),
+    };
+    let answer = ask(&prompt);
+    if answer == CredentialAnswer::NotAllowed {
+        questions.record_decline(kind, "key deploy");
+    }
+    if answer != CredentialAnswer::Allowed {
+        audit_or_log(
+            db,
+            "keys.deploy_declined",
+            None,
+            "Host entries not confirmed",
+        );
+        return Err(DEPLOY_HOSTS_NOT_ALLOWED.into());
+    }
+    Ok(())
 }
 
 /// Undo a deployment (A7-22 / A8-16): delete the key's deployed private key
