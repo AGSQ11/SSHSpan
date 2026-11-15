@@ -85,6 +85,13 @@ fn origin_only_for_pmxspan_with_cluster_and_kind() {
 }
 
 /// Each refusal, with a word the message must contain.
+/// An absolute bundle path in the platform's own form (percent-encoded for a
+/// link): `/tmp/b.json` is not absolute on Windows.
+#[cfg(windows)]
+const ABS_BUNDLE: &str = "C%3A%5Ctmp%5Cb.json";
+#[cfg(not(windows))]
+const ABS_BUNDLE: &str = "%2Ftmp%2Fb.json";
+
 #[test]
 fn every_refusal_names_its_problem() {
     let long = "a".repeat(MAX_URL_BYTES);
@@ -211,20 +218,20 @@ fn every_refusal_names_its_problem() {
         ),
         (
             format!(
-                "sshspan://import?v=1&bundle=%2Ftmp%2Fb.json&sha256={}",
+                "sshspan://import?v=1&bundle={ABS_BUNDLE}&sha256={}",
                 "0".repeat(63)
             ),
             "64 hexadecimal",
         ),
         (
             format!(
-                "sshspan://import?v=1&bundle=%2Ftmp%2Fb.json&sha256={}",
+                "sshspan://import?v=1&bundle={ABS_BUNDLE}&sha256={}",
                 "g".repeat(64)
             ),
             "64 hexadecimal",
         ),
         (
-            "sshspan://import?v=1&bundle=%2Ftmp%2Fb.json".into(),
+            format!("sshspan://import?v=1&bundle={ABS_BUNDLE}"),
             "no sha256",
         ),
     ];
