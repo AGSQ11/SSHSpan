@@ -381,6 +381,9 @@ pub fn import_openssh_private(
             .map_err(|_| anyhow::anyhow!("Incorrect passphrase, or the key file is corrupted."))?;
     }
 
+    // A key file whose stored public half is another key's would put that
+    // other key into an `authorized_keys` line when the key is deployed.
+    ensure_public_half_belongs_to_private(&key)?;
     let key_type = KeyType::from_ssh_key_algorithm(&key.algorithm())?;
     // The comment comes from the file unchecked (A7-45); the cleaned one is
     // also what the stored private key carries.
@@ -409,6 +412,7 @@ pub fn import_openssh_private(
 pub fn identity_of_private(private_bytes: &[u8]) -> anyhow::Result<(KeyType, Vec<u8>)> {
     let key = PrivateKey::from_bytes(private_bytes)
         .map_err(|e| anyhow::anyhow!("Invalid stored private key: {e}"))?;
+    ensure_public_half_belongs_to_private(&key)?;
     let key_type = KeyType::from_ssh_key_algorithm(&key.algorithm())?;
     let public = key
         .public_key()
@@ -416,6 +420,77 @@ pub fn identity_of_private(private_bytes: &[u8]) -> anyhow::Result<(KeyType, Vec
         .map_err(|e| anyhow::anyhow!(e))?
         .to_vec();
     Ok((key_type, public))
+}
+
+/// A private key blob carries its public half beside the private one, and
+/// `ssh-key`'s decoder takes the two as they are. Recompute the public half
+/// from the private material and refuse the blob when they disagree: a key
+/// whose stored public half names a different key is how a crafted backup
+/// would make a vault authorize a key it cannot sign for.
+fn ensure_public_half_belongs_to_private(key: &PrivateKey) -> anyhow::Result<()> {
+    use p256::elliptic_curve::sec1::ToSec1Point as _;
+    const MISMATCH: &str = "The stored private key does not match its own public key.";
+    match key.key_data() {
+        KeypairData::Ed25519(pair) => {
+            let derived = ed25519_dalek::SigningKey::from_bytes(&pair.private.to_bytes())
+                .verifying_key()
+                .to_bytes();
+            anyhow::ensure!(derived.as_slice() == pair.public.as_ref(), MISMATCH);
+        }
+        KeypairData::Ecdsa(pair) => {
+            let (stored, derived): (&[u8], Vec<u8>) = match pair {
+                EcdsaKeypair::NistP256 { public, private } => (
+                    public.as_bytes(),
+                    p256::SecretKey::from_slice(private.as_slice())
+                        .map_err(|_| anyhow::anyhow!(MISMATCH))?
+                        .public_key()
+                        .to_sec1_point(false)
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                EcdsaKeypair::NistP384 { public, private } => (
+                    public.as_bytes(),
+                    p384::SecretKey::from_slice(private.as_slice())
+                        .map_err(|_| anyhow::anyhow!(MISMATCH))?
+                        .public_key()
+                        .to_sec1_point(false)
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                EcdsaKeypair::NistP521 { public, private } => (
+                    public.as_bytes(),
+                    p521::SecretKey::from_slice(private.as_slice())
+                        .map_err(|_| anyhow::anyhow!(MISMATCH))?
+                        .public_key()
+                        .to_sec1_point(false)
+                        .as_bytes()
+                        .to_vec(),
+                ),
+            };
+            anyhow::ensure!(derived.as_slice() == stored, MISMATCH);
+        }
+        KeypairData::Rsa(pair) => {
+            use rsa::BigUint;
+            // Not `rsa::RsaPrivateKey::try_from(pair)`: `ssh-key`'s conversion
+            // refuses genuine keys here, so the components are read directly.
+            let big = |m: &ssh_key::Mpint| {
+                m.as_positive_bytes()
+                    .map(BigUint::from_bytes_be)
+                    .ok_or_else(|| anyhow::anyhow!(MISMATCH))
+            };
+            let private = rsa::RsaPrivateKey::from_components(
+                big(&pair.public.n)?,
+                big(&pair.public.e)?,
+                big(&pair.private.d)?,
+                vec![big(&pair.private.p)?, big(&pair.private.q)?],
+            )
+            .map_err(|_| anyhow::anyhow!(MISMATCH))?;
+            // The modulus is the primes' product, and e and d invert each other.
+            private.validate().map_err(|_| anyhow::anyhow!(MISMATCH))?;
+        }
+        _ => anyhow::bail!("This key type is not supported."),
+    }
+    Ok(())
 }
 
 /// Compute SSH fingerprint (SHA-256) - matches `ssh-keygen -lf` exactly.
@@ -739,6 +814,95 @@ pub(crate) fn sample_keys() -> &'static [PrivateKeyData] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // ── a stored private key must agree with its own public half ──
+
+    #[test]
+    fn identity_of_every_genuine_key_type_is_its_public_half() {
+        for key in sample_keys() {
+            let (kind, public) = identity_of_private(&key.private_key)
+                .unwrap_or_else(|e| panic!("{:?}: {e}", key.key_type));
+            assert_eq!(kind, key.key_type);
+            assert_eq!(public, key.public_key, "{:?}", key.key_type);
+        }
+    }
+
+    fn keypair_of(key: &PrivateKeyData) -> KeypairData {
+        PrivateKey::from_bytes(&key.private_key)
+            .unwrap()
+            .key_data()
+            .clone()
+    }
+
+    fn blob(pair: KeypairData) -> Vec<u8> {
+        PrivateKey::new(pair, "")
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .to_vec()
+    }
+
+    #[test]
+    fn identity_refuses_an_ed25519_blob_whose_public_half_is_another_key() {
+        let keys: Vec<&PrivateKeyData> = sample_keys()
+            .iter()
+            .filter(|k| k.key_type == KeyType::Ed25519)
+            .collect();
+        let a = generate_key_pair(KeyType::Ed25519, None, "a".into()).unwrap();
+        let b = generate_key_pair(KeyType::Ed25519, None, "b".into()).unwrap();
+        assert!(!keys.is_empty());
+        let (KeypairData::Ed25519(pa), KeypairData::Ed25519(pb)) = (keypair_of(&a), keypair_of(&b))
+        else {
+            panic!("not ed25519")
+        };
+        // A's private half under B's public half: what a crafted backup carries.
+        let crafted = blob(KeypairData::Ed25519(Ed25519Keypair {
+            public: pb.public,
+            private: pa.private,
+        }));
+        // Refused: by the decoder itself, or by the recomputation behind it.
+        assert!(identity_of_private(&crafted).is_err());
+    }
+
+    #[test]
+    fn identity_refuses_an_rsa_blob_whose_public_half_is_another_key() {
+        use ssh_key::{private::RsaKeypair, public::RsaPublicKey};
+        let a = sample_keys()
+            .iter()
+            .find(|k| k.key_type == KeyType::Rsa)
+            .unwrap();
+        let b = generate_key_pair(KeyType::Rsa, Some(2048), "b".into()).unwrap();
+        let (KeypairData::Rsa(pa), KeypairData::Rsa(pb)) = (keypair_of(a), keypair_of(&b)) else {
+            panic!("not rsa")
+        };
+        // A's private half under B's modulus.
+        let crafted = blob(KeypairData::Rsa(RsaKeypair {
+            public: RsaPublicKey {
+                e: pa.public.e,
+                n: pb.public.n,
+            },
+            private: pa.private,
+        }));
+        assert!(identity_of_private(&crafted).is_err());
+    }
+
+    #[test]
+    fn identity_refuses_an_ecdsa_blob_whose_public_half_is_another_key() {
+        let a = generate_key_pair(KeyType::EcdsaP256, None, "a".into()).unwrap();
+        let b = generate_key_pair(KeyType::EcdsaP256, None, "b".into()).unwrap();
+        let (
+            KeypairData::Ecdsa(EcdsaKeypair::NistP256 { private, .. }),
+            KeypairData::Ecdsa(EcdsaKeypair::NistP256 { public, .. }),
+        ) = (keypair_of(&a), keypair_of(&b))
+        else {
+            panic!("not p256")
+        };
+        let pair =
+            ecdsa_keypair(EcdsaCurve::NistP256, public.as_bytes(), private.as_slice()).unwrap();
+        let err = identity_of_private(&blob(KeypairData::Ecdsa(pair)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
 
     // ── A2-02 / A7-02 / A5-37: the New Key dialog's key types parse ──
 

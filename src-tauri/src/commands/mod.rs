@@ -3322,6 +3322,36 @@ mod tests {
         );
     }
 
+    /// A public-only row for an id whose vault key is the very key it names
+    /// is refused (it would blank the private half), but servers that used
+    /// that key keep using it.
+    #[test]
+    fn a_public_only_row_over_the_vaults_own_key_keeps_servers_on_it() {
+        let pw = "own-key-pw";
+        let key = real_key_record("k", "key-k", pw);
+        let backup = backup_of(std::slice::from_ref(&key), pw, |payload| {
+            payload["servers"] = serde_json::json!([{
+                "id": "s1", "name": "s1", "host": "h.example", "port": 22,
+                "username": "u", "key_id": "k", "auth_method": "key",
+            }]);
+            payload["keys"][0]["private_key_encrypted"] = serde_json::json!("");
+        });
+        let dst = test_db();
+        dst.insert_key(&key).unwrap();
+        let counts = restored_counts(apply_restore(&dst, &backup, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(!dst
+            .get_key("k")
+            .unwrap()
+            .unwrap()
+            .private_key_encrypted
+            .is_empty());
+        assert_eq!(
+            dst.get_server("s1").unwrap().unwrap().key_id.as_deref(),
+            Some("k")
+        );
+    }
+
     #[test]
     fn backup_file_from_another_master_password_needs_that_password() {
         let (old_pw, new_pw) = ("backup-era-pw", "current-master-pw");
@@ -4494,7 +4524,14 @@ fn verify_restored_keys(
                     .is_some_and(|owner| *owner != id);
             if strips_a_private_half || takes_anothers_fingerprint {
                 refused += 1;
-                remap.insert(id, None);
+                // The vault's own key under this id is the very key the row
+                // names: servers that used it keep it.
+                let same_key_here = strips_a_private_half
+                    && stored.iter().any(|k| {
+                        k.id == id && !claimed.is_empty() && k.fingerprint_sha256 == claimed
+                    });
+                let target = same_key_here.then(|| id.clone());
+                remap.insert(id, target);
                 continue;
             }
             kept.push(row);

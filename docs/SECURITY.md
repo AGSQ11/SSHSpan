@@ -191,9 +191,11 @@ Restore picks and reads the file in Rust (32 MiB cap). If the backup was sealed 
 master password and none was supplied, nothing is restored: Rust answers `needsPassword` and issues
 a single-use, five-minute grant for that one file. With the old password, readable blobs are
 re-sealed under the current password and undecryptable ones are counted and excluded. A restored
-key's type, line and fingerprints are derived from its private half; a row that claims others, that
-holds a fingerprint another id has, or that would replace another key under the same id is refused
-and counted (`keysRefused`). Restored
+key's type, line and fingerprints are derived from its private half, whose own stored public half
+must match what the private part produces (also checked when a key file is imported); a row that
+claims others, that holds a fingerprint another id has, or that would replace another key or blank
+its private half under the same id is refused and counted (`keysRefused`), and servers that used a
+refused row move to the id that already holds the same key or lose the key. Restored
 known-host pins are marked imported and must be confirmed on a live connection, restored MCP
 servers come back inert with tools disabled, and restored settings pass the same key/value
 validation as `settings_set` (rejected entries are counted). A restore holds the shared rotation
