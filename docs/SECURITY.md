@@ -211,7 +211,8 @@ watchdog and every exit:
 2. kill interactive SSH sessions;
 3. stop SFTP edit watches and best-effort delete their staged local copies;
 4. stop SFTP keepalives, clear SFTP handles, and pause queued/active transfers;
-5. clear backend AI access levels;
+5. clear backend AI access levels, the registry of unsaved Quick connect servers (the passwords
+   typed for them go with it) and the proposals that links handed to dialogs;
 6. drain MCP session/status state and end every MCP session at the endpoint it was set up with, one
    background task per session (each unseals its own credential on the blocking pool from one
    zeroizing copy of the password taken before the store clears);
@@ -931,7 +932,9 @@ Each is a known, deliberate state, with the reason it was left.
 - **A local program can send SSHSpan links.** Any program running as the user can start
   `sshspan "sshspan://..."` or open such a link; SSHSpan cannot tell PMXSpan from another sender.
   The consequences are bounded to a prefilled dialog: proposed host keys are verified against the
-  live key and refused when they differ, nothing is saved, connected or pinned without the user,
+  live key and refused when they differ, nothing is saved or connected without the user, and a host key is pinned without the first-use
+  dialog only when the host presents exactly a key the link proposed (a local program can send such
+  a link),
   and a bundle path is opened only under the checks above. A stored proposal applies to its
   `host:port` until the host is pinned; Settings > Known hosts does not list proposals.
 - **Renderer-attested approvals gate actions only.** A compromised renderer can claim that a

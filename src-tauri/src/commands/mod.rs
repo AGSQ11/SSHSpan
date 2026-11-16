@@ -3278,6 +3278,50 @@ mod tests {
         assert_eq!(counts["keys"], 3);
     }
 
+    /// A key the vault already holds under another id is not stored twice,
+    /// and a server in the backup that used it keeps using it. A server that
+    /// used a key refused for any other reason is left without one.
+    #[test]
+    fn refused_key_rows_do_not_leave_servers_pointing_at_missing_keys() {
+        let pw = "refs-pw";
+        let key = real_key_record("k", "key-k", pw);
+        let server = |id: &str, key_id: &str| {
+            serde_json::json!({
+                "id": id, "name": id, "host": "h.example", "port": 22,
+                "username": "u", "key_id": key_id, "auth_method": "key",
+            })
+        };
+        let backup = backup_of(std::slice::from_ref(&key), pw, |payload| {
+            payload["servers"] =
+                serde_json::json!([server("s-held", "k"), server("s-other", "gone")]);
+            // A second row for the same key under another id of the backup's own.
+            let mut forged = payload["keys"][0].clone();
+            forged["id"] = serde_json::json!("gone");
+            forged["name"] = serde_json::json!("key-gone");
+            forged["fingerprint_sha256"] = serde_json::json!("SHA256:not-this-key");
+            payload["keys"].as_array_mut().unwrap().push(forged);
+        });
+        // The vault holds the same key as `k` under another id.
+        let dst = test_db();
+        let mut held = key.clone();
+        held.id = "k2".into();
+        held.name = "key-k2".into();
+        dst.insert_key(&held).unwrap();
+
+        let counts = restored_counts(apply_restore(&dst, &backup, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 2, "{counts}");
+        assert_eq!(
+            dst.get_server("s-held").unwrap().unwrap().key_id.as_deref(),
+            Some("k2"),
+            "a server that used the same key keeps using it"
+        );
+        assert_eq!(
+            dst.get_server("s-other").unwrap().unwrap().key_id,
+            None,
+            "a refused (forged) key leaves its server keyless"
+        );
+    }
+
     #[test]
     fn backup_file_from_another_master_password_needs_that_password() {
         let (old_pw, new_pw) = ("backup-era-pw", "current-master-pw");
@@ -4426,6 +4470,10 @@ fn verify_restored_keys(
         .map(|k| (k.fingerprint_sha256.clone(), k.id.clone()))
         .collect();
     let mut refused = 0u32;
+    // What a server that pointed at a refused key id points at instead: the
+    // id that already holds the same key, or nothing.
+    let mut remap: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     let mut kept: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for mut row in rows.drain(..) {
         let text = |f: &str| row.get(f).and_then(|v| v.as_str()).map(String::from);
@@ -4446,6 +4494,7 @@ fn verify_restored_keys(
                     .is_some_and(|owner| *owner != id);
             if strips_a_private_half || takes_anothers_fingerprint {
                 refused += 1;
+                remap.insert(id, None);
                 continue;
             }
             kept.push(row);
@@ -4457,6 +4506,7 @@ fn verify_restored_keys(
             .and_then(|private| keys::identity_of_private(&private).map_err(|e| e.to_string()));
         let Ok((key_type, public)) = derived else {
             refused += 1;
+            remap.insert(id, None);
             continue;
         };
         let fingerprint = keys::compute_fingerprint_sha256(&public);
@@ -4472,6 +4522,15 @@ fn verify_restored_keys(
             .is_some_and(|owner| *owner != id);
         if !claims_fingerprint || !claims_public || id_holds_other || fingerprint_held_by_other {
             refused += 1;
+            // The same honest key already held under another id: servers that
+            // used it keep using it. Any other refusal leaves them keyless
+            // rather than bound to a key they were not saved with.
+            let held_elsewhere = if claims_fingerprint && claims_public && !id_holds_other {
+                fingerprint_owner.get(&fingerprint).cloned()
+            } else {
+                None
+            };
+            remap.insert(id, held_elsewhere);
             continue;
         }
         fingerprint_owner.insert(fingerprint.clone(), id);
@@ -4481,6 +4540,22 @@ fn verify_restored_keys(
         kept.push(row);
     }
     *rows = kept;
+    if !remap.is_empty() {
+        if let Some(servers) = data.get_mut("servers").and_then(|v| v.as_array_mut()) {
+            for server in servers {
+                let target = server
+                    .get("key_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|k| remap.get(k));
+                if let Some(target) = target {
+                    server["key_id"] = match target {
+                        Some(owner) => serde_json::json!(owner),
+                        None => serde_json::Value::Null,
+                    };
+                }
+            }
+        }
+    }
     Ok(refused)
 }
 

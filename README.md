@@ -435,8 +435,9 @@ contract is `INTEGRATION-SPEC.md` (v1).
 
 - **What crosses, and what never does.** Host names and addresses, ports, user names, guest ids,
   node and cluster names, host public keys and public keys. Never a password, a private key, an
-  API token or anything else from the vault. Nothing received connects, saves or trusts anything:
-  it lands in a dialog you confirm.
+  API token or anything else from the vault. Nothing received connects or saves anything: it
+  lands in a dialog you confirm. The one exception to "trusts" is a host key PMXSpan proposed: it is
+  pinned without a dialog only when the host then presents exactly that key (see below).
 - **From PMXSpan: one host** (`sshspan://connect`). Opens Quick connect prefilled. If a saved
   server already is that host (same PMXSpan cluster and guest, else the same host, port and user)
   the dialog says so and "Open saved server <name>" is its first button. Saved from there, the

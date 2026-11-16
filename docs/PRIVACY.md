@@ -2,7 +2,8 @@
 
 **Last updated:** 2026-10-18  
 **Status:** describes v1.10.0; checked against committed source at `6c19b1b`, and
-the passages edited since then at `b637fdc`; the code it describes is the same at both  
+the passages edited since then at `b637fdc`; the code it describes is the same at both. The
+Quick connect and PMXSpan passages describe the working tree that adds them, not those commits  
 **Platforms:** Windows and Linux
 
 SSHSpan collects no telemetry, analytics, advertising identifiers, or crash reports, and it has no

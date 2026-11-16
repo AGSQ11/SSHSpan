@@ -53,6 +53,11 @@ pub fn run() {
         // `sshspan:` argument is taken in as a link (validated, held for the
         // dialog; `commands::handoff::receive`).
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // After a failed startup the window stays hidden under the error
+            // dialog and no state exists to hold a link in.
+            if STARTUP_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();

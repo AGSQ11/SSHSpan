@@ -6,7 +6,8 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT,
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ,
+    RRF_RT_REG_SZ,
 };
 
 const UNINSTALL: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
@@ -46,7 +47,7 @@ fn string_value(key: &Key, name: &str) -> Option<String> {
             key.0,
             null(),
             name.as_ptr(),
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
             null_mut(),
             null_mut(),
             &mut size,
@@ -63,7 +64,7 @@ fn string_value(key: &Key, name: &str) -> Option<String> {
             key.0,
             null(),
             name.as_ptr(),
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
             null_mut(),
             buf.as_mut_ptr().cast(),
             &mut read,
@@ -154,7 +155,7 @@ pub fn url_scheme_registered(scheme: &str) -> bool {
                     k.0,
                     null(),
                     name.as_ptr(),
-                    RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                    RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
                     null_mut(),
                     null_mut(),
                     &mut size,

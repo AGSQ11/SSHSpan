@@ -234,7 +234,8 @@ pub struct HostKeyPolicy {
     pub proposal: Option<HostKeyProposal>,
     /// Ignore every proposal: the plain first-use / pinned-key policy.
     pub skip_proposals: bool,
-    /// Without it, a claimed rotation is treated as no rotation.
+    /// Without it no rotation question is asked: a claimed rotation is refused
+    /// as declined (the pin is left as it was).
     pub rotation_prompt: Option<RotationPrompt>,
     /// Set when the presented key was pinned because it matched a proposal.
     pub verified: Arc<std::sync::atomic::AtomicBool>,

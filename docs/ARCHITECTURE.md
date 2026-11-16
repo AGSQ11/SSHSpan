@@ -10,7 +10,10 @@ table, the IPC count at that commit (111, before Quick connect and the PMXSpan i
 added theirs) and the Servers group, its mention where the renderer shows
 `server_save`'s key-file warning, and the PuTTY session import section - are checked against
 committed source at `a75b533`; everything else against `6c19b1b`, and nothing else it describes
-has changed since (later changes are listed in the CHANGELOG)  
+has changed since (later changes are listed in the CHANGELOG). The security fixes of 2026-11
+(link-swap re-binding of recursive SFTP delete/chmod, the SFTP write deny-list, `key_deploy`'s
+native question, the `sftp_local_list` lock gate, the first-use pin result and the minimal webview
+capability) are described in SECURITY.md; the sections here that touch them were not rewritten  
 **Platforms:** Windows and Linux  
 **Entry points:** `src-tauri/src/main.rs`, `src-tauri/src/lib.rs`, `src/renderer/index.html`,
 `src/renderer/app.js`
