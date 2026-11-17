@@ -203,11 +203,24 @@ jobs:
       # ignore it - the same reasoning as scoping clippy to `correctness`. Every
       # OTHER advisory, including a future one on rsa itself, still fails here.
       # Revisit when rsa 0.10 ships a stable release.
+      # RUSTSEC-2026-0459 (libsqlite3-sys 0.30.1, SQLite CVE-2026-119375) is
+      # ignored TEMPORARILY, for this reason:
+      #
+      #   The fix is libsqlite3-sys >= 0.39 (SQLite 3.54). SQLite comes in through
+      #   sqlx, and no sqlx release accepts it yet: 0.8.6 pins 0.30.1 and 0.9.0
+      #   allows ">=0.30.1, <0.38.0". libsqlite3-sys links the native library, so
+      #   Cargo allows only one copy and a newer one cannot be added beside it.
+      #   The flaw needs a crafted database file opened together with a sibling
+      #   `-wal` file of another page size. SSHSpan opens only its own vault
+      #   database in its own data folder (backups are JSON, not database files),
+      #   so planting that pair already takes write access to that folder.
+      #
+      # Remove this ignore as soon as an sqlx release allows libsqlite3-sys >= 0.39.
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: Audit dependencies
-        run: cargo audit --file src-tauri/Cargo.lock --ignore RUSTSEC-2023-0071
+        run: cargo audit --file src-tauri/Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 
   ipc-arg-names:
     name: IPC argument names
