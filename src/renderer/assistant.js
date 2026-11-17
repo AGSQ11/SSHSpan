@@ -1143,12 +1143,17 @@ function aiTrimHistory(messages) {
   return head.concat(body.slice(cut));
 }
 
-/// A provider error that quotes its JSON body ("Provider error (400).
-/// {...}") reads as the provider's own message, without the rest of the
-/// body (A4-26). Anything else is shown as it came.
+/// A provider's refusal as the error to show. One that quotes its JSON body
+/// ("Provider error (400). {...}") reads as the provider's own message,
+/// without the rest of the body (A4-26); anything else is shown as it came.
+/// Either way it is spelled out (spellOut, app.js): the backend passes the
+/// provider's answer on as it is, only cut at 300 characters, and once its
+/// JSON escapes are decoded, an escaped U+202E is the override itself. Only
+/// a provider call's refusal comes here - an error of the page's own can
+/// read like one (an MCP tool named "x (400) {...}") and would be cut short.
 function aiFriendlyError(msg) {
   const m = /^([^{]*?\(\d{3}\))\.?\s*(\{[\s\S]*)$/.exec(String(msg));
-  if (!m) return String(msg);
+  if (!m) return spellOut(msg);
   let detail = null;
   try {
     const j = JSON.parse(m[2]);
@@ -1162,7 +1167,7 @@ function aiFriendlyError(msg) {
     const mm = /\x22message\x22\s*:\s*\x22((?:[^\x22\\]|\\.)*)\x22/.exec(m[2]);
     if (mm) { try { detail = JSON.parse('"' + mm[1] + '"'); } catch (e2) { detail = mm[1]; } }
   }
-  return detail ? m[1] + ': ' + String(detail) : String(msg);
+  return spellOut(detail ? m[1] + ': ' + String(detail) : msg);
 }
 
 // The backend's answers that mean "not set up yet": load_provider_in in
@@ -1218,11 +1223,15 @@ async function aiRunTurn(tabId) {
           break;
         }
       }
+      // A refusal of this call is the provider's, tidied as one
+      // (aiFriendlyError). An error of the page's own - an MCP tool's schema
+      // notice (aiToolsForLevel) among them - is thrown before the call and
+      // reaches the catch below as worded.
       const reply = await aiCall('assistant_chat', {
         messages: wireMessages,
         tools: aiToolsForLevel(s.level),
         maxTokens: AI_MAX_TOKENS,
-      });
+      }).catch((e) => { throw new Error(aiFriendlyError(errText(e))); });
       if (!alive()) return true; // cleared meanwhile: drop the late reply
       replied = true;
       const text = reply && reply.text != null ? String(reply.text) : '';
@@ -1274,7 +1283,7 @@ async function aiRunTurn(tabId) {
     return true;
   } catch (e) {
     if (!alive()) return true;
-    aiError(tabId, aiFriendlyError(errText(e)));
+    aiError(tabId, errText(e)); // a provider's refusal comes tidied (above)
     return replied; // false: nothing came back - aiSend restores the question
   } finally {
     clearTimeout(timeout);
@@ -1551,9 +1560,9 @@ async function aiTestConnection() {
       const r = await aiCall('assistant_test_connection');
       aiSetStatus((r && r.detail) || 'Connected.', 'ok');
     } catch (e) {
-      // The backend's words as they are ("The saved assistant URL is no
+      // The backend's words with no prefix ("The saved assistant URL is no
       // longer accepted - ..." is a whole sentence; a prefix in front of it
-      // only got in the way).
+      // only got in the way), the provider's in them spelled out.
       aiSetStatus(aiFriendlyError(errText(e)), 'err');
     }
   });
