@@ -602,11 +602,20 @@ function modalDidOpen(node) {
   modalStack.push({ node, opener: opener && opener !== document.body ? opener : null });
   layerModals();
   toastsOverDialogs();
+  // Focus that has been inside the dialog since it opened was put there on
+  // purpose. When the frame below runs late, the button that had it may be
+  // disabled for its work by then (focus falls to body), and moving focus to
+  // the first control would leave it on the dialog's close button after the
+  // work - withBusy keeps focus that moved to a visible control.
+  let focusedInside = false;
+  const noteFocus = () => { focusedInside = true; };
+  node.addEventListener('focusin', noteFocus, { once: true });
   // Only take focus if the dialog's own open path has not already placed it
   // somewhere deliberate (the picker focuses its search box, the delete
   // prompt focuses Cancel) \u2014 a rAF lets those run first.
   requestAnimationFrame(() => {
-    if (node.hidden || node.contains(document.activeElement)) return;
+    node.removeEventListener('focusin', noteFocus);
+    if (node.hidden || focusedInside || node.contains(document.activeElement)) return;
     const items = modalFocusable(node);
     if (items.length) items[0].focus();
   });

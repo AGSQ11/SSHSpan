@@ -630,8 +630,18 @@ function destroyTabTerminal(tabId) {
   if (rec.fitFrame) cancelAnimationFrame(rec.fitFrame);
   try { rec.resizeObserver && rec.resizeObserver.disconnect(); } catch (e) {}
   try { rec.dataSub && rec.dataSub.dispose(); } catch (e) {}
-  try { rec.term.dispose(); } catch (e) {}
-  rec.hostEl.remove();
+  // xterm 5.5 refreshes its viewport in animation frames and timers that read
+  // the renderer's dimensions; disposing while one is queued (output written
+  // just before the close) makes it throw on the disposed renderer. Hide the
+  // terminal now, and dispose it once the pending output is processed and two
+  // frames have run.
+  const { term, hostEl } = rec;
+  hostEl.style.display = 'none';
+  const dispose = () => requestAnimationFrame(() => requestAnimationFrame(() => {
+    try { term.dispose(); } catch (e) {}
+    hostEl.remove();
+  }));
+  try { term.write('', dispose); } catch (e) { dispose(); }
   sshTabs.delete(tabId);
   if (activeTabId === tabId) {
     activeTabId = sshTabs.keys().next().value || null;
