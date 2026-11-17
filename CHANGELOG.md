@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-11-17
+
 ### Added
 
 - **Quick connect.** A Quick button beside New under Servers, a "Quick connect..." palette entry
@@ -64,6 +66,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a server with one of them in its path had the same problem. (#98)
 
 ### Security
+
+- **Security audit fixes** (a full audit with the Cloudflare security-audit skill; one commit and
+  regression test each). Credential questions (API key move, Bitwarden destination, MCP) quote a
+  long host by its right end, so the receiving domain is always shown. `key_deploy` asks in a
+  native dialog before writing a stanza that turns host-key checking off, moves a host name or
+  overlaps the user's own `Host` lines. Recursive SFTP delete and chmod re-check each folder's real
+  path, so a subfolder swapped for a link is not followed. The SFTP write deny-list covers the XDG
+  handler files (`applications`, `mimeapps.list`). Bitwarden sync refuses a response with two items
+  under one id. The webview no longer has `core:default`, tray, menu, path or window grants, and
+  cannot emit events (so it cannot forge a deep link). SSHSpan's own private-key exports and vault
+  backups cannot be uploaded. `sftp_local_list` refuses while the vault is locked. Every channel a
+  server opens to SSHSpan is refused. First-use host trust honours the pin store's answer.
+- **Backup restore and key import check a key's identity.** A restored key's type, line and
+  fingerprints come from its private half, and a key whose stored public half does not match its
+  private part is refused, at restore and at key-file import. Rows that would blank a key's private
+  half or claim another key's fingerprint are refused, and servers that used a refused row move to
+  the key the vault already holds or lose the reference.
+- **Dependency advisories (November).** `russh` 0.63.2 -> 0.65.2 (RUSTSEC-2026-0495),
+  `quinn-proto` 0.11.18 -> 0.11.19 (RUSTSEC-2026-0523, -0524), `quinn-udp` 0.5.15 -> 0.5.16
+  (RUSTSEC-2026-0538), `tokio` 1.53.1 -> 1.54.1 (RUSTSEC-2026-0386) and `rustix` 1.1.4 -> 1.1.6
+  (RUSTSEC-2026-0486). `libsqlite3-sys` 0.30.1 (RUSTSEC-2026-0459) cannot be upgraded until an
+  `sqlx` release accepts 0.39 or later; CI ignores that one advisory, with the reasoning in
+  `ci.yml`.
 
 - **Dependency advisories.** `crypto-bigint` 0.7.5 -> 0.7.7 (RUSTSEC-2026-0387: operations meant
   to run in constant time could branch on secret values), `ctutils` 0.4.2 -> 0.4.5
