@@ -2243,7 +2243,7 @@ mod ru4_tests {
         async fn auth_publickey(
             &mut self,
             _user: &str,
-            _public_key: &russh::keys::ssh_key::PublicKey,
+            _public_key: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<Auth, Self::Error> {
             Ok(if self.behaviour.accept_keys {
                 Auth::Accept
