@@ -32,6 +32,11 @@ minisign signature before they run and a missing or invalid signature refuses th
 
 ## What's new
 
+- **v1.11.0** - Quick connect (connect to a host without saving it first; tick "Save for future
+  reconnects" to keep it), `sshspan://` links and the PMXSpan integration (import servers, host-key
+  proposals, "Manage in PMXSpan"), fixes for every confirmed finding of a full security audit, and
+  dependency security updates (`russh` 0.65, `quinn`, `tokio`, `rustix`). See
+  [every change](CHANGELOG.md#1110---2026-11-17).
 - **v1.10.0** - A flaw-remediation pass over v1.9.1 driven by an eight-area internal audit
   ([report](docs/audit/2026-10-09/REPORT.md), [finding index](docs/audit/2026-10-09/README.md),
   [every change](CHANGELOG.md#1100---2026-10-18)). Confirmations and the idle auto-lock now work
@@ -740,7 +745,7 @@ Back up and protect the data directory, not a `~/.sshspan` folder.
 
 ### From a release (recommended)
 Grab the latest installer from [Releases](https://github.com/AGSQ11/SSHSpan/releases). The source
-manifests currently say **1.10.0**; asset names follow these patterns (substitute the release
+manifests currently say **1.11.0**; asset names follow these patterns (substitute the release
 you are downloading):
 
 | Platform | Files |

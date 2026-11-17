@@ -6062,7 +6062,7 @@ dependencies = [
 
 [[package]]
 name = "sshspan"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
