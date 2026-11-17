@@ -426,7 +426,7 @@ const KEY_MOVE_LOCKED: &str =
 fn key_move_declined_lately(host: &str) -> String {
     format!(
         "Sending the stored API key to {} was declined a moment ago. Wait 30 seconds, then save again, or enter the API key for the new address.",
-        crate::commands::dialog_text(host, MAX_DIALOG_NAME_CHARS)
+        crate::commands::dialog_host(host, MAX_DIALOG_NAME_CHARS)
     )
 }
 
@@ -777,18 +777,19 @@ impl KeyMove {
     /// ([`crate::commands::dialog_text`]): the address and the provider come
     /// from settings a renderer saved (or a backup restored).
     fn prompt(&self) -> crate::commands::CredentialPrompt {
-        use crate::commands::dialog_text;
+        use crate::commands::{dialog_address, dialog_host, dialog_text};
         let name = |text: &str| dialog_text(text, MAX_DIALOG_NAME_CHARS);
+        let host = |text: &str| dialog_host(text, MAX_DIALOG_NAME_CHARS);
         crate::commands::CredentialPrompt {
             title: "SSHSpan - Send the API key?".to_string(),
             message: format!(
                 "Send the stored API key to {}?\n\nIt was saved for {} ({}). SSHSpan would send it \
                  with every assistant request to {} ({}). Allow only if you changed the address \
                  yourself.",
-                name(&self.to_host),
-                name(&self.from_host),
+                host(&self.to_host),
+                host(&self.from_host),
                 name(self.from_provider.as_deref().unwrap_or("no provider")),
-                dialog_text(&self.to_address, MAX_DIALOG_ADDRESS_CHARS),
+                dialog_address(&self.to_address, MAX_DIALOG_ADDRESS_CHARS),
                 name(&self.to_provider)
             ),
         }
@@ -2988,6 +2989,28 @@ mod tests {
             message.chars().count()
         );
         assert!(message.contains('\u{2026}'), "{message}");
+    }
+
+    /// A long host is cut at its start in the key question: the part that
+    /// names the receiver (its registrable domain) is always shown.
+    #[test]
+    fn sec_key_question_shows_the_right_end_of_a_long_host() {
+        let old = stored_config("openai", None);
+        let long = format!(
+            "https://api.openai.com.{}.{}.attacker.example/v1",
+            "a".repeat(60),
+            "b".repeat(40)
+        );
+        let message = key_move(&old, "openai", Some(&long))
+            .unwrap()
+            .prompt()
+            .message;
+        assert!(
+            message.matches("attacker.example").count() >= 2,
+            "host and address both name the receiver: {message}"
+        );
+        let declined = key_move_declined_lately(&format!("x.{}.attacker.example", "a".repeat(80)));
+        assert!(declined.contains("attacker.example"), "{declined}");
     }
 
     /// A chat or a connection test unseals the stored key with the master

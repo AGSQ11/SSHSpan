@@ -963,11 +963,17 @@ fn backup_key(id: &str, name: &str, private_key_encrypted: String) -> KeyRecord 
 fn backup_restore_round_trip_keeps_key_sync_metadata_bookmarks_and_audit() {
     let pw = "round-trip-master-pw";
     let src = fresh_db("backup_src");
+    // A real key: restore derives a key's identity from its private half and
+    // refuses a row whose stored fingerprint or line says otherwise.
+    let data = keys::generate_key_pair(KeyType::Ed25519, None, "linked@test".to_string()).unwrap();
     let mut key = backup_key(
         "k-linked",
         "linked",
-        sshspan::crypto::vault::seal(pw, b"fake-private-key").unwrap(),
+        sshspan::crypto::vault::seal(pw, &data.private_key).unwrap(),
     );
+    key.public_key = keys::export_public_key(&data, KeyFormat::OpenSsh).unwrap();
+    key.fingerprint_sha256 = keys::compute_fingerprint_sha256(&data.public_key);
+    key.fingerprint_md5 = keys::compute_fingerprint_md5(&data.public_key);
     key.bitwarden_id = Some("cipher-1".into());
     key.bitwarden_sync = true;
     key.bitwarden_revision_ts = Some(1_717_000_000_123);
@@ -1019,7 +1025,7 @@ fn backup_restore_round_trip_keeps_key_sync_metadata_bookmarks_and_audit() {
         ));
     }
     if sshspan::crypto::vault::unseal(pw, &restored.private_key_encrypted).ok()
-        != Some(b"fake-private-key".to_vec())
+        != Some(data.private_key.to_vec())
     {
         lost.push("private key no longer unseals".into());
     }

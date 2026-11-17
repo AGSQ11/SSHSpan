@@ -95,7 +95,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --example sftp-smoke
 ## Renderer checks
 
 The renderer has no build step. The static checks need only Node (`npm run check:vendor` and
-`npm run check:hygiene` run two of them). The seven suites drive the real renderer files in
+`npm run check:hygiene` run two of them). The eight suites drive the real renderer files in
 headless Chromium against a stubbed Tauri bridge; CI installs Playwright 1.56.1 for them only:
 
 ```sh
@@ -115,6 +115,7 @@ npm run test:polish
 npm run test:assistant
 npm run test:keys
 npm run test:servers
+npm run test:quick
 ```
 
 Static checks (no browser):
@@ -160,7 +161,8 @@ share `scripts/lib/renderer-harness.js`, which serves the renderer over HTTP.
 except `test:ui`, which always serves `src/renderer`; `--only <text>`
 runs the scenarios whose title contains the text (every suite except `test:ui` and
 `test:assistant`, which takes `ASSISTANT_ONLY=<group>`). Without Playwright `test:ui`,
-`test:safety`, `test:sftp`, `test:polish`, `test:keys` and `test:servers` skip their browser checks
+`test:safety`, `test:sftp`, `test:polish`, `test:keys`, `test:servers` and `test:quick` skip their
+browser checks
 and say so; `test:assistant` refuses to run.
 
 - `npm run test:ui` (`check-renderer-ui.js`): the key list's grouped view, the connect host
@@ -198,6 +200,12 @@ and say so; `test:assistant` refuses to run.
   ("Not confirmed", "Allow syncing...", where the focus goes) and the backend's Bitwarden texts
   shown spelled out, the Upload picker, and a scan that checks shown text uses " - ", never an em
   dash.
+- `npm run test:quick` (`check-quickconnect-ui.js`): Quick connect unsaved (the ephemeral id, the
+  `user@host` tab, "Save this server..." rebinding, forgetting on close) and saved through
+  `server_save`, the remembered tick, `sshspan://connect` offers ("Open saved server" first,
+  refused and waiting links), the explicit second step after "PMXSpan reported a different host
+  key", the "Import from PMXSpan" dialog, and "Manage in PMXSpan" / "Add to PMXSpan..." disabled
+  with the hint or sent with ids only.
 
 These are not WebView2 or WebKitGTK tests, do not exercise native dialogs, the tray or a screen
 reader, and use fake files and SSH/SFTP responses. State that distinction in reports. Test
@@ -212,7 +220,7 @@ Do not quote an 80% figure or any other number unless a coverage tool produced i
 timeout.
 
 - `rust`: `cargo fmt --check`, Clippy (correctness group) and `cargo test` on Linux;
-- `renderer`: the syntax, globals, vendor, MCP-contract and comment-hygiene checks and the seven
+- `renderer`: the syntax, globals, vendor, MCP-contract and comment-hygiene checks and the eight
   suites;
 - `ipc-arg-names`: `check-ipc-args.js`;
 - `cargo-audit`: dependency advisories (one advisory is ignored deliberately, with the reasoning in

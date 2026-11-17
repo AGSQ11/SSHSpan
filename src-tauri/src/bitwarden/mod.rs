@@ -950,7 +950,7 @@ fn quoted_destination(config: &crate::db::BitwardenConfig) -> Option<(String, St
         .map(|u| crate::commands::host_label(&u))
         .unwrap_or_else(|_| url.to_string());
     Some((
-        crate::commands::dialog_text(&host, 120),
+        crate::commands::dialog_host(&host, 120),
         crate::commands::dialog_text(email, 128),
     ))
 }
@@ -981,7 +981,7 @@ pub(crate) fn pending_destination(
 ) -> Option<PendingDestination> {
     let destination = config.destination()?;
     let (host, account) = quoted_destination(config)?;
-    let address = crate::commands::dialog_text(config.server_url.as_deref().unwrap_or(""), 200);
+    let address = crate::commands::dialog_address(config.server_url.as_deref().unwrap_or(""), 200);
     let previous = previous_account(config)
         .map(|before| format!("This is not the account allowed before ({before}).\n"))
         .unwrap_or_default();
@@ -1832,6 +1832,34 @@ mod tests {
                 "{given:?}"
             );
         }
+    }
+
+    /// A long server host is cut at its start in the question: the Server
+    /// and Address lines both end in the registrable domain.
+    #[test]
+    fn sec_question_shows_the_right_end_of_a_long_server_host() {
+        let config = crate::db::BitwardenConfig {
+            server_url: Some(format!(
+                "https://vault.bitwarden.com.{}.{}.{}.attacker.example",
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63)
+            )),
+            email: Some("me@example.com".into()),
+            ..crate::db::BitwardenConfig::default()
+        };
+        let pending = pending_destination(&config).unwrap();
+        assert!(
+            pending.host.ends_with("attacker.example"),
+            "{}",
+            pending.host
+        );
+        assert!(
+            pending.prompt.message.matches("attacker.example").count() >= 2,
+            "{}",
+            pending.prompt.message
+        );
+        assert!(sync_refusal(&config).unwrap().contains("attacker.example"));
     }
 
     /// The question led with the host, and a look-alike account on a

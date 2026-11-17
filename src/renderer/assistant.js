@@ -225,7 +225,7 @@ async function aiCommitLevel(tabId, level, prev) {
 function aiYoloTargetText(tabId) {
   const tab = (window.state && window.state.sessions && window.state.sessions.get(tabId)) || null;
   if (!tab) return 'This arms YOLO for the current session tab only.';
-  const server = window.state.servers ? window.state.servers.find((sv) => sv.id === tab.serverId) : null;
+  const server = typeof window.serverById === 'function' ? window.serverById(tab.serverId) : null;
   const who = (server && server.username ? serverInText(server.username) + '@' : '') + serverInText(tab.host || '?')
     + (tab.port ? ':' + tab.port : '');
   return 'This arms YOLO for one session tab only: "' + (tab.serverName ? serverInText(tab.serverName) : 'session') + '" (' + who + ').';
@@ -880,7 +880,7 @@ function aiGetTerminalText(tabId) {
 
 function aiGetSessionInfo(tabId) {
   const tab = (window.state && window.state.sessions && window.state.sessions.get(tabId)) || null;
-  const server = tab && window.state.servers ? window.state.servers.find(sv => sv.id === tab.serverId) : null;
+  const server = tab && typeof window.serverById === 'function' ? window.serverById(tab.serverId) : null;
   const live = typeof window.tabSessionLive === 'function' && window.tabSessionLive(tabId);
   return JSON.stringify({
     serverName: tab ? tab.serverName : null,

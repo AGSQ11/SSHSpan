@@ -23,8 +23,16 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # plugins were registered but never called from the renderer or Rust - dead
 # IPC surface - and were removed.
 tauri-plugin-dialog = "2"
-tauri-plugin-single-instance = "2"
+# `deep-link`: a second instance started with an sshspan:// URL hands it to
+# the running one through the deep-link plugin (registered after this one,
+# as the plugin requires).
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-clipboard-manager = "2"
+# sshspan:// links from PMXSpan (INTEGRATION-SPEC section 1): the OS scheme
+# registration (Linux/Windows at runtime, macOS via the bundle) and the URLs
+# the OS delivers. Rust-side only - no webview permission is granted, and the
+# webview may not emit events either (its listener reads the event bus).
+tauri-plugin-deep-link = "2"
 
 # ─── Crypto: password hashing / KDF ─────────────────────────────────────────
 argon2 = "0.5"                    # Argon2id (PPK v3, vault KDF)
@@ -150,7 +158,7 @@ urlencoding = "2"                 # URL-encode cipher IDs for Bitwarden API
 russh-sftp = "2"                  # SFTP client subsystem over russh channels
 notify = "7"                       # file watching (SFTP open-with-editor sync-back)
 semver = "1"                    # Release version comparison (update check)
-russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.65.2", default-features = false, features = ["ring", "rsa"] }
 log = "0.4"                        # surfaces russh-sftp's internal warn!() (dev tooling)
 env_logger = "0.11"                # used by examples/dev-sshd.rs + examples/sftp-smoke.rs (dev tooling only)
 

@@ -68,18 +68,34 @@ fn saved_pw_for_server(
 /// The `key_pem` and `password` fields are wrapped in `zeroize::Zeroizing`
 /// so secret material is wiped from memory once the connect/auth path is
 /// done with it.
+///
+/// An id that is not a saved server is looked up in `ephemeral` (Quick
+/// connect's unsaved servers): then its password is the one typed in the
+/// dialog, kept in memory for the tab's lifetime, and its host-key
+/// proposals come with it.
 fn resolve_for_server(
     db: &Database,
+    ephemeral: Option<&crate::quick_connect::EphemeralRegistry>,
     vault_pw: &str,
     server_id: &str,
     override_username: Option<String>,
     override_key_id: Option<String>,
     prompt_password: Option<zeroize::Zeroizing<String>>,
 ) -> Result<ResolvedConnection, String> {
-    let server = db
-        .get_server(server_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Server not found: {server_id}"))?;
+    let saved = if crate::quick_connect::is_ephemeral_id(server_id) {
+        None
+    } else {
+        db.get_server(server_id).map_err(|e| e.to_string())?
+    };
+    let (server, ephemeral_password, proposal) = match saved {
+        Some(server) => (server, None, None),
+        None => {
+            let entry = ephemeral
+                .and_then(|reg| reg.get(server_id))
+                .ok_or_else(|| format!("Server not found: {server_id}"))?;
+            (entry.record, entry.password, entry.proposal)
+        }
+    };
 
     let username = override_username.unwrap_or_else(|| server.username.clone());
     let auth_method = server.auth_method.clone();
@@ -117,9 +133,10 @@ fn resolve_for_server(
         // name and auth method the same way). Unsealed only when it is used.
         password = match prompt_password.filter(|p| !p.is_empty()) {
             Some(typed) => Some(typed),
-            None if username == server.username => {
-                saved_pw_for_server(db, vault_pw, &server)?.filter(|p| !p.is_empty())
-            }
+            None if username == server.username => match ephemeral_password {
+                Some(typed) => Some(typed).filter(|p| !p.is_empty()),
+                None => saved_pw_for_server(db, vault_pw, &server)?.filter(|p| !p.is_empty()),
+            },
             None => None,
         };
     }
@@ -130,6 +147,10 @@ fn resolve_for_server(
         auth_method,
         key_pem,
         password,
+        host_keys: ssh_client::HostKeyPolicy {
+            proposal,
+            ..Default::default()
+        },
     })
 }
 
@@ -142,6 +163,18 @@ pub(crate) struct ConnectRequest {
     pub prompt_password: Option<zeroize::Zeroizing<String>>,
 }
 
+/// [`resolve_connection`] for a command: saved servers and Quick connect's
+/// ephemeral ones.
+pub(crate) fn resolve_connection_with(
+    db: &Database,
+    ephemeral: &crate::quick_connect::EphemeralRegistry,
+    vault: &super::VaultPasswordStore,
+    rotation: &super::VaultRotationLock,
+    request: ConnectRequest,
+) -> super::CmdResult<ResolvedConnection> {
+    resolve_in(db, Some(ephemeral), vault, rotation, request)
+}
+
 /// [`resolve_for_server`] for a command, without the `AppHandle`. It reads a
 /// sealed password or key and unseals it with the master password, so the
 /// rotation guard is taken BEFORE the master password or any sealed row is
@@ -150,8 +183,19 @@ pub(crate) struct ConnectRequest {
 /// read without the guard, so a change committing in between could pair the
 /// old password with a re-sealed row. Argon2id: callers run it on the
 /// blocking pool ([`resolve_on_blocking_pool`]).
+#[cfg(test)]
 pub(crate) fn resolve_connection(
     db: &Database,
+    vault: &super::VaultPasswordStore,
+    rotation: &super::VaultRotationLock,
+    request: ConnectRequest,
+) -> super::CmdResult<ResolvedConnection> {
+    resolve_in(db, None, vault, rotation, request)
+}
+
+fn resolve_in(
+    db: &Database,
+    ephemeral: Option<&crate::quick_connect::EphemeralRegistry>,
     vault: &super::VaultPasswordStore,
     rotation: &super::VaultRotationLock,
     request: ConnectRequest,
@@ -163,6 +207,7 @@ pub(crate) fn resolve_connection(
     }
     resolve_for_server(
         db,
+        ephemeral,
         &vault_pw,
         &request.server_id,
         request.override_username,
@@ -178,17 +223,26 @@ pub(crate) fn resolve_connection(
 async fn resolve_on_blocking_pool(
     app: &AppHandle,
     request: ConnectRequest,
+    skip_proposals: bool,
 ) -> super::CmdResult<ResolvedConnection> {
     let app = app.clone();
+    let rotation_app = app.clone();
     super::run_blocking(move || {
-        resolve_connection(
+        resolve_connection_with(
             &app.state::<AppState>().db,
+            &app.state::<crate::quick_connect::EphemeralRegistry>(),
             &app.state::<super::VaultPasswordStore>(),
             app.state::<super::VaultRotationLock>().inner(),
             request,
         )
     })
     .await
+    .map(|mut resolved| {
+        resolved.host_keys.skip_proposals = skip_proposals;
+        resolved.host_keys.rotation_prompt =
+            Some(ssh_client::native_rotation_prompt(&rotation_app));
+        resolved
+    })
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -200,6 +254,7 @@ fn anyhow_cmd(e: anyhow::Error) -> CmdError {
 }
 
 #[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)]
 pub async fn terminal_connect(
     app: AppHandle,
     server_id: String,
@@ -211,6 +266,10 @@ pub async fn terminal_connect(
     override_username: Option<String>,
     override_key_id: Option<String>,
     prompt_password: Option<String>,
+    // The explicit second step after "PMXSpan reported a different host
+    // key": PMXSpan's proposals are set aside and the host gets the normal
+    // first-use dialog. It can only lead to a dialog, never to trust.
+    skip_proposed_host_keys: Option<bool>,
 ) -> CmdResult<serde_json::Value> {
     // Capture the vault generation BEFORE any await (this also refuses a
     // locked vault). If the vault is locked while the handshake is in
@@ -229,8 +288,10 @@ pub async fn terminal_connect(
             override_key_id,
             prompt_password: prompt_password.map(zeroize::Zeroizing::new),
         },
+        skip_proposed_host_keys.unwrap_or(false),
     )
     .await?;
+    let verified = resolved.host_keys.verified.clone();
 
     // Welcome banner so the user sees something even before the first
     // shell prompt arrives. If the channel to the webview is broken, FAIL
@@ -274,8 +335,14 @@ pub async fn terminal_connect(
         let _ = ssh_client::session_resize(&registry, &session_id, cols, rows);
     }
 
+    // A Quick connect that was not saved is audited as such.
+    let quick = crate::quick_connect::is_ephemeral_id(&resolved.server.id);
     let _ = db.add_audit(
-        "connect.start",
+        if quick {
+            "connect.quick"
+        } else {
+            "connect.start"
+        },
         None,
         &format!(
             "{} @ {}:{} as {}",
@@ -286,6 +353,9 @@ pub async fn terminal_connect(
     Ok(serde_json::json!({
         "ok": true,
         "sessionId": session_id,
+        // The key was pinned because it matched a key PMXSpan proposed: the
+        // renderer says "Host key verified against PMXSpan".
+        "hostKeyVerified": verified.load(std::sync::atomic::Ordering::SeqCst),
         "server": {
             "id": resolved.server.id,
             "name": resolved.server.name,
@@ -384,6 +454,7 @@ pub async fn server_test(
             override_key_id: None,
             prompt_password: prompt_password.map(zeroize::Zeroizing::new),
         },
+        false,
     )
     .await?;
 
@@ -398,6 +469,7 @@ pub async fn server_test(
             auth_method: resolved.auth_method.clone(),
             key_pem: resolved.key_pem.clone(),
             password: resolved.password.clone(),
+            host_keys: resolved.host_keys.clone(),
         },
         &db,
         ssh_client::native_host_trust_prompt(&app),

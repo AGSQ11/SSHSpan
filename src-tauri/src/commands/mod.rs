@@ -2,6 +2,7 @@
 //! Each handler wraps the backend services and returns Result<T, String>.
 //! Frontend calls them via `invoke('command_name', { key: value })`.
 
+pub mod handoff;
 pub mod server;
 pub mod sftp;
 pub mod terminal;
@@ -601,6 +602,13 @@ pub(crate) fn lock_vault_internal(app: &AppHandle) -> bool {
             app.state::<crate::sftp::SftpRegistry>().clear();
             crate::sftp::queue::pause_all(app);
             app.state::<crate::assistant::AssistantLevels>().clear();
+            // Quick connect's unsaved servers (and the passwords typed for
+            // them) and the proposals links handed to dialogs go with the
+            // vault; a link still waiting for an unlock stays.
+            app.state::<crate::quick_connect::EphemeralRegistry>()
+                .clear();
+            app.state::<crate::handoff::state::HandoffState>()
+                .clear_proposals();
             // MCP sessions die with the vault too: HTTP DELETE with
             // Mcp-Session-Id, carrying the static auth header (405 is valid
             // per spec - ignored; other refusals are audited, never
@@ -1200,6 +1208,12 @@ pub(crate) enum QuestionKind {
     AssistantKeyMove,
     /// Uploading keys and passwords to a Bitwarden server and account.
     BitwardenDestination,
+    /// Starting a PMXSpan executable found on this computer for the first
+    /// time (INTEGRATION-SPEC section 1).
+    PmxspanLaunch,
+    /// Writing `Host` entries that move where the user's own ssh and git
+    /// connect ([`key_deploy`]).
+    KeyDeployHosts,
 }
 
 /// How long a credential question answered "Don't allow" or "Cancel" is not
@@ -1330,6 +1344,50 @@ pub(crate) fn dialog_text(text: &str, max_chars: usize) -> String {
         format!("{}\u{2026}", cut.trim_end())
     } else {
         out
+    }
+}
+
+/// A host name as a credential question quotes it: cleaned like
+/// [`dialog_text`], and when longer than `max_chars` cut at the START. The
+/// end of a host name (its registrable domain) says who receives the
+/// credential, so that end is never the part that is dropped.
+pub(crate) fn dialog_host(host: &str, max_chars: usize) -> String {
+    let clean = dialog_text(host, usize::MAX);
+    let count = clean.chars().count();
+    if count <= max_chars {
+        return clean;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = clean.chars().skip(count - keep).collect();
+    format!("\u{2026}{}", tail.trim_start())
+}
+
+/// An address as a credential question quotes it: the origin (scheme, host,
+/// port) whole, then the rest of the address capped at `max_rest_chars`.
+/// Text that is not an address is cut from the start like a host.
+pub(crate) fn dialog_address(address: &str, max_rest_chars: usize) -> String {
+    match url::Url::parse(address) {
+        Ok(url) if url.has_host() => {
+            // Not `url.origin()`: that is opaque ("null") for every scheme the
+            // URL standard does not call special (ssh://, git://, ...).
+            let host = url.host_str().unwrap_or_default();
+            let origin = match url.port() {
+                Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                None => format!("{}://{host}", url.scheme()),
+            };
+            let mut rest = &url[url::Position::BeforePath..];
+            // The parser adds the "/" of an empty path; the text was typed
+            // without it.
+            if rest == "/" && !address.trim_end().ends_with('/') {
+                rest = "";
+            }
+            format!(
+                "{}{}",
+                dialog_text(&origin, usize::MAX),
+                dialog_text(rest, max_rest_chars)
+            )
+        }
+        _ => dialog_host(address, max_rest_chars),
     }
 }
 
@@ -2236,15 +2294,21 @@ mod tests {
         (root, target)
     }
 
-    /// A real Ed25519 key sealed with [`PW`], stored under `name`.
-    fn insert_real_key(db: &db::Database, id: &str, name: &str) {
+    /// A real Ed25519 key sealed with `pw`, named `name`.
+    fn real_key_record(id: &str, name: &str, pw: &str) -> KeyRecord {
         let data = keys::generate_key_pair(KeyType::Ed25519, None, format!("{name}@test")).unwrap();
-        let mut record = sample_key(id, PW);
+        let mut record = sample_key(id, pw);
         record.name = name.into();
         record.public_key = keys::export_public_key(&data, KeyFormat::OpenSsh).unwrap();
-        record.private_key_encrypted = crate::crypto::vault::seal(PW, &data.private_key).unwrap();
+        record.private_key_encrypted = crate::crypto::vault::seal(pw, &data.private_key).unwrap();
         record.fingerprint_sha256 = keys::compute_fingerprint_sha256(&data.public_key);
-        db.insert_key(&record).unwrap();
+        record.fingerprint_md5 = keys::compute_fingerprint_md5(&data.public_key);
+        record
+    }
+
+    /// A real Ed25519 key sealed with [`PW`], stored under `name`.
+    fn insert_real_key(db: &db::Database, id: &str, name: &str) {
+        db.insert_key(&real_key_record(id, name, PW)).unwrap();
     }
 
     fn host_fields() -> crate::ssh::DeployHostFields {
@@ -2269,10 +2333,12 @@ mod tests {
             db,
             &unlocked_vault(),
             &VaultRotationLock::new(),
+            &CredentialQuestions::new(),
             target,
             &ids,
             None,
             fields,
+            &|_| CredentialAnswer::Allowed,
             &|| Ok(()),
         )
     }
@@ -2394,6 +2460,69 @@ mod tests {
         );
     }
 
+    /// A deploy over IPC that would point a name the user already uses at
+    /// another host, or turn host-key checking off, is asked about in a
+    /// native question first; "no" writes nothing. Plain deploys of a key
+    /// under its own alias ask nothing.
+    #[test]
+    fn deploy_asks_before_it_moves_a_host_name_or_turns_host_key_checking_off() {
+        let db = test_db();
+        insert_real_key(&db, "k1", "web");
+        let (root, target) = deploy_target("hostask");
+        let ids = vec!["k1".to_string()];
+        let attack = crate::ssh::DeployHostFields::parse(
+            Some("github.com".into()),
+            Some("attacker.invalid".into()),
+            None,
+            None,
+            Some(false),
+        )
+        .unwrap();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let run = |fields: &crate::ssh::DeployHostFields, answer: CredentialAnswer| {
+            key_deploy_in(
+                &db,
+                &unlocked_vault(),
+                &VaultRotationLock::new(),
+                &CredentialQuestions::new(),
+                &target,
+                &ids,
+                None,
+                fields,
+                &|p: &CredentialPrompt| {
+                    asked.lock().unwrap().push(p.message.clone());
+                    answer
+                },
+                &|| Ok(()),
+            )
+        };
+        for answer in [CredentialAnswer::NotAllowed, CredentialAnswer::TooQuick] {
+            let refused = run(&attack, answer).unwrap_err();
+            assert!(refused.0.contains("not confirmed"), "{}", refused.0);
+            assert!(
+                !target.config_path.exists() && !target.ssh_dir.join("sshspan_web").exists(),
+                "nothing is written without an allowed answer"
+            );
+        }
+        {
+            let asked = asked.lock().unwrap();
+            assert_eq!(asked.len(), 2);
+            assert!(asked[0].contains("Host github.com -> HostName attacker.invalid"));
+            assert!(asked[0].contains("StrictHostKeyChecking no"));
+        }
+        // Allowed: written. The same fields again change nothing, but the
+        // checking is still off, so it asks again; a plain deploy does not.
+        run(&attack, CredentialAnswer::Allowed).unwrap();
+        let before = asked.lock().unwrap().len();
+        let plain = crate::ssh::DeployHostFields::parse(None, None, None, None, None).unwrap();
+        run(&plain, CredentialAnswer::NotAllowed).unwrap();
+        let after = asked.lock().unwrap().len();
+        let written = std::fs::read_to_string(&target.config_path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(before, after, "a plain deploy asks nothing");
+        assert!(written.contains("attacker.invalid"), "{written}");
+    }
+
     #[test]
     fn deploy_refuses_while_rotating_or_locked_and_stops_at_a_lock() {
         let db = test_db();
@@ -2409,10 +2538,12 @@ mod tests {
             &db,
             &unlocked_vault(),
             &rotation,
+            &CredentialQuestions::new(),
             &target,
             &ids,
             None,
             &fields,
+            &|_| CredentialAnswer::Allowed,
             &|| Ok(()),
         );
         drop(busy);
@@ -2420,20 +2551,24 @@ mod tests {
             &db,
             &locked_vault(),
             &rotation,
+            &CredentialQuestions::new(),
             &target,
             &ids,
             None,
             &fields,
+            &|_| CredentialAnswer::Allowed,
             &|| Ok(()),
         );
         let lock_midway = key_deploy_in(
             &db,
             &unlocked_vault(),
             &rotation,
+            &CredentialQuestions::new(),
             &target,
             &ids,
             None,
             &fields,
+            &|_| CredentialAnswer::Allowed,
             &|| {
                 Err(CmdError(
                     "Vault was locked while the operation was in progress.".into(),
@@ -2770,6 +2905,10 @@ mod tests {
         ("sftpDualPane", &["1", "0"]),
         // next || '' - empty turns the comparison off
         ("sftpCmpMode", &["size", "mtime", ""]),
+        // Quick connect's "Save for future reconnects" tick
+        ("quickConnectSave", &["1", "0"]),
+        // Settings > Integrations: "Register sshspan:// links"
+        ("deepLinkRegister", &["true", "false"]),
         // the local pane's current directory
         (
             "sftpLocalDir:server-1",
@@ -2806,6 +2945,8 @@ mod tests {
         ("sftpDualPane", &["", "yes"]),
         ("sftpCmpMode", &["off", "SIZE", "hash"]),
         ("sftpLocalDir:server-1", &["", "bad\0path"]),
+        ("quickConnectSave", &["", "true", "yes"]),
+        ("deepLinkRegister", &["", "1", "on"]),
     ];
 
     #[test]
@@ -2998,7 +3139,8 @@ mod tests {
     fn backup_exported_to_a_file_restores_from_that_file() {
         let pw = "file-round-trip-pw";
         let src = test_db();
-        src.insert_key(&sample_key("k1", pw)).unwrap();
+        src.insert_key(&real_key_record("k1", "key-k1", pw))
+            .unwrap();
         let dir = scratch_dir("backup-file");
         let path = dir.join("vault.json");
         let path_str = path.display().to_string();
@@ -3033,11 +3175,189 @@ mod tests {
         assert!(dst.get_key("k1").unwrap().is_some());
     }
 
+    /// A backup of `keys` (sealed under `pw`), with `tamper` applied to the
+    /// payload before it is sealed - what a backup's author controls.
+    fn backup_of(
+        keys: &[KeyRecord],
+        pw: &str,
+        tamper: impl FnOnce(&mut serde_json::Value),
+    ) -> serde_json::Value {
+        let src = test_db();
+        for k in keys {
+            src.insert_key(k).unwrap();
+        }
+        let built = build_backup_document(&src, pw).unwrap().document;
+        let plain = crate::crypto::vault::unseal(pw, built["sealed"].as_str().unwrap()).unwrap();
+        let mut payload: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        tamper(&mut payload);
+        let sealed = crate::crypto::vault::seal(pw, payload.to_string().as_bytes()).unwrap();
+        serde_json::json!({ "format": "sshspan-backup", "sealed": sealed })
+    }
+
+    fn restored_counts(outcome: CmdResult<RestoreOutcome>) -> serde_json::Value {
+        match outcome.unwrap() {
+            RestoreOutcome::Restored(r) => r["counts"].clone(),
+            other => panic!("expected a restore, got {other:?}"),
+        }
+    }
+
+    /// A restored key's identity comes from its private half. A row that
+    /// claims another key's fingerprint, or a line that is not its own, is
+    /// refused (and counted) while the others still restore; a same-id row
+    /// with another private half does not replace the stored key, and a
+    /// fingerprint another id holds is not stored twice.
+    #[test]
+    fn restore_derives_a_keys_identity_from_its_private_half() {
+        let pw = "identity-pw";
+        let (a, k, b) = (
+            real_key_record("a", "key-a", pw),
+            real_key_record("k", "key-k", pw),
+            real_key_record("b", "key-b", pw),
+        );
+        // Row a: A's private half under K's fingerprint and B's line.
+        let forged = backup_of(&[a.clone(), k.clone(), b.clone()], pw, |payload| {
+            for row in payload["keys"].as_array_mut().unwrap() {
+                if row["id"] == "a" {
+                    row["fingerprint_sha256"] = serde_json::json!(k.fingerprint_sha256);
+                    row["public_key"] = serde_json::json!(b.public_key);
+                }
+            }
+        });
+        let dst = test_db();
+        let counts = restored_counts(apply_restore(&dst, &forged, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(dst.get_key("a").unwrap().is_none(), "the forged row");
+        let stored_k = dst.get_key("k").unwrap().unwrap();
+        assert_eq!(stored_k.fingerprint_sha256, k.fingerprint_sha256);
+        assert!(dst.get_key("b").unwrap().is_some());
+
+        // The same id with another private half (claims that agree with it)
+        // is not stored over the key the vault has.
+        let swapped_in = real_key_record("k", "key-k", pw);
+        let swap = backup_of(std::slice::from_ref(&swapped_in), pw, |_| {});
+        let counts = restored_counts(apply_restore(&dst, &swap, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert_eq!(
+            dst.get_key("k").unwrap().unwrap().fingerprint_sha256,
+            k.fingerprint_sha256,
+            "k keeps its identity"
+        );
+
+        // A public-only row (empty private half) under an id that holds a key
+        // does not blank that key's private half.
+        let strip = backup_of(std::slice::from_ref(&k), pw, |payload| {
+            for row in payload["keys"].as_array_mut().unwrap() {
+                row["private_key_encrypted"] = serde_json::json!("");
+            }
+        });
+        let counts = restored_counts(apply_restore(&dst, &strip, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(
+            !dst.get_key("k")
+                .unwrap()
+                .unwrap()
+                .private_key_encrypted
+                .is_empty(),
+            "k keeps its private half"
+        );
+
+        // A fingerprint another id holds: key b's private half under a new id.
+        let mut copy = b.clone();
+        copy.id = "z".into();
+        copy.name = "key-z".into();
+        let dup = backup_of(&[copy], pw, |_| {});
+        let counts = restored_counts(apply_restore(&dst, &dup, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(dst.get_key("z").unwrap().is_none());
+
+        // An honest restore of one's own keys is unaffected.
+        let own = backup_of(&[a, k, b], pw, |_| {});
+        let fresh = test_db();
+        let counts = restored_counts(apply_restore(&fresh, &own, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 0, "{counts}");
+        assert_eq!(counts["keys"], 3);
+    }
+
+    /// A key the vault already holds under another id is not stored twice,
+    /// and a server in the backup that used it keeps using it. A server that
+    /// used a key refused for any other reason is left without one.
+    #[test]
+    fn refused_key_rows_do_not_leave_servers_pointing_at_missing_keys() {
+        let pw = "refs-pw";
+        let key = real_key_record("k", "key-k", pw);
+        let server = |id: &str, key_id: &str| {
+            serde_json::json!({
+                "id": id, "name": id, "host": "h.example", "port": 22,
+                "username": "u", "key_id": key_id, "auth_method": "key",
+            })
+        };
+        let backup = backup_of(std::slice::from_ref(&key), pw, |payload| {
+            payload["servers"] =
+                serde_json::json!([server("s-held", "k"), server("s-other", "gone")]);
+            // A second row for the same key under another id of the backup's own.
+            let mut forged = payload["keys"][0].clone();
+            forged["id"] = serde_json::json!("gone");
+            forged["name"] = serde_json::json!("key-gone");
+            forged["fingerprint_sha256"] = serde_json::json!("SHA256:not-this-key");
+            payload["keys"].as_array_mut().unwrap().push(forged);
+        });
+        // The vault holds the same key as `k` under another id.
+        let dst = test_db();
+        let mut held = key.clone();
+        held.id = "k2".into();
+        held.name = "key-k2".into();
+        dst.insert_key(&held).unwrap();
+
+        let counts = restored_counts(apply_restore(&dst, &backup, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 2, "{counts}");
+        assert_eq!(
+            dst.get_server("s-held").unwrap().unwrap().key_id.as_deref(),
+            Some("k2"),
+            "a server that used the same key keeps using it"
+        );
+        assert_eq!(
+            dst.get_server("s-other").unwrap().unwrap().key_id,
+            None,
+            "a refused (forged) key leaves its server keyless"
+        );
+    }
+
+    /// A public-only row for an id whose vault key is the very key it names
+    /// is refused (it would blank the private half), but servers that used
+    /// that key keep using it.
+    #[test]
+    fn a_public_only_row_over_the_vaults_own_key_keeps_servers_on_it() {
+        let pw = "own-key-pw";
+        let key = real_key_record("k", "key-k", pw);
+        let backup = backup_of(std::slice::from_ref(&key), pw, |payload| {
+            payload["servers"] = serde_json::json!([{
+                "id": "s1", "name": "s1", "host": "h.example", "port": 22,
+                "username": "u", "key_id": "k", "auth_method": "key",
+            }]);
+            payload["keys"][0]["private_key_encrypted"] = serde_json::json!("");
+        });
+        let dst = test_db();
+        dst.insert_key(&key).unwrap();
+        let counts = restored_counts(apply_restore(&dst, &backup, pw, None, &|| Ok(())));
+        assert_eq!(counts["keysRefused"], 1, "{counts}");
+        assert!(!dst
+            .get_key("k")
+            .unwrap()
+            .unwrap()
+            .private_key_encrypted
+            .is_empty());
+        assert_eq!(
+            dst.get_server("s1").unwrap().unwrap().key_id.as_deref(),
+            Some("k")
+        );
+    }
+
     #[test]
     fn backup_file_from_another_master_password_needs_that_password() {
         let (old_pw, new_pw) = ("backup-era-pw", "current-master-pw");
         let src = test_db();
-        src.insert_key(&sample_key("k1", old_pw)).unwrap();
+        src.insert_key(&real_key_record("k1", "key-k1", old_pw))
+            .unwrap();
         let dir = scratch_dir("backup-pw");
         let path = dir.join("old.json");
         export_backup_to_path(&src, old_pw, &path.display().to_string(), &|| Ok(())).unwrap();
@@ -3553,7 +3873,8 @@ mod tests {
     fn restore_commits_nothing_when_the_vault_locked_meanwhile() {
         let pw = "restore-lock-pw";
         let src = test_db();
-        src.insert_key(&sample_key("k1", pw)).unwrap();
+        src.insert_key(&real_key_record("k1", "key-k1", pw))
+            .unwrap();
         let dir = scratch_dir("restore-locked");
         let path = dir.join("vault.json");
         export_backup_to_path(&src, pw, &path.display().to_string(), &|| Ok(())).unwrap();
@@ -3655,6 +3976,19 @@ pub fn build_backup_document(db: &db::Database, pw: &str) -> CmdResult<BackupDoc
     let keys = db.list_keys_with_categories().map_err(|e| e.to_string())?;
     let categories = db.list_categories().map_err(|e| e.to_string())?;
     let servers = db.list_servers().map_err(|e| e.to_string())?;
+    // Each server with where it lives in PMXSpan (`origin`, absent for most):
+    // the origin columns are not part of the row the rest of the app reads.
+    let origins = db.server_origins().map_err(|e| e.to_string())?;
+    let servers_json: Vec<serde_json::Value> = servers
+        .iter()
+        .map(|s| {
+            let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
+            if let (Some(obj), Some(origin)) = (v.as_object_mut(), origins.get(&s.id)) {
+                obj.insert("origin".into(), serde_json::json!(origin));
+            }
+            v
+        })
+        .collect();
     let known_hosts = db.list_known_hosts().map_err(|e| e.to_string())?;
     // MCP servers travel with the backup (sealed auth secret included, same
     // vault password as everything else). They come back INERT on restore
@@ -3683,7 +4017,7 @@ pub fn build_backup_document(db: &db::Database, pw: &str) -> CmdResult<BackupDoc
     let payload = serde_json::json!({
         "keys": keys,
         "categories": categories,
-        "servers": servers,
+        "servers": servers_json,
         "known_hosts": known_hosts,
         "settings": settings,
         "mcpServers": mcp_servers,
@@ -3825,11 +4159,10 @@ fn export_backup_to_path_with(
     still_current()?;
     crate::ssh::write_secret_file(std::path::Path::new(path), text.as_bytes())
         .map_err(|e| CmdError(e.to_string()))?;
-    let _ = db.add_audit(
-        "vault.backup_created",
-        None,
-        &format!("{} -> {path}", backup.counts),
-    );
+    // The sealed vault is no upload source, and the audit row (which the page
+    // can list) does not say where it is.
+    sftp::record_own_secret_export(db, std::path::Path::new(path));
+    let _ = db.add_audit("vault.backup_created", None, &backup.counts.to_string());
     Ok(serde_json::json!({
         "ok": true, "canceled": false, "path": path, "counts": backup.counts,
     }))
@@ -4096,10 +4429,24 @@ pub fn apply_restore(
         .map(sanitize_backup_settings)
         .unwrap_or(0);
 
+    // A key's type, line and fingerprints are derived from its private half,
+    // never taken from the backup's text (see [`verify_restored_keys`]).
+    let keys_refused = verify_restored_keys(db, &mut data, pw)?;
+
     still_current()?;
     let mut counts = db.restore_backup(&data).map_err(|e| e.to_string())?;
     counts["settingsDropped"] = serde_json::json!(dropped_settings);
+    counts["keysRefused"] = serde_json::json!(keys_refused);
     let _ = db.add_audit("vault.backup_restored", None, &counts.to_string());
+    if keys_refused > 0 {
+        let _ = db.add_audit(
+            "vault.restore_keys_refused",
+            None,
+            &format!(
+                "{keys_refused} key(s) not restored: unreadable, claiming another fingerprint or line than their private key, or a fingerprint another key already holds"
+            ),
+        );
+    }
     if dropped_settings > 0 {
         let _ = db.add_audit(
             "vault.restore_settings_skipped",
@@ -4122,6 +4469,131 @@ pub fn apply_restore(
         "passwordReLinked": reused_backup_password,
         "resealFailures": reseal_failures,
     })))
+}
+
+/// Make every key row of a restore payload say what its private half says.
+/// `data["keys"]` rows with a private half are unsealed with `pw` (the
+/// current master password - the re-seal has run), and the key type, the
+/// authorized_keys line's key and both fingerprints are derived from it,
+/// as the Bitwarden pull does. A row is left out, and counted, when
+///
+/// - its private half cannot be read,
+/// - the fingerprint or the public key it claims is not the derived one,
+/// - the same id already holds another key (its private half would be
+///   swapped behind an unchanged fingerprint), or
+/// - another id - in the vault or earlier in the backup - already holds its
+///   fingerprint (the one-row-per-fingerprint rule of an import).
+///
+/// A public-only row has no private half to derive from and is kept as it is.
+/// Returns the number of rows left out.
+fn verify_restored_keys(
+    db: &db::Database,
+    data: &mut serde_json::Value,
+    pw: &str,
+) -> CmdResult<u32> {
+    let Some(rows) = data.get_mut("keys").and_then(|v| v.as_array_mut()) else {
+        return Ok(0);
+    };
+    let stored = db.list_keys().map_err(|e| e.to_string())?;
+    let mut fingerprint_owner: std::collections::HashMap<String, String> = stored
+        .iter()
+        .map(|k| (k.fingerprint_sha256.clone(), k.id.clone()))
+        .collect();
+    let mut refused = 0u32;
+    // What a server that pointed at a refused key id points at instead: the
+    // id that already holds the same key, or nothing.
+    let mut remap: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut kept: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    for mut row in rows.drain(..) {
+        let text = |f: &str| row.get(f).and_then(|v| v.as_str()).map(String::from);
+        let id = text("id").unwrap_or_default();
+        let blob = text("private_key_encrypted").unwrap_or_default();
+        if blob.is_empty() {
+            // A public-only row carries no private half to derive an identity
+            // from, but restore writes it by id: it must not blank the private
+            // half of a key the vault holds, nor claim a fingerprint another
+            // id already has.
+            let claimed = text("fingerprint_sha256").unwrap_or_default();
+            let strips_a_private_half = stored
+                .iter()
+                .any(|k| k.id == id && !k.private_key_encrypted.is_empty());
+            let takes_anothers_fingerprint = !claimed.is_empty()
+                && fingerprint_owner
+                    .get(&claimed)
+                    .is_some_and(|owner| *owner != id);
+            if strips_a_private_half || takes_anothers_fingerprint {
+                refused += 1;
+                // The vault's own key under this id is the very key the row
+                // names: servers that used it keep it.
+                let same_key_here = strips_a_private_half
+                    && stored.iter().any(|k| {
+                        k.id == id && !claimed.is_empty() && k.fingerprint_sha256 == claimed
+                    });
+                let target = same_key_here.then(|| id.clone());
+                remap.insert(id, target);
+                continue;
+            }
+            kept.push(row);
+            continue;
+        }
+        let derived = crate::crypto::vault::unseal(pw, &blob)
+            .map(zeroize::Zeroizing::new)
+            .map_err(|e| e.to_string())
+            .and_then(|private| keys::identity_of_private(&private).map_err(|e| e.to_string()));
+        let Ok((key_type, public)) = derived else {
+            refused += 1;
+            remap.insert(id, None);
+            continue;
+        };
+        let fingerprint = keys::compute_fingerprint_sha256(&public);
+        let claims_fingerprint = text("fingerprint_sha256").is_some_and(|f| f == fingerprint);
+        let claims_public = text("public_key")
+            .and_then(|line| parse_openssh_public_line(&line).ok())
+            .is_some_and(|wire| wire == public);
+        let id_holds_other = stored
+            .iter()
+            .any(|k| k.id == id && k.fingerprint_sha256 != fingerprint);
+        let fingerprint_held_by_other = fingerprint_owner
+            .get(&fingerprint)
+            .is_some_and(|owner| *owner != id);
+        if !claims_fingerprint || !claims_public || id_holds_other || fingerprint_held_by_other {
+            refused += 1;
+            // The same honest key already held under another id: servers that
+            // used it keep using it. Any other refusal leaves them keyless
+            // rather than bound to a key they were not saved with.
+            let held_elsewhere = if claims_fingerprint && claims_public && !id_holds_other {
+                fingerprint_owner.get(&fingerprint).cloned()
+            } else {
+                None
+            };
+            remap.insert(id, held_elsewhere);
+            continue;
+        }
+        fingerprint_owner.insert(fingerprint.clone(), id);
+        row["key_type"] = serde_json::json!(key_type.db_tag());
+        row["fingerprint_sha256"] = serde_json::json!(fingerprint);
+        row["fingerprint_md5"] = serde_json::json!(keys::compute_fingerprint_md5(&public));
+        kept.push(row);
+    }
+    *rows = kept;
+    if !remap.is_empty() {
+        if let Some(servers) = data.get_mut("servers").and_then(|v| v.as_array_mut()) {
+            for server in servers {
+                let target = server
+                    .get("key_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|k| remap.get(k));
+                if let Some(target) = target {
+                    server["key_id"] = match target {
+                        Some(owner) => serde_json::json!(owner),
+                        None => serde_json::Value::Null,
+                    };
+                }
+            }
+        }
+    }
+    Ok(refused)
 }
 
 // ─── File save helpers (public-key and audit-log exports, "Download as") ───
@@ -5026,11 +5498,14 @@ pub async fn key_export_to_file(
         data.as_bytes(),
         &sftp::SensitiveLocations::current(),
     )?;
+    // A plaintext private key is no upload source wherever it was saved, and
+    // the audit row (which the page can list) does not say where it is.
+    sftp::record_own_secret_export(&app.state::<AppState>().db, std::path::Path::new(&path_str));
 
     let _ = app.state::<AppState>().db.add_audit(
         "keys.exported",
         Some(&id),
-        &format!("private material, format {format} -> {path_str}"),
+        &format!("private material, format {format}"),
     );
 
     Ok(serde_json::json!({ "ok": true, "canceled": false, "path": path_str }))
@@ -5302,42 +5777,72 @@ pub async fn key_deploy(
             &worker.state::<AppState>().db,
             worker.state::<VaultPasswordStore>().inner(),
             worker.state::<VaultRotationLock>().inner(),
+            worker.state::<CredentialQuestions>().inner(),
             &target,
             &ids,
             passphrase.as_deref().map(String::as_str),
             &fields,
+            &|prompt| ask_native_confirmation(&worker, prompt),
             &|| require_generation_current(&worker, generation),
         )
     })
     .await
 }
 
+/// What a deploy that would move where the user's own ssh and git connect
+/// says when the question was not allowed.
+const DEPLOY_HOSTS_NOT_ALLOWED: &str =
+    "Not deployed: the Host entries were not confirmed. Deploy again and allow them, or leave the HostName, Port and host-key checking fields empty.";
+
 /// [`key_deploy`] on its blocking worker, without the `AppHandle`.
 /// `still_current` is the vault-generation check, run before each key is
-/// decrypted.
+/// decrypted. When the entries it would write can move where the user's own
+/// ssh and git connect ([`DeployPlan::host_entries_question`]), `ask` - the
+/// native dialog in the app - must allow them first: the page cannot answer
+/// it. It is asked without the rotation lock held, and the deploy is planned
+/// again afterwards; entries that changed meanwhile are not written.
 #[allow(clippy::too_many_arguments)]
 fn key_deploy_in(
     db: &db::Database,
     store: &VaultPasswordStore,
     rotation: &VaultRotationLock,
+    questions: &CredentialQuestions,
     target: &DeployTarget,
     ids: &[String],
     passphrase: Option<&str>,
     fields: &DeployHostFields,
+    ask: ConfirmCredential<'_>,
     still_current: &dyn Fn() -> CmdResult<()>,
 ) -> CmdResult<serde_json::Value> {
     // Unseals with the master password and records the deployment: taken
     // before the first read, not while a master-password change runs.
+    let plan_now = || -> CmdResult<(Vec<KeyRecord>, DeployPlan)> {
+        if store.get().unwrap_or_default().is_empty() {
+            return Err("Vault is locked.".into());
+        }
+        let records = load_deploy_records(db, ids)?;
+        if records.is_empty() {
+            return Err("Select at least one key to deploy.".into());
+        }
+        let plan = plan_key_deploy(db, target, &records, fields)?;
+        Ok((records, plan))
+    };
+    let asked = {
+        let _rotation = rotation.try_shared()?;
+        plan_now()?.1.host_entries_question()
+    };
+    if let Some(question) = &asked {
+        confirm_deploy_hosts(db, questions, question, ask)?;
+        still_current()?;
+    }
     let _rotation = rotation.try_shared()?;
     let pw = store.get().unwrap_or_default();
-    if pw.is_empty() {
-        return Err("Vault is locked.".into());
+    let (records, plan) = plan_now()?;
+    if plan.host_entries_question() != asked {
+        return Err(
+            "Not deployed: the Host entries changed while you were deciding. Deploy again.".into(),
+        );
     }
-    let records = load_deploy_records(db, ids)?;
-    if records.is_empty() {
-        return Err("Select at least one key to deploy.".into());
-    }
-    let plan = plan_key_deploy(db, target, &records, fields)?;
     let by_id: std::collections::HashMap<&str, &KeyRecord> =
         records.iter().map(|k| (k.id.as_str(), k)).collect();
     let passphrase = passphrase.filter(|p| !p.is_empty());
@@ -5372,7 +5877,23 @@ fn key_deploy_in(
             db,
             "keys.deployed",
             None,
-            &format!("{} key(s): {}", files.len(), files.join(", ")),
+            &format!(
+                "{} key(s): {}; aliases {} HostName {} StrictHostKeyChecking {}",
+                files.len(),
+                files.join(", "),
+                outcome
+                    .deployed
+                    .iter()
+                    .map(|d| d.alias.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                fields.hostname.as_deref().unwrap_or("(alias)"),
+                match fields.strict_host_key {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unchanged",
+                },
+            ),
         );
     }
     if !outcome.errors.is_empty() {
@@ -5396,6 +5917,41 @@ fn key_deploy_in(
         "configPath": target.config_path.display().to_string(),
         "includeLine": plan.include_line(),
     }))
+}
+
+/// The native question about the `Host` entries of a deploy, one at a
+/// time, with the back-off after a "no" every credential question has.
+fn confirm_deploy_hosts(
+    db: &db::Database,
+    questions: &CredentialQuestions,
+    question: &str,
+    ask: ConfirmCredential<'_>,
+) -> CmdResult<()> {
+    let Some(_turn) = questions.begin() else {
+        return Err(CREDENTIAL_QUESTION_OPEN.into());
+    };
+    let kind = QuestionKind::KeyDeployHosts;
+    if questions.declined_lately(kind).is_some() {
+        return Err(DEPLOY_HOSTS_NOT_ALLOWED.into());
+    }
+    let prompt = CredentialPrompt {
+        title: "SSHSpan - Change where ssh and git connect?".to_string(),
+        message: question.to_string(),
+    };
+    let answer = ask(&prompt);
+    if answer == CredentialAnswer::NotAllowed {
+        questions.record_decline(kind, "key deploy");
+    }
+    if answer != CredentialAnswer::Allowed {
+        audit_or_log(
+            db,
+            "keys.deploy_declined",
+            None,
+            "Host entries not confirmed",
+        );
+        return Err(DEPLOY_HOSTS_NOT_ALLOWED.into());
+    }
+    Ok(())
 }
 
 /// Undo a deployment (A7-22 / A8-16): delete the key's deployed private key
@@ -6878,6 +7434,10 @@ const SETTINGS_KEYS: &[&str] = &[
     "terminalAppKeypad",
     "terminalBell",
     "confirmMultiLinePaste",
+    // Quick connect's "Save for future reconnects" tick, as last left.
+    "quickConnectSave",
+    // "Register sshspan:// links on this computer" (default on).
+    "deepLinkRegister",
 ];
 
 /// Settings that weaken the vault's protection when changed, so they cannot
@@ -6935,7 +7495,10 @@ fn setting_domain(key: &str) -> Option<SettingDomain> {
             min: 0,
             max: SFTP_MAX_BPS_LIMIT,
         },
-        "confirmDelete" | "autoUpdateCheck" | "sftpVerifyTransfers" => OneOf(TRUE_FALSE),
+        "confirmDelete" | "autoUpdateCheck" | "sftpVerifyTransfers" | "deepLinkRegister" => {
+            OneOf(TRUE_FALSE)
+        }
+        "quickConnectSave" => OneOf(ONE_ZERO),
         "confirmMultiLinePaste"
         | "sftpShowHidden"
         | "sftpShowOwnerCols"
@@ -7126,6 +7689,13 @@ fn settings_set_in(
         || (key.starts_with(SFTP_LOCAL_DIR_PREFIX) && key.len() > SFTP_LOCAL_DIR_PREFIX.len());
     if !known {
         return Err(format!("Unknown setting: {key}").into());
+    }
+    // A Quick connect that was not saved leaves nothing in the database.
+    if key.starts_with(&format!(
+        "{SFTP_LOCAL_DIR_PREFIX}{}",
+        crate::quick_connect::EPHEMERAL_PREFIX
+    )) {
+        return Err("Save this server to remember a local folder for it.".into());
     }
     if SECURITY_SETTINGS.contains(&key) {
         require_unlocked(vault)?;
@@ -8475,6 +9045,36 @@ mod rw_tests {
         assert!(cut.ends_with('\u{2026}'), "{cut}");
     }
 
+    /// A credential question cuts a long host at its start, never at the
+    /// registrable domain that names the recipient.
+    #[test]
+    fn dialog_host_and_address_keep_the_right_end_of_a_long_host() {
+        let host = format!(
+            "api.openai.com.{}.{}.attacker.example",
+            "a".repeat(60),
+            "b".repeat(40)
+        );
+        let quoted = dialog_host(&host, 60);
+        assert_eq!(quoted.chars().count(), 60);
+        assert!(quoted.starts_with('\u{2026}'), "{quoted}");
+        assert!(quoted.ends_with("attacker.example"), "{quoted}");
+        assert_eq!(dialog_host("example.com", 60), "example.com");
+        let address = dialog_address(&format!("https://{host}:8443/v1/{}", "p".repeat(300)), 20);
+        assert!(
+            address.starts_with(&format!("https://{host}:8443/v1/")),
+            "{address}"
+        );
+        assert!(address.ends_with('\u{2026}'), "{address}");
+        assert_eq!(dialog_address("not a url", 40), "not a url");
+        // A scheme the URL standard calls non-special has an opaque origin
+        // ("null"); the question must still name the receiving host.
+        assert_eq!(
+            dialog_address("ssh://attacker.example:2222/v1", 20),
+            "ssh://attacker.example:2222/v1"
+        );
+        assert!(dialog_address("git://host.example/x", 20).starts_with("git://host.example"));
+    }
+
     /// The last guard before the OS dialog: the message's own line breaks
     /// stay, every other control or invisible character goes - a NUL above
     /// all, which cut the Windows message and aborted the process under GTK.
@@ -9566,7 +10166,7 @@ mod fw_tests {
         }
         assert_eq!(
             (file_titles, message_titles),
-            (7, 3),
+            (8, 4),
             "the dialogs that take a title"
         );
     }

@@ -245,7 +245,10 @@ async function scenarioMenus(browser, server) {
     await page.waitForTimeout(80);
     let m = await menuState(page);
     check('A2-21 a key menu opened at the bottom-right corner stays on screen', m && m.inViewport, true);
-    check('A2-50 it is a menu with the same item', m && [m.role, m.labels], ['menu', ['Use this key to connect...']]);
+    // And "Add to PMXSpan..." (INTEGRATION-SPEC 3.2), disabled with its
+    // hint while PMXSpan is not found - as here, with no PMXSpan stub.
+    check('A2-50 it is a menu with the same item', m && [m.role, m.labels], ['menu', ['Use this key to connect...',
+      'Add to PMXSpan... PMXSpan was not found on this computer. Install it or set its path in Settings.']]);
     await page.keyboard.press('Escape');
 
     await page.evaluate(() => switchView('connect'));

@@ -89,6 +89,12 @@ pub struct Knobs {
     /// there is first replaced by a symbolic link to `link target` - someone
     /// swapping it between our LSTAT and our OPEN.
     pub swap_for_link_on_open: Option<(String, String)>,
+    /// `(opened path, folder to swap, link target)`, once: when an OPENDIR of
+    /// `opened path` arrives, the folder `folder to swap` (the folder itself or
+    /// one of its ancestors) is first moved aside and replaced by a symbolic
+    /// link to `link target` - another user of a shared folder swapping it
+    /// between our LSTAT and our listing.
+    pub swap_dir_for_link_on_opendir: Option<(String, String, String)>,
 }
 
 /// What a test holds on to besides the client session.
@@ -439,6 +445,22 @@ impl russh_sftp::server::Handler for FsHandler {
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         if self.knobs.lock().unwrap().unlistable.contains(&path) {
             return Err(StatusCode::PermissionDenied);
+        }
+        let swap = {
+            let mut knobs = self.knobs.lock().unwrap();
+            match &knobs.swap_dir_for_link_on_opendir {
+                Some((opened, _, _)) if *opened == path => {
+                    knobs.swap_dir_for_link_on_opendir.take()
+                }
+                _ => None,
+            }
+        };
+        if let Some((_, folder, target)) = swap {
+            let at = self.real(&folder);
+            let mut aside = at.clone().into_os_string();
+            aside.push(".moved");
+            std::fs::rename(&at, aside).unwrap();
+            std::os::unix::fs::symlink(target, at).unwrap();
         }
         let real = self.real(&path);
         if let Some(code) = self.knobs.lock().unwrap().opendir_file_status {

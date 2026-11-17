@@ -25,6 +25,13 @@
     },
     "withGlobalTauri": true
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["sshspan"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

@@ -142,6 +142,28 @@ fn folder_settings_locations(config: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where the desktop's opener (xdg-open, gio, kde-open) looks up which
+/// program handles a file type or a URL scheme: the desktop entries in the XDG
+/// data folders (`applications`: also `mimeapps.list`, `defaults.list`,
+/// `mimeinfo.cache` and SSHSpan's own `sshspan://` handler entry) and the
+/// `mimeapps.list` files in the XDG config folders. A file written there
+/// decides what SSHSpan's own opener calls start.
+const DATA_HANDLER_DIRS: [&str; 1] = ["applications"];
+
+/// The handler-association locations in the XDG config folders `config` and
+/// data folders `data` ([`DATA_HANDLER_DIRS`]). Pure so the layout can be
+/// unit-tested anywhere.
+fn handler_settings_locations(config: &[PathBuf], data: &[PathBuf]) -> Vec<PathBuf> {
+    config
+        .iter()
+        .map(|c| c.join("mimeapps.list"))
+        .chain(
+            data.iter()
+                .flat_map(|d| DATA_HANDLER_DIRS.iter().map(move |rel| join_parts(d, rel))),
+        )
+        .collect()
+}
+
 /// The user's own command folders, which are (or are typically) on the PATH:
 /// a program planted there runs in place of the one the user meant.
 const HOME_PATH_DIRS: [&str; 2] = [".local/bin", "bin"];
@@ -427,6 +449,11 @@ struct Locations {
     program_files: Vec<PathBuf>,
     /// The XDG user-dirs settings ([`folder_settings_locations`]).
     folder_settings: Vec<PathBuf>,
+    /// Where the desktop looks up the program for a file type or URL scheme
+    /// ([`handler_settings_locations`]).
+    handler_settings: Vec<PathBuf>,
+    /// The XDG config folders, where `<desktop>-mimeapps.list` is read too.
+    config_dirs: Vec<PathBuf>,
     /// SSHSpan's program: the install folder (or the executable), the `.app`
     /// bundle, the running AppImage ([`app_program_locations`]).
     app_program: Vec<PathBuf>,
@@ -452,8 +479,14 @@ impl Locations {
         let path: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|p| std::env::split_paths(&p).collect())
             .unwrap_or_default();
-        let (mut startup_dirs, mut shell_startup, mut program_files, folder_settings) = match &home
-        {
+        let (
+            mut startup_dirs,
+            mut shell_startup,
+            mut program_files,
+            folder_settings,
+            handler_settings,
+            config_dirs,
+        ) = match &home {
             Some(home) => {
                 let config = distinct([Some(home.join(".config")), env_dir("XDG_CONFIG_HOME")]);
                 let data = distinct([
@@ -466,9 +499,11 @@ impl Locations {
                     shell,
                     home_program_locations(home, &config, &path),
                     folder_settings_locations(&config),
+                    handler_settings_locations(&config, &data),
+                    config,
                 )
             }
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            None => Default::default(),
         };
         if cfg!(windows) {
             startup_dirs.extend(windows_startup_dirs(
@@ -532,6 +567,8 @@ impl Locations {
             shell_startup,
             program_files,
             folder_settings,
+            handler_settings,
+            config_dirs,
             app_program: program.files,
             app_program_dll_dirs: program.dll_dirs,
             app_data: app_data_locations(&own, &bases, home.as_deref()),
@@ -552,6 +589,8 @@ impl Locations {
             shell_startup: all(self.shell_startup),
             program_files: all(self.program_files),
             folder_settings: all(self.folder_settings),
+            handler_settings: all(self.handler_settings),
+            config_dirs: all(self.config_dirs),
             app_program: all(self.app_program),
             app_program_dll_dirs: all(self.app_program_dll_dirs),
             app_data: all(self.app_data),
@@ -638,6 +677,10 @@ pub(crate) struct SensitiveLocations {
     shell_startup: Vec<Protected>,
     program_files: Vec<Protected>,
     folder_settings: Vec<Protected>,
+    /// The handler associations ([`handler_settings_locations`]).
+    handler_settings: Vec<Protected>,
+    /// The XDG config folders: `<desktop>-mimeapps.list` directly in one.
+    config_dirs: Vec<Protected>,
     /// SSHSpan's program: refused for writes and deletes - a dialog-approved
     /// write included; reading stays allowed.
     app_program: Vec<Protected>,
@@ -711,6 +754,11 @@ impl SensitiveLocations {
         if covered(&self.managed_config_dir) {
             return Some(MANAGED_CONFIG_REFUSAL);
         }
+        // Before the `.pub` allowance below: a file named like a public key
+        // is still what SSHSpan wrote if it is one of its exports.
+        if is_own_secret_export(path) {
+            return Some(OWN_EXPORT_READ_REFUSAL);
+        }
         let public_key = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pub"));
@@ -757,12 +805,26 @@ impl SensitiveLocations {
         if any(&self.folder_settings) {
             return Some(WriteHit::FolderSettings);
         }
+        if any(&self.handler_settings) || self.is_desktop_mimeapps(path) {
+            return Some(WriteHit::HandlerSettings);
+        }
         // A DLL beside the executable, a replaced AppImage or a file in the
         // webview's profile loads or runs at SSHSpan's next start.
         if self.holds_program(path) || any(&self.app_data) {
             return Some(WriteHit::AppFiles);
         }
         None
+    }
+
+    /// Whether `path` is a `<desktop>-mimeapps.list` directly in an XDG config
+    /// folder (`gnome-mimeapps.list`, `kde-mimeapps.list`, ...).
+    fn is_desktop_mimeapps(&self, path: &std::path::Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_ascii_lowercase().ends_with("-mimeapps.list"))
+            && path
+                .parent()
+                .is_some_and(|dir| self.config_dirs.iter().any(|c| c.is(dir)))
     }
 
     /// Whether `path` is SSHSpan's program: in the install folder, the
@@ -853,6 +915,9 @@ impl SensitiveLocations {
         if self.folder_settings.iter().any(holds) {
             return Some("your folder settings (user-dirs.dirs)");
         }
+        if self.handler_settings.iter().any(holds) {
+            return Some("your file-type and link handler settings (mimeapps.list, applications)");
+        }
         if self.app_program.iter().any(holds) || self.app_data.iter().any(holds) {
             return Some("SSHSpan's own program or data files");
         }
@@ -867,6 +932,127 @@ const APP_FILES_REFUSAL: &str = "SSHSpan's own program and data folders (where i
 const SSH_DIR_WRITE_REFUSAL: &str =
     "The ~/.ssh folder is off-limits for SFTP downloads and local changes.";
 
+/// What an upload of a private-key export or vault backup SSHSpan wrote is
+/// refused with.
+const OWN_EXPORT_READ_REFUSAL: &str =
+    "Private keys and backups that SSHSpan exported cannot be uploaded.";
+
+/// The config row that keeps [`OWN_SECRET_EXPORTS`] across restarts.
+const OWN_SECRET_EXPORTS_KEY: &str = "own_secret_exports";
+
+/// The most exports remembered; the oldest are forgotten first.
+const OWN_SECRET_EXPORTS_MAX: usize = 256;
+
+/// A secret file SSHSpan itself wrote: where, and - where the platform says
+/// it - which file ((device, inode)), so a rename or a link of it is still it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnSecretExport {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+/// (device, inode, length, modified seconds, modified nanoseconds). The
+/// length and time are what stop a *reused* inode - the number a deleted
+/// export leaves behind - from claiming an unrelated file as the export,
+/// while a rename or a hard link of the export (same file, same bytes, same
+/// time) still matches.
+type FileIdentity = (u64, u64, u64, i64, i64);
+
+/// The private-key exports and vault backups SSHSpan wrote. They hold plaintext
+/// private keys or the sealed vault, so - like `~/.ssh` and the vault
+/// database - the renderer cannot make an upload of them: the upload read
+/// rule ([`SensitiveLocations::read_refusal`]) refuses them wherever the
+/// user saved them (Downloads by default). Read live, not from the cached
+/// [`SensitiveLocations`]: an export is covered the moment it is written.
+static OWN_SECRET_EXPORTS: std::sync::Mutex<Vec<OwnSecretExport>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Remember the secret file just written at `path` (in memory), whatever its
+/// name or folder. Returns the list to persist.
+fn remember_own_secret_export(path: &std::path::Path) -> Vec<PathBuf> {
+    let entry = OwnSecretExport {
+        path: resolved_local_path(path),
+        identity: file_identity(path),
+    };
+    let mut list = OWN_SECRET_EXPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    list.retain(|e| e.path != entry.path);
+    list.push(entry);
+    let excess = list.len().saturating_sub(OWN_SECRET_EXPORTS_MAX);
+    list.drain(..excess);
+    list.iter().map(|e| e.path.clone()).collect()
+}
+
+/// Record a private-key export or vault backup SSHSpan just wrote to `path`:
+/// remembered now, and kept in the vault's config for the next start. A
+/// database error is logged - the file is covered for this run regardless.
+pub(crate) fn record_own_secret_export(db: &crate::db::Database, path: &std::path::Path) {
+    let paths = remember_own_secret_export(path);
+    let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    let saved = serde_json::to_string(&text)
+        .map_err(|e| e.to_string())
+        .and_then(|json| {
+            db.set_config(OWN_SECRET_EXPORTS_KEY, &json)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = saved {
+        log::warn!("[sshspan] the exported file could not be remembered for the next start: {e}");
+    }
+}
+
+/// Load the exports of earlier runs (at startup).
+pub(crate) fn load_own_secret_exports(db: &crate::db::Database) {
+    let Ok(Some(json)) = db.get_config(OWN_SECRET_EXPORTS_KEY) else {
+        return;
+    };
+    let Ok(paths) = serde_json::from_str::<Vec<String>>(&json) else {
+        return;
+    };
+    for path in paths {
+        let path = PathBuf::from(path);
+        let mut list = OWN_SECRET_EXPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !list.iter().any(|e| e.path == path) {
+            let identity = file_identity(&path);
+            list.push(OwnSecretExport { path, identity });
+        }
+    }
+}
+
+/// Whether `path` is a secret file SSHSpan wrote: the same path, or the same
+/// file under another name. A comparison against the list in memory, plus one
+/// stat of `path` while the list is not empty.
+fn is_own_secret_export(path: &std::path::Path) -> bool {
+    let list = OWN_SECRET_EXPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if list.is_empty() {
+        return false;
+    }
+    let identity = file_identity(path);
+    list.iter().any(|e| {
+        super::path_starts_with(path, &e.path) && super::path_starts_with(&e.path, path)
+            || (identity.is_some() && identity == e.identity)
+    })
+}
+
 /// What an upload of anything in `~/.ssh` but a public key is refused with.
 const SSH_DIR_READ_REFUSAL: &str =
     "Private keys and other files in ~/.ssh cannot be uploaded (public .pub keys can).";
@@ -877,6 +1063,9 @@ const PROGRAM_SETTINGS_REFUSAL: &str = "Your folders on the PATH and settings th
 
 /// What a write to the XDG user-dirs settings is refused with.
 const FOLDER_SETTINGS_REFUSAL: &str = "Your folder settings (user-dirs.dirs, user-dirs.locale) are off-limits for SFTP downloads and local changes.";
+
+/// What a write to the file-type and link handler settings is refused with.
+const HANDLER_SETTINGS_REFUSAL: &str = "Your file-type and link handler settings (mimeapps.list and the applications folder) are off-limits for SFTP downloads and local changes.";
 
 /// What a text export into SSHSpan's data folder (the vault) is refused
 /// with. (`validate_export_path` refuses it first, in words of its own.)
@@ -897,6 +1086,9 @@ const EXPORT_PROGRAM_SETTINGS_REFUSAL: &str = "Your folders on the PATH and sett
 
 /// What a text export to the XDG user-dirs settings is refused with.
 const EXPORT_FOLDER_SETTINGS_REFUSAL: &str = "Your folder settings (user-dirs.dirs, user-dirs.locale) are off-limits for exports - choose another file.";
+
+/// What a text export to the handler settings is refused with.
+const EXPORT_HANDLER_SETTINGS_REFUSAL: &str = "Your file-type and link handler settings (mimeapps.list and the applications folder) are off-limits for exports - choose another file.";
 
 /// What a text export into SSHSpan's own program or data folders is refused
 /// with.
@@ -921,6 +1113,8 @@ enum WriteHit {
     ProgramSettings,
     /// The XDG user-dirs settings.
     FolderSettings,
+    /// The file-type and link handler associations.
+    HandlerSettings,
     /// SSHSpan's own program or data folders.
     AppFiles,
 }
@@ -936,6 +1130,7 @@ impl WriteHit {
             Self::ShellStartup => SHELL_STARTUP_REFUSAL,
             Self::ProgramSettings => PROGRAM_SETTINGS_REFUSAL,
             Self::FolderSettings => FOLDER_SETTINGS_REFUSAL,
+            Self::HandlerSettings => HANDLER_SETTINGS_REFUSAL,
             Self::AppFiles => APP_FILES_REFUSAL,
         }
     }
@@ -950,6 +1145,7 @@ impl WriteHit {
             Self::ShellStartup => EXPORT_SHELL_STARTUP_REFUSAL,
             Self::ProgramSettings => EXPORT_PROGRAM_SETTINGS_REFUSAL,
             Self::FolderSettings => EXPORT_FOLDER_SETTINGS_REFUSAL,
+            Self::HandlerSettings => EXPORT_HANDLER_SETTINGS_REFUSAL,
             Self::AppFiles => EXPORT_APP_FILES_REFUSAL,
         }
     }
@@ -1593,8 +1789,34 @@ fn remove_remote_tree<'a>(
                 .await
                 .map_err(|e| format!("rm {path}: {}", sftp_error_detail(e)));
         }
-        remove_tree_below(sftp, path).await
+        let real = sftp
+            .canonicalize(path)
+            .await
+            .map_err(|e| format!("REALPATH {path} failed: {}", sftp_error_detail(e)))?;
+        remove_tree_below(sftp, path, &real).await
     })
+}
+
+/// Whether `path` still resolves to `real`, the REALPATH it had when it was
+/// classified as a folder. SFTP v3 has no calls relative to an open folder, so
+/// every step inside one is a path that is looked up again: another user of a
+/// shared folder can swap the folder - or one of its ancestors - for a link
+/// between two steps. A walk checks this before it lists a folder and right
+/// before each change in it, and stops that folder when it fails. (Server
+/// REALPATH resolves links, as OpenSSH's does; one round trip stays open
+/// between the check and the change - see docs/SECURITY.md.)
+async fn still_resolves_to(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    real: &str,
+) -> Result<(), String> {
+    match sftp.canonicalize(path).await {
+        Ok(now) if now == real => Ok(()),
+        _ => Err(format!(
+            "{path} changed while it was being worked on (it no longer leads to {real}); \
+             nothing more was changed there"
+        )),
+    }
 }
 
 /// Depth-first recursive delete of a remote directory tree. Children are
@@ -1602,12 +1824,19 @@ fn remove_remote_tree<'a>(
 /// unlinked, never followed - `symlink_metadata` classifies the link itself.
 /// An entry whose type the server leaves out is removed by
 /// [`remove_untyped`]: REMOVE first, a folder only if it resolves to itself.
+///
+/// `real` is the REALPATH `path` had when it was classified as a folder
+/// ([`still_resolves_to`]): checked before the listing and before every
+/// change in the folder, so a folder another user swapped for a link stops
+/// the walk instead of being emptied through the link.
 fn remove_tree_below<'a>(
     sftp: &'a russh_sftp::client::SftpSession,
     path: &'a str,
+    real: &'a str,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
         let mut first_err: Option<String> = None;
+        still_resolves_to(sftp, path, real).await?;
         let mut entries = sftp
             .read_dir(path)
             .await
@@ -1629,15 +1858,19 @@ fn remove_tree_below<'a>(
                     continue;
                 }
             };
+            // Right before acting on the entry: the folder is still the one
+            // that was classified, so `child` is inside it.
+            still_resolves_to(sftp, path, real).await?;
+            let child_real = join_remote(real, &name);
             let res = match classify_attrs(&md) {
-                Some(EntryKind::Dir) => remove_tree_below(sftp, &child).await,
+                Some(EntryKind::Dir) => remove_tree_below(sftp, &child, &child_real).await,
                 // Links and everything else are unlinked; a link is never
                 // followed.
                 Some(_) => sftp
                     .remove_file(&child)
                     .await
                     .map_err(|e| format!("rm {child}: {}", sftp_error_detail(e))),
-                None => remove_untyped(sftp, &child).await,
+                None => remove_untyped(sftp, &child, &child_real).await,
             };
             if let Err(e) = res {
                 if first_err.is_none() {
@@ -1645,6 +1878,7 @@ fn remove_tree_below<'a>(
                 }
             }
         }
+        still_resolves_to(sftp, path, real).await?;
         // rmdir regardless, so a partially-emptied dir still goes away when it
         // became empty; surface the first child error only if the dir remains.
         if let Err(e) = sftp.remove_dir(path).await {
@@ -1665,7 +1899,11 @@ fn remove_tree_below<'a>(
 /// the entry opened as a folder, and since that follows a link, it is
 /// emptied only when it resolves to itself (see [`resolves_to_itself`]);
 /// anything else is left, with REMOVE's error.
-async fn remove_untyped(sftp: &russh_sftp::client::SftpSession, child: &str) -> Result<(), String> {
+async fn remove_untyped(
+    sftp: &russh_sftp::client::SftpSession,
+    child: &str,
+    child_real: &str,
+) -> Result<(), String> {
     let refused = match sftp.remove_file(child).await {
         Ok(()) => return Ok(()),
         Err(e) => format!("rm {child}: {}", sftp_error_detail(e)),
@@ -1674,7 +1912,7 @@ async fn remove_untyped(sftp: &russh_sftp::client::SftpSession, child: &str) -> 
         return Err(refused);
     }
     match resolves_to_itself(sftp, child, &mut RealFolder::default()).await {
-        Ok(true) => remove_tree_below(sftp, child).await,
+        Ok(true) => remove_tree_below(sftp, child, child_real).await,
         Ok(false) => Err(format!(
             "{refused} (it leads to a folder somewhere else, which was left alone)"
         )),
@@ -4710,10 +4948,18 @@ const CHMOD_MAX_ENTRIES: usize = 200_000;
 /// the first error and leaving a half-applied tree with no account of what
 /// changed. `apply` gets each entry's kind (see [`chmod_path`] for what it
 /// does with it). `root` itself is the caller's business.
-async fn chmod_walk<L, LF, A, AF>(
+///
+/// `root_real` is the REALPATH `root` had when it was classified as a folder;
+/// `verify(dir, real)` says whether a folder still resolves to its `real`
+/// ([`still_resolves_to`]). It is asked before a folder is listed and right
+/// before each change in it: a folder (or an ancestor) another user swapped
+/// for a link stops the walk in that folder, and is recorded.
+async fn chmod_walk<L, LF, A, AF, V, VF>(
     root: &str,
+    root_real: &str,
     mut list: L,
     mut apply: A,
+    mut verify: V,
     apply_files: bool,
     apply_dirs: bool,
 ) -> ChmodOutcome
@@ -4722,11 +4968,18 @@ where
     LF: Future<Output = Result<Vec<ListedEntry>, String>>,
     A: FnMut(String, EntryKind) -> AF,
     AF: Future<Output = Result<(), String>>,
+    V: FnMut(String, String) -> VF,
+    VF: Future<Output = Result<(), String>>,
 {
     let mut out = ChmodOutcome::default();
-    let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
+    let mut stack: Vec<(String, usize, String)> =
+        vec![(root.to_string(), 0, root_real.to_string())];
     let mut seen = 0usize;
-    'walk: while let Some((dir, depth)) = stack.pop() {
+    'walk: while let Some((dir, depth, real)) = stack.pop() {
+        if let Err(e) = verify(dir.clone(), real.clone()).await {
+            out.failed.push(e);
+            continue;
+        }
         let listing = match list(dir.clone()).await {
             Ok(listing) => listing,
             Err(e) => {
@@ -4769,13 +5022,20 @@ where
                 continue;
             }
             if wanted {
+                // Right before the change: the folder is still the one that
+                // was classified, so `child` is inside it.
+                if let Err(e) = verify(dir.clone(), real.clone()).await {
+                    out.failed.push(e);
+                    continue 'walk;
+                }
                 match apply(child.clone(), entry.kind).await {
                     Ok(()) => out.changed += 1,
                     Err(e) => out.failed.push(e),
                 }
             }
             if entry.kind == EntryKind::Dir {
-                stack.push((child, depth + 1));
+                let child_real = join_remote(&real, &entry.name);
+                stack.push((child, depth + 1, child_real));
             }
         }
     }
@@ -5794,6 +6054,10 @@ pub fn sftp_bookmarks_save(
     server_id: String,
     bookmarks: serde_json::Value,
 ) -> CmdResult<serde_json::Value> {
+    // A Quick connect that was not saved leaves nothing in the database.
+    if crate::quick_connect::is_ephemeral_id(&server_id) {
+        return Err("Save this server to keep bookmarks for it.".into());
+    }
     let key = format!("sftp.bookmarks.{server_id}");
     let json = serde_json::to_string(&bookmarks).map_err(|e| e.to_string())?;
     app.state::<AppState>()
@@ -5828,7 +6092,20 @@ fn local_owner_bits(_md: &std::fs::Metadata) -> (Option<u32>, Option<u32>, Optio
 /// command runs on the MAIN thread, so listing a huge directory or an
 /// unresponsive network/removable drive froze the whole window.
 #[tauri::command]
-pub async fn sftp_local_list(path: String) -> CmdResult<serde_json::Value> {
+pub async fn sftp_local_list(app: AppHandle, path: String) -> CmdResult<serde_json::Value> {
+    local_list_in(app.state::<super::VaultPasswordStore>().inner(), path).await
+}
+
+/// [`sftp_local_list`] without the `AppHandle`. Like every other command that
+/// touches the local disk for the user, it needs an unlocked vault: a page
+/// must not enumerate directories on an unattended, auto-locked machine.
+async fn local_list_in(
+    vault: &super::VaultPasswordStore,
+    path: String,
+) -> CmdResult<serde_json::Value> {
+    if vault.get().unwrap_or_default().is_empty() {
+        return Err(CmdError("Vault is locked.".into()));
+    }
     tokio::task::spawn_blocking(move || local_list_blocking(path))
         .await
         .map_err(|e| CmdError(format!("Listing failed: {e}")))?
@@ -6220,6 +6497,12 @@ async fn chmod_path(
     let mut changed = 0u32;
     let mut outcome = ChmodOutcome::default();
     if root == EntryKind::Dir {
+        // Where the picked folder leads now (a link the user picked is
+        // followed, like `chmod -R` on one): the walk stays inside it.
+        let root_real = sftp
+            .canonicalize(path)
+            .await
+            .map_err(|e| format!("REALPATH {path} failed: {}", sftp_error_detail(e)))?;
         // Apply to the root path itself according to the dirs rule, then walk.
         if apply_dirs {
             chmod_one(sftp, path, mode).await?;
@@ -6233,6 +6516,7 @@ async fn chmod_path(
         let file_mode = mode & 0o777;
         outcome = chmod_walk(
             path,
+            &root_real,
             |dir| async move { list_remote_dir(sftp, &dir).await },
             |entry, kind| async move {
                 let mode = if kind == EntryKind::Dir {
@@ -6242,6 +6526,7 @@ async fn chmod_path(
                 };
                 chmod_one(sftp, &entry, mode).await
             },
+            |dir, real| async move { still_resolves_to(sftp, &dir, &real).await },
             apply_files,
             apply_dirs,
         )
@@ -7329,6 +7614,7 @@ mod tests {
         let log: RefCell<Vec<String>> = RefCell::new(Vec::new());
         let outcome = chmod_walk(
             "/t",
+            "/t",
             |dir: String| {
                 log.borrow_mut().push(format!("list {dir}"));
                 std::future::ready(tree.get(&dir).cloned().unwrap_or_else(|| Ok(Vec::new())))
@@ -7341,6 +7627,7 @@ mod tests {
                     Ok(())
                 })
             },
+            |_dir: String, _real: String| std::future::ready(Ok(())),
             apply_files,
             apply_dirs,
         )
@@ -7466,8 +7753,10 @@ mod tests {
 
         let outcome = chmod_walk(
             "/t",
+            "/t",
             |dir| async move { list_remote_dir(sftp_ref, &dir).await },
             |p, _| async move { chmod_one(sftp_ref, &p, 0o600).await },
+            |dir, real| async move { still_resolves_to(sftp_ref, &dir, &real).await },
             true,
             true,
         )
@@ -9558,7 +9847,11 @@ mod tests {
         std::fs::write(dir.join("b.txt"), b"12345").unwrap();
         std::fs::write(dir.join("a.txt"), b"1").unwrap();
 
-        let v = sftp_local_list(dir.display().to_string()).await.unwrap();
+        let vault = super::super::VaultPasswordStore::new();
+        vault.set("pw".into());
+        let v = local_list_in(&vault, dir.display().to_string())
+            .await
+            .unwrap();
 
         let names: Vec<&str> = v["entries"]
             .as_array()
@@ -9574,9 +9867,15 @@ mod tests {
         assert_eq!(v["entries"][2]["size"], 5);
         assert_eq!(v["entries"][0]["isDir"], true);
         assert_eq!(v["path"], dir.display().to_string());
-        assert!(sftp_local_list(dir.join("missing").display().to_string())
-            .await
-            .is_err());
+        assert!(
+            local_list_in(&vault, dir.join("missing").display().to_string())
+                .await
+                .is_err()
+        );
+        // A locked vault lists nothing: not even a folder that exists.
+        vault.clear();
+        let locked = local_list_in(&vault, dir.display().to_string()).await;
+        assert_eq!(locked.unwrap_err().0, "Vault is locked.");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -10009,6 +10308,8 @@ mod tests {
             shell_startup: vec![base.join("home/.bashrc")],
             program_files: vec![base.join("home/.gitconfig")],
             folder_settings: folder_settings_locations(&[join_parts(base, "home/.config")]),
+            handler_settings: Vec::new(),
+            config_dirs: Vec::new(),
             app_program: vec![
                 base.join("opt/SSHSpan"),
                 base.join("home/Apps/SSHSpan.AppImage"),
@@ -11862,6 +12163,90 @@ mod tests {
         }
     }
 
+    /// The files that decide which program the desktop's opener starts - the
+    /// desktop entries in the XDG data folders and the mimeapps lists in the
+    /// XDG config folders, including the ones an `XDG_*_HOME` moves - are
+    /// refused for writes, picked in the dialog or typed, and for exports,
+    /// and a folder holding them cannot be deleted. Reading stays allowed.
+    #[cfg(unix)]
+    #[test]
+    fn sec_xdg_handler_association_files_are_refused_for_writes() {
+        let base = std::path::PathBuf::from("/fixture");
+        let home = base.join("home");
+        let config = [home.join(".config"), PathBuf::from("/x/cfg")];
+        let data = [join_parts(&home, ".local/share"), PathBuf::from("/x/data")];
+        let s = Locations {
+            handler_settings: handler_settings_locations(&config, &data),
+            config_dirs: config.to_vec(),
+            ..fixture_locations(&base)
+        }
+        .resolve();
+        let refused = [
+            join_parts(&home, ".local/share/applications/evil.desktop"),
+            join_parts(&home, ".local/share/applications/mimeinfo.cache"),
+            join_parts(&home, ".local/share/applications/sshspan-handler.desktop"),
+            join_parts(&home, ".config/mimeapps.list"),
+            join_parts(&home, ".config/gnome-mimeapps.list"),
+            join_parts(&home, ".config/KDE-mimeapps.list"),
+            PathBuf::from("/x/cfg/mimeapps.list"),
+            PathBuf::from("/x/cfg/sway-mimeapps.list"),
+            PathBuf::from("/x/data/applications/evil.desktop"),
+        ];
+        for p in &refused {
+            for access in [LocalAccess::Write, LocalAccess::DialogWrite] {
+                assert_eq!(
+                    s.path_refusal(p, p, access),
+                    Some(HANDLER_SETTINGS_REFUSAL),
+                    "{}",
+                    p.display()
+                );
+            }
+            assert_eq!(
+                export_refusal(p, &s, false),
+                Some(EXPORT_HANDLER_SETTINGS_REFUSAL),
+                "{}",
+                p.display()
+            );
+            assert_eq!(s.path_refusal(p, p, LocalAccess::Read), None, "reads stay");
+        }
+        for p in [
+            join_parts(&home, ".local/share/applicationsx/a"),
+            join_parts(&home, ".local/share/other.desktop"),
+            join_parts(&home, ".config/mimeapps.list.d/a"),
+            join_parts(&home, ".config/sub/gnome-mimeapps.list"),
+            join_parts(&home, ".config/notes.txt"),
+        ] {
+            assert_eq!(
+                s.path_refusal(&p, &p, LocalAccess::Write),
+                None,
+                "{} stays writable",
+                p.display()
+            );
+        }
+        assert!(s
+            .held_by(&join_parts(&home, ".local/share/applications"))
+            .is_some());
+    }
+
+    /// This machine's handler files are on the write deny-list.
+    #[test]
+    fn sec_this_machines_handler_files_are_refused_for_writes() {
+        let Some(home) = dirs::home_dir() else { return };
+        for rel in [
+            ".local/share/applications/evil.desktop",
+            ".config/mimeapps.list",
+            ".config/gnome-mimeapps.list",
+        ] {
+            let p = join_parts(&home, rel).display().to_string();
+            assert_eq!(
+                validate_sftp_local_path(&p, LocalAccess::Write).map_err(|e| e.0),
+                Err(HANDLER_SETTINGS_REFUSAL.to_string()),
+                "{p}"
+            );
+            assert!(validate_sftp_local_path(&p, LocalAccess::Read).is_ok());
+        }
+    }
+
     /// The layout: the XDG folders the environment moves are
     /// covered as well as `~/.config` and `~/.local/share`, and the Windows
     /// PowerShell profiles sit in the real Documents folder and in
@@ -12015,6 +12400,62 @@ mod tests {
                 "untyped={untyped}"
             );
             assert_eq!(fx.read("/keep/precious"), b"keep me", "untyped={untyped}");
+        }
+    }
+
+    /// A folder - or one of its ancestors - that another user swaps for a
+    /// link between its classification and its listing is not walked: the
+    /// recursive delete and chmod re-check that the folder still leads where
+    /// it did, so nothing outside the picked folder is removed or changed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sec_recursive_delete_stops_at_a_folder_swapped_for_a_link() {
+        // (folder opened, folder swapped)
+        for (opened, swapped, kept) in [
+            ("/t/a", "/t/a", "/outside/f1"),
+            ("/t/a/b", "/t/a", "/outside/b/f1"),
+        ] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/t/a/b/mine", b"x");
+            fx.write("/t/a/f1", b"x");
+            fx.write("/outside/f1", b"keep");
+            fx.write("/outside/b/f1", b"keep");
+            fx.knobs.lock().unwrap().swap_dir_for_link_on_opendir =
+                Some((opened.into(), swapped.into(), "../outside".into()));
+
+            let result = remove_remote_tree(&sftp, "/t").await;
+
+            assert!(result.is_err(), "{opened}: the swap is reported");
+            assert_eq!(fx.read(kept), b"keep", "{opened}: outside file survives");
+            assert_eq!(fx.read("/outside/f1"), b"keep", "{opened}");
+            assert_eq!(fx.read("/outside/b/f1"), b"keep", "{opened}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sec_recursive_chmod_stops_at_a_folder_swapped_for_a_link() {
+        for (opened, swapped) in [("/t/a", "/t/a"), ("/t/a/b", "/t/a")] {
+            let (sftp, fx) = crate::sftp::testkit::serve().await;
+            fx.write("/t/a/b/mine", b"x");
+            fx.write("/t/a/f1", b"x");
+            fx.write("/outside/f1", b"keep");
+            fx.write("/outside/b/f1", b"keep");
+            for f in ["/outside/f1", "/outside/b/f1"] {
+                set_mode(&fx, f, 0o600);
+            }
+            fx.knobs.lock().unwrap().swap_dir_for_link_on_opendir =
+                Some((opened.into(), swapped.into(), "../outside".into()));
+
+            let result = chmod_path(&sftp, "/t", 0o777, true, true, true).await;
+
+            let result = result.unwrap();
+            assert!(
+                result["failedCount"].as_u64().unwrap() >= 1,
+                "{opened}: the swap is reported: {result}"
+            );
+            assert_eq!(fx.mode("/outside/f1"), 0o600, "{opened}");
+            assert_eq!(fx.mode("/outside/b/f1"), 0o600, "{opened}");
         }
     }
 
@@ -13102,6 +13543,101 @@ mod tests {
         assert!(key_export.contains("write_key_export("), "{key_export}");
         assert!(!key_export.contains("write_secret_file("), "{key_export}");
         assert!(body("fn export_backup_to_path(").contains("export_backup_to_path_with("));
+    }
+
+    /// A private-key export or a vault backup that SSHSpan wrote is no upload
+    /// source, wherever it was saved and whatever it is named (a `.pub`
+    /// name does not make it a public key), also after a rename; an ordinary
+    /// neighbour is still uploadable. The audit rows do not say where.
+    #[test]
+    fn sec_own_secret_exports_are_refused_as_upload_sources() {
+        let dir = std::env::temp_dir().join(format!("sshspan-own-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Database::open_at(dir.join("t.db")).unwrap();
+        let readable = |p: &std::path::Path| {
+            validate_sftp_local_path(&p.display().to_string(), LocalAccess::Read).map_err(|e| e.0)
+        };
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, b"hello").unwrap();
+        assert_eq!(readable(&other), Ok(()));
+
+        // A vault backup, through the command's own path.
+        let backup = dir.join("vault-backup.json");
+        assert_eq!(readable(&backup), Ok(()), "nothing is there yet");
+        super::super::export_backup_to_path(&db, "pw", &backup.display().to_string(), &|| Ok(()))
+            .unwrap();
+        assert_eq!(readable(&backup), Err(OWN_EXPORT_READ_REFUSAL.to_string()));
+        let audit = db.list_audit(10).unwrap();
+        assert!(
+            audit.iter().all(|a| !a.details.contains("vault-backup")),
+            "the audit row names no location: {audit:?}"
+        );
+
+        // A private-key export named like a public key.
+        let key = dir.join("id_ed25519.pub");
+        std::fs::write(&key, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        record_own_secret_export(&db, &key);
+        assert_eq!(readable(&key), Err(OWN_EXPORT_READ_REFUSAL.to_string()));
+        // Kept for the next start.
+        let kept = db.get_config(OWN_SECRET_EXPORTS_KEY).unwrap().unwrap();
+        assert!(kept.contains("id_ed25519.pub"), "{kept}");
+        #[cfg(unix)]
+        {
+            let renamed = dir.join("innocent.txt");
+            std::fs::rename(&key, &renamed).unwrap();
+            assert_eq!(
+                readable(&renamed),
+                Err(OWN_EXPORT_READ_REFUSAL.to_string()),
+                "the same file under another name"
+            );
+        }
+        assert_eq!(readable(&other), Ok(()), "other files are unaffected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deleted export leaves its inode number behind, and the filesystem
+    /// may hand that number to the next file created. An unrelated file that
+    /// shares only the (device, inode) of a remembered export is not the
+    /// export; the same file under another name still is.
+    #[cfg(unix)]
+    #[test]
+    fn sec_a_reused_inode_does_not_make_an_unrelated_file_an_own_export() {
+        let dir = std::env::temp_dir().join(format!("sshspan-ino-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("unrelated.txt");
+        std::fs::write(&file, b"an ordinary file").unwrap();
+        let (dev, ino, len, sec, nsec) = file_identity(&file).unwrap();
+
+        // What a deleted export would have left: same device and inode, but a
+        // different length (and time).
+        let stale = dir.join("deleted-export.json");
+        let mut list = OWN_SECRET_EXPORTS.lock().unwrap();
+        list.push(OwnSecretExport {
+            path: stale.clone(),
+            identity: Some((dev, ino, len + 7, sec - 3, nsec)),
+        });
+        drop(list);
+        assert!(
+            !is_own_secret_export(&file),
+            "a shared inode number alone is not the export"
+        );
+
+        // The real thing: the same file (same bytes and time) is the export,
+        // whatever it is now called.
+        let mut list = OWN_SECRET_EXPORTS.lock().unwrap();
+        list.retain(|e| e.path != stale);
+        list.push(OwnSecretExport {
+            path: stale.clone(),
+            identity: Some((dev, ino, len, sec, nsec)),
+        });
+        drop(list);
+        assert!(is_own_secret_export(&file), "the export under another name");
+
+        OWN_SECRET_EXPORTS
+            .lock()
+            .unwrap()
+            .retain(|e| e.path != stale);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── SFTP errors say what failed, once ───────────────────────────────

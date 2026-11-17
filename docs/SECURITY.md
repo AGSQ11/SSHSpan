@@ -190,7 +190,12 @@ neither bring a Bitwarden destination nor confirm one.
 Restore picks and reads the file in Rust (32 MiB cap). If the backup was sealed under a different
 master password and none was supplied, nothing is restored: Rust answers `needsPassword` and issues
 a single-use, five-minute grant for that one file. With the old password, readable blobs are
-re-sealed under the current password and undecryptable ones are counted and excluded. Restored
+re-sealed under the current password and undecryptable ones are counted and excluded. A restored
+key's type, line and fingerprints are derived from its private half, whose own stored public half
+must match what the private part produces (also checked when a key file is imported); a row that
+claims others, that holds a fingerprint another id has, or that would replace another key or blank
+its private half under the same id is refused and counted (`keysRefused`), and servers that used a
+refused row move to the id that already holds the same key or lose the key. Restored
 known-host pins are marked imported and must be confirmed on a live connection, restored MCP
 servers come back inert with tools disabled, and restored settings pass the same key/value
 validation as `settings_set` (rejected entries are counted). A restore holds the shared rotation
@@ -208,7 +213,8 @@ watchdog and every exit:
 2. kill interactive SSH sessions;
 3. stop SFTP edit watches and best-effort delete their staged local copies;
 4. stop SFTP keepalives, clear SFTP handles, and pause queued/active transfers;
-5. clear backend AI access levels;
+5. clear backend AI access levels, the registry of unsaved Quick connect servers (the passwords
+   typed for them go with it) and the proposals that links handed to dialogs;
 6. drain MCP session/status state and end every MCP session at the endpoint it was set up with, one
    background task per session (each unseals its own credential on the blocking pool from one
    zeroizing copy of the password taken before the store clears);
@@ -305,6 +311,10 @@ and `%` or `${` in User, warn about a `%` in the config path and about the user'
 files/stanzas. Undeploy ("Remove deployed copy") deletes only direct `sshspan_*` files in the
 managed `~/.ssh` directory plus matching stanzas.
 
+A deploy that would turn host-key checking off, write a HostName other than the alias or a Port,
+change an existing stanza's destination, or overlap the user's own `Host` lines is asked about first
+in a native dialog the page cannot answer; "Don't allow" writes nothing.
+
 ## SSH, SFTP, and local paths
 
 ### SSH host keys and connections
@@ -316,7 +326,9 @@ keyed by `host:port`; a later mismatch is a hard refusal and is audited, and a c
 and a declined first-trust prompt are different errors. Fingerprints are shown as `SHA256:` base64
 without padding, the form `ssh-keygen -lf` prints. Connecting has a 20-second limit and
 authentication a 30-second limit (the time spent in the trust dialog is excluded) and a timed-out
-handshake shuts its socket down.
+handshake shuts its socket down. After an accepted first-use dialog the connection goes on only if
+the store pins exactly that key (a pin made meanwhile is a mismatch refusal). SSHSpan opens no
+forwarding, agent, X11 or reverse channels, so every channel a server opens to it is refused.
 
 A saved SSH password is unsealed only to use it, and is wiped on every return path. Editing a
 server keeps the saved password unless the user replaces or removes it. A saved password stays
@@ -385,6 +397,40 @@ program running as the user can write, so the listing treats every one as untrus
   (`server_save` trims only white space at either end, as for every server), and shown spelled out
   (see [Names of saved servers](#names-of-saved-servers)).
 
+### Quick connect and PMXSpan links
+
+- **Unsaved servers stay in memory.** Quick connect without saving registers its server in the
+  backend's `EphemeralRegistry` under a random `quick-` id; nothing is written to SQLite. A
+  password typed for it is held there in `Zeroizing` memory for as long as a tab uses it and is
+  never sealed; the vault lock clears the registry before the master password, and the tab's
+  close forgets the record. Host-key pinning, the connect and sign-in deadlines, the vault gate
+  and the audit log (`connect.quick`) are the saved-server paths unchanged.
+- **Links are untrusted input, validated in Rust.** `handoff::parse_link` enforces the version
+  (`v=1`), an 8192-byte cap, strict percent-decoding (no `+` as space, no broken escapes, UTF-8
+  only), one value per field except `hostkey`, DNS-name or IP hosts, ports 1-65535, user names
+  `[A-Za-z0-9._@-]{1,64}`, names of at most 128 characters without control characters, VMIDs
+  100-999999999, host keys that parse as SSH wire-format public keys, and Unix-second rotation
+  times. The renderer receives typed values and opaque tokens only. A link received while the
+  vault is locked is held in memory (one, ten minutes) and never acted on before the unlock.
+- **Bundles are opened defensively.** Absolute path; `symlink_metadata` must show a regular file;
+  the open uses `O_NOFOLLOW | O_NONBLOCK` on Unix and the opened file must be the same inode; at
+  most 4 MiB is read; the SHA-256 from the link must match; format, version and a creation time
+  within the last hour are required. Unknown JSON members are ignored; a malformed host is a row
+  with its reason, not a refusal of the bundle.
+- **Proposed host keys never trust by themselves.** They are compared with the key the server
+  presents inside the native host-key check (`ssh_client::verify_host_key`): a match on an
+  unpinned host is pinned as `imported:pmxspan`; any other key on an unpinned host is refused with
+  both fingerprints, and the first-use dialog is only reachable by a separate reconnect with the
+  proposals set aside; a pinned host's key is replaced only after a native question that shows
+  both fingerprints and the reported rebuild time, and only when the presented key is a proposed
+  one. A backup restore never writes `imported:pmxspan`: restored pins stay `imported`.
+- **What goes to PMXSpan is public and built in Rust.** `pmxspan://guest|node` carry the stored
+  origin's ids; `pmxspan://add-key` carries `keys::sanitize_public_line` of the public key. The
+  executable path is either chosen in a native file dialog (`pmxspan_pick_path`) or discovered and
+  confirmed once in a native question with the one-second rule and the 30-second wait after a "no"
+  (`QuestionKind::PmxspanLaunch`); a changed path asks again. The program is started with the URL
+  as its only argument, with no shell.
+
 ### SFTP remote-side controls
 
 - remote names are sanitized before local use and every local path built from one is confined to
@@ -415,7 +461,8 @@ refuses:
 - for every access, including a path the user approved in a native dialog: the SSHSpan data
   directory (the vault) and system directories;
 - for reads (an upload source): also SSHSpan's managed config directory and everything under
-  `~/.ssh` except `*.pub`;
+  `~/.ssh` except `*.pub`, and every private-key export and vault backup SSHSpan wrote (remembered by
+  path and file identity, wherever it was saved; the audit rows do not name the location);
 - for writes, renames and deletes (download targets, new folders, the local pane): also SSHSpan's
   managed config directory, `~/.ssh`, startup folders and entries (the per-user and all-users
   Windows Startup folders, autostart entries, systemd user units, launch agents), shell startup
@@ -440,7 +487,9 @@ a dialog pick exempts nothing from the list. The text exports also need the pick
 a "Download as..." target without one is accepted under the same list.
 `~/.config/user-dirs.dirs` and `user-dirs.locale` are on the deny-list too, for typed and picked
 paths alike: a download over `user-dirs.dirs` could point the Downloads folder, where every save
-dialog opens, at a folder of the attacker's choosing. The private-key export and the vault backup,
+dialog opens, at a folder of the attacker's choosing. So are the file-type handler files the opener
+reads (`applications` in the XDG data folders, `mimeapps.list` and `*-mimeapps.list` in the XDG
+config folders). The private-key export and the vault backup,
 which Rust writes to a path picked in its own save dialog, are checked against the same list too,
 in the words of an export, with one exception: `~/.ssh` stays allowed for them, because exporting
 a private key to `~/.ssh/id_...` is an ordinary thing to do (the text exports still refuse it).
@@ -882,6 +931,14 @@ constants in `updater.rs`.
 
 Each is a known, deliberate state, with the reason it was left.
 
+- **A local program can send SSHSpan links.** Any program running as the user can start
+  `sshspan "sshspan://..."` or open such a link; SSHSpan cannot tell PMXSpan from another sender.
+  The consequences are bounded to a prefilled dialog: proposed host keys are verified against the
+  live key and refused when they differ, nothing is saved or connected without the user, and a host key is pinned without the first-use
+  dialog only when the host presents exactly a key the link proposed (a local program can send such
+  a link),
+  and a bundle path is opened only under the checks above. A stored proposal applies to its
+  `host:port` until the host is pinned; Settings > Known hosts does not list proposals.
 - **Renderer-attested approvals gate actions only.** A compromised renderer can claim that a
   human clicked Approve for an AI command, an MCP tool call or an update. Rust cannot observe the
   click. Destinations for secrets are therefore bound in Rust where that matters (native
@@ -892,6 +949,7 @@ Each is a known, deliberate state, with the reason it was left.
   locations listed under [SFTP local-path boundary](#sftp-local-path-boundary) and anything else
   is reachable from a compromised renderer. A grant model needs dialog-picked destinations and
   upload sources, a larger change that was not made.
+  Listing a local folder (`sftp_local_list`) needs an unlocked vault, like every local-pane command.
 - **A network share as a local path can still start a Windows sign-in (part of A6-02).** On
   Windows, a local path that a compromised renderer supplies for an SFTP command, or as the target
   of `system_open_external`, can name a network share (`\\host\...`, `\\?\UNC\...`), and checking
@@ -928,6 +986,11 @@ Each is a known, deliberate state, with the reason it was left.
   sent passes the resume check, and a hard link cannot be told from a file over SFTP v3. Replacing
   an existing remote file needs a remove and a rename (OpenSSH refuses a rename onto an existing
   file), so a swap in that one round trip is not prevented.
+- **Recursive remote delete and chmod.** Each folder is re-checked with REALPATH before it is listed
+  and before every change in it, so a folder (or ancestor) another user swaps for a link stops the
+  walk there. SFTP v3 has no calls relative to an open folder, so one round trip stays open between
+  the check and the change, and chmod's SETSTAT follows a link swapped in at the last moment. It
+  needs write permission inside the folder being deleted or changed.
 - **Servers that report no file types.** An entry is accepted as "not a link" when `READLINK` says
   it is not one or `REALPATH` resolves it to itself, and a size match (with the bytes just written)
   decides only when the folder probe is inconclusive; fooling that takes a server that answers those

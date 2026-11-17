@@ -348,6 +348,80 @@ impl DeployPlan {
         self.target.include_line()
     }
 
+    /// The `Host` entries this deploy would write, one line each, when they
+    /// could move where the user's own ssh and git connect - the entries are
+    /// read first by an `Include` at the top of `~/.ssh/config`. `None` when
+    /// nothing like that is written. It is the text of a native question the
+    /// page cannot answer ([`crate::commands::key_deploy`]).
+    ///
+    /// Asked about: host-key checking turned off, a `HostName` other than the
+    /// alias or a `Port` (the alias then names another destination), an
+    /// existing stanza whose destination or checking would change, and an
+    /// alias that overlaps a `Host` line of the user's own ssh config.
+    pub fn host_entries_question(&self) -> Option<String> {
+        let fields = &self.fields;
+        let quote = |text: &str| crate::commands::dialog_host(text, 80);
+        let mut lines = Vec::new();
+        let mut risky = !self.legacy.is_empty();
+        for key in self.keys.iter().filter(|k| k.refusal.is_none()) {
+            let alias = quote(&key.alias);
+            let target = fields.hostname.as_deref().unwrap_or(&key.alias);
+            let moves = fields
+                .hostname
+                .as_deref()
+                .is_some_and(|h| !h.eq_ignore_ascii_case(&key.alias))
+                || fields.port.is_some();
+            let unchecked = fields.strict_host_key == Some(false);
+            let mut changes = false;
+            if let Some(old) = self.base.hosts.iter().find(|h| h.host == key.alias) {
+                let mut merged = self.base.clone();
+                merge_stanza(&mut merged, &key.alias, &key.file, fields);
+                if let Some(new) = merged.hosts.iter().find(|h| h.host == key.alias) {
+                    let strict = |h: &SshHostConfig| h.extra.get("stricthostkeychecking").cloned();
+                    changes = old.hostname != new.hostname
+                        || old.port != new.port
+                        || strict(old) != strict(new);
+                }
+            }
+            risky |= moves || unchecked || changes;
+            let checking = match fields.strict_host_key {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unchanged",
+            };
+            let mut line = format!("Host {alias} -> HostName {}", quote(target));
+            if let Some(user) = &fields.user {
+                line.push_str(&format!(", User {}", quote(user)));
+            }
+            if let Some(port) = fields.port {
+                line.push_str(&format!(", Port {port}"));
+            }
+            line.push_str(&format!(", StrictHostKeyChecking {checking}"));
+            if changes {
+                line.push_str(" (replaces the entry that is there)");
+            }
+            lines.push(line);
+        }
+        if !risky || lines.is_empty() {
+            return None;
+        }
+        let more = lines.len().saturating_sub(10);
+        lines.truncate(10);
+        if more > 0 {
+            lines.push(format!("... and {more} more"));
+        }
+        let overlap = if self.legacy.is_empty() {
+            ""
+        } else {
+            "\n\nYour own ~/.ssh/config already has a Host line for one of these names."
+        };
+        Some(format!(
+            "SSHSpan will add these entries to the ssh config that your ~/.ssh/config includes. \
+             ssh and git use them first for these names, outside SSHSpan:\n\n{}{overlap}\n\nAllow?",
+            lines.join("\n")
+        ))
+    }
+
     /// `Host` lines in the user's own `~/.ssh/config` that name a host this
     /// deploy writes - typically left there by an older SSHSpan.
     pub fn legacy_host_lines(&self) -> Vec<LegacyHostLine> {
